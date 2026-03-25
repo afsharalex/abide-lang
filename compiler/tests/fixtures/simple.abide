@@ -1,0 +1,23 @@
+// Simple Abide example: types, entities with actions
+
+type OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
+type Price = Int
+
+type Address { street: String, city: String }
+
+entity Order {
+  field id: Id
+  field total: Price
+  field status: OrderStatus = @Pending
+
+  action submit()
+    requires status == @Pending
+    requires total > 0 {
+    status' = @AwaitingPayment
+  }
+
+  action mark_paid()
+    requires status == @AwaitingPayment {
+    status' = @Paid
+  }
+}

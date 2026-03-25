@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+*.swo
+
+# Keep this repo language-focused
+compiler/target/
