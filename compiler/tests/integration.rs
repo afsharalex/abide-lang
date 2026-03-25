@@ -1,7 +1,8 @@
+use abide::elab;
 use abide::lex;
 use abide::parse::Parser;
 
-fn parse_file(path: &str) {
+fn parse_file(path: &str) -> abide::ast::Program {
     let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let tokens = lex::lex(&src).unwrap_or_else(|errors| {
         panic!("lex errors in {path}: {errors:?}");
@@ -14,6 +15,17 @@ fn parse_file(path: &str) {
         !program.decls.is_empty(),
         "{path} should have at least one declaration"
     );
+    program
+}
+
+fn elaborate_file(path: &str) -> elab::types::ElabResult {
+    let program = parse_file(path);
+    let (result, errors) = elab::elaborate(&program);
+    for err in &errors {
+        eprintln!("{path}: {err}");
+    }
+    assert!(errors.is_empty(), "{path} should elaborate without errors");
+    result
 }
 
 #[test]
@@ -50,4 +62,51 @@ fn lex_all_fixtures() {
             panic!("lex errors in {path}: {errors:?}");
         });
     }
+}
+
+// ── Elaboration integration tests ────────────────────────────────────
+
+#[test]
+fn elaborate_simple() {
+    let result = elaborate_file("tests/fixtures/simple.abide");
+    assert!(!result.types.is_empty(), "should have types");
+    assert!(!result.entities.is_empty(), "should have entities");
+}
+
+#[test]
+fn elaborate_auth() {
+    let result = elaborate_file("tests/fixtures/auth.abide");
+    assert!(result.entities.len() >= 2, "should have User and Session");
+    assert!(!result.systems.is_empty(), "should have Auth system");
+    assert!(!result.preds.is_empty(), "should have predicates");
+    assert!(!result.verifies.is_empty(), "should have verify blocks");
+}
+
+#[test]
+fn elaborate_commerce() {
+    let result = elaborate_file("tests/fixtures/commerce.abide");
+    assert!(
+        result.systems.len() >= 2,
+        "should have Commerce and Billing"
+    );
+    assert!(!result.scenes.is_empty(), "should have scenes");
+    assert!(!result.proofs.is_empty(), "should have proofs");
+}
+
+#[test]
+fn elaborate_inventory() {
+    let result = elaborate_file("tests/fixtures/inventory.abide");
+    assert!(
+        result.entities.len() >= 3,
+        "should have Product, Reservation, Fulfillment"
+    );
+}
+
+#[test]
+fn elaborate_workflow() {
+    let result = elaborate_file("tests/fixtures/workflow.abide");
+    assert!(
+        !result.lemmas.is_empty() || !result.proofs.is_empty(),
+        "should have proofs or lemmas"
+    );
 }

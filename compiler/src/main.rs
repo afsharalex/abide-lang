@@ -54,8 +54,12 @@ fn main() -> miette::Result<()> {
     }
 
     if cli.elaborate_only {
-        eprintln!("elaboration not yet implemented");
-        std::process::exit(1);
+        let (result, errors) = abide::elab::elaborate(&program);
+        for err in &errors {
+            eprintln!("{err}");
+        }
+        println!("{result:#?}");
+        return Ok(());
     }
 
     if cli.emit_ir {
