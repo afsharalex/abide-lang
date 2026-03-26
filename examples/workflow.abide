@@ -1,0 +1,108 @@
+// Workflow — state machine with role-based guards
+// Demonstrates multi-step lifecycles, role separation, and temporal properties.
+
+type DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
+
+entity Document {
+  id: Id
+  status: DocStatus = @Draft
+  author_id: Id
+  reviewer_id: Id
+  revision_count: Int = 0
+
+  action submit() requires status == @Draft {
+    status' = @Submitted
+  }
+
+  action begin_review(reviewer: Id)
+    requires status == @Submitted
+    requires reviewer != author_id {
+    status' = @UnderReview
+    reviewer_id' = reviewer
+  }
+
+  action approve() requires status == @UnderReview {
+    status' = @Approved
+  }
+
+  action reject() requires status == @UnderReview {
+    status' = @Rejected
+  }
+
+  action revise() requires status == @Rejected {
+    status' = @Draft
+    revision_count' = revision_count + 1
+  }
+
+  action publish() requires status == @Approved {
+    status' = @Published
+  }
+
+  action archive() requires status == @Published {
+    status' = @Archived
+  }
+}
+
+pred is_reviewable(d: Document) = d.status == @Submitted
+pred is_published(d: Document) = d.status == @Published
+
+prop reviewer_not_author = all d: Document |
+  d.status == @UnderReview implies d.reviewer_id != d.author_id
+
+system Publishing {
+  use Document
+
+  event submit_doc(d: Document) requires d.status == @Draft {
+    d.submit()
+  }
+
+  event review(d: Document, reviewer: Id)
+    requires d.status == @Submitted
+    requires reviewer != d.author_id {
+    d.begin_review(reviewer)
+  }
+
+  event review_approve(d: Document) requires d.status == @UnderReview {
+    d.approve()
+  }
+
+  event review_reject(d: Document) requires d.status == @UnderReview {
+    d.reject()
+  }
+
+  event revise_doc(d: Document) requires d.status == @Rejected {
+    d.revise()
+  }
+
+  event publish_doc(d: Document) requires d.status == @Approved {
+    d.publish()
+  }
+}
+
+verify "review integrity" for Publishing[0..200] {
+  assert always (all d: Document |
+    d.status == @UnderReview implies d.reviewer_id != d.author_id)
+
+  assert all d: Document |
+    d.status == @Submitted implies
+      eventually (d.status == @Approved or d.status == @Rejected)
+}
+
+scene "full review cycle" for Publishing {
+  given let d = one Document where d.status == @Draft
+  when action s = Publishing::submit_doc(d) { one }
+  when action r = Publishing::review(d, d.reviewer_id) { one }
+  when action a = Publishing::review_approve(d) { one }
+  when assume s -> r -> a
+  then assert d.status == @Approved
+}
+
+scene "rejection and revision" for Publishing {
+  given let d = one Document where d.status == @Draft and d.revision_count == 0
+  when action s = Publishing::submit_doc(d) { one }
+  when action r = Publishing::review(d, d.reviewer_id) { one }
+  when action rej = Publishing::review_reject(d) { one }
+  when action rev = Publishing::revise_doc(d) { one }
+  when assume s -> r -> rej -> rev
+  then assert d.status == @Draft and d.revision_count == 1
+}

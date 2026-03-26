@@ -1,0 +1,147 @@
+// Healthcare — rich domain example
+// Demonstrates ADTs with record variants, complex entities, predicates, and proofs.
+
+type PatientStatus = Registered | Admitted | InTreatment | Discharged
+type PrescriptionStatus = Prescribed | Dispensed | Completed | Cancelled
+type InsuranceStatus = Active | Expired | Denied
+
+type DosageForm =
+  Tablet { mg: Int }
+  | Liquid { ml: Int }
+  | Injection { dose_mg: Int }
+
+type Priority = Low | Medium | High | Critical
+
+const MAX_REFILLS = 5
+const MAX_DAILY_DOSE = 4000
+
+entity Patient {
+  id: Id
+  status: PatientStatus = @Registered
+  insurance: InsuranceStatus = @Active
+  priority: Priority = @Low
+  room_number: Int = 0
+
+  action admit(room: Int)
+    requires status == @Registered
+    requires insurance == @Active
+    requires room > 0 {
+    status' = @Admitted
+    room_number' = room
+  }
+
+  action discharge()
+    requires status == @Admitted or status == @InTreatment {
+    status' = @Discharged
+    room_number' = 0
+  }
+
+  action escalate_priority()
+    requires status == @Admitted or status == @InTreatment
+    requires priority != @Critical {
+    let next_priority = match priority {
+      Low => @Medium
+      Medium => @High
+      High => @Critical
+      _ => priority
+    } in
+    priority' = next_priority
+  }
+}
+
+entity Prescription {
+  id: Id
+  patient_id: Id
+  status: PrescriptionStatus = @Prescribed
+  dosage: DosageForm
+  refills_remaining: Int = 0
+
+  action dispense()
+    requires status == @Prescribed {
+    status' = @Dispensed
+  }
+
+  action refill()
+    requires status == @Dispensed
+    requires refills_remaining > 0 {
+    refills_remaining' = refills_remaining - 1
+  }
+
+  action cancel()
+    requires status == @Prescribed or status == @Dispensed {
+    status' = @Cancelled
+  }
+}
+
+fn daily_dose(d: DosageForm): Int =
+  match d {
+    Tablet { mg: m } => m
+    Liquid { ml: m } => m * 5
+    Injection { dose_mg: d } => d
+  }
+
+pred is_admitted(p: Patient) =
+  p.status == @Admitted or p.status == @InTreatment
+
+pred can_refill(rx: Prescription) =
+  rx.status == @Dispensed and rx.refills_remaining > 0
+
+prop admitted_patients_have_rooms = all p: Patient |
+  is_admitted(p) implies p.room_number > 0
+
+prop discharged_patients_leave_rooms = all p: Patient |
+  p.status == @Discharged implies p.room_number == 0
+
+system Registration {
+  use Patient
+
+  event register_patient(p: Patient) requires p.status == @Registered {
+    sorry
+  }
+
+  event admit_patient(p: Patient, room: Int) requires p.insurance == @Active {
+    p.admit(room)
+  }
+
+  event discharge_patient(p: Patient) requires is_admitted(p) {
+    p.discharge()
+  }
+}
+
+system ClinicalSystem {
+  use Patient
+  use Prescription
+
+  event prescribe(rx: Prescription) requires rx.status == @Prescribed {
+    sorry
+  }
+
+  event dispense(rx: Prescription) requires rx.status == @Prescribed {
+    rx.dispense()
+  }
+
+  event refill(rx: Prescription) requires can_refill(rx) {
+    rx.refill()
+  }
+}
+
+verify "patient safety" for Registration[0..200] {
+  assert always (all p: Patient |
+    is_admitted(p) implies p.room_number > 0)
+
+  assert always (all p: Patient |
+    p.status == @Discharged implies p.room_number == 0)
+}
+
+lemma refill_decreases {
+  all rx: Prescription |
+    rx.status == @Dispensed and rx.refills_remaining > 0 implies
+      rx.refills_remaining' == rx.refills_remaining - 1
+}
+
+proof "patient lifecycle safety" for Registration
+  invariant (all p: Patient |
+    p.room_number > 0 implies is_admitted(p)) {
+  show always (all p: Patient |
+    p.status == @Discharged implies p.room_number == 0)
+}

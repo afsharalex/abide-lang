@@ -4,9 +4,9 @@ Without limiting other conditions in the License, the grant of rights under the 
 
 For purposes of the foregoing, "Sell" means practicing any or all of the rights granted to you under the License to provide to third parties, for a fee or other consideration (including without limitation fees for hosting or consulting/support services related to the Software), a product or service whose value derives, entirely or substantially, from the functionality of the Software. Any license notice or attribution required by the License must also include this Commons Clause License Condition notice.
 
-Software: abide-lang
+Software: Abide
 License: Apache License, Version 2.0
-Licensor: The Abide Authors
+Licensor: Alex Afshar
 
 Apache License
 Version 2.0, January 2004
@@ -196,7 +196,7 @@ file or class name and description of purpose be included on the
 same "printed page" as the copyright notice for easier
 identification within third-party archives.
 
-Copyright [yyyy] [name of copyright owner]
+Copyright 2026 Alex Afshar
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

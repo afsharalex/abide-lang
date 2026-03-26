@@ -1,0 +1,30 @@
+// Order — minimal Abide example
+// Demonstrates types, entities, actions, and primed notation.
+
+type OrderStatus = Pending | Paid | Shipped
+
+entity Order {
+  id: Id
+  status: OrderStatus = @Pending
+  total: Real
+
+  action pay() requires status == @Pending requires total > 0 {
+    status' = @Paid
+  }
+
+  action ship() requires status == @Paid {
+    status' = @Shipped
+  }
+}
+
+system Commerce {
+  use Order
+
+  event place_order(o: Order) requires o.status == @Pending {
+    o.pay()
+  }
+
+  event ship_order(o: Order) requires o.status == @Paid {
+    o.ship()
+  }
+}

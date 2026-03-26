@@ -1,60 +1,101 @@
-# abide-lang
+# Abide
 
-> Abide turns system behavior into an executable, verifiable contract.  
-> Model what must be true, explore it in motion, and keep specs readable enough to guide real engineering decisions.
+> A specification language for executable, verifiable system behavior.
 
-Abide is a formal specification language for practical engineering: an executable, verifiable contract for system behavior.
+Abide lets you model system behavior formally — then simulate it, check it against properties, and prove guarantees. Specifications are readable enough to guide engineering decisions and precise enough for automated verification.
 
-Write specifications you can simulate and check, while keeping them readable for humans and aligned with real implementations.
+**Status:** Active design and implementation phase. Syntax and semantics are evolving. Early feedback is welcome.
 
-**Status:** active design/implementation phase; syntax and semantics are still evolving.
+## A Taste of Abide
 
-## Language goals
+```abide
+type OrderStatus = Pending | Paid | Shipped
 
-Abide is being designed as a specification language for defining system behavior that is:
+entity Order {
+  id: Id
+  status: OrderStatus = @Pending
+  total: Real
 
-1. executable (simulation and trace generation),
-2. verifiable (bounded and unbounded claims),
-3. documentable (human-readable specifications), and
-4. exportable (canonical IR for conformance checking).
+  action pay() requires status == @Pending requires total > 0 {
+    status' = @Paid
+  }
 
-In short: write one specification that supports exploration, proof obligations, and implementation conformance workflows.
+  action ship() requires status == @Paid {
+    status' = @Shipped
+  }
+}
 
-### Experience goals
+system Commerce {
+  use Order
 
-Beyond formal capability, Abide is also aiming for strong developer ergonomics:
+  event place_order(o: Order) requires o.status == @Pending {
+    o.pay()
+  }
+}
 
-- Fast modeling and iteration loops, not proof-heavy ceremony for every task.
-- Interactive workflows via a live REPL and incremental model updates.
-- Exploratory analysis tooling (simulation/trace style workflows) alongside verification.
-- Queryable model state for debugging and understanding behavior.
+verify "paid orders can ship" for Commerce[0..50] {
+  assert all o: Order |
+    o.status == @Paid implies eventually (o.status == @Shipped)
+}
+```
 
-### Design influences (directional)
+## What Abide Covers
 
-Current language and tooling direction draws inspiration from:
+Abide spans five specification layers under one language:
 
-- Alloy-style lightweight modeling and exploration,
-- TLA+-style system and concurrency reasoning,
-- Dafny-style algorithm/function-level precision where needed,
-- optional deeper type-theoretic guarantees for critical slices (DTT).
+1. **Structural modeling** — Define domain vocabulary with types, records, and algebraic data types. Model stateful objects as entities with fields and defaults.
 
-These are design influences, not compatibility guarantees.
+2. **Behavioral modeling** — Specify state transitions with guarded actions (`requires`/`ensures`). Compose entities into systems with events. Express constraints as named predicates and properties.
 
-## What this repository includes
+3. **Temporal modeling** — Assert safety (`always`) and liveness (`eventually`) properties. Explore system behavior with bounded model checking. Construct scenario witnesses with `scene` blocks. Query specifications interactively with the [REPL](docs/repl.md) and [QA language](docs/qa-language.md) *(planned)*.
 
-- `compiler/`: CLI/compiler implementation.
-- `stdlib/`: standard library modules and checks.
-- `examples/`: sample Abide projects (will evolve as syntax stabilizes).
-- `docs/`: user-facing guides and references.
-- `spec/`: language contract notes and IR snapshots.
+4. **Algorithm verification** *(planned)* — Verify function correctness with loop invariants, termination measures, and refinement types. Prove algorithms correct against their contracts.
 
-## Notes for early adopters
+5. **Proof escape hatch** *(planned)* — For properties beyond bounded checking, export proof obligations to a dependent type theory backend (Agda, Lean 4, or Rocq — under evaluation).
 
-- This is not production-ready yet.
-- Syntax, APIs, and file formats may change without notice.
+## Start Here
+
+- **New to Abide?** Read the [Getting Started](docs/getting-started.md) guide
+- **Want the syntax quickly?** See [Syntax at a Glance](docs/syntax-at-a-glance.md)
+- **Evaluating the direction?** Read [Core Concepts](docs/core-concepts.md) and the [Roadmap](docs/roadmap.md)
+- **Looking for examples?** See [Examples](docs/examples.md) and the `examples/` directory
+
+## Design Influences
+
+Abide draws directional inspiration from:
+
+- **Alloy** — Lightweight structural modeling and bounded exploration
+- **TLA+** — System-level temporal reasoning and state machine specification
+- **Dafny / F\*** — Function and algorithm-level contracts with automated verification
+- **Agda / Lean 4 / Rocq** — Dependent type theory for deep proof obligations
+
+These are influences on the design, not compatibility guarantees.
+
+## Repository Structure
+
+```
+compiler/    Compiler and checker implementation (Rust)
+docs/        User-facing guides and references
+examples/    Sample Abide specifications
+stdlib/      Standard library (planned)
+spec/        Language specification notes
+```
+
+## Building
+
+Requires a Rust toolchain (stable).
+
+```sh
+cd compiler
+cargo build --release
+```
+
+## Notes for Early Adopters
+
+- This is not production-ready.
+- Syntax, semantics, and file formats may change without notice.
 - Issues and design feedback are welcome while the language is still being shaped.
 
-## Repository and licensing notes
+## License
 
-- Repository hosting location may change as the project setup is finalized.
-- This repository is released under Apache-2.0 with an added Commons Clause condition (see `LICENSE`).
+Released under Apache-2.0 with an added Commons Clause condition. See [LICENSE](LICENSE) for details.

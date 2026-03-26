@@ -1,0 +1,58 @@
+// Matching — pattern matching reference
+// Demonstrates sum types with record variants and comprehensive match syntax.
+
+type Shape =
+  Circle { radius: Real }
+  | Rectangle { width: Real, height: Real }
+  | Triangle { base: Real, height: Real }
+  | Point
+
+type Expr =
+  Lit { value: Int }
+  | Add { left: Expr, right: Expr }
+  | Neg { inner: Expr }
+
+type OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
+
+// Simple constructor matching
+fn status_label(s: OrderStatus): String =
+  match s {
+    Pending => "waiting"
+    Confirmed => "confirmed"
+    Shipped => "in transit"
+    Delivered => "complete"
+    Cancelled => "cancelled"
+  }
+
+// Record destructuring
+fn area(s: Shape): Real =
+  match s {
+    Circle { radius: r } => 3.14159 * r * r
+    Rectangle { width: w, height: h } => w * h
+    Triangle { base: b, height: h } => 0.5 * b * h
+    Point => 0
+  }
+
+// Guards
+fn describe(s: Shape): String =
+  match s {
+    Circle { radius: r } if r > 100 => "large circle"
+    Circle { .. } => "circle"
+    Rectangle { width: w, height: h } if w == h => "square"
+    Rectangle { .. } => "rectangle"
+    _ => "other"
+  }
+
+// Or-patterns
+fn is_terminal(s: OrderStatus): Bool =
+  match s {
+    Delivered | Cancelled => true
+    _ => false
+  }
+
+// Nested patterns
+fn is_double_negation(e: Expr): Bool =
+  match e {
+    Neg { inner: Neg { inner: _ } } => true
+    _ => false
+  }

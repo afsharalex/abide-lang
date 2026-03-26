@@ -1,0 +1,82 @@
+// Commerce — multi-system coordination
+// Demonstrates two systems sharing entities with cross-system event calls.
+
+type OrderStatus = Pending | AwaitingPayment | Paid | Shipped
+type PaymentStatus = Open | Captured | Failed
+
+entity Order {
+  id: Id
+  status: OrderStatus = @Pending
+  total: Real
+
+  action submit() requires status == @Pending requires total > 0 {
+    status' = @AwaitingPayment
+  }
+
+  action mark_paid() requires status == @AwaitingPayment {
+    status' = @Paid
+  }
+
+  action ship() requires status == @Paid {
+    status' = @Shipped
+  }
+}
+
+entity PaymentIntent {
+  id: Id
+  order_id: Id
+  amount: Real
+  status: PaymentStatus = @Open
+
+  action capture() requires status == @Open requires amount > 0 {
+    status' = @Captured
+  }
+
+  action fail() requires status == @Open {
+    status' = @Failed
+  }
+}
+
+system Commerce {
+  use Order
+
+  event submit_order(o: Order) requires o.status == @Pending {
+    o.submit()
+  }
+
+  event confirm_payment(o: Order) requires o.status == @AwaitingPayment {
+    o.mark_paid()
+  }
+
+  event ship_order(o: Order) requires o.status == @Paid {
+    o.ship()
+  }
+}
+
+system Billing {
+  use PaymentIntent
+  use Order
+
+  event process_payment(p: PaymentIntent, o: Order)
+    requires p.status == @Open
+    requires p.order_id == o.id {
+    p.capture()
+    Commerce::confirm_payment(o)
+  }
+}
+
+pred is_paid(o: Order) = o.status == @Paid or o.status == @Shipped
+
+verify "payment integrity" for Commerce[0..100], Billing[0..100] {
+  assert always (all o: Order |
+    o.status == @Paid implies o.total > 0)
+}
+
+scene "order to shipment" for Commerce {
+  given let o = one Order where o.status == @Pending and o.total == 99
+  when action s = Commerce::submit_order(o) { one }
+  when action p = Commerce::confirm_payment(o) { one }
+  when action sh = Commerce::ship_order(o) { one }
+  when assume s -> p -> sh
+  then assert o.status == @Shipped
+}
