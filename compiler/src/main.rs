@@ -63,8 +63,14 @@ fn main() -> miette::Result<()> {
     }
 
     if cli.emit_ir {
-        eprintln!("IR emission not yet implemented");
-        std::process::exit(1);
+        let (result, errors) = abide::elab::elaborate(&program);
+        for err in &errors {
+            eprintln!("{err}");
+        }
+        let ir_program = abide::ir::lower(&result);
+        let json = abide::ir::emit_json(&ir_program);
+        println!("{json}");
+        return Ok(());
     }
 
     // Default: full pipeline (not yet implemented)

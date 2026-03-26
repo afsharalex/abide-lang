@@ -1,4 +1,5 @@
 use abide::elab;
+use abide::ir;
 use abide::lex;
 use abide::parse::Parser;
 
@@ -109,4 +110,57 @@ fn elaborate_workflow() {
         !result.lemmas.is_empty() || !result.proofs.is_empty(),
         "should have proofs or lemmas"
     );
+}
+
+// ── IR lowering + JSON integration tests ─────────────────────────────
+
+fn lower_file(path: &str) -> ir::types::IRProgram {
+    let result = elaborate_file(path);
+    ir::lower(&result)
+}
+
+#[test]
+fn lower_simple() {
+    let prog = lower_file("tests/fixtures/simple.abide");
+    assert!(!prog.types.is_empty(), "should have IR types");
+    assert!(!prog.entities.is_empty(), "should have IR entities");
+    // Verify JSON serialization doesn't panic
+    let json = ir::emit_json(&prog);
+    assert!(
+        json.contains("\"entities\""),
+        "JSON should contain entities key"
+    );
+}
+
+#[test]
+fn lower_commerce() {
+    let prog = lower_file("tests/fixtures/commerce.abide");
+    assert!(prog.systems.len() >= 2, "should have Commerce and Billing");
+    assert!(!prog.verifies.is_empty(), "should have IR verifies");
+    assert!(!prog.scenes.is_empty(), "should have IR scenes");
+    let json = ir::emit_json(&prog);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert!(parsed["systems"].is_array());
+    assert!(parsed["scenes"].is_array());
+}
+
+#[test]
+fn lower_all_fixtures() {
+    for name in &["simple", "auth", "commerce", "inventory", "workflow"] {
+        let path = format!("tests/fixtures/{name}.abide");
+        let prog = lower_file(&path);
+        let json = ir::emit_json(&prog);
+        // Verify it's valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("{name}: invalid JSON: {e}"));
+        assert!(parsed.is_object(), "{name}: top-level should be object");
+        assert!(
+            parsed["types"].is_array(),
+            "{name}: should have types array"
+        );
+        assert!(
+            parsed["entities"].is_array(),
+            "{name}: should have entities array"
+        );
+    }
 }
