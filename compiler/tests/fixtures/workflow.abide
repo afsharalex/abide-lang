@@ -7,12 +7,12 @@ type ReviewResult = Pass | Fail | NeedsRevision
 type Priority = Low | Medium | High | Critical
 
 entity Document {
-  field id: Id
-  field author_id: Id
-  field reviewer_id: Id
-  field status: DocStatus = @Draft
-  field priority: Priority = @Medium
-  field revision_count: Int
+  id: Id
+  author_id: Id
+  reviewer_id: Id
+  status: DocStatus = @Draft
+  priority: Priority = @Medium
+  revision_count: Int
 
   action submit()
     requires status == @Draft {
@@ -59,15 +59,15 @@ entity Document {
 }
 
 entity AuditEntry {
-  field id: Id
-  field doc_id: Id
-  field action_name: String
-  field actor_id: Id
+  id: Id
+  doc_id: Id
+  action_name: String
+  actor_id: Id
 }
 
 system DocumentMgmt {
-  uses Document
-  uses AuditEntry
+  use Document
+  use AuditEntry
 
   event submit_document(doc_id: Id, author_id: Id)
     requires exists d: Document | d.id == doc_id and d.author_id == author_id and d.status == @Draft {

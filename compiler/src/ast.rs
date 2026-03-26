@@ -570,6 +570,8 @@ pub enum ExprKind {
     Str(String),
     True,
     False,
+    Sorry,
+    Todo,
 }
 
 #[derive(Debug, Clone)]

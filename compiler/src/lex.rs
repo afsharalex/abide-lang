@@ -23,8 +23,6 @@ pub enum Token {
     Entity,
     #[token("system")]
     System,
-    #[token("field")]
-    Field,
     #[token("action")]
     Action,
     #[token("event")]
@@ -37,8 +35,6 @@ pub enum Token {
     Else,
     #[token("idle")]
     Idle,
-    #[token("uses")]
-    Uses,
     #[token("where")]
     Where,
     #[token("choose")]
@@ -111,6 +107,10 @@ pub enum Token {
     Match,
     #[token("if")]
     If,
+    #[token("sorry")]
+    Sorry,
+    #[token("todo")]
+    Todo,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token("::")]
@@ -213,14 +213,12 @@ impl std::fmt::Display for Token {
             Self::Type => write!(f, "type"),
             Self::Entity => write!(f, "entity"),
             Self::System => write!(f, "system"),
-            Self::Field => write!(f, "field"),
             Self::Action => write!(f, "action"),
             Self::Event => write!(f, "event"),
             Self::Next => write!(f, "next"),
             Self::When => write!(f, "when"),
             Self::Else => write!(f, "else"),
             Self::Idle => write!(f, "idle"),
-            Self::Uses => write!(f, "uses"),
             Self::Where => write!(f, "where"),
             Self::Choose => write!(f, "choose"),
             Self::For => write!(f, "for"),
@@ -257,6 +255,8 @@ impl std::fmt::Display for Token {
             Self::Lone => write!(f, "lone"),
             Self::Match => write!(f, "match"),
             Self::If => write!(f, "if"),
+            Self::Sorry => write!(f, "sorry"),
+            Self::Todo => write!(f, "todo"),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),
             Self::Dot => write!(f, "."),
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src = "import as use const fn type entity system field action event";
+        let src = "import as use const fn type entity system action event sorry todo";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -343,9 +343,10 @@ mod tests {
                 Token::Type,
                 Token::Entity,
                 Token::System,
-                Token::Field,
                 Token::Action,
                 Token::Event,
+                Token::Sorry,
+                Token::Todo,
             ]
         );
     }
@@ -592,13 +593,13 @@ mod tests {
     #[test]
     fn entity_snippet() {
         let src = r#"entity Order {
-  field id: Id
-  field status: OrderStatus = @Pending
+  id: Id
+  status: OrderStatus = @Pending
 }"#;
         let tokens = lex_ok(src);
         assert_eq!(tokens[0], Token::Entity);
         assert_eq!(tokens[1], Token::Name("Order".into()));
         assert_eq!(tokens[2], Token::LBrace);
-        assert_eq!(tokens[3], Token::Field);
+        assert_eq!(tokens[3], Token::Name("id".into()));
     }
 }

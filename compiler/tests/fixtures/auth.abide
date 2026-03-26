@@ -7,11 +7,11 @@ type Role = Admin | Member | Guest
 type SessionStatus = Valid | Expired | Revoked
 
 entity User {
-  field id: Id
-  field email: String
-  field status: UserStatus = @Active
-  field role: Role = @Member
-  field failed_attempts: Int
+  id: Id
+  email: String
+  status: UserStatus = @Active
+  role: Role = @Member
+  failed_attempts: Int
 
   action activate()
     requires status == @Suspended {
@@ -47,9 +47,9 @@ entity User {
 }
 
 entity Session {
-  field id: Id
-  field user_id: Id
-  field status: SessionStatus = @Valid
+  id: Id
+  user_id: Id
+  status: SessionStatus = @Valid
 
   action expire()
     requires status == @Valid {
@@ -63,8 +63,8 @@ entity Session {
 }
 
 system Auth {
-  uses User
-  uses Session
+  use User
+  use Session
 
   event login(user_id: Id)
     requires exists u: User | u.id == user_id and u.status == @Active {

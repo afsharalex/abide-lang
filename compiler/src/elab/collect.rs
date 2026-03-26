@@ -838,6 +838,10 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                 .collect();
             EExpr::Match(Box::new(scrut), earms)
         }
+
+        // Stubs
+        ast::ExprKind::Sorry => EExpr::Sorry,
+        ast::ExprKind::Todo => EExpr::Todo,
     }
 }
 

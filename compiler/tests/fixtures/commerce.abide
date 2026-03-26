@@ -12,9 +12,9 @@ type Price = Int
 type Address { street: String, city: String }
 
 entity Order {
-  field id: Id
-  field total: Price
-  field status: OrderStatus = @Pending
+  id: Id
+  total: Price
+  status: OrderStatus = @Pending
 
   action submit()
     requires status == @Pending
@@ -39,9 +39,9 @@ entity Order {
 }
 
 entity PaymentIntent {
-  field order_id: Id
-  field amount: Price
-  field status: PaymentStatus = @Opened
+  order_id: Id
+  amount: Price
+  status: PaymentStatus = @Opened
 
   action capture()
     requires status == @Opened
@@ -56,7 +56,7 @@ entity PaymentIntent {
 }
 
 system Commerce {
-  uses Order
+  use Order
 
   event pay(order_id: Id)
     requires exists o: Order | o.id == order_id and o.status == @Pending {
@@ -94,7 +94,7 @@ system Commerce {
 }
 
 system Billing {
-  uses PaymentIntent
+  use PaymentIntent
 
   event open_intent(order_id: Id) {
     create PaymentIntent {

@@ -479,10 +479,10 @@ impl Parser {
 
     fn entity_item(&mut self) -> Result<EntityItem, ParseError> {
         match self.peek() {
-            Some(Token::Field) => Ok(EntityItem::Field(self.field_decl()?)),
             Some(Token::Action) => Ok(EntityItem::Action(self.entity_action()?)),
+            Some(Token::Name(_)) => Ok(EntityItem::Field(self.field_decl()?)),
             Some(tok) => Err(ParseError::expected(
-                "`field` or `action`",
+                "field declaration or `action`",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -491,7 +491,7 @@ impl Parser {
     }
 
     fn field_decl(&mut self) -> Result<FieldDecl, ParseError> {
-        let start = self.expect(&Token::Field)?;
+        let start = self.cur_span();
         let (name, _) = self.expect_name()?;
         self.expect(&Token::Colon)?;
         let ty = self.type_ref()?;
@@ -603,7 +603,7 @@ impl Parser {
 
     fn system_item(&mut self) -> Result<SystemItem, ParseError> {
         match self.peek() {
-            Some(Token::Uses) => {
+            Some(Token::Use) => {
                 let start = self.advance().1;
                 let (name, end) = self.expect_name()?;
                 Ok(SystemItem::Uses(name, start.merge(end)))
@@ -611,7 +611,7 @@ impl Parser {
             Some(Token::Event) => Ok(SystemItem::Event(self.event_decl()?)),
             Some(Token::Next) => Ok(SystemItem::Next(self.next_block()?)),
             Some(tok) => Err(ParseError::expected(
-                "`uses`, `event`, or `next`",
+                "`use`, `event`, or `next`",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -1620,6 +1620,20 @@ impl Parser {
                     span: start,
                 })
             }
+            Some(Token::Sorry) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Sorry,
+                    span: start,
+                })
+            }
+            Some(Token::Todo) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Todo,
+                    span: start,
+                })
+            }
             Some(Token::IntLit(_)) => {
                 let (n, span) = self.expect_int()?;
                 Ok(Expr {
@@ -2195,8 +2209,8 @@ mod tests {
     #[test]
     fn entity_decl() {
         let src = r#"entity Order {
-  field id: Id
-  field status: OrderStatus = @Pending
+  id: Id
+  status: OrderStatus = @Pending
 
   action submit()
     requires status == @Pending {
@@ -2215,7 +2229,7 @@ mod tests {
     #[test]
     fn system_decl() {
         let src = r#"system Commerce {
-  uses Order
+  use Order
 
   event pay(order_id: Id) {
     choose o: Order where o.id == order_id {
@@ -2355,7 +2369,7 @@ mod tests {
     #[test]
     fn create_block() {
         let src = r#"system Billing {
-  uses PaymentIntent
+  use PaymentIntent
 
   event open_intent(order_id: Id) {
     create PaymentIntent {

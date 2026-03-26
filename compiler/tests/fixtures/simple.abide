@@ -6,9 +6,9 @@ type Price = Int
 type Address { street: String, city: String }
 
 entity Order {
-  field id: Id
-  field total: Price
-  field status: OrderStatus = @Pending
+  id: Id
+  total: Price
+  status: OrderStatus = @Pending
 
   action submit()
     requires status == @Pending

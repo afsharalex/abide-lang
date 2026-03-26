@@ -131,6 +131,8 @@ pub enum IRExpr {
         scrutinee: Box<IRExpr>,
         arms: Vec<IRMatchArm>,
     },
+    Sorry,
+    Todo,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

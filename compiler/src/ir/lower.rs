@@ -611,6 +611,8 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                 })
                 .collect(),
         },
+        E::EExpr::Sorry => IRExpr::Sorry,
+        E::EExpr::Todo => IRExpr::Todo,
     }
 }
 

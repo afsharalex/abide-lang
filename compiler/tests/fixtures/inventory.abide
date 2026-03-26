@@ -7,10 +7,10 @@ type ReservationStatus = Held | Confirmed | Released | Expired
 type FulfillmentStatus = Pending | Picking | Packed | Shipped | Delivered
 
 entity Product {
-  field id: Id
-  field name: String
-  field quantity: Int
-  field status: ProductStatus = @Available
+  id: Id
+  name: String
+  quantity: Int
+  status: ProductStatus = @Available
 
   action restock(amount: Int)
     requires status != @Discontinued
@@ -44,10 +44,10 @@ entity Product {
 }
 
 entity Reservation {
-  field id: Id
-  field product_id: Id
-  field quantity: Int
-  field status: ReservationStatus = @Held
+  id: Id
+  product_id: Id
+  quantity: Int
+  status: ReservationStatus = @Held
 
   action confirm()
     requires status == @Held {
@@ -66,9 +66,9 @@ entity Reservation {
 }
 
 entity Fulfillment {
-  field id: Id
-  field reservation_id: Id
-  field status: FulfillmentStatus = @Pending
+  id: Id
+  reservation_id: Id
+  status: FulfillmentStatus = @Pending
 
   action start_picking()
     requires status == @Pending {
@@ -92,8 +92,8 @@ entity Fulfillment {
 }
 
 system Warehouse {
-  uses Product
-  uses Reservation
+  use Product
+  use Reservation
 
   event reserve_product(product_id: Id, qty: Int)
     requires exists p: Product |
@@ -150,7 +150,7 @@ system Warehouse {
 }
 
 system Shipping {
-  uses Fulfillment
+  use Fulfillment
 
   event begin_fulfillment(reservation_id: Id) {
     create Fulfillment {
