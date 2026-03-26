@@ -21,9 +21,10 @@ pub enum TopDecl {
     Pred(PredDecl),
     Prop(PropDecl),
     Verify(VerifyDecl),
-    Proof(ProofDecl),
+    Theorem(TheoremDecl),
     Lemma(LemmaDecl),
     Scene(SceneDecl),
+    Axiom(AxiomDecl),
 }
 
 // ── Import / Use ─────────────────────────────────────────────────────
@@ -310,7 +311,7 @@ pub struct PropDecl {
 
 #[derive(Debug, Clone)]
 pub struct VerifyDecl {
-    pub label: String,
+    pub name: String,
     pub targets: Vec<VerifyTarget>,
     pub asserts: Vec<Expr>,
     pub span: Span,
@@ -324,12 +325,15 @@ pub struct VerifyTarget {
     pub span: Span,
 }
 
+// ── Theorem Blocks (DDR-032) ─────────────────────────────────────────
+
 #[derive(Debug, Clone)]
-pub struct ProofDecl {
-    pub label: String,
+pub struct TheoremDecl {
+    pub name: String,
     pub systems: Vec<String>,
     pub invariants: Vec<Expr>,
     pub shows: Vec<Expr>,
+    pub by_file: Option<String>,
     pub span: Span,
 }
 
@@ -340,11 +344,21 @@ pub struct LemmaDecl {
     pub span: Span,
 }
 
+// ── Axiom Declarations (DDR-032) ─────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AxiomDecl {
+    pub name: String,
+    pub body: Expr,
+    pub by_file: Option<String>,
+    pub span: Span,
+}
+
 // ── Scene Blocks ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct SceneDecl {
-    pub label: String,
+    pub name: String,
     pub systems: Vec<String>,
     pub items: Vec<SceneItem>,
     pub span: Span,

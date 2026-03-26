@@ -111,6 +111,12 @@ pub enum Token {
     Sorry,
     #[token("todo")]
     Todo,
+    #[token("theorem")]
+    Theorem,
+    #[token("axiom")]
+    Axiom,
+    #[token("by")]
+    By,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token("::")]
@@ -257,6 +263,9 @@ impl std::fmt::Display for Token {
             Self::If => write!(f, "if"),
             Self::Sorry => write!(f, "sorry"),
             Self::Todo => write!(f, "todo"),
+            Self::Theorem => write!(f, "theorem"),
+            Self::Axiom => write!(f, "axiom"),
+            Self::By => write!(f, "by"),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),
             Self::Dot => write!(f, "."),

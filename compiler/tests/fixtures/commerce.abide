@@ -123,17 +123,17 @@ pred non_negative_order_total(o: Order) = o.total >= 0
 prop commerce_safe for Commerce = always all o: Order | non_negative_order_total(o)
 
 // Bounded model checking — automated, scope-bounded
-verify "commerce smoke" for Commerce[0..500] {
+verify commerce_smoke for Commerce[0..500] {
   assert commerce_safe
   assert eventually exists o: Order | o.status == @Paid
 }
 
-verify "billing safety" for Billing[0..500] {
+verify billing_safety for Billing[0..500] {
   assert always all p: PaymentIntent | p.status == @Captured implies p.amount > 0
 }
 
 // Unbounded proof — human-guided, emits obligations to Agda
-proof "order total non-negative" for Commerce
+theorem order_total_non_negative for Commerce
   invariant all o: Order | o.total >= 0 {
   show always all o: Order | non_negative_order_total(o)
 }
@@ -142,7 +142,7 @@ lemma order_total_preserved {
   non_negative_order_total(o) implies non_negative_order_total(o)
 }
 
-scene "happy path" for Commerce {
+scene happy_path for Commerce {
   given {
     let o = one Order where o.total == 100
   }

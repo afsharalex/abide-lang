@@ -33,7 +33,7 @@ system Commerce {
   }
 }
 
-verify "paid orders can ship" for Commerce[0..50] {
+verify paid_orders_can_ship for Commerce[0..50] {
   assert all o: Order |
     o.status == @Paid implies eventually (o.status == @Shipped)
 }

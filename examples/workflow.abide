@@ -79,7 +79,7 @@ system Publishing {
   }
 }
 
-verify "review integrity" for Publishing[0..200] {
+verify review_integrity for Publishing[0..200] {
   assert always (all d: Document |
     d.status == @UnderReview implies d.reviewer_id != d.author_id)
 
@@ -88,7 +88,7 @@ verify "review integrity" for Publishing[0..200] {
       eventually (d.status == @Approved or d.status == @Rejected)
 }
 
-scene "full review cycle" for Publishing {
+scene full_review_cycle for Publishing {
   given let d = one Document where d.status == @Draft
   when action s = Publishing::submit_doc(d) { one }
   when action r = Publishing::review(d, d.reviewer_id) { one }
@@ -97,7 +97,7 @@ scene "full review cycle" for Publishing {
   then assert d.status == @Approved
 }
 
-scene "rejection and revision" for Publishing {
+scene rejection_and_revision for Publishing {
   given let d = one Document where d.status == @Draft and d.revision_count == 0
   when action s = Publishing::submit_doc(d) { one }
   when action r = Publishing::review(d, d.reviewer_id) { one }

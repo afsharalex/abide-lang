@@ -19,10 +19,11 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Match expressions (patterns, guards, or-patterns, wildcards) | Implemented |
 | Verify blocks with bounds (`verify for System[0..N]`) | Syntax implemented, solver backend in progress |
 | Scene blocks (given/when/then) | Syntax implemented, solver backend in progress |
-| Proof and lemma blocks | Syntax implemented, backend not yet connected |
+| Theorem, lemma, and axiom blocks | Syntax implemented, backend not yet connected |
 | Temporal operators (`always`, `eventually`, `implies`) | Implemented |
 | Composition operators (`->`, `&`, `\|`, `\|\|`, `^|`, `\|>`) | Implemented |
 | Quantifiers (`all`, `some`, `no`, `one`, `lone`, `exists`) | Implemented |
+| `theorem` and `axiom` keywords | Implemented |
 | Sorry/todo stubs | Implemented |
 | Compiler type-checking | Implemented |
 

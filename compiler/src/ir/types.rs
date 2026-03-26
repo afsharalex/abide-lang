@@ -304,7 +304,7 @@ pub struct IRSchedWhen {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRVerify {
-    pub label: std::string::String,
+    pub name: std::string::String,
     pub systems: Vec<IRVerifySystem>,
     pub asserts: Vec<IRExpr>,
 }
@@ -317,16 +317,22 @@ pub struct IRVerifySystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct IRProof {
-    pub label: std::string::String,
+pub struct IRTheorem {
+    pub name: std::string::String,
     pub systems: Vec<std::string::String>,
     pub invariants: Vec<IRExpr>,
     pub shows: Vec<IRExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRAxiom {
+    pub name: std::string::String,
+    pub body: IRExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRScene {
-    pub label: std::string::String,
+    pub name: std::string::String,
     pub systems: Vec<std::string::String>,
     pub givens: Vec<IRSceneGiven>,
     pub events: Vec<IRSceneEvent>,
@@ -385,7 +391,8 @@ pub struct IRProgram {
     pub entities: Vec<IREntity>,
     pub systems: Vec<IRSystem>,
     pub verifies: Vec<IRVerify>,
-    pub proofs: Vec<IRProof>,
+    pub theorems: Vec<IRTheorem>,
+    pub axioms: Vec<IRAxiom>,
     pub scenes: Vec<IRScene>,
 }
 

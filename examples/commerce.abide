@@ -67,12 +67,12 @@ system Billing {
 
 pred is_paid(o: Order) = o.status == @Paid or o.status == @Shipped
 
-verify "payment integrity" for Commerce[0..100], Billing[0..100] {
+verify payment_integrity for Commerce[0..100], Billing[0..100] {
   assert always (all o: Order |
     o.status == @Paid implies o.total > 0)
 }
 
-scene "order to shipment" for Commerce {
+scene order_to_shipment for Commerce {
   given let o = one Order where o.status == @Pending and o.total == 99
   when action s = Commerce::submit_order(o) { one }
   when action p = Commerce::confirm_payment(o) { one }

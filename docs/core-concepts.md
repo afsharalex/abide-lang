@@ -115,7 +115,7 @@ Check properties across time.
 **Verify blocks** use bounded model checking — the solver systematically explores event sequences up to a given depth:
 
 ```abide
-verify "account safety" for Banking[0..500] {
+verify account_safety for Banking[0..500] {
   assert always (all a: Account |
     a.status == @Frozen implies a.balance' == a.balance)
 
@@ -129,13 +129,13 @@ verify "account safety" for Banking[0..500] {
 **Scene blocks** are existential witnesses — they show that a specific behavior is possible:
 
 ```abide
-scene "successful deposit" for Banking {
+scene successful_deposit for Banking {
   given let a = one Account where a.status == @Active and a.balance == 1000
   when action dep = Banking::deposit(a, 500) { one }
   then assert a.balance == 1500
 }
 
-scene "cannot withdraw from frozen" for Banking {
+scene cannot_withdraw_from_frozen for Banking {
   given let a = one Account where a.status == @Frozen and a.balance == 1000
   when action wd = Banking::withdraw(a, 100) { no }
   then assert a.balance == 1000
@@ -170,7 +170,7 @@ These let you express complex event relationships: "submit must happen before pa
 
 **Bounded vs. unbounded checking:**
 
-`verify` blocks with bounds (`[0..500]`) will use bounded model checking — the solver explores finite depth. For many common safety properties, the solver will also attempt to **discharge them as unbounded proofs automatically** when the property is inductive or the state space is finite. When automatic unbounded checking fails, `proof` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends. *(Solver backend in development.)*
+`verify` blocks with bounds (`[0..500]`) will use bounded model checking — the solver explores finite depth. For many common safety properties, the solver will also attempt to **discharge them as unbounded proofs automatically** when the property is inductive or the state space is finite. When automatic unbounded checking fails, `theorem` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends. *(Solver backend in development.)*
 
 **Interactive exploration** *(planned)* — the [REPL](repl.md) and [QA language](qa-language.md) let you explore specifications interactively:
 
@@ -241,7 +241,7 @@ At this layer, you're answering: *"Is this specific algorithm correct?"*
 
 Prove properties beyond what automated checking can handle.
 
-> This layer is designed but not yet fully implemented. The proof/lemma syntax exists; backend integration is under evaluation.
+> This layer is designed but not yet fully implemented. The theorem/lemma syntax exists; backend integration is under evaluation.
 
 The solver will attempt to discharge unbounded properties automatically where possible — many safety properties over finite state spaces or with inductive structure can be proved without human intervention. When the solver can't find a proof automatically, Abide provides an escape hatch to dependent type theory backends (**Agda**, **Lean 4**, or **Rocq** — under evaluation) where you write the proof yourself.
 
@@ -255,10 +255,10 @@ lemma frozen_blocks_transactions {
 }
 ```
 
-**Proof blocks** declare unbounded invariants with proof steps:
+**Theorem blocks** declare unbounded invariants with proof steps:
 
 ```abide
-proof "frozen account safety" for Compliance, Banking
+theorem frozen_account_safety for Compliance, Banking
   invariant frozen_accounts_stable {
   show always (all a: Account |
     a.status == @Frozen implies a.balance' == a.balance)

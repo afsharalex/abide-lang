@@ -91,7 +91,7 @@ fn elaborate_commerce() {
         "should have Commerce and Billing"
     );
     assert!(!result.scenes.is_empty(), "should have scenes");
-    assert!(!result.proofs.is_empty(), "should have proofs");
+    assert!(!result.theorems.is_empty(), "should have proofs");
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn elaborate_inventory() {
 fn elaborate_workflow() {
     let result = elaborate_file("tests/fixtures/workflow.abide");
     assert!(
-        !result.lemmas.is_empty() || !result.proofs.is_empty(),
+        !result.lemmas.is_empty() || !result.theorems.is_empty(),
         "should have proofs or lemmas"
     );
 }

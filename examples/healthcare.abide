@@ -125,7 +125,7 @@ system ClinicalSystem {
   }
 }
 
-verify "patient safety" for Registration[0..200] {
+verify patient_safety for Registration[0..200] {
   assert always (all p: Patient |
     is_admitted(p) implies p.room_number > 0)
 
@@ -139,7 +139,7 @@ lemma refill_decreases {
       rx.refills_remaining' == rx.refills_remaining - 1
 }
 
-proof "patient lifecycle safety" for Registration
+theorem patient_lifecycle_safety for Registration
   invariant (all p: Patient |
     p.room_number > 0 implies is_admitted(p)) {
   show always (all p: Patient |

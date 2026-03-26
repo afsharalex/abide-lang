@@ -7,9 +7,9 @@ use crate::ast;
 
 use super::env::{DeclInfo, DeclKind, Env};
 use super::types::{
-    BinOp, BuiltinTy, EAction, EConst, EEntity, EEvent, EEventAction, EExpr, EField, EFn, ELemma,
-    ENextItem, EPattern, EPred, EProof, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, EVerify,
-    Literal, Quantifier, Ty, UnOp,
+    BinOp, BuiltinTy, EAction, EAxiom, EConst, EEntity, EEvent, EEventAction, EExpr, EField, EFn,
+    ELemma, ENextItem, EPattern, EPred, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, ETheorem,
+    EVerify, Literal, Quantifier, Ty, UnOp,
 };
 
 /// Collect all declarations from a parsed program into an `Env`.
@@ -34,7 +34,8 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
         ast::TopDecl::Prop(d) => collect_prop(env, d),
         ast::TopDecl::Verify(d) => collect_verify(env, d),
         ast::TopDecl::Scene(d) => collect_scene(env, d),
-        ast::TopDecl::Proof(d) => collect_proof(env, d),
+        ast::TopDecl::Theorem(d) => collect_theorem(env, d),
+        ast::TopDecl::Axiom(d) => collect_axiom(env, d),
         ast::TopDecl::Lemma(d) => collect_lemma(env, d),
     }
 }
@@ -412,7 +413,7 @@ fn collect_prop(env: &mut Env, pd: &ast::PropDecl) {
 }
 
 fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
-    let label = &vd.label;
+    let name = &vd.name;
     let targets: Vec<(String, i64, i64)> = vd
         .targets
         .iter()
@@ -420,11 +421,11 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
         .collect();
     let asserts: Vec<EExpr> = vd.asserts.iter().map(collect_expr).collect();
     let ev = EVerify {
-        label: label.clone(),
+        name: name.clone(),
         targets,
         asserts,
     };
-    let key = format!("verify:{label}");
+    let key = format!("verify:{name}");
     let info = DeclInfo {
         kind: DeclKind::Verify,
         name: key.clone(),
@@ -435,7 +436,7 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
 }
 
 fn collect_scene(env: &mut Env, sd: &ast::SceneDecl) {
-    let label = &sd.label;
+    let name = &sd.name;
     let targets = sd.systems.clone();
     let mut givens = Vec::new();
     let mut whens = Vec::new();
@@ -492,13 +493,13 @@ fn collect_scene(env: &mut Env, sd: &ast::SceneDecl) {
     }
 
     let es = EScene {
-        label: label.clone(),
+        name: name.clone(),
         targets,
         givens,
         whens,
         thens,
     };
-    let key = format!("scene:{label}");
+    let key = format!("scene:{name}");
     let info = DeclInfo {
         kind: DeclKind::Scene,
         name: key.clone(),
@@ -571,21 +572,36 @@ fn qual_type_name(qt: &ast::QualType) -> String {
     }
 }
 
-fn collect_proof(env: &mut Env, pd: &ast::ProofDecl) {
-    let label = &pd.label;
-    let ep = EProof {
-        label: label.clone(),
-        targets: pd.systems.clone(),
-        invariants: pd.invariants.iter().map(collect_expr).collect(),
-        shows: pd.shows.iter().map(collect_expr).collect(),
+fn collect_theorem(env: &mut Env, td: &ast::TheoremDecl) {
+    let name = &td.name;
+    let et = ETheorem {
+        name: name.clone(),
+        targets: td.systems.clone(),
+        invariants: td.invariants.iter().map(collect_expr).collect(),
+        shows: td.shows.iter().map(collect_expr).collect(),
     };
     let info = DeclInfo {
-        kind: DeclKind::Proof,
-        name: label.clone(),
+        kind: DeclKind::Theorem,
+        name: name.clone(),
         ty: None,
     };
-    env.add_decl(label, info);
-    env.proofs.push(ep);
+    env.add_decl(name, info);
+    env.theorems.push(et);
+}
+
+fn collect_axiom(env: &mut Env, ad: &ast::AxiomDecl) {
+    let name = &ad.name;
+    let ea = EAxiom {
+        name: name.clone(),
+        body: collect_expr(&ad.body),
+    };
+    let info = DeclInfo {
+        kind: DeclKind::Axiom,
+        name: name.clone(),
+        ty: None,
+    };
+    env.add_decl(name, info);
+    env.axioms.push(ea);
 }
 
 fn collect_lemma(env: &mut Env, ld: &ast::LemmaDecl) {

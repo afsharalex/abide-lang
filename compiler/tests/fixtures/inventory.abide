@@ -205,18 +205,18 @@ prop fulfillment_progress for Shipping =
     f.status == @Pending implies eventually f.status == @Shipped
 
 // Bounded checks
-verify "inventory safety" for Warehouse[0..20] {
+verify inventory_safety for Warehouse[0..20] {
   assert inventory_safe
 }
 
-verify "end to end" for Warehouse[0..20], Shipping[0..20] {
+verify end_to_end for Warehouse[0..20], Shipping[0..20] {
   assert always all p: Product | p.quantity >= 0
   assert always all f: Fulfillment |
     f.status == @Delivered implies always f.status == @Delivered
 }
 
 // Scenarios
-scene "reserve and fulfill" for Warehouse, Shipping {
+scene reserve_and_fulfill for Warehouse, Shipping {
   given {
     let p = one Product where p.quantity == 50 and p.status == @Available
   }
@@ -231,7 +231,7 @@ scene "reserve and fulfill" for Warehouse, Shipping {
   }
 }
 
-scene "reservation release restores quantity" for Warehouse {
+scene reservation_release_restores_quantity for Warehouse {
   given {
     let p = one Product where p.quantity == 100
   }

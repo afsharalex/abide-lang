@@ -197,25 +197,25 @@ prop eventual_resolution for DocumentMgmt =
     d.status == @Submitted implies eventually (is_terminal(d) or d.status == @Draft)
 
 // Bounded checks
-verify "workflow safety" for DocumentMgmt[0..10] {
+verify workflow_safety for DocumentMgmt[0..10] {
   assert terminal_is_final
   assert revisions_non_negative
   assert review_exclusivity
 }
 
-verify "workflow liveness" for DocumentMgmt[0..5] {
+verify workflow_liveness for DocumentMgmt[0..5] {
   assert eventual_resolution
 }
 
 // Proofs
-proof "revision count monotonic" for DocumentMgmt
+theorem revision_count_monotonic for DocumentMgmt
   invariant all d: Document | d.revision_count >= 0 {
   show always all d: Document |
     d.revision_count >= 0
 }
 
 // Scenarios
-scene "happy path: submit to publish" for DocumentMgmt {
+scene happy_path_submit_to_publish for DocumentMgmt {
   given {
     let d = one Document where d.status == @Draft and d.revision_count == 0
   }
@@ -232,7 +232,7 @@ scene "happy path: submit to publish" for DocumentMgmt {
   }
 }
 
-scene "revision cycle" for DocumentMgmt {
+scene revision_cycle for DocumentMgmt {
   given {
     let d = one Document where d.status == @Draft and d.revision_count == 0
   }
@@ -251,7 +251,7 @@ scene "revision cycle" for DocumentMgmt {
   }
 }
 
-scene "rejection and reopen" for DocumentMgmt {
+scene rejection_and_reopen for DocumentMgmt {
   given {
     let d = one Document where d.status == @Draft
   }

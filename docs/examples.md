@@ -70,13 +70,13 @@ entity Account {
 pred is_active(a: Account) = a.status == @Active
 pred has_funds(a: Account, amount: Real) = a.balance >= amount
 
-verify "account safety" for Banking[0..500] {
+verify account_safety for Banking[0..500] {
   assert always (all a: Account | a.balance >= 0)
   assert always (all a: Account |
     a.status == @Frozen implies a.balance' == a.balance)
 }
 
-scene "successful deposit" for Banking {
+scene successful_deposit for Banking {
   given let a = one Account where a.status == @Active and a.balance == 1000
   when action dep = Banking::deposit(a, 500) { one }
   then assert a.balance == 1500
@@ -135,7 +135,7 @@ entity Document {
 prop reviewer_not_author = all d: Document |
   d.status == @UnderReview implies d.reviewer_id != d.author_id
 
-verify "review integrity" for Publishing[0..200] {
+verify review_integrity for Publishing[0..200] {
   assert always (all d: Document |
     d.status == @UnderReview implies d.reviewer_id != d.author_id)
   assert all d: Document |
@@ -211,7 +211,7 @@ system Billing {
   }
 }
 
-verify "cross-system payment" for Commerce[0..100], Billing[0..100] {
+verify cross_system_payment for Commerce[0..100], Billing[0..100] {
   assert all o: Order |
     o.status == @Paid implies o.total > 0
 }

@@ -6,10 +6,11 @@
 use crate::elab::types as E;
 
 use super::types::{
-    Cardinality, IRAction, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField, IRFieldPat,
-    IRFunction, IRMatchArm, IRPattern, IRProgram, IRProof, IRRecordField, IRScene, IRSceneEvent,
-    IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTransParam, IRTransRef, IRTransition,
-    IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding, LitVal,
+    Cardinality, IRAction, IRAxiom, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField,
+    IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene,
+    IRSceneEvent, IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam,
+    IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding,
+    LitVal,
 };
 
 // ── Top-level lowering ───────────────────────────────────────────────
@@ -22,7 +23,8 @@ pub fn lower(er: &E::ElabResult) -> IRProgram {
         entities: er.entities.iter().map(lower_entity).collect(),
         systems: er.systems.iter().map(lower_system).collect(),
         verifies: er.verifies.iter().map(lower_verify).collect(),
-        proofs: er.proofs.iter().map(lower_proof).collect(),
+        theorems: er.theorems.iter().map(lower_theorem).collect(),
+        axioms: er.axioms.iter().map(lower_axiom).collect(),
         scenes: er.scenes.iter().map(lower_scene).collect(),
     }
 }
@@ -303,7 +305,7 @@ fn lower_schedule(items: &[E::ENextItem]) -> IRSchedule {
 
 fn lower_verify(ev: &E::EVerify) -> IRVerify {
     IRVerify {
-        label: ev.label.clone(),
+        name: ev.name.clone(),
         systems: ev
             .targets
             .iter()
@@ -317,12 +319,19 @@ fn lower_verify(ev: &E::EVerify) -> IRVerify {
     }
 }
 
-fn lower_proof(ep: &E::EProof) -> IRProof {
-    IRProof {
-        label: ep.label.clone(),
-        systems: ep.targets.clone(),
-        invariants: ep.invariants.iter().map(lower_expr).collect(),
-        shows: ep.shows.iter().map(lower_expr).collect(),
+fn lower_theorem(et: &E::ETheorem) -> IRTheorem {
+    IRTheorem {
+        name: et.name.clone(),
+        systems: et.targets.clone(),
+        invariants: et.invariants.iter().map(lower_expr).collect(),
+        shows: et.shows.iter().map(lower_expr).collect(),
+    }
+}
+
+fn lower_axiom(ea: &E::EAxiom) -> IRAxiom {
+    IRAxiom {
+        name: ea.name.clone(),
+        body: lower_expr(&ea.body),
     }
 }
 
@@ -333,7 +342,7 @@ fn lower_scene(es: &E::EScene) -> IRScene {
         .partition(|w| !matches!(w, E::ESceneWhen::Assume(_)));
 
     IRScene {
-        label: es.label.clone(),
+        name: es.name.clone(),
         systems: es.targets.clone(),
         givens: es.givens.iter().map(lower_given).collect(),
         events: actions.iter().map(|w| lower_scene_action(w)).collect(),

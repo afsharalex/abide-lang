@@ -186,7 +186,7 @@ pub struct EProp {
 /// Elaborated verify block.
 #[derive(Debug, Clone)]
 pub struct EVerify {
-    pub label: String,
+    pub name: String,
     pub targets: Vec<(String, i64, i64)>,
     pub asserts: Vec<EExpr>,
 }
@@ -194,7 +194,7 @@ pub struct EVerify {
 /// Elaborated scene.
 #[derive(Debug, Clone)]
 pub struct EScene {
-    pub label: String,
+    pub name: String,
     pub targets: Vec<String>,
     pub givens: Vec<ESceneGiven>,
     pub whens: Vec<ESceneWhen>,
@@ -220,13 +220,20 @@ pub enum ESceneWhen {
     Assume(EExpr),
 }
 
-/// Elaborated proof block.
+/// Elaborated theorem block.
 #[derive(Debug, Clone)]
-pub struct EProof {
-    pub label: String,
+pub struct ETheorem {
+    pub name: String,
     pub targets: Vec<String>,
     pub invariants: Vec<EExpr>,
     pub shows: Vec<EExpr>,
+}
+
+/// Elaborated axiom declaration.
+#[derive(Debug, Clone)]
+pub struct EAxiom {
+    pub name: String,
+    pub body: EExpr,
 }
 
 /// Elaborated lemma block.
@@ -386,7 +393,8 @@ pub struct ElabResult {
     pub props: Vec<EProp>,
     pub verifies: Vec<EVerify>,
     pub scenes: Vec<EScene>,
-    pub proofs: Vec<EProof>,
+    pub theorems: Vec<ETheorem>,
+    pub axioms: Vec<EAxiom>,
     pub lemmas: Vec<ELemma>,
     pub consts: Vec<EConst>,
     pub fns: Vec<EFn>,

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    EConst, EEntity, EFn, ELemma, EPred, EProof, EProp, EScene, ESystem, EVerify, Ty,
+    EAxiom, EConst, EEntity, EFn, ELemma, EPred, EProp, EScene, ESystem, ETheorem, EVerify, Ty,
 };
 
 /// What kind of top-level declaration.
@@ -17,7 +17,8 @@ pub enum DeclKind {
     Prop,
     Verify,
     Scene,
-    Proof,
+    Theorem,
+    Axiom,
     Lemma,
     Const,
     Fn,
@@ -42,7 +43,8 @@ pub struct Env {
     pub props: HashMap<String, EProp>,
     pub verifies: Vec<EVerify>,
     pub scenes: Vec<EScene>,
-    pub proofs: Vec<EProof>,
+    pub theorems: Vec<ETheorem>,
+    pub axioms: Vec<EAxiom>,
     pub lemmas: Vec<ELemma>,
     pub consts: Vec<EConst>,
     pub fns: Vec<EFn>,
@@ -66,7 +68,8 @@ impl Env {
             props: HashMap::new(),
             verifies: Vec::new(),
             scenes: Vec::new(),
-            proofs: Vec::new(),
+            theorems: Vec::new(),
+            axioms: Vec::new(),
             lemmas: Vec::new(),
             consts: Vec::new(),
             fns: Vec::new(),

@@ -38,7 +38,7 @@ pub fn resolve(env: &mut Env) {
     resolve_props(env, &ctx);
     resolve_verifies(env, &ctx);
     resolve_scenes(env, &ctx);
-    resolve_proofs(env, &ctx);
+    resolve_theorems(env, &ctx);
     resolve_lemmas(env, &ctx);
 }
 
@@ -237,14 +237,14 @@ fn resolve_scenes(env: &mut Env, ctx: &Ctx) {
     }
 }
 
-fn resolve_proofs(env: &mut Env, ctx: &Ctx) {
-    for proof in &mut env.proofs {
-        proof.invariants = proof
+fn resolve_theorems(env: &mut Env, ctx: &Ctx) {
+    for theorem in &mut env.theorems {
+        theorem.invariants = theorem
             .invariants
             .iter()
             .map(|e| resolve_expr(ctx, e))
             .collect();
-        proof.shows = proof.shows.iter().map(|e| resolve_expr(ctx, e)).collect();
+        theorem.shows = theorem.shows.iter().map(|e| resolve_expr(ctx, e)).collect();
     }
 }
 

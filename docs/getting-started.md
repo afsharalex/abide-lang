@@ -77,12 +77,12 @@ The `@` prefix marks state atoms (`@Pending`, `@Paid`). The prime notation (`'`)
 Append this to your file:
 
 ```abide
-verify "order lifecycle" for Commerce[0..50] {
+verify order_lifecycle for Commerce[0..50] {
   assert always (all o: Order |
     o.status == @Shipped implies o.total > 0)
 }
 
-scene "successful payment" for Commerce {
+scene successful_payment for Commerce {
   given let o = one Order where o.status == @Pending and o.total == 100
   when action p = Commerce::place_order(o) { one }
   then assert o.status == @Paid

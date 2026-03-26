@@ -187,7 +187,7 @@ Named compile-time values. Used in guards, assertions, and expressions.
 ### Verify Blocks
 
 ```abide
-verify "no overdraft" for Banking[0..500] {
+verify no_overdraft for Banking[0..500] {
   assert always (all a: Account | a.balance >= 0)
   assert always (all a: Account |
     a.status == @Closed implies a.balance == 0)
@@ -203,7 +203,7 @@ Bounded model checking. The solver explores up to 500 steps of the Banking syste
 ### Scenes
 
 ```abide
-scene "successful deposit" for Banking {
+scene successful_deposit for Banking {
   given let a = one Account where a.status == @Active and a.balance == 1000
   when action dep = Banking::deposit(a, 500) { one }
   then assert a.balance == 1500
@@ -216,7 +216,7 @@ Existential witnesses. Given initial conditions, when specific events fire, then
 
 ---
 
-### Proofs and Lemmas
+### Theorems, Lemmas, and Axioms
 
 ```abide
 lemma frozen_blocks_transactions {
@@ -225,14 +225,19 @@ lemma frozen_blocks_transactions {
       t.status != @Executed
 }
 
-proof "frozen account safety" for Compliance, Banking
+theorem frozen_account_safety for Compliance, Banking
   invariant frozen_accounts_stable {
   show always (all a: Account |
     a.status == @Frozen implies a.balance' == a.balance)
 }
+
+axiom transfer_preserves_total {
+  all a: Account | all b: Account |
+    a.balance + b.balance == a.balance' + b.balance'
+}
 ```
 
-`lemma` = reusable proof building block. `proof` = unbounded verification with invariants and `show` steps. Proof backends are under evaluation.
+`lemma` = reusable proof building block. `theorem` = unbounded verification with invariants and `show` steps. `axiom` = assumed truth without proof (trusted assertion). Proof backends are under evaluation.
 
 `Evolving`
 

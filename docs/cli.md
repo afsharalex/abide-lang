@@ -118,14 +118,14 @@ $ abide verify spec.abide --bounded-only
 Expected output:
 
 ```
-Checking "no overdraft" for Banking[0..500]...
+Checking no_overdraft for Banking[0..500]...
   PROVED (inductive invariant, 0.3s)
 
-Checking "eventual delivery" for Commerce[0..100]...
+Checking eventual_delivery for Commerce[0..100]...
   CHECKED to depth 100 (no counterexample found, 1.2s)
   Note: could not prove unboundedly — checked to specified bound only
 
-Checking "invalid transition" for Commerce[0..50]...
+Checking invalid_transition for Commerce[0..50]...
   COUNTEREXAMPLE (3 steps):
     t=0: Commerce::submit_order(order1) → Order.status: @Pending → @AwaitingPayment
     t=1: Commerce::ship_order(order1)   → BLOCKED (requires status == @Paid)
@@ -185,7 +185,7 @@ Executes scriptable structural checks (`ask`, `explain`, `assert` commands) agai
 |-----------|---------|------------------|
 | `.abide` | Definitions (types, entities, systems, functions) | `check` |
 | `.spec.abide` | Verification (verify, scene blocks) | `verify` |
-| `.proof.abide` | Proofs (proof, lemma blocks) | `proof` |
+| `.proof.abide` | Proofs (theorem, lemma blocks) | `proof` |
 | `.qa` | QA scripts | `qa` |
 
 These extensions are conventions, not enforced — the CLI subcommand determines execution mode, not the file extension.

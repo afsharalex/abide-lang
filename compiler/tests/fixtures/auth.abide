@@ -134,14 +134,14 @@ prop deleted_is_final for Auth =
   always all u: User | u.status == @Deleted implies always u.status == @Deleted
 
 // Bounded checks
-verify "auth safety" for Auth[0..10] {
+verify auth_safety for Auth[0..10] {
   assert no_locked_sessions
   assert deleted_is_final
   assert always all u: User | u.failed_attempts >= 0
 }
 
 // Unbounded proof
-proof "lockout correctness" for Auth
+theorem lockout_correctness for Auth
   invariant all u: User | u.failed_attempts >= 0
   invariant all u: User | u.status == @Locked implies u.failed_attempts >= 5 {
   show always all u: User |
@@ -150,7 +150,7 @@ proof "lockout correctness" for Auth
 }
 
 // Scenario
-scene "lockout after 5 failures" for Auth {
+scene lockout_after_5_failures for Auth {
   given {
     let u = one User where u.status == @Active and u.failed_attempts == 0
   }

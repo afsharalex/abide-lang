@@ -1,11 +1,11 @@
 use crate::ast::{
-    ActionInvoc, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock, CreateField,
+    ActionInvoc, AxiomDecl, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock, CreateField,
     EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind, FieldDecl,
     FieldPat, FnDecl, ForBlock, GivenItem, ImportDecl, InvocArg, LemmaDecl, LetBind, MatchArm,
-    NextBlock, NextItem, Param, Pattern, PredDecl, Program, ProofDecl, PropDecl, QualType,
-    RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem, TopDecl,
-    TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem, VerifyDecl,
-    VerifyTarget, WhenItem,
+    NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl, QualType,
+    RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem, TheoremDecl,
+    TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem,
+    VerifyDecl, VerifyTarget, WhenItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -205,9 +205,10 @@ impl Parser {
             Some(Token::Pred) => Ok(TopDecl::Pred(self.pred_decl()?)),
             Some(Token::Prop) => Ok(TopDecl::Prop(self.prop_decl()?)),
             Some(Token::Verify) => Ok(TopDecl::Verify(self.verify_decl()?)),
-            Some(Token::Proof) => Ok(TopDecl::Proof(self.proof_decl()?)),
+            Some(Token::Theorem) => Ok(TopDecl::Theorem(self.theorem_decl()?)),
             Some(Token::Lemma) => Ok(TopDecl::Lemma(self.lemma_decl()?)),
             Some(Token::Scene) => Ok(TopDecl::Scene(self.scene_decl()?)),
+            Some(Token::Axiom) => Ok(TopDecl::Axiom(self.axiom_decl()?)),
             Some(tok) => Err(ParseError::expected(
                 "top-level declaration",
                 &format!("`{tok}`"),
@@ -809,7 +810,7 @@ impl Parser {
 
     fn verify_decl(&mut self) -> Result<VerifyDecl, ParseError> {
         let start = self.expect(&Token::Verify)?;
-        let (label, _) = self.expect_string()?;
+        let (name, _) = self.expect_name()?;
         self.expect(&Token::For)?;
 
         let mut targets = vec![self.verify_target()?];
@@ -825,7 +826,7 @@ impl Parser {
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(VerifyDecl {
-            label,
+            name,
             targets,
             asserts,
             span: start.merge(end),
@@ -847,9 +848,31 @@ impl Parser {
         })
     }
 
-    fn proof_decl(&mut self) -> Result<ProofDecl, ParseError> {
-        let start = self.expect(&Token::Proof)?;
-        let (label, _) = self.expect_string()?;
+    fn theorem_decl(&mut self) -> Result<TheoremDecl, ParseError> {
+        let start = self.expect(&Token::Theorem)?;
+        let (name, _) = self.expect_name()?;
+
+        // Check for expression form: theorem name = expr [by "file"]
+        if self.eat(&Token::Eq).is_some() {
+            let body_expr = self.expr()?;
+            let by_file = if self.eat(&Token::By).is_some() {
+                let (file, _) = self.expect_string()?;
+                Some(file)
+            } else {
+                None
+            };
+            let end = body_expr.span;
+            return Ok(TheoremDecl {
+                name,
+                systems: vec![],
+                invariants: vec![],
+                shows: vec![body_expr],
+                by_file,
+                span: start.merge(end),
+            });
+        }
+
+        // Block form: theorem name for System, System2 [invariant ...] { show ... }
         self.expect(&Token::For)?;
 
         let mut systems = vec![];
@@ -873,11 +896,32 @@ impl Parser {
             shows.push(self.expr()?);
         }
         let end = self.expect(&Token::RBrace)?;
-        Ok(ProofDecl {
-            label,
+        Ok(TheoremDecl {
+            name,
             systems,
             invariants,
             shows,
+            by_file: None,
+            span: start.merge(end),
+        })
+    }
+
+    fn axiom_decl(&mut self) -> Result<AxiomDecl, ParseError> {
+        let start = self.expect(&Token::Axiom)?;
+        let (name, _) = self.expect_name()?;
+        self.expect(&Token::Eq)?;
+        let body = self.expr()?;
+        let by_file = if self.eat(&Token::By).is_some() {
+            let (file, _) = self.expect_string()?;
+            Some(file)
+        } else {
+            None
+        };
+        let end = body.span;
+        Ok(AxiomDecl {
+            name,
+            body,
+            by_file,
             span: start.merge(end),
         })
     }
@@ -902,7 +946,7 @@ impl Parser {
 
     fn scene_decl(&mut self) -> Result<SceneDecl, ParseError> {
         let start = self.expect(&Token::Scene)?;
-        let (label, _) = self.expect_string()?;
+        let (name, _) = self.expect_name()?;
         self.expect(&Token::For)?;
 
         let mut systems = vec![];
@@ -920,7 +964,7 @@ impl Parser {
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(SceneDecl {
-            label,
+            name,
             systems,
             items,
             span: start.merge(end),
@@ -2276,12 +2320,12 @@ mod tests {
 
     #[test]
     fn verify_decl() {
-        let src = r#"verify "test" for Commerce[0..500] {
+        let src = r#"verify safety_check for Commerce[0..500] {
   assert always true
 }"#;
         let prog = parse_program(src);
         if let TopDecl::Verify(v) = &prog.decls[0] {
-            assert_eq!(v.label, "test");
+            assert_eq!(v.name, "safety_check");
             assert_eq!(v.targets.len(), 1);
             assert_eq!(v.targets[0].min, 0);
             assert_eq!(v.targets[0].max, 500);
@@ -2292,18 +2336,68 @@ mod tests {
     }
 
     #[test]
-    fn proof_decl() {
-        let src = r#"proof "test" for Commerce
+    fn theorem_decl() {
+        let src = r#"theorem order_safety for Commerce
   invariant all o: Order | o.total >= 0 {
   show always true
 }"#;
         let prog = parse_program(src);
-        if let TopDecl::Proof(p) = &prog.decls[0] {
-            assert_eq!(p.label, "test");
-            assert_eq!(p.invariants.len(), 1);
-            assert_eq!(p.shows.len(), 1);
+        if let TopDecl::Theorem(t) = &prog.decls[0] {
+            assert_eq!(t.name, "order_safety");
+            assert_eq!(t.invariants.len(), 1);
+            assert_eq!(t.shows.len(), 1);
+            assert!(t.by_file.is_none());
         } else {
-            panic!("expected Proof");
+            panic!("expected Theorem");
+        }
+    }
+
+    #[test]
+    fn theorem_expr_form() {
+        let src = r#"theorem no_overdraft = always true"#;
+        let prog = parse_program(src);
+        if let TopDecl::Theorem(t) = &prog.decls[0] {
+            assert_eq!(t.name, "no_overdraft");
+            assert_eq!(t.shows.len(), 1);
+            assert!(t.by_file.is_none());
+        } else {
+            panic!("expected Theorem");
+        }
+    }
+
+    #[test]
+    fn theorem_with_by() {
+        let src = r#"theorem crypto_safe = always true by "proofs/crypto.agda""#;
+        let prog = parse_program(src);
+        if let TopDecl::Theorem(t) = &prog.decls[0] {
+            assert_eq!(t.name, "crypto_safe");
+            assert_eq!(t.by_file, Some("proofs/crypto.agda".to_string()));
+        } else {
+            panic!("expected Theorem");
+        }
+    }
+
+    #[test]
+    fn axiom_decl() {
+        let src = r#"axiom max_accounts = true"#;
+        let prog = parse_program(src);
+        if let TopDecl::Axiom(a) = &prog.decls[0] {
+            assert_eq!(a.name, "max_accounts");
+            assert!(a.by_file.is_none());
+        } else {
+            panic!("expected Axiom");
+        }
+    }
+
+    #[test]
+    fn axiom_with_by() {
+        let src = r#"axiom crypto = true by "proofs/crypto.agda""#;
+        let prog = parse_program(src);
+        if let TopDecl::Axiom(a) = &prog.decls[0] {
+            assert_eq!(a.name, "crypto");
+            assert_eq!(a.by_file, Some("proofs/crypto.agda".to_string()));
+        } else {
+            panic!("expected Axiom");
         }
     }
 
@@ -2323,7 +2417,7 @@ mod tests {
 
     #[test]
     fn scene_with_blocks() {
-        let src = r#"scene "test" for Commerce {
+        let src = r#"scene payment_test for Commerce {
   given {
     let o = one Order where o.total == 100
   }
@@ -2337,7 +2431,7 @@ mod tests {
 }"#;
         let prog = parse_program(src);
         if let TopDecl::Scene(s) = &prog.decls[0] {
-            assert_eq!(s.label, "test");
+            assert_eq!(s.name, "payment_test");
             assert_eq!(s.items.len(), 3);
         } else {
             panic!("expected Scene");

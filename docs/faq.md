@@ -55,7 +55,7 @@ entity Account {
 
 - **Bounded model checking:** Z3 (SMT solver). `verify` blocks will be compiled to Z3 constraints. The solver explores finite-depth event interleavings. In progress.
 - **Automated unbounded checking:** For properties that are inductive or over finite state spaces, the solver will attempt to discharge them automatically without bounds. This covers many common safety properties without requiring manual proofs.
-- **Manual unbounded proofs:** For properties the solver can't discharge automatically, `proof` and `lemma` blocks export obligations to an external dependent type theory backend (Agda, Lean 4, or Rocq — under evaluation). You write the proof in the external language; Abide trusts the certificate.
+- **Manual unbounded proofs:** For properties the solver can't discharge automatically, `theorem` and `lemma` blocks export obligations to an external dependent type theory backend (Agda, Lean 4, or Rocq — under evaluation). You write the proof in the external language; Abide trusts the certificate.
 
 ### Is the language stable?
 
@@ -63,7 +63,7 @@ No. Abide is in active design. Syntax and semantics may change. We'll add versio
 
 The constructs most likely to remain stable: types, entities, actions, primed notation, `requires`/`ensures`, systems, events, `verify`/`scene` block structure, temporal operators, quantifiers.
 
-The constructs most likely to evolve: proof block internals, module system, trait system, algorithm verification syntax.
+The constructs most likely to evolve: theorem block internals, module system, trait system, algorithm verification syntax.
 
 ### What does `sorry` do?
 
@@ -79,7 +79,7 @@ fn validate(a: Address): Bool = todo       // not yet written, compiler warns
 Use `always` with `no` or negation in a `verify` block:
 
 ```abide
-verify "safety" for Banking[0..500] {
+verify safety for Banking[0..500] {
   // No account is ever both frozen and closed
   assert always (no a: Account |
     a.status == @Frozen and a.status == @Closed)
@@ -96,14 +96,14 @@ Use `eventually` in a `verify` block or construct a `scene`:
 
 ```abide
 // Property: every pending order eventually gets paid or cancelled
-verify "liveness" for Commerce[0..100] {
+verify liveness for Commerce[0..100] {
   assert all o: Order |
     o.status == @Pending implies
       eventually (o.status == @Paid or o.status == @Cancelled)
 }
 
 // Witness: show a specific path to payment
-scene "order gets paid" for Commerce {
+scene order_gets_paid for Commerce {
   given let o = one Order where o.status == @Pending and o.total == 50
   when action p = Commerce::place_order(o) { one }
   then assert o.status == @Paid
