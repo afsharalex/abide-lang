@@ -1,10 +1,11 @@
 use crate::ast::{
     ActionInvoc, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock, CreateField,
-    EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind, FieldDecl, FnDecl,
-    ForBlock, GivenItem, ImportDecl, InvocArg, LemmaDecl, LetBind, NextBlock, NextItem, Param,
-    PredDecl, Program, ProofDecl, PropDecl, QualType, RecField, RecordDecl, SceneDecl, SceneItem,
-    SystemDecl, SystemItem, ThenItem, TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant,
-    TypedParam, UseDecl, UseItem, VerifyDecl, VerifyTarget, WhenItem,
+    EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind, FieldDecl,
+    FieldPat, FnDecl, ForBlock, GivenItem, ImportDecl, InvocArg, LemmaDecl, LetBind, MatchArm,
+    NextBlock, NextItem, Param, Pattern, PredDecl, Program, ProofDecl, PropDecl, QualType,
+    RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem, TopDecl,
+    TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem, VerifyDecl,
+    VerifyTarget, WhenItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -1363,6 +1364,8 @@ impl Parser {
             Some(Token::Let) if min_bp <= 7 => self.parse_let_expr(),
             // Level 3: lambda
             Some(Token::Fn) if min_bp <= 7 => self.parse_lambda(),
+            // Level 3: match
+            Some(Token::Match) if min_bp <= 7 => self.parse_match_expr(),
             // Atoms
             _ => self.expr_atom(),
         }
@@ -1445,6 +1448,105 @@ impl Parser {
                 kind: ExprKind::Lambda(params, Box::new(body)),
                 span,
             }),
+        }
+    }
+
+    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&Token::Match)?;
+        let scrutinee = self.expr()?;
+        self.expect(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            arms.push(self.match_arm()?);
+        }
+        let end = self.expect(&Token::RBrace)?;
+        Ok(Expr {
+            kind: ExprKind::Match(Box::new(scrutinee), arms),
+            span: start.merge(end),
+        })
+    }
+
+    fn match_arm(&mut self) -> Result<MatchArm, ParseError> {
+        let pattern = self.pattern()?;
+        let guard = if self.eat(&Token::If).is_some() {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect(&Token::FatArrow)?;
+        let body = self.expr_bp(7)?; // body is Expr3
+        let span = pattern.span().merge(body.span);
+        Ok(MatchArm {
+            pattern,
+            guard,
+            body,
+            span,
+        })
+    }
+
+    fn pattern(&mut self) -> Result<Pattern, ParseError> {
+        let left = self.pattern_atom()?;
+        if self.eat(&Token::Pipe).is_some() {
+            let right = self.pattern()?; // right-associative
+            let span = left.span().merge(right.span());
+            Ok(Pattern::Or(Box::new(left), Box::new(right), span))
+        } else {
+            Ok(left)
+        }
+    }
+
+    fn pattern_atom(&mut self) -> Result<Pattern, ParseError> {
+        match self.peek() {
+            Some(Token::Underscore) => {
+                let (_, span) = self.advance();
+                Ok(Pattern::Wild(span))
+            }
+            Some(Token::Name(_)) => {
+                let (name, span) = self.expect_name()?;
+                if self.peek() == Some(&Token::LBrace) {
+                    // Record pattern: Name { field: pat, ... }
+                    self.expect(&Token::LBrace)?;
+                    let mut fields = Vec::new();
+                    let mut has_rest = false;
+                    while self.peek() != Some(&Token::RBrace) {
+                        if self.eat(&Token::DotDot).is_some() {
+                            has_rest = true;
+                            break;
+                        }
+                        let (fname, fspan) = self.expect_name()?;
+                        self.expect(&Token::Colon)?;
+                        let fpat = self.pattern()?;
+                        let fp_span = fspan.merge(fpat.span());
+                        fields.push(FieldPat {
+                            name: fname,
+                            pattern: fpat,
+                            span: fp_span,
+                        });
+                        if self.peek() != Some(&Token::RBrace)
+                            && self.peek() != Some(&Token::DotDot)
+                        {
+                            self.expect(&Token::Comma)?;
+                        }
+                    }
+                    let end = self.expect(&Token::RBrace)?;
+                    Ok(Pattern::Ctor(name, fields, has_rest, span.merge(end)))
+                } else {
+                    // Simple name — could be constructor or variable (resolved later)
+                    Ok(Pattern::Var(name, span))
+                }
+            }
+            Some(Token::LParen) => {
+                self.advance();
+                let inner = self.pattern()?;
+                self.expect(&Token::RParen)?;
+                Ok(inner)
+            }
+            Some(tok) => Err(ParseError::expected(
+                "pattern",
+                &format!("`{tok}`"),
+                self.cur_span(),
+            )),
+            None => Err(ParseError::eof(self.cur_span())),
         }
     }
 
@@ -2273,6 +2375,98 @@ mod tests {
             }
         } else {
             panic!("expected System");
+        }
+    }
+
+    // ── Match expression tests ──────────────────────────────────────
+
+    #[test]
+    fn match_simple() {
+        let e = parse_expr("match s { Pending => 1 Confirmed => 2 }");
+        if let ExprKind::Match(scrut, arms) = &e.kind {
+            assert!(matches!(scrut.kind, ExprKind::Var(ref s) if s == "s"));
+            assert_eq!(arms.len(), 2);
+            assert!(matches!(arms[0].pattern, Pattern::Var(ref s, _) if s == "Pending"));
+            assert!(matches!(arms[1].pattern, Pattern::Var(ref s, _) if s == "Confirmed"));
+            assert!(arms[0].guard.is_none());
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_wildcard() {
+        let e = parse_expr("match x { _ => 0 }");
+        if let ExprKind::Match(_, arms) = &e.kind {
+            assert_eq!(arms.len(), 1);
+            assert!(matches!(arms[0].pattern, Pattern::Wild(_)));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_record_pattern() {
+        let e = parse_expr("match s { Circle { radius: r } => r }");
+        if let ExprKind::Match(_, arms) = &e.kind {
+            assert_eq!(arms.len(), 1);
+            if let Pattern::Ctor(name, fields, has_rest, _) = &arms[0].pattern {
+                assert_eq!(name, "Circle");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "radius");
+                assert!(!has_rest);
+            } else {
+                panic!("expected Ctor pattern");
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_guard() {
+        let e = parse_expr("match s { Circle { radius: r } if r > 100 => 1 _ => 0 }");
+        if let ExprKind::Match(_, arms) = &e.kind {
+            assert_eq!(arms.len(), 2);
+            assert!(arms[0].guard.is_some());
+            assert!(arms[1].guard.is_none());
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_or_pattern() {
+        let e = parse_expr("match s { Pending | Confirmed => 1 _ => 0 }");
+        if let ExprKind::Match(_, arms) = &e.kind {
+            assert_eq!(arms.len(), 2);
+            assert!(matches!(arms[0].pattern, Pattern::Or(_, _, _)));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_rest_pattern() {
+        let e = parse_expr("match s { Circle { radius: r, .. } => r }");
+        if let ExprKind::Match(_, arms) = &e.kind {
+            if let Pattern::Ctor(_, _, has_rest, _) = &arms[0].pattern {
+                assert!(has_rest);
+            } else {
+                panic!("expected Ctor pattern");
+            }
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn match_field_access_scrutinee() {
+        let e = parse_expr("match o.status { Pending => 1 }");
+        if let ExprKind::Match(scrut, _) = &e.kind {
+            assert!(matches!(scrut.kind, ExprKind::Field(_, ref f) if f == "status"));
+        } else {
+            panic!("expected Match");
         }
     }
 }

@@ -6,10 +6,10 @@
 use crate::elab::types as E;
 
 use super::types::{
-    Cardinality, IRAction, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField, IRFunction,
-    IRProgram, IRProof, IRRecordField, IRScene, IRSceneEvent, IRSceneGiven, IRSchedWhen,
-    IRSchedule, IRSystem, IRTransParam, IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate,
-    IRVerify, IRVerifySystem, LetBinding, LitVal,
+    Cardinality, IRAction, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField, IRFieldPat,
+    IRFunction, IRMatchArm, IRPattern, IRProgram, IRProof, IRRecordField, IRScene, IRSceneEvent,
+    IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTransParam, IRTransRef, IRTransition,
+    IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding, LitVal,
 };
 
 // ── Top-level lowering ───────────────────────────────────────────────
@@ -600,6 +600,38 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
             arg: Box::new(lower_expr(a)),
             ty: lower_ty(ty),
         },
+        E::EExpr::Match(scrutinee, arms) => IRExpr::Match {
+            scrutinee: Box::new(lower_expr(scrutinee)),
+            arms: arms
+                .iter()
+                .map(|(pat, guard, body)| IRMatchArm {
+                    pattern: lower_pattern(pat),
+                    guard: guard.as_ref().map(lower_expr),
+                    body: lower_expr(body),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn lower_pattern(pat: &E::EPattern) -> IRPattern {
+    match pat {
+        E::EPattern::Var(name) => IRPattern::PVar { name: name.clone() },
+        E::EPattern::Ctor(name, fields) => IRPattern::PCtor {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|(fname, fpat)| IRFieldPat {
+                    name: fname.clone(),
+                    pattern: lower_pattern(fpat),
+                })
+                .collect(),
+        },
+        E::EPattern::Wild => IRPattern::PWild,
+        E::EPattern::Or(left, right) => IRPattern::POr {
+            left: Box::new(lower_pattern(left)),
+            right: Box::new(lower_pattern(right)),
+        },
     }
 }
 
@@ -614,24 +646,46 @@ fn lower_lit(lit: &E::Literal) -> LitVal {
 }
 
 /// Operator names match Haskell's `show` output for differential testing.
+#[allow(clippy::enum_variant_names)]
 enum IRBinOp {
-    OpAdd, OpSub, OpMul, OpDiv, OpMod,
-    OpEq, OpNEq, OpLt, OpGt, OpLe, OpGe,
-    OpAnd, OpOr, OpImplies,
-    OpUnord, OpConc, OpXor,
+    OpAdd,
+    OpSub,
+    OpMul,
+    OpDiv,
+    OpMod,
+    OpEq,
+    OpNEq,
+    OpLt,
+    OpGt,
+    OpLe,
+    OpGe,
+    OpAnd,
+    OpOr,
+    OpImplies,
+    OpUnord,
+    OpConc,
+    OpXor,
 }
 
 impl std::fmt::Debug for IRBinOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OpAdd => write!(f, "OpAdd"), Self::OpSub => write!(f, "OpSub"),
-            Self::OpMul => write!(f, "OpMul"), Self::OpDiv => write!(f, "OpDiv"),
-            Self::OpMod => write!(f, "OpMod"), Self::OpEq => write!(f, "OpEq"),
-            Self::OpNEq => write!(f, "OpNEq"), Self::OpLt => write!(f, "OpLt"),
-            Self::OpGt => write!(f, "OpGt"), Self::OpLe => write!(f, "OpLe"),
-            Self::OpGe => write!(f, "OpGe"), Self::OpAnd => write!(f, "OpAnd"),
-            Self::OpOr => write!(f, "OpOr"), Self::OpImplies => write!(f, "OpImplies"),
-            Self::OpUnord => write!(f, "OpUnord"), Self::OpConc => write!(f, "OpConc"),
+            Self::OpAdd => write!(f, "OpAdd"),
+            Self::OpSub => write!(f, "OpSub"),
+            Self::OpMul => write!(f, "OpMul"),
+            Self::OpDiv => write!(f, "OpDiv"),
+            Self::OpMod => write!(f, "OpMod"),
+            Self::OpEq => write!(f, "OpEq"),
+            Self::OpNEq => write!(f, "OpNEq"),
+            Self::OpLt => write!(f, "OpLt"),
+            Self::OpGt => write!(f, "OpGt"),
+            Self::OpLe => write!(f, "OpLe"),
+            Self::OpGe => write!(f, "OpGe"),
+            Self::OpAnd => write!(f, "OpAnd"),
+            Self::OpOr => write!(f, "OpOr"),
+            Self::OpImplies => write!(f, "OpImplies"),
+            Self::OpUnord => write!(f, "OpUnord"),
+            Self::OpConc => write!(f, "OpConc"),
             Self::OpXor => write!(f, "OpXor"),
         }
     }
@@ -659,7 +713,11 @@ fn lower_binop(op: E::BinOp) -> IRBinOp {
     }
 }
 
-enum IRUnOp { OpNot, OpNeg }
+#[allow(clippy::enum_variant_names)]
+enum IRUnOp {
+    OpNot,
+    OpNeg,
+}
 
 impl std::fmt::Debug for IRUnOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

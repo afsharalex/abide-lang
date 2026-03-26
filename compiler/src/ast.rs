@@ -514,6 +514,7 @@ pub enum ExprKind {
     Let(Vec<LetBind>, Box<Expr>),
     Lambda(Vec<TypedParam>, Box<Expr>),
     LambdaT(Vec<TypedParam>, TypeRef, Box<Expr>),
+    Match(Box<Expr>, Vec<MatchArm>),
 
     // Level 4: assignment
     Assign(Box<Expr>, Box<Expr>),
@@ -576,5 +577,43 @@ pub struct LetBind {
     pub name: String,
     pub ty: Option<TypeRef>,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: Option<Box<Expr>>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// Variable or simple constructor name (disambiguated during elaboration)
+    Var(String, Span),
+    /// Record constructor: `Name { field: pat, ... }` with optional `..`
+    Ctor(String, Vec<FieldPat>, bool, Span),
+    /// Wildcard: `_`
+    Wild(Span),
+    /// Or-pattern: `P1 | P2`
+    Or(Box<Pattern>, Box<Pattern>, Span),
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Var(_, s)
+            | Pattern::Wild(s)
+            | Pattern::Ctor(_, _, _, s)
+            | Pattern::Or(_, _, s) => *s,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldPat {
+    pub name: String,
+    pub pattern: Pattern,
     pub span: Span,
 }

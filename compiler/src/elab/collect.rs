@@ -8,8 +8,8 @@ use crate::ast;
 use super::env::{DeclInfo, DeclKind, Env};
 use super::types::{
     BinOp, BuiltinTy, EAction, EConst, EEntity, EEvent, EEventAction, EExpr, EField, EFn, ELemma,
-    ENextItem, EPred, EProof, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, EVerify, Literal,
-    Quantifier, Ty, UnOp,
+    ENextItem, EPattern, EPred, EProof, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, EVerify,
+    Literal, Quantifier, Ty, UnOp,
 };
 
 /// Collect all declarations from a parsed program into an `Env`.
@@ -823,6 +823,39 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
 
         // Tuple literal
         ast::ExprKind::TupleLit(es) => EExpr::TupleLit(u(), es.iter().map(collect_expr).collect()),
+
+        // Match expression
+        ast::ExprKind::Match(scrutinee, arms) => {
+            let scrut = collect_expr(scrutinee);
+            let earms = arms
+                .iter()
+                .map(|arm| {
+                    let pat = collect_pattern(&arm.pattern);
+                    let guard = arm.guard.as_ref().map(|g| collect_expr(g));
+                    let body = collect_expr(&arm.body);
+                    (pat, guard, body)
+                })
+                .collect();
+            EExpr::Match(Box::new(scrut), earms)
+        }
+    }
+}
+
+fn collect_pattern(pat: &ast::Pattern) -> EPattern {
+    match pat {
+        ast::Pattern::Var(name, _) => EPattern::Var(name.clone()),
+        ast::Pattern::Wild(_) => EPattern::Wild,
+        ast::Pattern::Ctor(name, fields, _has_rest, _) => {
+            let fps = fields
+                .iter()
+                .map(|fp| (fp.name.clone(), collect_pattern(&fp.pattern)))
+                .collect();
+            EPattern::Ctor(name.clone(), fps)
+        }
+        ast::Pattern::Or(left, right, _) => EPattern::Or(
+            Box::new(collect_pattern(left)),
+            Box::new(collect_pattern(right)),
+        ),
     }
 }
 

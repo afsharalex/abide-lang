@@ -281,6 +281,15 @@ pub enum EExpr {
     In(Ty, Box<EExpr>, Box<EExpr>),
     Card(Ty, Box<EExpr>),
     Pipe(Ty, Box<EExpr>, Box<EExpr>),
+    Match(Box<EExpr>, Vec<(EPattern, Option<EExpr>, EExpr)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EPattern {
+    Var(String),
+    Ctor(String, Vec<(String, EPattern)>),
+    Wild,
+    Or(Box<EPattern>, Box<EPattern>),
 }
 
 impl EExpr {
@@ -309,6 +318,7 @@ impl EExpr {
             | Self::Card(ty, _)
             | Self::Pipe(ty, _, _) => ty.clone(),
             Self::Let(_, body) => body.ty(),
+            Self::Match(scrut, _) => scrut.ty(),
             Self::Lam(_, _, _) | Self::Unresolved(_) => Ty::Unresolved(String::new()),
         }
     }

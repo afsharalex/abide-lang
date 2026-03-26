@@ -1,0 +1,16 @@
+type OrderStatus = Pending | Confirmed | Shipped | Cancelled
+
+type Shape = Circle { radius: Int } | Rectangle { width: Int, height: Int }
+
+fn area(s: Shape): Int
+  = match s {
+    Circle { radius: r } => r * r
+    Rectangle { width: w, height: h } => w * h
+  }
+
+fn status_label(s: OrderStatus): String
+  = match s {
+    Pending => "waiting"
+    Confirmed => "confirmed"
+    _ => "other"
+  }

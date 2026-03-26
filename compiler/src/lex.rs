@@ -107,6 +107,10 @@ pub enum Token {
     No,
     #[token("lone")]
     Lone,
+    #[token("match")]
+    Match,
+    #[token("if")]
+    If,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token("::")]
@@ -175,6 +179,8 @@ pub enum Token {
     LBrace,
     #[token("}")]
     RBrace,
+    #[token("_")]
+    Underscore,
 
     // ── Literals ──────────────────────────────────────────────────────
     #[regex("[a-zA-Z][a-zA-Z0-9_]*", |lex| lex.slice().to_owned())]
@@ -249,6 +255,8 @@ impl std::fmt::Display for Token {
             Self::Some => write!(f, "some"),
             Self::No => write!(f, "no"),
             Self::Lone => write!(f, "lone"),
+            Self::Match => write!(f, "match"),
+            Self::If => write!(f, "if"),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),
             Self::Dot => write!(f, "."),
@@ -282,6 +290,7 @@ impl std::fmt::Display for Token {
             Self::RBracket => write!(f, "]"),
             Self::LBrace => write!(f, "{{"),
             Self::RBrace => write!(f, "}}"),
+            Self::Underscore => write!(f, "_"),
             Self::Name(s) | Self::FloatLit(s) => write!(f, "{s}"),
             Self::IntLit(n) => write!(f, "{n}"),
             Self::DoubleLit(n) => write!(f, "{n}"),

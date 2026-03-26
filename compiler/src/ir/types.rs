@@ -127,6 +127,40 @@ pub enum IRExpr {
     Eventually {
         body: Box<IRExpr>,
     },
+    Match {
+        scrutinee: Box<IRExpr>,
+        arms: Vec<IRMatchArm>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRMatchArm {
+    pub pattern: IRPattern,
+    pub guard: Option<IRExpr>,
+    pub body: IRExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "tag")]
+pub enum IRPattern {
+    PVar {
+        name: std::string::String,
+    },
+    PCtor {
+        name: std::string::String,
+        fields: Vec<IRFieldPat>,
+    },
+    PWild,
+    POr {
+        left: Box<IRPattern>,
+        right: Box<IRPattern>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRFieldPat {
+    pub name: std::string::String,
+    pub pattern: IRPattern,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
