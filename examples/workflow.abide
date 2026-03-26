@@ -1,3 +1,5 @@
+module Workflow
+
 // Workflow — state machine with role-based guards
 // Demonstrates multi-step lifecycles, role separation, and temporal properties.
 

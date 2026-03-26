@@ -1,3 +1,5 @@
+module Commerce
+
 // Commerce — multi-system coordination
 // Demonstrates two systems sharing entities with cross-system event calls.
 

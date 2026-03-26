@@ -1,3 +1,5 @@
+module Auth
+
 // Authentication & authorization example
 // Demonstrates: shared entity reuse, multiple systems operating
 // on the same entity, cross-system calls, temporal properties

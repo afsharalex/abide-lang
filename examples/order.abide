@@ -1,3 +1,5 @@
+module Order
+
 // Order — minimal Abide example
 // Demonstrates types, entities, actions, and primed notation.
 

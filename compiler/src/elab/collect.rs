@@ -23,7 +23,13 @@ pub fn collect(program: &ast::Program) -> Env {
 
 fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
     match decl {
-        ast::TopDecl::Import(_) | ast::TopDecl::Use(_) => {} // future
+        ast::TopDecl::Module(d) => {
+            env.module_name = Some(d.name.clone());
+        }
+        ast::TopDecl::Include(d) => {
+            env.includes.push(d.path.clone());
+        }
+        ast::TopDecl::Use(_) => {} // future
         ast::TopDecl::Const(d) => collect_const(env, d),
         ast::TopDecl::Fn(d) => collect_fn(env, d),
         ast::TopDecl::Type(d) => collect_type(env, d),

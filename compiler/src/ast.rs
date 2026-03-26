@@ -10,7 +10,8 @@ pub struct Program {
 
 #[derive(Debug, Clone)]
 pub enum TopDecl {
-    Import(ImportDecl),
+    Module(ModuleDecl),
+    Include(IncludeDecl),
     Use(UseDecl),
     Const(ConstDecl),
     Fn(FnDecl),
@@ -27,13 +28,24 @@ pub enum TopDecl {
     Axiom(AxiomDecl),
 }
 
-// ── Import / Use ─────────────────────────────────────────────────────
+// ── Module / Include / Use ────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub struct ImportDecl {
-    pub path: String,
-    pub alias: String,
+pub struct ModuleDecl {
+    pub name: String,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncludeDecl {
+    pub path: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +90,7 @@ pub enum UseItem {
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub value: Expr,
     pub span: Span,
 }
@@ -85,6 +98,7 @@ pub struct ConstDecl {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub params: Vec<TypedParam>,
     pub ret_type: TypeRef,
     pub body: Expr,
@@ -103,6 +117,7 @@ pub struct TypedParam {
 #[derive(Debug, Clone)]
 pub struct TypeDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub variants: Vec<TypeVariant>,
     pub span: Span,
 }
@@ -128,6 +143,7 @@ pub enum TypeVariant {
 #[derive(Debug, Clone)]
 pub struct RecordDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub fields: Vec<RecField>,
     pub span: Span,
 }
@@ -166,6 +182,7 @@ pub enum TypeRefKind {
 #[derive(Debug, Clone)]
 pub struct EntityDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub items: Vec<EntityItem>,
     pub span: Span,
 }
@@ -294,6 +311,7 @@ pub enum NextItem {
 #[derive(Debug, Clone)]
 pub struct PredDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub params: Vec<Param>,
     pub body: Expr,
     pub span: Span,
@@ -302,6 +320,7 @@ pub struct PredDecl {
 #[derive(Debug, Clone)]
 pub struct PropDecl {
     pub name: String,
+    pub visibility: Visibility,
     pub systems: Vec<String>,
     pub body: Expr,
     pub span: Span,

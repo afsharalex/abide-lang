@@ -1,11 +1,11 @@
 use crate::ast::{
     ActionInvoc, AxiomDecl, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock, CreateField,
     EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind, FieldDecl,
-    FieldPat, FnDecl, ForBlock, GivenItem, ImportDecl, InvocArg, LemmaDecl, LetBind, MatchArm,
-    NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl, QualType,
+    FieldPat, FnDecl, ForBlock, GivenItem, IncludeDecl, InvocArg, LemmaDecl, LetBind, MatchArm,
+    ModuleDecl, NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl, QualType,
     RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem, TheoremDecl,
-    TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem,
-    VerifyDecl, VerifyTarget, WhenItem,
+    TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem, VerifyDecl,
+    VerifyTarget, Visibility, WhenItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -195,7 +195,9 @@ impl Parser {
 
     fn top_decl(&mut self) -> Result<TopDecl, ParseError> {
         match self.peek() {
-            Some(Token::Import) => Ok(TopDecl::Import(self.import_decl()?)),
+            Some(Token::Module) => Ok(TopDecl::Module(self.module_decl()?)),
+            Some(Token::Include) => Ok(TopDecl::Include(self.include_decl()?)),
+            Some(Token::Pub) => self.pub_decl(),
             Some(Token::Use) => Ok(TopDecl::Use(self.use_decl()?)),
             Some(Token::Const) => Ok(TopDecl::Const(self.const_decl()?)),
             Some(Token::Fn) => Ok(TopDecl::Fn(self.fn_decl()?)),
@@ -218,18 +220,75 @@ impl Parser {
         }
     }
 
-    // ── Import / Use ─────────────────────────────────────────────────
+    // ── Module / Include / Pub / Use ────────────────────────────────
 
-    fn import_decl(&mut self) -> Result<ImportDecl, ParseError> {
-        let start = self.expect(&Token::Import)?;
-        let (path, _) = self.expect_string()?;
-        self.expect(&Token::As)?;
-        let (alias, end) = self.expect_name()?;
-        Ok(ImportDecl {
-            path,
-            alias,
+    fn module_decl(&mut self) -> Result<ModuleDecl, ParseError> {
+        let start = self.expect(&Token::Module)?;
+        let (name, end) = self.expect_name()?;
+        Ok(ModuleDecl {
+            name,
             span: start.merge(end),
         })
+    }
+
+    fn include_decl(&mut self) -> Result<IncludeDecl, ParseError> {
+        let start = self.expect(&Token::Include)?;
+        let (path, end) = self.expect_string()?;
+        Ok(IncludeDecl {
+            path,
+            span: start.merge(end),
+        })
+    }
+
+    fn pub_decl(&mut self) -> Result<TopDecl, ParseError> {
+        self.expect(&Token::Pub)?;
+        match self.peek() {
+            Some(Token::Type) => {
+                let decl = self.type_or_record_decl()?;
+                match decl {
+                    TopDecl::Type(mut t) => {
+                        t.visibility = Visibility::Public;
+                        Ok(TopDecl::Type(t))
+                    }
+                    TopDecl::Record(mut r) => {
+                        r.visibility = Visibility::Public;
+                        Ok(TopDecl::Record(r))
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Some(Token::Entity) => {
+                let mut d = self.entity_decl()?;
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Entity(d))
+            }
+            Some(Token::Fn) => {
+                let mut d = self.fn_decl()?;
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Fn(d))
+            }
+            Some(Token::Const) => {
+                let mut d = self.const_decl()?;
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Const(d))
+            }
+            Some(Token::Pred) => {
+                let mut d = self.pred_decl()?;
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Pred(d))
+            }
+            Some(Token::Prop) => {
+                let mut d = self.prop_decl()?;
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Prop(d))
+            }
+            Some(tok) => Err(ParseError::expected(
+                "`type`, `entity`, `fn`, `const`, `pred`, or `prop` after `pub`",
+                &format!("`{tok}`"),
+                self.cur_span(),
+            )),
+            None => Err(ParseError::eof(self.cur_span())),
+        }
     }
 
     fn use_decl(&mut self) -> Result<UseDecl, ParseError> {
@@ -296,6 +355,7 @@ impl Parser {
         Ok(ConstDecl {
             span: start.merge(value.span),
             name,
+            visibility: Visibility::Private,
             value,
         })
     }
@@ -313,6 +373,7 @@ impl Parser {
         Ok(FnDecl {
             span: start.merge(body.span),
             name,
+            visibility: Visibility::Private,
             params,
             ret_type,
             body,
@@ -342,6 +403,7 @@ impl Parser {
             let end = self.expect(&Token::RBrace)?;
             Ok(TopDecl::Record(RecordDecl {
                 name,
+                visibility: Visibility::Private,
                 fields,
                 span: start.merge(end),
             }))
@@ -362,6 +424,7 @@ impl Parser {
             };
             Ok(TopDecl::Type(TypeDecl {
                 name,
+                visibility: Visibility::Private,
                 variants,
                 span: start.merge(last_span),
             }))
@@ -473,6 +536,7 @@ impl Parser {
         let end = self.expect(&Token::RBrace)?;
         Ok(EntityDecl {
             name,
+            visibility: Visibility::Private,
             items,
             span: start.merge(end),
         })
@@ -774,6 +838,7 @@ impl Parser {
         Ok(PredDecl {
             span: start.merge(body.span),
             name,
+            visibility: Visibility::Private,
             params,
             body,
         })
@@ -801,6 +866,7 @@ impl Parser {
         Ok(PropDecl {
             span: start.merge(body.span),
             name,
+            visibility: Visibility::Private,
             systems,
             body,
         })
@@ -2184,14 +2250,61 @@ mod tests {
     // ── Declaration tests ────────────────────────────────────────────
 
     #[test]
-    fn import_decl() {
-        let prog = parse_program(r#"import "billing.abide" as Billing"#);
+    fn module_decl() {
+        let prog = parse_program("module Commerce");
         assert_eq!(prog.decls.len(), 1);
-        if let TopDecl::Import(i) = &prog.decls[0] {
-            assert_eq!(i.path, "billing.abide");
-            assert_eq!(i.alias, "Billing");
+        if let TopDecl::Module(m) = &prog.decls[0] {
+            assert_eq!(m.name, "Commerce");
         } else {
-            panic!("expected Import");
+            panic!("expected Module");
+        }
+    }
+
+    #[test]
+    fn include_decl() {
+        let prog = parse_program(r#"include "billing.abide""#);
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Include(i) = &prog.decls[0] {
+            assert_eq!(i.path, "billing.abide");
+        } else {
+            panic!("expected Include");
+        }
+    }
+
+    #[test]
+    fn pub_type_decl() {
+        let prog = parse_program("pub type OrderStatus = Pending | Paid");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Type(t) = &prog.decls[0] {
+            assert_eq!(t.name, "OrderStatus");
+            assert_eq!(t.visibility, Visibility::Public);
+        } else {
+            panic!("expected Type");
+        }
+    }
+
+    #[test]
+    fn pub_entity_decl() {
+        let src = r#"pub entity Order {
+  id: Id
+}"#;
+        let prog = parse_program(src);
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Entity(e) = &prog.decls[0] {
+            assert_eq!(e.name, "Order");
+            assert_eq!(e.visibility, Visibility::Public);
+        } else {
+            panic!("expected Entity");
+        }
+    }
+
+    #[test]
+    fn private_by_default() {
+        let prog = parse_program("type Status = Active | Inactive");
+        if let TopDecl::Type(t) = &prog.decls[0] {
+            assert_eq!(t.visibility, Visibility::Private);
+        } else {
+            panic!("expected Type");
         }
     }
 

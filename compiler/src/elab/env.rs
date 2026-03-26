@@ -35,6 +35,8 @@ pub struct DeclInfo {
 /// The elaboration environment (symbol table).
 #[derive(Debug, Clone)]
 pub struct Env {
+    pub module_name: Option<String>,
+    pub includes: Vec<String>,
     pub decls: HashMap<String, DeclInfo>,
     pub types: HashMap<String, Ty>,
     pub entities: HashMap<String, EEntity>,
@@ -60,6 +62,8 @@ impl Default for Env {
 impl Env {
     pub fn new() -> Self {
         Self {
+            module_name: None,
+            includes: Vec::new(),
             decls: HashMap::new(),
             types: HashMap::new(),
             entities: HashMap::new(),

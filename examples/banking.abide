@@ -1,3 +1,5 @@
+module Banking
+
 // Banking — entity depth example
 // Demonstrates contracts, constants, predicates, verification, and scenes.
 

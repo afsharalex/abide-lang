@@ -1,3 +1,5 @@
+module Healthcare
+
 // Healthcare — rich domain example
 // Demonstrates ADTs with record variants, complex entities, predicates, and proofs.
 

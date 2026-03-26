@@ -1,7 +1,8 @@
 // Full Commerce example: entities with actions, system events,
-// cross-system calls, choose + for, verify, proof, scene, import/use
+// cross-system calls, choose + for, verify, proof, scene, module/use
 
-import "billing.abide" as Billing
+module Commerce
+include "billing.abide"
 use Billing::{PaymentIntent as PI, open_intent, capture_payment}
 use Billing::PaymentStatus as PS
 

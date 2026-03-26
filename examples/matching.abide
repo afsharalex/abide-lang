@@ -1,3 +1,5 @@
+module Matching
+
 // Matching — pattern matching reference
 // Demonstrates sum types with record variants and comprehensive match syntax.
 

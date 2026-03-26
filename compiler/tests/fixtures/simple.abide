@@ -1,3 +1,5 @@
+module Simple
+
 // Simple Abide example: types, entities with actions
 
 type OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled

@@ -1,3 +1,5 @@
+module MatchTest
+
 // Match expression examples — exercises all pattern features
 
 type OrderStatus = Pending | Confirmed | Shipped | Cancelled

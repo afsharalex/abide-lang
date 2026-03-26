@@ -1,3 +1,5 @@
+module Inventory
+
 // Inventory management example
 // Demonstrates: multiple entity types interacting, quantity tracking,
 // cross-system coordination, exclusive choice, concurrent operations

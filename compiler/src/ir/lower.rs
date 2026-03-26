@@ -7,10 +7,9 @@ use crate::elab::types as E;
 
 use super::types::{
     Cardinality, IRAction, IRAxiom, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField,
-    IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene,
-    IRSceneEvent, IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam,
-    IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding,
-    LitVal,
+    IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene, IRSceneEvent,
+    IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam, IRTransRef,
+    IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding, LitVal,
 };
 
 // ── Top-level lowering ───────────────────────────────────────────────

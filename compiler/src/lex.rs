@@ -7,8 +7,12 @@ use logos::Logos;
 #[logos(skip r"//[^\n]*")]
 pub enum Token {
     // ── Keywords ──────────────────────────────────────────────────────
-    #[token("import")]
-    Import,
+    #[token("module")]
+    Module,
+    #[token("include")]
+    Include,
+    #[token("pub")]
+    Pub,
     #[token("as")]
     As,
     #[token("use")]
@@ -211,7 +215,9 @@ pub enum Token {
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Import => write!(f, "import"),
+            Self::Module => write!(f, "module"),
+            Self::Include => write!(f, "include"),
+            Self::Pub => write!(f, "pub"),
             Self::As => write!(f, "as"),
             Self::Use => write!(f, "use"),
             Self::Const => write!(f, "const"),
@@ -339,12 +345,14 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src = "import as use const fn type entity system action event sorry todo";
+        let src = "module include pub as use const fn type entity system action event sorry todo";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
             vec![
-                Token::Import,
+                Token::Module,
+                Token::Include,
+                Token::Pub,
                 Token::As,
                 Token::Use,
                 Token::Const,
@@ -512,8 +520,8 @@ mod tests {
 
     #[test]
     fn comments_skipped() {
-        let tokens = lex_ok("import // this is a comment\nuse");
-        assert_eq!(tokens, vec![Token::Import, Token::Use]);
+        let tokens = lex_ok("module // this is a comment\nuse");
+        assert_eq!(tokens, vec![Token::Module, Token::Use]);
     }
 
     #[test]
@@ -593,7 +601,7 @@ mod tests {
 
     #[test]
     fn lex_error_on_invalid_char() {
-        let result = lex("import ~ use");
+        let result = lex("module ~ use");
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 1);

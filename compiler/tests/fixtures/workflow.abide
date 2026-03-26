@@ -1,3 +1,5 @@
+module Workflow
+
 // Document approval workflow example
 // Demonstrates: multi-step state machines, role-based guards,
 // exclusive choice, temporal liveness, proof obligations
@@ -223,8 +225,8 @@ scene happy_path_submit_to_publish for DocumentMgmt {
     action sub = DocumentMgmt::submit_document(d.id, d.author_id){one}
     action rev = DocumentMgmt::assign_review(d.id, d.reviewer_id){one}
     action app = DocumentMgmt::review_approve(d.id, d.reviewer_id){one}
-    action pub = DocumentMgmt::publish_document(d.id){one}
-    assume sub -> rev -> app -> pub
+    action publ = DocumentMgmt::publish_document(d.id){one}
+    assume sub -> rev -> app -> publ
   }
   then {
     assert d.status == @Published
