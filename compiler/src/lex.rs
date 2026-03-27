@@ -121,6 +121,8 @@ pub enum Token {
     Axiom,
     #[token("by")]
     By,
+    #[token("mut")]
+    Mut,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token("::")]
@@ -272,6 +274,7 @@ impl std::fmt::Display for Token {
             Self::Theorem => write!(f, "theorem"),
             Self::Axiom => write!(f, "axiom"),
             Self::By => write!(f, "by"),
+            Self::Mut => write!(f, "mut"),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),
             Self::Dot => write!(f, "."),
@@ -345,7 +348,8 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src = "module include pub as use const fn type entity system action event sorry todo";
+        let src =
+            "module include pub as use const fn type entity system action event sorry todo mut";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -364,6 +368,7 @@ mod tests {
                 Token::Event,
                 Token::Sorry,
                 Token::Todo,
+                Token::Mut,
             ]
         );
     }

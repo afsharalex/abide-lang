@@ -441,9 +441,9 @@ impl Parser {
                 fields,
                 span: start.merge(end),
             })
-        } else if self.eat(&Token::LBracket).is_some() {
-            let types = self.comma_sep(&Token::RBracket, Parser::type_ref)?;
-            let end = self.expect(&Token::RBracket)?;
+        } else if self.eat(&Token::Lt).is_some() {
+            let types = self.comma_sep(&Token::Gt, Parser::type_ref)?;
+            let end = self.expect(&Token::Gt)?;
             Ok(TypeVariant::Param {
                 name,
                 types,
@@ -507,9 +507,9 @@ impl Parser {
             }
         } else {
             let (name, start) = self.expect_name()?;
-            if self.eat(&Token::LBracket).is_some() {
-                let types = self.comma_sep(&Token::RBracket, Parser::type_ref)?;
-                let end = self.expect(&Token::RBracket)?;
+            if self.eat(&Token::Lt).is_some() {
+                let types = self.comma_sep(&Token::Gt, Parser::type_ref)?;
+                let end = self.expect(&Token::Gt)?;
                 Ok(TypeRef {
                     kind: TypeRefKind::Param(name, types),
                     span: start.merge(end),
@@ -612,12 +612,14 @@ impl Parser {
     }
 
     fn param(&mut self) -> Result<Param, ParseError> {
+        let mutable = self.eat(&Token::Mut).is_some();
         let (name, start) = self.expect_name()?;
         self.expect(&Token::Colon)?;
         let (ty, end) = self.expect_name()?;
         Ok(Param {
             name,
             ty,
+            mutable,
             span: start.merge(end),
         })
     }
@@ -2688,6 +2690,162 @@ mod tests {
             assert!(matches!(scrut.kind, ExprKind::Field(_, ref f) if f == "status"));
         } else {
             panic!("expected Match");
+        }
+    }
+
+    // ── Generic type reference tests (DDR-023) ─────────────────────────
+
+    #[test]
+    fn type_ref_generic_set() {
+        let src = "fn ids(s: Set<Int>): Bool = true";
+        let prog = parse_program(src);
+        if let TopDecl::Fn(f) = &prog.decls[0] {
+            match &f.params[0].ty.kind {
+                TypeRefKind::Param(name, args) => {
+                    assert_eq!(name, "Set");
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(args[0].kind, TypeRefKind::Simple(ref s) if s == "Int"));
+                }
+                other => panic!("expected Param, got {other:?}"),
+            }
+        } else {
+            panic!("expected Fn");
+        }
+    }
+
+    #[test]
+    fn type_ref_generic_map() {
+        let src = "fn lookup(m: Map<String, Bool>): Bool = true";
+        let prog = parse_program(src);
+        if let TopDecl::Fn(f) = &prog.decls[0] {
+            match &f.params[0].ty.kind {
+                TypeRefKind::Param(name, args) => {
+                    assert_eq!(name, "Map");
+                    assert_eq!(args.len(), 2);
+                    assert!(matches!(args[0].kind, TypeRefKind::Simple(ref s) if s == "String"));
+                    assert!(matches!(args[1].kind, TypeRefKind::Simple(ref s) if s == "Bool"));
+                }
+                other => panic!("expected Param, got {other:?}"),
+            }
+        } else {
+            panic!("expected Fn");
+        }
+    }
+
+    #[test]
+    fn type_ref_nested_generics() {
+        let src = "fn nested(s: Set<Set<Int>>): Bool = true";
+        let prog = parse_program(src);
+        if let TopDecl::Fn(f) = &prog.decls[0] {
+            match &f.params[0].ty.kind {
+                TypeRefKind::Param(name, args) => {
+                    assert_eq!(name, "Set");
+                    assert_eq!(args.len(), 1);
+                    match &args[0].kind {
+                        TypeRefKind::Param(inner_name, inner_args) => {
+                            assert_eq!(inner_name, "Set");
+                            assert_eq!(inner_args.len(), 1);
+                            assert!(
+                                matches!(inner_args[0].kind, TypeRefKind::Simple(ref s) if s == "Int")
+                            );
+                        }
+                        other => panic!("expected nested Param, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Param, got {other:?}"),
+            }
+        } else {
+            panic!("expected Fn");
+        }
+    }
+
+    // ── Mut ref param tests (DDR-016) ───────────────────────────────────
+
+    #[test]
+    fn action_mut_ref_param() {
+        let src = r#"entity Account {
+  balance: Int
+
+  action transfer[mut to: Account](amount: Int)
+    requires balance >= amount {
+    balance' = balance - amount
+  }
+}"#;
+        let prog = parse_program(src);
+        if let TopDecl::Entity(e) = &prog.decls[0] {
+            if let EntityItem::Action(a) = &e.items[1] {
+                assert_eq!(a.name, "transfer");
+                assert_eq!(a.ref_params.len(), 1);
+                assert_eq!(a.ref_params[0].name, "to");
+                assert_eq!(a.ref_params[0].ty, "Account");
+                assert!(a.ref_params[0].mutable);
+                assert_eq!(a.params.len(), 1);
+                assert_eq!(a.params[0].name, "amount");
+                assert!(!a.params[0].mutable);
+            } else {
+                panic!("expected Action");
+            }
+        } else {
+            panic!("expected Entity");
+        }
+    }
+
+    #[test]
+    fn action_non_mut_ref_param() {
+        let src = r#"entity Account {
+  balance: Int
+
+  action check[other: Account]() requires true {
+    balance' = balance
+  }
+}"#;
+        let prog = parse_program(src);
+        if let TopDecl::Entity(e) = &prog.decls[0] {
+            if let EntityItem::Action(a) = &e.items[1] {
+                assert_eq!(a.ref_params.len(), 1);
+                assert!(!a.ref_params[0].mutable);
+            } else {
+                panic!("expected Action");
+            }
+        } else {
+            panic!("expected Entity");
+        }
+    }
+
+    #[test]
+    fn field_type_generic_collection() {
+        let src = r#"entity Warehouse {
+  items: Set<Id>
+  prices: Map<Id, Int>
+}"#;
+        let prog = parse_program(src);
+        if let TopDecl::Entity(e) = &prog.decls[0] {
+            if let EntityItem::Field(f) = &e.items[0] {
+                assert_eq!(f.name, "items");
+                match &f.ty.kind {
+                    TypeRefKind::Param(name, args) => {
+                        assert_eq!(name, "Set");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected Param, got {other:?}"),
+                }
+            } else {
+                panic!("expected Field");
+            }
+            if let EntityItem::Field(f) = &e.items[1] {
+                assert_eq!(f.name, "prices");
+                match &f.ty.kind {
+                    TypeRefKind::Param(name, args) => {
+                        assert_eq!(name, "Map");
+                        assert_eq!(args.len(), 2);
+                    }
+                    other => panic!("expected Param, got {other:?}"),
+                }
+            } else {
+                panic!("expected Field");
+            }
+        } else {
+            panic!("expected Entity");
         }
     }
 }

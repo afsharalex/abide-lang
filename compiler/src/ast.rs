@@ -216,6 +216,7 @@ pub struct EntityAction {
 pub struct Param {
     pub name: String,
     pub ty: String,
+    pub mutable: bool,
     pub span: Span,
 }
 
