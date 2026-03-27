@@ -4,3 +4,4 @@
 
 # Keep this repo language-focused
 compiler/target/
+compiler/.z3-trace
