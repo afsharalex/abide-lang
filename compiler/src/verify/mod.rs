@@ -3,10 +3,12 @@
 //! Architecture:
 //! - `smt`: Z3 value types and sort mapping
 //! - `context`: `VerifyContext` (variant IDs, field metadata, entity pool info)
-//! - `encode`: IR → Z3 term encoding (expressions, actions, events)
+//! - `encode`: IR → Z3 term encoding (expressions)
+//! - `harness`: Multi-slot entity pools, action/event encoding, constraint generation
 
 pub mod context;
 pub mod encode;
+pub mod harness;
 pub mod smt;
 
 use crate::ir::types::IRProgram;
