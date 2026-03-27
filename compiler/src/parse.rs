@@ -77,6 +77,10 @@ impl Parser {
         self.tokens.get(self.pos).map(|(t, _)| t)
     }
 
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset).map(|(t, _)| t)
+    }
+
     fn cur_span(&self) -> Span {
         if self.pos < self.tokens.len() {
             self.tokens[self.pos].1
@@ -1782,6 +1786,58 @@ impl Parser {
                     span,
                 })
             }
+            // Set comprehension: { var: Type where filter } or { expr | var: Type where filter }
+            Some(Token::LBrace) => {
+                self.advance(); // consume {
+                                // Check for simple form: Name : TypeRef where ...
+                                // Lookahead: peek(0)=Name, peek(1)=Colon, peek(2)=Name (type start)
+                if matches!(self.peek(), Some(Token::Name(_)))
+                    && matches!(self.peek_at(1), Some(Token::Colon))
+                {
+                    // Could be simple set comp or projection form (if the expr before | happens to
+                    // start with Name:). Try simple form first: parse var : type where filter.
+                    let saved = self.pos;
+                    let (var, _) = self.expect_name()?;
+                    self.expect(&Token::Colon)?;
+                    let domain = self.type_ref()?;
+                    if matches!(self.peek(), Some(Token::Where)) {
+                        // Simple form confirmed
+                        self.advance(); // consume where
+                        let filter = self.expr()?;
+                        let end = self.expect(&Token::RBrace)?;
+                        return Ok(Expr {
+                            kind: ExprKind::SetComp {
+                                projection: None,
+                                var,
+                                domain,
+                                filter: Box::new(filter),
+                            },
+                            span: start.merge(end),
+                        });
+                    }
+                    // Not simple form — backtrack and try projection form
+                    self.pos = saved;
+                }
+                // Projection form: expr | var: Type where filter
+                // Parse at bp=2 to stop before `|` (which is bp 1)
+                let projection = self.expr_bp(2)?;
+                self.expect(&Token::Pipe)?;
+                let (var, _) = self.expect_name()?;
+                self.expect(&Token::Colon)?;
+                let domain = self.type_ref()?;
+                self.expect(&Token::Where)?;
+                let filter = self.expr()?;
+                let end = self.expect(&Token::RBrace)?;
+                Ok(Expr {
+                    kind: ExprKind::SetComp {
+                        projection: Some(Box::new(projection)),
+                        var,
+                        domain,
+                        filter: Box::new(filter),
+                    },
+                    span: start.merge(end),
+                })
+            }
             // Name, qualified ref (Name::Name, Name::Name::Name), or variable
             Some(Token::Name(_)) => {
                 let (n1, n1_span) = self.expect_name()?;
@@ -1843,16 +1899,47 @@ impl Parser {
                 })
             }
             Some(Token::LBracket) => {
-                self.advance();
-                let refs = self.comma_sep_expr(&Token::RBracket)?;
-                self.expect(&Token::RBracket)?;
-                self.expect(&Token::LParen)?;
-                let args = self.comma_sep_expr(&Token::RParen)?;
-                let end = self.expect(&Token::RParen)?;
-                Ok(Expr {
-                    kind: ExprKind::CallR(Box::new(lhs), refs, args),
-                    span: start.merge(end),
-                })
+                self.advance(); // consume [
+                let first = self.expr()?;
+                if self.eat(&Token::ColonEq).is_some() {
+                    // Map update: lhs[key := value]
+                    let value = self.expr()?;
+                    let end = self.expect(&Token::RBracket)?;
+                    Ok(Expr {
+                        kind: ExprKind::MapUpdate(Box::new(lhs), Box::new(first), Box::new(value)),
+                        span: start.merge(end),
+                    })
+                } else {
+                    // Collect remaining comma-separated exprs (if any)
+                    let mut refs = vec![first];
+                    while self.eat(&Token::Comma).is_some() {
+                        refs.push(self.expr()?);
+                    }
+                    self.expect(&Token::RBracket)?;
+                    if matches!(self.peek(), Some(Token::LParen)) {
+                        // CallR: lhs[refs](args)
+                        self.advance(); // consume (
+                        let args = self.comma_sep_expr(&Token::RParen)?;
+                        let end = self.expect(&Token::RParen)?;
+                        Ok(Expr {
+                            kind: ExprKind::CallR(Box::new(lhs), refs, args),
+                            span: start.merge(end),
+                        })
+                    } else if refs.len() == 1 {
+                        // Index: lhs[key]
+                        let key = refs.into_iter().next().unwrap();
+                        let end = self.prev_span();
+                        Ok(Expr {
+                            kind: ExprKind::Index(Box::new(lhs), Box::new(key)),
+                            span: start.merge(end),
+                        })
+                    } else {
+                        Err(ParseError::general(
+                            "multiple indices not supported; use map update `[k := v]` or ref call `[refs](args)`",
+                            self.cur_span(),
+                        ))
+                    }
+                }
             }
             _ => Err(ParseError::general(
                 "unexpected postfix operator",
@@ -2846,6 +2933,129 @@ mod tests {
             }
         } else {
             panic!("expected Entity");
+        }
+    }
+
+    // ── Map update and index tests (DDR-034) ────────────────────────────
+
+    #[test]
+    fn map_update() {
+        let e = parse_expr("m[k := v]");
+        match &e.kind {
+            ExprKind::MapUpdate(m, k, v) => {
+                assert!(matches!(m.kind, ExprKind::Var(ref s) if s == "m"));
+                assert!(matches!(k.kind, ExprKind::Var(ref s) if s == "k"));
+                assert!(matches!(v.kind, ExprKind::Var(ref s) if s == "v"));
+            }
+            other => panic!("expected MapUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_index() {
+        let e = parse_expr("m[k]");
+        match &e.kind {
+            ExprKind::Index(m, k) => {
+                assert!(matches!(m.kind, ExprKind::Var(ref s) if s == "m"));
+                assert!(matches!(k.kind, ExprKind::Var(ref s) if s == "k"));
+            }
+            other => panic!("expected Index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_update_chained() {
+        let e = parse_expr("m[a := x][b := y]");
+        match &e.kind {
+            ExprKind::MapUpdate(inner, b, y) => {
+                assert!(matches!(b.kind, ExprKind::Var(ref s) if s == "b"));
+                assert!(matches!(y.kind, ExprKind::Var(ref s) if s == "y"));
+                match &inner.kind {
+                    ExprKind::MapUpdate(m, a, x) => {
+                        assert!(matches!(m.kind, ExprKind::Var(ref s) if s == "m"));
+                        assert!(matches!(a.kind, ExprKind::Var(ref s) if s == "a"));
+                        assert!(matches!(x.kind, ExprKind::Var(ref s) if s == "x"));
+                    }
+                    other => panic!("expected inner MapUpdate, got {other:?}"),
+                }
+            }
+            other => panic!("expected MapUpdate, got {other:?}"),
+        }
+    }
+
+    // ── Set comprehension tests (DDR-035) ───────────────────────────────
+
+    #[test]
+    fn set_comp_simple() {
+        let e = parse_expr("{ a: Account where a.status == @Frozen }");
+        match &e.kind {
+            ExprKind::SetComp {
+                projection,
+                var,
+                domain,
+                filter,
+            } => {
+                assert!(projection.is_none());
+                assert_eq!(var, "a");
+                assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
+                assert!(matches!(filter.kind, ExprKind::Eq(_, _)));
+            }
+            other => panic!("expected SetComp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_comp_projection() {
+        let e = parse_expr("{ a.balance | a: Account where a.balance > 0 }");
+        match &e.kind {
+            ExprKind::SetComp {
+                projection,
+                var,
+                domain,
+                filter,
+            } => {
+                assert!(projection.is_some());
+                let proj = projection.as_ref().unwrap();
+                assert!(matches!(&proj.kind, ExprKind::Field(_, ref f) if f == "balance"));
+                assert_eq!(var, "a");
+                assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
+                assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
+            }
+            other => panic!("expected SetComp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_comp_cardinality() {
+        let e = parse_expr("#{ a: Account where a.balance > 0 }");
+        match &e.kind {
+            ExprKind::Card(inner) => {
+                assert!(matches!(
+                    &inner.kind,
+                    ExprKind::SetComp {
+                        projection: None,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected Card(SetComp), got {other:?}"),
+        }
+    }
+
+    // ── Collection literal recognition (DDR-017) ────────────────────────
+
+    #[test]
+    fn collection_literal_set() {
+        let e = parse_expr("Set(1, 2, 3)");
+        match &e.kind {
+            ExprKind::Call(callee, args) => {
+                assert!(matches!(&callee.kind, ExprKind::Var(ref s) if s == "Set"));
+                assert_eq!(args.len(), 3);
+                assert!(matches!(args[0].kind, ExprKind::Int(1)));
+                assert!(matches!(args[1].kind, ExprKind::Int(2)));
+                assert!(matches!(args[2].kind, ExprKind::Int(3)));
+            }
+            other => panic!("expected Call(Var(Set), [1,2,3]), got {other:?}"),
         }
     }
 }

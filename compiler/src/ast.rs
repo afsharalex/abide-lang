@@ -590,6 +590,19 @@ pub enum ExprKind {
     CallR(Box<Expr>, Vec<Expr>, Vec<Expr>),
     Call(Box<Expr>, Vec<Expr>),
 
+    // Map/collection operations
+    /// Map update: m[k := v] — produces new map
+    MapUpdate(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// Index access: m[k] — reads from map/seq
+    Index(Box<Expr>, Box<Expr>),
+    /// Set comprehension: { expr | var: Type where filter } or { var: Type where filter }
+    SetComp {
+        projection: Option<Box<Expr>>,
+        var: String,
+        domain: TypeRef,
+        filter: Box<Expr>,
+    },
+
     // Level 14: atoms
     State1(String),
     State2(String, String),

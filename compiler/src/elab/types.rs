@@ -289,6 +289,12 @@ pub enum EExpr {
     Card(Ty, Box<EExpr>),
     Pipe(Ty, Box<EExpr>, Box<EExpr>),
     Match(Box<EExpr>, Vec<(EPattern, Option<EExpr>, EExpr)>),
+    MapUpdate(Ty, Box<EExpr>, Box<EExpr>, Box<EExpr>),
+    Index(Ty, Box<EExpr>, Box<EExpr>),
+    SetComp(Ty, Option<Box<EExpr>>, String, Ty, Box<EExpr>),
+    SetLit(Ty, Vec<EExpr>),
+    SeqLit(Ty, Vec<EExpr>),
+    MapLit(Ty, Vec<(EExpr, EExpr)>),
     Sorry,
     Todo,
 }
@@ -325,7 +331,13 @@ impl EExpr {
             | Self::TupleLit(ty, _)
             | Self::In(ty, _, _)
             | Self::Card(ty, _)
-            | Self::Pipe(ty, _, _) => ty.clone(),
+            | Self::Pipe(ty, _, _)
+            | Self::MapUpdate(ty, _, _, _)
+            | Self::Index(ty, _, _)
+            | Self::SetComp(ty, _, _, _, _)
+            | Self::SetLit(ty, _)
+            | Self::SeqLit(ty, _)
+            | Self::MapLit(ty, _) => ty.clone(),
             Self::Let(_, body) => body.ty(),
             Self::Match(scrut, _) => scrut.ty(),
             Self::Sorry | Self::Todo | Self::Lam(_, _, _) | Self::Unresolved(_) => {

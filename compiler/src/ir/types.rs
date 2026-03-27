@@ -131,6 +131,42 @@ pub enum IRExpr {
         scrutinee: Box<IRExpr>,
         arms: Vec<IRMatchArm>,
     },
+    MapUpdate {
+        map: Box<IRExpr>,
+        key: Box<IRExpr>,
+        value: Box<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
+    Index {
+        map: Box<IRExpr>,
+        key: Box<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
+    SetLit {
+        elements: Vec<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
+    SeqLit {
+        elements: Vec<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
+    MapLit {
+        entries: Vec<(IRExpr, IRExpr)>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
+    SetComp {
+        var: std::string::String,
+        domain: IRType,
+        filter: Box<IRExpr>,
+        projection: Option<Box<IRExpr>>,
+        #[serde(rename = "type")]
+        ty: IRType,
+    },
     Sorry,
     Todo,
 }

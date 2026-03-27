@@ -125,6 +125,8 @@ pub enum Token {
     Mut,
 
     // ── Symbols ───────────────────────────────────────────────────────
+    #[token(":=")]
+    ColonEq,
     #[token("::")]
     ColonColon,
     #[token("..")]
@@ -275,6 +277,7 @@ impl std::fmt::Display for Token {
             Self::Axiom => write!(f, "axiom"),
             Self::By => write!(f, "by"),
             Self::Mut => write!(f, "mut"),
+            Self::ColonEq => write!(f, ":="),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),
             Self::Dot => write!(f, "."),
@@ -414,12 +417,13 @@ mod tests {
 
     #[test]
     fn symbols() {
-        let src = ":: . .. @ ' # == != => = <= >= < > + -> - * / % || |> ^| | & : , ( ) [ ] { }";
+        let src = ":: := . .. @ ' # == != => = <= >= < > + -> - * / % || |> ^| | & : , ( ) [ ] { }";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
             vec![
                 Token::ColonColon,
+                Token::ColonEq,
                 Token::Dot,
                 Token::DotDot,
                 Token::At,
@@ -531,12 +535,13 @@ mod tests {
 
     #[test]
     fn multi_char_symbol_priority() {
-        // :: vs : , == vs = , -> vs - , || vs | , |> vs |
-        let tokens = lex_ok(":: : == = -> - || | |> ^|");
+        // :: vs := vs : , == vs = , -> vs - , || vs | , |> vs |
+        let tokens = lex_ok(":: := : == = -> - || | |> ^|");
         assert_eq!(
             tokens,
             vec![
                 Token::ColonColon,
+                Token::ColonEq,
                 Token::Colon,
                 Token::EqEq,
                 Token::Eq,

@@ -693,11 +693,40 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
 
         ast::ExprKind::Field(e, f) => EExpr::Field(u(), Box::new(collect_expr(e)), f.clone()),
         ast::ExprKind::Prime(e) => EExpr::Prime(u(), Box::new(collect_expr(e))),
-        ast::ExprKind::Call(callee, args) => EExpr::Call(
-            u(),
-            Box::new(collect_expr(callee)),
-            args.iter().map(collect_expr).collect(),
-        ),
+        ast::ExprKind::Call(callee, args) => {
+            // Recognize collection literals: Set(1, 2, 3), Seq(1, 2), Map(k1, v1, k2, v2)
+            if let ast::ExprKind::Var(name) = &callee.kind {
+                match name.as_str() {
+                    "Set" => {
+                        return EExpr::SetLit(u(), args.iter().map(collect_expr).collect());
+                    }
+                    "Seq" => {
+                        return EExpr::SeqLit(u(), args.iter().map(collect_expr).collect());
+                    }
+                    "Map" => {
+                        // Map literal: pairs of (key, value) args
+                        let collected: Vec<EExpr> = args.iter().map(collect_expr).collect();
+                        let entries: Vec<(EExpr, EExpr)> = collected
+                            .chunks(2)
+                            .filter_map(|pair| {
+                                if pair.len() == 2 {
+                                    Some((pair[0].clone(), pair[1].clone()))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        return EExpr::MapLit(u(), entries);
+                    }
+                    _ => {}
+                }
+            }
+            EExpr::Call(
+                u(),
+                Box::new(collect_expr(callee)),
+                args.iter().map(collect_expr).collect(),
+            )
+        }
         ast::ExprKind::CallR(callee, refs, args) => EExpr::CallR(
             u(),
             Box::new(collect_expr(callee)),
@@ -859,6 +888,27 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                 })
                 .collect();
             EExpr::Match(Box::new(scrut), earms)
+        }
+
+        // Map/collection operations
+        ast::ExprKind::MapUpdate(m, k, v) => EExpr::MapUpdate(
+            u(),
+            Box::new(collect_expr(m)),
+            Box::new(collect_expr(k)),
+            Box::new(collect_expr(v)),
+        ),
+        ast::ExprKind::Index(m, k) => {
+            EExpr::Index(u(), Box::new(collect_expr(m)), Box::new(collect_expr(k)))
+        }
+        ast::ExprKind::SetComp {
+            projection,
+            var,
+            domain,
+            filter,
+        } => {
+            let dom = resolve_type_ref(domain);
+            let proj = projection.as_ref().map(|p| Box::new(collect_expr(p)));
+            EExpr::SetComp(u(), proj, var.clone(), dom, Box::new(collect_expr(filter)))
         }
 
         // Stubs

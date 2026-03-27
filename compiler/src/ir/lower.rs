@@ -619,6 +619,39 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                 })
                 .collect(),
         },
+        E::EExpr::MapUpdate(ty, m, k, v) => IRExpr::MapUpdate {
+            map: Box::new(lower_expr(m)),
+            key: Box::new(lower_expr(k)),
+            value: Box::new(lower_expr(v)),
+            ty: lower_ty(ty),
+        },
+        E::EExpr::Index(ty, m, k) => IRExpr::Index {
+            map: Box::new(lower_expr(m)),
+            key: Box::new(lower_expr(k)),
+            ty: lower_ty(ty),
+        },
+        E::EExpr::SetComp(ty, proj, var, domain, filter) => IRExpr::SetComp {
+            var: var.clone(),
+            domain: lower_ty(domain),
+            filter: Box::new(lower_expr(filter)),
+            projection: proj.as_ref().map(|p| Box::new(lower_expr(p))),
+            ty: lower_ty(ty),
+        },
+        E::EExpr::SetLit(ty, elems) => IRExpr::SetLit {
+            elements: elems.iter().map(lower_expr).collect(),
+            ty: lower_ty(ty),
+        },
+        E::EExpr::SeqLit(ty, elems) => IRExpr::SeqLit {
+            elements: elems.iter().map(lower_expr).collect(),
+            ty: lower_ty(ty),
+        },
+        E::EExpr::MapLit(ty, entries) => IRExpr::MapLit {
+            entries: entries
+                .iter()
+                .map(|(k, v)| (lower_expr(k), lower_expr(v)))
+                .collect(),
+            ty: lower_ty(ty),
+        },
         E::EExpr::Sorry => IRExpr::Sorry,
         E::EExpr::Todo => IRExpr::Todo,
     }
