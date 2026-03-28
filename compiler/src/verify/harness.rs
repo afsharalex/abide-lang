@@ -120,13 +120,13 @@ pub fn create_slot_pool(
 /// `bindings` tracks variables from prior Choose blocks, mapping
 /// `var_name` -> `(entity_name, slot_index)`. This enables cross-entity
 /// field references like `r.product_id` in a subsequent Choose over Product.
-struct SlotEncodeCtx<'a> {
-    pool: &'a SlotPool,
-    vctx: &'a VerifyContext,
-    entity: &'a str,
-    slot: usize,
-    params: HashMap<String, SmtValue>,
-    bindings: HashMap<String, (String, usize)>,
+pub struct SlotEncodeCtx<'a> {
+    pub pool: &'a SlotPool,
+    pub vctx: &'a VerifyContext,
+    pub entity: &'a str,
+    pub slot: usize,
+    pub params: HashMap<String, SmtValue>,
+    pub bindings: HashMap<String, (String, usize)>,
 }
 
 // ── Constraint generation ───────────────────────────────────────────
@@ -308,7 +308,9 @@ pub fn encode_create(
             conjuncts.push(act_next.clone());
         }
 
-        // Set field values at next step
+        // Set field values at next step from create block
+        let create_field_names: HashSet<&str> =
+            create_fields.iter().map(|(n, _)| n.as_str()).collect();
         for (field_name, value_expr) in create_fields {
             let val = encode_slot_expr(&ctx, value_expr, step);
             if let Some(field_next) = pool.field_at(entity_name, slot, field_name, step + 1) {
@@ -318,6 +320,36 @@ pub fn encode_create(
                     (SmtValue::Real(v), SmtValue::Real(f)) => conjuncts.push(f.eq(v.clone())),
                     _ => {
                         panic!("type mismatch in create field: value={val:?} field={field_next:?}")
+                    }
+                }
+            }
+        }
+
+        // Apply entity defaults for fields NOT specified in the create block.
+        // Without this, unconstrained fields could take any value, making the
+        // verification overly permissive.
+        if let Some(ent) = entity_ir {
+            for field in &ent.fields {
+                if create_field_names.contains(field.name.as_str()) {
+                    continue; // already set by create block
+                }
+                if let Some(ref default_expr) = field.default {
+                    let val = encode_slot_expr(&ctx, default_expr, step);
+                    if let Some(field_next) =
+                        pool.field_at(entity_name, slot, &field.name, step + 1)
+                    {
+                        match (&val, field_next) {
+                            (SmtValue::Int(v), SmtValue::Int(f)) => {
+                                conjuncts.push(f.eq(v.clone()));
+                            }
+                            (SmtValue::Bool(v), SmtValue::Bool(f)) => {
+                                conjuncts.push(f.eq(v.clone()));
+                            }
+                            (SmtValue::Real(v), SmtValue::Real(f)) => {
+                                conjuncts.push(f.eq(v.clone()));
+                            }
+                            _ => {} // skip if types don't match (e.g., Dynamic)
+                        }
                     }
                 }
             }
@@ -731,11 +763,62 @@ pub fn encode_event(
     event: &IREvent,
     step: usize,
 ) -> Bool {
-    encode_event_inner(pool, vctx, entities, all_systems, event, step, 0, None)
+    let (formula, touched) =
+        encode_event_inner(pool, vctx, entities, all_systems, event, step, 0, None);
+    apply_global_frame(pool, entities, &touched, step, formula)
+}
+
+/// Encode an event with specific parameter values (for scene checking).
+///
+/// Scene events supply concrete argument values (resolved from given bindings)
+/// rather than fresh unconstrained Z3 variables.
+#[allow(clippy::implicit_hasher)]
+pub fn encode_event_with_params(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    all_systems: &[IRSystem],
+    event: &IREvent,
+    step: usize,
+    params: HashMap<String, SmtValue>,
+) -> Bool {
+    let (formula, touched) = encode_event_inner(
+        pool,
+        vctx,
+        entities,
+        all_systems,
+        event,
+        step,
+        0,
+        Some(params),
+    );
+    apply_global_frame(pool, entities, &touched, step, formula)
+}
+
+/// Apply global frame for untouched slots to an event formula.
+/// Called once at the top level — never inside recursive `CrossCall` encoding.
+fn apply_global_frame(
+    pool: &SlotPool,
+    entities: &[IREntity],
+    touched: &HashSet<(String, usize)>,
+    step: usize,
+    formula: Bool,
+) -> Bool {
+    let frame = frame_untouched_slots(pool, entities, touched, step);
+    let mut all = vec![formula];
+    all.extend(frame);
+    let refs: Vec<&Bool> = all.iter().collect();
+    Bool::and(&refs)
 }
 
 /// Inner recursive implementation of `encode_event` with depth tracking
 /// to prevent infinite loops from cyclic cross-system calls.
+///
+/// Returns `(action_formula, touched_slots)` — the formula describing the
+/// event's effects WITHOUT global framing, plus the set of entity slots
+/// modified by the event. Global framing is applied once by the top-level
+/// caller (`encode_event` / `encode_event_with_params`), NOT inside
+/// recursive `CrossCall` invocations.
 ///
 /// `override_params` allows callers (e.g., `CrossCall`) to supply pre-built
 /// Z3 values for the target event's parameters, wiring the caller's args
@@ -750,7 +833,7 @@ fn encode_event_inner(
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
-) -> Bool {
+) -> (Bool, HashSet<(String, usize)>) {
     assert!(
         depth <= 10,
         "CrossCall recursion depth exceeded (depth {depth}) — possible cyclic cross-system calls"
@@ -1210,6 +1293,13 @@ fn encode_event_inner(
                             },
                             bindings: HashMap::new(),
                         };
+                        if target_event.params.len() != cross_args.len() {
+                            // Arity mismatches are validated in scene checking,
+                            // but keep harness encoding total so verify checks
+                            // never panic during recursive CrossCall expansion.
+                            conjuncts.push(Bool::from_bool(false));
+                            continue;
+                        }
                         for (target_param, arg_expr) in
                             target_event.params.iter().zip(cross_args.iter())
                         {
@@ -1217,8 +1307,11 @@ fn encode_event_inner(
                             cross_params.insert(target_param.name.clone(), val);
                         }
 
-                        // Recursively encode the target event with wired params
-                        let cross_formula = encode_event_inner(
+                        // Recursively encode the target event with wired params.
+                        // Merge the callee's touched set into ours — this is the key
+                        // fix for CrossCall framing: the callee does NOT apply its own
+                        // global frame, so there's no conflict with our modifications.
+                        let (cross_formula, cross_touched) = encode_event_inner(
                             pool,
                             vctx,
                             entities,
@@ -1229,13 +1322,8 @@ fn encode_event_inner(
                             Some(cross_params),
                         );
                         conjuncts.push(cross_formula);
-                        // Mark all entities used by the target system as touched
-                        for ent_name in &target_sys.entities {
-                            let n_slots = pool.slots_for(ent_name);
-                            for slot in 0..n_slots {
-                                touched.insert((ent_name.clone(), slot));
-                            }
-                        }
+                        // Merge callee's actual touched slots (not coarse system-level)
+                        touched.extend(cross_touched);
                     }
                 }
             }
@@ -1260,16 +1348,25 @@ fn encode_event_inner(
         }
     }
 
-    // Frame: all untouched slots stay unchanged (handles OTHER entity types)
-    let frame = frame_untouched_slots(pool, entities, &touched, step);
-    conjuncts.extend(frame);
-
-    let refs: Vec<&Bool> = conjuncts.iter().collect();
-    if refs.is_empty() {
-        Bool::from_bool(true)
-    } else {
-        Bool::and(&refs)
+    // Postcondition: if the event has an `ensures` clause, assert it at step+1.
+    // The postcondition is a constraint on the post-state that the event guarantees.
+    if let Some(post) = &event.postcondition {
+        let post_guard = encode_guard_expr(pool, vctx, post, &event_params, step + 1);
+        conjuncts.push(post_guard);
     }
+
+    // Return action formula + touched set. Global framing is applied by the
+    // top-level caller, NOT here — this allows CrossCall to compose without
+    // conflicting frame constraints.
+    let formula = {
+        let refs: Vec<&Bool> = conjuncts.iter().collect();
+        if refs.is_empty() {
+            Bool::from_bool(true)
+        } else {
+            Bool::and(&refs)
+        }
+    };
+    (formula, touched)
 }
 
 // ── Transition relation ─────────────────────────────────────────────
@@ -1318,7 +1415,7 @@ pub fn transition_constraints(
 ///
 /// Variable and field references resolve to `entity_s{slot}_{field}_t{step}`.
 /// Parameters (from action/event signatures) are checked first, then slot fields.
-fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
+pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
     match expr {
         IRExpr::Lit { value, .. } => encode_slot_literal(value),
 

@@ -19,12 +19,12 @@ use std::time::Instant;
 use z3::ast::Bool;
 use z3::Solver;
 
-use crate::ir::types::{IRAction, IRExpr, IRProgram, IRVerify};
+use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRVerify};
 
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool, domain_constraints, initial_state_constraints, transition_constraints,
-    SlotPool,
+    create_slot_pool, domain_constraints, encode_event_with_params, initial_state_constraints,
+    transition_constraints, SlotPool,
 };
 use self::smt::SmtValue;
 
@@ -67,7 +67,7 @@ pub struct TraceStep {
 
 /// Verify all targets in an IR program.
 ///
-/// Processes verify blocks (bounded model checking).
+/// Processes verify blocks (bounded model checking) and scene blocks (SAT).
 /// Returns one result per target.
 pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
@@ -76,6 +76,10 @@ pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
 
     for verify_block in &ir.verifies {
         results.push(check_verify_block(ir, &vctx, &defs, verify_block));
+    }
+
+    for scene_block in &ir.scenes {
+        results.push(check_scene_block(ir, &vctx, &defs, scene_block));
     }
 
     results
@@ -231,6 +235,376 @@ fn check_verify_block(
     }
 }
 
+// ── Scene checking (SAT) ────────────────────────────────────────────
+
+/// Check a scene block by encoding given/when/then as a SAT problem.
+///
+/// Scenes are existential: "does there exist an execution matching
+/// given+when that satisfies then?" This is the dual of verify blocks
+/// (which are universal).
+///
+/// 1. Build scope and pool from scene systems
+/// 2. Given: activate one slot per binding, constrain fields at step 0
+/// 3. When: encode each event at its step (ordering from assume)
+/// 4. Then: assert all then-expressions at the final step
+/// 5. SAT → `ScenePass`, UNSAT → `SceneFail`
+#[allow(clippy::too_many_lines)]
+fn check_scene_block(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    scene: &IRScene,
+) -> VerificationResult {
+    let start = Instant::now();
+    let n_events = scene.events.len();
+
+    // ── 1. Build scope from scene systems ──────────────────────────
+    // Each given binding needs one slot. Each entity type referenced
+    // needs at least as many slots as given bindings of that type.
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names: Vec<String> = scene.systems.clone();
+
+    // Count given bindings per entity type
+    for given in &scene.givens {
+        let entry = scope.entry(given.entity.clone()).or_insert(0);
+        *entry += 1;
+    }
+
+    // Include systems referenced directly in scene events (not just the 'for' clause)
+    for scene_event in &scene.events {
+        if !system_names.contains(&scene_event.system) {
+            system_names.push(scene_event.system.clone());
+        }
+    }
+
+    // Expand from systems — ensure all system entities are in scope.
+    // Also follow CrossCalls transitively. Non-given entities need enough
+    // slots for creates during the scenario (each event may create one instance).
+    let default_slots = n_events.max(1);
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(default_slots);
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return VerificationResult::SceneFail {
+            name: scene.name.clone(),
+            reason: "no systems or entities found".to_owned(),
+        };
+    }
+
+    // Bound = number of events (each event is one step)
+    let bound = n_events;
+
+    let relevant_entities: Vec<_> = ir
+        .entities
+        .iter()
+        .filter(|e| scope.contains_key(&e.name))
+        .cloned()
+        .collect();
+
+    let relevant_systems: Vec<_> = ir
+        .systems
+        .iter()
+        .filter(|s| system_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // ── 2. Create pool and solver ──────────────────────────────────
+    let pool = create_slot_pool(&relevant_entities, &scope, bound);
+    let solver = Solver::new();
+
+    // Domain constraints at every step
+    for c in domain_constraints(&pool, vctx, &relevant_entities) {
+        solver.assert(&c);
+    }
+
+    // ── 3. Encode given bindings ───────────────────────────────────
+    // Each given binding activates one slot at step 0 and constrains its fields.
+    // Track which slot each given variable is bound to.
+    let mut given_bindings: HashMap<String, (String, usize)> = HashMap::new(); // var → (entity, slot)
+    let mut next_slot: HashMap<String, usize> = HashMap::new(); // entity → next available slot
+
+    for given in &scene.givens {
+        if let Some(kind) = find_unsupported_scene_expr(&given.constraint) {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!(
+                    "unsupported expression kind in scene given for {}: {kind}",
+                    given.var
+                ),
+            };
+        }
+    }
+
+    for given in &scene.givens {
+        let slot = next_slot.entry(given.entity.clone()).or_insert(0);
+        let current_slot = *slot;
+        *slot += 1;
+
+        // Activate this slot at step 0
+        if let Some(SmtValue::Bool(active)) = pool.active_at(&given.entity, current_slot, 0) {
+            solver.assert(active);
+        }
+
+        // Encode the given constraint on this slot's fields at step 0
+        let given_ctx = PropertyCtx::new().with_binding(&given.var, &given.entity, current_slot);
+        let constraint = encode_prop_expr(&pool, vctx, defs, &given_ctx, &given.constraint, 0);
+        solver.assert(&constraint);
+
+        // Apply entity defaults for fields NOT explicitly constrained by the given block.
+        // Expand the constraint through DefEnv first so that pred/prop references
+        // are resolved, then collect field names to avoid default conflicts.
+        let expanded_constraint = expand_through_defs(&given.constraint, defs);
+        let mut constrained_fields = HashSet::new();
+        collect_field_refs_in_expr(&expanded_constraint, &given.var, &mut constrained_fields);
+        if let Some(entity_ir) = relevant_entities.iter().find(|e| e.name == given.entity) {
+            for field in &entity_ir.fields {
+                if constrained_fields.contains(field.name.as_str()) {
+                    continue; // given constraint already sets this field
+                }
+                if let Some(ref default_expr) = field.default {
+                    let default_ctx = harness::SlotEncodeCtx {
+                        pool: &pool,
+                        vctx,
+                        entity: &given.entity,
+                        slot: current_slot,
+                        params: HashMap::new(),
+                        bindings: HashMap::new(),
+                    };
+                    let val = harness::encode_slot_expr(&default_ctx, default_expr, 0);
+                    if let Some(field_var) =
+                        pool.field_at(&given.entity, current_slot, &field.name, 0)
+                    {
+                        match (&val, field_var) {
+                            (SmtValue::Int(v), SmtValue::Int(f)) => solver.assert(f.eq(v.clone())),
+                            (SmtValue::Bool(v), SmtValue::Bool(f)) => {
+                                solver.assert(f.eq(v.clone()));
+                            }
+                            (SmtValue::Real(v), SmtValue::Real(f)) => {
+                                solver.assert(f.eq(v.clone()));
+                            }
+                            _ => {} // skip Dynamic
+                        }
+                    }
+                }
+            }
+        }
+
+        given_bindings.insert(given.var.clone(), (given.entity.clone(), current_slot));
+    }
+
+    // Deactivate all other slots at step 0
+    for entity in &relevant_entities {
+        let n_slots = pool.slots_for(&entity.name);
+        let used = next_slot.get(&entity.name).copied().unwrap_or(0);
+        for slot in used..n_slots {
+            if let Some(SmtValue::Bool(active)) = pool.active_at(&entity.name, slot, 0) {
+                solver.assert(active.not());
+            }
+        }
+    }
+
+    // ── 4a. Validate scene events and determine referenced vars ────
+    // Reject unsupported cardinalities and validate arity up front.
+    for scene_event in &scene.events {
+        // Only {one} cardinality is supported for scenes
+        match &scene_event.cardinality {
+            crate::ir::types::Cardinality::Named(c) if c == "one" => {}
+            crate::ir::types::Cardinality::Exact { exactly: 1 } => {}
+            other => {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: format!(
+                        "unsupported cardinality {other:?} for scene event {}::{}; \
+                         only {{one}} is supported",
+                        scene_event.system, scene_event.event
+                    ),
+                };
+            }
+        }
+    }
+
+    // Scene ordering (assume blocks) is implicit from event list position.
+    // The assume expressions in scene.ordering are redundant for linear chains
+    // (a -> b -> c matches event list order). Non-linear ordering is not yet
+    // supported but the common linear case works correctly by construction.
+
+    for assertion in &scene.assertions {
+        if let Some(kind) = find_unsupported_scene_expr(assertion) {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!("unsupported expression kind in scene then assertion: {kind}"),
+            };
+        }
+    }
+
+    // Collect vars referenced in subsequent event args
+    let referenced_vars: HashSet<String> = {
+        let mut refs = HashSet::new();
+        for ev in &scene.events {
+            for arg in &ev.args {
+                collect_var_refs_in_expr(arg, &mut refs);
+            }
+        }
+        refs
+    };
+
+    // ── 4b. Encode when events ──────────────────────────────────────
+    // Each event fires at its step index (0-based).
+    for (step, scene_event) in scene.events.iter().enumerate() {
+        let sys = relevant_systems
+            .iter()
+            .find(|s| s.name == scene_event.system);
+        let Some(sys) = sys else {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!(
+                    "system {} not found for event {}",
+                    scene_event.system, scene_event.event
+                ),
+            };
+        };
+        let Some(event) = sys.events.iter().find(|e| e.name == scene_event.event) else {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!(
+                    "event {} not found in system {}",
+                    scene_event.event, scene_event.system
+                ),
+            };
+        };
+
+        // Validate arity: scene args must match event params
+        if scene_event.args.len() != event.params.len() {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!(
+                    "arity mismatch: scene provides {} args for {}::{} but event expects {} params",
+                    scene_event.args.len(),
+                    scene_event.system,
+                    scene_event.event,
+                    event.params.len()
+                ),
+            };
+        }
+
+        for arg in &scene_event.args {
+            if let Some(kind) = find_unsupported_scene_expr(arg) {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: format!(
+                        "unsupported expression kind in scene event arg for {}::{}: {kind}",
+                        scene_event.system, scene_event.event
+                    ),
+                };
+            }
+        }
+
+        if let Err(reason) = validate_crosscall_arities(&event.body, &relevant_systems, 0) {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason,
+            };
+        }
+
+        // Build override_params: resolve scene event args against current bindings.
+        let mut override_params: HashMap<String, SmtValue> = HashMap::new();
+        for (param, arg) in event.params.iter().zip(scene_event.args.iter()) {
+            let arg_ctx = PropertyCtx::new();
+            let arg_ctx = given_bindings
+                .iter()
+                .fold(arg_ctx, |ctx, (var, (ent, slot))| {
+                    ctx.with_binding(var, ent, *slot)
+                });
+            let val = encode_prop_value(&pool, vctx, defs, &arg_ctx, arg, step);
+            override_params.insert(param.name.clone(), val);
+        }
+
+        // Encode this specific event at this step with resolved params
+        let event_formula = encode_event_with_params(
+            &pool,
+            vctx,
+            &relevant_entities,
+            &relevant_systems,
+            event,
+            step,
+            override_params,
+        );
+        solver.assert(&event_formula);
+
+        // If this var is referenced by subsequent events, determine the result
+        // entity and bind it. Scan the event body (and CrossCalls) for Creates.
+        if referenced_vars.contains(&scene_event.var) {
+            let creates = scan_event_creates(&event.body, &relevant_systems);
+            if let Some(result_entity) = creates.first() {
+                // Pre-allocate next slot of this entity type
+                let slot = next_slot.entry(result_entity.clone()).or_insert(0);
+                let allocated_slot = *slot;
+                *slot += 1;
+
+                // Constrain: this slot was activated during this step
+                // (inactive at step → active at step+1)
+                if let Some(SmtValue::Bool(active_next)) =
+                    pool.active_at(result_entity, allocated_slot, step + 1)
+                {
+                    solver.assert(active_next);
+                }
+
+                // Bind the scene var to this slot
+                given_bindings.insert(
+                    scene_event.var.clone(),
+                    (result_entity.clone(), allocated_slot),
+                );
+            }
+        }
+    }
+
+    // ── 5. Encode then assertions at final step ────────────────────
+    let final_step = bound; // after all events
+    let mut then_ctx = PropertyCtx::new();
+    for (var, (entity, slot)) in &given_bindings {
+        then_ctx = then_ctx.with_binding(var, entity, *slot);
+    }
+
+    for assertion in &scene.assertions {
+        let prop = encode_prop_expr(&pool, vctx, defs, &then_ctx, assertion, final_step);
+        solver.assert(&prop);
+    }
+
+    // ── 6. Check SAT ───────────────────────────────────────────────
+    let elapsed = elapsed_ms(&start);
+
+    match solver.check() {
+        z3::SatResult::Sat => VerificationResult::ScenePass {
+            name: scene.name.clone(),
+            time_ms: elapsed,
+        },
+        z3::SatResult::Unsat => VerificationResult::SceneFail {
+            name: scene.name.clone(),
+            reason: "scenario is unsatisfiable — no execution matches given+when+then".to_owned(),
+        },
+        z3::SatResult::Unknown => VerificationResult::SceneFail {
+            name: scene.name.clone(),
+            reason: "Z3 returned unknown".to_owned(),
+        },
+    }
+}
+
 // ── Property encoding context ────────────────────────────────────────
 
 /// Tracks quantifier-bound variables mapping `var_name` → (`entity_name`, `slot_index`).
@@ -280,6 +654,229 @@ fn collect_crosscall_systems(actions: &[IRAction], targets: &mut Vec<String>) {
             _ => {}
         }
     }
+}
+
+/// Scan an event body (and `CrossCall` targets) for Create actions.
+/// Returns the entity types created, in order of first appearance.
+fn scan_event_creates(
+    actions: &[IRAction],
+    all_systems: &[crate::ir::types::IRSystem],
+) -> Vec<String> {
+    let mut creates = Vec::new();
+    scan_event_creates_inner(actions, all_systems, &mut creates, 0);
+    creates
+}
+
+fn scan_event_creates_inner(
+    actions: &[IRAction],
+    all_systems: &[crate::ir::types::IRSystem],
+    creates: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 10 {
+        return; // prevent infinite recursion on cyclic CrossCalls
+    }
+    for action in actions {
+        match action {
+            IRAction::Create { entity, .. } => {
+                if !creates.contains(entity) {
+                    creates.push(entity.clone());
+                }
+            }
+            IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                scan_event_creates_inner(ops, all_systems, creates, depth);
+            }
+            IRAction::CrossCall {
+                system,
+                event: event_name,
+                ..
+            } => {
+                if let Some(sys) = all_systems.iter().find(|s| s.name == *system) {
+                    if let Some(ev) = sys.events.iter().find(|e| e.name == *event_name) {
+                        scan_event_creates_inner(&ev.body, all_systems, creates, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Expand an IR expression through the `DefEnv` — replace Var refs matching
+/// nullary defs with their bodies, and App chains matching parameterized defs
+/// with their beta-reduced bodies. Used to resolve pred/prop references in
+/// given constraints before scanning for field references.
+fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
+    if let IRExpr::Var { name, .. } = expr {
+        if let Some(expanded) = defs.expand_var(name) {
+            return expand_through_defs(&expanded, defs);
+        }
+    }
+    if let IRExpr::App { .. } = expr {
+        if let Some(expanded) = defs.expand_app(expr) {
+            return expand_through_defs(&expanded, defs);
+        }
+    }
+    match expr {
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+        } => IRExpr::BinOp {
+            op: op.clone(),
+            left: Box::new(expand_through_defs(left, defs)),
+            right: Box::new(expand_through_defs(right, defs)),
+            ty: ty.clone(),
+        },
+        IRExpr::UnOp { op, operand, ty } => IRExpr::UnOp {
+            op: op.clone(),
+            operand: Box::new(expand_through_defs(operand, defs)),
+            ty: ty.clone(),
+        },
+        IRExpr::Forall { var, domain, body } => IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        IRExpr::Exists { var, domain, body } => IRExpr::Exists {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Collect field names referenced as `Field(Var(var_name), field)` in an expression.
+/// Used to determine which entity fields are explicitly constrained by a given block
+/// so that defaults are only applied to unconstrained fields.
+fn collect_field_refs_in_expr(expr: &IRExpr, var_name: &str, fields: &mut HashSet<String>) {
+    match expr {
+        IRExpr::Field {
+            expr: inner, field, ..
+        } => {
+            if let IRExpr::Var { name, .. } = inner.as_ref() {
+                if name == var_name {
+                    fields.insert(field.clone());
+                }
+            }
+            collect_field_refs_in_expr(inner, var_name, fields);
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            collect_field_refs_in_expr(left, var_name, fields);
+            collect_field_refs_in_expr(right, var_name, fields);
+        }
+        IRExpr::UnOp { operand, .. } => collect_field_refs_in_expr(operand, var_name, fields),
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
+            collect_field_refs_in_expr(body, var_name, fields);
+        }
+        _ => {}
+    }
+}
+
+/// Collect variable names referenced in an IR expression (for scene var tracking).
+/// Looks for `Field(Var(name), _)` patterns — `res.id` means `res` is referenced.
+fn collect_var_refs_in_expr(expr: &IRExpr, refs: &mut HashSet<String>) {
+    match expr {
+        IRExpr::Field { expr: inner, .. } => {
+            if let IRExpr::Var { name, .. } = inner.as_ref() {
+                refs.insert(name.clone());
+            }
+            collect_var_refs_in_expr(inner, refs);
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            collect_var_refs_in_expr(left, refs);
+            collect_var_refs_in_expr(right, refs);
+        }
+        IRExpr::UnOp { operand, .. } => collect_var_refs_in_expr(operand, refs),
+        IRExpr::App { func, arg, .. } => {
+            collect_var_refs_in_expr(func, refs);
+            collect_var_refs_in_expr(arg, refs);
+        }
+        _ => {}
+    }
+}
+
+/// Return the first expression kind that scene checking cannot encode safely.
+///
+/// Scene checks currently rely on `encode_prop_expr` / `encode_prop_value` for
+/// given constraints, event arguments, and then assertions. Some expression
+/// forms still panic there; reject those forms up front with `SceneFail`.
+fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
+    match expr {
+        IRExpr::Let { .. } => Some("Let"),
+        IRExpr::Lam { .. } => Some("Lam"),
+        IRExpr::Match { .. } => Some("Match"),
+        IRExpr::MapUpdate { .. } => Some("MapUpdate"),
+        IRExpr::Index { .. } => Some("Index"),
+        IRExpr::SetLit { .. } => Some("SetLit"),
+        IRExpr::SeqLit { .. } => Some("SeqLit"),
+        IRExpr::MapLit { .. } => Some("MapLit"),
+        IRExpr::SetComp { .. } => Some("SetComp"),
+        IRExpr::Sorry => Some("Sorry"),
+        IRExpr::Todo => Some("Todo"),
+        IRExpr::Field { expr, .. }
+        | IRExpr::UnOp { operand: expr, .. }
+        | IRExpr::Prime { expr }
+        | IRExpr::Always { body: expr }
+        | IRExpr::Eventually { body: expr } => find_unsupported_scene_expr(expr),
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::App {
+            func: left,
+            arg: right,
+            ..
+        } => find_unsupported_scene_expr(left).or_else(|| find_unsupported_scene_expr(right)),
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
+            find_unsupported_scene_expr(body)
+        }
+        IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
+    }
+}
+
+/// Validate recursive `CrossCall` arities before encoding a scene.
+///
+/// This avoids panics in the harness and produces a user-facing `SceneFail`
+/// reason pinpointing the mismatched call.
+fn validate_crosscall_arities(
+    actions: &[IRAction],
+    all_systems: &[crate::ir::types::IRSystem],
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 10 {
+        return Ok(());
+    }
+    for action in actions {
+        match action {
+            IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                validate_crosscall_arities(ops, all_systems, depth + 1)?;
+            }
+            IRAction::CrossCall {
+                system,
+                event,
+                args,
+            } => {
+                let Some(sys) = all_systems.iter().find(|s| s.name == *system) else {
+                    return Err(format!("CrossCall target system not found: {system}"));
+                };
+                let Some(target_event) = sys.events.iter().find(|e| e.name == *event) else {
+                    return Err(format!(
+                        "CrossCall target event not found: {system}::{event}"
+                    ));
+                };
+                if target_event.params.len() != args.len() {
+                    return Err(format!(
+                        "CrossCall arity mismatch: {system}::{event} expects {} params but got {} args",
+                        target_event.params.len(),
+                        args.len()
+                    ));
+                }
+                validate_crosscall_arities(&target_event.body, all_systems, depth + 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn encode_verify_properties(
@@ -963,5 +1560,451 @@ mod tests {
         };
         let results = verify_all(&ir);
         assert!(results.is_empty());
+    }
+
+    fn make_dummy_entity() -> IREntity {
+        IREntity {
+            name: "Dummy".to_owned(),
+            fields: vec![IRField {
+                name: "id".to_owned(),
+                ty: IRType::Id,
+                default: None,
+            }],
+            transitions: vec![],
+        }
+    }
+
+    fn make_noop_event(name: &str) -> IREvent {
+        IREvent {
+            name: name.to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            },
+            postcondition: None,
+            body: vec![IRAction::ExprStmt {
+                expr: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn scene_rejects_let_in_given_constraint() {
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![make_dummy_entity()],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![IRScene {
+                name: "let_scene".to_owned(),
+                systems: vec![],
+                givens: vec![IRSceneGiven {
+                    var: "d".to_owned(),
+                    entity: "Dummy".to_owned(),
+                    constraint: IRExpr::Let {
+                        bindings: vec![LetBinding {
+                            name: "x".to_owned(),
+                            ty: IRType::Int,
+                            expr: IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            },
+                        }],
+                        body: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                    },
+                }],
+                events: vec![],
+                ordering: vec![],
+                assertions: vec![],
+            }],
+        };
+
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            VerificationResult::SceneFail { reason, .. } => {
+                assert!(reason.contains("unsupported expression kind in scene given"));
+                assert!(reason.contains("Let"));
+            }
+            other => panic!("expected SceneFail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scene_reports_crosscall_arity_mismatch() {
+        let caller = IRSystem {
+            name: "Caller".to_owned(),
+            entities: vec!["Dummy".to_owned()],
+            events: vec![IREvent {
+                name: "start".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::CrossCall {
+                    system: "Callee".to_owned(),
+                    event: "run".to_owned(),
+                    args: vec![IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+        let callee = IRSystem {
+            name: "Callee".to_owned(),
+            entities: vec!["Dummy".to_owned()],
+            events: vec![IREvent {
+                name: "run".to_owned(),
+                params: vec![
+                    IRTransParam {
+                        name: "a".to_owned(),
+                        ty: IRType::Int,
+                    },
+                    IRTransParam {
+                        name: "b".to_owned(),
+                        ty: IRType::Int,
+                    },
+                ],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::ExprStmt {
+                    expr: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![make_dummy_entity()],
+            systems: vec![caller, callee],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![IRScene {
+                name: "crosscall_arity".to_owned(),
+                systems: vec!["Caller".to_owned()],
+                givens: vec![],
+                events: vec![IRSceneEvent {
+                    var: "r".to_owned(),
+                    system: "Caller".to_owned(),
+                    event: "start".to_owned(),
+                    args: vec![],
+                    cardinality: Cardinality::Named("one".to_owned()),
+                }],
+                ordering: vec![],
+                assertions: vec![],
+            }],
+        };
+
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            VerificationResult::SceneFail { reason, .. } => {
+                assert!(reason.contains("CrossCall arity mismatch"));
+                assert!(reason.contains("Callee::run"));
+            }
+            other => panic!("expected SceneFail, got {other:?}"),
+        }
+    }
+
+    /// Build a minimal IR with an entity that has a status field,
+    /// a transition, and a system event — for scene testing.
+    fn make_scene_test_ir(scene: IRScene) -> IRProgram {
+        let status_enum = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Active".to_owned(), "Locked".to_owned()],
+            },
+        };
+
+        let account = IREntity {
+            name: "Account".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "id".to_owned(),
+                    ty: IRType::Id,
+                    default: None,
+                },
+                IRField {
+                    name: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        constructors: vec!["Active".to_owned(), "Locked".to_owned()],
+                    },
+                    default: Some(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "lock".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                },
+                updates: vec![IRUpdate {
+                    field: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Locked".to_owned(),
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "Auth".to_owned(),
+            entities: vec!["Account".to_owned()],
+            events: vec![IREvent {
+                name: "lock_account".to_owned(),
+                params: vec![IRTransParam {
+                    name: "account_id".to_owned(),
+                    ty: IRType::Id,
+                }],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "a".to_owned(),
+                    entity: "Account".to_owned(),
+                    filter: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "a".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "Account".to_owned(),
+                                },
+                            }),
+                            field: "id".to_owned(),
+                            ty: IRType::Id,
+                        }),
+                        right: Box::new(IRExpr::Var {
+                            name: "account_id".to_owned(),
+                            ty: IRType::Id,
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "a".to_owned(),
+                        transition: "lock".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        IRProgram {
+            types: vec![status_enum],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![account],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![scene],
+        }
+    }
+
+    #[test]
+    fn scene_happy_path_passes() {
+        // Scene: given an Active account, lock it, then assert it's Locked.
+        let scene = IRScene {
+            name: "lock_test".to_owned(),
+            systems: vec!["Auth".to_owned()],
+            givens: vec![IRSceneGiven {
+                var: "a".to_owned(),
+                entity: "Account".to_owned(),
+                constraint: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "a".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Account".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                },
+            }],
+            events: vec![IRSceneEvent {
+                var: "lk".to_owned(),
+                system: "Auth".to_owned(),
+                event: "lock_account".to_owned(),
+                args: vec![IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "a".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Account".to_owned(),
+                        },
+                    }),
+                    field: "id".to_owned(),
+                    ty: IRType::Id,
+                }],
+                cardinality: Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![],
+            assertions: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "a".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Account".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Locked".to_owned(),
+                }),
+                ty: IRType::Bool,
+            }],
+        };
+
+        let ir = make_scene_test_ir(scene);
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::ScenePass { .. }),
+            "expected ScenePass, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn scene_impossible_assertion_fails() {
+        // Scene: given an Active account, lock it, then assert it's STILL Active.
+        // This is impossible — lock changes Active → Locked.
+        let scene = IRScene {
+            name: "impossible_test".to_owned(),
+            systems: vec!["Auth".to_owned()],
+            givens: vec![IRSceneGiven {
+                var: "a".to_owned(),
+                entity: "Account".to_owned(),
+                constraint: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "a".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Account".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                },
+            }],
+            events: vec![IRSceneEvent {
+                var: "lk".to_owned(),
+                system: "Auth".to_owned(),
+                event: "lock_account".to_owned(),
+                args: vec![IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "a".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Account".to_owned(),
+                        },
+                    }),
+                    field: "id".to_owned(),
+                    ty: IRType::Id,
+                }],
+                cardinality: Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![],
+            // Assert status is STILL Active — impossible after lock
+            assertions: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "a".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Account".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Active".to_owned(),
+                }),
+                ty: IRType::Bool,
+            }],
+        };
+
+        let ir = make_scene_test_ir(scene);
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::SceneFail { .. }),
+            "expected SceneFail, got: {:?}",
+            results[0]
+        );
     }
 }

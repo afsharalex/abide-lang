@@ -64,7 +64,7 @@ system Commerce {
     choose o: Order where o.id == order_id {
       o.submit()
     }
-    Billing::open_intent(order_id: order_id)
+    Billing::open_intent(order_id: order_id, amount: o.total)
   }
 
   event confirm_payment(order_id: Id)
@@ -97,10 +97,10 @@ system Commerce {
 system Billing {
   use PaymentIntent
 
-  event open_intent(order_id: Id) {
+  event open_intent(order_id: Id, amount: Price) {
     create PaymentIntent {
       order_id = order_id
-      amount = 0
+      amount = amount
       status = @Opened
     }
   }

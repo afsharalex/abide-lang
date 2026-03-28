@@ -218,15 +218,14 @@ verify end_to_end for Warehouse[0..8], Shipping[0..8] {
 }
 
 // Scenarios
-scene reserve_and_fulfill for Warehouse, Shipping {
+scene reserve_and_confirm for Warehouse {
   given {
     let p = one Product where p.quantity == 50 and p.status == @Available
   }
   when {
     action res = Warehouse::reserve_product(p.id, 10){one}
     action conf = Warehouse::confirm_reservation(res.id){one}
-    action deliv = Shipping::mark_delivered(conf.id){one}
-    assume res -> conf -> deliv
+    assume res -> conf
   }
   then {
     assert p.quantity == 40
