@@ -179,6 +179,43 @@ pub fn initial_state_constraints(pool: &SlotPool) -> Vec<Bool> {
     constraints
 }
 
+/// Symmetry breaking: for each entity type, require that slots are activated
+/// in order. If slot i is inactive at step k, then slot i+1 must also be
+/// inactive at step k. This eliminates equivalent states where the same
+/// entities appear in different slot orderings.
+///
+/// Halves (or more) the search space without excluding any behaviors.
+pub fn symmetry_breaking_constraints(pool: &SlotPool) -> Vec<Bool> {
+    let mut constraints = Vec::new();
+
+    // Group slots by entity type
+    let mut entities: HashMap<String, usize> = HashMap::new();
+    for (entity, _slot) in pool.active_vars.keys() {
+        let count = entities.entry(entity.clone()).or_insert(0);
+        *count = (*count).max(pool.slots_for(entity));
+    }
+
+    for (entity, n_slots) in &entities {
+        if *n_slots < 2 {
+            continue;
+        }
+        // For each step, slot i inactive → slot i+1 inactive
+        for step in 0..=pool.bound {
+            for slot in 0..(*n_slots - 1) {
+                if let (Some(SmtValue::Bool(act_i)), Some(SmtValue::Bool(act_j))) = (
+                    pool.active_at(entity, slot, step),
+                    pool.active_at(entity, slot + 1, step),
+                ) {
+                    // ¬active[i] → ¬active[i+1]  ≡  active[i+1] → active[i]
+                    constraints.push(act_j.implies(act_i));
+                }
+            }
+        }
+    }
+
+    constraints
+}
+
 /// Encode an entity action as a transition relation for a specific slot.
 ///
 /// Returns a `Bool` formula: `guard(slot, step) AND updates(slot, step, step+1) AND frame(slot, step, step+1)`.

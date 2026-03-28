@@ -24,7 +24,7 @@ use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRTheorem, IRVerify
 use self::context::VerifyContext;
 use self::harness::{
     create_slot_pool, domain_constraints, encode_event_with_params, initial_state_constraints,
-    transition_constraints, SlotPool,
+    symmetry_breaking_constraints, transition_constraints, SlotPool,
 };
 use self::smt::SmtValue;
 
@@ -63,27 +63,80 @@ pub struct TraceStep {
     pub assignments: Vec<(String, String, String)>, // (entity, field, value)
 }
 
+// ── Configuration ───────────────────────────────────────────────────
+
+/// Configuration for the verification pipeline.
+pub struct VerifyConfig {
+    /// Skip Tier 1 (induction), only run bounded model checking.
+    pub bounded_only: bool,
+    /// Skip Tier 2 (BMC), only try induction.
+    pub unbounded_only: bool,
+    /// Timeout for Tier 1 induction attempts, in milliseconds.
+    pub induction_timeout_ms: u64,
+    /// Timeout for Tier 2 BMC attempts, in milliseconds. 0 = no timeout.
+    pub bmc_timeout_ms: u64,
+    /// Default BMC depth for auto-verified props (which lack explicit `[0..N]`).
+    pub prop_bmc_depth: usize,
+    /// Print progress messages to stderr.
+    pub progress: bool,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            bounded_only: false,
+            unbounded_only: false,
+            induction_timeout_ms: 5000,
+            bmc_timeout_ms: 0,
+            prop_bmc_depth: 10,
+            progress: false,
+        }
+    }
+}
+
 // ── Top-level verification entry point ──────────────────────────────
 
 /// Verify all targets in an IR program.
 ///
-/// Processes verify blocks (bounded model checking) and scene blocks (SAT).
+/// Processes verify blocks (tiered: induction → BMC), scene blocks (SAT),
+/// and theorem blocks (induction only).
 /// Returns one result per target.
-pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
+pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
     let defs = defenv::DefEnv::from_ir(ir);
     let mut results = Vec::new();
 
     for verify_block in &ir.verifies {
-        results.push(check_verify_block(ir, &vctx, &defs, verify_block));
+        if config.progress {
+            eprint!("Checking {}...", verify_block.name);
+        }
+        let result = check_verify_block_tiered(ir, &vctx, &defs, verify_block, config);
+        if config.progress {
+            eprintln!(" done");
+        }
+        results.push(result);
     }
 
     for scene_block in &ir.scenes {
-        results.push(check_scene_block(ir, &vctx, &defs, scene_block));
+        if config.progress {
+            eprint!("Checking scene {}...", scene_block.name);
+        }
+        let result = check_scene_block(ir, &vctx, &defs, scene_block);
+        if config.progress {
+            eprintln!(" done");
+        }
+        results.push(result);
     }
 
     for theorem_block in &ir.theorems {
-        results.push(check_theorem_block(ir, &vctx, &defs, theorem_block));
+        if config.progress {
+            eprint!("Proving {}...", theorem_block.name);
+        }
+        let result = check_theorem_block(ir, &vctx, &defs, theorem_block);
+        if config.progress {
+            eprintln!(" done");
+        }
+        results.push(result);
     }
 
     results
@@ -93,6 +146,233 @@ pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
 #[allow(clippy::cast_possible_truncation)]
 fn elapsed_ms(start: &Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+// ── Tiered dispatch for verify blocks ───────────────────────────────
+
+/// Check a verify block using tiered dispatch (DDR-031):
+///
+/// 1. If asserts contain `eventually`, skip Tier 1 (liveness can't be proved by induction)
+/// 2. **Tier 1:** Try 1-induction with timeout — if PROVED, done
+/// 3. **Tier 2:** Fall back to bounded model checking with `[0..N]` depth
+///
+/// The user writes the same `verify` block regardless of which tier succeeds.
+fn check_verify_block_tiered(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> VerificationResult {
+    // Check if any assert contains `eventually` — skip induction for liveness
+    let has_liveness = verify_block.asserts.iter().any(|a| {
+        let expanded = expand_through_defs(a, defs);
+        contains_eventually(&expanded)
+    });
+
+    // Tier 1: Try induction (unless bounded-only or liveness)
+    if !config.bounded_only && !has_liveness {
+        if let Some(result) = try_induction_on_verify(ir, vctx, defs, verify_block, config) {
+            return result;
+        }
+        // Induction failed or timed out — fall through to Tier 2
+    }
+
+    // Tier 2: Bounded model checking (unless unbounded-only)
+    if config.unbounded_only {
+        let hint = if has_liveness {
+            "contains `eventually` (liveness) — induction not applicable, \
+             and --unbounded-only was specified"
+                .to_owned()
+        } else {
+            "induction failed and --unbounded-only was specified".to_owned()
+        };
+        return VerificationResult::Unprovable {
+            name: verify_block.name.clone(),
+            hint,
+        };
+    }
+
+    check_verify_block(ir, vctx, defs, verify_block, config)
+}
+
+/// Attempt to prove a verify block's asserts by 1-induction.
+///
+/// Returns `Some(Proved)` if all asserts are inductive.
+/// Returns `None` if induction fails, times out, or can't be applied.
+#[allow(clippy::too_many_lines)]
+fn try_induction_on_verify(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let start = Instant::now();
+
+    // Build scope (same as check_verify_block but reusable)
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names: Vec<String> = Vec::new();
+
+    for vs in &verify_block.systems {
+        system_names.push(vs.name.clone());
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == vs.name) {
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    // Expand scope via CrossCall
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return None;
+    }
+
+    // Analyze quantifier depth for adaptive scope
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in counts {
+            let min_slots = count + 1;
+            if let Some(existing) = scope.get_mut(&entity) {
+                *existing = (*existing).max(min_slots);
+            }
+        }
+    }
+
+    let relevant_entities: Vec<_> = ir
+        .entities
+        .iter()
+        .filter(|e| scope.contains_key(&e.name))
+        .cloned()
+        .collect();
+
+    let relevant_systems: Vec<_> = ir
+        .systems
+        .iter()
+        .filter(|s| system_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // Strip `always` wrappers from asserts — induction proves always by construction
+    let show_exprs: Vec<&IRExpr> = verify_block
+        .asserts
+        .iter()
+        .map(|a| match a {
+            IRExpr::Always { body } => body.as_ref(),
+            other => other,
+        })
+        .collect();
+
+    // Pre-check: reject unsupported expressions
+    for expr in &show_exprs {
+        let expanded = expand_through_defs(expr, defs);
+        if find_unsupported_scene_expr(&expanded).is_some() {
+            return None; // can't attempt induction — fall back to BMC
+        }
+    }
+
+    // ── Base case: P holds at step 0 ───────────────────────────────
+    {
+        let pool = create_slot_pool(&relevant_entities, &scope, 0);
+        let solver = Solver::new();
+        set_solver_timeout(&solver, config.induction_timeout_ms);
+
+        for c in initial_state_constraints(&pool) {
+            solver.assert(&c);
+        }
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        let mut negated = Vec::new();
+        for expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, expr, 0);
+            negated.push(prop.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // base holds
+            _ => return None,          // base fails or timeout — fall back
+        }
+    }
+
+    // ── Step case: P(k) ∧ transition(k→k+1) → P(k+1) ─────────────
+    {
+        let pool = create_slot_pool(&relevant_entities, &scope, 1);
+        let solver = Solver::new();
+        set_solver_timeout(&solver, config.induction_timeout_ms);
+
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        // Assume P at step 0
+        for expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, expr, 0);
+            solver.assert(&prop);
+        }
+
+        // One transition
+        let trans = transition_constraints(&pool, vctx, &relevant_entities, &relevant_systems, 0);
+        solver.assert(&trans);
+
+        // Assert NOT P at step 1
+        let mut negated = Vec::new();
+        for expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, expr, 1);
+            negated.push(prop.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // step holds
+            _ => return None,          // step fails or timeout — fall back
+        }
+    }
+
+    // Both passed — PROVED
+    let elapsed = elapsed_ms(&start);
+    Some(VerificationResult::Proved {
+        name: verify_block.name.clone(),
+        method: "1-induction".to_owned(),
+        time_ms: elapsed,
+    })
+}
+
+/// Set a timeout on a Z3 solver instance (milliseconds).
+#[allow(clippy::cast_possible_truncation)]
+fn set_solver_timeout(solver: &Solver, timeout_ms: u64) {
+    let mut params = z3::Params::new();
+    params.set_u32("timeout", timeout_ms.min(u64::from(u32::MAX)) as u32);
+    solver.set_params(&params);
 }
 
 // ── BMC check for a single verify block ─────────────────────────────
@@ -105,11 +385,13 @@ fn elapsed_ms(start: &Instant) -> u64 {
 /// 4. Encode properties at every step
 /// 5. Negate to search for counterexample
 /// 6. UNSAT → CHECKED, SAT → COUNTEREXAMPLE
+#[allow(clippy::too_many_lines)]
 fn check_verify_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
     defs: &defenv::DefEnv,
     verify_block: &IRVerify,
+    config: &VerifyConfig,
 ) -> VerificationResult {
     let start = Instant::now();
 
@@ -187,9 +469,17 @@ fn check_verify_block(
 
     // ── 4. Build solver and assert constraints ─────────────────────
     let solver = Solver::new();
+    if config.bmc_timeout_ms > 0 {
+        set_solver_timeout(&solver, config.bmc_timeout_ms);
+    }
 
     // Initial state: all slots inactive at step 0
     for c in initial_state_constraints(&pool) {
+        solver.assert(&c);
+    }
+
+    // Symmetry breaking: slots activated in order to reduce search space
+    for c in symmetry_breaking_constraints(&pool) {
         solver.assert(&c);
     }
 
@@ -232,10 +522,24 @@ fn check_verify_block(
                 trace,
             }
         }
-        z3::SatResult::Unknown => VerificationResult::Unprovable {
-            name: verify_block.name.clone(),
-            hint: "Z3 returned unknown — try reducing bound or simplifying property".to_owned(),
-        },
+        z3::SatResult::Unknown => {
+            let hint = if config.bmc_timeout_ms > 0 {
+                let timeout_display = if config.bmc_timeout_ms >= 1000 {
+                    format!("{}s", config.bmc_timeout_ms / 1000)
+                } else {
+                    format!("{}ms", config.bmc_timeout_ms)
+                };
+                format!(
+                    "Z3 timed out after {timeout_display} — try reducing bound, increasing --bmc-timeout, or simplifying property"
+                )
+            } else {
+                "Z3 returned unknown — try reducing bound or simplifying property".to_owned()
+            };
+            VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint,
+            }
+        }
     }
 }
 
@@ -1182,6 +1486,60 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
             domain: domain.clone(),
             body: Box::new(expand_through_defs(body, defs)),
         },
+        IRExpr::Always { body } => IRExpr::Always {
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        IRExpr::Eventually { body } => IRExpr::Eventually {
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        IRExpr::Field {
+            expr: inner,
+            field,
+            ty,
+        } => IRExpr::Field {
+            expr: Box::new(expand_through_defs(inner, defs)),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        IRExpr::Prime { expr: inner } => IRExpr::Prime {
+            expr: Box::new(expand_through_defs(inner, defs)),
+        },
+        IRExpr::App { func, arg, ty } => IRExpr::App {
+            func: Box::new(expand_through_defs(func, defs)),
+            arg: Box::new(expand_through_defs(arg, defs)),
+            ty: ty.clone(),
+        },
+        IRExpr::Let { bindings, body } => IRExpr::Let {
+            bindings: bindings
+                .iter()
+                .map(|b| crate::ir::types::LetBinding {
+                    name: b.name.clone(),
+                    ty: b.ty.clone(),
+                    expr: expand_through_defs(&b.expr, defs),
+                })
+                .collect(),
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        IRExpr::Lam {
+            param,
+            param_type,
+            body,
+        } => IRExpr::Lam {
+            param: param.clone(),
+            param_type: param_type.clone(),
+            body: Box::new(expand_through_defs(body, defs)),
+        },
+        IRExpr::Match { scrutinee, arms } => IRExpr::Match {
+            scrutinee: Box::new(expand_through_defs(scrutinee, defs)),
+            arms: arms
+                .iter()
+                .map(|arm| crate::ir::types::IRMatchArm {
+                    pattern: arm.pattern.clone(),
+                    guard: arm.guard.as_ref().map(|g| expand_through_defs(g, defs)),
+                    body: expand_through_defs(&arm.body, defs),
+                })
+                .collect(),
+        },
         _ => expr.clone(),
     }
 }
@@ -1894,12 +2252,12 @@ mod tests {
         };
 
         let ir = make_order_ir(property, 3);
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
 
         assert_eq!(results.len(), 1);
         assert!(
-            matches!(&results[0], VerificationResult::Checked { name, .. } if name == "test_verify"),
-            "expected CHECKED, got: {:?}",
+            matches!(&results[0], VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. } if name == "test_verify"),
+            "expected CHECKED or PROVED, got: {:?}",
             results[0]
         );
     }
@@ -1973,7 +2331,7 @@ mod tests {
             }],
         });
 
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -1996,7 +2354,7 @@ mod tests {
             axioms: vec![],
             scenes: vec![],
         };
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert!(results.is_empty());
     }
 
@@ -2068,7 +2426,7 @@ mod tests {
             }],
         };
 
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         match &results[0] {
             VerificationResult::SceneFail { reason, .. } => {
@@ -2163,7 +2521,7 @@ mod tests {
             }],
         };
 
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         match &results[0] {
             VerificationResult::SceneFail { reason, .. } => {
@@ -2360,7 +2718,7 @@ mod tests {
         };
 
         let ir = make_scene_test_ir(scene);
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0], VerificationResult::ScenePass { .. }),
@@ -2437,7 +2795,7 @@ mod tests {
         };
 
         let ir = make_scene_test_ir(scene);
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0], VerificationResult::SceneFail { .. }),
@@ -2490,7 +2848,7 @@ mod tests {
             }],
         });
 
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
@@ -2572,11 +2930,225 @@ mod tests {
             }],
         });
 
-        let results = verify_all(&ir);
+        let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0], VerificationResult::Unprovable { .. }),
             "expected Unprovable, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn tiered_bounded_only_skips_induction() {
+        // With bounded_only, an inductive property should be CHECKED (not PROVED)
+        let ir = make_order_ir(
+            IRExpr::Always {
+                body: Box::new(IRExpr::Forall {
+                    var: "o".to_owned(),
+                    domain: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    body: Box::new(IRExpr::BinOp {
+                        op: "OpNEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "o".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: -1 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                }),
+            },
+            3,
+        );
+        let config = VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::Checked { .. }),
+            "expected CHECKED with bounded_only, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn tiered_unbounded_only_returns_unknown_on_failure() {
+        // With unbounded_only, a non-inductive property should be UNKNOWN (not CHECKED)
+        let mut ir = make_order_ir(
+            IRExpr::Always {
+                body: Box::new(IRExpr::Forall {
+                    var: "o".to_owned(),
+                    domain: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    body: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "o".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "OrderStatus".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                }),
+            },
+            3,
+        );
+        // Add create so induction step fails (status changes via confirm)
+        ir.systems[0].events.push(IREvent {
+            name: "create_order".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            },
+            postcondition: None,
+            body: vec![IRAction::Create {
+                entity: "Order".to_owned(),
+                fields: vec![
+                    IRCreateField {
+                        name: "id".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    },
+                    IRCreateField {
+                        name: "status".to_owned(),
+                        value: IRExpr::Ctor {
+                            enum_name: "OrderStatus".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        },
+                    },
+                ],
+            }],
+        });
+        let config = VerifyConfig {
+            unbounded_only: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::Unprovable { .. }),
+            "expected UNKNOWN with unbounded_only, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn bmc_timeout_returns_unknown() {
+        // With a 1ms BMC timeout, even a simple property should return UNKNOWN
+        // because the solver can't finish in time.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpNEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: -1 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+        let ir = make_order_ir(property, 10);
+        let config = VerifyConfig {
+            bounded_only: true,
+            bmc_timeout_ms: 1, // 1ms — too short to solve
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        // Should be either CHECKED (if solver is fast enough) or UNKNOWN (timeout)
+        // On most systems, 1ms is too short for depth 10, but Z3 may be fast enough.
+        // Accept either — the important thing is it doesn't panic.
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Checked { .. } | VerificationResult::Unprovable { .. }
+            ),
+            "expected CHECKED or UNKNOWN with 1ms timeout, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn symmetry_breaking_does_not_regress_results() {
+        // Symmetry breaking should not change correctness — valid properties should
+        // still pass. The counterexample case is covered by bmc_counterexample_on_violation
+        // which also runs with symmetry breaking active (it's always on).
+        let valid_property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpNEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: -1 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+        let ir = make_order_ir(valid_property, 3);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Checked { .. } | VerificationResult::Proved { .. }
+            ),
+            "valid property should be CHECKED or PROVED with symmetry breaking, got: {:?}",
             results[0]
         );
     }

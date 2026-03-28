@@ -164,3 +164,148 @@ fn lower_all_fixtures() {
         );
     }
 }
+
+// ── Verification integration tests ──────────────────────────────────
+
+fn verify_file(path: &str) -> Vec<abide::verify::VerificationResult> {
+    let prog = lower_file(path);
+    abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default())
+}
+
+#[test]
+fn verify_auth_fixture() {
+    let results = verify_file("tests/fixtures/auth.abide");
+    assert!(!results.is_empty(), "auth should have verification results");
+    // auth_safety: CHECKED or PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+                if name == "auth_safety"
+        )),
+        "auth_safety should be CHECKED or PROVED"
+    );
+    // lockout scene: PASS
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                if name == "lockout_after_5_failures"
+        )),
+        "lockout scene should PASS"
+    );
+}
+
+#[test]
+fn verify_workflow_fixture() {
+    let results = verify_file("tests/fixtures/workflow.abide");
+    // workflow_safety: CHECKED (complex invariant, induction fails → BMC fallback)
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                if name == "workflow_safety"
+        )),
+        "workflow_safety should be CHECKED"
+    );
+    // workflow_liveness: CHECKED (eventually → skips induction, BMC)
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                if name == "workflow_liveness"
+        )),
+        "workflow_liveness should be CHECKED"
+    );
+    // revision_count_monotonic: PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                if name == "revision_count_monotonic"
+        )),
+        "revision_count_monotonic should be PROVED"
+    );
+    // All 3 scenes should pass
+    let scene_passes: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r, abide::verify::VerificationResult::ScenePass { .. }))
+        .collect();
+    assert_eq!(
+        scene_passes.len(),
+        3,
+        "all 3 workflow scenes should pass, got {}",
+        scene_passes.len()
+    );
+}
+
+#[test]
+fn verify_inventory_fixture() {
+    let results = verify_file("tests/fixtures/inventory.abide");
+    // inventory_safety: PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                if name == "inventory_safety"
+        )),
+        "inventory_safety should be PROVED"
+    );
+    // end_to_end: PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                if name == "end_to_end"
+        )),
+        "end_to_end should be PROVED"
+    );
+    // Both scenes should pass
+    let scene_passes: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r, abide::verify::VerificationResult::ScenePass { .. }))
+        .collect();
+    assert_eq!(scene_passes.len(), 2, "both inventory scenes should pass");
+}
+
+#[test]
+fn verify_commerce_fixture() {
+    let results = verify_file("tests/fixtures/commerce.abide");
+    // commerce_smoke: COUNTEREXAMPLE (expected — eventually in bounded check)
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Counterexample { name, .. }
+                if name == "commerce_smoke"
+        )),
+        "commerce_smoke should be COUNTEREXAMPLE"
+    );
+    // billing_safety: PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                if name == "billing_safety"
+        )),
+        "billing_safety should be PROVED"
+    );
+    // happy_path scene: PASS
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                if name == "happy_path"
+        )),
+        "commerce happy_path scene should PASS"
+    );
+    // order_total_non_negative theorem: PROVED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                if name == "order_total_non_negative"
+        )),
+        "order_total_non_negative should be PROVED"
+    );
+}

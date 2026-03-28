@@ -49,16 +49,16 @@ system Commerce {
 ## Check It
 
 ```sh
-abide --parse-only order.abide
+abide parse order.abide
 ```
 
 If the spec parses correctly, the compiler prints the AST. If there's a syntax error, it points to the offending line.
 
-> **Note:** The full pipeline (`abide order.abide`) is not yet implemented. Current available flags:
-> - `--lex-only` — tokenize and print tokens
-> - `--parse-only` — parse and print AST
-> - `--elaborate-only` — run elaboration
-> - `--emit-ir` — emit IR as JSON
+To verify the spec (bounded model checking + induction):
+
+```sh
+abide verify order.abide
+```
 
 ## What Just Happened
 
@@ -89,9 +89,9 @@ scene successful_payment for Commerce {
 }
 ```
 
-The `verify` block will ask the bounded model checker to explore up to 50 steps of the Commerce system and confirm the assertion holds on every reachable state. The solver backend is in development — for now, the compiler parses and type-checks the verify block but does not yet run the solver.
+The `verify` block asks the bounded model checker to explore up to 50 steps of the Commerce system and confirm the assertion holds on every reachable state. Run `abide verify <file>` to execute it.
 
-The `scene` block constructs a concrete scenario: given an order in a specific state, when a specific event fires, then a specific outcome holds. Scenes are existential witnesses — they demonstrate that a behavior is possible. Like verify blocks, scenes are parsed and type-checked now; solver-backed execution is planned.
+The `scene` block constructs a concrete scenario: given an order in a specific state, when a specific event fires, then a specific outcome holds. Scenes are existential witnesses — they demonstrate that a behavior is possible.
 
 ## Next Steps
 

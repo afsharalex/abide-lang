@@ -273,4 +273,4 @@ See: [`examples/healthcare.abide`](../examples/healthcare.abide)
 
 ## More Examples
 
-The `examples/` directory contains complete, self-contained specification files. Each file can be parsed independently with `abide --parse-only <file>`.
+The `examples/` directory contains complete, self-contained specification files. Each file can be parsed independently with `abide parse <file>`.

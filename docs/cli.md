@@ -1,98 +1,63 @@
 # CLI Reference
 
-## Current Usage
+## Usage
 
 ```
-abide [OPTIONS] <FILE>
+abide <COMMAND> <FILE> [OPTIONS]
 ```
 
-The compiler takes a single `.abide` source file and runs the requested pipeline stage.
+The compiler uses subcommands. Each takes a single `.abide` source file.
 
-### Options
+### Implemented Commands
+
+| Command | Description |
+|---------|-------------|
+| `abide lex <file>` | Tokenize the file and print tokens with spans |
+| `abide parse <file>` | Parse the file and print the AST |
+| `abide elaborate <file>` | Run elaboration (type checking and resolution) |
+| `abide emit-ir <file>` | Run the full frontend pipeline and emit IR as JSON |
+| `abide verify <file>` | Verify: bounded model checking, scene checking, theorem proving |
+
+### `abide verify` Options
 
 | Flag | Description |
 |------|-------------|
-| `--lex-only` | Tokenize the file and print tokens with spans |
-| `--parse-only` | Parse the file and print the AST |
-| `--elaborate-only` | Run elaboration (type checking and resolution) |
-| `--emit-ir` | Run the full frontend pipeline and emit IR as JSON |
-| `-h, --help` | Print help |
+| `--bounded-only` | Skip induction (Tier 1), only run BMC |
+| `--unbounded-only` | Skip BMC (Tier 2), only try induction |
+| `--induction-timeout <N>` | Induction timeout in seconds (default: 5) |
+| `--bmc-timeout <N>` | BMC timeout in seconds (default: 0 = no timeout) |
+| `--progress` | Print progress messages to stderr during verification |
 
-Running `abide <file>` without flags currently prints:
-
-```
-full pipeline not yet implemented — use --lex-only or --parse-only
-```
+The `--bounded-only` and `--unbounded-only` flags are mutually exclusive.
 
 ### Examples
+
+**Verify a spec with tiered dispatch (induction → BMC fallback):**
+
+```sh
+$ abide verify examples/order.abide
+PROVED  order_safety (method: 1-induction, 35ms)
+CHECKED liveness_check (depth: 10, 200ms)
+PASS    happy_path (3ms)
+```
 
 **Parse a spec and check for syntax errors:**
 
 ```sh
-$ abide --parse-only examples/order.abide
-```
-
-If the file is well-formed, the compiler prints the AST. If there's a syntax error, it reports the location:
-
-```
-Error: abide::parse::expected
-  × expected `:`, found `,`
+$ abide parse examples/order.abide
 ```
 
 **Emit IR as JSON:**
 
 ```sh
-$ abide --emit-ir examples/order.abide
-```
-
-Produces a JSON representation of the elaborated specification:
-
-```json
-{
-  "types": [
-    {
-      "name": "OrderStatus",
-      "type": {
-        "tag": "Enum",
-        "name": "OrderStatus",
-        "constructors": ["Pending", "Paid", "Shipped"]
-      }
-    }
-  ],
-  "entities": [
-    {
-      "name": "Order",
-      "fields": [
-        { "name": "id", "type": { "tag": "Id" }, "default": null },
-        ...
-      ],
-      "actions": [ ... ]
-    }
-  ],
-  "systems": [ ... ]
-}
-```
-
-**Tokenize only (for debugging):**
-
-```sh
-$ abide --lex-only examples/order.abide
-```
-
-Prints each token with its source span:
-
-```
-Span { start: 99, end: 103 }  type
-Span { start: 104, end: 115 }  OrderStatus
-Span { start: 116, end: 117 }  =
-...
+$ abide emit-ir examples/order.abide
 ```
 
 ---
 
 ## Planned Commands
 
-The following subcommands are planned but not yet implemented. This section describes the intended CLI surface.
+The following subcommands are planned but not yet implemented.
 
 ### `abide check`
 
