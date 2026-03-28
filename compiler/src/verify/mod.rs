@@ -19,7 +19,7 @@ use std::time::Instant;
 use z3::ast::Bool;
 use z3::Solver;
 
-use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRVerify};
+use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRTheorem, IRVerify};
 
 use self::context::VerifyContext;
 use self::harness::{
@@ -80,6 +80,10 @@ pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
 
     for scene_block in &ir.scenes {
         results.push(check_scene_block(ir, &vctx, &defs, scene_block));
+    }
+
+    for theorem_block in &ir.theorems {
+        results.push(check_theorem_block(ir, &vctx, &defs, theorem_block));
     }
 
     results
@@ -605,6 +609,367 @@ fn check_scene_block(
     }
 }
 
+// ── Inductive checking (theorem blocks) ─────────────────────────────
+
+/// Check a theorem block using 1-induction.
+///
+/// A theorem `show P` with `invariant I` is proved by:
+///
+/// 1. **Base case:** P holds at step 0 (initial state, all slots inactive).
+///    Assert initial state + domain. Assert NOT P. If UNSAT → base holds.
+///
+/// 2. **Step case:** If I and P hold at step k, then P holds at step k+1
+///    after any single transition.
+///    Assume I at step 0. Assume P at step 0.
+///    Assert transition from step 0 to step 1.
+///    Assert NOT P at step 1. If UNSAT → step holds (P is inductive).
+///
+/// Both pass → PROVED. Either fails → UNPROVABLE with hint.
+#[allow(clippy::too_many_lines)]
+fn check_theorem_block(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    theorem: &IRTheorem,
+) -> VerificationResult {
+    let start = Instant::now();
+
+    // ── Build scope from theorem systems ───────────────────────────
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names: Vec<String> = theorem.systems.clone();
+
+    // Analyze show expressions to determine required slots per entity type.
+    // Count the quantifier nesting depth per entity type (e.g., `all a: X | all b: X | ...`
+    // has depth 2 for entity X). Slots = max(2, depth + 1) — enough for all
+    // simultaneously bound variables plus one for Create transitions.
+    // Expand through DefEnv first so pred/prop bodies with entity quantifiers are counted.
+    let mut required_slots: HashMap<String, usize> = HashMap::new();
+    for show_expr in &theorem.shows {
+        let expanded = expand_through_defs(show_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in &counts {
+            let existing = required_slots.get(entity).copied().unwrap_or(0);
+            required_slots.insert(entity.clone(), existing.max(*count));
+        }
+    }
+    for inv_expr in &theorem.invariants {
+        let expanded = expand_through_defs(inv_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in &counts {
+            let existing = required_slots.get(entity).copied().unwrap_or(0);
+            required_slots.insert(entity.clone(), existing.max(*count));
+        }
+    }
+
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                // Slots = max(2, quantifier_depth + 1) — enough for the quantifier
+                // structure plus one slot for Create transitions.
+                let min_slots = required_slots.get(ent_name).copied().unwrap_or(0) + 1;
+                scope.entry(ent_name.clone()).or_insert(min_slots.max(2));
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return VerificationResult::Unprovable {
+            name: theorem.name.clone(),
+            hint: "no systems or entities found for theorem".to_owned(),
+        };
+    }
+
+    // Check for entity quantifiers over types not in scope — these would be vacuous.
+    for entity_name in required_slots.keys() {
+        if !scope.contains_key(entity_name) {
+            return VerificationResult::Unprovable {
+                name: theorem.name.clone(),
+                hint: format!(
+                    "theorem quantifies over entity {entity_name} which is not in scope \
+                     of systems {:?} — quantifier would be vacuous",
+                    theorem.systems
+                ),
+            };
+        }
+    }
+
+    let relevant_entities: Vec<_> = ir
+        .entities
+        .iter()
+        .filter(|e| scope.contains_key(&e.name))
+        .cloned()
+        .collect();
+
+    let relevant_systems: Vec<_> = ir
+        .systems
+        .iter()
+        .filter(|s| system_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // Strip `always` wrapper if present — induction proves always by construction.
+    // Detect `eventually` which cannot be proved by induction.
+    let mut show_exprs: Vec<&IRExpr> = Vec::new();
+    for s in &theorem.shows {
+        match s {
+            IRExpr::Always { body } => show_exprs.push(body.as_ref()),
+            _ => show_exprs.push(s),
+        }
+    }
+
+    // Check for `eventually` in show expressions — induction cannot prove liveness.
+    // Expand through DefEnv first so pred/prop bodies with `eventually` are detected.
+    for show_expr in &show_exprs {
+        let expanded = expand_through_defs(show_expr, defs);
+        if contains_eventually(&expanded) {
+            return VerificationResult::Unprovable {
+                name: theorem.name.clone(),
+                hint: "theorem contains `eventually` (possibly in a referenced pred/prop) — \
+                       liveness properties cannot be proved by induction; \
+                       use bounded model checking (verify block) instead"
+                    .to_owned(),
+            };
+        }
+    }
+
+    // Pre-validate: reject unsupported expression forms that would panic during encoding.
+    // Expand through DefEnv first — a pred body might contain unsupported forms.
+    for show_expr in &show_exprs {
+        let expanded = expand_through_defs(show_expr, defs);
+        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+            return VerificationResult::Unprovable {
+                name: theorem.name.clone(),
+                hint: format!("unsupported expression kind in theorem show: {kind}"),
+            };
+        }
+    }
+    for inv_expr in &theorem.invariants {
+        let expanded = expand_through_defs(inv_expr, defs);
+        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+            return VerificationResult::Unprovable {
+                name: theorem.name.clone(),
+                hint: format!("unsupported expression kind in theorem invariant: {kind}"),
+            };
+        }
+    }
+
+    // ── Phase 0: Verify invariants hold at step 0 ──────────────────
+    // This prevents false invariants from making the step case vacuously true.
+    if !theorem.invariants.is_empty() {
+        let pool = create_slot_pool(&relevant_entities, &scope, 0);
+        let solver = Solver::new();
+
+        for c in initial_state_constraints(&pool) {
+            solver.assert(&c);
+        }
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        // Assert NOT I at step 0 — if UNSAT, invariants hold initially
+        let mut negated = Vec::new();
+        for inv_expr in &theorem.invariants {
+            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            negated.push(inv.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // invariants hold initially
+            z3::SatResult::Sat => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "invariant does not hold at initial state — \
+                           check that invariants are valid for the empty/initial configuration"
+                        .to_owned(),
+                };
+            }
+            z3::SatResult::Unknown => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "Z3 returned unknown when checking invariant base case".to_owned(),
+                };
+            }
+        }
+    }
+
+    // ── Phase 1: Verify invariants are preserved by transitions ────
+    // I(k) ∧ transition(k→k+1) → I(k+1)
+    if !theorem.invariants.is_empty() {
+        let pool = create_slot_pool(&relevant_entities, &scope, 1);
+        let solver = Solver::new();
+
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        // Assume I at step 0
+        for inv_expr in &theorem.invariants {
+            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            solver.assert(&inv);
+        }
+
+        let trans = transition_constraints(&pool, vctx, &relevant_entities, &relevant_systems, 0);
+        solver.assert(&trans);
+
+        // Assert NOT I at step 1
+        let mut negated = Vec::new();
+        for inv_expr in &theorem.invariants {
+            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 1);
+            negated.push(inv.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // invariants are inductive
+            z3::SatResult::Sat => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "invariant is not preserved by transitions — \
+                           the invariant itself is not inductive"
+                        .to_owned(),
+                };
+            }
+            z3::SatResult::Unknown => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "Z3 returned unknown when checking invariant step case".to_owned(),
+                };
+            }
+        }
+    }
+
+    // ── Phase 2: Base case — P holds at step 0 ─────────────────────
+    {
+        let pool = create_slot_pool(&relevant_entities, &scope, 0);
+        let solver = Solver::new();
+
+        for c in initial_state_constraints(&pool) {
+            solver.assert(&c);
+        }
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        // Assert NOT P at step 0 — if UNSAT, P holds at initial state
+        let mut negated = Vec::new();
+        for show_expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 0);
+            negated.push(prop.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // base case holds
+            z3::SatResult::Sat => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "base case failed — property does not hold at initial state".to_owned(),
+                };
+            }
+            z3::SatResult::Unknown => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "Z3 returned unknown when checking base case".to_owned(),
+                };
+            }
+        }
+    }
+
+    // ── Phase 3: Step case — I(k) ∧ P(k) ∧ transition → P(k+1) ───
+    {
+        let pool = create_slot_pool(&relevant_entities, &scope, 1);
+        let solver = Solver::new();
+
+        for c in domain_constraints(&pool, vctx, &relevant_entities) {
+            solver.assert(&c);
+        }
+
+        // Assume invariants at step 0
+        for inv_expr in &theorem.invariants {
+            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            solver.assert(&inv);
+        }
+
+        // Assume P at step 0
+        for show_expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 0);
+            solver.assert(&prop);
+        }
+
+        // One transition step
+        let trans = transition_constraints(&pool, vctx, &relevant_entities, &relevant_systems, 0);
+        solver.assert(&trans);
+
+        // Assert NOT P at step 1
+        let mut negated = Vec::new();
+        for show_expr in &show_exprs {
+            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 1);
+            negated.push(prop.not());
+        }
+        let neg_refs: Vec<&Bool> = negated.iter().collect();
+        if !neg_refs.is_empty() {
+            solver.assert(Bool::or(&neg_refs));
+        }
+
+        match solver.check() {
+            z3::SatResult::Unsat => {} // step case holds
+            z3::SatResult::Sat => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "inductive step failed — property is not preserved by transitions"
+                        .to_owned(),
+                };
+            }
+            z3::SatResult::Unknown => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: "Z3 returned unknown when checking inductive step".to_owned(),
+                };
+            }
+        }
+    }
+
+    // Both base and step passed
+    let elapsed = elapsed_ms(&start);
+
+    // Report the method with scope details for inter-entity properties.
+    let max_scope = scope.values().copied().max().unwrap_or(2);
+    let method = if has_multi_entity_quantifier(&show_exprs) {
+        format!("1-induction (scope: {max_scope} slots per entity type)")
+    } else {
+        "1-induction".to_owned()
+    };
+
+    VerificationResult::Proved {
+        name: theorem.name.clone(),
+        method,
+        time_ms: elapsed,
+    }
+}
+
 // ── Property encoding context ────────────────────────────────────────
 
 /// Tracks quantifier-bound variables mapping `var_name` → (`entity_name`, `slot_index`).
@@ -640,6 +1005,79 @@ impl PropertyCtx {
 /// For `always P`: P must hold at every step 0..=bound.
 /// For plain assertions: evaluated at every step.
 /// Collect system names referenced by `CrossCall` actions, recursively.
+/// Check if an expression contains `Eventually` anywhere in its tree.
+/// Induction cannot prove liveness — detect and reject early.
+#[allow(clippy::match_same_arms)]
+fn contains_eventually(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Eventually { .. } => true,
+        IRExpr::Always { body }
+        | IRExpr::UnOp { operand: body, .. }
+        | IRExpr::Field { expr: body, .. }
+        | IRExpr::Prime { expr: body } => contains_eventually(body),
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::App {
+            func: left,
+            arg: right,
+            ..
+        } => contains_eventually(left) || contains_eventually(right),
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => contains_eventually(body),
+        _ => false,
+    }
+}
+
+/// Detect if show expressions have quantifier nesting depth > 1 for any entity type.
+/// E.g., `all a: Account | all b: Account | P(a, b)` has depth 2 for Account.
+/// Used to annotate PROVED output with scope info for inter-entity properties.
+fn has_multi_entity_quantifier(show_exprs: &[&IRExpr]) -> bool {
+    for expr in show_exprs {
+        let mut entity_vars: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(expr, &mut entity_vars);
+        if entity_vars.values().any(|&count| count > 1) {
+            return true;
+        }
+    }
+    false
+}
+
+fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) {
+    match expr {
+        IRExpr::Forall {
+            domain: crate::ir::types::IRType::Entity { name },
+            body,
+            ..
+        }
+        | IRExpr::Exists {
+            domain: crate::ir::types::IRType::Entity { name },
+            body,
+            ..
+        } => {
+            *counts.entry(name.clone()).or_insert(0) += 1;
+            count_entity_quantifiers(body, counts);
+        }
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::App {
+            func: left,
+            arg: right,
+            ..
+        } => {
+            count_entity_quantifiers(left, counts);
+            count_entity_quantifiers(right, counts);
+        }
+        IRExpr::UnOp { operand, .. }
+        | IRExpr::Field { expr: operand, .. }
+        | IRExpr::Prime { expr: operand }
+        | IRExpr::Always { body: operand }
+        | IRExpr::Eventually { body: operand } => {
+            count_entity_quantifiers(operand, counts);
+        }
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
+            count_entity_quantifiers(body, counts);
+        }
+        _ => {}
+    }
+}
+
 fn collect_crosscall_systems(actions: &[IRAction], targets: &mut Vec<String>) {
     for action in actions {
         match action {
@@ -2004,6 +2442,141 @@ mod tests {
         assert!(
             matches!(&results[0], VerificationResult::SceneFail { .. }),
             "expected SceneFail, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn theorem_proved_by_induction() {
+        // Theorem: status is always a valid enum variant (never -1).
+        // This is trivially inductive — domain constraints enforce it at every step.
+        let mut ir = make_order_ir(
+            IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            },
+            3,
+        );
+        ir.verifies.clear(); // remove verify block
+        ir.theorems.push(IRTheorem {
+            name: "status_valid".to_owned(),
+            systems: vec!["Commerce".to_owned()],
+            invariants: vec![],
+            shows: vec![IRExpr::Always {
+                body: Box::new(IRExpr::Forall {
+                    var: "o".to_owned(),
+                    domain: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    body: Box::new(IRExpr::BinOp {
+                        op: "OpNEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "o".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: -1 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                }),
+            }],
+        });
+
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "expected Proved, got: {:?}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn theorem_unprovable_when_not_inductive() {
+        // Theorem: all orders are always Pending.
+        // This is NOT inductive — the confirm transition changes Pending → Confirmed.
+        let mut ir = make_order_ir(
+            IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            },
+            3,
+        );
+        // Add a create event so orders can exist
+        ir.systems[0].events.push(IREvent {
+            name: "create_order".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            },
+            postcondition: None,
+            body: vec![IRAction::Create {
+                entity: "Order".to_owned(),
+                fields: vec![
+                    IRCreateField {
+                        name: "id".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    },
+                    IRCreateField {
+                        name: "status".to_owned(),
+                        value: IRExpr::Ctor {
+                            enum_name: "OrderStatus".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        },
+                    },
+                ],
+            }],
+        });
+        ir.verifies.clear();
+        ir.theorems.push(IRTheorem {
+            name: "always_pending".to_owned(),
+            systems: vec!["Commerce".to_owned()],
+            invariants: vec![],
+            shows: vec![IRExpr::Always {
+                body: Box::new(IRExpr::Forall {
+                    var: "o".to_owned(),
+                    domain: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    body: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "o".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "OrderStatus".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                }),
+            }],
+        });
+
+        let results = verify_all(&ir);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::Unprovable { .. }),
+            "expected Unprovable, got: {:?}",
             results[0]
         );
     }
