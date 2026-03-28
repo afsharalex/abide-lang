@@ -13,6 +13,7 @@ pub enum ErrorKind {
     InvalidDefault,
     InvalidScope,
     MissingField,
+    CyclicDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

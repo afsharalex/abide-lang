@@ -3,10 +3,12 @@
 //! Validates: field defaults match types, requires is Bool,
 //! primed assignments target known fields, system uses reference known entities.
 
+use std::collections::{HashMap, HashSet};
+
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BuiltinTy, EAction, EEntity, EExpr, EField, ESystem, EType, EVariant, ElabResult, Ty,
+    BuiltinTy, EAction, EEntity, EExpr, EField, EPattern, ESystem, EType, EVariant, ElabResult, Ty,
 };
 
 /// Type-check the resolved environment.
@@ -23,6 +25,9 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     for system in env.systems.values() {
         errors.extend(check_system(env, system));
     }
+
+    // Check for cyclic pred/prop definitions
+    errors.extend(check_pred_prop_cycles(env));
 
     let result = ElabResult {
         types: env
@@ -221,4 +226,243 @@ fn find_duplicates<T: PartialEq>(items: &[T]) -> Vec<&T> {
         }
     }
     dups
+}
+
+// ── Cycle detection for fn/pred/prop definitions ────────────────────
+
+/// Detect cyclic definitions in fn, pred, and prop declarations.
+///
+/// All three are definitional abstractions that get expanded during
+/// verification. Recursive definitions would cause non-termination.
+/// Examples:
+/// - `pred p(x) = p(x)` — direct self-reference
+/// - `pred p(x) = q(x)` + `pred q(x) = p(x)` — mutual recursion
+/// - `prop a = p(x)` + `pred p(x) = a` — prop-pred cycle
+/// - `fn f(x) = g(x)` + `fn g(x) = f(x)` — fn-fn cycle
+fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
+    let mut errors = Vec::new();
+
+    // Build dependency graph: name → set of fn/pred/prop names referenced in body
+    let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // All fn, pred, and prop names
+    let mut all_names: HashSet<String> = HashSet::new();
+    for name in env.preds.keys() {
+        all_names.insert(name.clone());
+    }
+    for name in env.props.keys() {
+        all_names.insert(name.clone());
+    }
+    for f in &env.fns {
+        all_names.insert(f.name.clone());
+    }
+
+    // Extract dependencies from pred bodies
+    for (name, pred) in &env.preds {
+        let mut referenced = HashSet::new();
+        let bound: HashSet<String> = pred.params.iter().map(|(n, _)| n.clone()).collect();
+        collect_name_refs(&pred.body, &all_names, &bound, &mut referenced);
+        deps.insert(name.clone(), referenced);
+    }
+
+    // Extract dependencies from prop bodies
+    for (name, prop) in &env.props {
+        let mut referenced = HashSet::new();
+        collect_name_refs(&prop.body, &all_names, &HashSet::new(), &mut referenced);
+        deps.insert(name.clone(), referenced);
+    }
+
+    // Extract dependencies from fn bodies
+    for f in &env.fns {
+        let mut referenced = HashSet::new();
+        let bound: HashSet<String> = f.params.iter().map(|(n, _)| n.clone()).collect();
+        collect_name_refs(&f.body, &all_names, &bound, &mut referenced);
+        deps.insert(f.name.clone(), referenced);
+    }
+
+    // DFS cycle detection
+    let mut visited = HashSet::new();
+    let mut in_stack = HashSet::new();
+
+    for name in all_names {
+        if !visited.contains(&name) {
+            if let Some(cycle) = dfs_find_cycle(&name, &deps, &mut visited, &mut in_stack) {
+                errors.push(ElabError::new(
+                    ErrorKind::CyclicDefinition,
+                    format!("circular definition detected: {}", cycle.join(" → ")),
+                    name.clone(),
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
+/// Collect fn/pred/prop name references from an elaborated expression.
+///
+/// Respects variable scoping: a `Var` that is shadowed by a parameter,
+/// quantifier binding, let binding, or lambda parameter is NOT counted
+/// as a dependency reference.
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
+fn collect_name_refs(
+    expr: &EExpr,
+    known_names: &HashSet<String>,
+    bound: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    match expr {
+        EExpr::Var(_, name) => {
+            if !bound.contains(name) && known_names.contains(name.as_str()) {
+                refs.insert(name.clone());
+            }
+        }
+        EExpr::Call(_, func, args) => {
+            collect_name_refs(func, known_names, bound, refs);
+            for arg in args {
+                collect_name_refs(arg, known_names, bound, refs);
+            }
+        }
+        EExpr::CallR(_, func, ref_args, args) => {
+            collect_name_refs(func, known_names, bound, refs);
+            for arg in ref_args {
+                collect_name_refs(arg, known_names, bound, refs);
+            }
+            for arg in args {
+                collect_name_refs(arg, known_names, bound, refs);
+            }
+        }
+        EExpr::BinOp(_, _, l, r) => {
+            collect_name_refs(l, known_names, bound, refs);
+            collect_name_refs(r, known_names, bound, refs);
+        }
+        EExpr::UnOp(_, _, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Field(_, e, _) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Prime(_, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Quant(_, _, var, _, body) => {
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(var.clone());
+            collect_name_refs(body, known_names, &inner_bound, refs);
+        }
+        EExpr::Always(_, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Eventually(_, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Assert(_, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Assign(_, l, r) => {
+            collect_name_refs(l, known_names, bound, refs);
+            collect_name_refs(r, known_names, bound, refs);
+        }
+        EExpr::Seq(_, l, r)
+        | EExpr::SameStep(_, l, r)
+        | EExpr::Pipe(_, l, r)
+        | EExpr::In(_, l, r) => {
+            collect_name_refs(l, known_names, bound, refs);
+            collect_name_refs(r, known_names, bound, refs);
+        }
+        EExpr::Let(binds, body) => {
+            let mut inner_bound = bound.clone();
+            for (name, _, e) in binds {
+                collect_name_refs(e, known_names, &inner_bound, refs);
+                inner_bound.insert(name.clone());
+            }
+            collect_name_refs(body, known_names, &inner_bound, refs);
+        }
+        EExpr::Lam(params, _, body) => {
+            let mut inner_bound = bound.clone();
+            for (name, _) in params {
+                inner_bound.insert(name.clone());
+            }
+            collect_name_refs(body, known_names, &inner_bound, refs);
+        }
+        EExpr::Match(scrut, arms) => {
+            collect_name_refs(scrut, known_names, bound, refs);
+            for (pat, guard, body) in arms {
+                let mut arm_bound = bound.clone();
+                collect_epattern_vars(pat, &mut arm_bound);
+                if let Some(g) = guard {
+                    collect_name_refs(g, known_names, &arm_bound, refs);
+                }
+                collect_name_refs(body, known_names, &arm_bound, refs);
+            }
+        }
+        EExpr::NamedPair(_, _, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::TupleLit(_, elems) => {
+            for e in elems {
+                collect_name_refs(e, known_names, bound, refs);
+            }
+        }
+        EExpr::Card(_, e) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::MapUpdate(_, m, k, v) => {
+            collect_name_refs(m, known_names, bound, refs);
+            collect_name_refs(k, known_names, bound, refs);
+            collect_name_refs(v, known_names, bound, refs);
+        }
+        EExpr::Index(_, m, k) => {
+            collect_name_refs(m, known_names, bound, refs);
+            collect_name_refs(k, known_names, bound, refs);
+        }
+        EExpr::SetComp(_, proj, var, _, filter) => {
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(var.clone());
+            if let Some(p) = proj {
+                collect_name_refs(p, known_names, &inner_bound, refs);
+            }
+            collect_name_refs(filter, known_names, &inner_bound, refs);
+        }
+        // Leaf nodes — no references
+        EExpr::Lit(..)
+        | EExpr::Qual(..)
+        | EExpr::Unresolved(_)
+        | EExpr::Sorry
+        | EExpr::Todo
+        | EExpr::SetLit(..)
+        | EExpr::SeqLit(..)
+        | EExpr::MapLit(..) => {}
+    }
+}
+
+/// DFS cycle detection. Returns the cycle path if one is found.
+fn dfs_find_cycle(
+    node: &str,
+    deps: &HashMap<String, HashSet<String>>,
+    visited: &mut HashSet<String>,
+    in_stack: &mut HashSet<String>,
+) -> Option<Vec<String>> {
+    visited.insert(node.to_owned());
+    in_stack.insert(node.to_owned());
+
+    if let Some(neighbors) = deps.get(node) {
+        for neighbor in neighbors {
+            if !visited.contains(neighbor.as_str()) {
+                if let Some(mut cycle) = dfs_find_cycle(neighbor, deps, visited, in_stack) {
+                    cycle.insert(0, node.to_owned());
+                    return Some(cycle);
+                }
+            } else if in_stack.contains(neighbor.as_str()) {
+                // Found a back edge — cycle detected
+                return Some(vec![node.to_owned(), neighbor.clone()]);
+            }
+        }
+    }
+
+    in_stack.remove(node);
+    None
+}
+
+/// Collect variable names bound by an elaborated pattern.
+fn collect_epattern_vars(pat: &EPattern, vars: &mut HashSet<String>) {
+    match pat {
+        EPattern::Var(name) => {
+            vars.insert(name.clone());
+        }
+        EPattern::Ctor(_, fields) => {
+            for (_, fpat) in fields {
+                collect_epattern_vars(fpat, vars);
+            }
+        }
+        EPattern::Wild => {}
+        EPattern::Or(left, right) => {
+            collect_epattern_vars(left, vars);
+            collect_epattern_vars(right, vars);
+        }
+    }
 }

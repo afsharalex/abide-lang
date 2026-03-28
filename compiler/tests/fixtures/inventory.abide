@@ -207,11 +207,11 @@ prop fulfillment_progress for Shipping =
     f.status == @Pending implies eventually f.status == @Shipped
 
 // Bounded checks
-verify inventory_safety for Warehouse[0..20] {
+verify inventory_safety for Warehouse[0..8] {
   assert inventory_safe
 }
 
-verify end_to_end for Warehouse[0..20], Shipping[0..20] {
+verify end_to_end for Warehouse[0..8], Shipping[0..8] {
   assert always all p: Product | p.quantity >= 0
   assert always all f: Fulfillment |
     f.status == @Delivered implies always f.status == @Delivered

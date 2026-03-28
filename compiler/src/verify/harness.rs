@@ -792,6 +792,13 @@ fn encode_event_inner(
     // Map Choose-bound variable names to their entity types for Apply target resolution.
     let mut var_to_entity: HashMap<String, String> = HashMap::new();
 
+    // Populate var_to_entity from event params with entity types
+    for p in &event.params {
+        if let IRType::Entity { name } = &p.ty {
+            var_to_entity.insert(p.name.clone(), name.clone());
+        }
+    }
+
     // Accumulated Choose variable params: after a `choose r: Reservation ...`
     // is encoded, fresh Z3 variables for `r`'s fields are created and
     // constrained to match the chosen slot. Subsequent actions can then
@@ -979,46 +986,57 @@ fn encode_event_inner(
                         None // ambiguous or not found — skip
                     }
                 });
-                if let Some(ent) = resolved_entity {
-                    if let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) {
-                        // Use resolved entity name, not the target variable name
-                        let ent_name = &ent.name;
-                        let n_slots = pool.slots_for(ent_name);
-                        let mut slot_options = Vec::new();
-                        for slot in 0..n_slots {
-                            let apply_ctx = SlotEncodeCtx {
-                                pool,
-                                vctx,
-                                entity: ent_name,
-                                slot,
-                                params: {
-                                    let mut p = event_params.clone();
-                                    p.extend(choose_var_params.clone());
-                                    p
-                                },
-                                bindings: HashMap::new(),
-                            };
-                            let action_params =
-                                build_apply_params(&apply_ctx, trans, args, apply_refs, step);
-                            let mut slot_conjuncts = Vec::new();
-                            let formula =
-                                encode_action(pool, vctx, ent, trans, slot, step, &action_params);
-                            slot_conjuncts.push(formula);
-                            // Frame all OTHER slots of this entity
-                            let slot_frame = frame_entity_slots_except(pool, ent, slot, step);
-                            slot_conjuncts.extend(slot_frame);
-                            let refs: Vec<&Bool> = slot_conjuncts.iter().collect();
-                            slot_options.push(Bool::and(&refs));
-                        }
-                        let refs: Vec<&Bool> = slot_options.iter().collect();
-                        if !refs.is_empty() {
-                            conjuncts.push(Bool::or(&refs));
-                        }
-                        // Mark all slots as touched — per-slot framing handled above
-                        for slot in 0..n_slots {
-                            touched.insert((ent_name.clone(), slot));
-                        }
-                    }
+                let Some(ent) = resolved_entity else {
+                    panic!(
+                        "Apply target resolution failed: target={target:?}, transition={transition:?} \
+                         — could not resolve entity (var_to_entity keys: {:?}, entity names: {:?})",
+                        var_to_entity.keys().collect::<Vec<_>>(),
+                        entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+                    );
+                };
+                let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) else {
+                    panic!(
+                        "Apply transition not found: entity={}, transition={transition:?} \
+                         — available transitions: {:?}",
+                        ent.name,
+                        ent.transitions.iter().map(|t| &t.name).collect::<Vec<_>>()
+                    );
+                };
+                // Use resolved entity name, not the target variable name
+                let ent_name = &ent.name;
+                let n_slots = pool.slots_for(ent_name);
+                let mut slot_options = Vec::new();
+                for slot in 0..n_slots {
+                    let apply_ctx = SlotEncodeCtx {
+                        pool,
+                        vctx,
+                        entity: ent_name,
+                        slot,
+                        params: {
+                            let mut p = event_params.clone();
+                            p.extend(choose_var_params.clone());
+                            p
+                        },
+                        bindings: HashMap::new(),
+                    };
+                    let action_params =
+                        build_apply_params(&apply_ctx, trans, args, apply_refs, step);
+                    let mut slot_conjuncts = Vec::new();
+                    let formula = encode_action(pool, vctx, ent, trans, slot, step, &action_params);
+                    slot_conjuncts.push(formula);
+                    // Frame all OTHER slots of this entity
+                    let slot_frame = frame_entity_slots_except(pool, ent, slot, step);
+                    slot_conjuncts.extend(slot_frame);
+                    let refs: Vec<&Bool> = slot_conjuncts.iter().collect();
+                    slot_options.push(Bool::and(&refs));
+                }
+                let refs: Vec<&Bool> = slot_options.iter().collect();
+                if !refs.is_empty() {
+                    conjuncts.push(Bool::or(&refs));
+                }
+                // Mark all slots as touched — per-slot framing handled above
+                for slot in 0..n_slots {
+                    touched.insert((ent_name.clone(), slot));
                 }
             }
 

@@ -8,6 +8,7 @@
 //! - `mod`: Top-level BMC entry point (`verify_all`, `check_verify_block`)
 
 pub mod context;
+pub mod defenv;
 pub mod encode;
 pub mod harness;
 pub mod smt;
@@ -70,10 +71,11 @@ pub struct TraceStep {
 /// Returns one result per target.
 pub fn verify_all(ir: &IRProgram) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
+    let defs = defenv::DefEnv::from_ir(ir);
     let mut results = Vec::new();
 
     for verify_block in &ir.verifies {
-        results.push(check_verify_block(ir, &vctx, verify_block));
+        results.push(check_verify_block(ir, &vctx, &defs, verify_block));
     }
 
     results
@@ -98,6 +100,7 @@ fn elapsed_ms(start: &Instant) -> u64 {
 fn check_verify_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
     verify_block: &IRVerify,
 ) -> VerificationResult {
     let start = Instant::now();
@@ -199,7 +202,8 @@ fn check_verify_block(
     // We negate: assert exists some step where P does NOT hold.
     // If UNSAT → property holds at all steps (CHECKED).
     // If SAT → counterexample found.
-    let property_at_all_steps = encode_verify_properties(&pool, vctx, &verify_block.asserts, bound);
+    let property_at_all_steps =
+        encode_verify_properties(&pool, vctx, defs, &verify_block.asserts, bound);
 
     // Negate the conjunction of all properties across all steps
     solver.assert(property_at_all_steps.not());
@@ -281,6 +285,7 @@ fn collect_crosscall_systems(actions: &[IRAction], targets: &mut Vec<String>) {
 fn encode_verify_properties(
     pool: &SlotPool,
     vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
     asserts: &[IRExpr],
     bound: usize,
 ) -> Bool {
@@ -291,7 +296,7 @@ fn encode_verify_properties(
             // `always P` — check P at every step
             IRExpr::Always { body } => {
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, body, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, body, step);
                     all_props.push(prop);
                 }
             }
@@ -299,7 +304,7 @@ fn encode_verify_properties(
             IRExpr::Eventually { body } => {
                 let mut step_props = Vec::new();
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, body, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, body, step);
                     step_props.push(prop);
                 }
                 let refs: Vec<&Bool> = step_props.iter().collect();
@@ -310,7 +315,7 @@ fn encode_verify_properties(
             // Plain assertion — check at every step
             other => {
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, other, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, other, step);
                     all_props.push(prop);
                 }
             }
@@ -332,11 +337,12 @@ fn encode_verify_properties(
 fn encode_property_at_step(
     pool: &SlotPool,
     vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
     expr: &IRExpr,
     step: usize,
 ) -> Bool {
     let ctx = PropertyCtx::new();
-    encode_prop_expr(pool, vctx, &ctx, expr, step)
+    encode_prop_expr(pool, vctx, defs, &ctx, expr, step)
 }
 
 /// Encode a property expression with quantifier context.
@@ -348,10 +354,26 @@ fn encode_property_at_step(
 fn encode_prop_expr(
     pool: &SlotPool,
     vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
     ctx: &PropertyCtx,
     expr: &IRExpr,
     step: usize,
 ) -> Bool {
+    // Try def expansion — but only if the name is NOT shadowed by a local binding
+    // (quantifier-bound variables take precedence over definitions).
+    if let IRExpr::Var { name, .. } = expr {
+        if !ctx.bindings.contains_key(name) {
+            if let Some(expanded) = defs.expand_var(name) {
+                return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
+            }
+        }
+    }
+    if let IRExpr::App { .. } = expr {
+        if let Some(expanded) = defs.expand_app(expr) {
+            return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
+        }
+    }
+
     match expr {
         // `all x: Entity | P(x)` — conjunction over all slots
         IRExpr::Forall {
@@ -364,7 +386,7 @@ fn encode_prop_expr(
             for slot in 0..n_slots {
                 let active = pool.active_at(entity_name, slot, step);
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, &inner_ctx, body, step);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step);
                 if let Some(SmtValue::Bool(act)) = active {
                     // active => P(slot)
                     conjuncts.push(act.implies(&body_val));
@@ -387,7 +409,7 @@ fn encode_prop_expr(
             for slot in 0..n_slots {
                 let active = pool.active_at(entity_name, slot, step);
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, &inner_ctx, body, step);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step);
                 if let Some(SmtValue::Bool(act)) = active {
                     // active AND P(slot)
                     disjuncts.push(Bool::and(&[act, &body_val]));
@@ -403,8 +425,8 @@ fn encode_prop_expr(
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" || op == "OpXor" => {
-            let l = encode_prop_expr(pool, vctx, ctx, left, step);
-            let r = encode_prop_expr(pool, vctx, ctx, right, step);
+            let l = encode_prop_expr(pool, vctx, defs, ctx, left, step);
+            let r = encode_prop_expr(pool, vctx, defs, ctx, right, step);
             match op.as_str() {
                 "OpAnd" => Bool::and(&[&l, &r]),
                 "OpOr" => Bool::or(&[&l, &r]),
@@ -414,21 +436,21 @@ fn encode_prop_expr(
             }
         }
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let inner = encode_prop_expr(pool, vctx, ctx, operand, step);
+            let inner = encode_prop_expr(pool, vctx, defs, ctx, operand, step);
             inner.not()
         }
         // Nested temporal operators — in BMC, `always P` at a single step
         // is just P (the outer loop iterates over steps), and `eventually P`
         // is also just P at this step (the outer loop handles the disjunction).
         IRExpr::Always { body } | IRExpr::Eventually { body } => {
-            encode_prop_expr(pool, vctx, ctx, body, step)
+            encode_prop_expr(pool, vctx, defs, ctx, body, step)
         }
         // Comparison and other BinOps that produce Bool (OpEq, OpNEq, OpLt, etc.)
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = encode_prop_value(pool, vctx, ctx, left, step);
-            let r = encode_prop_value(pool, vctx, ctx, right, step);
+            let l = encode_prop_value(pool, vctx, defs, ctx, left, step);
+            let r = encode_prop_value(pool, vctx, defs, ctx, right, step);
             smt::binop(op, &l, &r).to_bool()
         }
         // Literals
@@ -438,7 +460,7 @@ fn encode_prop_expr(
         } => Bool::from_bool(*value),
         // Everything else: encode as value and convert to Bool
         other => {
-            let val = encode_prop_value(pool, vctx, ctx, other, step);
+            let val = encode_prop_value(pool, vctx, defs, ctx, other, step);
             val.to_bool()
         }
     }
@@ -452,10 +474,25 @@ fn encode_prop_expr(
 fn encode_prop_value(
     pool: &SlotPool,
     vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
     ctx: &PropertyCtx,
     expr: &IRExpr,
     step: usize,
 ) -> SmtValue {
+    // Try def expansion — but only if the name is NOT shadowed by a local binding.
+    if let IRExpr::Var { name, .. } = expr {
+        if !ctx.bindings.contains_key(name) {
+            if let Some(expanded) = defs.expand_var(name) {
+                return encode_prop_value(pool, vctx, defs, ctx, &expanded, step);
+            }
+        }
+    }
+    if let IRExpr::App { .. } = expr {
+        if let Some(expanded) = defs.expand_app(expr) {
+            return encode_prop_value(pool, vctx, defs, ctx, &expanded, step);
+        }
+    }
+
     match expr {
         IRExpr::Lit { value, .. } => match value {
             crate::ir::types::LitVal::Int { value } => smt::int_val(*value),
@@ -521,20 +558,22 @@ fn encode_prop_value(
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = encode_prop_value(pool, vctx, ctx, left, step);
-            let r = encode_prop_value(pool, vctx, ctx, right, step);
+            let l = encode_prop_value(pool, vctx, defs, ctx, left, step);
+            let r = encode_prop_value(pool, vctx, defs, ctx, right, step);
             smt::binop(op, &l, &r)
         }
         IRExpr::UnOp { op, operand, .. } => {
-            let v = encode_prop_value(pool, vctx, ctx, operand, step);
+            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step);
             smt::unop(op, &v)
         }
-        IRExpr::Prime { expr } => encode_prop_value(pool, vctx, ctx, expr, step + 1),
+        IRExpr::Prime { expr } => encode_prop_value(pool, vctx, defs, ctx, expr, step + 1),
         // Nested quantifiers in value position — encode as Bool, wrap as SmtValue
         IRExpr::Forall { .. } | IRExpr::Exists { .. } => {
-            SmtValue::Bool(encode_prop_expr(pool, vctx, ctx, expr, step))
+            SmtValue::Bool(encode_prop_expr(pool, vctx, defs, ctx, expr, step))
         }
-        IRExpr::Always { body } => SmtValue::Bool(encode_prop_expr(pool, vctx, ctx, body, step)),
+        IRExpr::Always { body } => {
+            SmtValue::Bool(encode_prop_expr(pool, vctx, defs, ctx, body, step))
+        }
         _ => panic!("unsupported expression in property value encoding: {expr:?}"),
     }
 }
