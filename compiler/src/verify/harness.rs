@@ -116,12 +116,17 @@ pub fn create_slot_pool(
 /// Bundles pool, verification context, entity name, slot index, and
 /// any in-scope action/event parameters so that `encode_slot_expr` can
 /// resolve `Var` references in the right order: params first, then slot fields.
+///
+/// `bindings` tracks variables from prior Choose blocks, mapping
+/// `var_name` -> `(entity_name, slot_index)`. This enables cross-entity
+/// field references like `r.product_id` in a subsequent Choose over Product.
 struct SlotEncodeCtx<'a> {
     pool: &'a SlotPool,
     vctx: &'a VerifyContext,
     entity: &'a str,
     slot: usize,
     params: HashMap<String, SmtValue>,
+    bindings: HashMap<String, (String, usize)>,
 }
 
 // ── Constraint generation ───────────────────────────────────────────
@@ -201,6 +206,7 @@ pub fn encode_action(
         entity: &entity.name,
         slot,
         params: params.clone(),
+        bindings: HashMap::new(),
     };
 
     let mut conjuncts = Vec::new();
@@ -262,6 +268,7 @@ pub fn encode_action(
 ///
 /// Each disjunct also frames all OTHER slots of the same entity so that
 /// non-selected slots cannot take arbitrary values.
+#[allow(clippy::implicit_hasher)]
 pub fn encode_create(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -269,6 +276,7 @@ pub fn encode_create(
     entity_ir: Option<&IREntity>,
     create_fields: &[(String, IRExpr)],
     step: usize,
+    event_params: &HashMap<String, SmtValue>,
 ) -> Bool {
     assert!(
         step < pool.bound,
@@ -285,7 +293,8 @@ pub fn encode_create(
             vctx,
             entity: entity_name,
             slot,
-            params: HashMap::new(),
+            params: event_params.clone(),
+            bindings: HashMap::new(),
         };
 
         let mut conjuncts = Vec::new();
@@ -506,18 +515,200 @@ fn build_apply_params(
 
 /// Build a `HashMap<String, SmtValue>` of Z3 variables for event parameters.
 ///
-/// Each parameter gets a fresh Z3 variable named `param_{name}`.
-fn build_event_params(params: &[IRTransParam]) -> HashMap<String, SmtValue> {
+/// Each parameter gets a fresh Z3 variable named `param_{name}_{step}`, scoped
+/// to the given step so that parameter values are independent across steps.
+fn build_event_params(params: &[IRTransParam], step: usize) -> HashMap<String, SmtValue> {
     let mut map = HashMap::new();
     for p in params {
         let var = match &p.ty {
-            IRType::Bool => smt::bool_var(&format!("param_{}", p.name)),
-            IRType::Real | IRType::Float => smt::real_var(&format!("param_{}", p.name)),
-            _ => smt::int_var(&format!("param_{}", p.name)),
+            IRType::Bool => smt::bool_var(&format!("param_{}_{}", p.name, step)),
+            IRType::Real | IRType::Float => smt::real_var(&format!("param_{}_{}", p.name, step)),
+            _ => smt::int_var(&format!("param_{}_{}", p.name, step)),
         };
         map.insert(p.name.clone(), var);
     }
     map
+}
+
+/// Context for guard expression encoding — tracks entity bindings from
+/// enclosing quantifiers, similar to `PropertyCtx` in `mod.rs`.
+struct GuardCtx {
+    /// Quantifier-bound variables: `var_name` → (`entity_name`, `slot_index`)
+    bindings: HashMap<String, (String, usize)>,
+    /// Event parameter Z3 variables
+    params: HashMap<String, SmtValue>,
+}
+
+impl GuardCtx {
+    fn with_binding(&self, var: &str, entity: &str, slot: usize) -> Self {
+        let mut bindings = self.bindings.clone();
+        bindings.insert(var.to_owned(), (entity.to_owned(), slot));
+        Self {
+            bindings,
+            params: self.params.clone(),
+        }
+    }
+}
+
+/// Encode an event guard expression, expanding entity quantifiers over slots.
+///
+/// Uses `GuardCtx` to track entity bindings from enclosing quantifiers,
+/// ensuring that field references resolve correctly across nested quantifiers.
+fn encode_guard_expr(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    expr: &IRExpr,
+    event_params: &HashMap<String, SmtValue>,
+    step: usize,
+) -> Bool {
+    let ctx = GuardCtx {
+        bindings: HashMap::new(),
+        params: event_params.clone(),
+    };
+    encode_guard_inner(pool, vctx, &ctx, expr, step)
+}
+
+fn encode_guard_inner(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    ctx: &GuardCtx,
+    expr: &IRExpr,
+    step: usize,
+) -> Bool {
+    match expr {
+        IRExpr::Exists {
+            var,
+            domain: IRType::Entity { name: entity_name },
+            body,
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            let mut disjuncts = Vec::new();
+            for slot in 0..n_slots {
+                let active = pool.active_at(entity_name, slot, step);
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let body_val = encode_guard_inner(pool, vctx, &inner_ctx, body, step);
+                if let Some(SmtValue::Bool(act)) = active {
+                    disjuncts.push(Bool::and(&[act, &body_val]));
+                }
+            }
+            if disjuncts.is_empty() {
+                return Bool::from_bool(false);
+            }
+            let refs: Vec<&Bool> = disjuncts.iter().collect();
+            Bool::or(&refs)
+        }
+        IRExpr::Forall {
+            var,
+            domain: IRType::Entity { name: entity_name },
+            body,
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            let mut conjuncts = Vec::new();
+            for slot in 0..n_slots {
+                let active = pool.active_at(entity_name, slot, step);
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let body_val = encode_guard_inner(pool, vctx, &inner_ctx, body, step);
+                if let Some(SmtValue::Bool(act)) = active {
+                    conjuncts.push(act.implies(&body_val));
+                }
+            }
+            if conjuncts.is_empty() {
+                return Bool::from_bool(true);
+            }
+            let refs: Vec<&Bool> = conjuncts.iter().collect();
+            Bool::and(&refs)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
+            let l = encode_guard_inner(pool, vctx, ctx, left, step);
+            let r = encode_guard_inner(pool, vctx, ctx, right, step);
+            match op.as_str() {
+                "OpAnd" => Bool::and(&[&l, &r]),
+                "OpOr" => Bool::or(&[&l, &r]),
+                "OpImplies" => l.implies(&r),
+                _ => unreachable!(),
+            }
+        }
+        IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
+            encode_guard_inner(pool, vctx, ctx, operand, step).not()
+        }
+        IRExpr::Lit {
+            value: LitVal::Bool { value },
+            ..
+        } => Bool::from_bool(*value),
+        // Non-boolean expressions (comparisons, field access, etc.) —
+        // encode as value using the guard context bindings
+        other => encode_guard_value(pool, vctx, ctx, other, step).to_bool(),
+    }
+}
+
+/// Encode a value expression within a guard context.
+/// Resolves field references using the guard's entity bindings.
+fn encode_guard_value(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    ctx: &GuardCtx,
+    expr: &IRExpr,
+    step: usize,
+) -> SmtValue {
+    match expr {
+        IRExpr::Lit { value, .. } => encode_slot_literal(value),
+        IRExpr::Var { name, .. } => {
+            // Check event params first
+            if let Some(val) = ctx.params.get(name.as_str()) {
+                return val.clone();
+            }
+            // Check entity bindings (last-bound entity for bare field names)
+            for (entity, slot) in ctx.bindings.values() {
+                if let Some(val) = pool.field_at(entity, *slot, name, step) {
+                    return val.clone();
+                }
+            }
+            panic!(
+                "guard variable not found: {name} (bindings: {:?})",
+                ctx.bindings.keys().collect::<Vec<_>>()
+            )
+        }
+        IRExpr::Field {
+            expr: recv, field, ..
+        } => {
+            // Resolve receiver variable to entity/slot via bindings
+            if let IRExpr::Var { name, .. } = recv.as_ref() {
+                if let Some((entity, slot)) = ctx.bindings.get(name.as_str()) {
+                    if let Some(val) = pool.field_at(entity, *slot, field, step) {
+                        return val.clone();
+                    }
+                }
+            }
+            // Fallback: try all bindings
+            for (entity, slot) in ctx.bindings.values() {
+                if let Some(val) = pool.field_at(entity, *slot, field, step) {
+                    return val.clone();
+                }
+            }
+            panic!("guard field not found: {field}")
+        }
+        IRExpr::Ctor {
+            enum_name, ctor, ..
+        } => {
+            let id = vctx.variants.id_of(enum_name, ctor);
+            smt::int_val(id)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            let l = encode_guard_value(pool, vctx, ctx, left, step);
+            let r = encode_guard_value(pool, vctx, ctx, right, step);
+            smt::binop(op, &l, &r)
+        }
+        IRExpr::UnOp { op, operand, .. } => {
+            let v = encode_guard_value(pool, vctx, ctx, operand, step);
+            smt::unop(op, &v)
+        }
+        IRExpr::Prime { expr } => encode_guard_value(pool, vctx, ctx, expr, step + 1),
+        other => panic!("unsupported expression in guard value encoding: {other:?}"),
+    }
 }
 
 /// Encode a system event as a single transition step.
@@ -527,7 +718,8 @@ fn build_event_params(params: &[IRTransParam]) -> HashMap<String, SmtValue> {
 /// - `ForAll` — conjunction over all active slots
 /// - `Apply` — resolve entity and action, encode with per-slot framing
 /// - `Create` — delegate to `encode_create`
-/// - `CrossCall`, `ExprStmt` — `CrossCall` not yet supported
+/// - `CrossCall` — resolve target system event and encode inline
+/// - `ExprStmt` — encode as boolean constraint
 ///
 /// Frames all entity slots NOT touched by the event.
 #[allow(clippy::too_many_lines)]
@@ -535,9 +727,34 @@ pub fn encode_event(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],
+    all_systems: &[IRSystem],
     event: &IREvent,
     step: usize,
 ) -> Bool {
+    encode_event_inner(pool, vctx, entities, all_systems, event, step, 0, None)
+}
+
+/// Inner recursive implementation of `encode_event` with depth tracking
+/// to prevent infinite loops from cyclic cross-system calls.
+///
+/// `override_params` allows callers (e.g., `CrossCall`) to supply pre-built
+/// Z3 values for the target event's parameters, wiring the caller's args
+/// into the target event instead of creating fresh unconstrained variables.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn encode_event_inner(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    all_systems: &[IRSystem],
+    event: &IREvent,
+    step: usize,
+    depth: usize,
+    override_params: Option<HashMap<String, SmtValue>>,
+) -> Bool {
+    assert!(
+        depth <= 10,
+        "CrossCall recursion depth exceeded (depth {depth}) — possible cyclic cross-system calls"
+    );
     assert!(
         step < pool.bound,
         "step {step} out of bounds for bound {}",
@@ -549,16 +766,18 @@ pub fn encode_event(
     // (Choose/ForAll/bare Apply do their own per-slot framing).
     let mut touched: HashSet<(String, usize)> = HashSet::new();
 
-    // Issue 3: Build event parameter Z3 variables once, share across all contexts.
-    let event_params = build_event_params(&event.params);
+    // Build event parameter Z3 variables once per step, share across all contexts.
+    // If override_params is provided (e.g., from CrossCall), use those instead
+    // so that the caller's argument values are wired into this event.
+    let event_params = override_params.unwrap_or_else(|| build_event_params(&event.params, step));
 
-    // Issue 4: Event guard encoding with param support.
+    // Event guard encoding with support for quantifiers over entity slots.
     // For guards that are trivially `true`, skip encoding.
-    // For non-trivial guards, encode with entity="" (no slot scope) but with
-    // event params available. This handles param-only guards (e.g., `order_id > 0`).
-    // NOTE: Guards that reference entity fields via quantifiers (e.g.,
-    // `exists o: Order | o.id == order_id`) require the Phase 1 quantifier
-    // encoder (encode::encode_expr with EncodeCtx). That is not yet wired here.
+    // For non-trivial guards, use `encode_guard_expr` which handles:
+    // - Quantifiers (`exists o: Order | ...`, `forall o: Order | ...`) by
+    //   expanding over active slots
+    // - Boolean connectives by recursing
+    // - Param-only or literal guards via `encode_slot_expr` with event params
     if !matches!(
         &event.guard,
         IRExpr::Lit {
@@ -566,43 +785,55 @@ pub fn encode_event(
             ..
         }
     ) {
-        let guard_ctx = SlotEncodeCtx {
-            pool,
-            vctx,
-            entity: "",
-            slot: 0,
-            params: event_params.clone(),
-        };
-        let guard = encode_slot_expr(&guard_ctx, &event.guard, step);
-        conjuncts.push(guard.to_bool());
+        let guard = encode_guard_expr(pool, vctx, &event.guard, &event_params, step);
+        conjuncts.push(guard);
     }
+
+    // Map Choose-bound variable names to their entity types for Apply target resolution.
+    let mut var_to_entity: HashMap<String, String> = HashMap::new();
+
+    // Accumulated Choose variable params: after a `choose r: Reservation ...`
+    // is encoded, fresh Z3 variables for `r`'s fields are created and
+    // constrained to match the chosen slot. Subsequent actions can then
+    // reference `r.product_id` via these shared variables without requiring
+    // a cross-product of slot assignments.
+    let mut choose_var_params: HashMap<String, SmtValue> = HashMap::new();
 
     for action in &event.body {
         match action {
-            // Issue 1: Per-slot framing in Choose.
+            // Per-slot framing in Choose.
             // Each disjunct includes framing for all OTHER slots of the same entity,
             // so non-selected slots cannot take arbitrary values.
+            //
+            // After encoding, creates shared Z3 variables for the Choose-bound
+            // variable's entity fields, constrained to the chosen slot's values.
+            // This enables subsequent Choose blocks to reference cross-entity
+            // fields (e.g., `r.product_id`) efficiently.
             IRAction::Choose {
-                var: _,
+                var,
                 entity: ent_name,
                 filter,
                 ops,
             } => {
+                // Track var → entity mapping for Apply target resolution
+                var_to_entity.insert(var.clone(), ent_name.clone());
+
                 let n_slots = pool.slots_for(ent_name);
                 let entity_ir = entities.iter().find(|e| e.name == *ent_name);
                 let mut slot_options = Vec::new();
 
+                // Merge event params with accumulated Choose variable params
+                let mut merged_params = event_params.clone();
+                merged_params.extend(choose_var_params.clone());
+
                 for slot in 0..n_slots {
-                    // Issue 5: The Choose's entity and slot are propagated to nested
-                    // ops via SlotEncodeCtx. The `var` binder is not needed as a
-                    // separate binding because encode_slot_expr already resolves
-                    // field names to the current slot's variables.
                     let ctx = SlotEncodeCtx {
                         pool,
                         vctx,
                         entity: ent_name,
                         slot,
-                        params: event_params.clone(),
+                        params: merged_params.clone(),
+                        bindings: HashMap::new(),
                     };
 
                     let mut slot_conjuncts = Vec::new();
@@ -616,7 +847,7 @@ pub fn encode_event(
                     let filt = encode_slot_expr(&ctx, filter, step);
                     slot_conjuncts.push(filt.to_bool());
 
-                    // Issue 6: Apply nested ops — slot is already known from Choose loop.
+                    // Apply nested ops — slot is already known from Choose loop.
                     for op in ops {
                         match op {
                             IRAction::Apply {
@@ -625,8 +856,6 @@ pub fn encode_event(
                                 args,
                                 refs: apply_refs,
                             } => {
-                                // Inside Choose, the target resolves to the current slot
-                                // directly — no disjunction needed.
                                 if let Some(ent) = entity_ir {
                                     if let Some(trans) =
                                         ent.transitions.iter().find(|t| t.name == *transition)
@@ -652,7 +881,36 @@ pub fn encode_event(
                         }
                     }
 
-                    // Issue 1: Frame all OTHER slots of this entity within the disjunct.
+                    // Constrain shared Choose variable fields to match this slot.
+                    // For each field of the chosen entity, assert that the shared
+                    // variable equals the slot's field at this step.
+                    if let Some(ent) = entity_ir {
+                        for field in &ent.fields {
+                            let shared_name = format!("choose_{var}_{}_t{step}", field.name);
+                            let shared_var = match &field.ty {
+                                IRType::Bool => smt::bool_var(&shared_name),
+                                IRType::Real | IRType::Float => smt::real_var(&shared_name),
+                                _ => smt::int_var(&shared_name),
+                            };
+                            if let Some(slot_val) = pool.field_at(ent_name, slot, &field.name, step)
+                            {
+                                match (&shared_var, slot_val) {
+                                    (SmtValue::Int(s), SmtValue::Int(f)) => {
+                                        slot_conjuncts.push(s.eq(f.clone()));
+                                    }
+                                    (SmtValue::Bool(s), SmtValue::Bool(f)) => {
+                                        slot_conjuncts.push(s.eq(f.clone()));
+                                    }
+                                    (SmtValue::Real(s), SmtValue::Real(f)) => {
+                                        slot_conjuncts.push(s.eq(f.clone()));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    // Frame all OTHER slots of this entity within the disjunct.
                     if let Some(ent) = entity_ir {
                         let slot_frame = frame_entity_slots_except(pool, ent, slot, step);
                         slot_conjuncts.extend(slot_frame);
@@ -668,11 +926,26 @@ pub fn encode_event(
                 let refs: Vec<&Bool> = slot_options.iter().collect();
                 if !refs.is_empty() {
                     conjuncts.push(Bool::or(&refs));
-                    // Mark all slots as touched — per-slot framing is handled
-                    // inside the disjuncts above. The outer frame_untouched_slots
-                    // handles OTHER entity types.
                     for slot in 0..n_slots {
                         touched.insert((ent_name.clone(), slot));
+                    }
+                }
+
+                // Register shared Choose variable fields as params for
+                // subsequent actions to resolve `var.field` references.
+                if let Some(ent) = entity_ir {
+                    for field in &ent.fields {
+                        let shared_name = format!("choose_{var}_{}_t{step}", field.name);
+                        let shared_var = match &field.ty {
+                            IRType::Bool => smt::bool_var(&shared_name),
+                            IRType::Real | IRType::Float => smt::real_var(&shared_name),
+                            _ => smt::int_var(&shared_name),
+                        };
+                        // Register as `var.field` for Field resolution
+                        choose_var_params
+                            .insert(format!("{var}.{}", field.name), shared_var.clone());
+                        // Also register as bare `field` if the var itself is referenced
+                        // (some filters use bare field names from Choose context)
                     }
                 }
             }
@@ -689,27 +962,41 @@ pub fn encode_event(
                 args,
                 refs: apply_refs,
             } => {
-                // Try to resolve target as entity type name first
+                // Resolve target: entity type name → Choose-bound variable → transition-based fallback
                 let resolved_entity = entities.iter().find(|e| e.name == *target).or_else(|| {
-                    // Target is a variable name — this typically occurs inside
-                    // Choose blocks (already handled above). For bare top-level
-                    // Apply, this is unusual but we search all entities that have
-                    // this transition.
-                    entities
+                    // Target is a variable name — check Choose bindings first
+                    if let Some(entity_name) = var_to_entity.get(target.as_str()) {
+                        return entities.iter().find(|e| e.name == *entity_name);
+                    }
+                    // Last resort: find entity with this transition (only if unambiguous)
+                    let matches: Vec<_> = entities
                         .iter()
-                        .find(|e| e.transitions.iter().any(|t| t.name == *transition))
+                        .filter(|e| e.transitions.iter().any(|t| t.name == *transition))
+                        .collect();
+                    if matches.len() == 1 {
+                        Some(matches[0])
+                    } else {
+                        None // ambiguous or not found — skip
+                    }
                 });
                 if let Some(ent) = resolved_entity {
                     if let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) {
-                        let n_slots = pool.slots_for(target);
+                        // Use resolved entity name, not the target variable name
+                        let ent_name = &ent.name;
+                        let n_slots = pool.slots_for(ent_name);
                         let mut slot_options = Vec::new();
                         for slot in 0..n_slots {
                             let apply_ctx = SlotEncodeCtx {
                                 pool,
                                 vctx,
-                                entity: target,
+                                entity: ent_name,
                                 slot,
-                                params: event_params.clone(),
+                                params: {
+                                    let mut p = event_params.clone();
+                                    p.extend(choose_var_params.clone());
+                                    p
+                                },
+                                bindings: HashMap::new(),
                             };
                             let action_params =
                                 build_apply_params(&apply_ctx, trans, args, apply_refs, step);
@@ -729,7 +1016,7 @@ pub fn encode_event(
                         }
                         // Mark all slots as touched — per-slot framing handled above
                         for slot in 0..n_slots {
-                            touched.insert((target.clone(), slot));
+                            touched.insert((ent_name.clone(), slot));
                         }
                     }
                 }
@@ -744,7 +1031,15 @@ pub fn encode_event(
                     .iter()
                     .map(|f| (f.name.clone(), f.value.clone()))
                     .collect();
-                let create = encode_create(pool, vctx, ent_name, entity_ir, &create_fields, step);
+                let create = encode_create(
+                    pool,
+                    vctx,
+                    ent_name,
+                    entity_ir,
+                    &create_fields,
+                    step,
+                    &event_params,
+                );
                 conjuncts.push(create);
                 // Mark all slots of this entity as potentially touched
                 let n_slots = pool.slots_for(ent_name);
@@ -771,7 +1066,12 @@ pub fn encode_event(
                         vctx,
                         entity: ent_name,
                         slot,
-                        params: event_params.clone(),
+                        params: {
+                            let mut p = event_params.clone();
+                            p.extend(choose_var_params.clone());
+                            p
+                        },
+                        bindings: HashMap::new(),
                     };
 
                     let mut op_conjuncts = Vec::new();
@@ -864,8 +1164,62 @@ pub fn encode_event(
                 }
             }
 
-            IRAction::CrossCall { .. } => {
-                unimplemented!("CrossCall action encoding not yet supported")
+            IRAction::CrossCall {
+                system: target_system,
+                event: event_name,
+                args: cross_args,
+            } => {
+                // Find the target system and its event, then encode it inline.
+                // Wire CrossCall args into the target event's parameters so that
+                // the target event uses the caller's values, not fresh variables.
+                if let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) {
+                    if let Some(target_event) =
+                        target_sys.events.iter().find(|e| e.name == *event_name)
+                    {
+                        // Build override params: evaluate each CrossCall arg in
+                        // the current event's context (using event_params) and
+                        // bind it to the corresponding target event param name.
+                        let mut cross_params: HashMap<String, SmtValue> = HashMap::new();
+                        let arg_ctx = SlotEncodeCtx {
+                            pool,
+                            vctx,
+                            entity: "",
+                            slot: 0,
+                            params: {
+                                let mut p = event_params.clone();
+                                p.extend(choose_var_params.clone());
+                                p
+                            },
+                            bindings: HashMap::new(),
+                        };
+                        for (target_param, arg_expr) in
+                            target_event.params.iter().zip(cross_args.iter())
+                        {
+                            let val = encode_slot_expr(&arg_ctx, arg_expr, step);
+                            cross_params.insert(target_param.name.clone(), val);
+                        }
+
+                        // Recursively encode the target event with wired params
+                        let cross_formula = encode_event_inner(
+                            pool,
+                            vctx,
+                            entities,
+                            all_systems,
+                            target_event,
+                            step,
+                            depth + 1,
+                            Some(cross_params),
+                        );
+                        conjuncts.push(cross_formula);
+                        // Mark all entities used by the target system as touched
+                        for ent_name in &target_sys.entities {
+                            let n_slots = pool.slots_for(ent_name);
+                            for slot in 0..n_slots {
+                                touched.insert((ent_name.clone(), slot));
+                            }
+                        }
+                    }
+                }
             }
 
             IRAction::ExprStmt { expr } => {
@@ -875,7 +1229,12 @@ pub fn encode_event(
                     vctx,
                     entity: "",
                     slot: 0,
-                    params: event_params.clone(),
+                    params: {
+                        let mut p = event_params.clone();
+                        p.extend(choose_var_params.clone());
+                        p
+                    },
+                    bindings: HashMap::new(),
                 };
                 let val = encode_slot_expr(&expr_ctx, expr, step);
                 conjuncts.push(val.to_bool());
@@ -922,7 +1281,7 @@ pub fn transition_constraints(
     // Each system event is a possible transition
     for system in systems {
         for event in &system.events {
-            let event_formula = encode_event(pool, vctx, entities, event, step);
+            let event_formula = encode_event(pool, vctx, entities, systems, event, step);
             disjuncts.push(event_formula);
         }
     }
@@ -954,6 +1313,12 @@ fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtV
             if let Some(val) = ctx.pool.field_at(ctx.entity, ctx.slot, name, step) {
                 return val.clone();
             }
+            // Try cross-entity bindings (from prior Choose blocks)
+            for (entity, slot) in ctx.bindings.values() {
+                if let Some(val) = ctx.pool.field_at(entity, *slot, name, step) {
+                    return val.clone();
+                }
+            }
             panic!(
                 "slot variable not found: {}.{name} slot={} step={step}",
                 ctx.entity, ctx.slot
@@ -980,7 +1345,24 @@ fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtV
             smt::unop(op, &v)
         }
 
-        IRExpr::Field { field, .. } => {
+        IRExpr::Field {
+            expr: recv, field, ..
+        } => {
+            if let IRExpr::Var { name, .. } = recv.as_ref() {
+                // Check shared Choose variable params: `var.field` → shared Z3 var
+                let qualified = format!("{name}.{field}");
+                if let Some(val) = ctx.params.get(&qualified) {
+                    return val.clone();
+                }
+                // Check cross-entity bindings (e.g., r.product_id where
+                // r is from a prior Choose over Reservation)
+                if let Some((entity, slot)) = ctx.bindings.get(name.as_str()) {
+                    if let Some(val) = ctx.pool.field_at(entity, *slot, field, step) {
+                        return val.clone();
+                    }
+                }
+            }
+            // Fall back to current entity context
             if let Some(val) = ctx.pool.field_at(ctx.entity, ctx.slot, field, step) {
                 return val.clone();
             }
@@ -1412,7 +1794,7 @@ mod tests {
             solver.assert(&b0_t0.eq(Int::from_i64(100)));
         }
 
-        let formula = encode_event(&pool, &vctx, &[entity], &event, 0);
+        let formula = encode_event(&pool, &vctx, &[entity], &[], &event, 0);
         solver.assert(&formula);
         assert_eq!(solver.check(), z3::SatResult::Sat);
 
@@ -1476,7 +1858,15 @@ mod tests {
                 value: LitVal::Int { value: 100 },
             },
         )];
-        let formula = encode_create(&pool, &vctx, "Account", Some(&entity), &create_fields, 0);
+        let formula = encode_create(
+            &pool,
+            &vctx,
+            "Account",
+            Some(&entity),
+            &create_fields,
+            0,
+            &HashMap::new(),
+        );
         solver.assert(&formula);
 
         assert_eq!(solver.check(), z3::SatResult::Sat);

@@ -24,6 +24,11 @@ struct Cli {
     /// Emit IR as JSON
     #[arg(long)]
     emit_ir: bool,
+
+    /// Run bounded model checking on verify blocks
+    // TODO: Planned — migrate to subcommand-based CLI (`abide verify spec.abide`)
+    #[arg(long)]
+    verify: bool,
 }
 
 fn main() -> miette::Result<()> {
@@ -73,7 +78,35 @@ fn main() -> miette::Result<()> {
         return Ok(());
     }
 
-    // Default: full pipeline (not yet implemented)
-    eprintln!("full pipeline not yet implemented — use --lex-only or --parse-only");
-    std::process::exit(1);
+    // Default: run full pipeline with verification
+    let (result, errors) = abide::elab::elaborate(&program);
+    for err in &errors {
+        eprintln!("{err}");
+    }
+    let ir_program = abide::ir::lower(&result);
+
+    if cli.verify || !cli.lex_only && !cli.parse_only && !cli.elaborate_only && !cli.emit_ir {
+        let results = abide::verify::verify_all(&ir_program);
+        if results.is_empty() {
+            println!("No verify blocks found.");
+        } else {
+            let mut all_passed = true;
+            for result in &results {
+                println!("{result}");
+                if matches!(
+                    result,
+                    abide::verify::VerificationResult::Counterexample { .. }
+                        | abide::verify::VerificationResult::SceneFail { .. }
+                        | abide::verify::VerificationResult::Unprovable { .. }
+                ) {
+                    all_passed = false;
+                }
+            }
+            if !all_passed {
+                std::process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
 }

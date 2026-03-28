@@ -3,6 +3,8 @@
 //! Desugars, resolves primed variables, computes frame conditions,
 //! and produces a flat `IRProgram`.
 
+use std::collections::HashMap;
+
 use crate::elab::types as E;
 
 use super::types::{
@@ -15,14 +17,37 @@ use super::types::{
 // ── Top-level lowering ───────────────────────────────────────────────
 
 pub fn lower(er: &E::ElabResult) -> IRProgram {
+    // Collect props for inlining into verify/theorem blocks.
+    // Props are parameterless named expressions.
+    let mut prop_map: HashMap<String, IRExpr> = HashMap::new();
+    for prop in &er.props {
+        prop_map.insert(prop.name.clone(), lower_expr(&prop.body));
+    }
+
+    // Collect preds for inlining into verify/theorem blocks.
+    // Preds have parameters — inlined via App substitution (replace param with arg).
+    let mut pred_map: HashMap<String, (Vec<String>, IRExpr)> = HashMap::new();
+    for pred in &er.preds {
+        let param_names: Vec<String> = pred.params.iter().map(|(n, _)| n.clone()).collect();
+        pred_map.insert(pred.name.clone(), (param_names, lower_expr(&pred.body)));
+    }
+
     IRProgram {
         types: er.types.iter().map(lower_type).collect(),
         constants: er.consts.iter().map(lower_const).collect(),
         functions: er.fns.iter().map(lower_fn).collect(),
         entities: er.entities.iter().map(lower_entity).collect(),
         systems: er.systems.iter().map(lower_system).collect(),
-        verifies: er.verifies.iter().map(lower_verify).collect(),
-        theorems: er.theorems.iter().map(lower_theorem).collect(),
+        verifies: er
+            .verifies
+            .iter()
+            .map(|v| lower_verify(v, &prop_map, &pred_map))
+            .collect(),
+        theorems: er
+            .theorems
+            .iter()
+            .map(|t| lower_theorem(t, &prop_map, &pred_map))
+            .collect(),
         axioms: er.axioms.iter().map(lower_axiom).collect(),
         scenes: er.scenes.iter().map(lower_scene).collect(),
     }
@@ -302,7 +327,11 @@ fn lower_schedule(items: &[E::ENextItem]) -> IRSchedule {
 
 // ── Verification ─────────────────────────────────────────────────────
 
-fn lower_verify(ev: &E::EVerify) -> IRVerify {
+fn lower_verify(
+    ev: &E::EVerify,
+    prop_map: &HashMap<String, IRExpr>,
+    pred_map: &HashMap<String, (Vec<String>, IRExpr)>,
+) -> IRVerify {
     IRVerify {
         name: ev.name.clone(),
         systems: ev
@@ -314,16 +343,35 @@ fn lower_verify(ev: &E::EVerify) -> IRVerify {
                 hi: *hi,
             })
             .collect(),
-        asserts: ev.asserts.iter().map(lower_expr).collect(),
+        asserts: ev
+            .asserts
+            .iter()
+            .map(|a| {
+                let lowered = lower_expr(a);
+                substitute_defs(lowered, prop_map, pred_map)
+            })
+            .collect(),
     }
 }
 
-fn lower_theorem(et: &E::ETheorem) -> IRTheorem {
+fn lower_theorem(
+    et: &E::ETheorem,
+    prop_map: &HashMap<String, IRExpr>,
+    pred_map: &HashMap<String, (Vec<String>, IRExpr)>,
+) -> IRTheorem {
     IRTheorem {
         name: et.name.clone(),
         systems: et.targets.clone(),
-        invariants: et.invariants.iter().map(lower_expr).collect(),
-        shows: et.shows.iter().map(lower_expr).collect(),
+        invariants: et
+            .invariants
+            .iter()
+            .map(|i| substitute_defs(lower_expr(i), prop_map, pred_map))
+            .collect(),
+        shows: et
+            .shows
+            .iter()
+            .map(|s| substitute_defs(lower_expr(s), prop_map, pred_map))
+            .collect(),
     }
 }
 
@@ -400,6 +448,340 @@ fn card_from_text(s: Option<&str>) -> Cardinality {
             Ok(i) => Cardinality::Exact { exactly: i },
             Err(_) => Cardinality::Named("one".to_owned()),
         },
+    }
+}
+
+// ── Prop and pred inlining ───────────────────────────────────────────
+
+/// Substitute `Var` references matching prop names, and `App(Var(pred), arg)`
+/// calls matching pred names, with their inlined bodies.
+///
+/// Props are parameterless named expressions. Preds have parameters — when
+/// `App { func: Var(name), arg }` matches a pred, the pred body is returned
+/// with all occurrences of the parameter variable replaced by the argument.
+#[allow(clippy::too_many_lines)]
+/// Fixed-point inlining: run `substitute_defs_once` repeatedly until
+/// the expression stops changing or we hit 20 iterations (safety cap).
+fn substitute_defs(
+    expr: IRExpr,
+    prop_map: &HashMap<String, IRExpr>,
+    pred_map: &HashMap<String, (Vec<String>, IRExpr)>,
+) -> IRExpr {
+    let mut result = expr;
+    for _ in 0..20 {
+        let next = substitute_defs_once(result.clone(), prop_map, pred_map);
+        if format!("{next:?}") == format!("{result:?}") {
+            return next;
+        }
+        result = next;
+    }
+    result
+}
+
+/// Single pass: inline prop Var references and pred App calls.
+/// Does NOT recurse into inlined bodies — the caller loops to fixed point.
+#[allow(clippy::too_many_lines)]
+fn substitute_defs_once(
+    expr: IRExpr,
+    prop_map: &HashMap<String, IRExpr>,
+    pred_map: &HashMap<String, (Vec<String>, IRExpr)>,
+) -> IRExpr {
+    match expr {
+        IRExpr::Var { ref name, .. } => {
+            if let Some(body) = prop_map.get(name) {
+                body.clone()
+            } else {
+                expr
+            }
+        }
+        // Pred call: App chain — inline once, don't recurse into result.
+        IRExpr::App { .. } => {
+            let mut args = Vec::new();
+            let mut current = &expr;
+            while let IRExpr::App { func, arg, .. } = current {
+                args.push(arg.as_ref());
+                current = func.as_ref();
+            }
+            args.reverse();
+
+            if let IRExpr::Var { name, .. } = current {
+                if let Some((params, body)) = pred_map.get(name) {
+                    if params.len() == args.len() {
+                        let mut result = body.clone();
+                        for (param_name, arg_expr) in params.iter().zip(args.iter()) {
+                            let substituted_arg =
+                                substitute_defs_once((*arg_expr).clone(), prop_map, pred_map);
+                            result = substitute_var_in_expr(result, param_name, &substituted_arg);
+                        }
+                        return result; // return without recursing — outer loop handles it
+                    }
+                }
+            }
+            // Not a pred call — recurse structurally
+            let IRExpr::App { func, arg, ty } = expr else {
+                unreachable!()
+            };
+            IRExpr::App {
+                func: Box::new(substitute_defs_once(*func, prop_map, pred_map)),
+                arg: Box::new(substitute_defs_once(*arg, prop_map, pred_map)),
+                ty,
+            }
+        }
+        IRExpr::Always { body } => IRExpr::Always {
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::Eventually { body } => IRExpr::Eventually {
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+        } => IRExpr::BinOp {
+            op,
+            left: Box::new(substitute_defs_once(*left, prop_map, pred_map)),
+            right: Box::new(substitute_defs_once(*right, prop_map, pred_map)),
+            ty,
+        },
+        IRExpr::UnOp { op, operand, ty } => IRExpr::UnOp {
+            op,
+            operand: Box::new(substitute_defs_once(*operand, prop_map, pred_map)),
+            ty,
+        },
+        IRExpr::Forall { var, domain, body } => IRExpr::Forall {
+            var,
+            domain,
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::Exists { var, domain, body } => IRExpr::Exists {
+            var,
+            domain,
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::Field { expr, field, ty } => IRExpr::Field {
+            expr: Box::new(substitute_defs_once(*expr, prop_map, pred_map)),
+            field,
+            ty,
+        },
+        IRExpr::Prime { expr } => IRExpr::Prime {
+            expr: Box::new(substitute_defs_once(*expr, prop_map, pred_map)),
+        },
+        IRExpr::Let { bindings, body } => IRExpr::Let {
+            bindings: bindings
+                .into_iter()
+                .map(|b| LetBinding {
+                    name: b.name,
+                    ty: b.ty,
+                    expr: substitute_defs_once(b.expr, prop_map, pred_map),
+                })
+                .collect(),
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::Lam {
+            param,
+            param_type,
+            body,
+        } => IRExpr::Lam {
+            param,
+            param_type,
+            body: Box::new(substitute_defs_once(*body, prop_map, pred_map)),
+        },
+        IRExpr::Match { scrutinee, arms } => IRExpr::Match {
+            scrutinee: Box::new(substitute_defs_once(*scrutinee, prop_map, pred_map)),
+            arms: arms
+                .into_iter()
+                .map(|a| IRMatchArm {
+                    pattern: a.pattern,
+                    guard: a.guard.map(|g| substitute_defs_once(g, prop_map, pred_map)),
+                    body: substitute_defs_once(a.body, prop_map, pred_map),
+                })
+                .collect(),
+        },
+        IRExpr::MapUpdate {
+            map,
+            key,
+            value,
+            ty,
+        } => IRExpr::MapUpdate {
+            map: Box::new(substitute_defs_once(*map, prop_map, pred_map)),
+            key: Box::new(substitute_defs_once(*key, prop_map, pred_map)),
+            value: Box::new(substitute_defs_once(*value, prop_map, pred_map)),
+            ty,
+        },
+        IRExpr::Index { map, key, ty } => IRExpr::Index {
+            map: Box::new(substitute_defs_once(*map, prop_map, pred_map)),
+            key: Box::new(substitute_defs_once(*key, prop_map, pred_map)),
+            ty,
+        },
+        IRExpr::SetComp {
+            var,
+            domain,
+            filter,
+            projection,
+            ty,
+        } => IRExpr::SetComp {
+            var,
+            domain,
+            filter: Box::new(substitute_defs_once(*filter, prop_map, pred_map)),
+            projection: projection.map(|p| Box::new(substitute_defs_once(*p, prop_map, pred_map))),
+            ty,
+        },
+        IRExpr::SetLit { elements, ty } => IRExpr::SetLit {
+            elements: elements
+                .into_iter()
+                .map(|e| substitute_defs_once(e, prop_map, pred_map))
+                .collect(),
+            ty,
+        },
+        IRExpr::SeqLit { elements, ty } => IRExpr::SeqLit {
+            elements: elements
+                .into_iter()
+                .map(|e| substitute_defs_once(e, prop_map, pred_map))
+                .collect(),
+            ty,
+        },
+        IRExpr::MapLit { entries, ty } => IRExpr::MapLit {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        substitute_defs_once(k, prop_map, pred_map),
+                        substitute_defs_once(v, prop_map, pred_map),
+                    )
+                })
+                .collect(),
+            ty,
+        },
+        // Leaf nodes that contain no sub-expressions
+        other => other,
+    }
+}
+
+/// Replace all occurrences of `Var(var_name)` with `replacement` in `expr`.
+///
+/// Also handles `Field(Var(var_name), field)` by producing
+/// `Field(replacement, field)` so that `d.status` with `d` replaced by the
+/// argument expression correctly resolves field access.
+#[allow(clippy::too_many_lines)]
+fn substitute_var_in_expr(expr: IRExpr, var_name: &str, replacement: &IRExpr) -> IRExpr {
+    match expr {
+        IRExpr::Var { ref name, .. } if name == var_name => replacement.clone(),
+        IRExpr::Field {
+            expr: ref inner,
+            ref field,
+            ref ty,
+        } => {
+            if let IRExpr::Var { name, .. } = inner.as_ref() {
+                if name == var_name {
+                    return IRExpr::Field {
+                        expr: Box::new(replacement.clone()),
+                        field: field.clone(),
+                        ty: ty.clone(),
+                    };
+                }
+            }
+            let IRExpr::Field { expr, field, ty } = expr else {
+                unreachable!()
+            };
+            IRExpr::Field {
+                expr: Box::new(substitute_var_in_expr(*expr, var_name, replacement)),
+                field,
+                ty,
+            }
+        }
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+        } => IRExpr::BinOp {
+            op,
+            left: Box::new(substitute_var_in_expr(*left, var_name, replacement)),
+            right: Box::new(substitute_var_in_expr(*right, var_name, replacement)),
+            ty,
+        },
+        IRExpr::UnOp { op, operand, ty } => IRExpr::UnOp {
+            op,
+            operand: Box::new(substitute_var_in_expr(*operand, var_name, replacement)),
+            ty,
+        },
+        IRExpr::Always { body } => IRExpr::Always {
+            body: Box::new(substitute_var_in_expr(*body, var_name, replacement)),
+        },
+        IRExpr::Eventually { body } => IRExpr::Eventually {
+            body: Box::new(substitute_var_in_expr(*body, var_name, replacement)),
+        },
+        IRExpr::Forall { var, domain, body } => IRExpr::Forall {
+            var: var.clone(),
+            domain,
+            body: if var == var_name {
+                body // shadowed — don't substitute
+            } else {
+                Box::new(substitute_var_in_expr(*body, var_name, replacement))
+            },
+        },
+        IRExpr::Exists { var, domain, body } => IRExpr::Exists {
+            var: var.clone(),
+            domain,
+            body: if var == var_name {
+                body
+            } else {
+                Box::new(substitute_var_in_expr(*body, var_name, replacement))
+            },
+        },
+        IRExpr::App { func, arg, ty } => IRExpr::App {
+            func: Box::new(substitute_var_in_expr(*func, var_name, replacement)),
+            arg: Box::new(substitute_var_in_expr(*arg, var_name, replacement)),
+            ty,
+        },
+        IRExpr::Prime { expr } => IRExpr::Prime {
+            expr: Box::new(substitute_var_in_expr(*expr, var_name, replacement)),
+        },
+        IRExpr::Lam {
+            param,
+            param_type,
+            body,
+        } => IRExpr::Lam {
+            param: param.clone(),
+            param_type,
+            body: if param == var_name {
+                body
+            } else {
+                Box::new(substitute_var_in_expr(*body, var_name, replacement))
+            },
+        },
+        IRExpr::Let { bindings, body } => {
+            let mut shadowed = false;
+            let new_bindings: Vec<LetBinding> = bindings
+                .into_iter()
+                .map(|b| {
+                    let new_expr = if shadowed {
+                        b.expr
+                    } else {
+                        substitute_var_in_expr(b.expr, var_name, replacement)
+                    };
+                    if b.name == var_name {
+                        shadowed = true;
+                    }
+                    LetBinding {
+                        name: b.name,
+                        ty: b.ty,
+                        expr: new_expr,
+                    }
+                })
+                .collect();
+            IRExpr::Let {
+                bindings: new_bindings,
+                body: if shadowed {
+                    body
+                } else {
+                    Box::new(substitute_var_in_expr(*body, var_name, replacement))
+                },
+            }
+        }
+        // Leaf nodes and everything else — return as-is
+        other => other,
     }
 }
 

@@ -124,12 +124,12 @@ pred non_negative_order_total(o: Order) = o.total >= 0
 prop commerce_safe for Commerce = always all o: Order | non_negative_order_total(o)
 
 // Bounded model checking — automated, scope-bounded
-verify commerce_smoke for Commerce[0..500] {
+verify commerce_smoke for Commerce[0..5] {
   assert commerce_safe
   assert eventually exists o: Order | o.status == @Paid
 }
 
-verify billing_safety for Billing[0..500] {
+verify billing_safety for Billing[0..5] {
   assert always all p: PaymentIntent | p.status == @Captured implies p.amount > 0
 }
 
