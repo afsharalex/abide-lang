@@ -107,8 +107,9 @@ fn resolve_use_declarations(env: &mut Env) {
                     imports.push((name.clone(), module.clone(), name));
                 }
             }
-            UseDecl::Single { module, name, .. } => {
-                if let Some(err) = check_import_target(env, &known_modules, module, name, importing)
+            UseDecl::Single { module, name, span } => {
+                if let Some(err) =
+                    check_import_target(env, &known_modules, module, name, importing, *span)
                 {
                     errors.push(err);
                 } else {
@@ -119,31 +120,42 @@ fn resolve_use_declarations(env: &mut Env) {
                 module,
                 name,
                 alias,
-                ..
+                span,
             } => {
-                if let Some(err) = check_import_target(env, &known_modules, module, name, importing)
+                if let Some(err) =
+                    check_import_target(env, &known_modules, module, name, importing, *span)
                 {
                     errors.push(err);
                 } else {
                     imports.push((alias.clone(), module.clone(), name.clone()));
                 }
             }
-            UseDecl::Items { module, items, .. } => {
+            UseDecl::Items {
+                module,
+                items,
+                span,
+            } => {
                 for item in items {
-                    let (name, local) = match item {
-                        crate::ast::UseItem::Name { name, .. } => (name.as_str(), name.clone()),
-                        crate::ast::UseItem::Alias { name, alias, .. } => {
-                            (name.as_str(), alias.clone())
+                    let (name, local, item_span) = match item {
+                        crate::ast::UseItem::Name { name, span: s } => {
+                            (name.as_str(), name.clone(), *s)
                         }
+                        crate::ast::UseItem::Alias {
+                            name,
+                            alias,
+                            span: s,
+                        } => (name.as_str(), alias.clone(), *s),
                     };
                     if let Some(err) =
-                        check_import_target(env, &known_modules, module, name, importing)
+                        check_import_target(env, &known_modules, module, name, importing, item_span)
                     {
                         errors.push(err);
                     } else {
                         imports.push((local, module.clone(), name.to_string()));
                     }
                 }
+                // Suppress unused variable warning for the parent span
+                let _ = span;
             }
         }
     }
@@ -170,6 +182,7 @@ fn check_import_target(
     target_module: &str,
     target_name: &str,
     importing_module: Option<&str>,
+    use_span: crate::span::Span,
 ) -> Option<ElabError> {
     if !known_modules.contains(target_module) {
         // Module not loaded — don't error. In single-file mode this is expected
@@ -182,21 +195,23 @@ fn check_import_target(
         Some(decl) => {
             // Check visibility: cross-module access requires Public
             if decl.visibility == Visibility::Private && importing_module != Some(target_module) {
-                Some(ElabError::new(
+                Some(ElabError::with_span(
                     ErrorKind::UndefinedRef,
                     format!(
                         "cannot import private declaration '{target_name}' from module '{target_module}'"
                     ),
-                    "mark it 'pub' to make it importable".to_string(),
-                ))
+                    String::new(),
+                    use_span,
+                ).with_help("mark it 'pub' to make it importable"))
             } else {
                 None
             }
         }
-        None => Some(ElabError::new(
+        None => Some(ElabError::with_span(
             ErrorKind::UndefinedRef,
             format!("module '{target_module}' does not export '{target_name}'"),
             String::new(),
+            use_span,
         )),
     }
 }
@@ -740,6 +755,7 @@ mod tests {
             "Secret".to_string(),
             Some(Ty::Enum("Secret".to_string(), vec!["X".to_string()])),
             Visibility::Private,
+            crate::span::Span { start: 0, end: 0 },
         );
         // Override the module to Provider (make_decl_info uses current module)
         let info = crate::elab::env::DeclInfo {

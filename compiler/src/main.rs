@@ -1,5 +1,5 @@
 use clap::{Parser as ClapParser, Subcommand};
-use miette::{IntoDiagnostic, WrapErr};
+use miette::{IntoDiagnostic, NamedSource, WrapErr};
 use std::path::PathBuf;
 
 #[derive(ClapParser)]
@@ -97,6 +97,7 @@ const DEFAULT_PROP_BMC_DEPTH: usize = 10;
 /// power against responsiveness.
 const DEFAULT_IC3_TIMEOUT_SECS: u64 = 10;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
@@ -114,20 +115,36 @@ fn main() -> miette::Result<()> {
             let tokens =
                 abide::lex::lex(&src).map_err(|errors| errors.into_iter().next().unwrap())?;
             let mut parser = abide::parse::Parser::new(tokens);
-            let program = parser.parse_program()?;
+            let (program, parse_errors) = parser.parse_program_recovering();
+            if !parse_errors.is_empty() {
+                let named = NamedSource::new(file.display().to_string(), src);
+                for err in &parse_errors {
+                    let report = miette::Report::new(err.clone()).with_source_code(named.clone());
+                    eprintln!("{report:?}");
+                }
+                std::process::exit(1);
+            }
             println!("{program:#?}");
         }
         Command::Elaborate { files } => {
-            let (result, errors) = load_and_elaborate(&files)?;
-            for err in &errors {
-                eprintln!("{err}");
+            let mut sources = read_sources_for_diagnostics(&files);
+            let Some((result, errors)) = load_and_elaborate(&files, &mut sources) else {
+                std::process::exit(1);
+            };
+            report_elab_errors(&errors, &sources);
+            if !errors.is_empty() {
+                std::process::exit(1);
             }
             println!("{result:#?}");
         }
         Command::EmitIr { files } => {
-            let (result, errors) = load_and_elaborate(&files)?;
-            for err in &errors {
-                eprintln!("{err}");
+            let mut sources = read_sources_for_diagnostics(&files);
+            let Some((result, errors)) = load_and_elaborate(&files, &mut sources) else {
+                std::process::exit(1);
+            };
+            report_elab_errors(&errors, &sources);
+            if !errors.is_empty() {
+                std::process::exit(1);
             }
             let ir_program = abide::ir::lower(&result);
             let json = abide::ir::emit_json(&ir_program);
@@ -144,9 +161,13 @@ fn main() -> miette::Result<()> {
             no_prop_verify,
             progress,
         } => {
-            let (result, errors) = load_and_elaborate(&files)?;
-            for err in &errors {
-                eprintln!("{err}");
+            let mut sources = read_sources_for_diagnostics(&files);
+            let Some((result, errors)) = load_and_elaborate(&files, &mut sources) else {
+                std::process::exit(1);
+            };
+            report_elab_errors(&errors, &sources);
+            if !errors.is_empty() {
+                std::process::exit(1);
             }
             let ir_program = abide::ir::lower(&result);
 
@@ -194,12 +215,106 @@ fn read_file(path: &PathBuf) -> miette::Result<String> {
         .wrap_err_with(|| format!("failed to read {}", path.display()))
 }
 
+/// Read source text from all input files for diagnostic rendering.
+/// Returns `(filename, source_text)` pairs for matching against error file tags.
+fn read_sources_for_diagnostics(paths: &[PathBuf]) -> Vec<(String, String)> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let src = std::fs::read_to_string(p).ok()?;
+            // Use canonical path to match loader's canonicalized file tags.
+            let key = std::fs::canonicalize(p)
+                .map_or_else(|_| p.display().to_string(), |c| c.display().to_string());
+            Some((key, src))
+        })
+        .collect()
+}
+
+/// Render elaboration errors with miette source snippets when spans are available.
+///
+/// Only renders source snippets when the error's file matches the loaded source.
+/// Errors from other files (in multi-file mode) fall back to plain text to avoid
+/// rendering spans against the wrong source.
+fn report_elab_errors(errors: &[abide::elab::error::ElabError], sources: &[(String, String)]) {
+    let single_file = sources.len() <= 1;
+    for err in errors {
+        if let Some(span) = err.span {
+            // Find the matching source for this error's file
+            let matching_source = if let Some(ref file) = err.file {
+                sources.iter().find(|(name, _)| name == file)
+            } else if single_file {
+                // Single-file mode: safe to use the only source
+                sources.first()
+            } else {
+                // Multi-file with untagged error: don't guess — fall back to plain text
+                None
+            };
+
+            if let Some((name, src)) = matching_source {
+                // Verify the span is within the source's range
+                if span.end <= src.len() {
+                    let named = NamedSource::new(name.clone(), src.clone());
+                    let report = miette::Report::new(err.clone()).with_source_code(named);
+                    eprintln!("{report:?}");
+                    continue;
+                }
+            }
+        }
+        // Fallback: plain text for errors without spans, without matching source,
+        // or with out-of-range spans
+        eprintln!("{err}");
+    }
+}
+
 fn load_and_elaborate(
     paths: &[PathBuf],
-) -> miette::Result<(
+    sources: &mut Vec<(String, String)>,
+) -> Option<(
     abide::elab::types::ElabResult,
     Vec<abide::elab::error::ElabError>,
 )> {
-    let env = abide::loader::load_files(paths).map_err(|e| miette::miette!("{e}"))?;
-    Ok(abide::elab::elaborate_env(env))
+    let (env, load_errors, all_paths) = abide::loader::load_files(paths);
+
+    // Extend source map with any included files not already present
+    for loaded_path in &all_paths {
+        let key = loaded_path.display().to_string();
+        if !sources.iter().any(|(name, _)| name == &key) {
+            if let Ok(src) = std::fs::read_to_string(loaded_path) {
+                sources.push((key, src));
+            }
+        }
+    }
+
+    if !load_errors.is_empty() {
+        for err in &load_errors {
+            match err {
+                abide::loader::LoadError::ParseErrors { path, errors } => {
+                    // Render each parse error with source snippet
+                    let src = sources
+                        .iter()
+                        .find(|(name, _)| name == &path.display().to_string())
+                        .or_else(|| {
+                            // Try canonical path match
+                            let canonical = std::fs::canonicalize(path).ok()?;
+                            sources
+                                .iter()
+                                .find(|(name, _)| name == &canonical.display().to_string())
+                        });
+                    for pe in errors {
+                        if let Some((name, text)) = src {
+                            let named = NamedSource::new(name.clone(), text.clone());
+                            let report = miette::Report::new(pe.clone()).with_source_code(named);
+                            eprintln!("{report:?}");
+                        } else {
+                            eprintln!("{pe}");
+                        }
+                    }
+                }
+                other => eprintln!("{other}"),
+            }
+        }
+        return None;
+    }
+
+    Some(abide::elab::elaborate_env(env))
 }

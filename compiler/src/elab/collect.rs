@@ -50,13 +50,14 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
             env.known_modules.insert(d.name.clone());
             match &env.module_name {
                 Some(existing) if existing != &d.name => {
-                    env.errors.push(ElabError::new(
+                    env.errors.push(ElabError::with_span(
                         ErrorKind::DuplicateDecl,
                         format!(
                             "conflicting module declaration: '{}' (already declared as '{}')",
                             d.name, existing
                         ),
                         String::new(),
+                        d.span,
                     ));
                     // Keep first module name — don't overwrite on conflict
                 }
@@ -110,6 +111,7 @@ fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
                     name.clone(),
                     Some(ty.clone()),
                     td.visibility,
+                    td.span,
                 );
                 env.add_decl(name, info);
                 env.insert_type(name, ty);
@@ -134,6 +136,7 @@ fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
         name.clone(),
         Some(ty.clone()),
         td.visibility,
+        td.span,
     );
     env.add_decl(name, info);
     env.insert_type(name, ty);
@@ -152,6 +155,7 @@ fn collect_record(env: &mut Env, rd: &ast::RecordDecl) {
         name.clone(),
         Some(ty.clone()),
         rd.visibility,
+        rd.span,
     );
     env.add_decl(name, info);
     env.insert_type(name, ty);
@@ -210,8 +214,9 @@ fn collect_entity(env: &mut Env, ed: &ast::EntityDecl) {
         name: name.clone(),
         fields,
         actions,
+        span: Some(ed.span),
     };
-    let info = env.make_decl_info(DeclKind::Entity, name.clone(), None, ed.visibility);
+    let info = env.make_decl_info(DeclKind::Entity, name.clone(), None, ed.visibility, ed.span);
     env.add_decl(name, info);
     env.insert_entity(name, ee);
 }
@@ -221,6 +226,7 @@ fn collect_field(f: &ast::FieldDecl) -> EField {
         name: f.name.clone(),
         ty: resolve_type_ref(&f.ty),
         default: f.default.as_ref().map(collect_expr),
+        span: Some(f.span),
     }
 }
 
@@ -250,6 +256,7 @@ fn collect_action(a: &ast::EntityAction) -> EAction {
         params,
         requires,
         body,
+        span: Some(a.span),
     }
 }
 
@@ -286,8 +293,15 @@ fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         scopes: Vec::new(),
         events,
         next_items,
+        span: Some(sd.span),
     };
-    let info = env.make_decl_info(DeclKind::System, name.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::System,
+        name.clone(),
+        None,
+        Visibility::Public,
+        sd.span,
+    );
     env.add_decl(name, info);
     env.insert_system(name, es);
 }
@@ -321,6 +335,7 @@ fn collect_event(ev: &ast::EventDecl) -> EEvent {
         requires,
         ensures,
         body,
+        span: Some(ev.span),
     }
 }
 
@@ -429,8 +444,9 @@ fn collect_pred(env: &mut Env, pd: &ast::PredDecl) {
         name: name.clone(),
         params,
         body: collect_expr(&pd.body),
+        span: Some(pd.span),
     };
-    let info = env.make_decl_info(DeclKind::Pred, name.clone(), None, pd.visibility);
+    let info = env.make_decl_info(DeclKind::Pred, name.clone(), None, pd.visibility, pd.span);
     env.add_decl(name, info);
     env.insert_pred(name, ep);
 }
@@ -446,8 +462,9 @@ fn collect_prop(env: &mut Env, pd: &ast::PropDecl) {
         name: name.clone(),
         target,
         body: collect_expr(&pd.body),
+        span: Some(pd.span),
     };
-    let info = env.make_decl_info(DeclKind::Prop, name.clone(), None, pd.visibility);
+    let info = env.make_decl_info(DeclKind::Prop, name.clone(), None, pd.visibility, pd.span);
     env.add_decl(name, info);
     env.insert_prop(name, ep);
 }
@@ -464,9 +481,16 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
         name: name.clone(),
         targets,
         asserts,
+        span: Some(vd.span),
     };
     let key = format!("verify:{name}");
-    let info = env.make_decl_info(DeclKind::Verify, key.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::Verify,
+        key.clone(),
+        None,
+        Visibility::Public,
+        vd.span,
+    );
     env.add_decl(&key, info);
     env.verifies.push(ev);
 }
@@ -534,9 +558,16 @@ fn collect_scene(env: &mut Env, sd: &ast::SceneDecl) {
         givens,
         whens,
         thens,
+        span: Some(sd.span),
     };
     let key = format!("scene:{name}");
-    let info = env.make_decl_info(DeclKind::Scene, key.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::Scene,
+        key.clone(),
+        None,
+        Visibility::Public,
+        sd.span,
+    );
     env.add_decl(&key, info);
     env.scenes.push(es);
 }
@@ -611,8 +642,15 @@ fn collect_theorem(env: &mut Env, td: &ast::TheoremDecl) {
         targets: td.systems.clone(),
         invariants: td.invariants.iter().map(collect_expr).collect(),
         shows: td.shows.iter().map(collect_expr).collect(),
+        span: Some(td.span),
     };
-    let info = env.make_decl_info(DeclKind::Theorem, name.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::Theorem,
+        name.clone(),
+        None,
+        Visibility::Public,
+        td.span,
+    );
     env.add_decl(name, info);
     env.theorems.push(et);
 }
@@ -622,8 +660,15 @@ fn collect_axiom(env: &mut Env, ad: &ast::AxiomDecl) {
     let ea = EAxiom {
         name: name.clone(),
         body: collect_expr(&ad.body),
+        span: Some(ad.span),
     };
-    let info = env.make_decl_info(DeclKind::Axiom, name.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::Axiom,
+        name.clone(),
+        None,
+        Visibility::Public,
+        ad.span,
+    );
     env.add_decl(name, info);
     env.axioms.push(ea);
 }
@@ -633,8 +678,15 @@ fn collect_lemma(env: &mut Env, ld: &ast::LemmaDecl) {
     let el = ELemma {
         name: name.clone(),
         body: ld.body.iter().map(collect_expr).collect(),
+        span: Some(ld.span),
     };
-    let info = env.make_decl_info(DeclKind::Lemma, name.clone(), None, Visibility::Public);
+    let info = env.make_decl_info(
+        DeclKind::Lemma,
+        name.clone(),
+        None,
+        Visibility::Public,
+        ld.span,
+    );
     env.add_decl(name, info);
     env.lemmas.push(el);
 }
@@ -644,8 +696,9 @@ fn collect_const(env: &mut Env, cd: &ast::ConstDecl) {
     let ec = EConst {
         name: name.clone(),
         body: collect_expr(&cd.value),
+        span: Some(cd.span),
     };
-    let info = env.make_decl_info(DeclKind::Const, name.clone(), None, cd.visibility);
+    let info = env.make_decl_info(DeclKind::Const, name.clone(), None, cd.visibility, cd.span);
     env.add_decl(name, info);
     env.insert_const(name, ec);
 }
@@ -663,8 +716,9 @@ fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
         params,
         ret_ty: ret,
         body: collect_expr(&fd.body),
+        span: Some(fd.span),
     };
-    let info = env.make_decl_info(DeclKind::Fn, name.clone(), None, fd.visibility);
+    let info = env.make_decl_info(DeclKind::Fn, name.clone(), None, fd.visibility, fd.span);
     env.add_decl(name, info);
     env.insert_fn(name, ef);
 }

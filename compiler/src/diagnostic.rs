@@ -34,7 +34,7 @@ impl LexError {
     }
 }
 
-#[derive(Error, Diagnostic, Debug)]
+#[derive(Error, Diagnostic, Debug, Clone)]
 pub enum ParseError {
     #[error("expected {expected}, found {found}")]
     #[diagnostic(code(abide::parse::expected))]
@@ -43,6 +43,8 @@ pub enum ParseError {
         found: String,
         #[label("here")]
         span: miette::SourceSpan,
+        #[help]
+        help: Option<String>,
     },
 
     #[error("unexpected end of input")]
@@ -58,6 +60,8 @@ pub enum ParseError {
         msg: String,
         #[label("{msg}")]
         span: miette::SourceSpan,
+        #[help]
+        help: Option<String>,
     },
 }
 
@@ -67,6 +71,16 @@ impl ParseError {
             expected: expected.to_owned(),
             found: found.to_owned(),
             span: span.into(),
+            help: None,
+        }
+    }
+
+    pub fn expected_with_help(expected: &str, found: &str, span: Span, help: &str) -> Self {
+        Self::Expected {
+            expected: expected.to_owned(),
+            found: found.to_owned(),
+            span: span.into(),
+            help: Some(help.to_owned()),
         }
     }
 
@@ -78,6 +92,15 @@ impl ParseError {
         Self::General {
             msg: msg.to_owned(),
             span: span.into(),
+            help: None,
+        }
+    }
+
+    pub fn general_with_help(msg: &str, span: Span, help: &str) -> Self {
+        Self::General {
+            msg: msg.to_owned(),
+            span: span.into(),
+            help: Some(help.to_owned()),
         }
     }
 }

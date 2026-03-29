@@ -34,6 +34,8 @@ pub struct DeclInfo {
     pub visibility: Visibility,
     /// Source module this declaration belongs to (None = no module declared).
     pub module: Option<String>,
+    /// Source span of this declaration (for diagnostic pointing).
+    pub span: Option<crate::span::Span>,
 }
 
 /// The elaboration environment (symbol table).
@@ -133,14 +135,28 @@ impl Env {
     pub fn add_decl(&mut self, name: &str, info: DeclInfo) {
         let key = Self::qualified_key(info.module.as_deref(), name);
         if let Some(existing) = self.decls.get(&key) {
-            self.errors.push(ElabError::new(
-                ErrorKind::DuplicateDecl,
-                format!(
-                    "duplicate declaration: {name} (already declared as {:?})",
-                    existing.kind
-                ),
-                String::new(),
-            ));
+            let err = if let Some(span) = info.span {
+                ElabError::with_span(
+                    ErrorKind::DuplicateDecl,
+                    format!(
+                        "duplicate declaration: {name} (already declared as {:?})",
+                        existing.kind
+                    ),
+                    String::new(),
+                    span,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::DuplicateDecl,
+                    format!(
+                        "duplicate declaration: {name} (already declared as {:?})",
+                        existing.kind
+                    ),
+                    String::new(),
+                )
+            };
+            self.errors
+                .push(err.with_help("rename one of the declarations"));
         } else {
             self.decls.insert(key, info);
         }
@@ -360,13 +376,14 @@ impl Env {
         }
     }
 
-    /// Create a `DeclInfo` tagged with the current module name.
+    /// Create a `DeclInfo` tagged with the current module name and source span.
     pub fn make_decl_info(
         &self,
         kind: DeclKind,
         name: String,
         ty: Option<Ty>,
         visibility: Visibility,
+        span: crate::span::Span,
     ) -> DeclInfo {
         DeclInfo {
             kind,
@@ -374,6 +391,7 @@ impl Env {
             ty,
             visibility,
             module: self.module_name.clone(),
+            span: Some(span),
         }
     }
 

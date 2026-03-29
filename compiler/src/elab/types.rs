@@ -84,6 +84,7 @@ pub struct EType {
     pub name: String,
     pub variants: Vec<EVariant>,
     pub ty: Ty,
+    pub span: Option<crate::span::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,7 @@ pub struct EEntity {
     pub name: String,
     pub fields: Vec<EField>,
     pub actions: Vec<EAction>,
+    pub span: Option<crate::span::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,7 @@ pub struct EField {
     pub name: String,
     pub ty: Ty,
     pub default: Option<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +118,7 @@ pub struct EAction {
     pub params: Vec<(String, Ty)>,
     pub requires: Vec<EExpr>,
     pub body: Vec<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated system.
@@ -125,6 +129,7 @@ pub struct ESystem {
     pub scopes: Vec<EScope>,
     pub events: Vec<EEvent>,
     pub next_items: Vec<ENextItem>,
+    pub span: Option<crate::span::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +146,7 @@ pub struct EEvent {
     pub requires: Vec<EExpr>,
     pub ensures: Vec<EExpr>,
     pub body: Vec<EEventAction>,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Structured event body actions.
@@ -173,6 +179,7 @@ pub struct EPred {
     pub name: String,
     pub params: Vec<(String, Ty)>,
     pub body: EExpr,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated property.
@@ -181,6 +188,7 @@ pub struct EProp {
     pub name: String,
     pub target: Option<String>,
     pub body: EExpr,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated verify block.
@@ -189,6 +197,7 @@ pub struct EVerify {
     pub name: String,
     pub targets: Vec<(String, i64, i64)>,
     pub asserts: Vec<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated scene.
@@ -199,6 +208,7 @@ pub struct EScene {
     pub givens: Vec<ESceneGiven>,
     pub whens: Vec<ESceneWhen>,
     pub thens: Vec<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +237,7 @@ pub struct ETheorem {
     pub targets: Vec<String>,
     pub invariants: Vec<EExpr>,
     pub shows: Vec<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated axiom declaration.
@@ -234,6 +245,7 @@ pub struct ETheorem {
 pub struct EAxiom {
     pub name: String,
     pub body: EExpr,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated lemma block.
@@ -241,6 +253,7 @@ pub struct EAxiom {
 pub struct ELemma {
     pub name: String,
     pub body: Vec<EExpr>,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated const declaration.
@@ -248,6 +261,7 @@ pub struct ELemma {
 pub struct EConst {
     pub name: String,
     pub body: EExpr,
+    pub span: Option<crate::span::Span>,
 }
 
 /// Elaborated fn declaration.
@@ -257,6 +271,7 @@ pub struct EFn {
     pub params: Vec<(String, Ty)>,
     pub ret_ty: Ty,
     pub body: EExpr,
+    pub span: Option<crate::span::Span>,
 }
 
 // ── Elaborated expressions ───────────────────────────────────────────

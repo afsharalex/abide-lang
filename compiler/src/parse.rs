@@ -183,18 +183,75 @@ impl Parser {
 
     // ── Program ──────────────────────────────────────────────────────
 
+    /// Parse a program, stopping at the first error.
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let (program, errors) = self.parse_program_recovering();
+        if let Some(err) = errors.into_iter().next() {
+            return Err(err);
+        }
+        Ok(program)
+    }
+
+    /// Parse a program with error recovery.
+    ///
+    /// On parse error, skips tokens until the next top-level keyword
+    /// and continues parsing. Returns a partial program with all
+    /// successfully parsed declarations and all accumulated errors.
+    pub fn parse_program_recovering(&mut self) -> (Program, Vec<ParseError>) {
         let start = self.cur_span();
         let mut decls = Vec::new();
+        let mut errors = Vec::new();
         while !self.at_end() {
-            decls.push(self.top_decl()?);
+            let pos_before = self.pos;
+            match self.top_decl() {
+                Ok(decl) => decls.push(decl),
+                Err(err) => {
+                    errors.push(err);
+                    // If the parser didn't advance (error at dispatch), skip the
+                    // problematic token. If it did advance (error inside a
+                    // declaration), scan forward to the next top-level keyword.
+                    if self.pos == pos_before && !self.at_end() {
+                        self.pos += 1;
+                    }
+                    self.skip_to_next_top_level();
+                }
+            }
         }
         let span = if decls.is_empty() {
             start
         } else {
             start.merge(self.cur_span())
         };
-        Ok(Program { decls, span })
+        (Program { decls, span }, errors)
+    }
+
+    /// Skip tokens until a top-level keyword or EOF is reached.
+    /// Called after the caller has already ensured progress (skipped the
+    /// error token if needed). Does NOT skip unconditionally.
+    fn skip_to_next_top_level(&mut self) {
+        while !self.at_end() {
+            match self.peek() {
+                Some(
+                    Token::Module
+                    | Token::Include
+                    | Token::Pub
+                    | Token::Use
+                    | Token::Const
+                    | Token::Fn
+                    | Token::Type
+                    | Token::Entity
+                    | Token::System
+                    | Token::Pred
+                    | Token::Prop
+                    | Token::Verify
+                    | Token::Theorem
+                    | Token::Lemma
+                    | Token::Scene
+                    | Token::Axiom,
+                ) => return,
+                _ => self.pos += 1,
+            }
+        }
     }
 
     fn top_decl(&mut self) -> Result<TopDecl, ParseError> {
@@ -215,6 +272,31 @@ impl Parser {
             Some(Token::Lemma) => Ok(TopDecl::Lemma(self.lemma_decl()?)),
             Some(Token::Scene) => Ok(TopDecl::Scene(self.scene_decl()?)),
             Some(Token::Axiom) => Ok(TopDecl::Axiom(self.axiom_decl()?)),
+            // Detect removed/renamed keywords and suggest fixes
+            Some(Token::Name(ref name)) if name == "import" => {
+                Err(ParseError::expected_with_help(
+                    "top-level declaration",
+                    "`import`",
+                    self.cur_span(),
+                    "'import' was removed — use 'module' to declare membership and 'include' for file contents",
+                ))
+            }
+            Some(Token::Name(ref name)) if name == "proof" => {
+                Err(ParseError::expected_with_help(
+                    "top-level declaration",
+                    "`proof`",
+                    self.cur_span(),
+                    "'proof' was replaced by 'theorem' — use 'theorem name for System { show ... }'",
+                ))
+            }
+            Some(Token::Name(ref name)) if name == "field" => {
+                Err(ParseError::expected_with_help(
+                    "top-level declaration",
+                    "`field`",
+                    self.cur_span(),
+                    "'field' keyword was removed — declare fields directly inside entity: 'name: Type'",
+                ))
+            }
             Some(tok) => Err(ParseError::expected(
                 "top-level declaration",
                 &format!("`{tok}`"),
@@ -549,6 +631,15 @@ impl Parser {
     fn entity_item(&mut self) -> Result<EntityItem, ParseError> {
         match self.peek() {
             Some(Token::Action) => Ok(EntityItem::Action(self.entity_action()?)),
+            Some(Token::Name(ref name)) if name == "field" => {
+                // Detect removed 'field' keyword inside entity body
+                Err(ParseError::expected_with_help(
+                    "field declaration or `action`",
+                    "`field`",
+                    self.cur_span(),
+                    "the 'field' keyword was removed — write fields directly: 'name: Type' or 'name: Type = default'",
+                ))
+            }
             Some(Token::Name(_)) => Ok(EntityItem::Field(self.field_decl()?)),
             Some(tok) => Err(ParseError::expected(
                 "field declaration or `action`",
@@ -681,6 +772,12 @@ impl Parser {
             }
             Some(Token::Event) => Ok(SystemItem::Event(self.event_decl()?)),
             Some(Token::Next) => Ok(SystemItem::Next(self.next_block()?)),
+            Some(Token::Name(ref name)) if name == "uses" => Err(ParseError::expected_with_help(
+                "`use`, `event`, or `next`",
+                "`uses`",
+                self.cur_span(),
+                "'uses' was replaced by 'use' — write 'use EntityName'",
+            )),
             Some(tok) => Err(ParseError::expected(
                 "`use`, `event`, or `next`",
                 &format!("`{tok}`"),
@@ -717,6 +814,23 @@ impl Parser {
             Some(Token::Choose) => Ok(EventItem::Choose(self.choose_block()?)),
             Some(Token::For) => Ok(EventItem::For(self.for_block()?)),
             Some(Token::Create) => Ok(EventItem::Create(self.create_block()?)),
+            // Detect wrong-context keywords with helpful suggestions
+            Some(Token::Given | Token::Then) => {
+                Err(ParseError::expected_with_help(
+                    "event body item",
+                    &format!("`{}`", self.peek().unwrap()),
+                    self.cur_span(),
+                    "event bodies contain: 'choose', 'for', 'create', or expressions like 'entity.action()'",
+                ))
+            }
+            Some(Token::Assert) => {
+                Err(ParseError::expected_with_help(
+                    "event body item",
+                    "`assert`",
+                    self.cur_span(),
+                    "'assert' belongs in verify blocks, not event bodies. Did you mean 'requires'?",
+                ))
+            }
             _ => Ok(EventItem::Expr(self.expr()?)),
         }
     }
@@ -893,8 +1007,21 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut asserts = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
-            self.expect(&Token::Assert)?;
-            asserts.push(self.expr()?);
+            match self.peek() {
+                Some(Token::Assert) => {
+                    self.advance();
+                    asserts.push(self.expr()?);
+                }
+                Some(tok) => {
+                    return Err(ParseError::expected_with_help(
+                        "`assert` or `}`",
+                        &format!("`{tok}`"),
+                        self.cur_span(),
+                        "verify blocks contain 'assert <expression>' statements",
+                    ));
+                }
+                None => return Err(ParseError::eof(self.cur_span())),
+            }
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(VerifyDecl {
@@ -964,8 +1091,29 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut shows = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
-            self.expect(&Token::Show)?;
-            shows.push(self.expr()?);
+            match self.peek() {
+                Some(Token::Show) => {
+                    self.advance();
+                    shows.push(self.expr()?);
+                }
+                Some(Token::Assert) => {
+                    return Err(ParseError::expected_with_help(
+                        "`show` or `}`",
+                        "`assert`",
+                        self.cur_span(),
+                        "theorem blocks use 'show', not 'assert' — write 'show <expression>'",
+                    ));
+                }
+                Some(tok) => {
+                    return Err(ParseError::expected_with_help(
+                        "`show` or `}`",
+                        &format!("`{tok}`"),
+                        self.cur_span(),
+                        "theorem blocks contain 'show <expression>' statements",
+                    ));
+                }
+                None => return Err(ParseError::eof(self.cur_span())),
+            }
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(TheoremDecl {
@@ -1134,10 +1282,11 @@ impl Parser {
                     })
                 }
             }
-            Some(tok) => Err(ParseError::expected(
+            Some(tok) => Err(ParseError::expected_with_help(
                 "`given`, `when`, or `then`",
                 &format!("`{tok}`"),
                 self.cur_span(),
+                "scene blocks contain: given { let v = one Entity where ... }, when { action ... }, then { assert ... }",
             )),
             None => Err(ParseError::eof(self.cur_span())),
         }
@@ -1941,9 +2090,10 @@ impl Parser {
                     }
                 }
             }
-            _ => Err(ParseError::general(
+            _ => Err(ParseError::general_with_help(
                 "unexpected postfix operator",
                 self.cur_span(),
+                "valid postfix operators: . (field access), () (call), [] (index/map update), ' (prime)",
             )),
         }
     }
@@ -3093,5 +3243,151 @@ mod tests {
             }
             other => panic!("expected Call(Var(Set), [1,2,3]), got {other:?}"),
         }
+    }
+
+    // ── Removed keyword detection tests ──────────────────────────
+
+    fn try_parse(src: &str) -> Result<Program, ParseError> {
+        let tokens = lex::lex(src).expect("lex error");
+        let mut parser = Parser::new(tokens);
+        parser.parse_program()
+    }
+
+    #[test]
+    fn removed_field_keyword_in_entity() {
+        let err = try_parse("entity Order { field status: Int }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("field"), "should mention 'field': {msg}");
+    }
+
+    #[test]
+    fn removed_import_keyword() {
+        let err = try_parse(r#"import "billing.abide" as Billing"#).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("import"), "should mention 'import': {msg}");
+    }
+
+    #[test]
+    fn removed_proof_keyword() {
+        let err = try_parse("proof safety for S { show always true }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("proof"), "should mention 'proof': {msg}");
+    }
+
+    #[test]
+    fn removed_uses_keyword() {
+        let err = try_parse("system S { uses Order }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("uses"), "should mention 'uses': {msg}");
+    }
+
+    // ── Recovery and multi-error tests ──────────────────────────
+
+    fn try_parse_recovering(src: &str) -> (Program, Vec<ParseError>) {
+        let tokens = lex::lex(src).expect("lex error");
+        let mut parser = Parser::new(tokens);
+        parser.parse_program_recovering()
+    }
+
+    #[test]
+    fn recovery_reports_multiple_errors() {
+        let src = "import x\ntype Status = A | B\nimport y\nentity Order { id: Id }";
+        let (program, errors) = try_parse_recovering(src);
+        // Two import errors, but type and entity should parse successfully
+        assert_eq!(errors.len(), 2, "should have 2 errors: {errors:?}");
+        assert_eq!(program.decls.len(), 2, "should have 2 valid decls");
+    }
+
+    #[test]
+    fn recovery_does_not_skip_valid_starter() {
+        let src = "import x\ntype Status = A | B";
+        let (program, errors) = try_parse_recovering(src);
+        assert_eq!(errors.len(), 1, "one import error");
+        assert_eq!(program.decls.len(), 1, "type should be recovered");
+    }
+
+    /// Extract the help text from a ParseError, if present.
+    fn extract_help(err: &ParseError) -> Option<&str> {
+        match err {
+            ParseError::Expected { help, .. } => help.as_deref(),
+            ParseError::General { help, .. } => help.as_deref(),
+            ParseError::UnexpectedEof { .. } => None,
+        }
+    }
+
+    #[test]
+    fn import_help_text_content() {
+        let err = try_parse(r#"import "billing.abide" as Billing"#).unwrap_err();
+        let help = extract_help(&err).expect("should have help");
+        assert!(
+            help.contains("module"),
+            "help should mention 'module': {help}"
+        );
+        assert!(
+            help.contains("include"),
+            "help should mention 'include': {help}"
+        );
+    }
+
+    #[test]
+    fn field_help_text_content() {
+        let err = try_parse("entity Order { field status: Int }").unwrap_err();
+        let help = extract_help(&err).expect("should have help");
+        assert!(
+            help.contains("name: Type"),
+            "help should show bare field syntax: {help}"
+        );
+    }
+
+    #[test]
+    fn verify_body_contextual_help() {
+        let err = try_parse("verify test for S[0..5] { show always true }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("assert"),
+            "should expect 'assert' in verify body: {msg}"
+        );
+        let help = extract_help(&err).expect("should have help");
+        assert!(
+            help.contains("assert"),
+            "help should mention assert statements: {help}"
+        );
+    }
+
+    #[test]
+    fn theorem_assert_instead_of_show() {
+        let err = try_parse("theorem t for S { assert always true }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("show"),
+            "should suggest 'show' instead of 'assert': {msg}"
+        );
+        let help = extract_help(&err).expect("should have help");
+        assert!(help.contains("show"), "help should mention 'show': {help}");
+    }
+
+    #[test]
+    fn scene_body_contextual_help() {
+        let err = try_parse("scene s for S { verify true }").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("given") || msg.contains("when") || msg.contains("then"),
+            "should mention scene sections: {msg}"
+        );
+        let help = extract_help(&err).expect("should have help");
+        assert!(
+            help.contains("given"),
+            "help should mention 'given': {help}"
+        );
+    }
+
+    #[test]
+    fn event_body_assert_instead_of_requires() {
+        let err = try_parse("system S { event e() { assert true } }").unwrap_err();
+        let help = extract_help(&err).expect("should have help");
+        assert!(
+            help.contains("requires"),
+            "help should suggest 'requires': {help}"
+        );
     }
 }

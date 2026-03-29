@@ -16,8 +16,9 @@ use super::types::{
 pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     let mut errors = Vec::new();
 
-    for ty in env.types.values() {
-        errors.extend(check_type(ty));
+    for (name, ty) in &env.types {
+        let decl_span = env.lookup_decl(name).and_then(|d| d.span);
+        errors.extend(check_type(ty, decl_span));
     }
     for entity in env.entities.values() {
         errors.extend(check_entity(entity));
@@ -55,42 +56,52 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
 }
 
 fn mk_etype(_map_key: &str, ty: &Ty) -> EType {
-    // Use the canonical name from the Ty value, not the map key.
-    // This ensures aliased imports (use M::Order as O) keep the
-    // canonical declaration name "Order" in the output, not the alias "O".
     let canonical = ty.name().to_owned();
     match ty {
         Ty::Enum(_, vs) => EType {
             name: canonical,
             variants: vs.iter().map(|v| EVariant::Simple(v.clone())).collect(),
             ty: ty.clone(),
+            span: None, // Type spans not yet tracked in Ty
         },
         Ty::Record(_, fs) => EType {
             name: canonical.clone(),
             variants: vec![EVariant::Record(canonical, fs.clone())],
             ty: ty.clone(),
+            span: None,
         },
         _ => EType {
             name: canonical,
             variants: Vec::new(),
             ty: ty.clone(),
+            span: None,
         },
     }
 }
 
 // ── Type well-formedness ─────────────────────────────────────────────
 
-fn check_type(ty: &Ty) -> Vec<ElabError> {
+fn check_type(ty: &Ty, decl_span: Option<crate::span::Span>) -> Vec<ElabError> {
     match ty {
         Ty::Enum(name, ctors) => {
             let dups = find_duplicates(ctors);
             dups.iter()
                 .map(|d| {
-                    ElabError::new(
-                        ErrorKind::DuplicateDecl,
-                        format!("duplicate constructor {d} in type {name}"),
-                        format!("type {name}"),
-                    )
+                    let ctx = format!("type {name}");
+                    if let Some(span) = decl_span {
+                        ElabError::with_span(
+                            ErrorKind::DuplicateDecl,
+                            format!("duplicate constructor {d} in type {name}"),
+                            &ctx,
+                            span,
+                        )
+                    } else {
+                        ElabError::new(
+                            ErrorKind::DuplicateDecl,
+                            format!("duplicate constructor {d} in type {name}"),
+                            &ctx,
+                        )
+                    }
                 })
                 .collect()
         }
@@ -99,11 +110,21 @@ fn check_type(ty: &Ty) -> Vec<ElabError> {
             let dups = find_duplicates(&field_names);
             dups.iter()
                 .map(|d| {
-                    ElabError::new(
-                        ErrorKind::DuplicateDecl,
-                        format!("duplicate field {d} in record {name}"),
-                        format!("type {name}"),
-                    )
+                    let ctx = format!("type {name}");
+                    if let Some(span) = decl_span {
+                        ElabError::with_span(
+                            ErrorKind::DuplicateDecl,
+                            format!("duplicate field {d} in record {name}"),
+                            &ctx,
+                            span,
+                        )
+                    } else {
+                        ElabError::new(
+                            ErrorKind::DuplicateDecl,
+                            format!("duplicate field {d} in record {name}"),
+                            &ctx,
+                        )
+                    }
                 })
                 .collect()
         }
@@ -133,11 +154,31 @@ fn check_field(entity_name: &str, field: &EField) -> Vec<ElabError> {
 
     match (&field.ty, def_expr) {
         (Ty::Enum(_, ctors), EExpr::Var(_, v)) if !ctors.iter().any(|c| c == v) => {
-            vec![ElabError::new(
-                ErrorKind::InvalidDefault,
-                format!("{v} is not a constructor of {}", field.ty.name()),
-                format!("entity {entity_name}, field {}", field.name),
-            )]
+            let ctx = format!("entity {entity_name}, field {}", field.name);
+            let err = if let Some(span) = field.span {
+                ElabError::with_span(
+                    ErrorKind::InvalidDefault,
+                    format!("{v} is not a constructor of {}", field.ty.name()),
+                    &ctx,
+                    span,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::InvalidDefault,
+                    format!("{v} is not a constructor of {}", field.ty.name()),
+                    &ctx,
+                )
+            };
+            // Suggest closest matching constructor
+            let help = if let Some(closest) = find_closest_name(v, ctors) {
+                format!(
+                    "did you mean '@{closest}'? Valid constructors: {}",
+                    ctors.join(", ")
+                )
+            } else {
+                format!("valid constructors: {}", ctors.join(", "))
+            };
+            vec![err.with_help(help)]
         }
         _ => Vec::new(),
     }
@@ -150,34 +191,59 @@ fn check_action(entity: &EEntity, action: &EAction) -> Vec<ElabError> {
     // Check requires are boolean-typed
     for req in &action.requires {
         if !is_bool_expr(req) {
-            errors.push(ElabError::new(
-                ErrorKind::TypeMismatch,
-                "requires expression should be Bool",
-                &ctx,
-            ));
+            let err = if let Some(span) = action.span {
+                ElabError::with_span(
+                    ErrorKind::TypeMismatch,
+                    "requires expression should be Bool",
+                    &ctx,
+                    span,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::TypeMismatch,
+                    "requires expression should be Bool",
+                    &ctx,
+                )
+            };
+            errors.push(err);
         }
+    }
+
+    // Check for unresolved uppercase names that might be missing @ prefix
+    for req in &action.requires {
+        check_unresolved_constructors(req, &ctx, action.span, &mut errors);
     }
 
     // Check primed assignments target known fields
     for expr in &action.body {
-        errors.extend(check_assignment(entity, &ctx, expr));
+        errors.extend(check_assignment(entity, action, &ctx, expr));
     }
 
     errors
 }
 
-fn check_assignment(entity: &EEntity, ctx: &str, expr: &EExpr) -> Vec<ElabError> {
+fn check_assignment(entity: &EEntity, action: &EAction, ctx: &str, expr: &EExpr) -> Vec<ElabError> {
     if let EExpr::Assign(_, lhs, _) = expr {
         if let EExpr::Prime(_, inner) = lhs.as_ref() {
             if let EExpr::Var(_, field_name) = inner.as_ref() {
                 let field_names: Vec<&str> =
                     entity.fields.iter().map(|f| f.name.as_str()).collect();
                 if !field_names.contains(&field_name.as_str()) {
-                    return vec![ElabError::new(
-                        ErrorKind::InvalidPrime,
-                        format!("{field_name} is not a field of {}", entity.name),
-                        ctx,
-                    )];
+                    let err = if let Some(span) = action.span {
+                        ElabError::with_span(
+                            ErrorKind::InvalidPrime,
+                            format!("{field_name} is not a field of {}", entity.name),
+                            ctx,
+                            span,
+                        )
+                    } else {
+                        ElabError::new(
+                            ErrorKind::InvalidPrime,
+                            format!("{field_name} is not a field of {}", entity.name),
+                            ctx,
+                        )
+                    };
+                    return vec![err.with_help("only entity fields can be primed")];
                 }
             }
         }
@@ -189,27 +255,51 @@ fn check_assignment(entity: &EEntity, ctx: &str, expr: &EExpr) -> Vec<ElabError>
 
 fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     let mut errors = Vec::new();
+    let sys_ctx = format!("system {}", system.name);
 
     for entity_name in &system.uses {
         if env.lookup_entity(entity_name).is_none() {
-            errors.push(ElabError::new(
-                ErrorKind::UndefinedRef,
-                format!("system {} uses unknown entity {entity_name}", system.name),
-                format!("system {}", system.name),
-            ));
+            let err = if let Some(span) = system.span {
+                ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!("system {} uses unknown entity {entity_name}", system.name),
+                    &sys_ctx,
+                    span,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::UndefinedRef,
+                    format!("system {} uses unknown entity {entity_name}", system.name),
+                    &sys_ctx,
+                )
+            };
+            errors.push(err);
         }
     }
 
     for scope in &system.scopes {
         if scope.lo < 0 || scope.hi < scope.lo {
-            errors.push(ElabError::new(
-                ErrorKind::InvalidScope,
-                format!(
-                    "scope {} has invalid range {}..{}",
-                    scope.entity, scope.lo, scope.hi
-                ),
-                format!("system {}", system.name),
-            ));
+            let err = if let Some(span) = system.span {
+                ElabError::with_span(
+                    ErrorKind::InvalidScope,
+                    format!(
+                        "scope {} has invalid range {}..{}",
+                        scope.entity, scope.lo, scope.hi
+                    ),
+                    &sys_ctx,
+                    span,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::InvalidScope,
+                    format!(
+                        "scope {} has invalid range {}..{}",
+                        scope.entity, scope.lo, scope.hi
+                    ),
+                    &sys_ctx,
+                )
+            };
+            errors.push(err);
         }
     }
 
@@ -218,11 +308,164 @@ fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// Check for unresolved uppercase names in an expression that might be
+/// missing an `@` prefix. Produces a hint when a name looks like a
+/// constructor but was not resolved.
+#[allow(clippy::too_many_lines)]
+fn check_unresolved_constructors(
+    expr: &EExpr,
+    ctx: &str,
+    span: Option<crate::span::Span>,
+    errors: &mut Vec<ElabError>,
+) {
+    match expr {
+        EExpr::Var(Ty::Unresolved(_), name)
+            if !name.is_empty() && name.chars().next().unwrap().is_uppercase() =>
+        {
+            let err = if let Some(s) = span {
+                ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!("unresolved name '{name}'"),
+                    ctx,
+                    s,
+                )
+            } else {
+                ElabError::new(
+                    ErrorKind::UndefinedRef,
+                    format!("unresolved name '{name}'"),
+                    ctx,
+                )
+            };
+            errors.push(err.with_help(format!(
+                "if '{name}' is a state constructor, write '@{name}'"
+            )));
+        }
+        EExpr::BinOp(_, _, l, r)
+        | EExpr::Assign(_, l, r)
+        | EExpr::Seq(_, l, r)
+        | EExpr::SameStep(_, l, r)
+        | EExpr::Pipe(_, l, r)
+        | EExpr::In(_, l, r) => {
+            check_unresolved_constructors(l, ctx, span, errors);
+            check_unresolved_constructors(r, ctx, span, errors);
+        }
+        EExpr::UnOp(_, _, e)
+        | EExpr::Always(_, e)
+        | EExpr::Eventually(_, e)
+        | EExpr::Assert(_, e)
+        | EExpr::Prime(_, e)
+        | EExpr::Card(_, e)
+        | EExpr::Field(_, e, _)
+        | EExpr::NamedPair(_, _, e) => {
+            check_unresolved_constructors(e, ctx, span, errors);
+        }
+        EExpr::Call(_, f, args) => {
+            check_unresolved_constructors(f, ctx, span, errors);
+            for arg in args {
+                check_unresolved_constructors(arg, ctx, span, errors);
+            }
+        }
+        EExpr::Quant(_, _, _, _, body) | EExpr::Lam(_, _, body) => {
+            check_unresolved_constructors(body, ctx, span, errors);
+        }
+        EExpr::Match(scrut, arms) => {
+            check_unresolved_constructors(scrut, ctx, span, errors);
+            for (_, guard, body) in arms {
+                if let Some(g) = guard {
+                    check_unresolved_constructors(g, ctx, span, errors);
+                }
+                check_unresolved_constructors(body, ctx, span, errors);
+            }
+        }
+        EExpr::Let(binds, body) => {
+            for (_, _, e) in binds {
+                check_unresolved_constructors(e, ctx, span, errors);
+            }
+            check_unresolved_constructors(body, ctx, span, errors);
+        }
+        EExpr::TupleLit(_, es) | EExpr::SetLit(_, es) | EExpr::SeqLit(_, es) => {
+            for e in es {
+                check_unresolved_constructors(e, ctx, span, errors);
+            }
+        }
+        EExpr::CallR(_, f, refs, args) => {
+            check_unresolved_constructors(f, ctx, span, errors);
+            for r in refs {
+                check_unresolved_constructors(r, ctx, span, errors);
+            }
+            for a in args {
+                check_unresolved_constructors(a, ctx, span, errors);
+            }
+        }
+        EExpr::MapUpdate(_, m, k, v) => {
+            check_unresolved_constructors(m, ctx, span, errors);
+            check_unresolved_constructors(k, ctx, span, errors);
+            check_unresolved_constructors(v, ctx, span, errors);
+        }
+        EExpr::Index(_, m, k) => {
+            check_unresolved_constructors(m, ctx, span, errors);
+            check_unresolved_constructors(k, ctx, span, errors);
+        }
+        EExpr::SetComp(_, proj, _, _, filter) => {
+            if let Some(p) = proj {
+                check_unresolved_constructors(p, ctx, span, errors);
+            }
+            check_unresolved_constructors(filter, ctx, span, errors);
+        }
+        EExpr::MapLit(_, entries) => {
+            for (k, v) in entries {
+                check_unresolved_constructors(k, ctx, span, errors);
+                check_unresolved_constructors(v, ctx, span, errors);
+            }
+        }
+        // True leaf nodes: Lit, Qual, Unresolved, Sorry, Todo
+        _ => {}
+    }
+}
+
 fn is_bool_expr(e: &EExpr) -> bool {
     match e.ty() {
         Ty::Builtin(BuiltinTy::Bool) | Ty::Unresolved(_) => true, // might be Bool; don't error
         _ => false,
     }
+}
+
+/// Find the closest matching name by edit distance (Levenshtein).
+/// Returns `Some(closest)` if there's a match within distance 3, else `None`.
+fn find_closest_name<'a>(target: &str, candidates: &'a [String]) -> Option<&'a str> {
+    let mut best: Option<(&str, usize)> = None;
+    for candidate in candidates {
+        let dist = levenshtein(target, candidate);
+        if dist <= 3 && dist > 0 && (best.is_none() || dist < best.unwrap().1) {
+            best = Some((candidate, dist));
+        }
+    }
+    best.map(|(name, _)| name)
+}
+
+/// Simple Levenshtein distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
+        row[0] = i;
+    }
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[m][n]
 }
 
 fn find_duplicates<T: PartialEq>(items: &[T]) -> Vec<&T> {
@@ -471,5 +714,103 @@ fn collect_epattern_vars(pat: &EPattern, vars: &mut HashSet<String>) {
             collect_epattern_vars(left, vars);
             collect_epattern_vars(right, vars);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{EExpr, Literal, Ty};
+
+    /// Helper: make an unresolved uppercase Var that should trigger the hint.
+    fn unresolved_var(name: &str) -> EExpr {
+        EExpr::Var(Ty::Unresolved("?".to_string()), name.to_string())
+    }
+
+    /// Helper: make a resolved Int literal (should NOT trigger the hint).
+    fn int_lit(n: i64) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(n))
+    }
+
+    fn collect_hints(expr: &EExpr) -> Vec<ElabError> {
+        let mut errors = Vec::new();
+        check_unresolved_constructors(expr, "test context", None, &mut errors);
+        errors
+    }
+
+    #[test]
+    fn unresolved_uppercase_var_triggers_hint() {
+        let hints = collect_hints(&unresolved_var("Pending"));
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].message.contains("Pending"));
+        assert!(hints[0].help.as_ref().unwrap().contains("@Pending"));
+    }
+
+    #[test]
+    fn resolved_var_no_hint() {
+        let expr = EExpr::Var(Ty::Builtin(BuiltinTy::Int), "x".to_string());
+        let hints = collect_hints(&expr);
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn lowercase_unresolved_no_hint() {
+        let expr = EExpr::Var(Ty::Unresolved("?".to_string()), "pending".to_string());
+        let hints = collect_hints(&expr);
+        assert!(hints.is_empty(), "lowercase names should not trigger hint");
+    }
+
+    #[test]
+    fn setlit_traversal() {
+        let expr = EExpr::SetLit(
+            Ty::Unresolved("?".to_string()),
+            vec![int_lit(1), unresolved_var("Unknown"), int_lit(3)],
+        );
+        let hints = collect_hints(&expr);
+        assert_eq!(hints.len(), 1, "should find hint inside SetLit");
+        assert!(hints[0].message.contains("Unknown"));
+    }
+
+    #[test]
+    fn seqlit_traversal() {
+        let expr = EExpr::SeqLit(
+            Ty::Unresolved("?".to_string()),
+            vec![unresolved_var("First"), unresolved_var("Second")],
+        );
+        let hints = collect_hints(&expr);
+        assert_eq!(hints.len(), 2, "should find hints in all SeqLit elements");
+    }
+
+    #[test]
+    fn maplit_traversal() {
+        let expr = EExpr::MapLit(
+            Ty::Unresolved("?".to_string()),
+            vec![
+                (int_lit(1), unresolved_var("ValA")),
+                (unresolved_var("KeyB"), int_lit(2)),
+            ],
+        );
+        let hints = collect_hints(&expr);
+        assert_eq!(
+            hints.len(),
+            2,
+            "should find hints in MapLit keys and values"
+        );
+    }
+
+    #[test]
+    fn nested_binop_traversal() {
+        let expr = EExpr::BinOp(
+            Ty::Builtin(BuiltinTy::Bool),
+            crate::elab::types::BinOp::Eq,
+            Box::new(EExpr::Var(
+                Ty::Unresolved("?".to_string()),
+                "status".to_string(),
+            )),
+            Box::new(unresolved_var("Active")),
+        );
+        let hints = collect_hints(&expr);
+        assert_eq!(hints.len(), 1, "should find hint in binop rhs");
+        assert!(hints[0].help.as_ref().unwrap().contains("@Active"));
     }
 }
