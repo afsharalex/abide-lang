@@ -17,16 +17,23 @@ enum Command {
     /// Parse a source file and print AST
     Parse { file: PathBuf },
 
-    /// Elaborate a source file and print result
-    Elaborate { file: PathBuf },
+    /// Elaborate source file(s) and print result
+    Elaborate {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
 
     /// Emit IR as JSON
     #[command(name = "emit-ir")]
-    EmitIr { file: PathBuf },
+    EmitIr {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
 
     /// Verify a specification: bounded model checking, scene checking, theorem proving
     Verify {
-        file: PathBuf,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
 
         /// Skip induction (Tier 1), only run bounded model checking
         #[arg(long, conflicts_with = "unbounded_only")]
@@ -110,15 +117,15 @@ fn main() -> miette::Result<()> {
             let program = parser.parse_program()?;
             println!("{program:#?}");
         }
-        Command::Elaborate { file } => {
-            let (result, errors) = parse_and_elaborate(&file)?;
+        Command::Elaborate { files } => {
+            let (result, errors) = load_and_elaborate(&files)?;
             for err in &errors {
                 eprintln!("{err}");
             }
             println!("{result:#?}");
         }
-        Command::EmitIr { file } => {
-            let (result, errors) = parse_and_elaborate(&file)?;
+        Command::EmitIr { files } => {
+            let (result, errors) = load_and_elaborate(&files)?;
             for err in &errors {
                 eprintln!("{err}");
             }
@@ -127,7 +134,7 @@ fn main() -> miette::Result<()> {
             println!("{json}");
         }
         Command::Verify {
-            file,
+            files,
             bounded_only,
             unbounded_only,
             induction_timeout,
@@ -137,7 +144,7 @@ fn main() -> miette::Result<()> {
             no_prop_verify,
             progress,
         } => {
-            let (result, errors) = parse_and_elaborate(&file)?;
+            let (result, errors) = load_and_elaborate(&files)?;
             for err in &errors {
                 eprintln!("{err}");
             }
@@ -187,15 +194,12 @@ fn read_file(path: &PathBuf) -> miette::Result<String> {
         .wrap_err_with(|| format!("failed to read {}", path.display()))
 }
 
-fn parse_and_elaborate(
-    path: &PathBuf,
+fn load_and_elaborate(
+    paths: &[PathBuf],
 ) -> miette::Result<(
     abide::elab::types::ElabResult,
     Vec<abide::elab::error::ElabError>,
 )> {
-    let src = read_file(path)?;
-    let tokens = abide::lex::lex(&src).map_err(|errors| errors.into_iter().next().unwrap())?;
-    let mut parser = abide::parse::Parser::new(tokens);
-    let program = parser.parse_program()?;
-    Ok(abide::elab::elaborate(&program))
+    let env = abide::loader::load_files(paths).map_err(|e| miette::miette!("{e}"))?;
+    Ok(abide::elab::elaborate_env(env))
 }

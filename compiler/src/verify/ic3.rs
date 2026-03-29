@@ -431,9 +431,7 @@ fn is_ground_value(expr: &SExpr) -> bool {
             s == "true"
                 || s == "false"
                 || s.chars().next().is_some_and(|c| c.is_ascii_digit())
-                || (s.starts_with('-')
-                    && s.len() > 1
-                    && s[1..].chars().all(|c| c.is_ascii_digit()))
+                || (s.starts_with('-') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit()))
         }
         SExpr::List(children) => match children.first() {
             // (- X) — negation of a ground value
@@ -540,9 +538,8 @@ fn parse_state_snapshots(answer: &str, columns: &[TraceColumn]) -> Vec<Ic3TraceS
                 continue; // active flag
             }
             // Check if entity slot is active
-            let active_col = (0..n_cols).find(|&j| {
-                columns[j].0 == *ent && columns[j].2 == usize::MAX && j > i
-            });
+            let active_col =
+                (0..n_cols).find(|&j| columns[j].0 == *ent && columns[j].2 == usize::MAX && j > i);
             let is_active = active_col
                 .and_then(|j| state_vals.get(j))
                 .is_some_and(|v| matches!(v, SExpr::Atom(s) if s == "true"));
@@ -640,96 +637,98 @@ fn build_system_chc(
     // Only emitted when no systems are present (pure entity-level IC3).
     // When systems exist, transitions are constrained by system event rules.
     if systems.is_empty() {
-    for entity in entities {
-        let n_slots = slots_per_entity.get(&entity.name).copied().unwrap_or(1);
-        for slot in 0..n_slots {
-            for transition in &entity.transitions {
-                let guard = guard_to_smt_sys(&transition.guard, entity, vctx, &entity.name, slot)?;
+        for entity in entities {
+            let n_slots = slots_per_entity.get(&entity.name).copied().unwrap_or(1);
+            for slot in 0..n_slots {
+                for transition in &entity.transitions {
+                    let guard =
+                        guard_to_smt_sys(&transition.guard, entity, vctx, &entity.name, slot)?;
 
-                // Build next-state: update target slot, frame everything else
-                let mut next_vals: Vec<String> = Vec::new();
+                    // Build next-state: update target slot, frame everything else
+                    let mut next_vals: Vec<String> = Vec::new();
+                    for ent in entities {
+                        let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
+                        for s in 0..ns {
+                            for (fi, f) in ent.fields.iter().enumerate() {
+                                if ent.name == entity.name && s == slot {
+                                    let updated =
+                                        transition.updates.iter().find(|u| u.field == f.name);
+                                    if let Some(upd) = updated {
+                                        next_vals.push(expr_to_smt_sys(
+                                            &upd.value,
+                                            entity,
+                                            vctx,
+                                            &entity.name,
+                                            slot,
+                                        )?);
+                                    } else {
+                                        next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                                    }
+                                } else {
+                                    next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                                }
+                            }
+                            if ent.name == entity.name && s == slot {
+                                next_vals.push("true".to_owned());
+                            } else {
+                                next_vals.push(format!("{}_{}_active", ent.name, s));
+                            }
+                        }
+                    }
+                    let next_str = next_vals.join(" ");
+                    let active_var = format!("{}_{}_active", entity.name, slot);
+
+                    chc.push_str(&format!(
+                        "(rule (=> (and (State {all_vars_str}) {active_var} {guard}) \
+                     (State {next_str})) trans_{}_{}_{slot})\n",
+                        entity.name, transition.name
+                    ));
+                }
+
+                // Create rule for this entity slot
+                let mut create_next: Vec<String> = Vec::new();
                 for ent in entities {
                     let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
                     for s in 0..ns {
                         for (fi, f) in ent.fields.iter().enumerate() {
                             if ent.name == entity.name && s == slot {
-                                let updated = transition.updates.iter().find(|u| u.field == f.name);
-                                if let Some(upd) = updated {
-                                    next_vals.push(expr_to_smt_sys(
-                                        &upd.value,
-                                        entity,
-                                        vctx,
-                                        &entity.name,
-                                        slot,
-                                    )?);
+                                if let Some(ref default_expr) = f.default {
+                                    create_next.push(expr_to_smt(default_expr, entity, vctx)?);
                                 } else {
-                                    next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                                    create_next.push(format!("{}_{}_f{}", ent.name, s, fi));
                                 }
-                            } else {
-                                next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
-                            }
-                        }
-                        if ent.name == entity.name && s == slot {
-                            next_vals.push("true".to_owned());
-                        } else {
-                            next_vals.push(format!("{}_{}_active", ent.name, s));
-                        }
-                    }
-                }
-                let next_str = next_vals.join(" ");
-                let active_var = format!("{}_{}_active", entity.name, slot);
-
-                chc.push_str(&format!(
-                    "(rule (=> (and (State {all_vars_str}) {active_var} {guard}) \
-                     (State {next_str})) trans_{}_{}_{slot})\n",
-                    entity.name, transition.name
-                ));
-            }
-
-            // Create rule for this entity slot
-            let mut create_next: Vec<String> = Vec::new();
-            for ent in entities {
-                let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
-                for s in 0..ns {
-                    for (fi, f) in ent.fields.iter().enumerate() {
-                        if ent.name == entity.name && s == slot {
-                            if let Some(ref default_expr) = f.default {
-                                create_next.push(expr_to_smt(default_expr, entity, vctx)?);
                             } else {
                                 create_next.push(format!("{}_{}_f{}", ent.name, s, fi));
                             }
+                        }
+                        if ent.name == entity.name && s == slot {
+                            create_next.push("true".to_owned());
                         } else {
-                            create_next.push(format!("{}_{}_f{}", ent.name, s, fi));
+                            create_next.push(format!("{}_{}_active", ent.name, s));
                         }
                     }
-                    if ent.name == entity.name && s == slot {
-                        create_next.push("true".to_owned());
-                    } else {
-                        create_next.push(format!("{}_{}_active", ent.name, s));
-                    }
                 }
-            }
-            let create_str = create_next.join(" ");
-            let inactive_var = format!("{}_{}_active", entity.name, slot);
+                let create_str = create_next.join(" ");
+                let inactive_var = format!("{}_{}_active", entity.name, slot);
 
-            // Symmetry: slot i requires slot i-1 active
-            let create_guard = if slot == 0 {
-                format!("(not {inactive_var})")
-            } else {
-                format!(
-                    "(and (not {inactive_var}) {}_{}_active)",
-                    entity.name,
-                    slot - 1
-                )
-            };
+                // Symmetry: slot i requires slot i-1 active
+                let create_guard = if slot == 0 {
+                    format!("(not {inactive_var})")
+                } else {
+                    format!(
+                        "(and (not {inactive_var}) {}_{}_active)",
+                        entity.name,
+                        slot - 1
+                    )
+                };
 
-            chc.push_str(&format!(
-                "(rule (=> (and (State {all_vars_str}) {create_guard}) \
+                chc.push_str(&format!(
+                    "(rule (=> (and (State {all_vars_str}) {create_guard}) \
                  (State {create_str})) create_{}_{slot})\n",
-                entity.name
-            ));
+                    entity.name
+                ));
+            }
         }
-    }
     } // if systems.is_empty()
 
     // ── System event rules ──────────────────────────────────────────
@@ -913,7 +912,11 @@ fn negate_guard_sys_two(
 /// **Soundness:** All encoding errors propagate — never silently approximates.
 /// Missing transitions, systems, or events produce hard errors. Cyclic
 /// `CrossCall` graphs are detected via `visited` and produce errors.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::format_push_string)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::format_push_string
+)]
 fn encode_event_chc(
     chc: &mut String,
     actions: &[IRAction],
@@ -942,8 +945,7 @@ fn encode_event_chc(
                 let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
 
                 for slot in 0..n_slots {
-                    let evt_guard =
-                        guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
+                    let evt_guard = guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
                     let filter_smt = guard_to_smt_sys(filter, entity, vctx, ent_name, slot)?;
                     let active_var = format!("{ent_name}_{slot}_active");
 
@@ -982,8 +984,7 @@ fn encode_event_chc(
                 let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
 
                 for slot in 0..n_slots {
-                    let evt_guard =
-                        guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
+                    let evt_guard = guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
                     let active_var = format!("{ent_name}_{slot}_active");
 
                     let mut forall_guards = extra_guards.to_vec();
@@ -1038,9 +1039,7 @@ fn encode_event_chc(
                 let sys = all_systems
                     .iter()
                     .find(|s| s.name == *target_sys)
-                    .ok_or_else(|| {
-                        format!("CrossCall target system {target_sys} not found")
-                    })?;
+                    .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
                 let evt = sys
                     .events
                     .iter()
@@ -1125,11 +1124,9 @@ fn encode_ops_chc(
         .filter(|op| matches!(op, IRAction::Apply { target, .. } if target == bound_var))
         .count();
     if same_entity_apply_count > 1 {
-        return Err(
-            "multi-apply on same entity in IC3 encoding not supported \
+        return Err("multi-apply on same entity in IC3 encoding not supported \
              (sequential composition requires intermediate CHC constraints)"
-                .to_owned(),
-        );
+            .to_owned());
     }
 
     for (oi, op) in ops.iter().enumerate() {
@@ -1150,17 +1147,10 @@ fn encode_ops_chc(
                     .iter()
                     .find(|t| t.name == *trans_name)
                     .ok_or_else(|| {
-                        format!(
-                            "transition {trans_name} not found on entity {bound_ent_name}"
-                        )
+                        format!("transition {trans_name} not found on entity {bound_ent_name}")
                     })?;
-                let trans_guard = guard_to_smt_sys(
-                    &trans.guard,
-                    bound_entity,
-                    vctx,
-                    bound_ent_name,
-                    bound_slot,
-                )?;
+                let trans_guard =
+                    guard_to_smt_sys(&trans.guard, bound_entity, vctx, bound_ent_name, bound_slot)?;
                 let next_str = build_transition_next(
                     entities,
                     slots_per_entity,
@@ -1203,17 +1193,13 @@ fn encode_ops_chc(
                 let sys = all_systems
                     .iter()
                     .find(|s| s.name == *target_sys)
-                    .ok_or_else(|| {
-                        format!("CrossCall target system {target_sys} not found")
-                    })?;
+                    .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
                 let evt = sys
                     .events
                     .iter()
                     .find(|e| e.name == *target_evt)
                     .ok_or_else(|| {
-                        format!(
-                            "CrossCall target event {target_sys}.{target_evt} not found"
-                        )
+                        format!("CrossCall target event {target_sys}.{target_evt} not found")
                     })?;
 
                 // Cycle guard
@@ -1252,8 +1238,7 @@ fn encode_ops_chc(
                     .ok_or_else(|| format!("entity {ent_name} not found in nested Choose"))?;
                 let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
                 for slot in 0..n_slots {
-                    let filter_smt =
-                        guard_to_smt_sys(filter, entity, vctx, ent_name, slot)?;
+                    let filter_smt = guard_to_smt_sys(filter, entity, vctx, ent_name, slot)?;
                     let active_var = format!("{ent_name}_{slot}_active");
                     let mut nested = guards.to_vec();
                     nested.push(active_var);
@@ -2382,7 +2367,11 @@ fn ir_type_to_sort_name(ty: &IRType) -> String {
         IRType::Real | IRType::Float => "Real".to_owned(),
         IRType::Enum { .. } => "Int".to_owned(),
         IRType::Map { key, value } => {
-            format!("(Array {} {})", ir_type_to_sort_name(key), ir_type_to_sort_name(value))
+            format!(
+                "(Array {} {})",
+                ir_type_to_sort_name(key),
+                ir_type_to_sort_name(value)
+            )
         }
         IRType::Set { element } => {
             format!("(Array {} Bool)", ir_type_to_sort_name(element))
@@ -2471,9 +2460,7 @@ fn expr_to_smt(expr: &IRExpr, entity: &IREntity, vctx: &VerifyContext) -> Result
             let k = expr_to_smt(key, entity, vctx)?;
             Ok(format!("(select {m} {k})"))
         }
-        IRExpr::Card { .. } => {
-            Err("cardinality (#) not supported in IC3 CHC encoding".to_owned())
-        }
+        IRExpr::Card { .. } => Err("cardinality (#) not supported in IC3 CHC encoding".to_owned()),
         _ => Err(format!(
             "unsupported expression in IC3 value encoding: {:?}",
             std::mem::discriminant(expr)
@@ -2858,12 +2845,24 @@ mod tests {
                 };
 
                 // Step 0: initial state after create — Pending, total=0
-                assert_eq!(field_val(0, "status"), "0", "step 0: status should be Pending (0)");
+                assert_eq!(
+                    field_val(0, "status"),
+                    "0",
+                    "step 0: status should be Pending (0)"
+                );
                 assert_eq!(field_val(0, "total"), "0", "step 0: total should be 0");
 
                 // Step 1: after confirm — Confirmed, total unchanged
-                assert_eq!(field_val(1, "status"), "1", "step 1: status should be Confirmed (1)");
-                assert_eq!(field_val(1, "total"), "0", "step 1: total should still be 0");
+                assert_eq!(
+                    field_val(1, "status"),
+                    "1",
+                    "step 1: status should be Confirmed (1)"
+                );
+                assert_eq!(
+                    field_val(1, "total"),
+                    "0",
+                    "step 1: total should still be 0"
+                );
 
                 // Entity labels should be "Order" (single slot)
                 assert!(
@@ -2891,7 +2890,8 @@ mod tests {
         assert_eq!(steps.len(), 1, "expected 1 trace step");
         let a_val = steps[0].assignments.iter().find(|(_, f, _)| f == "b");
         assert_eq!(
-            a_val.unwrap().2, "-1",
+            a_val.unwrap().2,
+            "-1",
             "negative literal (- 1) should render as -1"
         );
     }
@@ -2948,7 +2948,10 @@ mod tests {
         assert!(steps.is_empty(), "unclosed paren should invalidate parse");
         // Extra closing paren
         let steps = parse_state_snapshots("(State 0 true))", &columns);
-        assert!(steps.is_empty(), "extra close paren should invalidate parse");
+        assert!(
+            steps.is_empty(),
+            "extra close paren should invalidate parse"
+        );
     }
 
     #[test]
@@ -3591,8 +3594,14 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 2);
 
-        let result =
-            try_ic3_system(&ir, &vctx, &["Commerce".to_owned()], &property, &slots, 10000);
+        let result = try_ic3_system(
+            &ir,
+            &vctx,
+            &["Commerce".to_owned()],
+            &property,
+            &slots,
+            10000,
+        );
         assert!(
             matches!(result, Ic3Result::Proved),
             "expected Proved with system events, got: {result:?}"
@@ -3678,8 +3687,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
 
-        let result =
-            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
+        let result = try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
         assert!(
             matches!(result, Ic3Result::Unknown(ref reason)
                 if reason.contains("transition nonexistent not found")),
@@ -3746,8 +3754,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
 
-        let result =
-            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
+        let result = try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
         assert!(
             matches!(result, Ic3Result::Unknown(ref reason)
                 if reason.contains("CrossCall target system NonExistent not found")),
@@ -3761,16 +3768,14 @@ mod tests {
         // Tests recursive CrossCall encoding (not just Create scanning).
         let item = IREntity {
             name: "Item".to_owned(),
-            fields: vec![
-                IRField {
-                    name: "qty".to_owned(),
+            fields: vec![IRField {
+                name: "qty".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
                     ty: IRType::Int,
-                    default: Some(IRExpr::Lit {
-                        ty: IRType::Int,
-                        value: LitVal::Int { value: 1 },
-                    }),
-                },
-            ],
+                    value: LitVal::Int { value: 1 },
+                }),
+            }],
             transitions: vec![],
         };
 
@@ -4051,8 +4056,7 @@ mod tests {
         slots.insert("Order".to_owned(), 1);
         slots.insert("Item".to_owned(), 2);
 
-        let result =
-            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 10000);
+        let result = try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 10000);
         assert!(
             matches!(result, Ic3Result::Proved),
             "expected Proved for ForAll+Create, got: {result:?}"
@@ -4311,8 +4315,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
 
-        let result =
-            try_ic3_system(&ir, &vctx, &["A".to_owned()], &property, &slots, 5000);
+        let result = try_ic3_system(&ir, &vctx, &["A".to_owned()], &property, &slots, 5000);
         assert!(
             matches!(result, Ic3Result::Unknown(ref reason)
                 if reason.contains("cyclic CrossCall")),
@@ -4370,8 +4373,7 @@ mod tests {
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
 
-        let result =
-            try_ic3_system(&ir2, &vctx, &["Bad".to_owned()], &property, &slots, 5000);
+        let result = try_ic3_system(&ir2, &vctx, &["Bad".to_owned()], &property, &slots, 5000);
         assert!(
             matches!(result, Ic3Result::Unknown(ref reason)
                 if reason.contains("Apply target wrong_var does not match")),

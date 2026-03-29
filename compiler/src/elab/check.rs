@@ -30,6 +30,9 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     errors.extend(check_pred_prop_cycles(env));
 
     let result = ElabResult {
+        module_name: env.module_name.clone(),
+        includes: env.includes.clone(),
+        use_decls: env.use_decls.iter().map(|(ud, _)| ud.clone()).collect(),
         types: env
             .types
             .iter()
@@ -44,27 +47,31 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
         theorems: env.theorems.clone(),
         axioms: env.axioms.clone(),
         lemmas: env.lemmas.clone(),
-        consts: env.consts.clone(),
-        fns: env.fns.clone(),
+        consts: env.consts.values().cloned().collect(),
+        fns: env.fns.values().cloned().collect(),
     };
 
     (result, errors)
 }
 
-fn mk_etype(name: &str, ty: &Ty) -> EType {
+fn mk_etype(_map_key: &str, ty: &Ty) -> EType {
+    // Use the canonical name from the Ty value, not the map key.
+    // This ensures aliased imports (use M::Order as O) keep the
+    // canonical declaration name "Order" in the output, not the alias "O".
+    let canonical = ty.name().to_owned();
     match ty {
         Ty::Enum(_, vs) => EType {
-            name: name.to_owned(),
+            name: canonical,
             variants: vs.iter().map(|v| EVariant::Simple(v.clone())).collect(),
             ty: ty.clone(),
         },
         Ty::Record(_, fs) => EType {
-            name: name.to_owned(),
-            variants: vec![EVariant::Record(name.to_owned(), fs.clone())],
+            name: canonical.clone(),
+            variants: vec![EVariant::Record(canonical, fs.clone())],
             ty: ty.clone(),
         },
         _ => EType {
-            name: name.to_owned(),
+            name: canonical,
             variants: Vec::new(),
             ty: ty.clone(),
         },
@@ -253,8 +260,8 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
     for name in env.props.keys() {
         all_names.insert(name.clone());
     }
-    for f in &env.fns {
-        all_names.insert(f.name.clone());
+    for name in env.fns.keys() {
+        all_names.insert(name.clone());
     }
 
     // Extract dependencies from pred bodies
@@ -273,11 +280,11 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
     }
 
     // Extract dependencies from fn bodies
-    for f in &env.fns {
+    for (name, f) in &env.fns {
         let mut referenced = HashSet::new();
         let bound: HashSet<String> = f.params.iter().map(|(n, _)| n.clone()).collect();
         collect_name_refs(&f.body, &all_names, &bound, &mut referenced);
-        deps.insert(f.name.clone(), referenced);
+        deps.insert(name.clone(), referenced);
     }
 
     // DFS cycle detection

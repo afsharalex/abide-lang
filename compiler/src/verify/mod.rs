@@ -242,11 +242,7 @@ fn collect_def_refs_in_exprs(exprs: &[IRExpr], refs: &mut HashSet<String>) {
     }
 }
 
-fn collect_def_refs_inner(
-    expr: &IRExpr,
-    bound: &HashSet<String>,
-    refs: &mut HashSet<String>,
-) {
+fn collect_def_refs_inner(expr: &IRExpr, bound: &HashSet<String>, refs: &mut HashSet<String>) {
     match expr {
         IRExpr::Var { name, .. } => {
             if !bound.contains(name) {
@@ -273,7 +269,10 @@ fn collect_def_refs_inner(
             collect_def_refs_inner(body, &inner_bound, refs);
         }
         IRExpr::SetComp {
-            var, filter, projection, ..
+            var,
+            filter,
+            projection,
+            ..
         } => {
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone());
@@ -698,8 +697,14 @@ fn try_ic3_on_verify(
     // per-slot independence can produce spurious intermediate states).
     for assert_expr in &verify_block.asserts {
         let expanded = expand_through_defs(assert_expr, defs);
-        let result =
-            ic3::try_ic3_system(ir, vctx, &system_names, &expanded, &scope, config.ic3_timeout_ms);
+        let result = ic3::try_ic3_system(
+            ir,
+            vctx,
+            &system_names,
+            &expanded,
+            &scope,
+            config.ic3_timeout_ms,
+        );
         match result {
             ic3::Ic3Result::Proved => {} // this assert proved, continue
             ic3::Ic3Result::Violated(_) | ic3::Ic3Result::Unknown(_) => {
@@ -1990,13 +1995,17 @@ fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) 
                 count_entity_quantifiers(proj, counts);
             }
         }
-        IRExpr::SetComp { filter, projection, .. } => {
+        IRExpr::SetComp {
+            filter, projection, ..
+        } => {
             count_entity_quantifiers(filter, counts);
             if let Some(proj) = projection {
                 count_entity_quantifiers(proj, counts);
             }
         }
-        IRExpr::MapUpdate { map, key, value, .. } => {
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
             count_entity_quantifiers(map, counts);
             count_entity_quantifiers(key, counts);
             count_entity_quantifiers(value, counts);
@@ -2169,7 +2178,10 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
                 .collect(),
         },
         IRExpr::MapUpdate {
-            map, key, value, ty,
+            map,
+            key,
+            value,
+            ty,
         } => IRExpr::MapUpdate {
             map: Box::new(expand_through_defs(map, defs)),
             key: Box::new(expand_through_defs(key, defs)),
@@ -2270,8 +2282,11 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
             ..
         } => {
             // Entity-domain comprehension is supported; check sub-expressions
-            find_unsupported_scene_expr(filter)
-                .or_else(|| projection.as_ref().and_then(|p| find_unsupported_scene_expr(p)))
+            find_unsupported_scene_expr(filter).or_else(|| {
+                projection
+                    .as_ref()
+                    .and_then(|p| find_unsupported_scene_expr(p))
+            })
         }
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
         IRExpr::Sorry => Some("Sorry"),
@@ -2315,9 +2330,9 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
         IRExpr::Index { map, key, .. } => {
             find_unsupported_scene_expr(map).or_else(|| find_unsupported_scene_expr(key))
         }
-        IRExpr::MapLit { entries, .. } => entries
-            .iter()
-            .find_map(|(k, v)| find_unsupported_scene_expr(k).or_else(|| find_unsupported_scene_expr(v))),
+        IRExpr::MapLit { entries, .. } => entries.iter().find_map(|(k, v)| {
+            find_unsupported_scene_expr(k).or_else(|| find_unsupported_scene_expr(v))
+        }),
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().find_map(find_unsupported_scene_expr)
         }
@@ -2766,8 +2781,7 @@ fn encode_prop_value(
                 _ => panic!("SeqLit with non-Seq type: {ty:?}"),
             };
             let default_val = smt::default_dynamic(elem_ty);
-            let mut arr =
-                z3::ast::Array::const_array(&z3::Sort::int(), &default_val);
+            let mut arr = z3::ast::Array::const_array(&z3::Sort::int(), &default_val);
             for (i, elem) in elements.iter().enumerate() {
                 let idx = smt::int_val(i64::try_from(i).unwrap_or(0)).to_dynamic();
                 let v = encode_prop_value(pool, vctx, defs, ctx, elem, step);
@@ -2802,16 +2816,14 @@ fn encode_prop_value(
                     _ => continue,
                 };
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let filter_val =
-                    encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
                 // Condition: slot is active AND filter holds
                 let cond = Bool::and(&[&is_active, &filter_val]);
 
                 // Key: what to store true at
                 let key = if let Some(proj_expr) = projection {
                     // Projection: store true at the projected value
-                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)
-                        .to_dynamic()
+                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step).to_dynamic()
                 } else {
                     // Simple: store true at the slot index
                     smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic()
@@ -2831,21 +2843,16 @@ fn encode_prop_value(
             let false_val = smt::bool_val(false).to_dynamic();
             SmtValue::Array(z3::ast::Array::const_array(&sort, &false_val))
         }
-        IRExpr::Card { expr: inner } => {
-            encode_card(pool, vctx, defs, ctx, inner, step)
-        }
+        IRExpr::Card { expr: inner } => encode_card(pool, vctx, defs, ctx, inner, step),
         IRExpr::App { func, .. } => {
             if let IRExpr::Var { name, .. } = func.as_ref() {
-                panic!(
-                    "built-in function `{name}` is not yet supported in verification encoding"
-                );
+                panic!("built-in function `{name}` is not yet supported in verification encoding");
             }
             panic!("unsupported App expression in property value encoding: {expr:?}")
         }
         _ => panic!("unsupported expression in property value encoding: {expr:?}"),
     }
 }
-
 
 /// Encode cardinality (`#expr`) as a Z3 Int.
 ///
@@ -2871,9 +2878,7 @@ fn encode_card(
                 elements.iter().map(|e| format!("{e:?}")).collect();
             smt::int_val(i64::try_from(unique.len()).unwrap_or(0))
         }
-        IRExpr::SeqLit { elements, .. } => {
-            smt::int_val(i64::try_from(elements.len()).unwrap_or(0))
-        }
+        IRExpr::SeqLit { elements, .. } => smt::int_val(i64::try_from(elements.len()).unwrap_or(0)),
         IRExpr::MapLit { entries, .. } => {
             let unique_keys: std::collections::HashSet<String> =
                 entries.iter().map(|(k, _)| format!("{k:?}")).collect();
@@ -2897,8 +2902,7 @@ fn encode_card(
                     _ => continue,
                 };
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let filter_val =
-                    encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
                 let cond = Bool::and(&[&is_active, &filter_val]);
                 sum_terms.push(cond.ite(&one, &zero));
             }
@@ -2909,9 +2913,9 @@ fn encode_card(
             let refs: Vec<&z3::ast::Int> = sum_terms.iter().collect();
             SmtValue::Int(z3::ast::Int::add(&refs))
         }
-        _ => panic!(
-            "unsupported cardinality expression — should be caught by pre-check: {inner:?}"
-        ),
+        _ => {
+            panic!("unsupported cardinality expression — should be caught by pre-check: {inner:?}")
+        }
     }
 }
 
@@ -4004,8 +4008,7 @@ mod tests {
         assert!(
             matches!(
                 &results[0],
-                VerificationResult::Counterexample { .. }
-                    | VerificationResult::Unprovable { .. }
+                VerificationResult::Counterexample { .. } | VerificationResult::Unprovable { .. }
             ),
             "expected Counterexample or Unprovable with unbounded_only, got: {:?}",
             results[0]
@@ -4325,13 +4328,15 @@ mod tests {
         // Verify block: BMC fallback (CHECKED)
         assert!(
             matches!(&results[0], VerificationResult::Checked { .. }),
-            "expected CHECKED with --no-ic3, got: {}", results[0]
+            "expected CHECKED with --no-ic3, got: {}",
+            results[0]
         );
 
         // Theorem: IC3 skipped, induction fails → UNPROVABLE
         assert!(
             matches!(&results[1], VerificationResult::Unprovable { .. }),
-            "expected UNPROVABLE with --no-ic3, got: {}", results[1]
+            "expected UNPROVABLE with --no-ic3, got: {}",
+            results[1]
         );
     }
 
@@ -4349,7 +4354,8 @@ mod tests {
         // Verify block: BMC only → CHECKED
         assert!(
             matches!(&results[0], VerificationResult::Checked { .. }),
-            "expected CHECKED with --bounded-only, got: {}", results[0]
+            "expected CHECKED with --bounded-only, got: {}",
+            results[0]
         );
 
         // Theorem: --bounded-only → UNPROVABLE
@@ -4742,7 +4748,8 @@ mod tests {
         // Reflexivity: data[42] == data[42] — PROVED by induction (trivially true)
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
-            "reflexive map property should be PROVED: got {}", results[0]
+            "reflexive map property should be PROVED: got {}",
+            results[0]
         );
 
         // Post-put: data[42] == 100 — COUNTEREXAMPLE expected (create_store
@@ -4750,7 +4757,8 @@ mod tests {
         // before first put). Validates full MapUpdate→Index→comparison path.
         assert!(
             matches!(&results[1], VerificationResult::Counterexample { .. }),
-            "post-put map property should find COUNTEREXAMPLE: got {}", results[1]
+            "post-put map property should find COUNTEREXAMPLE: got {}",
+            results[1]
         );
     }
 
@@ -4863,7 +4871,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(
             !matches!(&results[0], VerificationResult::Unprovable { .. }),
-            "MapLit in property should encode without error: got {}", results[0]
+            "MapLit in property should encode without error: got {}",
+            results[0]
         );
     }
 
@@ -5056,7 +5065,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "primed map update with scalar should succeed: got {}", results[0]
+            "primed map update with scalar should succeed: got {}",
+            results[0]
         );
     }
 
@@ -5343,7 +5353,8 @@ mod tests {
         // Set(1,2,3)[2] is always true — should be PROVED
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
-            "set literal membership should be PROVED: got {}", results[0]
+            "set literal membership should be PROVED: got {}",
+            results[0]
         );
     }
 
@@ -5451,7 +5462,8 @@ mod tests {
         // #Set(1,2,3) = 3 — compile-time constant, trivially PROVED
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
-            "#Set(1,2,3) == 3 should be PROVED: got {}", results[0]
+            "#Set(1,2,3) == 3 should be PROVED: got {}",
+            results[0]
         );
     }
 
@@ -5556,7 +5568,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
-            "#Set(1,1,2) == 2 should be PROVED (deduplicated): got {}", results[0]
+            "#Set(1,1,2) == 2 should be PROVED (deduplicated): got {}",
+            results[0]
         );
     }
 
@@ -5739,7 +5752,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "set comprehension should encode without error: got {}", results[0]
+            "set comprehension should encode without error: got {}",
+            results[0]
         );
     }
 
@@ -5860,7 +5874,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "SetComp→Index chain should encode without error: got {}", results[0]
+            "SetComp→Index chain should encode without error: got {}",
+            results[0]
         );
     }
 
@@ -5990,7 +6005,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "projection SetComp should encode without error: got {}", results[0]
+            "projection SetComp should encode without error: got {}",
+            results[0]
         );
     }
 
@@ -6040,9 +6056,18 @@ mod tests {
 
         let seq_lit = || IRExpr::SeqLit {
             elements: vec![
-                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 10 } },
-                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 20 } },
-                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 30 } },
+                IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 10 },
+                },
+                IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 20 },
+                },
+                IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 30 },
+                },
             ],
             ty: seq_ty.clone(),
         };
@@ -6051,7 +6076,9 @@ mod tests {
         let index_prop = IRExpr::Always {
             body: Box::new(IRExpr::Forall {
                 var: "x".to_owned(),
-                domain: IRType::Entity { name: "X".to_owned() },
+                domain: IRType::Entity {
+                    name: "X".to_owned(),
+                },
                 body: Box::new(IRExpr::BinOp {
                     op: "OpEq".to_owned(),
                     left: Box::new(IRExpr::Index {
@@ -6075,7 +6102,9 @@ mod tests {
         let card_prop = IRExpr::Always {
             body: Box::new(IRExpr::Forall {
                 var: "x".to_owned(),
-                domain: IRType::Entity { name: "X".to_owned() },
+                domain: IRType::Entity {
+                    name: "X".to_owned(),
+                },
                 body: Box::new(IRExpr::BinOp {
                     op: "OpEq".to_owned(),
                     left: Box::new(IRExpr::Card {
@@ -6127,7 +6156,8 @@ mod tests {
         // Seq(10,20,30)[1] == 20 — PROVED (store/select axiom)
         assert!(
             matches!(&results[0], VerificationResult::Proved { .. }),
-            "Seq index should be PROVED: got {}", results[0]
+            "Seq index should be PROVED: got {}",
+            results[0]
         );
 
         // #Seq(10,20,30) == 3 — compile-time constant, PROVED or CHECKED
@@ -6136,7 +6166,8 @@ mod tests {
                 &results[1],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "Seq cardinality should succeed: got {}", results[1]
+            "Seq cardinality should succeed: got {}",
+            results[1]
         );
     }
 
@@ -6247,7 +6278,9 @@ mod tests {
             map: Box::new(IRExpr::Field {
                 expr: Box::new(IRExpr::Var {
                     name: "q".to_owned(),
-                    ty: IRType::Entity { name: "Q".to_owned() },
+                    ty: IRType::Entity {
+                        name: "Q".to_owned(),
+                    },
                 }),
                 field: "items".to_owned(),
                 ty: seq_ty.clone(),
@@ -6263,7 +6296,9 @@ mod tests {
         let property = IRExpr::Always {
             body: Box::new(IRExpr::Forall {
                 var: "q".to_owned(),
-                domain: IRType::Entity { name: "Q".to_owned() },
+                domain: IRType::Entity {
+                    name: "Q".to_owned(),
+                },
                 body: Box::new(IRExpr::BinOp {
                     op: "OpAnd".to_owned(),
                     left: Box::new(IRExpr::BinOp {
@@ -6277,7 +6312,9 @@ mod tests {
                         left: Box::new(IRExpr::Field {
                             expr: Box::new(IRExpr::Var {
                                 name: "q".to_owned(),
-                                ty: IRType::Entity { name: "Q".to_owned() },
+                                ty: IRType::Entity {
+                                    name: "Q".to_owned(),
+                                },
                             }),
                             field: "count".to_owned(),
                             ty: IRType::Int,
@@ -6320,7 +6357,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "Seq frame alongside scalar should succeed: got {}", results[0]
+            "Seq frame alongside scalar should succeed: got {}",
+            results[0]
         );
     }
 
@@ -6529,7 +6567,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "#{{ Active }} >= 0 should succeed: got {}", results[0]
+            "#{{ Active }} >= 0 should succeed: got {}",
+            results[0]
         );
 
         // #{ Active } <= 2 — PROVED (at most 2 slots can be active)
@@ -6538,7 +6577,8 @@ mod tests {
                 &results[1],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "#{{ Active }} <= 2 should succeed: got {}", results[1]
+            "#{{ Active }} <= 2 should succeed: got {}",
+            results[1]
         );
     }
 
@@ -6632,7 +6672,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { name, .. } if name == "prop_n_non_neg"
             ),
-            "prop should be auto-verified as PROVED: got {}", results[0]
+            "prop should be auto-verified as PROVED: got {}",
+            results[0]
         );
     }
 
@@ -6719,7 +6760,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { name, .. } if name == "explicit_thm"
             ),
-            "only the explicit theorem should appear: got {}", results[0]
+            "only the explicit theorem should appear: got {}",
+            results[0]
         );
     }
 
@@ -6900,7 +6942,8 @@ mod tests {
                     | VerificationResult::Unprovable { name, .. }
                     if name == "prop_always_off"
             ),
-            "false prop should produce Counterexample or Unprovable: got {}", results[0]
+            "false prop should produce Counterexample or Unprovable: got {}",
+            results[0]
         );
     }
 
@@ -7096,7 +7139,8 @@ mod tests {
                 &results[0],
                 VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
             ),
-            "multi-apply sequential chaining should succeed: got {}", results[0]
+            "multi-apply sequential chaining should succeed: got {}",
+            results[0]
         );
     }
 
@@ -7283,7 +7327,8 @@ mod tests {
         // Without intermediate chaining, ship's guard fails (sees 0, not 1).
         assert!(
             matches!(&results[0], VerificationResult::ScenePass { .. }),
-            "scene with multi-apply should PASS: got {}", results[0]
+            "scene with multi-apply should PASS: got {}",
+            results[0]
         );
     }
 
@@ -8432,9 +8477,7 @@ mod tests {
                     "ForAll multi-apply rejection should mention 'multiple Apply': got {reason}"
                 );
             }
-            other => panic!(
-                "ForAll multi-apply in scene should produce SceneFail, got: {other}"
-            ),
+            other => panic!("ForAll multi-apply in scene should produce SceneFail, got: {other}"),
         }
     }
 }

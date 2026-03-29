@@ -300,10 +300,10 @@ impl Parser {
         let (module, _) = self.expect_name()?;
         self.expect(&Token::ColonColon)?;
 
-        if self.eat(&Token::Star).is_some() {
+        if let Some(star_span) = self.eat(&Token::Star) {
             return Ok(UseDecl::All {
                 module,
-                span: start.merge(self.cur_span()),
+                span: start.merge(star_span),
             });
         }
 
@@ -878,7 +878,7 @@ impl Parser {
         })
     }
 
-    // ── Verify / Proof / Lemma ───────────────────────────────────────
+    // ── Verify / Theorem / Lemma ──────────────────────────────────────
 
     fn verify_decl(&mut self) -> Result<VerifyDecl, ParseError> {
         let start = self.expect(&Token::Verify)?;
@@ -2408,12 +2408,48 @@ mod tests {
     }
 
     #[test]
+    fn use_single() {
+        let prog = parse_program("use Commerce::Order");
+        if let TopDecl::Use(UseDecl::Single { module, name, .. }) = &prog.decls[0] {
+            assert_eq!(module, "Commerce");
+            assert_eq!(name, "Order");
+        } else {
+            panic!("expected Use::Single");
+        }
+    }
+
+    #[test]
+    fn use_alias() {
+        let prog = parse_program("use Commerce::Order as CO");
+        if let TopDecl::Use(UseDecl::Alias {
+            module,
+            name,
+            alias,
+            ..
+        }) = &prog.decls[0]
+        {
+            assert_eq!(module, "Commerce");
+            assert_eq!(name, "Order");
+            assert_eq!(alias, "CO");
+        } else {
+            panic!("expected Use::Alias");
+        }
+    }
+
+    #[test]
     fn use_items() {
         let src = "use Billing::{PaymentIntent as PI, open_intent, capture_payment}";
         let prog = parse_program(src);
         if let TopDecl::Use(UseDecl::Items { module, items, .. }) = &prog.decls[0] {
             assert_eq!(module, "Billing");
             assert_eq!(items.len(), 3);
+            // First item is an alias
+            assert!(
+                matches!(&items[0], UseItem::Alias { name, alias, .. } if name == "PaymentIntent" && alias == "PI")
+            );
+            // Second and third are plain names
+            assert!(matches!(&items[1], UseItem::Name { name, .. } if name == "open_intent"));
+            assert!(matches!(&items[2], UseItem::Name { name, .. } if name == "capture_payment"));
         } else {
             panic!("expected Use::Items");
         }

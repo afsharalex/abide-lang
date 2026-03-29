@@ -1,35 +1,82 @@
 //! Pass 1: Collect all top-level declarations into the environment.
 //!
 //! Walks the parsed AST and registers every type, entity, system,
-//! pred, prop, verify, scene, proof, lemma, const, and fn declaration.
+//! pred, prop, verify, scene, theorem, axiom, lemma, const, and fn declaration.
 
-use crate::ast;
+use crate::ast::{self, Visibility};
 
-use super::env::{DeclInfo, DeclKind, Env};
+use super::env::{DeclKind, Env};
+use super::error::{ElabError, ErrorKind};
 use super::types::{
     BinOp, BuiltinTy, EAction, EAxiom, EConst, EEntity, EEvent, EEventAction, EExpr, EField, EFn,
     ELemma, ENextItem, EPattern, EPred, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, ETheorem,
     EVerify, Literal, Quantifier, Ty, UnOp,
 };
 
-/// Collect all declarations from a parsed program into an `Env`.
+/// Collect all declarations from a parsed program into a new `Env`.
 pub fn collect(program: &ast::Program) -> Env {
     let mut env = Env::new();
-    for decl in &program.decls {
-        collect_top_decl(&mut env, decl);
-    }
+    collect_into(&mut env, program);
     env
+}
+
+/// Collect declarations from a parsed program into an existing `Env`.
+///
+/// Used by the multi-file loader to merge declarations from multiple files
+/// into a shared environment.
+pub fn collect_into(env: &mut Env, program: &ast::Program) {
+    // Track how many use_decls exist before this file's declarations
+    let use_decls_before = env.use_decls.len();
+
+    for decl in &program.decls {
+        collect_top_decl(env, decl);
+    }
+
+    // Retroactively fix use-before-module: if this file's `use` declarations
+    // were recorded with source_module=None (because `use` appeared before
+    // `module` in the file), patch them now that module_name is set.
+    if let Some(ref module) = env.module_name {
+        for entry in &mut env.use_decls[use_decls_before..] {
+            if entry.1.is_none() {
+                entry.1 = Some(module.clone());
+            }
+        }
+    }
 }
 
 fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
     match decl {
         ast::TopDecl::Module(d) => {
-            env.module_name = Some(d.name.clone());
+            env.known_modules.insert(d.name.clone());
+            match &env.module_name {
+                Some(existing) if existing != &d.name => {
+                    env.errors.push(ElabError::new(
+                        ErrorKind::DuplicateDecl,
+                        format!(
+                            "conflicting module declaration: '{}' (already declared as '{}')",
+                            d.name, existing
+                        ),
+                        String::new(),
+                    ));
+                    // Keep first module name — don't overwrite on conflict
+                }
+                None => {
+                    env.module_name = Some(d.name.clone());
+                }
+                _ => {} // Same name repeated — idempotent
+            }
         }
         ast::TopDecl::Include(d) => {
             env.includes.push(d.path.clone());
         }
-        ast::TopDecl::Use(_) => {} // future
+        ast::TopDecl::Use(ud) => {
+            // Pair with current module so resolve knows which module is importing.
+            // If module_name is None (use before module decl, or no module decl),
+            // the use still gets recorded — resolve handles None source gracefully
+            // by skipping same-module visibility shortcuts.
+            let source_module = env.module_name.clone();
+            env.use_decls.push((ud.clone(), source_module));
+        }
         ast::TopDecl::Const(d) => collect_const(env, d),
         ast::TopDecl::Fn(d) => collect_fn(env, d),
         ast::TopDecl::Type(d) => collect_type(env, d),
@@ -58,13 +105,14 @@ fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
         {
             if let Some(builtin) = resolve_builtin(target) {
                 let ty = Ty::Alias(name.clone(), Box::new(Ty::Builtin(builtin)));
-                let info = DeclInfo {
-                    kind: DeclKind::Type,
-                    name: name.clone(),
-                    ty: Some(ty.clone()),
-                };
+                let info = env.make_decl_info(
+                    DeclKind::Type,
+                    name.clone(),
+                    Some(ty.clone()),
+                    td.visibility,
+                );
                 env.add_decl(name, info);
-                env.types.insert(name.clone(), ty);
+                env.insert_type(name, ty);
                 return;
             }
         }
@@ -81,13 +129,14 @@ fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
         .collect();
 
     let ty = Ty::Enum(name.clone(), variant_names);
-    let info = DeclInfo {
-        kind: DeclKind::Type,
-        name: name.clone(),
-        ty: Some(ty.clone()),
-    };
+    let info = env.make_decl_info(
+        DeclKind::Type,
+        name.clone(),
+        Some(ty.clone()),
+        td.visibility,
+    );
     env.add_decl(name, info);
-    env.types.insert(name.clone(), ty);
+    env.insert_type(name, ty);
 }
 
 fn collect_record(env: &mut Env, rd: &ast::RecordDecl) {
@@ -98,13 +147,14 @@ fn collect_record(env: &mut Env, rd: &ast::RecordDecl) {
         .map(|f| (f.name.clone(), resolve_type_ref(&f.ty)))
         .collect();
     let ty = Ty::Record(name.clone(), fields);
-    let info = DeclInfo {
-        kind: DeclKind::Type,
-        name: name.clone(),
-        ty: Some(ty.clone()),
-    };
+    let info = env.make_decl_info(
+        DeclKind::Type,
+        name.clone(),
+        Some(ty.clone()),
+        rd.visibility,
+    );
     env.add_decl(name, info);
-    env.types.insert(name.clone(), ty);
+    env.insert_type(name, ty);
 }
 
 /// Convert a parse-level `TypeRef` to a semantic `Ty`.
@@ -161,13 +211,9 @@ fn collect_entity(env: &mut Env, ed: &ast::EntityDecl) {
         fields,
         actions,
     };
-    let info = DeclInfo {
-        kind: DeclKind::Entity,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Entity, name.clone(), None, ed.visibility);
     env.add_decl(name, info);
-    env.entities.insert(name.clone(), ee);
+    env.insert_entity(name, ee);
 }
 
 fn collect_field(f: &ast::FieldDecl) -> EField {
@@ -241,13 +287,9 @@ fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         events,
         next_items,
     };
-    let info = DeclInfo {
-        kind: DeclKind::System,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::System, name.clone(), None, Visibility::Public);
     env.add_decl(name, info);
-    env.systems.insert(name.clone(), es);
+    env.insert_system(name, es);
 }
 
 fn collect_event(ev: &ast::EventDecl) -> EEvent {
@@ -374,7 +416,7 @@ fn expr_to_text(kind: &ast::ExprKind) -> String {
     }
 }
 
-// ── Predicates, properties, verify, scene, proof, lemma ──────────────
+// ── Predicates, properties, verify, scene, theorem, axiom, lemma ─────
 
 fn collect_pred(env: &mut Env, pd: &ast::PredDecl) {
     let name = &pd.name;
@@ -388,13 +430,9 @@ fn collect_pred(env: &mut Env, pd: &ast::PredDecl) {
         params,
         body: collect_expr(&pd.body),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Pred,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Pred, name.clone(), None, pd.visibility);
     env.add_decl(name, info);
-    env.preds.insert(name.clone(), ep);
+    env.insert_pred(name, ep);
 }
 
 fn collect_prop(env: &mut Env, pd: &ast::PropDecl) {
@@ -409,13 +447,9 @@ fn collect_prop(env: &mut Env, pd: &ast::PropDecl) {
         target,
         body: collect_expr(&pd.body),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Prop,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Prop, name.clone(), None, pd.visibility);
     env.add_decl(name, info);
-    env.props.insert(name.clone(), ep);
+    env.insert_prop(name, ep);
 }
 
 fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
@@ -432,11 +466,7 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
         asserts,
     };
     let key = format!("verify:{name}");
-    let info = DeclInfo {
-        kind: DeclKind::Verify,
-        name: key.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Verify, key.clone(), None, Visibility::Public);
     env.add_decl(&key, info);
     env.verifies.push(ev);
 }
@@ -506,11 +536,7 @@ fn collect_scene(env: &mut Env, sd: &ast::SceneDecl) {
         thens,
     };
     let key = format!("scene:{name}");
-    let info = DeclInfo {
-        kind: DeclKind::Scene,
-        name: key.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Scene, key.clone(), None, Visibility::Public);
     env.add_decl(&key, info);
     env.scenes.push(es);
 }
@@ -586,11 +612,7 @@ fn collect_theorem(env: &mut Env, td: &ast::TheoremDecl) {
         invariants: td.invariants.iter().map(collect_expr).collect(),
         shows: td.shows.iter().map(collect_expr).collect(),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Theorem,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Theorem, name.clone(), None, Visibility::Public);
     env.add_decl(name, info);
     env.theorems.push(et);
 }
@@ -601,11 +623,7 @@ fn collect_axiom(env: &mut Env, ad: &ast::AxiomDecl) {
         name: name.clone(),
         body: collect_expr(&ad.body),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Axiom,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Axiom, name.clone(), None, Visibility::Public);
     env.add_decl(name, info);
     env.axioms.push(ea);
 }
@@ -616,11 +634,7 @@ fn collect_lemma(env: &mut Env, ld: &ast::LemmaDecl) {
         name: name.clone(),
         body: ld.body.iter().map(collect_expr).collect(),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Lemma,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Lemma, name.clone(), None, Visibility::Public);
     env.add_decl(name, info);
     env.lemmas.push(el);
 }
@@ -631,13 +645,9 @@ fn collect_const(env: &mut Env, cd: &ast::ConstDecl) {
         name: name.clone(),
         body: collect_expr(&cd.value),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Const,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Const, name.clone(), None, cd.visibility);
     env.add_decl(name, info);
-    env.consts.push(ec);
+    env.insert_const(name, ec);
 }
 
 fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
@@ -654,13 +664,9 @@ fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
         ret_ty: ret,
         body: collect_expr(&fd.body),
     };
-    let info = DeclInfo {
-        kind: DeclKind::Fn,
-        name: name.clone(),
-        ty: None,
-    };
+    let info = env.make_decl_info(DeclKind::Fn, name.clone(), None, fd.visibility);
     env.add_decl(name, info);
-    env.fns.push(ef);
+    env.insert_fn(name, ef);
 }
 
 // ── Expression collection ────────────────────────────────────────────
@@ -942,4 +948,199 @@ fn bin_op(ty: Ty, op: BinOp, a: &ast::Expr, b: &ast::Expr) -> EExpr {
 fn parse_float_text(s: &str) -> f64 {
     let stripped = s.strip_suffix('f').unwrap_or(s);
     stripped.parse().unwrap_or(0.0)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::Visibility;
+    use crate::lex;
+    use crate::parse::Parser;
+
+    fn collect_src(src: &str) -> Env {
+        let tokens = lex::lex(src).expect("lex error");
+        let mut parser = Parser::new(tokens);
+        let prog = parser.parse_program().expect("parse error");
+        collect(&prog)
+    }
+
+    #[test]
+    fn module_name_tracked() {
+        let env = collect_src("module Commerce");
+        assert_eq!(env.module_name.as_deref(), Some("Commerce"));
+    }
+
+    #[test]
+    fn duplicate_module_errors_and_keeps_first() {
+        let env = collect_src("module Commerce\nmodule Billing");
+        // First module name wins — not overwritten on conflict
+        assert_eq!(env.module_name.as_deref(), Some("Commerce"));
+        assert!(
+            env.errors
+                .iter()
+                .any(|e| format!("{:?}", e).contains("conflicting module")),
+            "expected conflicting module error, got: {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn same_module_twice_no_error() {
+        let env = collect_src("module Commerce\nmodule Commerce");
+        assert_eq!(env.module_name.as_deref(), Some("Commerce"));
+        assert!(
+            env.errors.is_empty(),
+            "duplicate same-name module should not error"
+        );
+    }
+
+    #[test]
+    fn include_paths_tracked() {
+        let env = collect_src(r#"include "billing.abide""#);
+        assert_eq!(env.includes, vec!["billing.abide"]);
+    }
+
+    #[test]
+    fn include_preserves_order() {
+        let env = collect_src(
+            r#"include "first.abide"
+include "second.abide""#,
+        );
+        assert_eq!(env.includes, vec!["first.abide", "second.abide"]);
+    }
+
+    #[test]
+    fn use_decls_tracked() {
+        let env = collect_src("use Commerce::Order\nuse Billing::*\nuse Fulfillment::Ship as S");
+        assert_eq!(env.use_decls.len(), 3);
+    }
+
+    #[test]
+    fn use_decls_preserve_order() {
+        let env = collect_src("use A::X\nuse B::Y\nuse C::Z");
+        assert_eq!(env.use_decls.len(), 3);
+        // First should be A::X
+        if let (ast::UseDecl::Single { module, name, .. }, _src) = &env.use_decls[0] {
+            assert_eq!(module, "A");
+            assert_eq!(name, "X");
+        } else {
+            panic!("expected Single");
+        }
+        // Third should be C::Z
+        if let (ast::UseDecl::Single { module, name, .. }, _src) = &env.use_decls[2] {
+            assert_eq!(module, "C");
+            assert_eq!(name, "Z");
+        } else {
+            panic!("expected Single");
+        }
+    }
+
+    #[test]
+    fn type_visibility_private_by_default() {
+        let env = collect_src("type Status = Active | Inactive");
+        let info = env.decls.get("Status").expect("Status decl");
+        assert_eq!(info.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn type_visibility_public() {
+        let env = collect_src("pub type Status = Active | Inactive");
+        let info = env.decls.get("Status").expect("Status decl");
+        assert_eq!(info.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn entity_visibility_private_by_default() {
+        let env = collect_src("entity Order { id: Id }");
+        let info = env.decls.get("Order").expect("Order decl");
+        assert_eq!(info.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn entity_visibility_public() {
+        let env = collect_src("pub entity Order { id: Id }");
+        let info = env.decls.get("Order").expect("Order decl");
+        assert_eq!(info.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn system_always_public() {
+        let env = collect_src("system S { }");
+        let info = env.decls.get("S").expect("S decl");
+        assert_eq!(info.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn fn_visibility() {
+        let env = collect_src("fn total(x: Int): Int = x\npub fn calc(x: Int): Int = x");
+        let priv_info = env.decls.get("total").expect("total");
+        assert_eq!(priv_info.visibility, Visibility::Private);
+        let pub_info = env.decls.get("calc").expect("calc");
+        assert_eq!(pub_info.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn const_visibility() {
+        let env = collect_src("const A = 1\npub const B = 2");
+        assert_eq!(env.decls.get("A").unwrap().visibility, Visibility::Private);
+        assert_eq!(env.decls.get("B").unwrap().visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn decl_module_tagged() {
+        let env = collect_src("module Commerce\ntype Status = Active | Inactive");
+        let info = env
+            .lookup_decl_qualified("Commerce", "Status")
+            .expect("Commerce::Status decl");
+        assert_eq!(info.module.as_deref(), Some("Commerce"));
+    }
+
+    #[test]
+    fn decl_module_none_without_module_decl() {
+        let env = collect_src("type Status = Active | Inactive");
+        let info = env.lookup_decl("Status").expect("Status decl");
+        assert_eq!(info.module, None);
+    }
+
+    #[test]
+    fn multi_file_collect_into() {
+        let mut env = Env::new();
+        let prog1 = {
+            let tokens = lex::lex("module Commerce\npub type Status = Active").unwrap();
+            let mut p = Parser::new(tokens);
+            p.parse_program().unwrap()
+        };
+        let prog2 = {
+            let tokens = lex::lex("module Commerce\npub type Payment = Pending | Done").unwrap();
+            let mut p = Parser::new(tokens);
+            p.parse_program().unwrap()
+        };
+        collect_into(&mut env, &prog1);
+        collect_into(&mut env, &prog2);
+        assert_eq!(env.module_name.as_deref(), Some("Commerce"));
+        // Types are stored with qualified keys during collection
+        assert!(env.types.contains_key("Commerce::Status"));
+        assert!(env.types.contains_key("Commerce::Payment"));
+        // After building working namespace, bare names are available
+        env.build_working_namespace();
+        assert!(env.types.contains_key("Status"));
+        assert!(env.types.contains_key("Payment"));
+        assert!(env.errors.is_empty());
+    }
+
+    #[test]
+    fn visibility_error_on_private_import() {
+        // Simulate: module A defines private type, module B imports it.
+        // In a single file, we test the resolve pass catches it.
+        let env = collect_src("module TestMod\ntype Secret = X | Y\nuse TestMod::Secret");
+        // Collector doesn't enforce visibility — that's resolve's job.
+        // But we can verify the declaration is tagged private.
+        let info = env
+            .lookup_decl_qualified("TestMod", "Secret")
+            .expect("TestMod::Secret decl");
+        assert_eq!(info.visibility, Visibility::Private);
+        assert_eq!(info.module.as_deref(), Some("TestMod"));
+    }
 }

@@ -55,8 +55,6 @@ pub enum Token {
     Verify,
     #[token("assert")]
     Assert,
-    #[token("proof")]
-    Proof,
     #[token("invariant")]
     Invariant,
     #[token("show")]
@@ -243,7 +241,6 @@ impl std::fmt::Display for Token {
             Self::Prop => write!(f, "prop"),
             Self::Verify => write!(f, "verify"),
             Self::Assert => write!(f, "assert"),
-            Self::Proof => write!(f, "proof"),
             Self::Invariant => write!(f, "invariant"),
             Self::Show => write!(f, "show"),
             Self::Lemma => write!(f, "lemma"),

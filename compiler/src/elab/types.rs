@@ -398,6 +398,9 @@ pub enum Quantifier {
 /// Full elaboration result containing all elaborated declarations.
 #[derive(Debug, Clone)]
 pub struct ElabResult {
+    pub module_name: Option<String>,
+    pub includes: Vec<String>,
+    pub use_decls: Vec<crate::ast::UseDecl>,
     pub types: Vec<EType>,
     pub entities: Vec<EEntity>,
     pub systems: Vec<ESystem>,

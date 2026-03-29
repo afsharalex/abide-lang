@@ -1107,11 +1107,7 @@ fn encode_event_inner(
                                             ent.transitions.iter().find(|t| t.name == *transition)
                                         {
                                             let action_params = build_apply_params(
-                                                &ctx,
-                                                trans,
-                                                args,
-                                                apply_refs,
-                                                step,
+                                                &ctx, trans, args, apply_refs, step,
                                             );
                                             let action_formula = encode_action(
                                                 pool,
@@ -1868,20 +1864,16 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
 
         IRExpr::Card { expr: inner } => match inner.as_ref() {
             IRExpr::SetLit { elements, .. } => {
-                let unique: std::collections::HashSet<String> = elements
-                    .iter()
-                    .map(|e| format!("{e:?}"))
-                    .collect();
+                let unique: std::collections::HashSet<String> =
+                    elements.iter().map(|e| format!("{e:?}")).collect();
                 smt::int_val(i64::try_from(unique.len()).unwrap_or(0))
             }
             IRExpr::SeqLit { elements, .. } => {
                 smt::int_val(i64::try_from(elements.len()).unwrap_or(0))
             }
             IRExpr::MapLit { entries, .. } => {
-                let unique_keys: std::collections::HashSet<String> = entries
-                    .iter()
-                    .map(|(k, _)| format!("{k:?}"))
-                    .collect();
+                let unique_keys: std::collections::HashSet<String> =
+                    entries.iter().map(|(k, _)| format!("{k:?}")).collect();
                 smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0))
             }
             _ => panic!(

@@ -79,9 +79,9 @@ impl SmtValue {
         match self {
             SmtValue::Bool(b) => b.clone(),
             SmtValue::Int(i) => i.eq(Int::from_i64(0)).not(),
-            SmtValue::Dynamic(d) => d.as_bool().unwrap_or_else(|| {
-                panic!("cannot convert Dynamic to Bool: {d:?}")
-            }),
+            SmtValue::Dynamic(d) => d
+                .as_bool()
+                .unwrap_or_else(|| panic!("cannot convert Dynamic to Bool: {d:?}")),
             _ => panic!("cannot convert {self:?} to Bool"),
         }
     }
@@ -189,9 +189,7 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Bool {
         (SmtValue::Array(x), SmtValue::Array(y)) => x.eq(y.clone()),
         (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => x.eq(y.clone()),
         // Cross-variant: coerce both to Dynamic for Z3's generic equality
-        (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => {
-            d.eq(other.to_dynamic())
-        }
+        (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => d.eq(other.to_dynamic()),
         _ => panic!("sort mismatch in smt_eq: {a:?} vs {b:?}"),
     }
 }
@@ -255,13 +253,16 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> SmtValue {
         (op, SmtValue::Dynamic(d), other) | (op, other, SmtValue::Dynamic(d)) => {
             let coerced = match other {
                 SmtValue::Int(_) => SmtValue::Int(
-                    d.as_int().unwrap_or_else(|| panic!("Dynamic→Int cast failed in {op}")),
+                    d.as_int()
+                        .unwrap_or_else(|| panic!("Dynamic→Int cast failed in {op}")),
                 ),
                 SmtValue::Bool(_) => SmtValue::Bool(
-                    d.as_bool().unwrap_or_else(|| panic!("Dynamic→Bool cast failed in {op}")),
+                    d.as_bool()
+                        .unwrap_or_else(|| panic!("Dynamic→Bool cast failed in {op}")),
                 ),
                 SmtValue::Real(_) => SmtValue::Real(
-                    d.as_real().unwrap_or_else(|| panic!("Dynamic→Real cast failed in {op}")),
+                    d.as_real()
+                        .unwrap_or_else(|| panic!("Dynamic→Real cast failed in {op}")),
                 ),
                 SmtValue::Dynamic(_) => {
                     // Both Dynamic — try Int (most common for map values)
