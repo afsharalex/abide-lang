@@ -11,6 +11,7 @@ pub mod context;
 pub mod defenv;
 pub mod encode;
 pub mod harness;
+pub mod ic3;
 pub mod smt;
 
 use std::collections::{HashMap, HashSet};
