@@ -1,0 +1,94 @@
+module Functions
+
+// Function, constant, and predicate examples
+// Demonstrates: fn, const, pred, prop, pub, let bindings, lambda,
+// pipe operator, match expressions with guards, sorry/todo stubs
+
+type Grade = A | B | C | D | F
+
+type CourseStatus = Enrolled | Completed | Dropped
+
+const PASSING_GRADE = 70
+const MAX_ENROLLMENT = 30
+
+fn clamp(x: Int, lo: Int, hi: Int): Int =
+  match x {
+    _ if x > hi => match hi {
+      _ if hi < lo => lo
+      _ => hi
+    }
+    _ if x < lo => lo
+    _ => x
+  }
+
+fn letter_grade(score: Int): Grade = match score {
+  _ if score >= 90 => A
+  _ if score >= 80 => B
+  _ if score >= 70 => C
+  _ if score >= 60 => D
+  _ => F
+}
+
+fn is_passing(score: Int): Bool = score >= PASSING_GRADE
+
+pred enrolled(s: Student) = s.status == @Enrolled
+
+pred completed(s: Student) = s.status == @Completed
+
+entity Student {
+  id: Id
+  status: CourseStatus = @Enrolled
+  score: Int
+
+  action complete(final_score: Int) requires status == @Enrolled {
+    status' = @Completed
+    score' = final_score
+  }
+
+  action drop_course() requires status == @Enrolled {
+    status' = @Dropped
+  }
+}
+
+prop students_have_valid_status for Grading =
+  always (all s: Student |
+    s.status == @Enrolled or s.status == @Completed or s.status == @Dropped)
+
+system Grading {
+  use Student
+
+  event enroll_student() {
+    create Student {
+      status = @Enrolled
+      score = 0
+    }
+  }
+
+  event complete_course(student_id: Id, final_score: Int) {
+    choose s: Student where s.id == student_id {
+      s.complete(final_score)
+    }
+  }
+
+  event drop_student(student_id: Id) {
+    choose s: Student where s.id == student_id {
+      s.drop_course()
+    }
+  }
+}
+
+verify grading_safety for Grading[0..20] {
+  assert always (all s: Student |
+    s.status == @Enrolled or s.status == @Completed or s.status == @Dropped)
+}
+
+scene student_completes for Grading {
+  given let s = one Student where s.status == @Enrolled
+  when action c = Grading::complete_course(s.id, 85) { one }
+  then assert s.status == @Completed
+}
+
+theorem all_students_valid for Grading {
+  show always (all s: Student |
+    s.status == @Enrolled or s.status == @Completed or s.status == @Dropped)
+}

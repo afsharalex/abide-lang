@@ -52,6 +52,7 @@ pub fn resolve(env: &mut Env) {
     resolve_scenes(env, &ctx);
     resolve_theorems(env, &ctx);
     resolve_lemmas(env, &ctx);
+    resolve_axioms(env, &ctx);
     resolve_consts(env, &ctx);
     resolve_fns(env, &ctx);
 }
@@ -463,6 +464,12 @@ fn resolve_lemmas(env: &mut Env, ctx: &Ctx) {
     }
 }
 
+fn resolve_axioms(env: &mut Env, ctx: &Ctx) {
+    for axiom in &mut env.axioms {
+        axiom.body = resolve_expr(ctx, &HashSet::new(), &axiom.body);
+    }
+}
+
 fn resolve_consts(env: &mut Env, ctx: &Ctx) {
     for c in env.consts.values_mut() {
         c.body = resolve_expr(ctx, &HashSet::new(), &c.body);
@@ -487,15 +494,16 @@ fn resolve_fns(env: &mut Env, ctx: &Ctx) {
 #[allow(clippy::too_many_lines)]
 fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
     match expr {
-        EExpr::Var(_, name) => {
-            // Only rewrite alias to canonical name if the variable is not locally bound.
-            let resolved_name = if bound.contains(name) {
-                name.clone()
+        EExpr::Var(ty, name) => {
+            if bound.contains(name) {
+                // Bound variable: keep name and type as-is.
+                // Don't alias-rewrite or constructor-resolve.
+                EExpr::Var(ty.clone(), name.clone())
             } else {
-                ctx.canonical_name(name).to_owned()
-            };
-            let ty = resolve_var_type(ctx, &resolved_name);
-            EExpr::Var(ty, resolved_name)
+                let resolved_name = ctx.canonical_name(name).to_owned();
+                let resolved_ty = resolve_var_type(ctx, &resolved_name);
+                EExpr::Var(resolved_ty, resolved_name)
+            }
         }
         EExpr::Field(ty, e, f) => {
             EExpr::Field(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), f.clone())
@@ -709,6 +717,8 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let prog = parser.parse_program().expect("parse error");
         let mut env = collect::collect(&prog);
+        // Match the real elaborate_env pipeline: build working namespace first
+        env.build_working_namespace();
         resolve(&mut env);
         env
     }
@@ -1374,5 +1384,28 @@ mod tests {
             "scene with given var should resolve cleanly: {:?}",
             env.errors
         );
+    }
+
+    #[test]
+    fn axiom_quantifier_domain_resolved() {
+        // axiom body containing `all b: Bed | ...` should resolve
+        // the domain Bed to Entity("Bed"), not leave it as Unresolved.
+        let env = elaborate_src(
+            "module Test\n\
+             entity Bed { id: Id\n ward: Int }\n\
+             axiom bed_positive = all b: Bed | b.ward >= 0",
+        );
+        // Check the axiom body's quantifier domain type
+        assert_eq!(env.axioms.len(), 1);
+        let axiom = &env.axioms[0];
+        match &axiom.body {
+            EExpr::Quant(_, _, _, domain_ty, _) => {
+                assert!(
+                    matches!(domain_ty, Ty::Entity(n) if n == "Bed"),
+                    "axiom quantifier domain should be Entity(\"Bed\"), got {domain_ty:?}"
+                );
+            }
+            other => panic!("expected Quant in axiom body, got {other:?}"),
+        }
     }
 }

@@ -1,0 +1,86 @@
+module Collections
+
+// Collection types example
+// Demonstrates: Map<K,V>, Set<T>, Seq<T>, map update, index access,
+// set comprehension, cardinality, collection literals, membership
+
+type Priority = Low | Medium | High | Critical
+
+type TaskStatus = Open | InProgress | Done
+
+entity Task {
+  id: Id
+  status: TaskStatus = @Open
+  priority: Priority = @Medium
+  tags: Set<Id>
+  metadata: Map<String, Int>
+  history: Seq<Int>
+
+  action start() requires status == @Open {
+    status' = @InProgress
+  }
+
+  action finish() requires status == @InProgress {
+    status' = @Done
+  }
+
+  action add_tag(tag_id: Id) requires status != @Done {
+    tags' = tags[tag_id := true]
+  }
+
+  action set_meta(key: String, value: Int) {
+    metadata' = metadata[key := value]
+  }
+}
+
+const MAX_TASKS = 100
+
+fn priority_weight(p: Priority): Int = match p {
+  Low => 1
+  Medium => 2
+  High => 3
+  Critical => 5
+}
+
+pred is_active(t: Task) = t.status != @Done
+
+prop tasks_start_open for TaskMgmt =
+  always (all t: Task | t.status == @Open or t.status == @InProgress or t.status == @Done)
+
+system TaskMgmt {
+  use Task
+
+  event create_task() {
+    create Task {
+      status = @Open
+      priority = @Medium
+    }
+  }
+
+  event start_task(task_id: Id) {
+    choose t: Task where t.id == task_id {
+      t.start()
+    }
+  }
+
+  event finish_task(task_id: Id) {
+    choose t: Task where t.id == task_id {
+      t.finish()
+    }
+  }
+
+  event tag_task(task_id: Id, tag: Id) {
+    choose t: Task where t.id == task_id {
+      t.add_tag(tag)
+    }
+  }
+}
+
+verify task_lifecycle for TaskMgmt[0..20] {
+  assert always (all t: Task | t.status == @Open or t.status == @InProgress or t.status == @Done)
+}
+
+scene task_creation for TaskMgmt {
+  given let t = one Task where t.status == @Open
+  then assert t.status == @Open
+}

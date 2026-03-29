@@ -102,6 +102,68 @@ prop order_safety for Commerce =
   always all o: Order | o.total >= 0
 ```
 
+## Organize with Modules
+
+As specs grow, split them into multiple files using the module system:
+
+```abide
+// types.abide
+module Commerce
+
+pub type OrderStatus = Pending | Paid | Shipped
+
+pub entity Order {
+  id: Id
+  status: OrderStatus = @Pending
+  total: Real
+
+  action pay() requires status == @Pending {
+    status' = @Paid
+  }
+}
+```
+
+```abide
+// system.abide
+module Commerce
+
+use Commerce::Order
+use Commerce::OrderStatus
+
+system Commerce {
+  use Order
+
+  event place_order(o: Order) requires o.status == @Pending {
+    o.pay()
+  }
+}
+```
+
+```abide
+// spec.abide
+module Spec
+
+use Commerce::*
+
+verify order_safety for Commerce[0..50] {
+  assert always (all o: Order | o.status == @Shipped implies o.total > 0)
+}
+```
+
+Verify all files together:
+
+```sh
+abide verify types.abide system.abide spec.abide
+```
+
+Key module system concepts:
+- `module Name` at the top of each file declares which module it belongs to
+- `pub` marks declarations visible to other modules (private by default)
+- `use Module::Name` imports a specific declaration; `use Module::*` imports all public names
+- `use Module::Name as Alias` provides a local alias
+- `include "file.abide"` includes a file's contents into the current module
+- Systems and events are always public; entity fields are always private
+
 ## Next Steps
 
 - [Syntax at a Glance](syntax-at-a-glance.md) — quick reference for all constructs

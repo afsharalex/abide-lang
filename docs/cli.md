@@ -3,20 +3,20 @@
 ## Usage
 
 ```
-abide <COMMAND> <FILE> [OPTIONS]
+abide <COMMAND> <FILE...> [OPTIONS]
 ```
 
-The compiler uses subcommands. Each takes a single `.abide` source file.
+The compiler uses subcommands. Most commands accept one or more `.abide` source files. When multiple files are provided, the compiler loads them all into a shared environment, resolves `include` directives transitively, and applies module-scoped `use` declarations before elaboration.
 
 ### Implemented Commands
 
 | Command | Description |
 |---------|-------------|
-| `abide lex <file>` | Tokenize the file and print tokens with spans |
-| `abide parse <file>` | Parse the file and print the AST |
-| `abide elaborate <file>` | Run elaboration (type checking and resolution) |
-| `abide emit-ir <file>` | Run the full frontend pipeline and emit IR as JSON |
-| `abide verify <file>` | Verify: bounded model checking, scene checking, theorem proving |
+| `abide lex <file>` | Tokenize a file and print tokens with spans |
+| `abide parse <file>` | Parse a file and print the AST |
+| `abide elaborate <files...>` | Load file(s), run elaboration (collection, resolution, checking) |
+| `abide emit-ir <files...>` | Load file(s), run the full frontend pipeline and emit IR as JSON |
+| `abide verify <files...>` | Load file(s), verify: model checking, scene checking, theorem proving |
 
 ### `abide verify` Options
 
@@ -44,6 +44,14 @@ PROVED  complex_invariant (method: IC3/PDR, 1200ms)
 CHECKED liveness_check (depth: 10, 200ms)
 PASS    happy_path (3ms)
 ```
+
+**Verify multiple files together (multi-module):**
+
+```sh
+$ abide verify src/commerce.abide src/billing.abide src/spec.abide
+```
+
+The compiler loads all files, each declaring its own module. `use` declarations bring cross-module names into scope. `include` directives are resolved relative to the including file.
 
 **Parse a spec and check for syntax errors:**
 

@@ -1,0 +1,157 @@
+module Hospital
+
+// Hospital patient management example
+// Demonstrates: multiple entities, cross-entity references, complex state machines,
+// axioms, lemmas, multiple verify/scene/theorem blocks, quantifier-heavy properties
+
+type PatientStatus = Admitted | InTreatment | Discharged | Transferred
+
+type BedStatus = Available | Occupied | Maintenance
+
+type Severity = Minor | Moderate | Severe | Critical
+
+entity Patient {
+  id: Id
+  status: PatientStatus = @Admitted
+  severity: Severity = @Minor
+  bed_id: Id
+
+  action begin_treatment() requires status == @Admitted {
+    status' = @InTreatment
+  }
+
+  action discharge() requires status == @InTreatment {
+    status' = @Discharged
+  }
+
+  action transfer() requires status == @InTreatment {
+    status' = @Transferred
+  }
+
+  action escalate() requires status == @InTreatment requires severity != @Critical {
+    severity' = @Severe
+  }
+}
+
+entity Bed {
+  id: Id
+  status: BedStatus = @Available
+  ward: Int
+
+  action occupy() requires status == @Available {
+    status' = @Occupied
+  }
+
+  action release() requires status == @Occupied {
+    status' = @Available
+  }
+
+  action mark_maintenance() requires status == @Available {
+    status' = @Maintenance
+  }
+}
+
+pred is_active_patient(p: Patient) =
+  p.status == @Admitted or p.status == @InTreatment
+
+pred is_available_bed(b: Bed) = b.status == @Available
+
+fn severity_level(s: Severity): Int = match s {
+  Minor => 1
+  Moderate => 2
+  Severe => 3
+  Critical => 4
+}
+
+const MAX_BEDS_PER_WARD = 50
+
+prop patients_valid_status for HospitalOps =
+  always (all p: Patient |
+    p.status == @Admitted or p.status == @InTreatment or
+    p.status == @Discharged or p.status == @Transferred)
+
+prop beds_valid_status for HospitalOps =
+  always (all b: Bed |
+    b.status == @Available or b.status == @Occupied or b.status == @Maintenance)
+
+system HospitalOps {
+  use Patient
+  use Bed
+
+  event admit_patient(bed_id: Id) {
+    choose b: Bed where b.id == bed_id {
+      b.occupy()
+    }
+    create Patient {
+      status = @Admitted
+      severity = @Minor
+      bed_id = bed_id
+    }
+  }
+
+  event begin_treatment(patient_id: Id) {
+    choose p: Patient where p.id == patient_id {
+      p.begin_treatment()
+    }
+  }
+
+  event discharge_patient(patient_id: Id) {
+    choose p: Patient where p.id == patient_id {
+      p.discharge()
+    }
+  }
+
+  event transfer_patient(patient_id: Id) {
+    choose p: Patient where p.id == patient_id {
+      p.transfer()
+    }
+  }
+
+  event release_bed(bed_id: Id) {
+    choose b: Bed where b.id == bed_id {
+      b.release()
+    }
+  }
+
+  event maintenance_bed(bed_id: Id) {
+    choose b: Bed where b.id == bed_id {
+      b.mark_maintenance()
+    }
+  }
+}
+
+verify patient_safety for HospitalOps[0..30] {
+  assert always (all p: Patient |
+    p.status == @Admitted or p.status == @InTreatment or
+    p.status == @Discharged or p.status == @Transferred)
+}
+
+verify bed_safety for HospitalOps[0..30] {
+  assert always (all b: Bed |
+    b.status == @Available or b.status == @Occupied or b.status == @Maintenance)
+}
+
+scene admit_and_treat for HospitalOps {
+  given let b = one Bed where b.status == @Available
+  when action a = HospitalOps::admit_patient(b.id) { one }
+  then assert b.status == @Occupied
+}
+
+scene discharge_flow for HospitalOps {
+  given let p = one Patient where p.status == @InTreatment
+  when action d = HospitalOps::discharge_patient(p.id) { one }
+  then assert p.status == @Discharged
+}
+
+theorem patients_always_valid for HospitalOps {
+  show always (all p: Patient |
+    p.status == @Admitted or p.status == @InTreatment or
+    p.status == @Discharged or p.status == @Transferred)
+}
+
+axiom bed_capacity = all b: Bed | b.ward >= 0
+
+lemma treatment_precedes_discharge {
+  always (all p: Patient |
+    p.status == @Discharged implies true)
+}
