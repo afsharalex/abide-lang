@@ -167,6 +167,10 @@ pub enum IRExpr {
         #[serde(rename = "type")]
         ty: IRType,
     },
+    /// Cardinality: `#S` — count of elements in a set/collection.
+    Card {
+        expr: Box<IRExpr>,
+    },
     Sorry,
     Todo,
 }
@@ -415,6 +419,10 @@ pub struct IRFunction {
     #[serde(rename = "type")]
     pub ty: IRType,
     pub body: IRExpr,
+    /// For props: the target system name (from `prop X for System = ...`).
+    /// None for preds and fns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prop_target: Option<std::string::String>,
 }
 
 // ── Top-level program ────────────────────────────────────────────────

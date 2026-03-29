@@ -44,6 +44,18 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         bmc_timeout: u64,
 
+        /// IC3/PDR timeout in seconds (default: 10)
+        #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
+        ic3_timeout: u64,
+
+        /// Skip IC3/PDR verification (for speed)
+        #[arg(long)]
+        no_ic3: bool,
+
+        /// Skip automatic prop verification
+        #[arg(long)]
+        no_prop_verify: bool,
+
         /// Show progress messages during verification
         #[arg(long)]
         progress: bool,
@@ -70,6 +82,13 @@ const DEFAULT_INDUCTION_TIMEOUT_SECS: u64 = 5;
 /// Not yet wired to a CLI flag — will be exposed when prop auto-verification
 /// is implemented (Phase 6 deferred item).
 const DEFAULT_PROP_BMC_DEPTH: usize = 10;
+
+/// Default timeout for IC3/PDR attempts, in seconds.
+///
+/// IC3 can take longer than induction because it iteratively discovers
+/// strengthening invariants. The default of 10 seconds balances proof
+/// power against responsiveness.
+const DEFAULT_IC3_TIMEOUT_SECS: u64 = 10;
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
@@ -113,6 +132,9 @@ fn main() -> miette::Result<()> {
             unbounded_only,
             induction_timeout,
             bmc_timeout,
+            ic3_timeout,
+            no_ic3,
+            no_prop_verify,
             progress,
         } => {
             let (result, errors) = parse_and_elaborate(&file)?;
@@ -127,6 +149,9 @@ fn main() -> miette::Result<()> {
                 induction_timeout_ms: induction_timeout.saturating_mul(1000),
                 bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
                 prop_bmc_depth: DEFAULT_PROP_BMC_DEPTH,
+                ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
+                no_ic3,
+                no_prop_verify,
                 progress,
             };
 

@@ -169,6 +169,8 @@ system Shipping {
     }
   }
 
+  // Sequential composition: pack then ship in one atomic event step.
+  // Uses intermediate variable chaining — ship's guard sees pack's result.
   event pack_and_ship(fulfillment_id: Id)
     requires exists f: Fulfillment |
       f.id == fulfillment_id and f.status == @Picking {

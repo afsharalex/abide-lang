@@ -5,7 +5,7 @@
 //!
 //! Uses z3 crate v0.19 API (no explicit Context parameter — global context).
 
-use z3::ast::{Bool, Dynamic, Int, Real};
+use z3::ast::{Array, Bool, Dynamic, Int, Real};
 use z3::Sort;
 
 use crate::ir::types::IRType;
@@ -23,7 +23,9 @@ pub enum SmtValue {
     Bool(Bool),
     /// Z3 Real sort — used for Abide Real type (exact rational).
     Real(Real),
-    /// Z3 uninterpreted/dynamic sort — used for complex types.
+    /// Z3 Array sort — used for `Map<K,V>` (store/select), `Set<T>` (characteristic function).
+    Array(Array),
+    /// Z3 uninterpreted/dynamic sort — used for complex types and array select results.
     Dynamic(Dynamic),
 }
 
@@ -52,12 +54,34 @@ impl SmtValue {
         }
     }
 
+    /// Extract as Array, panics if wrong variant.
+    pub fn as_array(&self) -> &Array {
+        match self {
+            SmtValue::Array(a) => a,
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    /// Extract the underlying Z3 AST as Dynamic (works for any variant).
+    pub fn to_dynamic(&self) -> Dynamic {
+        match self {
+            SmtValue::Int(i) => Dynamic::from_ast(i),
+            SmtValue::Bool(b) => Dynamic::from_ast(b),
+            SmtValue::Real(r) => Dynamic::from_ast(r),
+            SmtValue::Array(a) => Dynamic::from_ast(a),
+            SmtValue::Dynamic(d) => d.clone(),
+        }
+    }
+
     /// Convert to a Bool (for use in assertions).
-    /// Int → Bool via (int != 0), Bool → Bool, others panic.
+    /// Int → Bool via (int != 0), Bool → Bool, Dynamic → Bool (sort cast), others panic.
     pub fn to_bool(&self) -> Bool {
         match self {
             SmtValue::Bool(b) => b.clone(),
             SmtValue::Int(i) => i.eq(Int::from_i64(0)).not(),
+            SmtValue::Dynamic(d) => d.as_bool().unwrap_or_else(|| {
+                panic!("cannot convert Dynamic to Bool: {d:?}")
+            }),
             _ => panic!("cannot convert {self:?} to Bool"),
         }
     }
@@ -80,9 +104,9 @@ pub fn ir_type_to_sort(ty: &IRType) -> Sort {
         IRType::Entity { .. } => Sort::int(), // entity refs as slot indices
         IRType::Fn { .. } => Sort::int(), // functions as uninterpreted for now
         IRType::Record { .. } => Sort::int(), // records as uninterpreted for now
-        IRType::Set { .. } => Sort::int(), // sets handled separately
-        IRType::Seq { .. } => Sort::int(), // sequences as uninterpreted for now
-        IRType::Map { .. } => Sort::int(), // maps handled via Z3 arrays separately
+        IRType::Set { element } => Sort::array(&ir_type_to_sort(element), &Sort::bool()),
+        IRType::Seq { element } => Sort::array(&Sort::int(), &ir_type_to_sort(element)),
+        IRType::Map { key, value } => Sort::array(&ir_type_to_sort(key), &ir_type_to_sort(value)),
         IRType::Tuple { .. } => Sort::int(), // tuples as uninterpreted for now
     }
 }
@@ -117,6 +141,59 @@ pub fn bool_var(name: &str) -> SmtValue {
 /// Create a named Z3 Real variable.
 pub fn real_var(name: &str) -> SmtValue {
     SmtValue::Real(Real::new_const(name))
+}
+
+/// Z3 default value for a given IR type, returned as Dynamic.
+/// Used for constant-array initialization in collection literal encoding.
+/// Recurses for nested collections: `Map<K, Set<T>>` gets a const-array default.
+pub fn default_dynamic(ty: &IRType) -> Dynamic {
+    match ty {
+        IRType::Bool => Dynamic::from_ast(&Bool::from_bool(false)),
+        IRType::Real | IRType::Float => Dynamic::from_ast(&Real::from_rational(0, 1)),
+        IRType::Map { key, value } => {
+            let key_sort = ir_type_to_sort(key);
+            let val_default = default_dynamic(value);
+            Dynamic::from_ast(&Array::const_array(&key_sort, &val_default))
+        }
+        IRType::Set { element } => {
+            let elem_sort = ir_type_to_sort(element);
+            let false_val = Dynamic::from_ast(&Bool::from_bool(false));
+            Dynamic::from_ast(&Array::const_array(&elem_sort, &false_val))
+        }
+        IRType::Seq { element } => {
+            let elem_default = default_dynamic(element);
+            Dynamic::from_ast(&Array::const_array(&Sort::int(), &elem_default))
+        }
+        _ => Dynamic::from_ast(&Int::from_i64(0)),
+    }
+}
+
+/// Create a named Z3 Array variable for a Map/Set/Seq field.
+pub fn array_var(name: &str, ty: &IRType) -> SmtValue {
+    let sort = ir_type_to_sort(ty);
+    let domain = sort.array_domain().expect("array_var requires array sort");
+    let range = sort.array_range().expect("array_var requires array sort");
+    SmtValue::Array(Array::new_const(name, &domain, &range))
+}
+
+/// Assert that two `SmtValue`s are equal, returning a Z3 Bool constraint.
+///
+/// Handles same-variant pairs directly. For cross-variant pairs involving
+/// Dynamic (e.g., `Array::select` result vs Int field), coerces the typed
+/// operand to Dynamic and uses Z3's generic equality.
+pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Bool {
+    match (a, b) {
+        (SmtValue::Int(x), SmtValue::Int(y)) => x.eq(y.clone()),
+        (SmtValue::Bool(x), SmtValue::Bool(y)) => x.eq(y.clone()),
+        (SmtValue::Real(x), SmtValue::Real(y)) => x.eq(y.clone()),
+        (SmtValue::Array(x), SmtValue::Array(y)) => x.eq(y.clone()),
+        (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => x.eq(y.clone()),
+        // Cross-variant: coerce both to Dynamic for Z3's generic equality
+        (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => {
+            d.eq(other.to_dynamic())
+        }
+        _ => panic!("sort mismatch in smt_eq: {a:?} vs {b:?}"),
+    }
 }
 
 // ── Binary operations ───────────────────────────────────────────────
@@ -163,12 +240,47 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> SmtValue {
         ("OpOr", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::or(&[a, b])),
         ("OpImplies", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.implies(b)),
 
+        // Array equality (Map/Set/Seq)
+        ("OpEq", SmtValue::Array(a), SmtValue::Array(b)) => SmtValue::Bool(a.eq(b.clone())),
+        ("OpNEq", SmtValue::Array(a), SmtValue::Array(b)) => SmtValue::Bool(a.eq(b.clone()).not()),
+
         // Composition operators — encode as boolean combinators for now
         ("OpSeq", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.implies(b)),
         ("OpSameStep", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
         ("OpUnord", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
         ("OpConc", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
         ("OpXor", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::xor(a, b)),
+
+        // Dynamic operands — from array select, cast to matching type
+        (op, SmtValue::Dynamic(d), other) | (op, other, SmtValue::Dynamic(d)) => {
+            let coerced = match other {
+                SmtValue::Int(_) => SmtValue::Int(
+                    d.as_int().unwrap_or_else(|| panic!("Dynamic→Int cast failed in {op}")),
+                ),
+                SmtValue::Bool(_) => SmtValue::Bool(
+                    d.as_bool().unwrap_or_else(|| panic!("Dynamic→Bool cast failed in {op}")),
+                ),
+                SmtValue::Real(_) => SmtValue::Real(
+                    d.as_real().unwrap_or_else(|| panic!("Dynamic→Real cast failed in {op}")),
+                ),
+                SmtValue::Dynamic(_) => {
+                    // Both Dynamic — try Int (most common for map values)
+                    if let Some(i) = d.as_int() {
+                        SmtValue::Int(i)
+                    } else if let Some(b) = d.as_bool() {
+                        SmtValue::Bool(b)
+                    } else {
+                        panic!("cannot resolve Dynamic-Dynamic binop: {op}")
+                    }
+                }
+                SmtValue::Array(_) => panic!("cannot apply {op} to Array operand"),
+            };
+            if matches!(lhs, SmtValue::Dynamic(_)) {
+                binop(op, &coerced, rhs)
+            } else {
+                binop(op, lhs, &coerced)
+            }
+        }
 
         _ => panic!("unsupported binop: {op} on {lhs:?}, {rhs:?}"),
     }

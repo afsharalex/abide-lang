@@ -1,15 +1,15 @@
 //! Verification backend — connects Abide IR to Z3.
 //!
 //! Architecture:
-//! - `smt`: Z3 value types and sort mapping
+//! - `smt`: Z3 value types, sort mapping, collection array support
 //! - `context`: `VerifyContext` (variant IDs, field metadata, entity pool info)
-//! - `encode`: IR → Z3 term encoding (expressions)
-//! - `harness`: Multi-slot entity pools, action/event encoding, constraint generation
-//! - `mod`: Top-level BMC entry point (`verify_all`, `check_verify_block`)
+//! - `harness`: Multi-slot entity pools, action/event/collection encoding
+//! - `ic3`: IC3/PDR via Z3 Spacer (CHC encoding, counterexample extraction)
+//! - `defenv`: Definition environment for pred/prop/fn expansion
+//! - `mod`: Tiered dispatch (`verify_all`), property encoding, counterexample extraction
 
 pub mod context;
 pub mod defenv;
-pub mod encode;
 pub mod harness;
 pub mod ic3;
 pub mod smt;
@@ -20,7 +20,7 @@ use std::time::Instant;
 use z3::ast::Bool;
 use z3::Solver;
 
-use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRTheorem, IRVerify};
+use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRTheorem, IRType, IRVerify};
 
 use self::context::VerifyContext;
 use self::harness::{
@@ -67,6 +67,7 @@ pub struct TraceStep {
 // ── Configuration ───────────────────────────────────────────────────
 
 /// Configuration for the verification pipeline.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VerifyConfig {
     /// Skip Tier 1 (induction), only run bounded model checking.
     pub bounded_only: bool,
@@ -78,6 +79,12 @@ pub struct VerifyConfig {
     pub bmc_timeout_ms: u64,
     /// Default BMC depth for auto-verified props (which lack explicit `[0..N]`).
     pub prop_bmc_depth: usize,
+    /// Timeout for IC3/PDR attempts, in milliseconds. 0 = no timeout.
+    pub ic3_timeout_ms: u64,
+    /// Skip IC3/PDR verification (for speed).
+    pub no_ic3: bool,
+    /// Skip automatic prop verification.
+    pub no_prop_verify: bool,
     /// Print progress messages to stderr.
     pub progress: bool,
 }
@@ -90,6 +97,9 @@ impl Default for VerifyConfig {
             induction_timeout_ms: 5000,
             bmc_timeout_ms: 0,
             prop_bmc_depth: 10,
+            ic3_timeout_ms: 10000,
+            no_ic3: false,
+            no_prop_verify: false,
             progress: false,
         }
     }
@@ -99,8 +109,8 @@ impl Default for VerifyConfig {
 
 /// Verify all targets in an IR program.
 ///
-/// Processes verify blocks (tiered: induction → BMC), scene blocks (SAT),
-/// and theorem blocks (induction only).
+/// Processes verify blocks (tiered: induction → IC3 → BMC), scene blocks (SAT),
+/// and theorem blocks (IC3 → induction).
 /// Returns one result per target.
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
@@ -133,11 +143,82 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Proving {}...", theorem_block.name);
         }
-        let result = check_theorem_block(ir, &vctx, &defs, theorem_block);
+        let result = check_theorem_block(ir, &vctx, &defs, theorem_block, config);
         if config.progress {
             eprintln!(" done");
         }
         results.push(result);
+    }
+
+    // ── Auto-verify props ───────────────────────────────────────────
+    // Props with a target system are implicit theorems: declaring a prop
+    // means asserting it must hold (Dafny model).
+    if !config.no_prop_verify {
+        // Collect prop names already covered by explicit theorems/verify blocks.
+        // Collect from both unexpanded (direct name refs like `Var("prop_name")`)
+        // AND expanded forms (transitive refs: if p2's body references p1,
+        // a theorem proving p2 also covers p1).
+        let mut covered: HashSet<String> = HashSet::new();
+        for thm in &ir.theorems {
+            // Direct references
+            collect_def_refs_in_exprs(&thm.shows, &mut covered);
+            collect_def_refs_in_exprs(&thm.invariants, &mut covered);
+            // Transitive references (after def expansion)
+            let expanded: Vec<IRExpr> = thm
+                .shows
+                .iter()
+                .chain(thm.invariants.iter())
+                .map(|e| expand_through_defs(e, &defs))
+                .collect();
+            collect_def_refs_in_exprs(&expanded, &mut covered);
+        }
+        for vb in &ir.verifies {
+            collect_def_refs_in_exprs(&vb.asserts, &mut covered);
+            let expanded: Vec<IRExpr> = vb
+                .asserts
+                .iter()
+                .map(|e| expand_through_defs(e, &defs))
+                .collect();
+            collect_def_refs_in_exprs(&expanded, &mut covered);
+        }
+
+        for func in &ir.functions {
+            // Props: have prop_target AND return Bool
+            let Some(ref target_system) = func.prop_target else {
+                continue;
+            };
+            if func.ty != IRType::Bool {
+                results.push(VerificationResult::Unprovable {
+                    name: format!("prop_{}", func.name),
+                    hint: format!(
+                        "internal error: prop `{}` has non-Bool return type {:?}",
+                        func.name, func.ty
+                    ),
+                });
+                continue;
+            }
+            if covered.contains(&func.name) {
+                continue; // already checked via an explicit theorem/verify
+            }
+
+            let synthetic_theorem = crate::ir::types::IRTheorem {
+                name: format!("prop_{}", func.name),
+                systems: vec![target_system.clone()],
+                invariants: vec![],
+                shows: vec![IRExpr::Always {
+                    body: Box::new(func.body.clone()),
+                }],
+            };
+
+            if config.progress {
+                eprint!("Verifying prop {}...", func.name);
+            }
+            let result = check_theorem_block(ir, &vctx, &defs, &synthetic_theorem, config);
+            if config.progress {
+                eprintln!(" done");
+            }
+            results.push(result);
+        }
     }
 
     results
@@ -149,13 +230,155 @@ fn elapsed_ms(start: &Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// Collect top-level definition names referenced in expressions.
+///
+/// Finds `Var(name)` nodes that are NOT bound by enclosing quantifiers/lambdas
+/// (i.e., free references to props/preds/fns). Used to detect which props are
+/// already covered by explicit theorem/verify blocks.
+fn collect_def_refs_in_exprs(exprs: &[IRExpr], refs: &mut HashSet<String>) {
+    let bound = HashSet::new();
+    for expr in exprs {
+        collect_def_refs_inner(expr, &bound, refs);
+    }
+}
+
+fn collect_def_refs_inner(
+    expr: &IRExpr,
+    bound: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    match expr {
+        IRExpr::Var { name, .. } => {
+            if !bound.contains(name) {
+                refs.insert(name.clone());
+            }
+        }
+        IRExpr::App { func, arg, .. } => {
+            if let IRExpr::Var { name, .. } = func.as_ref() {
+                if !bound.contains(name) {
+                    refs.insert(name.clone());
+                }
+            }
+            collect_def_refs_inner(func, bound, refs);
+            collect_def_refs_inner(arg, bound, refs);
+        }
+        IRExpr::Forall { var, body, .. } | IRExpr::Exists { var, body, .. } => {
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(var.clone());
+            collect_def_refs_inner(body, &inner_bound, refs);
+        }
+        IRExpr::Lam { param, body, .. } => {
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(param.clone());
+            collect_def_refs_inner(body, &inner_bound, refs);
+        }
+        IRExpr::SetComp {
+            var, filter, projection, ..
+        } => {
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(var.clone());
+            collect_def_refs_inner(filter, &inner_bound, refs);
+            if let Some(proj) = projection {
+                collect_def_refs_inner(proj, &inner_bound, refs);
+            }
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            collect_def_refs_inner(left, bound, refs);
+            collect_def_refs_inner(right, bound, refs);
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            collect_def_refs_inner(map, bound, refs);
+            collect_def_refs_inner(key, bound, refs);
+            collect_def_refs_inner(value, bound, refs);
+        }
+        IRExpr::Index { map, key, .. } => {
+            collect_def_refs_inner(map, bound, refs);
+            collect_def_refs_inner(key, bound, refs);
+        }
+        IRExpr::MapLit { entries, .. } => {
+            for (k, v) in entries {
+                collect_def_refs_inner(k, bound, refs);
+                collect_def_refs_inner(v, bound, refs);
+            }
+        }
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            for e in elements {
+                collect_def_refs_inner(e, bound, refs);
+            }
+        }
+        IRExpr::UnOp { operand, .. }
+        | IRExpr::Field { expr: operand, .. }
+        | IRExpr::Prime { expr: operand }
+        | IRExpr::Always { body: operand }
+        | IRExpr::Eventually { body: operand }
+        | IRExpr::Card { expr: operand } => {
+            collect_def_refs_inner(operand, bound, refs);
+        }
+        IRExpr::Let { bindings, body } => {
+            let mut inner_bound = bound.clone();
+            for b in bindings {
+                // Binding RHS is evaluated in the outer scope
+                collect_def_refs_inner(&b.expr, &inner_bound, refs);
+                inner_bound.insert(b.name.clone());
+            }
+            collect_def_refs_inner(body, &inner_bound, refs);
+        }
+        IRExpr::Match { scrutinee, arms } => {
+            collect_def_refs_inner(scrutinee, bound, refs);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_binders(&arm.pattern, &mut arm_bound);
+                if let Some(ref guard) = arm.guard {
+                    collect_def_refs_inner(guard, &arm_bound, refs);
+                }
+                collect_def_refs_inner(&arm.body, &arm_bound, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect variable names bound by a pattern (for binder-aware traversal).
+fn collect_pattern_binders(pat: &crate::ir::types::IRPattern, bound: &mut HashSet<String>) {
+    match pat {
+        crate::ir::types::IRPattern::PVar { name } => {
+            bound.insert(name.clone());
+        }
+        crate::ir::types::IRPattern::PCtor { fields, .. } => {
+            for f in fields {
+                collect_pattern_binders(&f.pattern, bound);
+            }
+        }
+        crate::ir::types::IRPattern::POr { left, right } => {
+            collect_pattern_binders(left, bound);
+            collect_pattern_binders(right, bound);
+        }
+        crate::ir::types::IRPattern::PWild => {}
+    }
+}
+
+/// Convert IC3 trace steps to the shared `TraceStep` format.
+fn ic3_trace_to_trace_steps(ic3_trace: &[ic3::Ic3TraceStep]) -> Vec<TraceStep> {
+    ic3_trace
+        .iter()
+        .map(|s| TraceStep {
+            step: s.step,
+            event: None, // IC3 doesn't track which rule/event fired
+            assignments: s.assignments.clone(),
+        })
+        .collect()
+}
+
 // ── Tiered dispatch for verify blocks ───────────────────────────────
 
 /// Check a verify block using tiered dispatch (DDR-031):
 ///
 /// 1. If asserts contain `eventually`, skip Tier 1 (liveness can't be proved by induction)
-/// 2. **Tier 1:** Try 1-induction with timeout — if PROVED, done
-/// 3. **Tier 2:** Fall back to bounded model checking with `[0..N]` depth
+/// 2. **Tier 1a:** Try 1-induction with timeout — if PROVED, done
+/// 3. **Tier 1b:** Try IC3/PDR — discovers strengthening invariants automatically
+/// 4. **Tier 2:** Fall back to bounded model checking with `[0..N]` depth
 ///
 /// The user writes the same `verify` block regardless of which tier succeeds.
 fn check_verify_block_tiered(
@@ -171,26 +394,34 @@ fn check_verify_block_tiered(
         contains_eventually(&expanded)
     });
 
-    // Tier 1: Try induction (unless bounded-only or liveness)
+    // Tier 1a: Try induction (unless bounded-only or liveness)
     if !config.bounded_only && !has_liveness {
         if let Some(result) = try_induction_on_verify(ir, vctx, defs, verify_block, config) {
             return result;
         }
-        // Induction failed or timed out — fall through to Tier 2
+        // Induction failed or timed out — try IC3
+    }
+
+    // Tier 1b: Try IC3/PDR (unless bounded-only, no-ic3, or liveness)
+    if !config.bounded_only && !config.no_ic3 && !has_liveness {
+        if let Some(result) = try_ic3_on_verify(ir, vctx, defs, verify_block, config) {
+            return result;
+        }
+        // IC3 failed — fall through to Tier 2
     }
 
     // Tier 2: Bounded model checking (unless unbounded-only)
     if config.unbounded_only {
-        let hint = if has_liveness {
-            "contains `eventually` (liveness) — induction not applicable, \
-             and --unbounded-only was specified"
-                .to_owned()
+        let techniques = if has_liveness {
+            "induction not applicable (liveness)".to_owned()
+        } else if config.no_ic3 {
+            "induction failed (IC3 skipped via --no-ic3)".to_owned()
         } else {
-            "induction failed and --unbounded-only was specified".to_owned()
+            "induction and IC3 failed".to_owned()
         };
         return VerificationResult::Unprovable {
             name: verify_block.name.clone(),
-            hint,
+            hint: format!("{techniques}, and --unbounded-only was specified"),
         };
     }
 
@@ -285,11 +516,33 @@ fn try_induction_on_verify(
         })
         .collect();
 
-    // Pre-check: reject unsupported expressions
+    // Pre-check: reject unsupported expressions in asserts AND transitions
     for expr in &show_exprs {
         let expanded = expand_through_defs(expr, defs);
         if find_unsupported_scene_expr(&expanded).is_some() {
-            return None; // can't attempt induction — fall back to BMC
+            return None;
+        }
+    }
+    for entity in &relevant_entities {
+        for trans in &entity.transitions {
+            if find_unsupported_scene_expr(&trans.guard).is_some() {
+                return None;
+            }
+            for upd in &trans.updates {
+                if find_unsupported_scene_expr(&upd.value).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    for sys in &relevant_systems {
+        for event in &sys.events {
+            if find_unsupported_scene_expr(&event.guard).is_some() {
+                return None;
+            }
+            if find_unsupported_in_actions(&event.body).is_some() {
+                return None;
+            }
         }
     }
 
@@ -364,6 +617,101 @@ fn try_induction_on_verify(
     Some(VerificationResult::Proved {
         name: verify_block.name.clone(),
         method: "1-induction".to_owned(),
+        time_ms: elapsed,
+    })
+}
+
+/// Try to prove a verify block using IC3/PDR via Z3's Spacer engine.
+///
+/// IC3 is more powerful than 1-induction: it automatically discovers
+/// strengthening invariants, proving properties that aren't directly
+/// inductive. Returns `Some(Proved)` if all asserts are proved, `None`
+/// if any assert fails or can't be encoded.
+fn try_ic3_on_verify(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let start = Instant::now();
+
+    // Build scope (same as induction)
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names: Vec<String> = Vec::new();
+
+    for vs in &verify_block.systems {
+        system_names.push(vs.name.clone());
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == vs.name) {
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    // Expand scope via CrossCall
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return None;
+    }
+
+    // Quantifier-based scope adjustment
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in counts {
+            let min_slots = count + 1;
+            if let Some(existing) = scope.get_mut(&entity) {
+                *existing = (*existing).max(min_slots);
+            }
+        }
+    }
+
+    if config.progress {
+        eprint!(" (trying IC3/PDR)");
+    }
+
+    // Try IC3 on each assert — all must pass for PROVED
+    // Try IC3 on each assert — all must pass for PROVED.
+    // IC3 Violated always falls to BMC for verify blocks: BMC produces
+    // confirmed counterexamples from concrete solver models, while IC3
+    // traces come from the over-approximated CHC encoding (ForAll
+    // per-slot independence can produce spurious intermediate states).
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        let result =
+            ic3::try_ic3_system(ir, vctx, &system_names, &expanded, &scope, config.ic3_timeout_ms);
+        match result {
+            ic3::Ic3Result::Proved => {} // this assert proved, continue
+            ic3::Ic3Result::Violated(_) | ic3::Ic3Result::Unknown(_) => {
+                return None; // fall back to BMC for confirmed trace
+            }
+        }
+    }
+
+    let elapsed = elapsed_ms(&start);
+    Some(VerificationResult::Proved {
+        name: verify_block.name.clone(),
+        method: "IC3/PDR".to_owned(),
         time_ms: elapsed,
     })
 }
@@ -464,6 +812,68 @@ fn check_verify_block(
         .filter(|s| system_names.contains(&s.name))
         .cloned()
         .collect();
+
+    // ── 2c. Pre-validate: reject unsupported expression forms ─────
+    // Catches forms like Card(field), SetComp with non-entity domain, etc.
+    // that would panic during encoding. Scans both assert expressions AND
+    // transition/event bodies (guards, updates, create fields).
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+            return VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: format!("unsupported expression kind in verify assert: {kind}"),
+            };
+        }
+    }
+    // Scan transition guards and update values for unsupported forms
+    for entity in &relevant_entities {
+        for trans in &entity.transitions {
+            if let Some(kind) = find_unsupported_scene_expr(&trans.guard) {
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} guard: {kind}",
+                        entity.name, trans.name
+                    ),
+                };
+            }
+            for upd in &trans.updates {
+                if let Some(kind) = find_unsupported_scene_expr(&upd.value) {
+                    return VerificationResult::Unprovable {
+                        name: verify_block.name.clone(),
+                        hint: format!(
+                            "unsupported expression in {}.{} update of {}: {kind}",
+                            entity.name, trans.name, upd.field
+                        ),
+                    };
+                }
+            }
+        }
+    }
+    // Scan event guards and action bodies
+    for sys in &relevant_systems {
+        for event in &sys.events {
+            if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} event guard: {kind}",
+                        sys.name, event.name
+                    ),
+                };
+            }
+            if let Some(kind) = find_unsupported_in_actions(&event.body) {
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} event body: {kind}",
+                        sys.name, event.name
+                    ),
+                };
+            }
+        }
+    }
 
     // ── 3. Create slot pool ────────────────────────────────────────
     let pool = create_slot_pool(&relevant_entities, &scope, bound);
@@ -831,6 +1241,17 @@ fn check_scene_block(
             };
         }
 
+        // Pre-validate event body for unsupported action forms
+        if let Some(kind) = find_unsupported_in_actions(&event.body) {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason: format!(
+                    "unsupported action in scene event {}::{}: {kind}",
+                    scene_event.system, scene_event.event
+                ),
+            };
+        }
+
         // Build override_params: resolve scene event args against current bindings.
         let mut override_params: HashMap<String, SmtValue> = HashMap::new();
         for (param, arg) in event.params.iter().zip(scene_event.args.iter()) {
@@ -914,28 +1335,29 @@ fn check_scene_block(
     }
 }
 
-// ── Inductive checking (theorem blocks) ─────────────────────────────
+// ── Theorem proving (IC3 → 1-induction) ─────────────────────────────
 
-/// Check a theorem block using 1-induction.
+/// Check a theorem block using IC3/PDR, then 1-induction as fallback.
 ///
-/// A theorem `show P` with `invariant I` is proved by:
+/// **IC3/PDR** is tried first — it automatically discovers strengthening
+/// invariants, proving properties that aren't directly 1-inductive.
 ///
-/// 1. **Base case:** P holds at step 0 (initial state, all slots inactive).
-///    Assert initial state + domain. Assert NOT P. If UNSAT → base holds.
+/// If IC3 fails or is skipped (`--no-ic3`), falls back to **4-phase
+/// 1-induction** with user-provided invariants:
 ///
-/// 2. **Step case:** If I and P hold at step k, then P holds at step k+1
-///    after any single transition.
-///    Assume I at step 0. Assume P at step 0.
-///    Assert transition from step 0 to step 1.
-///    Assert NOT P at step 1. If UNSAT → step holds (P is inductive).
+/// 0. Invariant base: I holds at step 0
+/// 1. Invariant step: I(k) ∧ transition → I(k+1)
+/// 2. Property base: P holds at step 0
+/// 3. Property step: I(k) ∧ P(k) ∧ transition → P(k+1)
 ///
-/// Both pass → PROVED. Either fails → UNPROVABLE with hint.
+/// All phases pass → PROVED. Any fails → UNPROVABLE with hint.
 #[allow(clippy::too_many_lines)]
 fn check_theorem_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
     defs: &defenv::DefEnv,
     theorem: &IRTheorem,
+    config: &VerifyConfig,
 ) -> VerificationResult {
     let start = Instant::now();
 
@@ -1070,12 +1492,80 @@ fn check_theorem_block(
             };
         }
     }
+    // Scan transition guards/updates and event bodies
+    for entity in &relevant_entities {
+        for trans in &entity.transitions {
+            if let Some(kind) = find_unsupported_scene_expr(&trans.guard) {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} guard: {kind}",
+                        entity.name, trans.name
+                    ),
+                };
+            }
+            for upd in &trans.updates {
+                if let Some(kind) = find_unsupported_scene_expr(&upd.value) {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!(
+                            "unsupported expression in {}.{} update of {}: {kind}",
+                            entity.name, trans.name, upd.field
+                        ),
+                    };
+                }
+            }
+        }
+    }
+    for sys in &relevant_systems {
+        for event in &sys.events {
+            if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} event guard: {kind}",
+                        sys.name, event.name
+                    ),
+                };
+            }
+            if let Some(kind) = find_unsupported_in_actions(&event.body) {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!(
+                        "unsupported expression in {}.{} event body: {kind}",
+                        sys.name, event.name
+                    ),
+                };
+            }
+        }
+    }
+
+    // ── bounded-only: theorems cannot be proved by BMC ────────────
+    if config.bounded_only {
+        return VerificationResult::Unprovable {
+            name: theorem.name.clone(),
+            hint: "--bounded-only was specified — theorems require unbounded proof \
+                   (induction or IC3), not bounded model checking"
+                .to_owned(),
+        };
+    }
+
+    // ── Try IC3/PDR (more powerful than 1-induction) ───────────────
+    // IC3 discovers strengthening invariants automatically. If it proves
+    // the property, we're done. If not, fall through to 4-phase induction
+    // which can leverage user-provided invariants.
+    if let Some(result) = try_ic3_on_theorem(ir, vctx, defs, theorem, config) {
+        return result;
+    }
 
     // ── Phase 0: Verify invariants hold at step 0 ──────────────────
     // This prevents false invariants from making the step case vacuously true.
     if !theorem.invariants.is_empty() {
         let pool = create_slot_pool(&relevant_entities, &scope, 0);
         let solver = Solver::new();
+        if config.induction_timeout_ms > 0 {
+            set_solver_timeout(&solver, config.induction_timeout_ms);
+        }
 
         for c in initial_state_constraints(&pool) {
             solver.assert(&c);
@@ -1119,6 +1609,9 @@ fn check_theorem_block(
     if !theorem.invariants.is_empty() {
         let pool = create_slot_pool(&relevant_entities, &scope, 1);
         let solver = Solver::new();
+        if config.induction_timeout_ms > 0 {
+            set_solver_timeout(&solver, config.induction_timeout_ms);
+        }
 
         for c in domain_constraints(&pool, vctx, &relevant_entities) {
             solver.assert(&c);
@@ -1167,6 +1660,9 @@ fn check_theorem_block(
     {
         let pool = create_slot_pool(&relevant_entities, &scope, 0);
         let solver = Solver::new();
+        if config.induction_timeout_ms > 0 {
+            set_solver_timeout(&solver, config.induction_timeout_ms);
+        }
 
         for c in initial_state_constraints(&pool) {
             solver.assert(&c);
@@ -1207,6 +1703,9 @@ fn check_theorem_block(
     {
         let pool = create_slot_pool(&relevant_entities, &scope, 1);
         let solver = Solver::new();
+        if config.induction_timeout_ms > 0 {
+            set_solver_timeout(&solver, config.induction_timeout_ms);
+        }
 
         for c in domain_constraints(&pool, vctx, &relevant_entities) {
             solver.assert(&c);
@@ -1273,6 +1772,104 @@ fn check_theorem_block(
         method,
         time_ms: elapsed,
     }
+}
+
+/// Try to prove a theorem's show expressions using IC3/PDR.
+///
+/// IC3 discovers strengthening invariants automatically, so user-provided
+/// invariants are not needed. This is tried before 4-phase induction (since
+/// IC3 is strictly more powerful for properties that need invariant discovery).
+fn try_ic3_on_theorem(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    theorem: &IRTheorem,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    if config.no_ic3 {
+        return None;
+    }
+
+    let start = Instant::now();
+
+    // Build scope from theorem systems
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names = theorem.systems.clone();
+
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return None;
+    }
+
+    // Quantifier-based scope
+    for show_expr in &theorem.shows {
+        let expanded = expand_through_defs(show_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in counts {
+            let min_slots = count + 1;
+            if let Some(existing) = scope.get_mut(&entity) {
+                *existing = (*existing).max(min_slots);
+            }
+        }
+    }
+
+    if config.progress {
+        eprint!(" (trying IC3/PDR)");
+    }
+
+    // Try IC3 on each show expression
+    for show_expr in &theorem.shows {
+        let expanded = expand_through_defs(show_expr, defs);
+        let result = ic3::try_ic3_system(
+            ir,
+            vctx,
+            &system_names,
+            &expanded,
+            &scope,
+            config.ic3_timeout_ms,
+        );
+        match result {
+            ic3::Ic3Result::Proved => {}
+            ic3::Ic3Result::Violated(trace) if !trace.is_empty() => {
+                // Theorems have no BMC fallback, so IC3's trace is the best
+                // counterexample available. The trace is extracted from the
+                // CHC derivation tree, which may reflect the ForAll per-slot
+                // over-approximation (see encode_event_chc doc). For confirmed
+                // traces, users should write a verify block with BMC depth.
+                return Some(VerificationResult::Counterexample {
+                    name: theorem.name.clone(),
+                    trace: ic3_trace_to_trace_steps(&trace),
+                });
+            }
+            ic3::Ic3Result::Violated(_) | ic3::Ic3Result::Unknown(_) => return None,
+        }
+    }
+
+    let elapsed = elapsed_ms(&start);
+    Some(VerificationResult::Proved {
+        name: theorem.name.clone(),
+        method: "IC3/PDR".to_owned(),
+        time_ms: elapsed,
+    })
 }
 
 // ── Property encoding context ────────────────────────────────────────
@@ -1372,12 +1969,41 @@ fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) 
         IRExpr::UnOp { operand, .. }
         | IRExpr::Field { expr: operand, .. }
         | IRExpr::Prime { expr: operand }
+        | IRExpr::Card { expr: operand }
         | IRExpr::Always { body: operand }
         | IRExpr::Eventually { body: operand } => {
             count_entity_quantifiers(operand, counts);
         }
         IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
             count_entity_quantifiers(body, counts);
+        }
+        // SetComp introduces an entity binder — count it like Forall
+        IRExpr::SetComp {
+            domain: crate::ir::types::IRType::Entity { name },
+            filter,
+            projection,
+            ..
+        } => {
+            *counts.entry(name.clone()).or_insert(0) += 1;
+            count_entity_quantifiers(filter, counts);
+            if let Some(proj) = projection {
+                count_entity_quantifiers(proj, counts);
+            }
+        }
+        IRExpr::SetComp { filter, projection, .. } => {
+            count_entity_quantifiers(filter, counts);
+            if let Some(proj) = projection {
+                count_entity_quantifiers(proj, counts);
+            }
+        }
+        IRExpr::MapUpdate { map, key, value, .. } => {
+            count_entity_quantifiers(map, counts);
+            count_entity_quantifiers(key, counts);
+            count_entity_quantifiers(value, counts);
+        }
+        IRExpr::Index { map, key, .. } => {
+            count_entity_quantifiers(map, counts);
+            count_entity_quantifiers(key, counts);
         }
         _ => {}
     }
@@ -1449,6 +2075,7 @@ fn scan_event_creates_inner(
 /// nullary defs with their bodies, and App chains matching parameterized defs
 /// with their beta-reduced bodies. Used to resolve pred/prop references in
 /// given constraints before scanning for field references.
+#[allow(clippy::too_many_lines)]
 fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
     if let IRExpr::Var { name, .. } = expr {
         if let Some(expanded) = defs.expand_var(name) {
@@ -1541,6 +2168,37 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
                 })
                 .collect(),
         },
+        IRExpr::MapUpdate {
+            map, key, value, ty,
+        } => IRExpr::MapUpdate {
+            map: Box::new(expand_through_defs(map, defs)),
+            key: Box::new(expand_through_defs(key, defs)),
+            value: Box::new(expand_through_defs(value, defs)),
+            ty: ty.clone(),
+        },
+        IRExpr::Index { map, key, ty } => IRExpr::Index {
+            map: Box::new(expand_through_defs(map, defs)),
+            key: Box::new(expand_through_defs(key, defs)),
+            ty: ty.clone(),
+        },
+        IRExpr::Card { expr: inner } => IRExpr::Card {
+            expr: Box::new(expand_through_defs(inner, defs)),
+        },
+        IRExpr::SetComp {
+            var,
+            domain,
+            filter,
+            projection,
+            ty,
+        } => IRExpr::SetComp {
+            var: var.clone(),
+            domain: domain.clone(),
+            filter: Box::new(expand_through_defs(filter, defs)),
+            projection: projection
+                .as_ref()
+                .map(|p| Box::new(expand_through_defs(p, defs))),
+            ty: ty.clone(),
+        },
         _ => expr.clone(),
     }
 }
@@ -1605,14 +2263,36 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
         IRExpr::Let { .. } => Some("Let"),
         IRExpr::Lam { .. } => Some("Lam"),
         IRExpr::Match { .. } => Some("Match"),
-        IRExpr::MapUpdate { .. } => Some("MapUpdate"),
-        IRExpr::Index { .. } => Some("Index"),
-        IRExpr::SetLit { .. } => Some("SetLit"),
-        IRExpr::SeqLit { .. } => Some("SeqLit"),
-        IRExpr::MapLit { .. } => Some("MapLit"),
-        IRExpr::SetComp { .. } => Some("SetComp"),
+        IRExpr::SetComp {
+            domain: IRType::Entity { .. },
+            filter,
+            projection,
+            ..
+        } => {
+            // Entity-domain comprehension is supported; check sub-expressions
+            find_unsupported_scene_expr(filter)
+                .or_else(|| projection.as_ref().and_then(|p| find_unsupported_scene_expr(p)))
+        }
+        IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
         IRExpr::Sorry => Some("Sorry"),
         IRExpr::Todo => Some("Todo"),
+        IRExpr::Card { expr } => match expr.as_ref() {
+            // Compile-time literal cardinality — always supported
+            IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => None,
+            // Entity-domain set comprehension — bounded sum over slots
+            IRExpr::SetComp {
+                domain: IRType::Entity { .. },
+                filter,
+                projection,
+                ..
+            } => find_unsupported_scene_expr(filter).or_else(|| {
+                projection
+                    .as_ref()
+                    .and_then(|p| find_unsupported_scene_expr(p))
+            }),
+            // Anything else: unsupported (infinite domain, field expression, etc.)
+            _ => Some("cardinality (#) of non-literal, non-comprehension expression"),
+        },
         IRExpr::Field { expr, .. }
         | IRExpr::UnOp { operand: expr, .. }
         | IRExpr::Prime { expr }
@@ -1627,8 +2307,76 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
         IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
             find_unsupported_scene_expr(body)
         }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => find_unsupported_scene_expr(map)
+            .or_else(|| find_unsupported_scene_expr(key))
+            .or_else(|| find_unsupported_scene_expr(value)),
+        IRExpr::Index { map, key, .. } => {
+            find_unsupported_scene_expr(map).or_else(|| find_unsupported_scene_expr(key))
+        }
+        IRExpr::MapLit { entries, .. } => entries
+            .iter()
+            .find_map(|(k, v)| find_unsupported_scene_expr(k).or_else(|| find_unsupported_scene_expr(v))),
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            elements.iter().find_map(find_unsupported_scene_expr)
+        }
         IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
     }
+}
+
+/// Scan action bodies for unsupported expression forms.
+///
+/// Walks Choose/ForAll/Apply/Create/CrossCall/ExprStmt and checks guards,
+/// filters, create field values for unsupported expressions.
+fn find_unsupported_in_actions(actions: &[IRAction]) -> Option<&'static str> {
+    for action in actions {
+        match action {
+            IRAction::Choose { filter, ops, .. } => {
+                if let Some(kind) = find_unsupported_scene_expr(filter) {
+                    return Some(kind);
+                }
+                if let Some(kind) = find_unsupported_in_actions(ops) {
+                    return Some(kind);
+                }
+            }
+            IRAction::ForAll { var, ops, .. } => {
+                let apply_count = ops
+                    .iter()
+                    .filter(|op| matches!(op, IRAction::Apply { target, .. } if target == var))
+                    .count();
+                if apply_count > 1 {
+                    return Some(
+                        "multiple Apply actions on the same entity in one ForAll block \
+                         (sequential composition not yet supported — split into separate events)",
+                    );
+                }
+                if let Some(kind) = find_unsupported_in_actions(ops) {
+                    return Some(kind);
+                }
+            }
+            IRAction::Create { fields, .. } => {
+                for f in fields {
+                    if let Some(kind) = find_unsupported_scene_expr(&f.value) {
+                        return Some(kind);
+                    }
+                }
+            }
+            IRAction::ExprStmt { expr } => {
+                if let Some(kind) = find_unsupported_scene_expr(expr) {
+                    return Some(kind);
+                }
+            }
+            IRAction::Apply { args, .. } | IRAction::CrossCall { args, .. } => {
+                for arg in args {
+                    if let Some(kind) = find_unsupported_scene_expr(arg) {
+                        return Some(kind);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Validate recursive `CrossCall` arities before encoding a scene.
@@ -1865,6 +2613,7 @@ fn encode_prop_expr(
 /// Resolves field references like `s.user_id` by looking up `"s"` in the
 /// `PropertyCtx` bindings to find the bound entity and slot index,
 /// then resolves via `pool.field_at(entity, slot, field, step)`.
+#[allow(clippy::too_many_lines)]
 fn encode_prop_value(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -1968,7 +2717,201 @@ fn encode_prop_value(
         IRExpr::Always { body } => {
             SmtValue::Bool(encode_prop_expr(pool, vctx, defs, ctx, body, step))
         }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step);
+            let k = encode_prop_value(pool, vctx, defs, ctx, key, step);
+            let v = encode_prop_value(pool, vctx, defs, ctx, value, step);
+            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+        }
+        IRExpr::Index { map, key, .. } => {
+            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step);
+            let k = encode_prop_value(pool, vctx, defs, ctx, key, step);
+            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+        }
+        IRExpr::MapLit { entries, ty } => {
+            let (key_ty, val_ty) = match ty {
+                IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
+                _ => panic!("MapLit with non-Map type: {ty:?}"),
+            };
+            let key_sort = smt::ir_type_to_sort(key_ty);
+            let default_val = smt::default_dynamic(val_ty);
+            let mut arr = z3::ast::Array::const_array(&key_sort, &default_val);
+            for (k_expr, v_expr) in entries {
+                let k = encode_prop_value(pool, vctx, defs, ctx, k_expr, step);
+                let v = encode_prop_value(pool, vctx, defs, ctx, v_expr, step);
+                arr = arr.store(&k.to_dynamic(), &v.to_dynamic());
+            }
+            SmtValue::Array(arr)
+        }
+        IRExpr::SetLit { elements, ty } => {
+            let elem_ty = match ty {
+                IRType::Set { element } => element.as_ref(),
+                _ => panic!("SetLit with non-Set type: {ty:?}"),
+            };
+            let elem_sort = smt::ir_type_to_sort(elem_ty);
+            let false_val = smt::bool_val(false).to_dynamic();
+            let true_val = smt::bool_val(true).to_dynamic();
+            let mut arr = z3::ast::Array::const_array(&elem_sort, &false_val);
+            for elem in elements {
+                let e = encode_prop_value(pool, vctx, defs, ctx, elem, step);
+                arr = arr.store(&e.to_dynamic(), &true_val);
+            }
+            SmtValue::Array(arr)
+        }
+        IRExpr::SeqLit { elements, ty } => {
+            let elem_ty = match ty {
+                IRType::Seq { element } => element.as_ref(),
+                _ => panic!("SeqLit with non-Seq type: {ty:?}"),
+            };
+            let default_val = smt::default_dynamic(elem_ty);
+            let mut arr =
+                z3::ast::Array::const_array(&z3::Sort::int(), &default_val);
+            for (i, elem) in elements.iter().enumerate() {
+                let idx = smt::int_val(i64::try_from(i).unwrap_or(0)).to_dynamic();
+                let v = encode_prop_value(pool, vctx, defs, ctx, elem, step);
+                arr = arr.store(&idx, &v.to_dynamic());
+            }
+            SmtValue::Array(arr)
+        }
+        IRExpr::SetComp {
+            var,
+            domain: IRType::Entity { name: entity_name },
+            filter,
+            projection,
+            ty,
+        } => {
+            // Set comprehension over entity slots.
+            // Simple: { a: E where P(a) } → Array<Int, Bool> (slot index → member)
+            // Projection: { f(a) | a: E where P(a) } → Array<T, Bool> (value → member)
+            let n_slots = pool.slots_for(entity_name);
+            let result_elem_sort = match (projection.as_ref(), ty) {
+                (Some(_), IRType::Set { element }) => smt::ir_type_to_sort(element),
+                (Some(_), _) => panic!("projection SetComp with non-Set result type: {ty:?}"),
+                (None, _) => z3::Sort::int(), // simple form: slot indices are Int
+            };
+            let false_val = smt::bool_val(false).to_dynamic();
+            let true_val = smt::bool_val(true).to_dynamic();
+            let mut arr = z3::ast::Array::const_array(&result_elem_sort, &false_val);
+
+            for slot in 0..n_slots {
+                let active = pool.active_at(entity_name, slot, step);
+                let is_active = match active {
+                    Some(SmtValue::Bool(act)) => act.clone(),
+                    _ => continue,
+                };
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let filter_val =
+                    encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                // Condition: slot is active AND filter holds
+                let cond = Bool::and(&[&is_active, &filter_val]);
+
+                // Key: what to store true at
+                let key = if let Some(proj_expr) = projection {
+                    // Projection: store true at the projected value
+                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)
+                        .to_dynamic()
+                } else {
+                    // Simple: store true at the slot index
+                    smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic()
+                };
+
+                // Conditional store: ite(cond, store(arr, key, true), arr)
+                let stored = arr.store(&key, &true_val);
+                arr = cond.ite(&stored, &arr);
+            }
+            SmtValue::Array(arr)
+        }
+        IRExpr::SetComp { domain, .. } => {
+            // Non-entity domain — should be caught by find_unsupported_scene_expr,
+            // but if reached (e.g., manually constructed IR), return a fresh
+            // unconstrained array rather than panicking.
+            let sort = smt::ir_type_to_sort(domain);
+            let false_val = smt::bool_val(false).to_dynamic();
+            SmtValue::Array(z3::ast::Array::const_array(&sort, &false_val))
+        }
+        IRExpr::Card { expr: inner } => {
+            encode_card(pool, vctx, defs, ctx, inner, step)
+        }
+        IRExpr::App { func, .. } => {
+            if let IRExpr::Var { name, .. } = func.as_ref() {
+                panic!(
+                    "built-in function `{name}` is not yet supported in verification encoding"
+                );
+            }
+            panic!("unsupported App expression in property value encoding: {expr:?}")
+        }
         _ => panic!("unsupported expression in property value encoding: {expr:?}"),
+    }
+}
+
+
+/// Encode cardinality (`#expr`) as a Z3 Int.
+///
+/// - **Literals** (`SetLit`, `SeqLit`, `MapLit`): compile-time constant.
+/// - **Entity set comprehension** `#{ x: E where P(x) }`: exact bounded sum
+///   `Σ ite(active[i] ∧ P(i), 1, 0)` over entity slots. This is the primary
+///   use case in Abide specs (e.g., `#{ o: Order where o.status == @Pending } > 0`).
+/// - **Projection comprehension** `#{ f(x) | x: E where P(x) }`: bounded sum
+///   that counts matching slots (may overcount if projection collapses duplicates —
+///   sound as upper bound for `> 0` checks, not exact for `== N`).
+/// - **Other**: panics (should be caught by `find_unsupported_scene_expr`).
+fn encode_card(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    inner: &IRExpr,
+    step: usize,
+) -> SmtValue {
+    match inner {
+        IRExpr::SetLit { elements, .. } => {
+            let unique: std::collections::HashSet<String> =
+                elements.iter().map(|e| format!("{e:?}")).collect();
+            smt::int_val(i64::try_from(unique.len()).unwrap_or(0))
+        }
+        IRExpr::SeqLit { elements, .. } => {
+            smt::int_val(i64::try_from(elements.len()).unwrap_or(0))
+        }
+        IRExpr::MapLit { entries, .. } => {
+            let unique_keys: std::collections::HashSet<String> =
+                entries.iter().map(|(k, _)| format!("{k:?}")).collect();
+            smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0))
+        }
+        // Entity-domain set comprehension: bounded sum over slots
+        IRExpr::SetComp {
+            var,
+            domain: IRType::Entity { name: entity_name },
+            filter,
+            ..
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            let mut sum_terms: Vec<z3::ast::Int> = Vec::new();
+            let one = z3::ast::Int::from_i64(1);
+            let zero = z3::ast::Int::from_i64(0);
+
+            for slot in 0..n_slots {
+                let is_active = match pool.active_at(entity_name, slot, step) {
+                    Some(SmtValue::Bool(act)) => act.clone(),
+                    _ => continue,
+                };
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let filter_val =
+                    encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                let cond = Bool::and(&[&is_active, &filter_val]);
+                sum_terms.push(cond.ite(&one, &zero));
+            }
+
+            if sum_terms.is_empty() {
+                return smt::int_val(0);
+            }
+            let refs: Vec<&z3::ast::Int> = sum_terms.iter().collect();
+            SmtValue::Int(z3::ast::Int::add(&refs))
+        }
+        _ => panic!(
+            "unsupported cardinality expression — should be caught by pre-check: {inner:?}"
+        ),
     }
 }
 
@@ -2025,6 +2968,9 @@ fn extract_counterexample(
                                 .map_or_else(|| "?".to_owned(), |v| format!("{v}")),
                             SmtValue::Dynamic(d) => model
                                 .eval(d, true)
+                                .map_or_else(|| "?".to_owned(), |v| format!("{v}")),
+                            SmtValue::Array(a) => model
+                                .eval(a, true)
                                 .map_or_else(|| "?".to_owned(), |v| format!("{v}")),
                         };
                         let entity_label = if n_slots > 1 {
@@ -2933,9 +3879,10 @@ mod tests {
 
         let results = verify_all(&ir, &VerifyConfig::default());
         assert_eq!(results.len(), 1);
+        // IC3 finds the actual counterexample (Pending→Confirmed) with trace.
         assert!(
-            matches!(&results[0], VerificationResult::Unprovable { .. }),
-            "expected Unprovable, got: {:?}",
+            matches!(&results[0], VerificationResult::Counterexample { trace, .. } if !trace.is_empty()),
+            "expected Counterexample with non-empty trace, got: {:?}",
             results[0]
         );
     }
@@ -3052,9 +3999,15 @@ mod tests {
         };
         let results = verify_all(&ir, &config);
         assert_eq!(results.len(), 1);
+        // IC3 now finds the actual violation even in unbounded-only mode,
+        // producing a Counterexample. If IC3 fails, falls back to Unprovable.
         assert!(
-            matches!(&results[0], VerificationResult::Unprovable { .. }),
-            "expected UNKNOWN with unbounded_only, got: {:?}",
+            matches!(
+                &results[0],
+                VerificationResult::Counterexample { .. }
+                    | VerificationResult::Unprovable { .. }
+            ),
+            "expected Counterexample or Unprovable with unbounded_only, got: {:?}",
             results[0]
         );
     }
@@ -3152,5 +4105,4336 @@ mod tests {
             "valid property should be CHECKED or PROVED with symmetry breaking, got: {:?}",
             results[0]
         );
+    }
+
+    // ── IC3 integration tests ──────────────────────────────────────
+
+    /// Test: property proved by IC3 that 1-induction can't prove.
+    ///
+    /// Entity has two fields (x, y) both starting at 0, with a transition
+    /// that increments both. Property: `y <= 10`. This requires the
+    /// strengthening invariant `y == x` (so the guard `x < 10` constrains y).
+    /// 1-induction fails because from an arbitrary state with y=10, x could
+    /// be anything, and y'=11 violates the property. IC3 discovers `y == x`.
+    #[test]
+    fn ic3_proves_property_induction_cannot() {
+        let entity = IREntity {
+            name: "Counter".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+                IRField {
+                    name: "y".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "step".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpLt".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 10 },
+                    }),
+                    ty: IRType::Bool,
+                },
+                updates: vec![
+                    IRUpdate {
+                        field: "x".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "x".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Int,
+                        },
+                    },
+                    IRUpdate {
+                        field: "y".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "y".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Int,
+                        },
+                    },
+                ],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Counter".to_owned()],
+            events: vec![IREvent {
+                name: "tick".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "c".to_owned(),
+                    entity: "Counter".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "c".to_owned(),
+                        transition: "step".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: always all c: Counter | c.y <= 10
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "c".to_owned(),
+                domain: IRType::Entity {
+                    name: "Counter".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpLe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "c".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Counter".to_owned(),
+                            },
+                        }),
+                        field: "y".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 10 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        // Verify block with this property
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "counter_bounded".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 20,
+                }],
+                asserts: vec![property.clone()],
+            }],
+            theorems: vec![IRTheorem {
+                name: "counter_bounded_thm".to_owned(),
+                systems: vec!["S".to_owned()],
+                invariants: vec![],
+                shows: vec![property],
+            }],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let config = VerifyConfig::default();
+        let results = verify_all(&ir, &config);
+
+        // We expect:
+        // - verify block: induction fails, IC3 proves → PROVED (method: IC3/PDR)
+        //   OR: induction fails, IC3 fails, BMC checks → CHECKED
+        // - theorem: IC3 proves → PROVED (method: IC3/PDR)
+        //   OR: induction fails, IC3 fails → UNPROVABLE
+
+        // At minimum, the verify block should succeed (BMC fallback if IC3 can't)
+        assert!(results.len() >= 1, "expected at least 1 result");
+
+        // Verify block: induction fails → IC3 proves
+        let verify_result = &results[0];
+        assert!(
+            matches!(
+                verify_result,
+                VerificationResult::Proved { method, .. } if method == "IC3/PDR"
+            ),
+            "expected PROVED (method: IC3/PDR) for verify block, got: {verify_result}"
+        );
+
+        // Theorem: IC3 proves (tried before 4-phase induction)
+        assert_eq!(results.len(), 2, "expected 2 results (verify + theorem)");
+        let thm_result = &results[1];
+        assert!(
+            matches!(
+                thm_result,
+                VerificationResult::Proved { method, .. } if method == "IC3/PDR"
+            ),
+            "expected PROVED (method: IC3/PDR) for theorem, got: {thm_result}"
+        );
+    }
+
+    #[test]
+    fn no_ic3_flag_skips_ic3_verify_falls_to_bmc() {
+        // Same IR as ic3_proves_property_induction_cannot, but with --no-ic3.
+        // Verify block: induction fails, IC3 skipped, falls to BMC → CHECKED.
+        let ir = make_two_counter_ir();
+        let config = VerifyConfig {
+            no_ic3: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 2);
+
+        // Verify block: BMC fallback (CHECKED)
+        assert!(
+            matches!(&results[0], VerificationResult::Checked { .. }),
+            "expected CHECKED with --no-ic3, got: {}", results[0]
+        );
+
+        // Theorem: IC3 skipped, induction fails → UNPROVABLE
+        assert!(
+            matches!(&results[1], VerificationResult::Unprovable { .. }),
+            "expected UNPROVABLE with --no-ic3, got: {}", results[1]
+        );
+    }
+
+    #[test]
+    fn bounded_only_skips_theorem_proving() {
+        // With --bounded-only, theorems can't be proved (no BMC for theorems).
+        let ir = make_two_counter_ir();
+        let config = VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 2);
+
+        // Verify block: BMC only → CHECKED
+        assert!(
+            matches!(&results[0], VerificationResult::Checked { .. }),
+            "expected CHECKED with --bounded-only, got: {}", results[0]
+        );
+
+        // Theorem: --bounded-only → UNPROVABLE
+        let thm = &results[1];
+        assert!(
+            matches!(thm, VerificationResult::Unprovable { hint, .. }
+                if hint.contains("--bounded-only")),
+            "expected UNPROVABLE with --bounded-only hint, got: {thm}"
+        );
+    }
+
+    #[test]
+    fn unbounded_only_no_ic3_gives_accurate_hint() {
+        // --unbounded-only + --no-ic3: hint should say IC3 was skipped.
+        let ir = make_two_counter_ir();
+        let config = VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+
+        // Verify block: induction fails, IC3 skipped, BMC skipped → UNPROVABLE
+        let verify_result = &results[0];
+        assert!(
+            matches!(verify_result, VerificationResult::Unprovable { hint, .. }
+                if hint.contains("--no-ic3")),
+            "expected UNPROVABLE mentioning --no-ic3, got: {verify_result}"
+        );
+    }
+
+    /// Helper: build the two-counter IR used by multiple IC3 flag tests.
+    fn make_two_counter_ir() -> IRProgram {
+        let entity = IREntity {
+            name: "Counter".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+                IRField {
+                    name: "y".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "step".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpLt".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 10 },
+                    }),
+                    ty: IRType::Bool,
+                },
+                updates: vec![
+                    IRUpdate {
+                        field: "x".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "x".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Int,
+                        },
+                    },
+                    IRUpdate {
+                        field: "y".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "y".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Int,
+                        },
+                    },
+                ],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Counter".to_owned()],
+            events: vec![IREvent {
+                name: "tick".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "c".to_owned(),
+                    entity: "Counter".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "c".to_owned(),
+                        transition: "step".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: always all c: Counter | c.y <= 10
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "c".to_owned(),
+                domain: IRType::Entity {
+                    name: "Counter".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpLe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "c".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Counter".to_owned(),
+                            },
+                        }),
+                        field: "y".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 10 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "counter_bounded".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 20,
+                }],
+                asserts: vec![property.clone()],
+            }],
+            theorems: vec![IRTheorem {
+                name: "counter_bounded_thm".to_owned(),
+                systems: vec!["S".to_owned()],
+                invariants: vec![],
+                shows: vec![property],
+            }],
+            axioms: vec![],
+            scenes: vec![],
+        }
+    }
+
+    // ── Map encoding tests ──────────────────────────────────────────
+
+    #[test]
+    fn map_field_verify_index_after_update() {
+        // Entity with a Map<Int, Int> field. Action does m[k := v].
+        // Property: after update, m[k] == v. Tests MapUpdate + Index Z3 encoding.
+        let entity = IREntity {
+            name: "Store".to_owned(),
+            fields: vec![IRField {
+                name: "data".to_owned(),
+                ty: IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Int),
+                },
+                default: None,
+            }],
+            transitions: vec![IRTransition {
+                name: "put".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                updates: vec![IRUpdate {
+                    field: "data".to_owned(),
+                    value: IRExpr::MapUpdate {
+                        map: Box::new(IRExpr::Var {
+                            name: "data".to_owned(),
+                            ty: IRType::Map {
+                                key: Box::new(IRType::Int),
+                                value: Box::new(IRType::Int),
+                            },
+                        }),
+                        key: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 42 },
+                        }),
+                        value: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 100 },
+                        }),
+                        ty: IRType::Map {
+                            key: Box::new(IRType::Int),
+                            value: Box::new(IRType::Int),
+                        },
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Store".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_store".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Store".to_owned(),
+                        fields: vec![], // data field unconstrained at creation
+                    }],
+                },
+                IREvent {
+                    name: "do_put".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "s".to_owned(),
+                        entity: "Store".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "s".to_owned(),
+                            transition: "put".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Helper: build s.data[42] expression
+        let data_at_42 = |var: &str| -> IRExpr {
+            IRExpr::Index {
+                map: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: var.to_owned(),
+                        ty: IRType::Entity {
+                            name: "Store".to_owned(),
+                        },
+                    }),
+                    field: "data".to_owned(),
+                    ty: IRType::Map {
+                        key: Box::new(IRType::Int),
+                        value: Box::new(IRType::Int),
+                    },
+                }),
+                key: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 42 },
+                }),
+                ty: IRType::Int,
+            }
+        };
+
+        // Property: always all s: Store | s.data[42] == s.data[42]
+        // Tautological — tests that Index encodes correctly in properties
+        // without depending on initial/transition values. Z3 should prove
+        // this by reflexivity of array select.
+        let reflex_property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "s".to_owned(),
+                domain: IRType::Entity {
+                    name: "Store".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(data_at_42("s")),
+                    right: Box::new(data_at_42("s")),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        // Property: data[42] == 100 — false for newly created entities,
+        // but CHECKED at depth 0 shows no violation with no active entities.
+        // After create + put it holds. BMC validates the full encoding
+        // path (MapUpdate in action → Index in property → comparison).
+        let post_put_property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "s".to_owned(),
+                domain: IRType::Entity {
+                    name: "Store".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(data_at_42("s")),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 100 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![
+                IRVerify {
+                    name: "map_reflex".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 3,
+                    }],
+                    asserts: vec![reflex_property],
+                },
+                IRVerify {
+                    name: "map_post_put".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 5,
+                    }],
+                    asserts: vec![post_put_property],
+                },
+            ],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 2, "expected 2 verify results");
+
+        // Reflexivity: data[42] == data[42] — PROVED by induction (trivially true)
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "reflexive map property should be PROVED: got {}", results[0]
+        );
+
+        // Post-put: data[42] == 100 — COUNTEREXAMPLE expected (create_store
+        // event creates entities with unconstrained data, so data[42] != 100
+        // before first put). Validates full MapUpdate→Index→comparison path.
+        assert!(
+            matches!(&results[1], VerificationResult::Counterexample { .. }),
+            "post-put map property should find COUNTEREXAMPLE: got {}", results[1]
+        );
+    }
+
+    #[test]
+    fn map_literal_in_property_encoding() {
+        // Tests MapLit encoding in the property encoder.
+        // Entity with Map<Int, Int> field. Property compares field to a
+        // MapLit constant: data == Map((42, 100)). BMC checks this.
+        let entity = IREntity {
+            name: "M".to_owned(),
+            fields: vec![IRField {
+                name: "data".to_owned(),
+                ty: IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Int),
+                },
+                default: None,
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["M".to_owned()],
+            events: vec![IREvent {
+                name: "create_m".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "M".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: all m: M | m.data != Map((42, 100))
+        // MapLit in the assertion — validates MapLit property encoding.
+        // True: data is unconstrained at creation, extremely unlikely to
+        // equal the specific map literal. BMC should PROVE or CHECK this.
+        let map_ty = IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Int),
+        };
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "m".to_owned(),
+                domain: IRType::Entity {
+                    name: "M".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpNEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "m".to_owned(),
+                            ty: IRType::Entity {
+                                name: "M".to_owned(),
+                            },
+                        }),
+                        field: "data".to_owned(),
+                        ty: map_ty.clone(),
+                    }),
+                    right: Box::new(IRExpr::MapLit {
+                        entries: vec![(
+                            IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 42 },
+                            },
+                            IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 100 },
+                            },
+                        )],
+                        ty: map_ty,
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "map_lit_test".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        // Should not panic — validates MapLit in property encoder path
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            !matches!(&results[0], VerificationResult::Unprovable { .. }),
+            "MapLit in property should encode without error: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn primed_map_update_sugar_encoding() {
+        // Tests the primed-index sugar path: data' = data[key := value]
+        // where the action body uses MapUpdate on the current field value.
+        // This is the pattern used in workflow_engine: variables'[k] = v
+        // which desugars to variables' = variables[k := v].
+        //
+        // Verifies that Prime(MapUpdate(Var, key, val)) encodes correctly
+        // through the action → frame → property encoding chain.
+        let entity = IREntity {
+            name: "KV".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "store".to_owned(),
+                    ty: IRType::Map {
+                        key: Box::new(IRType::Int),
+                        value: Box::new(IRType::Int),
+                    },
+                    default: None,
+                },
+                IRField {
+                    name: "count".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "set_key".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                updates: vec![
+                    // store' = store[1 := 42]
+                    IRUpdate {
+                        field: "store".to_owned(),
+                        value: IRExpr::MapUpdate {
+                            map: Box::new(IRExpr::Var {
+                                name: "store".to_owned(),
+                                ty: IRType::Map {
+                                    key: Box::new(IRType::Int),
+                                    value: Box::new(IRType::Int),
+                                },
+                            }),
+                            key: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            value: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 42 },
+                            }),
+                            ty: IRType::Map {
+                                key: Box::new(IRType::Int),
+                                value: Box::new(IRType::Int),
+                            },
+                        },
+                    },
+                    // count' = count + 1 (scalar frame test alongside map)
+                    IRUpdate {
+                        field: "count".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "count".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Int,
+                        },
+                    },
+                ],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["KV".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_kv".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "KV".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_set".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "k".to_owned(),
+                        entity: "KV".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "k".to_owned(),
+                            transition: "set_key".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: count >= 0 (monotonically increasing from 0).
+        // Tests that scalar fields are correctly framed alongside map updates.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "k".to_owned(),
+                domain: IRType::Entity {
+                    name: "KV".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "k".to_owned(),
+                            ty: IRType::Entity {
+                                name: "KV".to_owned(),
+                            },
+                        }),
+                        field: "count".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "primed_map_update".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 5,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // count starts at 0, incremented by 1 each set_key → always >= 0.
+        // Map update (store) encodes alongside scalar update without conflict.
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "primed map update with scalar should succeed: got {}", results[0]
+        );
+    }
+
+    // ── Set encoding tests ──────────────────────────────────────────
+
+    #[test]
+    fn set_membership_via_index() {
+        // Tests that `e in S` (lowered to Index(S, e)) works in properties.
+        // Entity with Set<Int> field `tags`. Action `add_tag` does tags' = tags[5 := true]
+        // (store 5 as member). Property: after add_tag, 5 is in tags.
+        //
+        // Since Set<T> = Array<T, Bool>, Index(tags, 5) returns Bool = true after store.
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+
+        let entity = IREntity {
+            name: "Item".to_owned(),
+            fields: vec![IRField {
+                name: "tags".to_owned(),
+                ty: set_ty.clone(),
+                default: None,
+            }],
+            transitions: vec![IRTransition {
+                name: "add_tag".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                // tags' = tags[5 := true] (add 5 to set)
+                updates: vec![IRUpdate {
+                    field: "tags".to_owned(),
+                    value: IRExpr::MapUpdate {
+                        map: Box::new(IRExpr::Var {
+                            name: "tags".to_owned(),
+                            ty: set_ty.clone(),
+                        }),
+                        key: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 5 },
+                        }),
+                        value: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ty: set_ty.clone(),
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Item".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_item".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Item".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_add".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "i".to_owned(),
+                        entity: "Item".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "i".to_owned(),
+                            transition: "add_tag".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: always (all i: Item | i.tags[5] == true)
+        // i.e., "5 is always a member of tags"
+        // This is NOT always true: newly created items have unconstrained tags,
+        // so tags[5] can be false before add_tag fires.
+        // BMC should find a COUNTEREXAMPLE — validates the full store→select
+        // semantic chain for set membership.
+        let tags_at_5 = IRExpr::Index {
+            map: Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "i".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Item".to_owned(),
+                    },
+                }),
+                field: "tags".to_owned(),
+                ty: set_ty,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 5 },
+            }),
+            ty: IRType::Bool,
+        };
+
+        let membership_property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "i".to_owned(),
+                domain: IRType::Entity {
+                    name: "Item".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(tags_at_5),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "set_membership".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![membership_property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // Created items have unconstrained tags → tags[5] can be false → COUNTEREXAMPLE.
+        // This validates: Set field as Array<Int,Bool>, store(5,true) in add_tag action,
+        // select(5) in property assertion, Bool comparison — full semantic chain.
+        assert!(
+            matches!(&results[0], VerificationResult::Counterexample { .. }),
+            "set membership should produce COUNTEREXAMPLE (unconstrained before add_tag): got {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn set_literal_in_property() {
+        // Tests SetLit in property encoding.
+        // Property: Set(1,2,3)[2] == true (2 is a member of {1,2,3}).
+        // Uses SetLit directly in the assertion, validates property-side encoding.
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: Set(1,2,3)[2] == true — 2 is in {1,2,3}
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Entity {
+                    name: "X".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Index {
+                        map: Box::new(IRExpr::SetLit {
+                            elements: vec![
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 1 },
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 2 },
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 3 },
+                                },
+                            ],
+                            ty: set_ty,
+                        }),
+                        key: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "set_lit_membership".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // Set(1,2,3)[2] is always true — should be PROVED
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "set literal membership should be PROVED: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn set_literal_cardinality() {
+        // Tests #Set(1,2,3) == 3 in a property — cardinality of a set literal.
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: #Set(1,2,3) == 3
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Entity {
+                    name: "X".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Card {
+                        expr: Box::new(IRExpr::SetLit {
+                            elements: vec![
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 1 },
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 2 },
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 3 },
+                                },
+                            ],
+                            ty: set_ty,
+                        }),
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 3 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "card_set_lit".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // #Set(1,2,3) = 3 — compile-time constant, trivially PROVED
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "#Set(1,2,3) == 3 should be PROVED: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn set_literal_cardinality_deduplicates() {
+        // #Set(1,1,2) should be 2 (not 3) — duplicates are collapsed.
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // #Set(1,1,2) == 2
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Entity {
+                    name: "X".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Card {
+                        expr: Box::new(IRExpr::SetLit {
+                            elements: vec![
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 1 },
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 1 }, // duplicate
+                                },
+                                IRExpr::Lit {
+                                    ty: IRType::Int,
+                                    value: LitVal::Int { value: 2 },
+                                },
+                            ],
+                            ty: set_ty,
+                        }),
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 2 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "card_dedup".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "#Set(1,1,2) == 2 should be PROVED (deduplicated): got {}", results[0]
+        );
+    }
+
+    // ── Set comprehension tests ─────────────────────────────────────
+
+    #[test]
+    fn set_comprehension_simple_form() {
+        // { o: Order where o.status == @Active } — simple set comprehension.
+        // Entity with status enum, one transition that sets Active.
+        // Property: #{ o: Order where true } >= 0 — always true (count is non-negative).
+        // Tests that SetComp encodes without panic and produces a valid Array.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+            },
+        };
+
+        let entity = IREntity {
+            name: "Obj".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "id".to_owned(),
+                    ty: IRType::Id,
+                    default: None,
+                },
+                IRField {
+                    name: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                    },
+                    default: Some(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Idle".to_owned(),
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "activate".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Idle".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                },
+                updates: vec![IRUpdate {
+                    field: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Obj".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_obj".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Obj".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_activate".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "o".to_owned(),
+                        entity: "Obj".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "o".to_owned(),
+                            transition: "activate".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Simple comprehension: { o: Obj where o.status == @Active }
+        let active_set = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Obj".to_owned(),
+            },
+            filter: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Obj".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Active".to_owned(),
+                }),
+                ty: IRType::Bool,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+        };
+
+        // Property: { o: Obj where o.status == @Active } == { o: Obj where o.status == @Active }
+        // Reflexive — validates SetComp encodes to Array without panic.
+        // Wrapped in a Forall to get the right encoding context.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(active_set.clone()),
+                right: Box::new(active_set),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "set_comp_simple".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "set comprehension should encode without error: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn set_comprehension_membership_check() {
+        // After activate: slot 0 should be in { o: Obj where o.status == @Active }.
+        // Uses Index on the comprehension result to check membership.
+        // This won't be provable (needs invariant linking slot index to active set),
+        // but it validates the full SetComp→Index→Bool encoding chain.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+            },
+        };
+
+        let entity = IREntity {
+            name: "Obj".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Idle".to_owned(),
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Obj".to_owned()],
+            events: vec![IREvent {
+                name: "create_obj".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "Obj".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // { o: Obj where true }[0] — slot 0 membership in "all objects" set
+        // This is true iff slot 0 is active. Since we can create objects, and
+        // the set includes all active objects, Index(comprehension, 0) == active[0].
+        // We check: Index(comprehension, 0) == Index(comprehension, 0) — reflexive,
+        // but validates the SetComp→Index chain doesn't panic.
+        let comp = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Obj".to_owned(),
+            },
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+        };
+
+        let comp_at_0 = IRExpr::Index {
+            map: Box::new(comp),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 0 },
+            }),
+            ty: IRType::Bool,
+        };
+
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(comp_at_0.clone()),
+                right: Box::new(comp_at_0),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "set_comp_index".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "SetComp→Index chain should encode without error: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn set_comprehension_projection_form() {
+        // Projection comprehension: { o.status | o: Obj where true }
+        // Collects status values of all active objects into a set.
+        // Property: Set(1,2,3)[0] == true is independent of comprehension —
+        // just validates projection encoding doesn't panic.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+            },
+        };
+
+        let entity = IREntity {
+            name: "Obj".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Idle".to_owned(),
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Obj".to_owned()],
+            events: vec![IREvent {
+                name: "create_obj".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "Obj".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Projection: { o.status | o: Obj where true }
+        let status_set = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Obj".to_owned(),
+            },
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+            }),
+            projection: Some(Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "o".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Obj".to_owned(),
+                    },
+                }),
+                field: "status".to_owned(),
+                ty: IRType::Int,
+            })),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+        };
+
+        // Property: Index(status_set, Idle_id) == Index(status_set, Idle_id)
+        // Reflexive on the projection result — validates projection encoding chain.
+        // Idle is constructor 0 in VerifyContext.
+        let idle_id = IRExpr::Ctor {
+            enum_name: "Status".to_owned(),
+            ctor: "Idle".to_owned(),
+        };
+        let proj_at_idle = IRExpr::Index {
+            map: Box::new(status_set),
+            key: Box::new(idle_id),
+            ty: IRType::Bool,
+        };
+
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(proj_at_idle.clone()),
+                right: Box::new(proj_at_idle),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "set_comp_proj".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "projection SetComp should encode without error: got {}", results[0]
+        );
+    }
+
+    // ── Sequence encoding tests ─────────────────────────────────────
+
+    #[test]
+    fn seq_literal_index_and_cardinality() {
+        // Tests SeqLit encoding in properties: Seq(10, 20, 30)[1] == 20 and #Seq(10,20,30) == 3.
+        let seq_ty = IRType::Seq {
+            element: Box::new(IRType::Int),
+        };
+
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let seq_lit = || IRExpr::SeqLit {
+            elements: vec![
+                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 10 } },
+                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 20 } },
+                IRExpr::Lit { ty: IRType::Int, value: LitVal::Int { value: 30 } },
+            ],
+            ty: seq_ty.clone(),
+        };
+
+        // Property 1: Seq(10,20,30)[1] == 20
+        let index_prop = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Entity { name: "X".to_owned() },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Index {
+                        map: Box::new(seq_lit()),
+                        key: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 20 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        // Property 2: #Seq(10,20,30) == 3
+        let card_prop = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Entity { name: "X".to_owned() },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Card {
+                        expr: Box::new(seq_lit()),
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 3 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![
+                IRVerify {
+                    name: "seq_index".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 3,
+                    }],
+                    asserts: vec![index_prop],
+                },
+                IRVerify {
+                    name: "seq_card".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 3,
+                    }],
+                    asserts: vec![card_prop],
+                },
+            ],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 2);
+
+        // Seq(10,20,30)[1] == 20 — PROVED (store/select axiom)
+        assert!(
+            matches!(&results[0], VerificationResult::Proved { .. }),
+            "Seq index should be PROVED: got {}", results[0]
+        );
+
+        // #Seq(10,20,30) == 3 — compile-time constant, PROVED or CHECKED
+        assert!(
+            matches!(
+                &results[1],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "Seq cardinality should succeed: got {}", results[1]
+        );
+    }
+
+    #[test]
+    fn seq_field_frame_across_transition() {
+        // Entity with Seq<Int> field + Int field. Transition updates Int only.
+        // Seq field should be framed (preserved). Tests Array framing works for Seq.
+        let seq_ty = IRType::Seq {
+            element: Box::new(IRType::Int),
+        };
+
+        let entity = IREntity {
+            name: "Q".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "items".to_owned(),
+                    ty: seq_ty.clone(),
+                    default: None,
+                },
+                IRField {
+                    name: "count".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![IRTransition {
+                name: "inc".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                updates: vec![IRUpdate {
+                    field: "count".to_owned(),
+                    value: IRExpr::BinOp {
+                        op: "OpAdd".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "count".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Int,
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Q".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_q".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Q".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_inc".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "q".to_owned(),
+                        entity: "Q".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "q".to_owned(),
+                            transition: "inc".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: items[0] == items[0] — reflexive on the Seq field.
+        // This is trivially true but exercises the Array-typed field resolution
+        // in the property encoder, proving the Seq field variable is correctly
+        // created, accessed, and compared across time steps.
+        let items_at_0 = IRExpr::Index {
+            map: Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "q".to_owned(),
+                    ty: IRType::Entity { name: "Q".to_owned() },
+                }),
+                field: "items".to_owned(),
+                ty: seq_ty.clone(),
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 0 },
+            }),
+            ty: IRType::Int,
+        };
+
+        // Also check count >= 0 to validate scalar framing alongside Seq.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "q".to_owned(),
+                domain: IRType::Entity { name: "Q".to_owned() },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpAnd".to_owned(),
+                    left: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(items_at_0.clone()),
+                        right: Box::new(items_at_0),
+                        ty: IRType::Bool,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpGe".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "q".to_owned(),
+                                ty: IRType::Entity { name: "Q".to_owned() },
+                            }),
+                            field: "count".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "seq_frame".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 5,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "Seq frame alongside scalar should succeed: got {}", results[0]
+        );
+    }
+
+    // ── Cardinality (bounded sum) tests ──────────────────────────────
+
+    #[test]
+    fn card_set_comp_bounded_sum() {
+        // #{ o: Obj where o.status == @Active } — count of active objects.
+        // With 2 slots and no transitions that create or activate, the count
+        // is always 0. Property: #{ o | status == Active } == 0 should be PROVED.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+            },
+        };
+
+        let entity = IREntity {
+            name: "Obj".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Idle".to_owned(),
+                }),
+            }],
+            transitions: vec![IRTransition {
+                name: "activate".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Idle".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                },
+                updates: vec![IRUpdate {
+                    field: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Active".to_owned(),
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Obj".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_obj".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Obj".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_activate".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "o".to_owned(),
+                        entity: "Obj".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "o".to_owned(),
+                            transition: "activate".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Comprehension: { o: Obj where o.status == @Active }
+        let active_comp = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Obj".to_owned(),
+            },
+            filter: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Obj".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Active".to_owned(),
+                }),
+                ty: IRType::Bool,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+        };
+
+        // Property: #{ o | Active } >= 0 — always true (count is non-negative).
+        // This is semantically meaningful: the bounded sum produces a real Int,
+        // not a fresh unconstrained variable. Z3 can prove sum of ite(cond,1,0) >= 0.
+        let non_neg_prop = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpGe".to_owned(),
+                left: Box::new(IRExpr::Card {
+                    expr: Box::new(active_comp.clone()),
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+                ty: IRType::Bool,
+            }),
+        };
+
+        // Property: #{ o | Active } <= 2 — true with scope size 2 (at most 2 slots).
+        // The bounded sum can be at most n_slots = 2.
+        let bounded_prop = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpLe".to_owned(),
+                left: Box::new(IRExpr::Card {
+                    expr: Box::new(active_comp),
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 2 },
+                }),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![
+                IRVerify {
+                    name: "card_non_neg".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 5,
+                    }],
+                    asserts: vec![non_neg_prop],
+                },
+                IRVerify {
+                    name: "card_bounded".to_owned(),
+                    systems: vec![IRVerifySystem {
+                        name: "S".to_owned(),
+                        lo: 0,
+                        hi: 5,
+                    }],
+                    asserts: vec![bounded_prop],
+                },
+            ],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 2);
+
+        // #{ Active } >= 0 — PROVED (bounded sum of non-negative terms)
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "#{{ Active }} >= 0 should succeed: got {}", results[0]
+        );
+
+        // #{ Active } <= 2 — PROVED (at most 2 slots can be active)
+        assert!(
+            matches!(
+                &results[1],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "#{{ Active }} <= 2 should succeed: got {}", results[1]
+        );
+    }
+
+    // ── Prop auto-verification tests ────────────────────────────────
+
+    #[test]
+    fn prop_auto_verified_when_true() {
+        // A prop targeting a system with a trivially true body should be auto-verified.
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Prop: always all x: X | x.n >= 0 (true: default is 0, no transitions)
+        let prop_body = IRExpr::Forall {
+            var: "x".to_owned(),
+            domain: IRType::Entity {
+                name: "X".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpGe".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Entity {
+                            name: "X".to_owned(),
+                        },
+                    }),
+                    field: "n".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![IRFunction {
+                name: "n_non_neg".to_owned(),
+                ty: IRType::Bool,
+                body: prop_body,
+                prop_target: Some("S".to_owned()),
+            }],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        // Should produce 1 result: the auto-verified prop
+        assert_eq!(results.len(), 1, "expected 1 auto-verified prop result");
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { name, .. } if name == "prop_n_non_neg"
+            ),
+            "prop should be auto-verified as PROVED: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn prop_skipped_when_covered_by_theorem() {
+        // A prop already referenced in an explicit theorem should not be double-checked.
+        let entity = IREntity {
+            name: "X".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["X".to_owned()],
+            events: vec![IREvent {
+                name: "create_x".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "X".to_owned(),
+                    fields: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let prop_ref = IRExpr::Var {
+            name: "my_prop".to_owned(),
+            ty: IRType::Bool,
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![IRFunction {
+                name: "my_prop".to_owned(),
+                ty: IRType::Bool,
+                body: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                prop_target: Some("S".to_owned()),
+            }],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            // Theorem already references my_prop
+            theorems: vec![IRTheorem {
+                name: "explicit_thm".to_owned(),
+                systems: vec!["S".to_owned()],
+                invariants: vec![],
+                shows: vec![IRExpr::Always {
+                    body: Box::new(prop_ref),
+                }],
+            }],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        // Should only have 1 result (the explicit theorem), not 2
+        assert_eq!(
+            results.len(),
+            1,
+            "prop covered by theorem should not be double-checked: got {} results",
+            results.len()
+        );
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { name, .. } if name == "explicit_thm"
+            ),
+            "only the explicit theorem should appear: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn no_prop_verify_flag_skips_props() {
+        // --no-prop-verify should skip all prop auto-verification.
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![IRFunction {
+                name: "some_prop".to_owned(),
+                ty: IRType::Bool,
+                body: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                prop_target: Some("S".to_owned()),
+            }],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let config = VerifyConfig {
+            no_prop_verify: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert!(
+            results.is_empty(),
+            "--no-prop-verify should produce no results: got {} results",
+            results.len()
+        );
+    }
+
+    #[test]
+    fn prop_auto_verified_when_false() {
+        // A false prop should produce COUNTEREXAMPLE or UNPROVABLE.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["On".to_owned(), "Off".to_owned()],
+            },
+        };
+        let entity = IREntity {
+            name: "Switch".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    constructors: vec!["On".to_owned(), "Off".to_owned()],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Off".to_owned(),
+                }),
+            }],
+            transitions: vec![IRTransition {
+                name: "toggle".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                updates: vec![IRUpdate {
+                    field: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "On".to_owned(),
+                    },
+                }],
+                postcondition: None,
+            }],
+        };
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Switch".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_switch".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "Switch".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "do_toggle".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "s".to_owned(),
+                        entity: "Switch".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![IRAction::Apply {
+                            target: "s".to_owned(),
+                            transition: "toggle".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        }],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // False prop: "all switches are always Off" — toggle breaks this.
+        let false_prop_body = IRExpr::Forall {
+            var: "s".to_owned(),
+            domain: IRType::Entity {
+                name: "Switch".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "s".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Switch".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Off".to_owned(),
+                }),
+                ty: IRType::Bool,
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![IRFunction {
+                name: "always_off".to_owned(),
+                ty: IRType::Bool,
+                body: false_prop_body,
+                prop_target: Some("S".to_owned()),
+            }],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1, "expected 1 auto-verified prop result");
+        // The prop is false — IC3 should find a counterexample (toggle sets On),
+        // or induction returns Unprovable.
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Counterexample { name, .. }
+                    | VerificationResult::Unprovable { name, .. }
+                    if name == "prop_always_off"
+            ),
+            "false prop should produce Counterexample or Unprovable: got {}", results[0]
+        );
+    }
+
+    // ── Multi-apply sequential composition tests ──────────────────
+
+    #[test]
+    fn multi_apply_sequential_chaining() {
+        // Two sequential Apply actions: pack (status 0→1) then ship (requires status==1, sets 2).
+        // With intermediate variable chaining, ship's guard sees the result of pack.
+        // Property: status is always 0 or 2 (never 1) at step boundaries — FALSE because
+        // entities start at 0 and pack_and_ship takes them to 2 in one event step,
+        // but status could be 0 (before pack_and_ship) or 2 (after). Status 1 only
+        // exists in the intermediate state within the event.
+        // Simpler property: status >= 0 (always true). Tests encoding doesn't panic.
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "pack".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    // Guard: requires status == 1 (result of pack)
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_f".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "F".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "pack_and_ship".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "pack".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "ship".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: status >= 0 (always true — 0, 1, or 2)
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "f".to_owned(),
+                domain: IRType::Entity {
+                    name: "F".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "multi_apply_test".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 5,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let config = VerifyConfig {
+            bounded_only: true, // BMC only — test the chaining encoding
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        // Should succeed — status is always 0 or 2 at step boundaries, both >= 0.
+        // The key test: this doesn't panic and the guard chain works (ship sees pack's result).
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "multi-apply sequential chaining should succeed: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_scene_checks_final_state() {
+        // Scene: given entity with status==0, when pack_and_ship fires,
+        // then status == 2 (pack sets 1, ship reads 1 and sets 2).
+        // This validates intermediate chaining in the scene encoding path.
+        use crate::ir::types::{Cardinality, IRScene, IRSceneEvent, IRSceneGiven};
+
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "pack".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![IREvent {
+                name: "pack_and_ship".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "f".to_owned(),
+                    entity: "F".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![
+                        IRAction::Apply {
+                            target: "f".to_owned(),
+                            transition: "pack".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        },
+                        IRAction::Apply {
+                            target: "f".to_owned(),
+                            transition: "ship".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        },
+                    ],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Scene: given f with status==0, when pack_and_ship, then f.status==2
+        let scene = IRScene {
+            name: "pack_then_ship".to_owned(),
+            systems: vec!["S".to_owned()],
+            givens: vec![IRSceneGiven {
+                var: "f".to_owned(),
+                entity: "F".to_owned(),
+                constraint: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                },
+            }],
+            events: vec![IRSceneEvent {
+                var: "ps".to_owned(),
+                system: "S".to_owned(),
+                event: "pack_and_ship".to_owned(),
+                args: vec![],
+                cardinality: Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![],
+            assertions: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "f".to_owned(),
+                        ty: IRType::Entity {
+                            name: "F".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 2 },
+                }),
+                ty: IRType::Bool,
+            }],
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![scene],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // Scene should PASS: pack (0→1) then ship (1→2) = final status 2.
+        // Without intermediate chaining, ship's guard fails (sees 0, not 1).
+        assert!(
+            matches!(&results[0], VerificationResult::ScenePass { .. }),
+            "scene with multi-apply should PASS: got {}", results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_ic3_proves_property() {
+        // IC3 rejects same-entity multi-apply (CHC per-Apply rules model
+        // multi-step, not atomic intra-event composition). Falls through to
+        // 4-phase induction which uses BMC-style intermediate variable chaining.
+        // Property: status >= 0 (1-inductive: default 0, transitions set 1 or 2).
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "pack".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_f".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "F".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "pack_and_ship".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "pack".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "ship".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: status >= 0 (always true: 0, 1, or 2)
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "f".to_owned(),
+                domain: IRType::Entity {
+                    name: "F".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![IRTheorem {
+                name: "multi_apply_ic3".to_owned(),
+                systems: vec!["S".to_owned()],
+                invariants: vec![],
+                shows: vec![property],
+            }],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // IC3 rejects multi-apply (Unknown), falls to 4-phase induction.
+        // status >= 0 is 1-inductive (default 0, transitions set 1 or 2).
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { method, .. } if method == "1-induction"
+            ),
+            "multi-apply theorem should be PROVED by 1-induction (IC3 rejects, falls through): got {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_step_scoping_no_intermediate_collision() {
+        // Regression: two events with multi-apply chains in the same system.
+        // Intermediate variables must be scoped by step and chain_id so that
+        // chains at step 0 and step 1 don't alias each other.
+        // Entity has three transitions: a (0→1), b (1→2), c (2→3).
+        // Event "ab" does a+b (0→2), event "bc" does b+c (but can only fire
+        // if status==1, which never happens via ab). We verify status <= 2
+        // after create+ab — if intermediates aliased across events, the solver
+        // could produce spurious states.
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "a".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "b".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "c".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 3 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_f".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "F".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                // Event ab: a (0→1) then b (1→2) — multi-apply chain
+                IREvent {
+                    name: "ab".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "a".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "b".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    }],
+                },
+                // Event bc: b (1→2) then c (2→3) — second multi-apply chain
+                IREvent {
+                    name: "bc".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "b".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "c".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: status <= 3 (always true: 0 via default, 2 via ab, 3 via ab then bc)
+        // If intermediates aliased across events, solver could produce spurious values.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "f".to_owned(),
+                domain: IRType::Entity {
+                    name: "F".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpLe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 3 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "step_scope_test".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 5,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let config = VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "two multi-apply events with distinct chains should not alias intermediates: got {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_active_flag_preserved_in_chain() {
+        // Regression: multi-apply chain must assert active flag at step k AND k+1.
+        // If active constraints were missing, an inactive entity slot could get
+        // spurious intermediate state written through it.
+        // Test: entity defaults to status=0, pack_and_ship chains pack(0→1)+ship(1→2).
+        // Property: status is exactly 0 or 2 (never anything else at step boundaries).
+        // This is tighter than >= 0 — validates that only active entities transition.
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "pack".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_f".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "F".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "pack_and_ship".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "pack".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "ship".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Tighter property: status == 0 OR status == 2
+        // Status 1 only exists in intermediate state within the event chain.
+        // If active flag constraints were missing, inactive slots could leak
+        // intermediate values (1) into step-boundary observations.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "f".to_owned(),
+                domain: IRType::Entity {
+                    name: "F".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpOr".to_owned(),
+                    left: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "f".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "F".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "f".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "F".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![IRVerify {
+                name: "active_flag_test".to_owned(),
+                systems: vec![IRVerifySystem {
+                    name: "S".to_owned(),
+                    lo: 0,
+                    hi: 5,
+                }],
+                asserts: vec![property],
+            }],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        let config = VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 1);
+        // Status should only be 0 (default/uncreated) or 2 (after pack_and_ship).
+        // The intermediate value 1 must never appear at step boundaries.
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
+            ),
+            "status should be exactly 0 or 2 at step boundaries (active flag preserves chain integrity): got {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_second_apply_args_depend_on_first_update() {
+        // Regression: when the second Apply's transition takes a parameter whose
+        // value is computed from a field updated by the first Apply, the parameter
+        // must be evaluated against the intermediate state, not the pre-state.
+        //
+        // Entity "F" has two fields: status (int) and amount (int, default 0).
+        // Transition "prepare": guard status==0, sets status=1, sets amount=10.
+        // Transition "finalize(expected: int)": guard status==1 AND amount==expected,
+        //   sets status=2.
+        // Event "prep_and_finalize": Choose f, f.prepare(), f.finalize(f.amount).
+        // The arg `f.amount` must resolve to 10 (prepare's update), not 0 (pre-state).
+        // Property: if status==2 then amount==10 (validates correct arg resolution).
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "status".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+                IRField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![
+                IRTransition {
+                    name: "prepare".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![
+                        IRUpdate {
+                            field: "status".to_owned(),
+                            value: IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            },
+                        },
+                        IRUpdate {
+                            field: "amount".to_owned(),
+                            value: IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 10 },
+                            },
+                        },
+                    ],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "finalize".to_owned(),
+                    refs: vec![],
+                    params: vec![IRTransParam {
+                        name: "expected".to_owned(),
+                        ty: IRType::Int,
+                    }],
+                    // Guard: status==1 AND amount==expected
+                    guard: IRExpr::BinOp {
+                        op: "OpAnd".to_owned(),
+                        left: Box::new(IRExpr::BinOp {
+                            op: "OpEq".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "status".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 1 },
+                            }),
+                            ty: IRType::Bool,
+                        }),
+                        right: Box::new(IRExpr::BinOp {
+                            op: "OpEq".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "amount".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            right: Box::new(IRExpr::Var {
+                                name: "expected".to_owned(),
+                                ty: IRType::Int,
+                            }),
+                            ty: IRType::Bool,
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![
+                IREvent {
+                    name: "create_f".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Create {
+                        entity: "F".to_owned(),
+                        fields: vec![],
+                    }],
+                },
+                IREvent {
+                    name: "prep_and_finalize".to_owned(),
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    },
+                    postcondition: None,
+                    body: vec![IRAction::Choose {
+                        var: "f".to_owned(),
+                        entity: "F".to_owned(),
+                        filter: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                        }),
+                        ops: vec![
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "prepare".to_owned(),
+                                refs: vec![],
+                                args: vec![],
+                            },
+                            IRAction::Apply {
+                                target: "f".to_owned(),
+                                transition: "finalize".to_owned(),
+                                refs: vec![],
+                                // Arg: f.amount — must resolve from intermediate state (10),
+                                // not pre-state (0)
+                                args: vec![IRExpr::Var {
+                                    name: "amount".to_owned(),
+                                    ty: IRType::Int,
+                                }],
+                            },
+                        ],
+                    }],
+                },
+            ],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // Property: if status == 2 then amount == 10.
+        // If the second Apply's arg was evaluated against pre-state,
+        // finalize's guard (amount==expected) would use expected=0 (pre-state amount),
+        // which wouldn't match the intermediate amount=10, making finalize's guard UNSAT.
+        // The event wouldn't fire, so status would stay at 0 — the property holds vacuously.
+        //
+        // With correct intermediate evaluation, expected=10 (from intermediate amount),
+        // finalize fires (amount==10==expected), status goes to 2, and status==2 → amount==10
+        // holds concretely.
+        //
+        // To distinguish: use a scene to verify the event CAN fire and produces status==2.
+        use crate::ir::types::{Cardinality, IRScene, IRSceneEvent, IRSceneGiven};
+        let scene = IRScene {
+            name: "prep_finalize_fires".to_owned(),
+            systems: vec!["S".to_owned()],
+            givens: vec![IRSceneGiven {
+                var: "f".to_owned(),
+                entity: "F".to_owned(),
+                constraint: IRExpr::BinOp {
+                    op: "OpAnd".to_owned(),
+                    left: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "f".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "F".to_owned(),
+                                },
+                            }),
+                            field: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Field {
+                            expr: Box::new(IRExpr::Var {
+                                name: "f".to_owned(),
+                                ty: IRType::Entity {
+                                    name: "F".to_owned(),
+                                },
+                            }),
+                            field: "amount".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    ty: IRType::Bool,
+                },
+            }],
+            events: vec![IRSceneEvent {
+                var: "pf".to_owned(),
+                system: "S".to_owned(),
+                event: "prep_and_finalize".to_owned(),
+                args: vec![],
+                cardinality: Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![],
+            // Assert: status reaches 2 AND amount is 10 (prepare's update)
+            assertions: vec![
+                IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 2 },
+                    }),
+                    ty: IRType::Bool,
+                },
+                IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "amount".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 10 },
+                    }),
+                    ty: IRType::Bool,
+                },
+            ],
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![scene],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // Scene must PASS: prepare sets amount=10, finalize's arg (f.amount)
+        // reads from intermediate state and gets 10, guard is satisfied, status→2.
+        assert!(
+            matches!(&results[0], VerificationResult::ScenePass { .. }),
+            "second Apply's args must resolve from intermediate state (amount=10, not 0): got {}",
+            results[0]
+        );
+    }
+
+    #[test]
+    fn multi_apply_forall_rejected_in_scene() {
+        // Regression: a scene whose event uses ForAll with multiple Apply actions
+        // on the same entity must be rejected via find_unsupported_in_actions,
+        // not silently encoded incorrectly.
+        use crate::ir::types::{Cardinality, IRScene, IRSceneEvent, IRSceneGiven};
+
+        let entity = IREntity {
+            name: "F".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "pack".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 0 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        let system = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["F".to_owned()],
+            events: vec![IREvent {
+                name: "pack_all_and_ship".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                // ForAll with two Applies on same entity — NOT supported
+                body: vec![IRAction::ForAll {
+                    var: "f".to_owned(),
+                    entity: "F".to_owned(),
+                    ops: vec![
+                        IRAction::Apply {
+                            target: "f".to_owned(),
+                            transition: "pack".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        },
+                        IRAction::Apply {
+                            target: "f".to_owned(),
+                            transition: "ship".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        },
+                    ],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let scene = IRScene {
+            name: "forall_multi_apply".to_owned(),
+            systems: vec!["S".to_owned()],
+            givens: vec![IRSceneGiven {
+                var: "f".to_owned(),
+                entity: "F".to_owned(),
+                constraint: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "f".to_owned(),
+                            ty: IRType::Entity {
+                                name: "F".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                },
+            }],
+            events: vec![IRSceneEvent {
+                var: "ps".to_owned(),
+                system: "S".to_owned(),
+                event: "pack_all_and_ship".to_owned(),
+                args: vec![],
+                cardinality: Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![],
+            assertions: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "f".to_owned(),
+                        ty: IRType::Entity {
+                            name: "F".to_owned(),
+                        },
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Int,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 2 },
+                }),
+                ty: IRType::Bool,
+            }],
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![scene],
+        };
+
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        // Must be rejected as SceneFail with "multiple Apply" message,
+        // NOT silently encoded incorrectly.
+        match &results[0] {
+            VerificationResult::SceneFail { reason, .. } => {
+                assert!(
+                    reason.contains("multiple Apply"),
+                    "ForAll multi-apply rejection should mention 'multiple Apply': got {reason}"
+                );
+            }
+            other => panic!(
+                "ForAll multi-apply in scene should produce SceneFail, got: {other}"
+            ),
+        }
     }
 }

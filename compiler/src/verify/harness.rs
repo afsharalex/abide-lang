@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use z3::ast::{Bool, Int};
+use z3::Sort;
 
 use crate::ir::types::{
     IRAction, IREntity, IREvent, IRExpr, IRSystem, IRTransParam, IRTransition, IRType, LitVal,
@@ -92,6 +93,9 @@ pub fn create_slot_pool(
                         match &field.ty {
                             IRType::Bool => smt::bool_var(&name),
                             IRType::Real | IRType::Float => smt::real_var(&name),
+                            IRType::Map { .. } | IRType::Set { .. } | IRType::Seq { .. } => {
+                                smt::array_var(&name, &field.ty)
+                            }
                             _ => smt::int_var(&name),
                         }
                     })
@@ -258,14 +262,7 @@ pub fn encode_action(
     for update in &action.updates {
         let new_val = encode_slot_expr(&ctx, &update.value, step);
         if let Some(field_next) = pool.field_at(&entity.name, slot, &update.field, step + 1) {
-            match (&new_val, field_next) {
-                (SmtValue::Int(v), SmtValue::Int(f)) => conjuncts.push(f.eq(v.clone())),
-                (SmtValue::Bool(v), SmtValue::Bool(f)) => conjuncts.push(f.eq(v.clone())),
-                (SmtValue::Real(v), SmtValue::Real(f)) => conjuncts.push(f.eq(v.clone())),
-                _ => {
-                    panic!("type mismatch in field update: value={new_val:?} field={field_next:?}")
-                }
-            }
+            conjuncts.push(smt::smt_eq(&new_val, field_next));
         }
     }
 
@@ -276,12 +273,7 @@ pub fn encode_action(
                 pool.field_at(&entity.name, slot, &field.name, step),
                 pool.field_at(&entity.name, slot, &field.name, step + 1),
             ) {
-                match (curr, next) {
-                    (SmtValue::Int(c), SmtValue::Int(n)) => conjuncts.push(n.eq(c.clone())),
-                    (SmtValue::Bool(c), SmtValue::Bool(n)) => conjuncts.push(n.eq(c.clone())),
-                    (SmtValue::Real(c), SmtValue::Real(n)) => conjuncts.push(n.eq(c.clone())),
-                    _ => panic!("type mismatch in frame constraint: curr={curr:?} next={next:?}"),
-                }
+                conjuncts.push(smt::smt_eq(curr, next));
             }
         }
     }
@@ -297,6 +289,145 @@ pub fn encode_action(
 
     let refs: Vec<&Bool> = conjuncts.iter().collect();
     Bool::and(&refs)
+}
+
+/// Encode a transition with explicit read/write variable maps.
+///
+/// Unlike `encode_action` which reads from `step` and writes to `step+1`,
+/// this function reads guards and update value expressions from `read_vars`
+/// and writes updates to `write_vars`. Fields not updated are framed from
+/// `read_vars` to `write_vars`.
+///
+/// Used for sequential Apply chaining: first Apply reads from step k and
+/// writes to intermediate vars; next Apply reads from those and writes to
+/// step k+1.
+#[allow(clippy::implicit_hasher)]
+pub fn encode_action_with_vars(
+    entity: &IREntity,
+    action: &IRTransition,
+    _slot: usize,
+    read_vars: &HashMap<String, SmtValue>,
+    write_vars: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    params: &HashMap<String, SmtValue>,
+) -> Bool {
+    // Build a context that resolves field names from read_vars
+    let mut conjuncts = Vec::new();
+
+    // Guard: evaluate against read_vars
+    let guard = eval_expr_with_vars(&action.guard, entity, read_vars, vctx, params);
+    conjuncts.push(guard.to_bool());
+
+    // Updates: evaluate value from read_vars, constrain write_vars
+    let updated_fields: Vec<String> = action.updates.iter().map(|u| u.field.clone()).collect();
+    for update in &action.updates {
+        let new_val = eval_expr_with_vars(&update.value, entity, read_vars, vctx, params);
+        if let Some(write_val) = write_vars.get(&update.field) {
+            conjuncts.push(smt::smt_eq(&new_val, write_val));
+        }
+    }
+
+    // Frame: fields NOT in updates copied from read to write
+    for field in &entity.fields {
+        if !updated_fields.contains(&field.name) {
+            if let (Some(read_val), Some(write_val)) =
+                (read_vars.get(&field.name), write_vars.get(&field.name))
+            {
+                conjuncts.push(smt::smt_eq(read_val, write_val));
+            }
+        }
+    }
+
+    if conjuncts.is_empty() {
+        return Bool::from_bool(true);
+    }
+    let refs: Vec<&Bool> = conjuncts.iter().collect();
+    Bool::and(&refs)
+}
+
+/// Evaluate an IR expression using explicit variable maps instead of `SlotPool`.
+///
+/// Resolves field names from `vars` (a map of `field_name` → `SmtValue`).
+/// Falls back to `params` for action parameters.
+#[allow(clippy::only_used_in_recursion)]
+fn eval_expr_with_vars(
+    expr: &IRExpr,
+    entity: &IREntity,
+    vars: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    params: &HashMap<String, SmtValue>,
+) -> SmtValue {
+    match expr {
+        IRExpr::Lit { value, .. } => encode_slot_literal(value),
+        IRExpr::Var { name, .. } => {
+            if let Some(val) = params.get(name) {
+                return val.clone();
+            }
+            if let Some(val) = vars.get(name) {
+                return val.clone();
+            }
+            panic!("variable not found in chained encoding: {name}")
+        }
+        IRExpr::Field {
+            expr: recv, field, ..
+        } => {
+            if let IRExpr::Var { name, .. } = recv.as_ref() {
+                // Qualified lookup in params (cross-entity or event-level refs)
+                let qualified = format!("{name}.{field}");
+                if let Some(val) = params.get(&qualified) {
+                    return val.clone();
+                }
+                // Same-entity field: only resolve from vars (intermediate state)
+                if let Some(val) = vars.get(field) {
+                    return val.clone();
+                }
+                // Check unqualified in params as last resort
+                if let Some(val) = params.get(field) {
+                    return val.clone();
+                }
+            }
+            // No blind fallback — strict resolution only
+            panic!(
+                "field {field} not found in chained encoding (vars: {:?}, params: {:?})",
+                vars.keys().collect::<Vec<_>>(),
+                params.keys().collect::<Vec<_>>()
+            )
+        }
+        IRExpr::Ctor {
+            enum_name, ctor, ..
+        } => {
+            let id = vctx.variants.id_of(enum_name, ctor);
+            smt::int_val(id)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            let l = eval_expr_with_vars(left, entity, vars, vctx, params);
+            let r = eval_expr_with_vars(right, entity, vars, vctx, params);
+            smt::binop(op, &l, &r)
+        }
+        IRExpr::UnOp { op, operand, .. } => {
+            let v = eval_expr_with_vars(operand, entity, vars, vctx, params);
+            smt::unop(op, &v)
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let arr = eval_expr_with_vars(map, entity, vars, vctx, params);
+            let k = eval_expr_with_vars(key, entity, vars, vctx, params);
+            let v = eval_expr_with_vars(value, entity, vars, vctx, params);
+            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+        }
+        IRExpr::Index { map, key, .. } => {
+            let arr = eval_expr_with_vars(map, entity, vars, vctx, params);
+            let k = eval_expr_with_vars(key, entity, vars, vctx, params);
+            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+        }
+        _ => panic!(
+            "unsupported expression in chained action encoding: {:?}",
+            std::mem::discriminant(expr)
+        ),
+    }
 }
 
 /// Encode a `create` action: find an inactive slot and activate it.
@@ -351,14 +482,7 @@ pub fn encode_create(
         for (field_name, value_expr) in create_fields {
             let val = encode_slot_expr(&ctx, value_expr, step);
             if let Some(field_next) = pool.field_at(entity_name, slot, field_name, step + 1) {
-                match (&val, field_next) {
-                    (SmtValue::Int(v), SmtValue::Int(f)) => conjuncts.push(f.eq(v.clone())),
-                    (SmtValue::Bool(v), SmtValue::Bool(f)) => conjuncts.push(f.eq(v.clone())),
-                    (SmtValue::Real(v), SmtValue::Real(f)) => conjuncts.push(f.eq(v.clone())),
-                    _ => {
-                        panic!("type mismatch in create field: value={val:?} field={field_next:?}")
-                    }
-                }
+                conjuncts.push(smt::smt_eq(&val, field_next));
             }
         }
 
@@ -375,18 +499,7 @@ pub fn encode_create(
                     if let Some(field_next) =
                         pool.field_at(entity_name, slot, &field.name, step + 1)
                     {
-                        match (&val, field_next) {
-                            (SmtValue::Int(v), SmtValue::Int(f)) => {
-                                conjuncts.push(f.eq(v.clone()));
-                            }
-                            (SmtValue::Bool(v), SmtValue::Bool(f)) => {
-                                conjuncts.push(f.eq(v.clone()));
-                            }
-                            (SmtValue::Real(v), SmtValue::Real(f)) => {
-                                conjuncts.push(f.eq(v.clone()));
-                            }
-                            _ => {} // skip if types don't match (e.g., Dynamic)
-                        }
+                        conjuncts.push(smt::smt_eq(&val, field_next));
                     }
                 }
             }
@@ -439,16 +552,7 @@ pub fn stutter_constraint(pool: &SlotPool, entities: &[IREntity], step: usize) -
                     pool.field_at(&entity.name, slot, &field.name, step),
                     pool.field_at(&entity.name, slot, &field.name, step + 1),
                 ) {
-                    match (curr, next) {
-                        (SmtValue::Int(c), SmtValue::Int(n)) => conjuncts.push(n.eq(c.clone())),
-                        (SmtValue::Bool(c), SmtValue::Bool(n)) => {
-                            conjuncts.push(n.eq(c.clone()));
-                        }
-                        (SmtValue::Real(c), SmtValue::Real(n)) => {
-                            conjuncts.push(n.eq(c.clone()));
-                        }
-                        _ => panic!("type mismatch in stutter frame: curr={curr:?} next={next:?}"),
-                    }
+                    conjuncts.push(smt::smt_eq(curr, next));
                 }
             }
         }
@@ -491,12 +595,7 @@ fn frame_untouched_slots(
                     pool.field_at(&entity.name, slot, &field.name, step),
                     pool.field_at(&entity.name, slot, &field.name, step + 1),
                 ) {
-                    match (curr, next) {
-                        (SmtValue::Int(c), SmtValue::Int(n)) => conjuncts.push(n.eq(c.clone())),
-                        (SmtValue::Bool(c), SmtValue::Bool(n)) => conjuncts.push(n.eq(c.clone())),
-                        (SmtValue::Real(c), SmtValue::Real(n)) => conjuncts.push(n.eq(c.clone())),
-                        _ => panic!("type mismatch in event frame: curr={curr:?} next={next:?}"),
-                    }
+                    conjuncts.push(smt::smt_eq(curr, next));
                 }
             }
         }
@@ -536,12 +635,7 @@ fn frame_entity_slots_except(
                 pool.field_at(&entity.name, slot, &field.name, step),
                 pool.field_at(&entity.name, slot, &field.name, step + 1),
             ) {
-                match (curr, next) {
-                    (SmtValue::Int(c), SmtValue::Int(n)) => conjuncts.push(n.eq(c.clone())),
-                    (SmtValue::Bool(c), SmtValue::Bool(n)) => conjuncts.push(n.eq(c.clone())),
-                    (SmtValue::Real(c), SmtValue::Real(n)) => conjuncts.push(n.eq(c.clone())),
-                    _ => panic!("type mismatch in slot frame: curr={curr:?} next={next:?}"),
-                }
+                conjuncts.push(smt::smt_eq(curr, next));
             }
         }
     }
@@ -885,6 +979,9 @@ fn encode_event_inner(
     // Track which entity types have ALL their slots handled internally
     // (Choose/ForAll/bare Apply do their own per-slot framing).
     let mut touched: HashSet<(String, usize)> = HashSet::new();
+    // Counter for unique chain instance IDs (prevents aliasing when
+    // multiple Choose blocks reuse the same var name in one step).
+    let mut chain_id: usize = 0;
 
     // Build event parameter Z3 variables once per step, share across all contexts.
     // If override_params is provided (e.g., from CrossCall), use those instead
@@ -974,37 +1071,227 @@ fn encode_event_inner(
                     let filt = encode_slot_expr(&ctx, filter, step);
                     slot_conjuncts.push(filt.to_bool());
 
-                    // Apply nested ops — slot is already known from Choose loop.
-                    for op in ops {
-                        match op {
-                            IRAction::Apply {
-                                target: _,
-                                transition,
-                                args,
-                                refs: apply_refs,
-                            } => {
-                                if let Some(ent) = entity_ir {
-                                    if let Some(trans) =
-                                        ent.transitions.iter().find(|t| t.name == *transition)
-                                    {
-                                        let action_params =
-                                            build_apply_params(&ctx, trans, args, apply_refs, step);
-                                        let action_formula = encode_action(
-                                            pool,
-                                            vctx,
-                                            ent,
-                                            trans,
-                                            slot,
-                                            step,
-                                            &action_params,
-                                        );
-                                        slot_conjuncts.push(action_formula);
+                    // Apply nested ops — detect multi-apply chains and use
+                    // intermediate variables for sequential composition.
+                    if let Some(ent) = entity_ir {
+                        // Collect Apply ops targeting the Choose-bound entity
+                        let same_entity_applies: Vec<_> = ops
+                            .iter()
+                            .filter_map(|op| {
+                                if let IRAction::Apply {
+                                    target,
+                                    transition,
+                                    args,
+                                    refs: apply_refs,
+                                } = op
+                                {
+                                    if target == var {
+                                        return Some((transition, args, apply_refs));
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+
+                        if same_entity_applies.len() <= 1 {
+                            // Single Apply — use standard encoding
+                            for op in ops {
+                                match op {
+                                    IRAction::Apply {
+                                        transition,
+                                        args,
+                                        refs: apply_refs,
+                                        ..
+                                    } => {
+                                        if let Some(trans) =
+                                            ent.transitions.iter().find(|t| t.name == *transition)
+                                        {
+                                            let action_params = build_apply_params(
+                                                &ctx,
+                                                trans,
+                                                args,
+                                                apply_refs,
+                                                step,
+                                            );
+                                            let action_formula = encode_action(
+                                                pool,
+                                                vctx,
+                                                ent,
+                                                trans,
+                                                slot,
+                                                step,
+                                                &action_params,
+                                            );
+                                            slot_conjuncts.push(action_formula);
+                                        }
+                                    }
+                                    _ => {
+                                        unimplemented!(
+                                            "nested action in Choose not yet supported: {op:?}"
+                                        )
                                     }
                                 }
                             }
-                            _ => {
-                                unimplemented!("nested action in Choose not yet supported: {op:?}")
+                        } else {
+                            // Multi-apply chain — create intermediate variables.
+                            // Chain: step_k → inter_0 → inter_1 → ... → step_k+1
+                            let n_applies = same_entity_applies.len();
+
+                            // Build variable maps for each stage
+                            // Stage 0 reads: step k fields
+                            // Stage i writes: intermediate_i (or step k+1 if last)
+                            let read_step_k: HashMap<String, SmtValue> = ent
+                                .fields
+                                .iter()
+                                .filter_map(|f| {
+                                    pool.field_at(ent_name, slot, &f.name, step)
+                                        .map(|v| (f.name.clone(), v.clone()))
+                                })
+                                .collect();
+
+                            let write_step_k1: HashMap<String, SmtValue> = ent
+                                .fields
+                                .iter()
+                                .filter_map(|f| {
+                                    pool.field_at(ent_name, slot, &f.name, step + 1)
+                                        .map(|v| (f.name.clone(), v.clone()))
+                                })
+                                .collect();
+
+                            // Create N-1 intermediate variable maps
+                            let intermediates: Vec<HashMap<String, SmtValue>> = (0..n_applies - 1)
+                                .map(|i| {
+                                    ent.fields
+                                        .iter()
+                                        .map(|f| {
+                                            // Fully scoped: entity, slot, field, step,
+                                            // chain instance ID, and stage index.
+                                            // Prevents aliasing across steps, events,
+                                            // and multiple Choose blocks with same var name.
+                                            let name = format!(
+                                                "{}_s{}_{}_t{step}_ch{chain_id}_inter{i}",
+                                                ent_name, slot, f.name
+                                            );
+                                            let var = match &f.ty {
+                                                IRType::Bool => smt::bool_var(&name),
+                                                IRType::Real | IRType::Float => {
+                                                    smt::real_var(&name)
+                                                }
+                                                IRType::Map { .. }
+                                                | IRType::Set { .. }
+                                                | IRType::Seq { .. } => {
+                                                    smt::array_var(&name, &f.ty)
+                                                }
+                                                _ => smt::int_var(&name),
+                                            };
+                                            (f.name.clone(), var)
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+
+                            for (i, (transition, args, apply_refs)) in
+                                same_entity_applies.iter().enumerate()
+                            {
+                                let Some(trans) =
+                                    ent.transitions.iter().find(|t| t.name == **transition)
+                                else {
+                                    continue;
+                                };
+
+                                // Read from: step k (first) or intermediate_{i-1}
+                                let read_from = if i == 0 {
+                                    &read_step_k
+                                } else {
+                                    &intermediates[i - 1]
+                                };
+
+                                // Build action params from the intermediate state.
+                                // First Apply uses standard build_apply_params (step k).
+                                // Later Applies evaluate args AND refs from intermediate vars.
+                                let action_params = if i == 0 {
+                                    build_apply_params(&ctx, trans, args, apply_refs, step)
+                                } else {
+                                    let mut params = HashMap::new();
+                                    // Positional params
+                                    for (pi, param) in trans.params.iter().enumerate() {
+                                        if let Some(arg_expr) = args.get(pi) {
+                                            let val = eval_expr_with_vars(
+                                                arg_expr,
+                                                ent,
+                                                read_from,
+                                                vctx,
+                                                &ctx.params,
+                                            );
+                                            params.insert(param.name.clone(), val);
+                                        }
+                                    }
+                                    // Refs: resolve from intermediate vars
+                                    for (ri, tref) in trans.refs.iter().enumerate() {
+                                        if let Some(ref_name) = apply_refs.get(ri) {
+                                            if let Some(val) = read_from.get(ref_name) {
+                                                params.insert(tref.name.clone(), val.clone());
+                                            }
+                                        }
+                                    }
+                                    params
+                                };
+
+                                // Write to: intermediate_i (middle) or step k+1 (last)
+                                let write_to = if i == n_applies - 1 {
+                                    &write_step_k1
+                                } else {
+                                    &intermediates[i]
+                                };
+
+                                let formula = encode_action_with_vars(
+                                    ent,
+                                    trans,
+                                    slot,
+                                    read_from,
+                                    write_to,
+                                    vctx,
+                                    &action_params,
+                                );
+                                slot_conjuncts.push(formula);
                             }
+
+                            // Active flag: must be active at step k AND stays active at step k+1
+                            // (matches single-apply semantics in encode_action)
+                            if let (
+                                Some(SmtValue::Bool(act_curr)),
+                                Some(SmtValue::Bool(act_next)),
+                            ) = (
+                                pool.active_at(ent_name, slot, step),
+                                pool.active_at(ent_name, slot, step + 1),
+                            ) {
+                                slot_conjuncts.push(act_curr.clone());
+                                slot_conjuncts.push(act_next.clone());
+                            }
+
+                            // Handle non-Apply ops in the Choose (Create, CrossCall, etc.)
+                            for op in ops {
+                                match op {
+                                    IRAction::Apply { target, .. } if target == var => {
+                                        // Already handled above
+                                    }
+                                    IRAction::Apply { target, .. } => {
+                                        // Apply targeting a different variable inside a Choose
+                                        // is malformed IR — the Apply target should match
+                                        // the Choose-bound variable.
+                                        panic!(
+                                            "Apply target {target} does not match Choose var {var} \
+                                             — cross-target Apply in Choose is not supported"
+                                        );
+                                    }
+                                    _ => {
+                                        unimplemented!(
+                                            "nested action in Choose not yet supported: {op:?}"
+                                        )
+                                    }
+                                }
+                            }
+                            chain_id += 1; // unique ID per multi-apply chain
                         }
                     }
 
@@ -1274,20 +1561,7 @@ fn encode_event_inner(
                                     pool.field_at(ent_name, slot, &field.name, step),
                                     pool.field_at(ent_name, slot, &field.name, step + 1),
                                 ) {
-                                    match (curr, next) {
-                                        (SmtValue::Int(c), SmtValue::Int(n)) => {
-                                            frame_parts.push(n.eq(c.clone()));
-                                        }
-                                        (SmtValue::Bool(c), SmtValue::Bool(n)) => {
-                                            frame_parts.push(n.eq(c.clone()));
-                                        }
-                                        (SmtValue::Real(c), SmtValue::Real(n)) => {
-                                            frame_parts.push(n.eq(c.clone()));
-                                        }
-                                        _ => panic!(
-                                            "type mismatch in ForAll inactive-slot frame: curr={curr:?} next={next:?}"
-                                        ),
-                                    }
+                                    frame_parts.push(smt::smt_eq(curr, next));
                                 }
                             }
                         }
@@ -1452,6 +1726,7 @@ pub fn transition_constraints(
 ///
 /// Variable and field references resolve to `entity_s{slot}_{field}_t{step}`.
 /// Parameters (from action/event signatures) are checked first, then slot fields.
+#[allow(clippy::too_many_lines)]
 pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
     match expr {
         IRExpr::Lit { value, .. } => encode_slot_literal(value),
@@ -1525,6 +1800,95 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
         }
 
         IRExpr::Prime { expr } => encode_slot_expr(ctx, expr, step + 1),
+
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let arr = encode_slot_expr(ctx, map, step);
+            let k = encode_slot_expr(ctx, key, step);
+            let v = encode_slot_expr(ctx, value, step);
+            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+        }
+
+        IRExpr::Index { map, key, .. } => {
+            let arr = encode_slot_expr(ctx, map, step);
+            let k = encode_slot_expr(ctx, key, step);
+            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+        }
+
+        IRExpr::MapLit { entries, ty } => {
+            // Build constant array with default value, then store each entry
+            let (key_ty, val_ty) = match ty {
+                IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
+                _ => panic!("MapLit with non-Map type: {ty:?}"),
+            };
+            let key_sort = smt::ir_type_to_sort(key_ty);
+            let default_val = smt::default_dynamic(val_ty);
+            let mut arr = z3::ast::Array::const_array(&key_sort, &default_val);
+            for entry in entries {
+                let k = encode_slot_expr(ctx, &entry.0, step);
+                let v = encode_slot_expr(ctx, &entry.1, step);
+                arr = arr.store(&k.to_dynamic(), &v.to_dynamic());
+            }
+            SmtValue::Array(arr)
+        }
+
+        IRExpr::SetLit { elements, ty } => {
+            // Set as characteristic function: Array<T, Bool>
+            let elem_ty = match ty {
+                IRType::Set { element } => element.as_ref(),
+                _ => panic!("SetLit with non-Set type: {ty:?}"),
+            };
+            let elem_sort = smt::ir_type_to_sort(elem_ty);
+            let false_val = smt::bool_val(false).to_dynamic();
+            let mut arr = z3::ast::Array::const_array(&elem_sort, &false_val);
+            let true_val = smt::bool_val(true).to_dynamic();
+            for elem in elements {
+                let e = encode_slot_expr(ctx, elem, step);
+                arr = arr.store(&e.to_dynamic(), &true_val);
+            }
+            SmtValue::Array(arr)
+        }
+
+        IRExpr::SeqLit { elements, ty } => {
+            // Seq as int-indexed array: Array<Int, T>
+            let elem_ty = match ty {
+                IRType::Seq { element } => element.as_ref(),
+                _ => panic!("SeqLit with non-Seq type: {ty:?}"),
+            };
+            let default_val = smt::default_dynamic(elem_ty);
+            let mut arr = z3::ast::Array::const_array(&Sort::int(), &default_val);
+            for (i, elem) in elements.iter().enumerate() {
+                let idx = smt::int_val(i64::try_from(i).unwrap_or(0)).to_dynamic();
+                let v = encode_slot_expr(ctx, elem, step);
+                arr = arr.store(&idx, &v.to_dynamic());
+            }
+            SmtValue::Array(arr)
+        }
+
+        IRExpr::Card { expr: inner } => match inner.as_ref() {
+            IRExpr::SetLit { elements, .. } => {
+                let unique: std::collections::HashSet<String> = elements
+                    .iter()
+                    .map(|e| format!("{e:?}"))
+                    .collect();
+                smt::int_val(i64::try_from(unique.len()).unwrap_or(0))
+            }
+            IRExpr::SeqLit { elements, .. } => {
+                smt::int_val(i64::try_from(elements.len()).unwrap_or(0))
+            }
+            IRExpr::MapLit { entries, .. } => {
+                let unique_keys: std::collections::HashSet<String> = entries
+                    .iter()
+                    .map(|(k, _)| format!("{k:?}"))
+                    .collect();
+                smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0))
+            }
+            _ => panic!(
+                "unsupported cardinality in action context — \
+                 should be caught by pre-check: {inner:?}"
+            ),
+        },
 
         other => unimplemented!("slot expression encoding not yet supported: {other:?}"),
     }

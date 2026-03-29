@@ -22,21 +22,25 @@ The compiler uses subcommands. Each takes a single `.abide` source file.
 
 | Flag | Description |
 |------|-------------|
-| `--bounded-only` | Skip induction (Tier 1), only run BMC |
-| `--unbounded-only` | Skip BMC (Tier 2), only try induction |
+| `--bounded-only` | Skip induction and IC3 (Tier 1), only run BMC |
+| `--unbounded-only` | Skip BMC (Tier 2), only try induction and IC3 |
 | `--induction-timeout <N>` | Induction timeout in seconds (default: 5) |
 | `--bmc-timeout <N>` | BMC timeout in seconds (default: 0 = no timeout) |
+| `--ic3-timeout <N>` | IC3/PDR timeout in seconds (default: 10) |
+| `--no-ic3` | Skip IC3/PDR verification (for speed) |
+| `--no-prop-verify` | Skip automatic prop verification |
 | `--progress` | Print progress messages to stderr during verification |
 
 The `--bounded-only` and `--unbounded-only` flags are mutually exclusive.
 
 ### Examples
 
-**Verify a spec with tiered dispatch (induction → BMC fallback):**
+**Verify a spec with tiered dispatch (induction → IC3 → BMC fallback):**
 
 ```sh
 $ abide verify examples/order.abide
 PROVED  order_safety (method: 1-induction, 35ms)
+PROVED  complex_invariant (method: IC3/PDR, 1200ms)
 CHECKED liveness_check (depth: 10, 200ms)
 PASS    happy_path (3ms)
 ```

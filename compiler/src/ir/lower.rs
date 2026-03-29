@@ -138,6 +138,7 @@ fn lower_fn(ef: &E::EFn) -> IRFunction {
         name: ef.name.clone(),
         ty: fn_ty,
         body,
+        prop_target: None,
     }
 }
 
@@ -165,6 +166,7 @@ fn lower_pred(ep: &E::EPred) -> IRFunction {
         name: ep.name.clone(),
         ty: fn_ty,
         body,
+        prop_target: None,
     }
 }
 
@@ -175,6 +177,7 @@ fn lower_prop(ep: &E::EProp) -> IRFunction {
         name: ep.name.clone(),
         ty: IRType::Bool,
         body: lower_expr(&ep.body),
+        prop_target: ep.target.clone(),
     }
 }
 
@@ -632,26 +635,16 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                 },
             )
         }
-        E::EExpr::In(ty, e, s) => IRExpr::BinOp {
-            op: "OpEq".to_owned(),
-            left: Box::new(IRExpr::App {
-                func: Box::new(IRExpr::Var {
-                    name: "contains".to_owned(),
-                    ty: IRType::Bool,
-                }),
-                arg: Box::new(lower_expr(s)),
+        E::EExpr::In(_ty, e, s) => {
+            // `e in S` → `Index(S, e)` which returns Bool (Set<T> = Array<T, Bool>)
+            IRExpr::Index {
+                map: Box::new(lower_expr(s)),
+                key: Box::new(lower_expr(e)),
                 ty: IRType::Bool,
-            }),
-            right: Box::new(lower_expr(e)),
-            ty: lower_ty(ty),
-        },
-        E::EExpr::Card(ty, expr) => IRExpr::App {
-            func: Box::new(IRExpr::Var {
-                name: "card".to_owned(),
-                ty: lower_ty(ty),
-            }),
-            arg: Box::new(lower_expr(expr)),
-            ty: lower_ty(ty),
+            }
+        }
+        E::EExpr::Card(_ty, expr) => IRExpr::Card {
+            expr: Box::new(lower_expr(expr)),
         },
         E::EExpr::Pipe(ty, a, f) => IRExpr::App {
             func: Box::new(lower_expr(f)),

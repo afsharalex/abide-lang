@@ -54,7 +54,7 @@ abide parse order.abide
 
 If the spec parses correctly, the compiler prints the AST. If there's a syntax error, it points to the offending line.
 
-To verify the spec (bounded model checking + induction):
+To verify the spec (induction, IC3/PDR, and bounded model checking):
 
 ```sh
 abide verify order.abide
@@ -89,9 +89,18 @@ scene successful_payment for Commerce {
 }
 ```
 
-The `verify` block asks the bounded model checker to explore up to 50 steps of the Commerce system and confirm the assertion holds on every reachable state. Run `abide verify <file>` to execute it.
+The `verify` block asks the checker to explore up to 50 steps of the Commerce system. It tries induction and IC3/PDR first (unbounded proof), then falls back to bounded model checking. Run `abide verify <file>` to execute it.
 
 The `scene` block constructs a concrete scenario: given an order in a specific state, when a specific event fires, then a specific outcome holds. Scenes are existential witnesses — they demonstrate that a behavior is possible.
+
+Abide also supports collection-typed fields (`Map<K,V>`, `Set<T>`, `Seq<T>`) with map update (`m[k := v]`), index access (`m[k]`), set comprehension (`{ x: T where P(x) }`), and cardinality (`#S`). These are verified using Z3's array theory.
+
+Properties declared with `prop` are automatically verified — declaring a property IS asserting it must hold:
+
+```abide
+prop order_safety for Commerce =
+  always all o: Order | o.total >= 0
+```
 
 ## Next Steps
 

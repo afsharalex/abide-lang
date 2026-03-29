@@ -136,7 +136,7 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             }
         }
         IRExpr::Lit { .. } | IRExpr::Ctor { .. } | IRExpr::Sorry | IRExpr::Todo => {}
-        IRExpr::Field { expr, .. } => free_vars_inner(expr, bound, fv),
+        IRExpr::Field { expr, .. } | IRExpr::Card { expr } => free_vars_inner(expr, bound, fv),
         IRExpr::BinOp { left, right, .. } => {
             free_vars_inner(left, bound, fv);
             free_vars_inner(right, bound, fv);
@@ -614,6 +614,9 @@ fn substitute_var_inner(
                 .collect(),
             ty,
         },
+        IRExpr::Card { expr } => IRExpr::Card {
+            expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+        },
     }
 }
 
@@ -854,6 +857,7 @@ mod tests {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
                 },
+                prop_target: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -901,6 +905,7 @@ mod tests {
                         ty: IRType::Bool,
                     }),
                 },
+                prop_target: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -948,6 +953,7 @@ mod tests {
                         value: LitVal::Bool { value: true },
                     }),
                 },
+                prop_target: None,
             }],
             entities: vec![],
             systems: vec![],

@@ -15,7 +15,9 @@ use std::collections::{HashMap, HashSet};
 
 use z3::{Fixedpoint, FuncDecl, Params, SatResult, Sort};
 
-use crate::ir::types::{IRAction, IREntity, IRExpr, IRProgram, IRSystem, IRType, LitVal};
+use crate::ir::types::{
+    IRAction, IRCreateField, IREntity, IRExpr, IRProgram, IRSystem, IRTransition, IRType, LitVal,
+};
 
 use super::context::VerifyContext;
 
@@ -25,9 +27,18 @@ pub enum Ic3Result {
     /// Property proved — IC3 found an inductive invariant.
     Proved,
     /// Property violated — a reachable error state exists.
-    Violated,
+    /// Carries a counterexample trace (may be empty if extraction failed).
+    Violated(Vec<Ic3TraceStep>),
     /// IC3 could not determine (timeout, unsupported encoding, or incompleteness).
     Unknown(String),
+}
+
+/// A single step in an IC3 counterexample trace.
+#[derive(Debug, Clone)]
+pub struct Ic3TraceStep {
+    pub step: usize,
+    /// Field assignments: `(entity_name, field_name, value_string)`.
+    pub assignments: Vec<(String, String, String)>,
 }
 
 /// Try to prove a safety property for a single-entity system using IC3/PDR.
@@ -49,6 +60,7 @@ pub fn try_ic3_single_entity(
 
     let mut params = Params::new();
     params.set_symbol("engine", "spacer");
+    params.set_bool("xform.slice", false); // preserve column order for trace extraction
     if timeout_ms > 0 {
         #[allow(clippy::cast_possible_truncation)]
         params.set_u32("timeout", timeout_ms.min(u64::from(u32::MAX)) as u32);
@@ -74,7 +86,18 @@ pub fn try_ic3_single_entity(
     let error_query = error_rel.apply(&[]);
     match fp.query(&error_query) {
         SatResult::Unsat => Ic3Result::Proved,
-        SatResult::Sat => Ic3Result::Violated,
+        SatResult::Sat => {
+            // Build column layout: fields + active flag (matches CHC State relation)
+            let mut columns: Vec<TraceColumn> = entity
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(fi, f)| (entity.name.clone(), f.name.clone(), fi))
+                .collect();
+            columns.push((entity.name.clone(), "active".to_owned(), usize::MAX));
+            let trace = extract_trace_from_answer(&fp, &columns);
+            Ic3Result::Violated(trace)
+        }
         SatResult::Unknown => {
             let reason = fp.get_reason_unknown();
             Ic3Result::Unknown(reason)
@@ -105,6 +128,7 @@ pub fn try_ic3_multi_slot(
 
     let mut params = Params::new();
     params.set_symbol("engine", "spacer");
+    params.set_bool("xform.slice", false);
     if timeout_ms > 0 {
         #[allow(clippy::cast_possible_truncation)]
         params.set_u32("timeout", timeout_ms.min(u64::from(u32::MAX)) as u32);
@@ -126,7 +150,11 @@ pub fn try_ic3_multi_slot(
     let error_query = error_rel.apply(&[]);
     match fp.query(&error_query) {
         SatResult::Unsat => Ic3Result::Proved,
-        SatResult::Sat => Ic3Result::Violated,
+        SatResult::Sat => {
+            let columns = build_multi_slot_columns(entity, n_slots);
+            let trace = extract_trace_from_answer(&fp, &columns);
+            Ic3Result::Violated(trace)
+        }
         SatResult::Unknown => {
             let reason = fp.get_reason_unknown();
             Ic3Result::Unknown(reason)
@@ -154,11 +182,19 @@ pub fn try_ic3_system(
 
     let mut params = Params::new();
     params.set_symbol("engine", "spacer");
+    params.set_bool("xform.slice", false); // preserve column order for trace extraction
     if timeout_ms > 0 {
         #[allow(clippy::cast_possible_truncation)]
         params.set_u32("timeout", timeout_ms.min(u64::from(u32::MAX)) as u32);
     }
     fp.set_params(&params);
+
+    // Validate that all requested system names exist in the IR
+    for name in system_names {
+        if !ir.systems.iter().any(|s| s.name == *name) {
+            return Ic3Result::Unknown(format!("system {name} not found in IR"));
+        }
+    }
 
     // Expand scope to include CrossCall-reachable systems
     let mut all_system_names: Vec<String> = system_names.to_vec();
@@ -212,7 +248,11 @@ pub fn try_ic3_system(
     let error_query = error_rel.apply(&[]);
     match fp.query(&error_query) {
         SatResult::Unsat => Ic3Result::Proved,
-        SatResult::Sat => Ic3Result::Violated,
+        SatResult::Sat => {
+            let columns = build_system_columns(&relevant_entities, slots_per_entity);
+            let trace = extract_trace_from_answer(&fp, &columns);
+            Ic3Result::Violated(trace)
+        }
         SatResult::Unknown => {
             let reason = fp.get_reason_unknown();
             Ic3Result::Unknown(reason)
@@ -243,6 +283,282 @@ struct SlotColumn {
     var_name: String,
     /// SMT-LIB2 sort name
     sort_name: String,
+}
+
+/// Column metadata for trace extraction: `(entity_name, field_name, field_index)`.
+/// The last column per slot is the `active` flag `(entity_name, "active", usize::MAX)`.
+type TraceColumn = (String, String, usize);
+
+/// Build column layout for system-level trace extraction.
+fn build_system_columns(
+    entities: &[&IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+) -> Vec<TraceColumn> {
+    let mut columns = Vec::new();
+    for entity in entities {
+        let n_slots = slots_per_entity.get(&entity.name).copied().unwrap_or(1);
+        for slot in 0..n_slots {
+            let ent_label = if n_slots > 1 {
+                format!("{}[{}]", entity.name, slot)
+            } else {
+                entity.name.clone()
+            };
+            for (fi, f) in entity.fields.iter().enumerate() {
+                columns.push((ent_label.clone(), f.name.clone(), fi));
+            }
+            columns.push((ent_label, "active".to_owned(), usize::MAX));
+        }
+    }
+    columns
+}
+
+/// Build column layout for multi-slot single-entity trace extraction.
+fn build_multi_slot_columns(entity: &IREntity, n_slots: usize) -> Vec<TraceColumn> {
+    let mut columns = Vec::new();
+    for slot in 0..n_slots {
+        let ent_label = if n_slots > 1 {
+            format!("{}[{}]", entity.name, slot)
+        } else {
+            entity.name.clone()
+        };
+        for (fi, f) in entity.fields.iter().enumerate() {
+            columns.push((ent_label.clone(), f.name.clone(), fi));
+        }
+        columns.push((ent_label, "active".to_owned(), usize::MAX));
+    }
+    columns
+}
+
+/// Extract a counterexample trace from Z3 Spacer's answer after a SAT result.
+///
+/// Parses ground `(State v1 v2 ... vN)` applications from the derivation tree.
+/// Returns empty vec if answer is unavailable or unparseable.
+fn extract_trace_from_answer(fp: &Fixedpoint, columns: &[TraceColumn]) -> Vec<Ic3TraceStep> {
+    let Some(answer) = fp.get_answer() else {
+        return Vec::new();
+    };
+
+    let answer_str = format!("{answer}");
+    parse_state_snapshots(&answer_str, columns)
+}
+
+// ── S-expression parser for Z3 answer derivation ────────────────────
+
+/// A minimal s-expression token.
+#[derive(Debug, Clone, PartialEq)]
+enum SExpr {
+    Atom(String),
+    List(Vec<SExpr>),
+}
+
+/// Tokenize an s-expression string into a tree.
+///
+/// Handles nested parentheses, atoms (identifiers, numbers, booleans),
+/// and negative literals like `(- 1)`.
+fn parse_sexpr(input: &str) -> Option<SExpr> {
+    let tokens = tokenize_sexpr(input);
+    let mut pos = 0;
+    let result = parse_sexpr_tokens(&tokens, &mut pos)?;
+    // Reject trailing garbage — all tokens must be consumed
+    if pos != tokens.len() {
+        return None;
+    }
+    Some(result)
+}
+
+fn tokenize_sexpr(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '(' {
+            tokens.push("(".to_owned());
+            chars.next();
+        } else if c == ')' {
+            tokens.push(")".to_owned());
+            chars.next();
+        } else {
+            // Atom: collect until whitespace or paren
+            let mut atom = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() || ch == '(' || ch == ')' {
+                    break;
+                }
+                atom.push(ch);
+                chars.next();
+            }
+            if !atom.is_empty() {
+                tokens.push(atom);
+            }
+        }
+    }
+    tokens
+}
+
+fn parse_sexpr_tokens(tokens: &[String], pos: &mut usize) -> Option<SExpr> {
+    if *pos >= tokens.len() {
+        return None;
+    }
+    if tokens[*pos] == ")" {
+        // Unmatched closing paren — malformed input
+        return None;
+    }
+    if tokens[*pos] == "(" {
+        *pos += 1;
+        let mut children = Vec::new();
+        while *pos < tokens.len() && tokens[*pos] != ")" {
+            let child = parse_sexpr_tokens(tokens, pos)?;
+            children.push(child);
+        }
+        if *pos >= tokens.len() {
+            // Unclosed paren — malformed input
+            return None;
+        }
+        *pos += 1; // consume ')'
+        Some(SExpr::List(children))
+    } else {
+        let atom = tokens[*pos].clone();
+        *pos += 1;
+        Some(SExpr::Atom(atom))
+    }
+}
+
+/// Check if an s-expression atom is a ground value (integer, boolean, or negative literal).
+fn is_ground_value(expr: &SExpr) -> bool {
+    match expr {
+        SExpr::Atom(s) => {
+            s == "true"
+                || s == "false"
+                || s.chars().next().is_some_and(|c| c.is_ascii_digit())
+                || (s.starts_with('-')
+                    && s.len() > 1
+                    && s[1..].chars().all(|c| c.is_ascii_digit()))
+        }
+        SExpr::List(children) => match children.first() {
+            // (- X) — negation of a ground value
+            Some(SExpr::Atom(op)) if op == "-" && children.len() == 2 => {
+                is_ground_value(&children[1])
+            }
+            // (/ X Y) — rational: both operands must be ground
+            Some(SExpr::Atom(op)) if op == "/" && children.len() == 3 => {
+                is_ground_value(&children[1]) && is_ground_value(&children[2])
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Convert an s-expression value to a display string.
+///
+/// Recurses into nested forms: `(- (/ 1 2))` → `"-1/2"`.
+fn sexpr_value_to_string(expr: &SExpr) -> String {
+    match expr {
+        SExpr::Atom(s) => s.clone(),
+        SExpr::List(children) => match children.first() {
+            // (- X) → "-{X}"
+            Some(SExpr::Atom(op)) if op == "-" && children.len() == 2 => {
+                format!("-{}", sexpr_value_to_string(&children[1]))
+            }
+            // (/ X Y) → "{X}/{Y}"
+            Some(SExpr::Atom(op)) if op == "/" && children.len() == 3 => {
+                format!(
+                    "{}/{}",
+                    sexpr_value_to_string(&children[1]),
+                    sexpr_value_to_string(&children[2])
+                )
+            }
+            _ => format!("{expr:?}"),
+        },
+    }
+}
+
+/// Extract ground `(State v1 v2 ... vN)` applications from the derivation tree.
+///
+/// Walks the s-expression tree depth-first (children before parent). Spacer's
+/// derivation nests earlier states deeper: the initial state is the innermost
+/// `(asserted (State ...))`, each `hyper-res` step produces the next state as
+/// its conclusion (last child). Depth-first traversal therefore yields states
+/// in chronological order for linear derivations.
+///
+/// **Limitation:** If the derivation has branches (e.g., multiple independent
+/// rule applications merged), states from different branches may interleave.
+/// Our CHC encoding produces linear chains (each rule takes one State and
+/// produces one State), so this is not expected in practice.
+fn collect_ground_states(expr: &SExpr, n_cols: usize, out: &mut Vec<Vec<SExpr>>) {
+    if let SExpr::List(children) = expr {
+        // Recurse into children first (depth-first = derivation order)
+        for child in children {
+            collect_ground_states(child, n_cols, out);
+        }
+
+        // Check if this is (State v1 v2 ... vN) with exactly n_cols ground args
+        if children.len() == n_cols + 1 {
+            if let SExpr::Atom(head) = &children[0] {
+                if head == "State" {
+                    let args = &children[1..];
+                    if args.iter().all(is_ground_value) {
+                        out.push(args.to_vec());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse the Z3 Spacer answer into IC3 trace steps.
+///
+/// Uses proper s-expression parsing to handle nested terms like `(- 1)`.
+/// Extracts ground State applications in derivation order (depth-first).
+fn parse_state_snapshots(answer: &str, columns: &[TraceColumn]) -> Vec<Ic3TraceStep> {
+    let n_cols = columns.len();
+    if n_cols == 0 {
+        return Vec::new();
+    }
+
+    let Some(tree) = parse_sexpr(answer) else {
+        return Vec::new();
+    };
+
+    let mut ground_states: Vec<Vec<SExpr>> = Vec::new();
+    collect_ground_states(&tree, n_cols, &mut ground_states);
+
+    // Deduplicate consecutive identical states (stutter rule may repeat)
+    ground_states.dedup_by(|a, b| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| sexpr_value_to_string(x) == sexpr_value_to_string(y))
+    });
+
+    let mut steps = Vec::new();
+    for (step_idx, state_vals) in ground_states.iter().enumerate() {
+        let mut assignments = Vec::new();
+        for (i, val) in state_vals.iter().enumerate() {
+            let (ref ent, ref field, fi) = columns[i];
+            if fi == usize::MAX {
+                continue; // active flag
+            }
+            // Check if entity slot is active
+            let active_col = (0..n_cols).find(|&j| {
+                columns[j].0 == *ent && columns[j].2 == usize::MAX && j > i
+            });
+            let is_active = active_col
+                .and_then(|j| state_vals.get(j))
+                .is_some_and(|v| matches!(v, SExpr::Atom(s) if s == "true"));
+            if is_active {
+                assignments.push((ent.clone(), field.clone(), sexpr_value_to_string(val)));
+            }
+        }
+        if !assignments.is_empty() {
+            steps.push(Ic3TraceStep {
+                step: step_idx,
+                assignments,
+            });
+        }
+    }
+
+    steps
 }
 
 /// Build unified CHC encoding for multiple entity types and systems.
@@ -321,8 +637,9 @@ fn build_system_chc(
     ));
 
     // ── Entity transition rules ────────────────────────────────────
-    // For each entity type, for each slot, for each transition:
-    // guard(slot) ∧ active(slot) → update(slot) ∧ frame(everything else)
+    // Only emitted when no systems are present (pure entity-level IC3).
+    // When systems exist, transitions are constrained by system event rules.
+    if systems.is_empty() {
     for entity in entities {
         let n_slots = slots_per_entity.get(&entity.name).copied().unwrap_or(1);
         for slot in 0..n_slots {
@@ -413,13 +730,19 @@ fn build_system_chc(
             ));
         }
     }
+    } // if systems.is_empty()
 
     // ── System event rules ──────────────────────────────────────────
-    // Encode system events as composite CHC rules: event guard + Choose filter + Apply transition.
-    // This adds event-level constraints (guards, Choose filters) on top of entity transitions.
-    // CrossCall effects are encoded by including the callee's Create actions.
+    // Encode system events as composite CHC rules via recursive action tree walk.
+    // Choose/ForAll/Apply/Create/CrossCall are all handled with full context
+    // guard propagation. CrossCall targets are recursively encoded (not just Creates).
     for system in systems {
         for event in &system.events {
+            // Fresh visited set per event tree — cycles within one event's
+            // CrossCall graph are detected, but the same event can appear
+            // in different top-level event trees.
+            let mut visited = HashSet::new();
+            visited.insert((system.name.clone(), event.name.clone()));
             encode_event_chc(
                 &mut chc,
                 &event.body,
@@ -430,6 +753,8 @@ fn build_system_chc(
                 &all_vars_str,
                 systems,
                 &format!("{}_{}", system.name, event.name),
+                &[],
+                &mut visited,
             )?;
         }
     }
@@ -572,14 +897,23 @@ fn negate_guard_sys_two(
 
 /// Encode a system event body as CHC transition rules.
 ///
-/// Walks the event action tree (Choose/Apply/Create/CrossCall) and generates
-/// composite rules that combine event guard + Choose filter + transition effects.
-/// Each Choose+Apply pattern generates one rule per slot.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::format_push_string
-)]
+/// Walks the event action tree (Choose/Apply/Create/CrossCall/ForAll) and
+/// generates composite rules that combine event guard + Choose filter +
+/// transition effects. Context guards from parent Choose/ForAll blocks are
+/// propagated through `extra_guards` to ensure callee rules are properly
+/// constrained.
+///
+/// **`ForAll` encoding note:** `ForAll` is encoded as per-slot independent
+/// transitions (one rule per active slot), not a single combined rule that
+/// updates all slots simultaneously. This is an over-approximation — IC3
+/// may see intermediate states where some but not all slots are updated.
+/// This is sound for safety proofs (more reachable states = harder to prove
+/// = if proved, the property holds in the real system too).
+///
+/// **Soundness:** All encoding errors propagate — never silently approximates.
+/// Missing transitions, systems, or events produce hard errors. Cyclic
+/// `CrossCall` graphs are detected via `visited` and produce errors.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::format_push_string)]
 fn encode_event_chc(
     chc: &mut String,
     actions: &[IRAction],
@@ -590,14 +924,16 @@ fn encode_event_chc(
     all_vars_str: &str,
     all_systems: &[&IRSystem],
     rule_prefix: &str,
+    extra_guards: &[String],
+    visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
     for (ai, action) in actions.iter().enumerate() {
         match action {
             IRAction::Choose {
+                var,
                 entity: ent_name,
                 filter,
                 ops,
-                ..
             } => {
                 let entity = entities
                     .iter()
@@ -605,251 +941,40 @@ fn encode_event_chc(
                     .ok_or_else(|| format!("entity {ent_name} not found"))?;
                 let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
 
-                // For each slot, generate: event_guard ∧ active(slot) ∧ filter(slot) ∧ Apply effects
                 for slot in 0..n_slots {
-                    // Encode event guard (may reference event params — simplified to true for non-parameterized)
-                    let guard_smt =
-                        match guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot) {
-                            Ok(g) => g,
-                            Err(_) => "true".to_owned(), // event guard may be complex — fall back
-                        };
-
-                    // Encode Choose filter
+                    let evt_guard =
+                        guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
                     let filter_smt = guard_to_smt_sys(filter, entity, vctx, ent_name, slot)?;
                     let active_var = format!("{ent_name}_{slot}_active");
 
-                    // Find Apply ops and encode their transition effects
-                    for op in ops {
-                        if let IRAction::Apply {
-                            transition: trans_name,
-                            ..
-                        } = op
-                        {
-                            if let Some(trans) =
-                                entity.transitions.iter().find(|t| t.name == *trans_name)
-                            {
-                                let trans_guard =
-                                    guard_to_smt_sys(&trans.guard, entity, vctx, ent_name, slot)?;
+                    let mut choose_guards = extra_guards.to_vec();
+                    choose_guards.push(active_var);
+                    choose_guards.push(evt_guard);
+                    choose_guards.push(filter_smt);
 
-                                // Build next-state with this transition's updates
-                                let mut next_vals: Vec<String> = Vec::new();
-                                for ent in entities {
-                                    let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
-                                    for s in 0..ns {
-                                        for (fi, f) in ent.fields.iter().enumerate() {
-                                            if ent.name == *ent_name && s == slot {
-                                                let updated = trans
-                                                    .updates
-                                                    .iter()
-                                                    .find(|u| u.field == f.name);
-                                                if let Some(upd) = updated {
-                                                    next_vals.push(expr_to_smt_sys(
-                                                        &upd.value, entity, vctx, ent_name, slot,
-                                                    )?);
-                                                } else {
-                                                    next_vals.push(format!(
-                                                        "{}_{}_f{}",
-                                                        ent.name, s, fi
-                                                    ));
-                                                }
-                                            } else {
-                                                next_vals
-                                                    .push(format!("{}_{}_f{}", ent.name, s, fi));
-                                            }
-                                        }
-                                        if ent.name == *ent_name && s == slot {
-                                            next_vals.push("true".to_owned());
-                                        } else {
-                                            next_vals.push(format!("{}_{}_active", ent.name, s));
-                                        }
-                                    }
-                                }
-                                let next_str = next_vals.join(" ");
-
-                                chc.push_str(&format!(
-                                    "(rule (=> (and (State {all_vars_str}) {active_var} \
-                                     {guard_smt} {filter_smt} {trans_guard}) \
-                                     (State {next_str})) {rule_prefix}_choose_{ai}_s{slot}_{trans_name})\n"
-                                ));
-                            }
-                        }
-                    }
-
-                    // Handle CrossCall in ops
-                    for op in ops {
-                        if let IRAction::CrossCall {
-                            system: target_sys,
-                            event: target_evt,
-                            ..
-                        } = op
-                        {
-                            // Find the target event and encode its Create actions
-                            if let Some(sys) = all_systems.iter().find(|s| s.name == *target_sys) {
-                                if let Some(evt) = sys.events.iter().find(|e| e.name == *target_evt)
-                                {
-                                    for cc_action in &evt.body {
-                                        if let IRAction::Create {
-                                            entity: create_ent,
-                                            fields: create_fields,
-                                        } = cc_action
-                                        {
-                                            let create_entity =
-                                                entities.iter().find(|e| e.name == *create_ent);
-                                            if let Some(ce) = create_entity {
-                                                let cns = slots_per_entity
-                                                    .get(create_ent)
-                                                    .copied()
-                                                    .unwrap_or(1);
-                                                for cs in 0..cns {
-                                                    let inactive =
-                                                        format!("{create_ent}_{cs}_active");
-
-                                                    // Build next-state: activate this create slot
-                                                    let mut next_vals: Vec<String> = Vec::new();
-                                                    for ent in entities {
-                                                        let ns = slots_per_entity
-                                                            .get(&ent.name)
-                                                            .copied()
-                                                            .unwrap_or(1);
-                                                        for s in 0..ns {
-                                                            for (fi, f) in
-                                                                ent.fields.iter().enumerate()
-                                                            {
-                                                                if ent.name == *create_ent
-                                                                    && s == cs
-                                                                {
-                                                                    let created =
-                                                                        create_fields.iter().find(
-                                                                            |cf| cf.name == f.name,
-                                                                        );
-                                                                    if let Some(cf) = created {
-                                                                        match expr_to_smt(
-                                                                            &cf.value, ce, vctx,
-                                                                        ) {
-                                                                            Ok(v) => {
-                                                                                next_vals.push(v);
-                                                                            }
-                                                                            Err(_) => next_vals
-                                                                                .push(format!(
-                                                                                    "{}_{}_f{}",
-                                                                                    ent.name, s, fi
-                                                                                )),
-                                                                        }
-                                                                    } else if let Some(ref def) =
-                                                                        f.default
-                                                                    {
-                                                                        match expr_to_smt(
-                                                                            def, ce, vctx,
-                                                                        ) {
-                                                                            Ok(v) => {
-                                                                                next_vals.push(v);
-                                                                            }
-                                                                            Err(_) => next_vals
-                                                                                .push(format!(
-                                                                                    "{}_{}_f{}",
-                                                                                    ent.name, s, fi
-                                                                                )),
-                                                                        }
-                                                                    } else {
-                                                                        next_vals.push(format!(
-                                                                            "{}_{}_f{}",
-                                                                            ent.name, s, fi
-                                                                        ));
-                                                                    }
-                                                                } else {
-                                                                    next_vals.push(format!(
-                                                                        "{}_{}_f{}",
-                                                                        ent.name, s, fi
-                                                                    ));
-                                                                }
-                                                            }
-                                                            if ent.name == *create_ent && s == cs {
-                                                                next_vals.push("true".to_owned());
-                                                            } else {
-                                                                next_vals.push(format!(
-                                                                    "{}_{}_active",
-                                                                    ent.name, s
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    let next_str = next_vals.join(" ");
-
-                                                    chc.push_str(&format!(
-                                                        "(rule (=> (and (State {all_vars_str}) {active_var} \
-                                                         {guard_smt} {filter_smt} (not {inactive})) \
-                                                         (State {next_str})) {rule_prefix}_crosscall_{target_sys}_{target_evt}_s{cs})\n"
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            IRAction::Create {
-                entity: ent_name,
-                fields: create_fields,
-            } => {
-                // Direct Create (not inside Choose) — encode as create rule
-                if let Some(entity) = entities.iter().find(|e| e.name == *ent_name) {
-                    let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
-                    for slot in 0..n_slots {
-                        let inactive = format!("{ent_name}_{slot}_active");
-
-                        let mut next_vals: Vec<String> = Vec::new();
-                        for ent in entities {
-                            let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
-                            for s in 0..ns {
-                                for (fi, f) in ent.fields.iter().enumerate() {
-                                    if ent.name == *ent_name && s == slot {
-                                        let created =
-                                            create_fields.iter().find(|cf| cf.name == f.name);
-                                        if let Some(cf) = created {
-                                            match expr_to_smt(&cf.value, entity, vctx) {
-                                                Ok(v) => next_vals.push(v),
-                                                Err(_) => next_vals
-                                                    .push(format!("{}_{}_f{}", ent.name, s, fi)),
-                                            }
-                                        } else if let Some(ref def) = f.default {
-                                            match expr_to_smt(def, entity, vctx) {
-                                                Ok(v) => next_vals.push(v),
-                                                Err(_) => next_vals
-                                                    .push(format!("{}_{}_f{}", ent.name, s, fi)),
-                                            }
-                                        } else {
-                                            next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
-                                        }
-                                    } else {
-                                        next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
-                                    }
-                                }
-                                if ent.name == *ent_name && s == slot {
-                                    next_vals.push("true".to_owned());
-                                } else {
-                                    next_vals.push(format!("{}_{}_active", ent.name, s));
-                                }
-                            }
-                        }
-                        let next_str = next_vals.join(" ");
-
-                        chc.push_str(&format!(
-                            "(rule (=> (and (State {all_vars_str}) (not {inactive})) \
-                             (State {next_str})) {rule_prefix}_create_{ent_name}_s{slot})\n"
-                        ));
-                    }
+                    encode_ops_chc(
+                        chc,
+                        ops,
+                        entities,
+                        entity,
+                        ent_name,
+                        slot,
+                        var,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_choose_{ai}_s{slot}"),
+                        &choose_guards,
+                        visited,
+                    )?;
                 }
             }
             IRAction::ForAll {
+                var,
                 entity: ent_name,
                 ops,
-                ..
             } => {
-                // ForAll iterates ALL active slots and applies ops to each.
-                // In CHC: for each slot, if active, apply the ops (same as Choose but no filter).
                 let entity = entities
                     .iter()
                     .find(|e| e.name == *ent_name)
@@ -857,105 +982,507 @@ fn encode_event_chc(
                 let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
 
                 for slot in 0..n_slots {
+                    let evt_guard =
+                        guard_to_smt_sys(event_guard, entity, vctx, ent_name, slot)?;
                     let active_var = format!("{ent_name}_{slot}_active");
 
-                    for op in ops {
-                        if let IRAction::Apply {
-                            transition: trans_name,
-                            ..
-                        } = op
-                        {
-                            if let Some(trans) =
-                                entity.transitions.iter().find(|t| t.name == *trans_name)
-                            {
-                                let trans_guard =
-                                    guard_to_smt_sys(&trans.guard, entity, vctx, ent_name, slot)?;
+                    let mut forall_guards = extra_guards.to_vec();
+                    forall_guards.push(active_var);
+                    forall_guards.push(evt_guard);
 
-                                let mut next_vals: Vec<String> = Vec::new();
-                                for ent in entities {
-                                    let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
-                                    for s in 0..ns {
-                                        for (fi, f) in ent.fields.iter().enumerate() {
-                                            if ent.name == *ent_name && s == slot {
-                                                let updated = trans
-                                                    .updates
-                                                    .iter()
-                                                    .find(|u| u.field == f.name);
-                                                if let Some(upd) = updated {
-                                                    next_vals.push(expr_to_smt_sys(
-                                                        &upd.value, entity, vctx, ent_name, slot,
-                                                    )?);
-                                                } else {
-                                                    next_vals.push(format!(
-                                                        "{}_{}_f{}",
-                                                        ent.name, s, fi
-                                                    ));
-                                                }
-                                            } else {
-                                                next_vals
-                                                    .push(format!("{}_{}_f{}", ent.name, s, fi));
-                                            }
-                                        }
-                                        if ent.name == *ent_name && s == slot {
-                                            next_vals.push("true".to_owned());
-                                        } else {
-                                            next_vals.push(format!("{}_{}_active", ent.name, s));
-                                        }
-                                    }
-                                }
-                                let next_str = next_vals.join(" ");
-
-                                chc.push_str(&format!(
-                                    "(rule (=> (and (State {all_vars_str}) {active_var} \
-                                     {trans_guard}) \
-                                     (State {next_str})) \
-                                     {rule_prefix}_forall_{ai}_s{slot}_{trans_name})\n"
-                                ));
-                            }
-                        }
-                    }
+                    encode_ops_chc(
+                        chc,
+                        ops,
+                        entities,
+                        entity,
+                        ent_name,
+                        slot,
+                        var,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_forall_{ai}_s{slot}"),
+                        &forall_guards,
+                        visited,
+                    )?;
                 }
+            }
+            IRAction::Create {
+                entity: ent_name,
+                fields: create_fields,
+            } => {
+                // Top-level Create — event guard may not reference entity fields
+                let evt_guard_smt = encode_non_entity_guard(event_guard)?;
+                let mut guards = extra_guards.to_vec();
+                if evt_guard_smt != "true" {
+                    guards.push(evt_guard_smt);
+                }
+                encode_create_chc(
+                    chc,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    ent_name,
+                    create_fields,
+                    &guards,
+                    &format!("{rule_prefix}_create_{ai}"),
+                )?;
             }
             IRAction::CrossCall {
                 system: target_sys,
                 event: target_evt,
                 ..
             } => {
-                // Bare CrossCall (not inside Choose): invoke target event's body.
-                // Recursively encode the target event's actions.
-                if let Some(sys) = all_systems.iter().find(|s| s.name == *target_sys) {
-                    if let Some(evt) = sys.events.iter().find(|e| e.name == *target_evt) {
-                        encode_event_chc(
-                            chc,
-                            &evt.body,
-                            &evt.guard,
-                            entities,
-                            vctx,
-                            slots_per_entity,
-                            all_vars_str,
-                            all_systems,
-                            &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
-                        )?;
-                    }
+                let sys = all_systems
+                    .iter()
+                    .find(|s| s.name == *target_sys)
+                    .ok_or_else(|| {
+                        format!("CrossCall target system {target_sys} not found")
+                    })?;
+                let evt = sys
+                    .events
+                    .iter()
+                    .find(|e| e.name == *target_evt)
+                    .ok_or_else(|| {
+                        format!("CrossCall target event {target_sys}.{target_evt} not found")
+                    })?;
+
+                // Cycle guard: detect recursive CrossCall chains
+                let key = (target_sys.clone(), target_evt.clone());
+                if !visited.insert(key.clone()) {
+                    return Err(format!(
+                        "cyclic CrossCall detected: {target_sys}.{target_evt}"
+                    ));
                 }
+
+                // Propagate caller's event guard as extra context for callee
+                let evt_guard_smt = encode_non_entity_guard(event_guard)?;
+                let mut cc_guards = extra_guards.to_vec();
+                if evt_guard_smt != "true" {
+                    cc_guards.push(evt_guard_smt);
+                }
+
+                let result = encode_event_chc(
+                    chc,
+                    &evt.body,
+                    &evt.guard,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
+                    &cc_guards,
+                    visited,
+                );
+                visited.remove(&key);
+                result?;
             }
             IRAction::ExprStmt { .. } => {
-                // Expression statements in event bodies are typically boolean
-                // assertions or side-effect-free expressions. In CHC, these
-                // don't generate transition rules — they're constraints that
-                // would be part of a more complex event guard composition.
-                // For soundness: not generating a rule is correct (no state change).
+                // No state change — correct to not generate a rule.
             }
             IRAction::Apply { .. } => {
-                // Bare Apply outside Choose — this shouldn't happen in well-formed IR
-                // (Apply targets a Choose-bound variable). Return error for safety.
                 return Err(
-                    "bare Apply action outside Choose in event body — malformed IR".to_owned(),
+                    "bare Apply outside Choose/ForAll in event body — malformed IR".to_owned(),
                 );
             }
         }
     }
     Ok(())
+}
+
+/// Encode ops within a Choose/ForAll context (with a bound entity slot).
+///
+/// Handles all action types: Apply, Create, `CrossCall`, nested Choose/ForAll.
+/// Context guards from the parent are propagated to every generated rule.
+/// `bound_var` is the variable name from the enclosing Choose/ForAll — Apply
+/// targets are validated against it to catch malformed IR.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn encode_ops_chc(
+    chc: &mut String,
+    ops: &[IRAction],
+    entities: &[&IREntity],
+    bound_entity: &IREntity,
+    bound_ent_name: &str,
+    bound_slot: usize,
+    bound_var: &str,
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    all_systems: &[&IRSystem],
+    rule_prefix: &str,
+    guards: &[String],
+    visited: &mut HashSet<(String, String)>,
+) -> Result<(), String> {
+    // Reject multi-apply on same entity — IC3's per-Apply CHC rules model
+    // sequential transitions as separate derivation steps, not atomic
+    // intra-event composition. BMC handles this via intermediate variable
+    // chaining; IC3 would need combined rules with intermediate constraints.
+    let same_entity_apply_count = ops
+        .iter()
+        .filter(|op| matches!(op, IRAction::Apply { target, .. } if target == bound_var))
+        .count();
+    if same_entity_apply_count > 1 {
+        return Err(
+            "multi-apply on same entity in IC3 encoding not supported \
+             (sequential composition requires intermediate CHC constraints)"
+                .to_owned(),
+        );
+    }
+
+    for (oi, op) in ops.iter().enumerate() {
+        match op {
+            IRAction::Apply {
+                target,
+                transition: trans_name,
+                ..
+            } => {
+                if target != bound_var {
+                    return Err(format!(
+                        "Apply target {target} does not match bound variable \
+                         {bound_var} from enclosing Choose/ForAll — malformed IR"
+                    ));
+                }
+                let trans = bound_entity
+                    .transitions
+                    .iter()
+                    .find(|t| t.name == *trans_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "transition {trans_name} not found on entity {bound_ent_name}"
+                        )
+                    })?;
+                let trans_guard = guard_to_smt_sys(
+                    &trans.guard,
+                    bound_entity,
+                    vctx,
+                    bound_ent_name,
+                    bound_slot,
+                )?;
+                let next_str = build_transition_next(
+                    entities,
+                    slots_per_entity,
+                    bound_entity,
+                    bound_ent_name,
+                    bound_slot,
+                    trans,
+                    vctx,
+                )?;
+                let mut all_guards = guards.to_vec();
+                all_guards.push(trans_guard);
+                chc.push_str(&format_chc_rule(
+                    all_vars_str,
+                    &all_guards,
+                    &next_str,
+                    &format!("{rule_prefix}_{trans_name}"),
+                ));
+            }
+            IRAction::Create {
+                entity: ent_name,
+                fields: create_fields,
+            } => {
+                encode_create_chc(
+                    chc,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    ent_name,
+                    create_fields,
+                    guards,
+                    &format!("{rule_prefix}_create_{oi}"),
+                )?;
+            }
+            IRAction::CrossCall {
+                system: target_sys,
+                event: target_evt,
+                ..
+            } => {
+                let sys = all_systems
+                    .iter()
+                    .find(|s| s.name == *target_sys)
+                    .ok_or_else(|| {
+                        format!("CrossCall target system {target_sys} not found")
+                    })?;
+                let evt = sys
+                    .events
+                    .iter()
+                    .find(|e| e.name == *target_evt)
+                    .ok_or_else(|| {
+                        format!(
+                            "CrossCall target event {target_sys}.{target_evt} not found"
+                        )
+                    })?;
+
+                // Cycle guard
+                let key = (target_sys.clone(), target_evt.clone());
+                if !visited.insert(key.clone()) {
+                    return Err(format!(
+                        "cyclic CrossCall detected: {target_sys}.{target_evt}"
+                    ));
+                }
+                let result = encode_event_chc(
+                    chc,
+                    &evt.body,
+                    &evt.guard,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    &format!("{rule_prefix}_cc_{oi}_{target_sys}_{target_evt}"),
+                    guards,
+                    visited,
+                );
+                visited.remove(&key);
+                result?;
+            }
+            IRAction::Choose {
+                var,
+                entity: ent_name,
+                filter,
+                ops: inner_ops,
+            } => {
+                // Nested Choose inside ForAll/Choose
+                let entity = entities
+                    .iter()
+                    .find(|e| e.name == *ent_name)
+                    .ok_or_else(|| format!("entity {ent_name} not found in nested Choose"))?;
+                let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
+                for slot in 0..n_slots {
+                    let filter_smt =
+                        guard_to_smt_sys(filter, entity, vctx, ent_name, slot)?;
+                    let active_var = format!("{ent_name}_{slot}_active");
+                    let mut nested = guards.to_vec();
+                    nested.push(active_var);
+                    nested.push(filter_smt);
+                    encode_ops_chc(
+                        chc,
+                        inner_ops,
+                        entities,
+                        entity,
+                        ent_name,
+                        slot,
+                        var,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_choose_{oi}_s{slot}"),
+                        &nested,
+                        visited,
+                    )?;
+                }
+            }
+            IRAction::ForAll {
+                var,
+                entity: ent_name,
+                ops: inner_ops,
+            } => {
+                // Nested ForAll
+                let entity = entities
+                    .iter()
+                    .find(|e| e.name == *ent_name)
+                    .ok_or_else(|| format!("entity {ent_name} not found in nested ForAll"))?;
+                let n_slots = slots_per_entity.get(ent_name).copied().unwrap_or(1);
+                for slot in 0..n_slots {
+                    let active_var = format!("{ent_name}_{slot}_active");
+                    let mut nested = guards.to_vec();
+                    nested.push(active_var);
+                    encode_ops_chc(
+                        chc,
+                        inner_ops,
+                        entities,
+                        entity,
+                        ent_name,
+                        slot,
+                        var,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_forall_{oi}_s{slot}"),
+                        &nested,
+                        visited,
+                    )?;
+                }
+            }
+            IRAction::ExprStmt { .. } => {
+                // No state change — correct to skip.
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Try to encode an event guard that doesn't reference entity fields.
+///
+/// Returns `"true"` for boolean true, propagates error for guards that
+/// require entity context (e.g., field comparisons outside Choose/ForAll).
+fn encode_non_entity_guard(guard: &IRExpr) -> Result<String, String> {
+    match guard {
+        IRExpr::Lit {
+            value: LitVal::Bool { value: true },
+            ..
+        } => Ok("true".to_owned()),
+        IRExpr::Lit {
+            value: LitVal::Bool { value: false },
+            ..
+        } => Ok("false".to_owned()),
+        _ => Err(format!(
+            "event guard requires entity context but appears outside Choose/ForAll: {:?}",
+            std::mem::discriminant(guard)
+        )),
+    }
+}
+
+/// Build next-state string with transition updates for a specific entity slot.
+///
+/// The target slot gets transition updates; everything else is framed.
+fn build_transition_next(
+    entities: &[&IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+    target_entity: &IREntity,
+    target_ent_name: &str,
+    target_slot: usize,
+    transition: &IRTransition,
+    vctx: &VerifyContext,
+) -> Result<String, String> {
+    let mut next_vals = Vec::new();
+    for ent in entities {
+        let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
+        for s in 0..ns {
+            for (fi, f) in ent.fields.iter().enumerate() {
+                if ent.name == target_ent_name && s == target_slot {
+                    if let Some(upd) = transition.updates.iter().find(|u| u.field == f.name) {
+                        next_vals.push(expr_to_smt_sys(
+                            &upd.value,
+                            target_entity,
+                            vctx,
+                            target_ent_name,
+                            target_slot,
+                        )?);
+                    } else {
+                        next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                    }
+                } else {
+                    next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                }
+            }
+            if ent.name == target_ent_name && s == target_slot {
+                next_vals.push("true".to_owned());
+            } else {
+                next_vals.push(format!("{}_{}_active", ent.name, s));
+            }
+        }
+    }
+    Ok(next_vals.join(" "))
+}
+
+/// Build next-state string with entity creation for a specific slot.
+///
+/// The target slot gets created (fields from `create_fields` or defaults, `active=true`).
+/// Everything else is framed. Propagates encoding errors — never falls back to frame.
+fn build_create_next(
+    entities: &[&IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+    create_entity: &IREntity,
+    create_ent_name: &str,
+    create_slot: usize,
+    create_fields: &[IRCreateField],
+    vctx: &VerifyContext,
+) -> Result<String, String> {
+    let mut next_vals = Vec::new();
+    for ent in entities {
+        let ns = slots_per_entity.get(&ent.name).copied().unwrap_or(1);
+        for s in 0..ns {
+            for (fi, f) in ent.fields.iter().enumerate() {
+                if ent.name == create_ent_name && s == create_slot {
+                    if let Some(cf) = create_fields.iter().find(|cf| cf.name == f.name) {
+                        next_vals.push(expr_to_smt(&cf.value, create_entity, vctx)?);
+                    } else if let Some(ref def) = f.default {
+                        next_vals.push(expr_to_smt(def, create_entity, vctx)?);
+                    } else {
+                        // No explicit value and no default: unconstrained
+                        next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                    }
+                } else {
+                    next_vals.push(format!("{}_{}_f{}", ent.name, s, fi));
+                }
+            }
+            if ent.name == create_ent_name && s == create_slot {
+                next_vals.push("true".to_owned());
+            } else {
+                next_vals.push(format!("{}_{}_active", ent.name, s));
+            }
+        }
+    }
+    Ok(next_vals.join(" "))
+}
+
+/// Encode a Create action as CHC rules — one rule per available (inactive) slot.
+#[allow(clippy::too_many_arguments)]
+fn encode_create_chc(
+    chc: &mut String,
+    entities: &[&IREntity],
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    create_ent_name: &str,
+    create_fields: &[IRCreateField],
+    extra_guards: &[String],
+    rule_prefix: &str,
+) -> Result<(), String> {
+    let entity = entities
+        .iter()
+        .find(|e| e.name == create_ent_name)
+        .ok_or_else(|| format!("entity {create_ent_name} not found for Create"))?;
+    let n_slots = slots_per_entity.get(create_ent_name).copied().unwrap_or(1);
+    for slot in 0..n_slots {
+        let inactive = format!("{create_ent_name}_{slot}_active");
+        let next_str = build_create_next(
+            entities,
+            slots_per_entity,
+            entity,
+            create_ent_name,
+            slot,
+            create_fields,
+            vctx,
+        )?;
+        let mut guards = extra_guards.to_vec();
+        guards.push(format!("(not {inactive})"));
+        // Symmetry breaking: slot i can only be created if slot i-1 is active
+        if slot > 0 {
+            guards.push(format!("{}_{}_active", create_ent_name, slot - 1));
+        }
+        chc.push_str(&format_chc_rule(
+            all_vars_str,
+            &guards,
+            &next_str,
+            &format!("{rule_prefix}_{create_ent_name}_s{slot}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Format a CHC rule with AND of all guard conditions.
+fn format_chc_rule(
+    all_vars_str: &str,
+    guards: &[String],
+    next_str: &str,
+    rule_name: &str,
+) -> String {
+    if guards.is_empty() {
+        format!("(rule (=> (State {all_vars_str}) (State {next_str})) {rule_name})\n")
+    } else {
+        let guard_str = guards.join(" ");
+        format!(
+            "(rule (=> (and (State {all_vars_str}) {guard_str}) \
+             (State {next_str})) {rule_name})\n"
+        )
+    }
 }
 
 /// Encode a value expression with system-level slot naming: {entity}_{slot}_f{field}.
@@ -998,6 +1525,19 @@ fn expr_to_smt_sys(
                 "OpMul" => Ok(format!("(* {l} {r})")),
                 _ => Err(format!("unsupported op in system IC3 value: {op}")),
             }
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let m = expr_to_smt_sys(map, entity, vctx, ent_name, slot)?;
+            let k = expr_to_smt_sys(key, entity, vctx, ent_name, slot)?;
+            let v = expr_to_smt_sys(value, entity, vctx, ent_name, slot)?;
+            Ok(format!("(store {m} {k} {v})"))
+        }
+        IRExpr::Index { map, key, .. } => {
+            let m = expr_to_smt_sys(map, entity, vctx, ent_name, slot)?;
+            let k = expr_to_smt_sys(key, entity, vctx, ent_name, slot)?;
+            Ok(format!("(select {m} {k})"))
         }
         IRExpr::Lit { .. } | IRExpr::Ctor { .. } => expr_to_smt(expr, entity, vctx),
         _ => Err(format!(
@@ -1628,6 +2168,19 @@ fn expr_to_smt_slot(
             let inner = expr_to_smt_slot(operand, entity, vctx, slot)?;
             Ok(format!("(- {inner})"))
         }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let m = expr_to_smt_slot(map, entity, vctx, slot)?;
+            let k = expr_to_smt_slot(key, entity, vctx, slot)?;
+            let v = expr_to_smt_slot(value, entity, vctx, slot)?;
+            Ok(format!("(store {m} {k} {v})"))
+        }
+        IRExpr::Index { map, key, .. } => {
+            let m = expr_to_smt_slot(map, entity, vctx, slot)?;
+            let k = expr_to_smt_slot(key, entity, vctx, slot)?;
+            Ok(format!("(select {m} {k})"))
+        }
         // Literals and constructors don't need slot context
         IRExpr::Lit { .. } | IRExpr::Ctor { .. } => expr_to_smt(expr, entity, vctx),
         _ => Err(format!(
@@ -1828,6 +2381,15 @@ fn ir_type_to_sort_name(ty: &IRType) -> String {
         IRType::Bool => "Bool".to_owned(),
         IRType::Real | IRType::Float => "Real".to_owned(),
         IRType::Enum { .. } => "Int".to_owned(),
+        IRType::Map { key, value } => {
+            format!("(Array {} {})", ir_type_to_sort_name(key), ir_type_to_sort_name(value))
+        }
+        IRType::Set { element } => {
+            format!("(Array {} Bool)", ir_type_to_sort_name(element))
+        }
+        IRType::Seq { element } => {
+            format!("(Array Int {})", ir_type_to_sort_name(element))
+        }
         _ => "Int".to_owned(),
     }
 }
@@ -1895,6 +2457,22 @@ fn expr_to_smt(expr: &IRExpr, entity: &IREntity, vctx: &VerifyContext) -> Result
         IRExpr::UnOp { op, operand, .. } if op == "OpNeg" => {
             let inner = expr_to_smt(operand, entity, vctx)?;
             Ok(format!("(- {inner})"))
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let m = expr_to_smt(map, entity, vctx)?;
+            let k = expr_to_smt(key, entity, vctx)?;
+            let v = expr_to_smt(value, entity, vctx)?;
+            Ok(format!("(store {m} {k} {v})"))
+        }
+        IRExpr::Index { map, key, .. } => {
+            let m = expr_to_smt(map, entity, vctx)?;
+            let k = expr_to_smt(key, entity, vctx)?;
+            Ok(format!("(select {m} {k})"))
+        }
+        IRExpr::Card { .. } => {
+            Err("cardinality (#) not supported in IC3 CHC encoding".to_owned())
         }
         _ => Err(format!(
             "unsupported expression in IC3 value encoding: {:?}",
@@ -2231,9 +2809,192 @@ mod tests {
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
         assert!(
-            matches!(result, Ic3Result::Violated),
+            matches!(result, Ic3Result::Violated(_)),
             "expected Violated (confirm breaks always-Pending), got: {result:?}"
         );
+    }
+
+    #[test]
+    fn ic3_violation_extracts_trace() {
+        // Property: status == Pending always (false — confirm changes it)
+        // IC3 should find the violation AND extract a trace showing the state change.
+        let (entity, types) = make_simple_entity();
+        let ir = make_ir_for_entity(&entity, types);
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "status".to_owned(),
+                ty: IRType::Int,
+            }),
+            right: Box::new(IRExpr::Ctor {
+                enum_name: "Status".to_owned(),
+                ctor: "Pending".to_owned(),
+            }),
+            ty: IRType::Bool,
+        };
+
+        let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
+        match result {
+            Ic3Result::Violated(trace) => {
+                assert!(
+                    trace.len() >= 2,
+                    "expected at least 2 trace steps, got {}",
+                    trace.len()
+                );
+
+                // Helper: find field value in a step
+                let field_val = |step: usize, field: &str| -> String {
+                    trace[step]
+                        .assignments
+                        .iter()
+                        .find(|(_, f, _)| f == field)
+                        .unwrap_or_else(|| {
+                            panic!("step {step} missing field {field}: {:?}", trace[step])
+                        })
+                        .2
+                        .clone()
+                };
+
+                // Step 0: initial state after create — Pending, total=0
+                assert_eq!(field_val(0, "status"), "0", "step 0: status should be Pending (0)");
+                assert_eq!(field_val(0, "total"), "0", "step 0: total should be 0");
+
+                // Step 1: after confirm — Confirmed, total unchanged
+                assert_eq!(field_val(1, "status"), "1", "step 1: status should be Confirmed (1)");
+                assert_eq!(field_val(1, "total"), "0", "step 1: total should still be 0");
+
+                // Entity labels should be "Order" (single slot)
+                assert!(
+                    trace[0].assignments.iter().all(|(e, _, _)| e == "Order"),
+                    "all assignments should be for Order entity"
+                );
+            }
+            other => panic!("expected Violated with trace, got: {other:?}"),
+        }
+    }
+
+    // ── S-expression parser unit tests ─────────────────────────────
+
+    #[test]
+    fn sexpr_parser_handles_nested_negative() {
+        // (State 0 (- 1) 0 true) should parse as 4 ground args
+        let columns = vec![
+            ("E".to_owned(), "a".to_owned(), 0),
+            ("E".to_owned(), "b".to_owned(), 1),
+            ("E".to_owned(), "c".to_owned(), 2),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(State 0 (- 1) 0 true)";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert_eq!(steps.len(), 1, "expected 1 trace step");
+        let a_val = steps[0].assignments.iter().find(|(_, f, _)| f == "b");
+        assert_eq!(
+            a_val.unwrap().2, "-1",
+            "negative literal (- 1) should render as -1"
+        );
+    }
+
+    #[test]
+    fn sexpr_parser_handles_rational_literal() {
+        // (State (/ 3 2) true) should be recognized as ground and render as "3/2"
+        let columns = vec![
+            ("E".to_owned(), "val".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(State (/ 3 2) true)";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert_eq!(steps.len(), 1, "expected 1 trace step for rational");
+        assert_eq!(
+            steps[0].assignments[0].2, "3/2",
+            "rational (/ 3 2) should render as 3/2"
+        );
+    }
+
+    #[test]
+    fn sexpr_parser_handles_negative_rational() {
+        // (State (/ (- 1) 2) true) — negative rational
+        let columns = vec![
+            ("E".to_owned(), "val".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(State (/ (- 1) 2) true)";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert_eq!(steps.len(), 1, "negative rational should be ground");
+        assert_eq!(steps[0].assignments[0].2, "-1/2");
+    }
+
+    #[test]
+    fn sexpr_parser_rejects_trailing_garbage() {
+        // Trailing tokens after the s-expression should cause parse failure → empty trace
+        let columns = vec![
+            ("E".to_owned(), "x".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(State 0 true) extra garbage";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert!(steps.is_empty(), "trailing garbage should invalidate parse");
+    }
+
+    #[test]
+    fn sexpr_parser_rejects_unbalanced_parens() {
+        let columns = vec![
+            ("E".to_owned(), "x".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        // Missing closing paren
+        let steps = parse_state_snapshots("(State 0 true", &columns);
+        assert!(steps.is_empty(), "unclosed paren should invalidate parse");
+        // Extra closing paren
+        let steps = parse_state_snapshots("(State 0 true))", &columns);
+        assert!(steps.is_empty(), "extra close paren should invalidate parse");
+    }
+
+    #[test]
+    fn sexpr_parser_skips_non_ground_states() {
+        // State applications with variable names (forall context) should be skipped
+        let columns = vec![
+            ("E".to_owned(), "x".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(and (State A true) (State 5 true))";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert_eq!(steps.len(), 1, "only ground State should be extracted");
+        assert_eq!(steps[0].assignments[0].2, "5");
+    }
+
+    #[test]
+    fn sexpr_parser_deduplicates_stutter() {
+        // Consecutive identical states (from stutter rule) should be collapsed
+        let columns = vec![
+            ("E".to_owned(), "n".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(and (State 0 true) (State 0 true) (State 1 true))";
+        let steps = parse_state_snapshots(answer, &columns);
+        assert_eq!(steps.len(), 2, "stuttered duplicate should be removed");
+        assert_eq!(steps[0].assignments[0].2, "0");
+        assert_eq!(steps[1].assignments[0].2, "1");
+    }
+
+    #[test]
+    fn sexpr_parser_handles_derivation_tree() {
+        // Realistic Spacer answer structure with nested hyper-res/mp
+        let columns = vec![
+            ("E".to_owned(), "x".to_owned(), 0),
+            ("E".to_owned(), "active".to_owned(), usize::MAX),
+        ];
+        let answer = "(mp ((_ hyper-res 0 0 0 1) \
+            (asserted (forall ((A Int)) (! (=> (State A true) query!0) :weight 0))) \
+            ((_ hyper-res 0 0) (asserted (State 0 true)) (State 0 true)) \
+            (State 1 true)) \
+            (asserted (=> query!0 false)) false)";
+        let steps = parse_state_snapshots(answer, &columns);
+        // Should find: (State 0 true) and (State 1 true) — ground, in order
+        assert!(steps.len() >= 2, "expected >= 2 steps, got {}", steps.len());
+        assert_eq!(steps[0].assignments[0].2, "0");
+        assert_eq!(steps[1].assignments[0].2, "1");
     }
 
     #[test]
@@ -2344,7 +3105,7 @@ mod tests {
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 2, 5000);
         assert!(
-            matches!(result, Ic3Result::Violated),
+            matches!(result, Ic3Result::Violated(_)),
             "expected Violated for multi-slot always-Pending, got: {result:?}"
         );
     }
@@ -2630,6 +3391,991 @@ mod tests {
         assert!(
             matches!(result, Ic3Result::Proved),
             "expected Proved for multi-entity total >= 0, got: {result:?}"
+        );
+    }
+
+    // ── System event encoding tests ─────────────────────────────────
+
+    /// Helper: build an IRProgram with system events for testing system-level IC3.
+    fn make_system_program() -> (IRProgram, IRExpr) {
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec![
+                    "Pending".to_owned(),
+                    "Confirmed".to_owned(),
+                    "Shipped".to_owned(),
+                ],
+            },
+        };
+
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "id".to_owned(),
+                    ty: IRType::Id,
+                    default: None,
+                },
+                IRField {
+                    name: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        constructors: vec![
+                            "Pending".to_owned(),
+                            "Confirmed".to_owned(),
+                            "Shipped".to_owned(),
+                        ],
+                    },
+                    default: Some(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Pending".to_owned(),
+                    }),
+                },
+                IRField {
+                    name: "total".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                },
+            ],
+            transitions: vec![
+                IRTransition {
+                    name: "confirm".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Confirmed".to_owned(),
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "ship".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Confirmed".to_owned(),
+                        }),
+                        ty: IRType::Bool,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "status".to_owned(),
+                        value: IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Shipped".to_owned(),
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+        };
+
+        // System with Choose+Apply event
+        let commerce = IRSystem {
+            name: "Commerce".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "process_order".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "status".to_owned(),
+                            ty: IRType::Int,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Pending".to_owned(),
+                        }),
+                        ty: IRType::Bool,
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "o".to_owned(),
+                        transition: "confirm".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![order],
+            systems: vec![commerce],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+
+        // Property: all o: Order | o.total >= 0
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        }),
+                        field: "total".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        (ir, property)
+    }
+
+    #[test]
+    fn ic3_system_with_events_proves_safety() {
+        // Test system-level IC3 with actual system events (not empty systems vec).
+        // Commerce system has Choose+Apply(confirm) for Orders.
+        // Property: total >= 0 (no transition modifies total).
+        let (ir, property) = make_system_program();
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 2);
+
+        let result =
+            try_ic3_system(&ir, &vctx, &["Commerce".to_owned()], &property, &slots, 10000);
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved with system events, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_missing_transition_returns_unknown() {
+        // System event references a non-existent transition — should return Unknown.
+        let status_type = IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                constructors: vec!["Pending".to_owned(), "Done".to_owned()],
+            },
+        };
+
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    constructors: vec!["Pending".to_owned(), "Done".to_owned()],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Pending".to_owned(),
+                }),
+            }],
+            transitions: vec![], // no transitions defined
+        };
+
+        let sys = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "do_thing".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "o".to_owned(),
+                        transition: "nonexistent".to_owned(), // missing!
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![status_type],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![order],
+            systems: vec![sys],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let property = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+        };
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+
+        let result =
+            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
+        assert!(
+            matches!(result, Ic3Result::Unknown(ref reason)
+                if reason.contains("transition nonexistent not found")),
+            "expected Unknown with missing transition message, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_missing_crosscall_target_returns_unknown() {
+        // System event has CrossCall to non-existent system — should return Unknown.
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "count".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let sys = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "trigger".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::CrossCall {
+                    system: "NonExistent".to_owned(),
+                    event: "whatever".to_owned(),
+                    args: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![order],
+            systems: vec![sys],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let property = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+        };
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+
+        let result =
+            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 5000);
+        assert!(
+            matches!(result, Ic3Result::Unknown(ref reason)
+                if reason.contains("CrossCall target system NonExistent not found")),
+            "expected Unknown with missing CrossCall target, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_crosscall_create_via_recursion() {
+        // System A has CrossCall to System B which Creates an entity.
+        // Tests recursive CrossCall encoding (not just Create scanning).
+        let item = IREntity {
+            name: "Item".to_owned(),
+            fields: vec![
+                IRField {
+                    name: "qty".to_owned(),
+                    ty: IRType::Int,
+                    default: Some(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                    }),
+                },
+            ],
+            transitions: vec![],
+        };
+
+        // System B: event that Creates an Item
+        let sys_b = IRSystem {
+            name: "Inventory".to_owned(),
+            entities: vec!["Item".to_owned()],
+            events: vec![IREvent {
+                name: "add_item".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Create {
+                    entity: "Item".to_owned(),
+                    fields: vec![IRCreateField {
+                        name: "qty".to_owned(),
+                        value: IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 5 },
+                        },
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        // System A: event that CrossCalls B.add_item
+        let sys_a = IRSystem {
+            name: "Commerce".to_owned(),
+            entities: vec![],
+            events: vec![IREvent {
+                name: "place_order".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::CrossCall {
+                    system: "Inventory".to_owned(),
+                    event: "add_item".to_owned(),
+                    args: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![item],
+            systems: vec![sys_a, sys_b],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        // Property: all i: Item | i.qty >= 0 (Items are created with qty=5)
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "i".to_owned(),
+                domain: IRType::Entity {
+                    name: "Item".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "i".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Item".to_owned(),
+                            },
+                        }),
+                        field: "qty".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let mut slots = HashMap::new();
+        slots.insert("Item".to_owned(), 2);
+
+        let result = try_ic3_system(
+            &ir,
+            &vctx,
+            &["Commerce".to_owned()],
+            &property,
+            &slots,
+            10000,
+        );
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved for CrossCall-created items qty >= 0, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_forall_with_apply() {
+        // ForAll iterates all active orders and applies confirm.
+        // With event-level encoding (no entity-level rules), transitions
+        // are only accessible through system events.
+        let (ir, property) = make_system_program();
+
+        // Replace the system with one that uses ForAll instead of Choose
+        let forall_sys = IRSystem {
+            name: "BatchProcessor".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "confirm_all".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::ForAll {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    ops: vec![IRAction::Apply {
+                        target: "o".to_owned(),
+                        transition: "confirm".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir2 = IRProgram {
+            systems: vec![forall_sys],
+            ..ir
+        };
+        let vctx = VerifyContext::from_ir(&ir2);
+
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 2);
+
+        let result = try_ic3_system(
+            &ir2,
+            &vctx,
+            &["BatchProcessor".to_owned()],
+            &property,
+            &slots,
+            10000,
+        );
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved for ForAll+Apply, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_forall_with_create() {
+        // ForAll iterates active orders and creates an Item for each.
+        // Tests ForAll handling of Create ops (not just Apply).
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "count".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let item = IREntity {
+            name: "Item".to_owned(),
+            fields: vec![IRField {
+                name: "qty".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 1 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let sys = IRSystem {
+            name: "S".to_owned(),
+            entities: vec!["Order".to_owned(), "Item".to_owned()],
+            events: vec![IREvent {
+                name: "create_items".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::ForAll {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    ops: vec![IRAction::Create {
+                        entity: "Item".to_owned(),
+                        fields: vec![IRCreateField {
+                            name: "qty".to_owned(),
+                            value: IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 3 },
+                            },
+                        }],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![order, item],
+            systems: vec![sys],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        // Property: all i: Item | i.qty >= 0 (Items created with qty=3)
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "i".to_owned(),
+                domain: IRType::Entity {
+                    name: "Item".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "i".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Item".to_owned(),
+                            },
+                        }),
+                        field: "qty".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+        slots.insert("Item".to_owned(), 2);
+
+        let result =
+            try_ic3_system(&ir, &vctx, &["S".to_owned()], &property, &slots, 10000);
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved for ForAll+Create, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_event_guard_propagation() {
+        // Event guard is false → no transitions can fire → property trivially holds.
+        // Verifies that event guard is properly AND'd into generated rules.
+        let (ir, _) = make_system_program();
+
+        // Replace system with event that has guard=false
+        let guarded_sys = IRSystem {
+            name: "Guarded".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "never_fires".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: false },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "o".to_owned(),
+                        transition: "confirm".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir2 = IRProgram {
+            systems: vec![guarded_sys],
+            ..ir
+        };
+        let vctx = VerifyContext::from_ir(&ir2);
+
+        // Property: all orders always Pending — true because no event can fire
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Pending".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 2);
+
+        let result = try_ic3_system(
+            &ir2,
+            &vctx,
+            &["Guarded".to_owned()],
+            &property,
+            &slots,
+            10000,
+        );
+        // With event guard=false, no transitions fire, so always-Pending holds
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved (event guard=false prevents transitions), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_no_entity_rules_when_systems_present() {
+        // With systems present, entity-level transition rules are NOT emitted.
+        // This means transitions can only fire through system events.
+        // Test: property that would fail with entity-level rules but succeeds
+        // when only system events are available and system has no ship event.
+        let (ir, _) = make_system_program();
+
+        // Commerce system only has process_order (which does confirm, not ship).
+        // Without entity-level rules, ship can never fire.
+        // Property: no order is ever Shipped — should be PROVED.
+        let property = IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpNEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        }),
+                        field: "status".to_owned(),
+                        ty: IRType::Int,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Shipped".to_owned(),
+                    }),
+                    ty: IRType::Bool,
+                }),
+            }),
+        };
+
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 2);
+
+        let vctx = VerifyContext::from_ir(&ir);
+        let result = try_ic3_system(
+            &ir,
+            &vctx,
+            &["Commerce".to_owned()],
+            &property,
+            &slots,
+            10000,
+        );
+        // Commerce only has confirm (Pending→Confirmed), no way to reach Shipped
+        assert!(
+            matches!(result, Ic3Result::Proved),
+            "expected Proved (ship not reachable via system events), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_unknown_system_name_returns_unknown() {
+        let (ir, property) = make_system_program();
+        let vctx = VerifyContext::from_ir(&ir);
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+
+        let result = try_ic3_system(
+            &ir,
+            &vctx,
+            &["DoesNotExist".to_owned()],
+            &property,
+            &slots,
+            5000,
+        );
+        assert!(
+            matches!(result, Ic3Result::Unknown(ref reason)
+                if reason.contains("system DoesNotExist not found")),
+            "expected Unknown for missing system name, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_cyclic_crosscall_returns_unknown() {
+        // System A calls B, system B calls A — cyclic CrossCall.
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                }),
+            }],
+            transitions: vec![],
+        };
+
+        let sys_a = IRSystem {
+            name: "A".to_owned(),
+            entities: vec![],
+            events: vec![IREvent {
+                name: "go".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::CrossCall {
+                    system: "B".to_owned(),
+                    event: "bounce".to_owned(),
+                    args: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let sys_b = IRSystem {
+            name: "B".to_owned(),
+            entities: vec![],
+            events: vec![IREvent {
+                name: "bounce".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::CrossCall {
+                    system: "A".to_owned(),
+                    event: "go".to_owned(),
+                    args: vec![],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![order],
+            systems: vec![sys_a, sys_b],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let property = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+        };
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+
+        let result =
+            try_ic3_system(&ir, &vctx, &["A".to_owned()], &property, &slots, 5000);
+        assert!(
+            matches!(result, Ic3Result::Unknown(ref reason)
+                if reason.contains("cyclic CrossCall")),
+            "expected Unknown for cyclic CrossCall, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ic3_system_apply_target_mismatch_returns_unknown() {
+        // Apply.target doesn't match Choose variable — malformed IR.
+        let (ir, _) = make_system_program();
+
+        let bad_sys = IRSystem {
+            name: "Bad".to_owned(),
+            entities: vec!["Order".to_owned()],
+            events: vec![IREvent {
+                name: "bad_event".to_owned(),
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                },
+                postcondition: None,
+                body: vec![IRAction::Choose {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                    }),
+                    ops: vec![IRAction::Apply {
+                        target: "wrong_var".to_owned(), // mismatch!
+                        transition: "confirm".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+            }],
+            schedule: IRSchedule {
+                when: vec![],
+                idle: true,
+            },
+        };
+
+        let ir2 = IRProgram {
+            systems: vec![bad_sys],
+            ..ir
+        };
+        let vctx = VerifyContext::from_ir(&ir2);
+
+        let property = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+        };
+        let mut slots = HashMap::new();
+        slots.insert("Order".to_owned(), 1);
+
+        let result =
+            try_ic3_system(&ir2, &vctx, &["Bad".to_owned()], &property, &slots, 5000);
+        assert!(
+            matches!(result, Ic3Result::Unknown(ref reason)
+                if reason.contains("Apply target wrong_var does not match")),
+            "expected Unknown for Apply target mismatch, got: {result:?}"
         );
     }
 }
