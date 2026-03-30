@@ -745,6 +745,7 @@ fn collect_contract(c: &ast::Contract) -> EContract {
             measures: measures.iter().map(collect_expr).collect(),
             star: *star,
         },
+        ast::Contract::Invariant { expr, .. } => EContract::Invariant(collect_expr(expr)),
     }
 }
 
@@ -1033,9 +1034,76 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             )
         }
 
+        // Imperative constructs
+        ast::ExprKind::Block(items) => collect_block_items(items),
+        ast::ExprKind::VarDecl { name, ty, init } => {
+            // Standalone VarDecl outside a block (shouldn't happen in practice,
+            // but handle gracefully by wrapping with a Sorry continuation).
+            let ty_e = ty.as_ref().map(resolve_type_ref);
+            EExpr::VarDecl(
+                name.clone(),
+                ty_e,
+                Box::new(collect_expr(init)),
+                Box::new(EExpr::Sorry(sp)),
+                sp,
+            )
+        }
+        ast::ExprKind::While {
+            cond,
+            contracts,
+            body,
+        } => {
+            let contracts_e = contracts.iter().map(collect_contract).collect();
+            EExpr::While(
+                Box::new(collect_expr(cond)),
+                contracts_e,
+                Box::new(collect_expr(body)),
+                sp,
+            )
+        }
+        ast::ExprKind::IfElse {
+            cond,
+            then_body,
+            else_body,
+        } => EExpr::IfElse(
+            Box::new(collect_expr(cond)),
+            Box::new(collect_expr(then_body)),
+            else_body.as_ref().map(|e| Box::new(collect_expr(e))),
+            sp,
+        ),
+
         // Stubs
         ast::ExprKind::Sorry => EExpr::Sorry(sp),
         ast::ExprKind::Todo => EExpr::Todo(sp),
+    }
+}
+
+/// Build nested `VarDecl` continuations from a flat block item list.
+///
+/// When a `VarDecl` appears in a block, its continuation is the remaining items.
+/// Non-VarDecl items are sequenced into a Block.
+fn collect_block_items(items: &[ast::Expr]) -> EExpr {
+    match items {
+        [] => EExpr::Sorry(None),
+        [single] => collect_expr(single),
+        [first, rest @ ..] => {
+            if let ast::ExprKind::VarDecl { name, ty, init } = &first.kind {
+                let init_e = collect_expr(init);
+                let rest_e = collect_block_items(rest);
+                let ty_e = ty.as_ref().map(resolve_type_ref);
+                EExpr::VarDecl(
+                    name.clone(),
+                    ty_e,
+                    Box::new(init_e),
+                    Box::new(rest_e),
+                    Some(first.span),
+                )
+            } else {
+                let first_e = collect_expr(first);
+                let rest_e = collect_block_items(rest);
+                EExpr::Block(vec![first_e, rest_e], Some(first.span))
+            }
+        }
     }
 }
 

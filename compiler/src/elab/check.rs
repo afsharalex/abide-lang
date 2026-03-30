@@ -557,9 +557,15 @@ fn check_fn_contracts(f: &EFn) -> Vec<ElabError> {
                 }
             }
             EContract::Decreases { measures, star } => {
-                // decreases * is valid but skips termination checking.
-                // A warning could be emitted here in the future.
-                let _ = star;
+                if *star {
+                    let mut w = ElabError::warning(
+                        messages::DECREASES_STAR_WARNING.to_owned(),
+                        f.name.clone(),
+                    );
+                    w.span = f.span;
+                    w.file.clone_from(&f.file);
+                    errors.push(w);
+                }
                 for m in measures {
                     if let Some(ty) = expr_type(m) {
                         if !matches!(ty, Ty::Builtin(BuiltinTy::Int)) {
@@ -572,6 +578,20 @@ fn check_fn_contracts(f: &EFn) -> Vec<ElabError> {
                             err.help = Some(messages::HELP_DECREASES_INT.into());
                             errors.push(err);
                         }
+                    }
+                }
+            }
+            EContract::Invariant(e) => {
+                if let Some(ty) = expr_type(e) {
+                    if !matches!(ty, Ty::Builtin(BuiltinTy::Bool)) {
+                        let mut err = ElabError::new(
+                            ErrorKind::TypeMismatch,
+                            "invariant clause must have type Bool".to_owned(),
+                            f.name.clone(),
+                        );
+                        err.span = expr_span(e);
+                        err.help = Some("invariant clauses must evaluate to Bool".into());
+                        errors.push(err);
                     }
                 }
             }
@@ -797,6 +817,28 @@ fn collect_name_refs(
                 collect_name_refs(p, known_names, &inner_bound, refs);
             }
             collect_name_refs(filter, known_names, &inner_bound, refs);
+        }
+        EExpr::Block(items, _) => {
+            for item in items {
+                collect_name_refs(item, known_names, bound, refs);
+            }
+        }
+        EExpr::VarDecl(name, _, init, rest, _) => {
+            collect_name_refs(init, known_names, bound, refs);
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(name.clone());
+            collect_name_refs(rest, known_names, &inner_bound, refs);
+        }
+        EExpr::While(cond, _, body, _) => {
+            collect_name_refs(cond, known_names, bound, refs);
+            collect_name_refs(body, known_names, bound, refs);
+        }
+        EExpr::IfElse(cond, then_body, else_body, _) => {
+            collect_name_refs(cond, known_names, bound, refs);
+            collect_name_refs(then_body, known_names, bound, refs);
+            if let Some(e) = else_body {
+                collect_name_refs(e, known_names, bound, refs);
+            }
         }
         // Leaf nodes — no references
         EExpr::Lit(..)

@@ -215,6 +215,31 @@ Functions with contracts use the `{ body }` form. `requires` = precondition. `en
 
 ---
 
+### Imperative Functions
+
+```abide
+fn sum_to(n: Int): Int
+  requires n >= 0
+{
+  var total = 0
+  var i = 0
+  while i <= n
+    invariant total >= 0
+    decreases n - i
+  {
+    total = total + i
+    i = i + 1
+  }
+  total
+}
+```
+
+`var` = mutable local. `while` = loop with optional `invariant` and `decreases`. `if/else` is an expression. Block evaluates to its last expression — no `return` keyword.
+
+`Stable`
+
+---
+
 ### Constants
 
 ```abide

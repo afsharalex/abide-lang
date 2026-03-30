@@ -225,6 +225,40 @@ pub enum IRExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    // Imperative constructs
+    Block {
+        exprs: Vec<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    VarDecl {
+        name: std::string::String,
+        #[serde(rename = "type")]
+        ty: IRType,
+        init: Box<IRExpr>,
+        rest: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    While {
+        cond: Box<IRExpr>,
+        invariants: Vec<IRExpr>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decreases: Option<IRDecreases>,
+        body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    IfElse {
+        cond: Box<IRExpr>,
+        #[serde(rename = "then")]
+        then_body: Box<IRExpr>,
+        #[serde(rename = "else")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        else_body: Option<Box<IRExpr>>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -132,7 +132,7 @@ fn main() -> miette::Result<()> {
                 std::process::exit(1);
             };
             report_elab_errors(&errors, &sources);
-            if !errors.is_empty() {
+            if has_errors(&errors) {
                 std::process::exit(1);
             }
             println!("{result:#?}");
@@ -143,7 +143,7 @@ fn main() -> miette::Result<()> {
                 std::process::exit(1);
             };
             report_elab_errors(&errors, &sources);
-            if !errors.is_empty() {
+            if has_errors(&errors) {
                 std::process::exit(1);
             }
             let ir_program = abide::ir::lower(&result);
@@ -168,7 +168,7 @@ fn main() -> miette::Result<()> {
                 std::process::exit(1);
             };
             report_elab_errors(&errors, &sources);
-            if !errors.is_empty() {
+            if has_errors(&errors) {
                 std::process::exit(1);
             }
             let ir_program = abide::ir::lower(&result);
@@ -232,6 +232,13 @@ fn read_sources_for_diagnostics(paths: &[PathBuf]) -> Vec<(String, String)> {
 /// Only renders source snippets when the error's file matches the loaded source.
 /// Errors from other files (in multi-file mode) fall back to plain text to avoid
 /// rendering spans against the wrong source.
+/// Returns true if any diagnostics are errors (not warnings).
+fn has_errors(errors: &[abide::elab::error::ElabError]) -> bool {
+    errors
+        .iter()
+        .any(|e| e.severity == abide::elab::error::Severity::Error)
+}
+
 fn report_elab_errors(errors: &[abide::elab::error::ElabError], sources: &[(String, String)]) {
     let single_file = sources.len() <= 1;
     for err in errors {

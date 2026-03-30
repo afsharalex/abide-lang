@@ -320,8 +320,11 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
                 .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
                 .collect();
             // Bind ref params and value params so they aren't alias-rewritten
-            let mut action_bound: HashMap<String, Ty> =
-                action.refs.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+            let mut action_bound: HashMap<String, Ty> = action
+                .refs
+                .iter()
+                .map(|(n, t)| (n.clone(), t.clone()))
+                .collect();
             action_bound.extend(action.params.iter().map(|(n, t)| (n.clone(), t.clone())));
             action.requires = action
                 .requires
@@ -348,8 +351,11 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
                 .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
                 .collect();
             // Bind event params so they aren't alias-rewritten
-            let event_bound: HashMap<String, Ty> =
-                event.params.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+            let event_bound: HashMap<String, Ty> = event
+                .params
+                .iter()
+                .map(|(n, t)| (n.clone(), t.clone()))
+                .collect();
             event.requires = event
                 .requires
                 .iter()
@@ -432,7 +438,11 @@ fn resolve_preds(env: &mut Env, ctx: &Ctx) {
             .iter()
             .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
             .collect();
-        let bound: HashMap<String, Ty> = pred.params.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+        let bound: HashMap<String, Ty> = pred
+            .params
+            .iter()
+            .map(|(n, t)| (n.clone(), t.clone()))
+            .collect();
         pred.body = resolve_expr(ctx, &bound, &pred.body);
     }
 }
@@ -534,7 +544,11 @@ fn resolve_fns(env: &mut Env, ctx: &Ctx) {
             .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
             .collect();
         f.ret_ty = ctx.resolve_ty(&f.ret_ty);
-        let bound: HashMap<String, Ty> = f.params.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+        let bound: HashMap<String, Ty> = f
+            .params
+            .iter()
+            .map(|(n, t)| (n.clone(), t.clone()))
+            .collect();
         // Resolve contract expressions (ensures gets 'result' in scope)
         let mut bound_with_result = bound.clone();
         bound_with_result.insert("result".to_owned(), f.ret_ty.clone());
@@ -561,9 +575,13 @@ fn resolve_contract(
             EContract::Ensures(resolve_expr(ctx, bound_with_result, e))
         }
         EContract::Decreases { measures, star } => EContract::Decreases {
-            measures: measures.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            measures: measures
+                .iter()
+                .map(|e| resolve_expr(ctx, bound, e))
+                .collect(),
             star: *star,
         },
+        EContract::Invariant(e) => EContract::Invariant(resolve_expr(ctx, bound, e)),
     }
 }
 
@@ -672,7 +690,10 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
                         resolved_mt.clone(),
                         resolve_expr(ctx, &inner_bound, e),
                     );
-                    inner_bound.insert(n.clone(), resolved_mt.unwrap_or_else(|| Ty::Unresolved("?".to_owned())));
+                    inner_bound.insert(
+                        n.clone(),
+                        resolved_mt.unwrap_or_else(|| Ty::Unresolved("?".to_owned())),
+                    );
                     resolved
                 })
                 .collect();
@@ -764,6 +785,49 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
+        ),
+        EExpr::Block(items, sp) => EExpr::Block(
+            items.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            *sp,
+        ),
+        EExpr::VarDecl(name, ty, init, rest, sp) => {
+            let resolved_ty = ty.as_ref().map(|t| ctx.resolve_ty(t));
+            let resolved_init = resolve_expr(ctx, bound, init);
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(
+                name.clone(),
+                resolved_ty
+                    .clone()
+                    .unwrap_or_else(|| Ty::Unresolved("?".to_owned())),
+            );
+            let resolved_rest = resolve_expr(ctx, &inner_bound, rest);
+            EExpr::VarDecl(
+                name.clone(),
+                resolved_ty,
+                Box::new(resolved_init),
+                Box::new(resolved_rest),
+                *sp,
+            )
+        }
+        EExpr::While(cond, contracts, body, sp) => {
+            let resolved_contracts = contracts
+                .iter()
+                .map(|c| resolve_contract(ctx, bound, bound, c))
+                .collect();
+            EExpr::While(
+                Box::new(resolve_expr(ctx, bound, cond)),
+                resolved_contracts,
+                Box::new(resolve_expr(ctx, bound, body)),
+                *sp,
+            )
+        }
+        EExpr::IfElse(cond, then_body, else_body, sp) => EExpr::IfElse(
+            Box::new(resolve_expr(ctx, bound, cond)),
+            Box::new(resolve_expr(ctx, bound, then_body)),
+            else_body
+                .as_ref()
+                .map(|e| Box::new(resolve_expr(ctx, bound, e))),
             *sp,
         ),
         e => e.clone(),

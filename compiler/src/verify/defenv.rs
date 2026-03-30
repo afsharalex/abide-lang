@@ -129,6 +129,7 @@ fn free_vars(expr: &IRExpr) -> HashSet<String> {
     fv
 }
 
+#[allow(clippy::too_many_lines)]
 fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<String>) {
     match expr {
         IRExpr::Var { name, .. } => {
@@ -227,6 +228,45 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             for (k, v) in entries {
                 free_vars_inner(k, bound, fv);
                 free_vars_inner(v, bound, fv);
+            }
+        }
+        IRExpr::Block { exprs, .. } => {
+            for e in exprs {
+                free_vars_inner(e, bound, fv);
+            }
+        }
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            free_vars_inner(init, bound, fv);
+            let was_new = bound.insert(name.clone());
+            free_vars_inner(rest, bound, fv);
+            if was_new {
+                bound.remove(name);
+            }
+        }
+        IRExpr::While {
+            cond,
+            invariants,
+            body,
+            ..
+        } => {
+            free_vars_inner(cond, bound, fv);
+            for inv in invariants {
+                free_vars_inner(inv, bound, fv);
+            }
+            free_vars_inner(body, bound, fv);
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            free_vars_inner(cond, bound, fv);
+            free_vars_inner(then_body, bound, fv);
+            if let Some(eb) = else_body {
+                free_vars_inner(eb, bound, fv);
             }
         }
     }
@@ -656,6 +696,73 @@ fn substitute_var_inner(
         },
         IRExpr::Card { expr, .. } => IRExpr::Card {
             expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+            span: None,
+        },
+        IRExpr::Block { exprs, .. } => IRExpr::Block {
+            exprs: exprs
+                .into_iter()
+                .map(|e| substitute_var_inner(e, var_name, replacement, repl_fv))
+                .collect(),
+            span: None,
+        },
+        IRExpr::VarDecl {
+            name,
+            ty,
+            init,
+            rest,
+            ..
+        } => {
+            let new_init = substitute_var_inner(*init, var_name, replacement, repl_fv);
+            if name == var_name {
+                // Shadowed — don't substitute into rest
+                IRExpr::VarDecl {
+                    name,
+                    ty,
+                    init: Box::new(new_init),
+                    rest,
+                    span: None,
+                }
+            } else {
+                IRExpr::VarDecl {
+                    name,
+                    ty,
+                    init: Box::new(new_init),
+                    rest: Box::new(substitute_var_inner(*rest, var_name, replacement, repl_fv)),
+                    span: None,
+                }
+            }
+        }
+        IRExpr::While {
+            cond,
+            invariants,
+            decreases,
+            body,
+            ..
+        } => IRExpr::While {
+            cond: Box::new(substitute_var_inner(*cond, var_name, replacement, repl_fv)),
+            invariants: invariants
+                .into_iter()
+                .map(|e| substitute_var_inner(e, var_name, replacement, repl_fv))
+                .collect(),
+            decreases,
+            body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
+            span: None,
+        },
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => IRExpr::IfElse {
+            cond: Box::new(substitute_var_inner(*cond, var_name, replacement, repl_fv)),
+            then_body: Box::new(substitute_var_inner(
+                *then_body,
+                var_name,
+                replacement,
+                repl_fv,
+            )),
+            else_body: else_body
+                .map(|e| Box::new(substitute_var_inner(*e, var_name, replacement, repl_fv))),
             span: None,
         },
     }

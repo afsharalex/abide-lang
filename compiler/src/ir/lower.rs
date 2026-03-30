@@ -116,9 +116,7 @@ fn lower_const(ec: &E::EConst) -> IRConst {
     }
 }
 
-fn lower_contracts(
-    contracts: &[E::EContract],
-) -> (Vec<IRExpr>, Vec<IRExpr>, Option<IRDecreases>) {
+fn lower_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Vec<IRExpr>, Option<IRDecreases>) {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     let mut decreases = None;
@@ -132,9 +130,31 @@ fn lower_contracts(
                     star: *star,
                 });
             }
+            E::EContract::Invariant(_) => {
+                // Invariant contracts are handled separately (while loops)
+            }
         }
     }
     (requires, ensures, decreases)
+}
+
+/// Extract invariants and decreases from while-loop contracts.
+fn lower_while_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Option<IRDecreases>) {
+    let mut invariants = Vec::new();
+    let mut decreases = None;
+    for c in contracts {
+        match c {
+            E::EContract::Invariant(e) => invariants.push(lower_expr(e)),
+            E::EContract::Decreases { measures, star } => {
+                decreases = Some(IRDecreases {
+                    measures: measures.iter().map(lower_expr).collect(),
+                    star: *star,
+                });
+            }
+            _ => {}
+        }
+    }
+    (invariants, decreases)
 }
 
 fn lower_fn(ef: &E::EFn) -> IRFunction {
@@ -787,6 +807,34 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
         },
         E::EExpr::Sorry(sp) => IRExpr::Sorry { span: *sp },
         E::EExpr::Todo(sp) => IRExpr::Todo { span: *sp },
+        // Imperative constructs
+        E::EExpr::Block(items, sp) => IRExpr::Block {
+            exprs: items.iter().map(lower_expr).collect(),
+            span: *sp,
+        },
+        E::EExpr::VarDecl(name, ty, init, rest, sp) => IRExpr::VarDecl {
+            name: name.clone(),
+            ty: ty.as_ref().map_or(IRType::String, lower_ty),
+            init: Box::new(lower_expr(init)),
+            rest: Box::new(lower_expr(rest)),
+            span: *sp,
+        },
+        E::EExpr::While(cond, contracts, body, sp) => {
+            let (invariants, decreases) = lower_while_contracts(contracts);
+            IRExpr::While {
+                cond: Box::new(lower_expr(cond)),
+                invariants,
+                decreases,
+                body: Box::new(lower_expr(body)),
+                span: *sp,
+            }
+        }
+        E::EExpr::IfElse(cond, then_body, else_body, sp) => IRExpr::IfElse {
+            cond: Box::new(lower_expr(cond)),
+            then_body: Box::new(lower_expr(then_body)),
+            else_body: else_body.as_ref().map(|e| Box::new(lower_expr(e))),
+            span: *sp,
+        },
     }
 }
 

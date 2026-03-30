@@ -468,15 +468,9 @@ impl Parser {
         let contracts = self.contracts()?;
         // Two body forms:
         //   = expr     (pure, no contracts or contracts allowed)
-        //   { expr }   (contracted form, consistent with action/event)
+        //   { body }   (imperative form with blocks, consistent with action/event)
         let body = if matches!(self.peek(), Some(Token::LBrace)) {
-            self.advance();
-            let body = self.expr()?;
-            let end = self.expect(&Token::RBrace)?;
-            Expr {
-                span: body.span.merge(end),
-                ..body
-            }
+            self.parse_block()?
         } else {
             self.expect(&Token::Eq)?;
             self.expr()?
@@ -814,10 +808,113 @@ impl Parser {
                         });
                     }
                 }
+                Some(Token::Invariant) => {
+                    let start = self.advance().1;
+                    let expr = self.expr()?;
+                    contracts.push(Contract::Invariant {
+                        span: start.merge(expr.span),
+                        expr,
+                    });
+                }
                 _ => break,
             }
         }
         Ok(contracts)
+    }
+
+    // ── Imperative blocks (fn body) ─────────────────────────────────
+
+    fn parse_block(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&Token::LBrace)?;
+        let mut items = Vec::new();
+        while !matches!(self.peek(), Some(Token::RBrace)) {
+            items.push(self.block_item()?);
+        }
+        let end = self.expect(&Token::RBrace)?;
+        let span = start.merge(end);
+        // Single-expression block: unwrap to avoid unnecessary Block wrapper
+        if items.len() == 1 && !matches!(items[0].kind, ExprKind::VarDecl { .. }) {
+            let item = items.into_iter().next().unwrap();
+            return Ok(Expr {
+                kind: item.kind,
+                span,
+            });
+        }
+        Ok(Expr {
+            kind: ExprKind::Block(items),
+            span,
+        })
+    }
+
+    fn block_item(&mut self) -> Result<Expr, ParseError> {
+        match self.peek() {
+            Some(Token::Var) => self.parse_var_decl(),
+            Some(Token::While) => self.parse_while(),
+            Some(Token::If) => self.parse_if_else(),
+            _ => self.expr(),
+        }
+    }
+
+    fn parse_var_decl(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&Token::Var)?;
+        let (name, _) = self.expect_name()?;
+        let ty = if self.eat(&Token::Colon).is_some() {
+            Some(self.type_ref()?)
+        } else {
+            None
+        };
+        self.expect(&Token::Eq)?;
+        let init = self.expr()?;
+        let end = init.span;
+        Ok(Expr {
+            kind: ExprKind::VarDecl {
+                name,
+                ty,
+                init: Box::new(init),
+            },
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_while(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&Token::While)?;
+        let cond = self.expr()?;
+        let contracts = self.contracts()?;
+        let body = self.parse_block()?;
+        let end = body.span;
+        Ok(Expr {
+            kind: ExprKind::While {
+                cond: Box::new(cond),
+                contracts,
+                body: Box::new(body),
+            },
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_if_else(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&Token::If)?;
+        let cond = self.expr()?;
+        let then_body = self.parse_block()?;
+        let else_body = if self.eat(&Token::Else).is_some() {
+            if matches!(self.peek(), Some(Token::If)) {
+                // else if ...
+                Some(Box::new(self.parse_if_else()?))
+            } else {
+                Some(Box::new(self.parse_block()?))
+            }
+        } else {
+            None
+        };
+        let end = else_body.as_ref().map_or(then_body.span, |e| e.span);
+        Ok(Expr {
+            kind: ExprKind::IfElse {
+                cond: Box::new(cond),
+                then_body: Box::new(then_body),
+                else_body,
+            },
+            span: start.merge(end),
+        })
     }
 
     // ── System Declarations ──────────────────────────────────────────
@@ -3737,9 +3834,8 @@ pub type Distance = Real"#;
 
     #[test]
     fn fn_with_requires() {
-        let prog = parse_program(
-            "fn gcd(a: Int, b: Int): Int requires a > 0 requires b >= 0 { a }",
-        );
+        let prog =
+            parse_program("fn gcd(a: Int, b: Int): Int requires a > 0 requires b >= 0 { a }");
         match &prog.decls[0] {
             TopDecl::Fn(f) => {
                 assert_eq!(f.name, "gcd");
@@ -3753,8 +3849,7 @@ pub type Distance = Real"#;
 
     #[test]
     fn fn_with_ensures() {
-        let prog =
-            parse_program("fn abs(x: Int): Int ensures result >= 0 { x }");
+        let prog = parse_program("fn abs(x: Int): Int ensures result >= 0 { x }");
         match &prog.decls[0] {
             TopDecl::Fn(f) => {
                 assert_eq!(f.name, "abs");
@@ -3767,9 +3862,7 @@ pub type Distance = Real"#;
 
     #[test]
     fn fn_with_decreases_single() {
-        let prog = parse_program(
-            "fn countdown(n: Int): Int decreases n { n }",
-        );
+        let prog = parse_program("fn countdown(n: Int): Int decreases n { n }");
         match &prog.decls[0] {
             TopDecl::Fn(f) => {
                 assert_eq!(f.contracts.len(), 1);
@@ -3787,9 +3880,7 @@ pub type Distance = Real"#;
 
     #[test]
     fn fn_with_decreases_lexicographic() {
-        let prog = parse_program(
-            "fn ack(m: Int, n: Int): Int decreases m, n { m }",
-        );
+        let prog = parse_program("fn ack(m: Int, n: Int): Int decreases m, n { m }");
         match &prog.decls[0] {
             TopDecl::Fn(f) => {
                 assert_eq!(f.contracts.len(), 1);
@@ -3807,9 +3898,7 @@ pub type Distance = Real"#;
 
     #[test]
     fn fn_with_decreases_star() {
-        let prog = parse_program(
-            "fn f(n: Int): Int decreases * { n }",
-        );
+        let prog = parse_program("fn f(n: Int): Int decreases * { n }");
         match &prog.decls[0] {
             TopDecl::Fn(f) => {
                 assert_eq!(f.contracts.len(), 1);
@@ -3849,6 +3938,173 @@ pub type Distance = Real"#;
             TopDecl::Fn(f) => {
                 assert_eq!(f.name, "id");
                 assert!(f.contracts.is_empty());
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    // ── Imperative fn body tests ────────────────────────────────────
+
+    #[test]
+    fn fn_with_var_decl() {
+        let prog = parse_program("fn f(x: Int): Int { var y = x + 1\ny }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.name, "f");
+                match &f.body.kind {
+                    ExprKind::Block(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert!(matches!(items[0].kind, ExprKind::VarDecl { .. }));
+                        assert!(matches!(items[1].kind, ExprKind::Var(_)));
+                    }
+                    other => panic!("expected Block, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_while_loop() {
+        let prog = parse_program("fn f(x: Int): Int { while x > 0 { x } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                // Single-item block with a while unwraps directly
+                match &f.body.kind {
+                    ExprKind::While { cond, body, .. } => {
+                        assert!(matches!(cond.kind, ExprKind::Gt(_, _)));
+                        assert!(matches!(body.kind, ExprKind::Var(_)));
+                    }
+                    other => panic!("expected While, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_while_invariant_decreases() {
+        let prog =
+            parse_program("fn f(x: Int): Int { while x > 0 invariant x >= 0 decreases x { x } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => match &f.body.kind {
+                ExprKind::While {
+                    contracts, cond, ..
+                } => {
+                    assert!(matches!(cond.kind, ExprKind::Gt(_, _)));
+                    assert_eq!(contracts.len(), 2);
+                    assert!(matches!(contracts[0], Contract::Invariant { .. }));
+                    assert!(matches!(contracts[1], Contract::Decreases { .. }));
+                }
+                other => panic!("expected While, got {other:?}"),
+            },
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_if_else() {
+        let prog = parse_program("fn f(x: Int): Int { if x > 0 { x } else { 0 } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => match &f.body.kind {
+                ExprKind::IfElse {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    assert!(matches!(cond.kind, ExprKind::Gt(_, _)));
+                    assert!(matches!(then_body.kind, ExprKind::Var(_)));
+                    assert!(else_body.is_some());
+                    assert!(matches!(else_body.as_ref().unwrap().kind, ExprKind::Int(0)));
+                }
+                other => panic!("expected IfElse, got {other:?}"),
+            },
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_if_no_else() {
+        let prog = parse_program("fn f(x: Int): Int { if x > 0 { x } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => match &f.body.kind {
+                ExprKind::IfElse { else_body, .. } => {
+                    assert!(else_body.is_none());
+                }
+                other => panic!("expected IfElse, got {other:?}"),
+            },
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_multiple_statements() {
+        let prog = parse_program("fn f(x: Int): Int {\n  var a = 1\n  var b = 2\n  a + b\n}");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => match &f.body.kind {
+                ExprKind::Block(items) => {
+                    assert_eq!(items.len(), 3);
+                    assert!(matches!(items[0].kind, ExprKind::VarDecl { .. }));
+                    assert!(matches!(items[1].kind, ExprKind::VarDecl { .. }));
+                    assert!(matches!(items[2].kind, ExprKind::Add(_, _)));
+                }
+                other => panic!("expected Block, got {other:?}"),
+            },
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_var_typed() {
+        let prog = parse_program("fn f(x: Int): Int { var y: Int = 0\ny }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => match &f.body.kind {
+                ExprKind::Block(items) => {
+                    assert_eq!(items.len(), 2);
+                    match &items[0].kind {
+                        ExprKind::VarDecl { name, ty, .. } => {
+                            assert_eq!(name, "y");
+                            assert!(ty.is_some());
+                        }
+                        other => panic!("expected VarDecl, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Block, got {other:?}"),
+            },
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_else_if_chain() {
+        let prog =
+            parse_program("fn f(x: Int): Int { if x > 0 { 1 } else if x == 0 { 0 } else { 2 } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                match &f.body.kind {
+                    ExprKind::IfElse { else_body, .. } => {
+                        // The else branch is another IfElse
+                        let eb = else_body.as_ref().unwrap();
+                        assert!(matches!(eb.kind, ExprKind::IfElse { .. }));
+                    }
+                    other => panic!("expected IfElse, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_single_expr_body_unwraps() {
+        // A block with a single non-VarDecl expression should unwrap
+        let prog = parse_program("fn f(x: Int): Int { x + 1 }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert!(
+                    matches!(f.body.kind, ExprKind::Add(_, _)),
+                    "single-expr block should unwrap, got {:?}",
+                    f.body.kind
+                );
             }
             other => panic!("expected Fn, got {other:?}"),
         }

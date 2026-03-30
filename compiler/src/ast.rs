@@ -233,9 +233,23 @@ pub struct Param {
 
 #[derive(Debug, Clone)]
 pub enum Contract {
-    Requires { expr: Expr, span: Span },
-    Ensures { expr: Expr, span: Span },
-    Decreases { measures: Vec<Expr>, star: bool, span: Span },
+    Requires {
+        expr: Expr,
+        span: Span,
+    },
+    Ensures {
+        expr: Expr,
+        span: Span,
+    },
+    Decreases {
+        measures: Vec<Expr>,
+        star: bool,
+        span: Span,
+    },
+    Invariant {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 // ── System Declarations ──────────────────────────────────────────────
@@ -613,6 +627,24 @@ pub enum ExprKind {
         var: String,
         domain: TypeRef,
         filter: Box<Expr>,
+    },
+
+    // Imperative constructs (fn body)
+    Block(Vec<Expr>),
+    VarDecl {
+        name: String,
+        ty: Option<TypeRef>,
+        init: Box<Expr>,
+    },
+    While {
+        cond: Box<Expr>,
+        contracts: Vec<Contract>,
+        body: Box<Expr>,
+    },
+    IfElse {
+        cond: Box<Expr>,
+        then_body: Box<Expr>,
+        else_body: Option<Box<Expr>>,
     },
 
     // Level 14: atoms

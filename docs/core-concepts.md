@@ -193,45 +193,26 @@ At this layer, you're answering: *"Does my system behave correctly across all po
 
 ---
 
-## Layer 4: Algorithm Verification *(Partially Implemented)*
+## Layer 4: Algorithm Verification
 
 Verify function and algorithm correctness.
 
 Beyond system-level properties, some specifications need to verify that a specific algorithm is correct — that a sorting function actually sorts, that a routing algorithm finds the shortest path, that a cryptographic operation preserves certain invariants.
 
-**Function contracts** are implemented: `requires`, `ensures`, and `decreases` clauses attach to `fn` declarations. Functions with contracts use the `{ body }` form:
+**Function contracts** attach `requires`, `ensures`, and `decreases` clauses to `fn` declarations. **Imperative bodies** provide `var` for mutable locals, `while` loops with `invariant` and `decreases`, and `if`/`else` expressions. Functions with contracts or imperative logic use the `{ body }` form:
 
 ```abide
 fn gcd(a: Int, b: Int): Int
   requires a > 0
   requires b >= 0
   ensures result > 0
-  decreases b
 {
-  match b {
-    _ if b == 0 => a
-    _ => gcd(b, a % b)
-  }
-}
-```
-
-- `requires` = precondition (must be Bool)
-- `ensures` = postcondition (must be Bool, `result` refers to the return value)
-- `decreases` = termination measure for recursive functions (must be Int, comma-separated for lexicographic tuples, `*` to skip checking)
-
-**Imperative bodies** are planned for v0.2: `var` for mutable locals, `while` loops with `invariant` and `decreases`, `if`/`else` expressions:
-
-```abide
-// Planned syntax — not yet implemented
-
-fn gcd_imperative(a: Int, b: Int): Int
-  requires a > 0 and b > 0
-  ensures result > 0 {
   var x = a
   var y = b
   while y != 0
-    invariant x > 0 and y >= 0
-    decreases y {
+    invariant x > 0
+    decreases y
+  {
     var temp = y
     y = x % y
     x = temp
@@ -240,15 +221,21 @@ fn gcd_imperative(a: Int, b: Int): Int
 }
 ```
 
-**Refinement types** will constrain values at the type level:
+- `requires` = precondition (must be Bool)
+- `ensures` = postcondition (must be Bool, `result` refers to the return value)
+- `decreases` = termination measure for recursive functions (must be Int, comma-separated for lexicographic tuples, `*` to skip checking)
+- `var` = mutable local variable (vs `let` for immutable)
+- `while` = loop with optional `invariant` (must be Bool) and `decreases`
+- `if`/`else` = conditional expression (both branches must have the same type)
+- Block evaluates to its last expression — no explicit `return` keyword
+
+**Refinement types** are under evaluation:
 
 ```abide
-// Planned syntax — not yet implemented
+// Under evaluation — see Proposal 031
 
 type Positive = Int{$ > 0}
 type Probability = Real{$ >= 0.0 and $ <= 1.0}
-
-fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int{$ >= lo and $ <= hi}
 ```
 
 At this layer, you're answering: *"Is this specific algorithm correct?"*

@@ -127,6 +127,10 @@ pub enum Token {
     Mut,
     #[token("decreases")]
     Decreases,
+    #[token("var")]
+    Var,
+    #[token("while")]
+    While,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token(":=")]
@@ -284,6 +288,8 @@ impl std::fmt::Display for Token {
             Self::By => write!(f, "by"),
             Self::Mut => write!(f, "mut"),
             Self::Decreases => write!(f, "decreases"),
+            Self::Var => write!(f, "var"),
+            Self::While => write!(f, "while"),
             Self::ColonEq => write!(f, ":="),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),

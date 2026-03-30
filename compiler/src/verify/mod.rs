@@ -410,7 +410,11 @@ fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
         | IRExpr::SetComp { span, .. }
         | IRExpr::Card { span, .. }
         | IRExpr::Sorry { span, .. }
-        | IRExpr::Todo { span, .. } => *span,
+        | IRExpr::Todo { span, .. }
+        | IRExpr::Block { span, .. }
+        | IRExpr::VarDecl { span, .. }
+        | IRExpr::While { span, .. }
+        | IRExpr::IfElse { span, .. } => *span,
     }
 }
 
@@ -2776,6 +2780,10 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
             elements.iter().find_map(find_unsupported_scene_expr)
         }
         IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
+        IRExpr::Block { .. } => Some("Block"),
+        IRExpr::VarDecl { .. } => Some("VarDecl"),
+        IRExpr::While { .. } => Some("While"),
+        IRExpr::IfElse { .. } => Some("IfElse"),
     }
 }
 

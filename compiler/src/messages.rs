@@ -88,6 +88,13 @@ pub const HELP_ENSURES_BOOL: &str = "ensures clauses must evaluate to Bool";
 /// Help for decreases measure type mismatch.
 pub const HELP_DECREASES_INT: &str = "decreases measures must be Int expressions";
 
+/// Error when while loop has multiple decreases clauses.
+pub const WHILE_MULTIPLE_DECREASES: &str =
+    "while loop has multiple decreases clauses; only one is allowed";
+
+/// Error when if/else branches have different types.
+pub const IF_ELSE_TYPE_MISMATCH: &str = "if/else branches have different types";
+
 // ── Verification messages ────────────────────────────────────────────
 
 /// Scene check: unsatisfiable scenario.

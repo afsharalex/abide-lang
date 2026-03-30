@@ -105,9 +105,17 @@ impl ErrorKind {
     }
 }
 
+/// Severity level for elaboration diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElabError {
     pub kind: ErrorKind,
+    pub severity: Severity,
     pub message: String,
     pub context: String,
     /// Source span for the primary error location.
@@ -128,6 +136,23 @@ impl ElabError {
     pub fn new(kind: ErrorKind, message: impl Into<String>, context: impl Into<String>) -> Self {
         Self {
             kind,
+            severity: Severity::Error,
+            message: message.into(),
+            context: context.into(),
+            span: None,
+            file: None,
+            help: None,
+            secondary_span: None,
+            secondary_label: None,
+            secondary_file: None,
+        }
+    }
+
+    /// Create a warning diagnostic.
+    pub fn warning(message: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::TypeMismatch, // warnings reuse the closest kind
+            severity: Severity::Warning,
             message: message.into(),
             context: context.into(),
             span: None,
@@ -148,6 +173,7 @@ impl ElabError {
     ) -> Self {
         Self {
             kind,
+            severity: Severity::Error,
             message: message.into(),
             context: context.into(),
             span: Some(span),
@@ -202,7 +228,11 @@ impl ElabError {
 
 impl std::fmt::Display for ElabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error[{}]: {}", self.kind.code(), self.message)?;
+        let prefix = match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        write!(f, "{}[{}]: {}", prefix, self.kind.code(), self.message)?;
         if !self.context.is_empty() {
             write!(f, " ({})", self.context)?;
         }
@@ -213,6 +243,13 @@ impl std::fmt::Display for ElabError {
 impl std::error::Error for ElabError {}
 
 impl miette::Diagnostic for ElabError {
+    fn severity(&self) -> Option<miette::Severity> {
+        Some(match self.severity {
+            Severity::Error => miette::Severity::Error,
+            Severity::Warning => miette::Severity::Warning,
+        })
+    }
+
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
         Some(Box::new(format!("abide::{}", self.kind.code())))
     }

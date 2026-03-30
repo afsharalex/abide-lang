@@ -283,12 +283,13 @@ pub struct EFn {
     pub file: Option<String>,
 }
 
-/// Contract clause on fn declarations.
+/// Contract clause on fn declarations and while loops.
 #[derive(Debug, Clone)]
 pub enum EContract {
     Requires(EExpr),
     Ensures(EExpr),
     Decreases { measures: Vec<EExpr>, star: bool },
+    Invariant(EExpr),
 }
 
 // ── Elaborated expressions ───────────────────────────────────────────
@@ -368,6 +369,30 @@ pub enum EExpr {
     MapLit(Ty, Vec<(EExpr, EExpr)>, Option<crate::span::Span>),
     Sorry(Option<crate::span::Span>),
     Todo(Option<crate::span::Span>),
+    // Imperative constructs
+    Block(Vec<EExpr>, Option<crate::span::Span>),
+    /// VarDecl(name, type, init, rest, span)
+    VarDecl(
+        String,
+        Option<Ty>,
+        Box<EExpr>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    /// While(cond, contracts, body, span)
+    While(
+        Box<EExpr>,
+        Vec<EContract>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    /// IfElse(cond, then, else, span)
+    IfElse(
+        Box<EExpr>,
+        Box<EExpr>,
+        Option<Box<EExpr>>,
+        Option<crate::span::Span>,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +436,12 @@ impl EExpr {
             | Self::MapLit(ty, _, _) => ty.clone(),
             Self::Let(_, body, _) => body.ty(),
             Self::Match(scrut, _, _) => scrut.ty(),
+            Self::Block(items, _) => items
+                .last()
+                .map_or(Ty::Unresolved(String::new()), EExpr::ty),
+            Self::VarDecl(_, _, _, rest, _) => rest.ty(),
+            Self::While(_, _, _, _) => Ty::Unresolved(String::new()),
+            Self::IfElse(_, then_body, _, _) => then_body.ty(),
             Self::Sorry(_) | Self::Todo(_) | Self::Lam(_, _, _, _) | Self::Unresolved(_, _) => {
                 Ty::Unresolved(String::new())
             }
