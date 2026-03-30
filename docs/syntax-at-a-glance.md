@@ -115,7 +115,7 @@ action deposit(amount: Real)
 }
 ```
 
-`requires` = precondition (must be true to execute). `ensures` = postcondition (must be true after execution). Contracts attach to actions, events, and functions.
+`requires` = precondition (must be true to execute). `ensures` = postcondition (must be true after execution). `decreases` = termination measure (for recursive functions). Contracts attach to actions, events, and functions.
 
 `Stable`
 
@@ -187,7 +187,29 @@ fn max(a: Int, b: Int): Int = if a > b then a else b
 fn risk_score(t: Transfer): Real = sorry
 ```
 
-Named pure functions. `= expr` form for single expressions. `sorry` stubs a function body that will be filled in later.
+Named pure functions. `= expr` form for simple definitions. `sorry` stubs a function body that will be filled in later.
+
+`Stable`
+
+---
+
+### Function Contracts
+
+```abide
+fn gcd(a: Int, b: Int): Int
+  requires a > 0
+  requires b >= 0
+  ensures result > 0
+  decreases b
+{
+  match b {
+    _ if b == 0 => a
+    _ => gcd(b, a % b)
+  }
+}
+```
+
+Functions with contracts use the `{ body }` form. `requires` = precondition. `ensures` = postcondition (`result` refers to the return value). `decreases` = termination measure for recursive functions (comma-separated for lexicographic, `*` to skip checking).
 
 `Stable`
 

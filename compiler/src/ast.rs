@@ -102,6 +102,7 @@ pub struct FnDecl {
     pub visibility: Visibility,
     pub params: Vec<TypedParam>,
     pub ret_type: TypeRef,
+    pub contracts: Vec<Contract>,
     pub body: Expr,
     pub span: Span,
 }
@@ -234,6 +235,7 @@ pub struct Param {
 pub enum Contract {
     Requires { expr: Expr, span: Span },
     Ensures { expr: Expr, span: Span },
+    Decreases { measures: Vec<Expr>, star: bool, span: Span },
 }
 
 // ── System Declarations ──────────────────────────────────────────────

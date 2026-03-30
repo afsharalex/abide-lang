@@ -465,14 +465,29 @@ impl Parser {
         self.expect(&Token::RParen)?;
         self.expect(&Token::Colon)?;
         let ret_type = self.type_ref()?;
-        self.expect(&Token::Eq)?;
-        let body = self.expr()?;
+        let contracts = self.contracts()?;
+        // Two body forms:
+        //   = expr     (pure, no contracts or contracts allowed)
+        //   { expr }   (contracted form, consistent with action/event)
+        let body = if matches!(self.peek(), Some(Token::LBrace)) {
+            self.advance();
+            let body = self.expr()?;
+            let end = self.expect(&Token::RBrace)?;
+            Expr {
+                span: body.span.merge(end),
+                ..body
+            }
+        } else {
+            self.expect(&Token::Eq)?;
+            self.expr()?
+        };
         Ok(FnDecl {
             span: start.merge(body.span),
             name,
             visibility: Visibility::Private,
             params,
             ret_type,
+            contracts,
             body,
         })
     }
@@ -772,6 +787,32 @@ impl Parser {
                         span: start.merge(expr.span),
                         expr,
                     });
+                }
+                Some(Token::Decreases) => {
+                    let start = self.advance().1;
+                    // decreases * (escape hatch)
+                    if matches!(self.peek(), Some(Token::Star)) {
+                        let end = self.advance().1;
+                        contracts.push(Contract::Decreases {
+                            measures: vec![],
+                            star: true,
+                            span: start.merge(end),
+                        });
+                    } else {
+                        // decreases expr, expr, ... (comma-separated measures)
+                        let first = self.expr()?;
+                        let mut measures = vec![first];
+                        while matches!(self.peek(), Some(Token::Comma)) {
+                            self.advance();
+                            measures.push(self.expr()?);
+                        }
+                        let end = measures.last().unwrap().span;
+                        contracts.push(Contract::Decreases {
+                            span: start.merge(end),
+                            measures,
+                            star: false,
+                        });
+                    }
                 }
                 _ => break,
             }
@@ -3677,6 +3718,139 @@ pub type Distance = Real"#;
                 );
             }
             other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    // ── fn contract tests ─────────────────────────────────────────────
+
+    #[test]
+    fn fn_no_contracts() {
+        let prog = parse_program("fn double(x: Int): Int = x + x");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.name, "double");
+                assert!(f.contracts.is_empty());
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_requires() {
+        let prog = parse_program(
+            "fn gcd(a: Int, b: Int): Int requires a > 0 requires b >= 0 { a }",
+        );
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.name, "gcd");
+                assert_eq!(f.contracts.len(), 2);
+                assert!(matches!(f.contracts[0], Contract::Requires { .. }));
+                assert!(matches!(f.contracts[1], Contract::Requires { .. }));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_ensures() {
+        let prog =
+            parse_program("fn abs(x: Int): Int ensures result >= 0 { x }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.name, "abs");
+                assert_eq!(f.contracts.len(), 1);
+                assert!(matches!(f.contracts[0], Contract::Ensures { .. }));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_decreases_single() {
+        let prog = parse_program(
+            "fn countdown(n: Int): Int decreases n { n }",
+        );
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.contracts.len(), 1);
+                match &f.contracts[0] {
+                    Contract::Decreases { measures, star, .. } => {
+                        assert_eq!(measures.len(), 1);
+                        assert!(!star);
+                    }
+                    other => panic!("expected Decreases, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_decreases_lexicographic() {
+        let prog = parse_program(
+            "fn ack(m: Int, n: Int): Int decreases m, n { m }",
+        );
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.contracts.len(), 1);
+                match &f.contracts[0] {
+                    Contract::Decreases { measures, star, .. } => {
+                        assert_eq!(measures.len(), 2);
+                        assert!(!star);
+                    }
+                    other => panic!("expected Decreases, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_decreases_star() {
+        let prog = parse_program(
+            "fn f(n: Int): Int decreases * { n }",
+        );
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.contracts.len(), 1);
+                match &f.contracts[0] {
+                    Contract::Decreases { measures, star, .. } => {
+                        assert!(measures.is_empty());
+                        assert!(star);
+                    }
+                    other => panic!("expected Decreases, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_with_all_contracts() {
+        let prog = parse_program(
+            "fn gcd(a: Int, b: Int): Int requires a > 0 ensures result > 0 decreases b { a }",
+        );
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.contracts.len(), 3);
+                assert!(matches!(f.contracts[0], Contract::Requires { .. }));
+                assert!(matches!(f.contracts[1], Contract::Ensures { .. }));
+                assert!(matches!(f.contracts[2], Contract::Decreases { .. }));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_pure_form_no_contracts() {
+        // Pure form with = body should still work
+        let prog = parse_program("fn id(x: Int): Int = x");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.name, "id");
+                assert!(f.contracts.is_empty());
+            }
+            other => panic!("expected Fn, got {other:?}"),
         }
     }
 }

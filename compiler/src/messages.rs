@@ -64,6 +64,30 @@ pub const HELP_PRIME_FIELDS_ONLY: &str = "only entity fields can be primed";
 /// Help for requires clause type.
 pub const MSG_REQUIRES_SHOULD_BE_BOOL: &str = "requires expression should be Bool";
 
+// ── Contract messages ───────────────────────────────────────────────
+
+/// Warning when `decreases *` is used (skips termination checking).
+pub const DECREASES_STAR_WARNING: &str =
+    "decreases * skips termination checking — ensure termination manually";
+
+/// Error when a decreases measure is not Int.
+pub const DECREASES_MEASURE_NOT_INT: &str = "decreases measure must have type Int";
+
+/// Error when ensures clause is not Bool.
+pub const ENSURES_NOT_BOOL: &str = "ensures clause must have type Bool";
+
+/// Error when requires clause is not Bool.
+pub const REQUIRES_NOT_BOOL: &str = "requires clause must have type Bool";
+
+/// Help for requires clause type mismatch.
+pub const HELP_REQUIRES_BOOL: &str = "requires clauses must evaluate to Bool";
+
+/// Help for ensures clause type mismatch.
+pub const HELP_ENSURES_BOOL: &str = "ensures clauses must evaluate to Bool";
+
+/// Help for decreases measure type mismatch.
+pub const HELP_DECREASES_INT: &str = "decreases measures must be Int expressions";
+
 // ── Verification messages ────────────────────────────────────────────
 
 /// Scene check: unsatisfiable scenario.

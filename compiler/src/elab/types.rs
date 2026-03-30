@@ -277,9 +277,18 @@ pub struct EFn {
     pub name: String,
     pub params: Vec<(String, Ty)>,
     pub ret_ty: Ty,
+    pub contracts: Vec<EContract>,
     pub body: EExpr,
     pub span: Option<crate::span::Span>,
     pub file: Option<String>,
+}
+
+/// Contract clause on fn declarations.
+#[derive(Debug, Clone)]
+pub enum EContract {
+    Requires(EExpr),
+    Ensures(EExpr),
+    Decreases { measures: Vec<EExpr>, star: bool },
 }
 
 // ── Elaborated expressions ───────────────────────────────────────────

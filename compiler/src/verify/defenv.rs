@@ -930,7 +930,9 @@ mod tests {
                     span: None,
                 },
                 prop_target: None,
-
+                requires: vec![],
+                ensures: vec![],
+                decreases: None,
                 span: None,
                 file: None,
             }],
@@ -989,7 +991,9 @@ mod tests {
                     span: None,
                 },
                 prop_target: None,
-
+                requires: vec![],
+                ensures: vec![],
+                decreases: None,
                 span: None,
                 file: None,
             }],
@@ -1050,7 +1054,9 @@ mod tests {
                     span: None,
                 },
                 prop_target: None,
-
+                requires: vec![],
+                ensures: vec![],
+                decreases: None,
                 span: None,
                 file: None,
             }],

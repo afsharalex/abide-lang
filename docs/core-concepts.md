@@ -193,20 +193,38 @@ At this layer, you're answering: *"Does my system behave correctly across all po
 
 ---
 
-## Layer 4: Algorithm Verification *(Planned)*
+## Layer 4: Algorithm Verification *(Partially Implemented)*
 
 Verify function and algorithm correctness.
 
-> This layer is designed but not yet implemented. The syntax below is planned for v0.2.
-
 Beyond system-level properties, some specifications need to verify that a specific algorithm is correct — that a sorting function actually sorts, that a routing algorithm finds the shortest path, that a cryptographic operation preserves certain invariants.
 
-Abide will extend the `fn` construct with imperative bodies, loop invariants, and termination measures:
+**Function contracts** are implemented: `requires`, `ensures`, and `decreases` clauses attach to `fn` declarations. Functions with contracts use the `{ body }` form:
+
+```abide
+fn gcd(a: Int, b: Int): Int
+  requires a > 0
+  requires b >= 0
+  ensures result > 0
+  decreases b
+{
+  match b {
+    _ if b == 0 => a
+    _ => gcd(b, a % b)
+  }
+}
+```
+
+- `requires` = precondition (must be Bool)
+- `ensures` = postcondition (must be Bool, `result` refers to the return value)
+- `decreases` = termination measure for recursive functions (must be Int, comma-separated for lexicographic tuples, `*` to skip checking)
+
+**Imperative bodies** are planned for v0.2: `var` for mutable locals, `while` loops with `invariant` and `decreases`, `if`/`else` expressions:
 
 ```abide
 // Planned syntax — not yet implemented
 
-fn gcd(a: Int, b: Int): Int
+fn gcd_imperative(a: Int, b: Int): Int
   requires a > 0 and b > 0
   ensures result > 0 {
   var x = a

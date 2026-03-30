@@ -8,9 +8,9 @@ use crate::ast::{self, Visibility};
 use super::env::{DeclKind, Env};
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BinOp, BuiltinTy, EAction, EAxiom, EConst, EEntity, EEvent, EEventAction, EExpr, EField, EFn,
-    ELemma, ENextItem, EPattern, EPred, EProp, EScene, ESceneGiven, ESceneWhen, ESystem, ETheorem,
-    EVerify, Literal, Quantifier, Ty, UnOp,
+    BinOp, BuiltinTy, EAction, EAxiom, EConst, EContract, EEntity, EEvent, EEventAction, EExpr,
+    EField, EFn, ELemma, ENextItem, EPattern, EPred, EProp, EScene, ESceneGiven, ESceneWhen,
+    ESystem, ETheorem, EVerify, Literal, Quantifier, Ty, UnOp,
 };
 
 /// Collect all declarations from a parsed program into a new `Env`.
@@ -247,7 +247,7 @@ fn collect_action(a: &ast::EntityAction) -> EAction {
         .iter()
         .filter_map(|c| match c {
             ast::Contract::Requires { expr, .. } => Some(collect_expr(expr)),
-            ast::Contract::Ensures { .. } => None,
+            _ => None,
         })
         .collect();
     let body: Vec<EExpr> = a.body.iter().map(collect_expr).collect();
@@ -318,7 +318,7 @@ fn collect_event(ev: &ast::EventDecl) -> EEvent {
         .iter()
         .filter_map(|c| match c {
             ast::Contract::Requires { expr, .. } => Some(collect_expr(expr)),
-            ast::Contract::Ensures { .. } => None,
+            _ => None,
         })
         .collect();
     let ensures: Vec<EExpr> = ev
@@ -326,7 +326,7 @@ fn collect_event(ev: &ast::EventDecl) -> EEvent {
         .iter()
         .filter_map(|c| match c {
             ast::Contract::Ensures { expr, .. } => Some(collect_expr(expr)),
-            ast::Contract::Requires { .. } => None,
+            _ => None,
         })
         .collect();
     let body: Vec<EEventAction> = ev.items.iter().map(collect_event_item).collect();
@@ -722,10 +722,12 @@ fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
         .map(|p| (p.name.clone(), resolve_type_ref(&p.ty)))
         .collect();
     let ret = resolve_type_ref(&fd.ret_type);
+    let contracts = fd.contracts.iter().map(collect_contract).collect();
     let ef = EFn {
         name: name.clone(),
         params,
         ret_ty: ret,
+        contracts,
         body: collect_expr(&fd.body),
         span: Some(fd.span),
         file: env.current_file.clone(),
@@ -733,6 +735,17 @@ fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
     let info = env.make_decl_info(DeclKind::Fn, name.clone(), None, fd.visibility, fd.span);
     env.add_decl(name, info);
     env.insert_fn(name, ef);
+}
+
+fn collect_contract(c: &ast::Contract) -> EContract {
+    match c {
+        ast::Contract::Requires { expr, .. } => EContract::Requires(collect_expr(expr)),
+        ast::Contract::Ensures { expr, .. } => EContract::Ensures(collect_expr(expr)),
+        ast::Contract::Decreases { measures, star, .. } => EContract::Decreases {
+            measures: measures.iter().map(collect_expr).collect(),
+            star: *star,
+        },
+    }
 }
 
 // ── Expression collection ────────────────────────────────────────────

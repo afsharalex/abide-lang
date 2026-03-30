@@ -6,10 +6,11 @@
 use crate::elab::types as E;
 
 use super::types::{
-    Cardinality, IRAction, IRAxiom, IRConst, IRCreateField, IREntity, IREvent, IRExpr, IRField,
-    IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene, IRSceneEvent,
-    IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam, IRTransRef,
-    IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding, LitVal,
+    Cardinality, IRAction, IRAxiom, IRConst, IRCreateField, IRDecreases, IREntity, IREvent, IRExpr,
+    IRField, IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene,
+    IRSceneEvent, IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam,
+    IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding,
+    LitVal,
 };
 
 // ── Top-level lowering ───────────────────────────────────────────────
@@ -115,6 +116,27 @@ fn lower_const(ec: &E::EConst) -> IRConst {
     }
 }
 
+fn lower_contracts(
+    contracts: &[E::EContract],
+) -> (Vec<IRExpr>, Vec<IRExpr>, Option<IRDecreases>) {
+    let mut requires = Vec::new();
+    let mut ensures = Vec::new();
+    let mut decreases = None;
+    for c in contracts {
+        match c {
+            E::EContract::Requires(e) => requires.push(lower_expr(e)),
+            E::EContract::Ensures(e) => ensures.push(lower_expr(e)),
+            E::EContract::Decreases { measures, star } => {
+                decreases = Some(IRDecreases {
+                    measures: measures.iter().map(lower_expr).collect(),
+                    star: *star,
+                });
+            }
+        }
+    }
+    (requires, ensures, decreases)
+}
+
 fn lower_fn(ef: &E::EFn) -> IRFunction {
     let ret_ty = lower_ty(&ef.ret_ty);
     let fn_ty = ef
@@ -135,11 +157,15 @@ fn lower_fn(ef: &E::EFn) -> IRFunction {
             body: Box::new(acc),
             span: ef.span,
         });
+    let (requires, ensures, decreases) = lower_contracts(&ef.contracts);
     IRFunction {
         name: ef.name.clone(),
         ty: fn_ty,
         body,
         prop_target: None,
+        requires,
+        ensures,
+        decreases,
         span: ef.span,
         file: ef.file.clone(),
     }
@@ -171,6 +197,9 @@ fn lower_pred(ep: &E::EPred) -> IRFunction {
         ty: fn_ty,
         body,
         prop_target: None,
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
         span: ep.span,
         file: ep.file.clone(),
     }
@@ -184,6 +213,9 @@ fn lower_prop(ep: &E::EProp) -> IRFunction {
         ty: IRType::Bool,
         body: lower_expr(&ep.body),
         prop_target: ep.target.clone(),
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
         span: ep.span,
         file: ep.file.clone(),
     }
@@ -1016,6 +1048,7 @@ mod tests {
             name: "f".to_owned(),
             params: vec![("x".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
             ret_ty: E::Ty::Builtin(E::BuiltinTy::Int),
+            contracts: vec![],
             body: E::EExpr::Var(E::Ty::Builtin(E::BuiltinTy::Int), "x".to_owned(), None),
             span: Some(sp),
             file: Some("/fn.abide".to_owned()),

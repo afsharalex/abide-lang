@@ -499,12 +499,29 @@ pub struct IRFunction {
     /// None for preds and fns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prop_target: Option<std::string::String>,
+    /// Requires clauses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<IRExpr>,
+    /// Ensures clauses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ensures: Vec<IRExpr>,
+    /// Decreases clause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decreases: Option<IRDecreases>,
     /// Source span (not serialized — diagnostic use only).
     #[serde(skip)]
     pub span: Option<Span>,
     /// Source file path (not serialized — diagnostic use only).
     #[serde(skip)]
     pub file: Option<std::string::String>,
+}
+
+/// Decreases clause: termination measure for recursive functions.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRDecreases {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub measures: Vec<IRExpr>,
+    pub star: bool,
 }
 
 // ── Top-level program ────────────────────────────────────────────────

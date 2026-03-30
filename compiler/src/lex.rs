@@ -125,6 +125,8 @@ pub enum Token {
     By,
     #[token("mut")]
     Mut,
+    #[token("decreases")]
+    Decreases,
 
     // ── Symbols ───────────────────────────────────────────────────────
     #[token(":=")]
@@ -218,6 +220,7 @@ pub enum Token {
     StringLit(String),
 }
 
+#[allow(clippy::too_many_lines)]
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -280,6 +283,7 @@ impl std::fmt::Display for Token {
             Self::Axiom => write!(f, "axiom"),
             Self::By => write!(f, "by"),
             Self::Mut => write!(f, "mut"),
+            Self::Decreases => write!(f, "decreases"),
             Self::ColonEq => write!(f, ":="),
             Self::ColonColon => write!(f, "::"),
             Self::DotDot => write!(f, ".."),

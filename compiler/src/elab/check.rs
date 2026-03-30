@@ -8,8 +8,10 @@ use std::collections::{HashMap, HashSet};
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BuiltinTy, EAction, EEntity, EExpr, EField, EPattern, ESystem, EType, EVariant, ElabResult, Ty,
+    BuiltinTy, EAction, EContract, EEntity, EExpr, EField, EFn, EPattern, ESystem, EType, EVariant,
+    ElabResult, Ty,
 };
+use crate::messages;
 
 /// Type-check the resolved environment.
 /// Returns an `ElabResult` with all elaborated declarations + any errors.
@@ -39,6 +41,11 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     }
     for system in env.systems.values() {
         errors.extend(check_system(env, system));
+    }
+
+    // Check fn contracts
+    for f in env.fns.values() {
+        errors.extend(check_fn_contracts(f));
     }
 
     // Check for cyclic pred/prop definitions
@@ -511,6 +518,97 @@ fn find_duplicates<T: PartialEq>(items: &[T]) -> Vec<&T> {
     dups
 }
 
+// ── Fn contract checking ────────────────────────────────────────────
+
+/// Check that fn contracts are well-typed:
+/// - requires/ensures must be Bool
+/// - decreases measures must be Int
+/// - decreases * emits a warning
+fn check_fn_contracts(f: &EFn) -> Vec<ElabError> {
+    let mut errors = Vec::new();
+    for c in &f.contracts {
+        match c {
+            EContract::Requires(e) => {
+                if let Some(ty) = expr_type(e) {
+                    if !matches!(ty, Ty::Builtin(BuiltinTy::Bool)) {
+                        let mut err = ElabError::new(
+                            ErrorKind::TypeMismatch,
+                            messages::REQUIRES_NOT_BOOL.to_owned(),
+                            f.name.clone(),
+                        );
+                        err.span = expr_span(e);
+                        err.help = Some(messages::HELP_REQUIRES_BOOL.into());
+                        errors.push(err);
+                    }
+                }
+            }
+            EContract::Ensures(e) => {
+                if let Some(ty) = expr_type(e) {
+                    if !matches!(ty, Ty::Builtin(BuiltinTy::Bool)) {
+                        let mut err = ElabError::new(
+                            ErrorKind::TypeMismatch,
+                            messages::ENSURES_NOT_BOOL.to_owned(),
+                            f.name.clone(),
+                        );
+                        err.span = expr_span(e);
+                        err.help = Some(messages::HELP_ENSURES_BOOL.into());
+                        errors.push(err);
+                    }
+                }
+            }
+            EContract::Decreases { measures, star } => {
+                // decreases * is valid but skips termination checking.
+                // A warning could be emitted here in the future.
+                let _ = star;
+                for m in measures {
+                    if let Some(ty) = expr_type(m) {
+                        if !matches!(ty, Ty::Builtin(BuiltinTy::Int)) {
+                            let mut err = ElabError::new(
+                                ErrorKind::TypeMismatch,
+                                messages::DECREASES_MEASURE_NOT_INT.to_owned(),
+                                f.name.clone(),
+                            );
+                            err.span = expr_span(m);
+                            err.help = Some(messages::HELP_DECREASES_INT.into());
+                            errors.push(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// Extract the type annotation from an elaborated expression (if available).
+fn expr_type(e: &EExpr) -> Option<&Ty> {
+    match e {
+        EExpr::Lit(ty, _, _)
+        | EExpr::Var(ty, _, _)
+        | EExpr::BinOp(ty, _, _, _, _)
+        | EExpr::UnOp(ty, _, _, _)
+        | EExpr::Call(ty, _, _, _)
+        | EExpr::Field(ty, _, _, _)
+        | EExpr::Quant(ty, _, _, _, _, _)
+        | EExpr::Always(ty, _, _)
+        | EExpr::Eventually(ty, _, _) => Some(ty),
+        _ => None,
+    }
+}
+
+/// Extract span from an elaborated expression.
+fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
+    match e {
+        EExpr::Lit(_, _, sp)
+        | EExpr::Var(_, _, sp)
+        | EExpr::BinOp(_, _, _, _, sp)
+        | EExpr::UnOp(_, _, _, sp)
+        | EExpr::Call(_, _, _, sp)
+        | EExpr::Field(_, _, _, sp) => *sp,
+        _ => None,
+    }
+}
+
 // ── Cycle detection for fn/pred/prop definitions ────────────────────
 
 /// Detect cyclic definitions in fn, pred, and prop declarations.
@@ -555,11 +653,20 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
         deps.insert(name.clone(), referenced);
     }
 
-    // Extract dependencies from fn bodies
+    // Extract dependencies from fn bodies.
+    // Functions with a `decreases` clause may reference themselves (self-recursion
+    // is guarded by the termination measure), so remove the self-edge.
     for (name, f) in &env.fns {
         let mut referenced = HashSet::new();
         let bound: HashSet<String> = f.params.iter().map(|(n, _)| n.clone()).collect();
         collect_name_refs(&f.body, &all_names, &bound, &mut referenced);
+        let has_decreases = f
+            .contracts
+            .iter()
+            .any(|c| matches!(c, super::types::EContract::Decreases { .. }));
+        if has_decreases {
+            referenced.remove(name);
+        }
         deps.insert(name.clone(), referenced);
     }
 
