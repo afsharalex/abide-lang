@@ -478,10 +478,10 @@ fn multi_file_duplicate_decl_has_file_tags() {
     let dir = tempfile::tempdir().expect("create tempdir");
 
     let file_a = dir.path().join("a.abide");
-    std::fs::write(&file_a, "type Color = Red | Blue\n").unwrap();
+    std::fs::write(&file_a, "enum Color = Red | Blue\n").unwrap();
 
     let file_b = dir.path().join("b.abide");
-    std::fs::write(&file_b, "type Color = Green | Yellow\n").unwrap();
+    std::fs::write(&file_b, "enum Color = Green | Yellow\n").unwrap();
 
     let main_file = dir.path().join("main.abide");
     std::fs::write(&main_file, "include \"a.abide\"\ninclude \"b.abide\"\n").unwrap();
@@ -524,7 +524,7 @@ fn name_suggestion_includes_types_and_entities() {
     std::fs::write(
         &file,
         r#"
-type OrderStatus = Pending | Confirmed
+enum OrderStatus = Pending | Confirmed
 
 entity Order {
     status: OrderStatus = @Pending

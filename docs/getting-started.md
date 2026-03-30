@@ -21,7 +21,7 @@ The binary is at `target/release/abide`.
 Create a file called `order.abide`:
 
 ```abide
-type OrderStatus = Pending | Paid | Shipped
+enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
   id: Id
@@ -64,7 +64,7 @@ abide verify order.abide
 
 You defined:
 
-- A **type** (`OrderStatus`) — an enum with three states
+- An **enum** (`OrderStatus`) — a sum type with three states
 - An **entity** (`Order`) — a stateful domain object with fields and defaults
 - Two **actions** (`pay`, `ship`) — guarded state transitions using primed notation (`status' = @Paid` means "the next value of status is Paid")
 - A **system** (`Commerce`) — a boundary that composes entities and defines events
@@ -110,7 +110,7 @@ As specs grow, split them into multiple files using the module system:
 // types.abide
 module Commerce
 
-pub type OrderStatus = Pending | Paid | Shipped
+pub enum OrderStatus = Pending | Paid | Shipped
 
 pub entity Order {
   id: Id

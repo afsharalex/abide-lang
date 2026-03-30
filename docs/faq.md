@@ -40,7 +40,7 @@ Fields not mentioned in the action body are unchanged (inertia). This is the sam
 State and constructor atoms. `@Pending`, `@Active`, `@USD` are named values in an enum's state space. `@OrderStatus::Paid` is a qualified atom with scope resolution.
 
 ```abide
-type Status = Active | Frozen | Closed
+enum Status = Active | Frozen | Closed
 
 entity Account {
   status: Status = @Active       // default value is the Active atom
@@ -61,7 +61,7 @@ entity Account {
 
 No. Abide is in active design. Syntax and semantics may change. We'll add version-tagged stability markers when the language reaches that point.
 
-The constructs most likely to remain stable: types, entities, actions, primed notation, `requires`/`ensures`, systems, events, `verify`/`scene` block structure, temporal operators, quantifiers.
+The constructs most likely to remain stable: enums, structs, type aliases, entities, actions, primed notation, `requires`/`ensures`, systems, events, `verify`/`scene` block structure, temporal operators, quantifiers.
 
 The constructs most likely to evolve: theorem block internals, module system, trait system, algorithm verification syntax.
 

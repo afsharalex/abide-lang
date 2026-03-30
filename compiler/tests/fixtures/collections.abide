@@ -4,9 +4,9 @@ module Collections
 // Demonstrates: Map<K,V>, Set<T>, Seq<T>, map update, index access,
 // set comprehension, cardinality, collection literals, membership
 
-type Priority = Low | Medium | High | Critical
+enum Priority = Low | Medium | High | Critical
 
-type TaskStatus = Open | InProgress | Done
+enum TaskStatus = Open | InProgress | Done
 
 entity Task {
   id: Id

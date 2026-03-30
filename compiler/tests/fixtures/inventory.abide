@@ -4,9 +4,9 @@ module Inventory
 // Demonstrates: multiple entity types interacting, quantity tracking,
 // cross-system coordination, exclusive choice, concurrent operations
 
-type ProductStatus = Available | Discontinued | OutOfStock
-type ReservationStatus = Held | Confirmed | Released | Expired
-type FulfillmentStatus = Pending | Picking | Packed | Shipped | Delivered
+enum ProductStatus = Available | Discontinued | OutOfStock
+enum ReservationStatus = Held | Confirmed | Released | Expired
+enum FulfillmentStatus = Pending | Picking | Packed | Shipped | Delivered
 
 entity Product {
   id: Id

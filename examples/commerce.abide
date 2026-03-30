@@ -3,8 +3,8 @@ module Commerce
 // Commerce — multi-system coordination
 // Demonstrates two systems sharing entities with cross-system event calls.
 
-type OrderStatus = Pending | AwaitingPayment | Paid | Shipped
-type PaymentStatus = Open | Captured | Failed
+enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped
+enum PaymentStatus = Open | Captured | Failed
 
 entity Order {
   id: Id

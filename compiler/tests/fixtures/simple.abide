@@ -2,10 +2,10 @@ module Simple
 
 // Simple Abide example: types, entities with actions
 
-type OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
+enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
 type Price = Int
 
-type Address { street: String, city: String }
+struct Address { street: String, city: String }
 
 entity Order {
   id: Id

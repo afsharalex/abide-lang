@@ -4,9 +4,9 @@ module Functions
 // Demonstrates: fn, const, pred, prop, pub, let bindings, lambda,
 // pipe operator, match expressions with guards, sorry/todo stubs
 
-type Grade = A | B | C | D | F
+enum Grade = A | B | C | D | F
 
-type CourseStatus = Enrolled | Completed | Dropped
+enum CourseStatus = Enrolled | Completed | Dropped
 
 const PASSING_GRADE = 70
 const MAX_ENROLLMENT = 30

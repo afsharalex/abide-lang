@@ -23,6 +23,10 @@ pub enum Token {
     Fn,
     #[token("type")]
     Type,
+    #[token("enum")]
+    Enum,
+    #[token("struct")]
+    Struct,
     #[token("entity")]
     Entity,
     #[token("system")]
@@ -225,6 +229,8 @@ impl std::fmt::Display for Token {
             Self::Const => write!(f, "const"),
             Self::Fn => write!(f, "fn"),
             Self::Type => write!(f, "type"),
+            Self::Enum => write!(f, "enum"),
+            Self::Struct => write!(f, "struct"),
             Self::Entity => write!(f, "entity"),
             Self::System => write!(f, "system"),
             Self::Action => write!(f, "action"),
@@ -348,8 +354,7 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src =
-            "module include pub as use const fn type entity system action event sorry todo mut";
+        let src = "module include pub as use const fn type enum struct entity system action event sorry todo mut";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -362,6 +367,8 @@ mod tests {
                 Token::Const,
                 Token::Fn,
                 Token::Type,
+                Token::Enum,
+                Token::Struct,
                 Token::Entity,
                 Token::System,
                 Token::Action,

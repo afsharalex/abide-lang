@@ -17,6 +17,7 @@ pub enum TopDecl {
     Fn(FnDecl),
     Type(TypeDecl),
     Record(RecordDecl),
+    Alias(AliasDecl),
     Entity(EntityDecl),
     System(SystemDecl),
     Pred(PredDecl),
@@ -152,6 +153,15 @@ pub struct RecordDecl {
 pub struct RecField {
     pub name: String,
     pub ty: TypeRef,
+    pub span: Span,
+}
+
+/// Type alias declaration: `type Name = TypeRef`
+#[derive(Debug, Clone)]
+pub struct AliasDecl {
+    pub name: String,
+    pub visibility: Visibility,
+    pub target: TypeRef,
     pub span: Span,
 }
 

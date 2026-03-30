@@ -3,7 +3,7 @@ module Order
 // Order — minimal Abide example
 // Demonstrates types, entities, actions, and primed notation.
 
-type OrderStatus = Pending | Paid | Shipped
+enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
   id: Id

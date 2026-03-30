@@ -2,11 +2,11 @@ module MatchTest
 
 // Match expression examples — exercises all pattern features
 
-type OrderStatus = Pending | Confirmed | Shipped | Cancelled
+enum OrderStatus = Pending | Confirmed | Shipped | Cancelled
 
-type Shape = Circle { radius: Int } | Rectangle { width: Int, height: Int }
+enum Shape = Circle { radius: Int } | Rectangle { width: Int, height: Int }
 
-type Expr = Lit { value: Int } | Neg { inner: Expr } | Add { left: Expr, right: Expr }
+enum Expr = Lit { value: Int } | Neg { inner: Expr } | Add { left: Expr, right: Expr }
 
 // Simple constructor patterns
 fn status_label(s: OrderStatus): String

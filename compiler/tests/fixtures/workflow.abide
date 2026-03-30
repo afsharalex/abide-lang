@@ -4,9 +4,9 @@ module Workflow
 // Demonstrates: multi-step state machines, role-based guards,
 // exclusive choice, temporal liveness, proof obligations
 
-type DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
-type ReviewResult = Pass | Fail | NeedsRevision
-type Priority = Low | Medium | High | Critical
+enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
+enum ReviewResult = Pass | Fail | NeedsRevision
+enum Priority = Low | Medium | High | Critical
 
 entity Document {
   id: Id

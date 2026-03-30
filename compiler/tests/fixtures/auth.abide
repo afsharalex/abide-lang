@@ -4,9 +4,9 @@ module Auth
 // Demonstrates: shared entity reuse, multiple systems operating
 // on the same entity, cross-system calls, temporal properties
 
-type UserStatus = Active | Suspended | Locked | Deleted
-type Role = Admin | Member | Guest
-type SessionStatus = Valid | Expired | Revoked
+enum UserStatus = Active | Suspended | Locked | Deleted
+enum Role = Admin | Member | Guest
+enum SessionStatus = Valid | Expired | Revoked
 
 entity User {
   id: Id

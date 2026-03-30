@@ -65,8 +65,8 @@ If you're wondering "should this be an entity or a system?" — ask yourself: "a
 | Database model, domain object | Entity (pooled, created/destroyed by events) |
 | Service, controller, manager | System (singleton, orchestrates entities) |
 | Business rule, computation | `fn` with contracts |
-| Configuration, constants | `const` or record type |
-| Data shape without identity | `type` (enum or record) |
+| Configuration, constants | `const` or `struct` |
+| Data shape without identity | `enum` (sum type) or `struct` (product type) |
 
 > **Side note:** You might think you need a "class" for something like a ProcessManager or CacheService. You don't — that's a system. Systems are singletons that orchestrate entities. If your "class" has internal state, model the state as an entity and the behavior as a system. The split feels unfamiliar if you come from OOP, but it's how spec languages work — and it makes verification much cleaner because state and behavior are separated.
 
@@ -74,16 +74,16 @@ If you're wondering "should this be an entity or a system?" — ask yourself: "a
 
 ## Types are your vocabulary
 
-Before writing entities or systems, define the vocabulary of your domain. Types are cheap — make lots of them:
+Before writing entities or systems, define the vocabulary of your domain. Enums, structs, and type aliases are cheap — make lots of them:
 
 ```abide
-type OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
-type Priority = Low | Medium | High | Critical
+enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
+enum Priority = Low | Medium | High | Critical
 type Money = Int  // cents, not dollars — avoid floating point in specs
-type Address { street: String, city: String, zip: String }
+struct Address { street: String, city: String, zip: String }
 ```
 
-Enums define finite state spaces. Records group related data. Together they describe the conceptual landscape before any behavior is added.
+Enums define finite state spaces. Structs group related data. Type aliases (`type Money = Int`) give meaningful names to built-in types. Together they describe the conceptual landscape before any behavior is added.
 
 A well-typed spec catches mistakes at the structural level: if `Priority` and `OrderStatus` are different types, you can't accidentally compare them.
 
@@ -226,7 +226,7 @@ The solver attempts an inductive proof. If it succeeds, the property is guarante
 You don't need to write everything at once. Start with types and entities — just the structure:
 
 ```abide
-type OrderStatus = Pending | Confirmed | Shipped
+enum OrderStatus = Pending | Confirmed | Shipped
 
 entity Order {
   id: Id
@@ -248,7 +248,7 @@ entity Order {
 
 Then add a system. Then add verification. Each step adds detail without invalidating the previous work. This is the layered approach:
 
-1. **Types and entities** — "what exists?" (explore)
+1. **Enums, structs, and entities** — "what exists?" (explore)
 2. **Actions and events** — "what can happen?" (model behavior)
 3. **Verify and scenes** — "is it correct?" (check properties)
 4. **Theorems** — "is it provably correct?" (prove guarantees)
@@ -419,7 +419,7 @@ The full lifecycle: create → transitions → terminal state. Scoped verificati
 
 If you can't figure out how to model something:
 
-1. **Start with types.** What are the concepts? Name them. Don't worry about behavior yet.
+1. **Start with enums and structs.** What are the concepts? Name them. Don't worry about behavior yet.
 2. **Ask "what changes?"** The things that change are entities. The things that cause change are events.
 3. **Draw the state machine.** Entity actions ARE the state machine. If you can draw it, you can write it.
 4. **Write a scene first.** A concrete example ("user signs up, creates an order, pays") often clarifies the abstract model.

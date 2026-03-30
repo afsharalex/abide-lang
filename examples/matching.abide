@@ -3,18 +3,18 @@ module Matching
 // Matching — pattern matching reference
 // Demonstrates sum types with record variants and comprehensive match syntax.
 
-type Shape =
+enum Shape =
   Circle { radius: Real }
   | Rectangle { width: Real, height: Real }
   | Triangle { base: Real, height: Real }
   | Point
 
-type Expr =
+enum Expr =
   Lit { value: Int }
   | Add { left: Expr, right: Expr }
   | Neg { inner: Expr }
 
-type OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
+enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
 
 // Simple constructor matching
 fn status_label(s: OrderStatus): String =

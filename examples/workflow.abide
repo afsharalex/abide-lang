@@ -3,7 +3,7 @@ module Workflow
 // Workflow — state machine with role-based guards
 // Demonstrates multi-step lifecycles, role separation, and temporal properties.
 
-type DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
+enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
 
 entity Document {
   id: Id

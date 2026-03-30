@@ -6,15 +6,37 @@ Quick reference for all Abide constructs. Each section shows a minimal example, 
 
 ---
 
-### Types
+### Enums
 
 ```abide
-type OrderStatus = Pending | Paid | Shipped | Cancelled
-type Address { street: String, city: String }
+enum OrderStatus = Pending | Paid | Shipped | Cancelled
+```
+
+Sum types. Enums define the vocabulary of state with named constructors.
+
+`Stable`
+
+---
+
+### Structs
+
+```abide
+struct Address { street: String, city: String }
+```
+
+Product types with named fields. Structs group related data.
+
+`Stable`
+
+---
+
+### Type Aliases
+
+```abide
 type Price = Int
 ```
 
-Enums (sum types), record types, and type aliases. Enums define the vocabulary of state; records group related fields.
+Type aliases give a new name to an existing type.
 
 `Stable`
 
@@ -23,7 +45,7 @@ Enums (sum types), record types, and type aliases. Enums define the vocabulary o
 ### Algebraic Data Types
 
 ```abide
-type Shape =
+enum Shape =
   Circle { radius: Real }
   | Rectangle { width: Real, height: Real }
   | Point

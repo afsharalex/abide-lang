@@ -96,6 +96,7 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
         ast::TopDecl::Theorem(d) => collect_theorem(env, d),
         ast::TopDecl::Axiom(d) => collect_axiom(env, d),
         ast::TopDecl::Lemma(d) => collect_lemma(env, d),
+        ast::TopDecl::Alias(d) => collect_alias(env, d),
     }
 }
 
@@ -103,28 +104,8 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
 
 fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
     let name = &td.name;
-    // Check for single-variant alias to builtin
-    if td.variants.len() == 1 {
-        if let ast::TypeVariant::Simple {
-            name: ref target, ..
-        } = td.variants[0]
-        {
-            if let Some(builtin) = resolve_builtin(target) {
-                let ty = Ty::Alias(name.clone(), Box::new(Ty::Builtin(builtin)));
-                let info = env.make_decl_info(
-                    DeclKind::Type,
-                    name.clone(),
-                    Some(ty.clone()),
-                    td.visibility,
-                    td.span,
-                );
-                env.add_decl(name, info);
-                env.insert_type(name, ty);
-                return;
-            }
-        }
-    }
-
+    // TypeDecl always represents an enum (sum type with constructors).
+    // Type aliases are handled separately via TopDecl::Alias → collect_alias.
     let variant_names: Vec<String> = td
         .variants
         .iter()
@@ -161,6 +142,21 @@ fn collect_record(env: &mut Env, rd: &ast::RecordDecl) {
         Some(ty.clone()),
         rd.visibility,
         rd.span,
+    );
+    env.add_decl(name, info);
+    env.insert_type(name, ty);
+}
+
+fn collect_alias(env: &mut Env, ad: &ast::AliasDecl) {
+    let name = &ad.name;
+    let resolved = resolve_type_ref(&ad.target);
+    let ty = Ty::Alias(name.clone(), Box::new(resolved));
+    let info = env.make_decl_info(
+        DeclKind::Type,
+        name.clone(),
+        Some(ty.clone()),
+        ad.visibility,
+        ad.span,
     );
     env.add_decl(name, info);
     env.insert_type(name, ty);
@@ -1152,14 +1148,14 @@ include "second.abide""#,
 
     #[test]
     fn type_visibility_private_by_default() {
-        let env = collect_src("type Status = Active | Inactive");
+        let env = collect_src("enum Status = Active | Inactive");
         let info = env.decls.get("Status").expect("Status decl");
         assert_eq!(info.visibility, Visibility::Private);
     }
 
     #[test]
     fn type_visibility_public() {
-        let env = collect_src("pub type Status = Active | Inactive");
+        let env = collect_src("pub enum Status = Active | Inactive");
         let info = env.decls.get("Status").expect("Status decl");
         assert_eq!(info.visibility, Visibility::Public);
     }
@@ -1203,7 +1199,7 @@ include "second.abide""#,
 
     #[test]
     fn decl_module_tagged() {
-        let env = collect_src("module Commerce\ntype Status = Active | Inactive");
+        let env = collect_src("module Commerce\nenum Status = Active | Inactive");
         let info = env
             .lookup_decl_qualified("Commerce", "Status")
             .expect("Commerce::Status decl");
@@ -1212,7 +1208,7 @@ include "second.abide""#,
 
     #[test]
     fn decl_module_none_without_module_decl() {
-        let env = collect_src("type Status = Active | Inactive");
+        let env = collect_src("enum Status = Active | Inactive");
         let info = env.lookup_decl("Status").expect("Status decl");
         assert_eq!(info.module, None);
     }
@@ -1221,12 +1217,12 @@ include "second.abide""#,
     fn multi_file_collect_into() {
         let mut env = Env::new();
         let prog1 = {
-            let tokens = lex::lex("module Commerce\npub type Status = Active").unwrap();
+            let tokens = lex::lex("module Commerce\npub enum Status = Active").unwrap();
             let mut p = Parser::new(tokens);
             p.parse_program().unwrap()
         };
         let prog2 = {
-            let tokens = lex::lex("module Commerce\npub type Payment = Pending | Done").unwrap();
+            let tokens = lex::lex("module Commerce\npub enum Payment = Pending | Done").unwrap();
             let mut p = Parser::new(tokens);
             p.parse_program().unwrap()
         };
@@ -1247,7 +1243,7 @@ include "second.abide""#,
     fn visibility_error_on_private_import() {
         // Simulate: module A defines private type, module B imports it.
         // In a single file, we test the resolve pass catches it.
-        let env = collect_src("module TestMod\ntype Secret = X | Y\nuse TestMod::Secret");
+        let env = collect_src("module TestMod\nenum Secret = X | Y\nuse TestMod::Secret");
         // Collector doesn't enforce visibility — that's resolve's job.
         // But we can verify the declaration is tagged private.
         let info = env
@@ -1255,5 +1251,93 @@ include "second.abide""#,
             .expect("TestMod::Secret decl");
         assert_eq!(info.visibility, Visibility::Private);
         assert_eq!(info.module.as_deref(), Some("TestMod"));
+    }
+
+    // ── DDR-043: Alias elaboration tests ─────────────────────────
+
+    #[test]
+    fn alias_to_builtin() {
+        let env = collect_src("type Money = Real");
+        let ty = env.types.get("Money").expect("Money type");
+        assert!(
+            matches!(ty, Ty::Alias(n, inner) if n == "Money" && matches!(inner.as_ref(), Ty::Builtin(BuiltinTy::Real))),
+            "expected Alias(Money, Builtin(Real)), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn alias_to_tuple() {
+        let env = collect_src("type Coord = (Int, Int)");
+        let ty = env.types.get("Coord").expect("Coord type");
+        assert!(
+            matches!(ty, Ty::Alias(n, inner) if n == "Coord" && matches!(inner.as_ref(), Ty::Tuple(_))),
+            "expected Alias(Coord, Tuple(...)), got {ty:?}"
+        );
+        if let Ty::Alias(_, inner) = ty {
+            if let Ty::Tuple(ts) = inner.as_ref() {
+                assert_eq!(ts.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn alias_to_collection() {
+        let env = collect_src("type Users = Set<Id>");
+        let ty = env.types.get("Users").expect("Users type");
+        assert!(
+            matches!(ty, Ty::Alias(n, inner) if n == "Users" && matches!(inner.as_ref(), Ty::Set(_))),
+            "expected Alias(Users, Set(...)), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn alias_to_map() {
+        let env = collect_src("type Ledger = Map<Id, Real>");
+        let ty = env.types.get("Ledger").expect("Ledger type");
+        assert!(
+            matches!(ty, Ty::Alias(n, inner) if n == "Ledger" && matches!(inner.as_ref(), Ty::Map(_, _))),
+            "expected Alias(Ledger, Map(...)), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn alias_to_function_type() {
+        let env = collect_src("type Handler = Int -> Bool");
+        let ty = env.types.get("Handler").expect("Handler type");
+        assert!(
+            matches!(ty, Ty::Alias(n, inner) if n == "Handler" && matches!(inner.as_ref(), Ty::Fn(_, _))),
+            "expected Alias(Handler, Fn(...)), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn enum_single_variant() {
+        // `enum Status = Pending` → single-variant enum
+        let env = collect_src("enum Status = Pending");
+        let ty = env.types.get("Status").expect("Status type");
+        assert!(
+            matches!(ty, Ty::Enum(n, ctors) if n == "Status" && ctors == &["Pending"]),
+            "expected Enum(Status, [Pending]), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn enum_via_enum_keyword() {
+        let env = collect_src("enum Color = Red | Green | Blue");
+        let ty = env.types.get("Color").expect("Color type");
+        assert!(
+            matches!(ty, Ty::Enum(n, ctors) if n == "Color" && ctors.len() == 3),
+            "expected Enum(Color, [Red, Green, Blue]), got {ty:?}"
+        );
+    }
+
+    #[test]
+    fn struct_via_struct_keyword() {
+        let env = collect_src("struct Point { x: Int, y: Int }");
+        let ty = env.types.get("Point").expect("Point type");
+        assert!(
+            matches!(ty, Ty::Record(n, fields) if n == "Point" && fields.len() == 2),
+            "expected Record(Point, [x, y]), got {ty:?}"
+        );
     }
 }

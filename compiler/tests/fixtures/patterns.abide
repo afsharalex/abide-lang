@@ -4,11 +4,11 @@ module Patterns
 // Demonstrates: nested match, or-patterns, record patterns, guards,
 // let bindings, lambda, tuple literals, quantifiers (some/no/one/lone)
 
-type Shape = Circle | Rectangle | Triangle
+enum Shape = Circle | Rectangle | Triangle
 
-type Color = Red | Green | Blue
+enum Color = Red | Green | Blue
 
-type Result = Ok | Error
+enum Result = Ok | Error
 
 fn shape_sides(s: Shape): Int = match s {
   Circle => 0

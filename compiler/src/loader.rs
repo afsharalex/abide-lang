@@ -205,7 +205,7 @@ mod tests {
 
         let good_path = dir.path().join("good.abide");
         let mut good = std::fs::File::create(&good_path).unwrap();
-        writeln!(good, "type GoodType = A | B").unwrap();
+        writeln!(good, "enum GoodType = A | B").unwrap();
 
         let main_path = dir.path().join("main.abide");
         let mut main_f = std::fs::File::create(&main_path).unwrap();

@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn public_import_no_error() {
-        let env = elaborate_src("module TestMod\npub type Status = Active\nuse TestMod::Status");
+        let env = elaborate_src("module TestMod\npub enum Status = Active\nuse TestMod::Status");
         assert!(
             !env.errors
                 .iter()
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn same_module_private_import_allowed() {
-        let env = elaborate_src("module TestMod\ntype Secret = X | Y\nuse TestMod::Secret");
+        let env = elaborate_src("module TestMod\nenum Secret = X | Y\nuse TestMod::Secret");
         let private_errors: Vec<_> = env
             .errors
             .iter()
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn use_missing_name_in_known_module_errors() {
         // Module TestMod exports Status but not NoSuchName
-        let env = elaborate_src("module TestMod\npub type Status = A\nuse TestMod::NoSuchName");
+        let env = elaborate_src("module TestMod\npub enum Status = A\nuse TestMod::NoSuchName");
         assert!(
             env.errors
                 .iter()
@@ -904,7 +904,7 @@ mod tests {
         let mut env = Env::new();
 
         // File 1: module A defines type Status
-        let tokens1 = lex::lex("module A\npub type Status = Active").unwrap();
+        let tokens1 = lex::lex("module A\npub enum Status = Active").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         let saved = env.module_name.take();
@@ -915,7 +915,7 @@ mod tests {
         // File 2: module B defines type Status
         let saved = env.module_name.take();
         env.module_name = None; // Reset for file 2
-        let tokens2 = lex::lex("module B\npub type Status = Pending").unwrap();
+        let tokens2 = lex::lex("module B\npub enum Status = Pending").unwrap();
         let mut p2 = Parser::new(tokens2);
         let prog2 = p2.parse_program().unwrap();
         collect::collect_into(&mut env, &prog2);
@@ -968,7 +968,7 @@ mod tests {
         let mut env = Env::new();
 
         // File 1: module Provider, private type Secret
-        let tokens1 = lex::lex("module Provider\ntype Secret = X").unwrap();
+        let tokens1 = lex::lex("module Provider\nenum Secret = X").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         collect::collect_into(&mut env, &prog1);
@@ -1005,9 +1005,9 @@ mod tests {
 
         let mut env = Env::new();
 
-        // File 1: module Provider declares pub type Status = Active | Inactive
+        // File 1: module Provider declares pub enum Status = Active | Inactive
         env.module_name = None;
-        let tokens1 = lex::lex("module Provider\npub type Status = Active | Inactive").unwrap();
+        let tokens1 = lex::lex("module Provider\npub enum Status = Active | Inactive").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         collect::collect_into(&mut env, &prog1);
@@ -1060,7 +1060,7 @@ mod tests {
         // File 1: module Lib with pub type Color and private type Secret
         env.module_name = None;
         let tokens1 =
-            lex::lex("module Lib\npub type Color = Red | Blue\ntype Secret = X | Y").unwrap();
+            lex::lex("module Lib\npub enum Color = Red | Blue\nenum Secret = X | Y").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         collect::collect_into(&mut env, &prog1);
@@ -1162,7 +1162,7 @@ mod tests {
 
         // File 1: module Provider declares pub type Order
         env.module_name = None;
-        let tokens1 = lex::lex("module Provider\npub type Order = Pending | Done").unwrap();
+        let tokens1 = lex::lex("module Provider\npub enum Order = Pending | Done").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         collect::collect_into(&mut env, &prog1);
@@ -1315,7 +1315,7 @@ mod tests {
 
         // File 1: module Lib, pub type Color
         env.module_name = None;
-        let tokens1 = lex::lex("module Lib\npub type Color = Red | Blue").unwrap();
+        let tokens1 = lex::lex("module Lib\npub enum Color = Red | Blue").unwrap();
         let mut p1 = Parser::new(tokens1);
         let prog1 = p1.parse_program().unwrap();
         collect::collect_into(&mut env, &prog1);
@@ -1329,7 +1329,7 @@ mod tests {
         env.module_name = None;
 
         // File 3: module App (root) does NOT import Color
-        let tokens3 = lex::lex("module App\npub type Shape = Circle | Square").unwrap();
+        let tokens3 = lex::lex("module App\npub enum Shape = Circle | Square").unwrap();
         let mut p3 = Parser::new(tokens3);
         let prog3 = p3.parse_program().unwrap();
         collect::collect_into(&mut env, &prog3);
@@ -1402,7 +1402,7 @@ mod tests {
         // App imports o from Lib, then defines pred check(o: Order) = ...
         // "o" as pred param should not be rewritten.
         let tokens2 = lex::lex(
-            "module App\nuse Lib::o\ntype Order = Pending\npred check(o: Order) = o == Pending",
+            "module App\nuse Lib::o\nenum Order = Pending\npred check(o: Order) = o == Pending",
         )
         .unwrap();
         let mut p2 = Parser::new(tokens2);
@@ -1442,7 +1442,7 @@ mod tests {
         // when/then sections.
         let env = elaborate_src(
             "module TestMod\n\
-             pub type Status = Active\n\
+             pub enum Status = Active\n\
              entity Order { id: Id }\n\
              system S {\n\
                event noop() { }\n\

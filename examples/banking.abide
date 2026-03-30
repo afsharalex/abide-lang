@@ -3,7 +3,7 @@ module Banking
 // Banking — entity depth example
 // Demonstrates contracts, constants, predicates, verification, and scenes.
 
-type AccountStatus = Active | Frozen | Closed
+enum AccountStatus = Active | Frozen | Closed
 
 const MAX_WITHDRAWAL = 10000
 

@@ -4,11 +4,11 @@ module Hospital
 // Demonstrates: multiple entities, cross-entity references, complex state machines,
 // axioms, lemmas, multiple verify/scene/theorem blocks, quantifier-heavy properties
 
-type PatientStatus = Admitted | InTreatment | Discharged | Transferred
+enum PatientStatus = Admitted | InTreatment | Discharged | Transferred
 
-type BedStatus = Available | Occupied | Maintenance
+enum BedStatus = Available | Occupied | Maintenance
 
-type Severity = Minor | Moderate | Severe | Critical
+enum Severity = Minor | Moderate | Severe | Critical
 
 entity Patient {
   id: Id

@@ -11,8 +11,8 @@ These errors are detected during semantic analysis (after parsing).
 Two declarations with the same name exist in the same scope.
 
 ```abide
-type Status = Active | Inactive
-type Status = Open | Closed       // error[E001]: duplicate declaration 'Status'
+enum Status = Active | Inactive
+enum Status = Open | Closed       // error[E001]: duplicate declaration 'Status'
 ```
 
 **Fix:** Rename one of the declarations, or if they are in different modules, use qualified names (`Module::Name`) to disambiguate.
@@ -87,7 +87,7 @@ A declaration was accessed from a scope where it is not visible.
 
 ```abide
 // In module A:
-type Secret = X | Y                   // private (no `pub`)
+enum Secret = X | Y                   // private (no `pub`)
 
 // In module B:
 use A::Secret                         // error[E006]: cannot import private declaration
@@ -118,7 +118,7 @@ The number or types of arguments do not match the declaration's parameter list.
 A field default value has an invalid type or uses an expression that is not allowed in default position.
 
 ```abide
-type Status = Active | Inactive
+enum Status = Active | Inactive
 
 entity Order {
   status: Status = @Unknown          // error[E009]: Unknown is not a constructor of Status

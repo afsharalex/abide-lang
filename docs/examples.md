@@ -11,7 +11,7 @@ Complete files are in the `examples/` directory.
 The simplest useful spec — an entity with a status enum and two actions.
 
 ```abide
-type OrderStatus = Pending | Paid | Shipped
+enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
   id: Id
@@ -28,7 +28,7 @@ entity Order {
 }
 ```
 
-Key concepts: types define state vocabulary, entities hold state, actions transition state with guards, `'` notation distinguishes current from next state.
+Key concepts: enums define state vocabulary, entities hold state, actions transition state with guards, `'` notation distinguishes current from next state.
 
 See: [`examples/order.abide`](../examples/order.abide)
 
@@ -94,7 +94,7 @@ See: [`examples/banking.abide`](../examples/banking.abide)
 A document review lifecycle with role-based guards and temporal properties.
 
 ```abide
-type DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published
+enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published
 
 entity Document {
   id: Id
@@ -155,7 +155,7 @@ See: [`examples/workflow.abide`](../examples/workflow.abide)
 Sum types with record variants and comprehensive match expressions.
 
 ```abide
-type Shape =
+enum Shape =
   Circle { radius: Real }
   | Rectangle { width: Real, height: Real }
   | Triangle { base: Real, height: Real }
@@ -228,7 +228,7 @@ See: [`examples/commerce.abide`](../examples/commerce.abide)
 A condensed healthcare specification showing entities, ADTs, predicates, and proof blocks.
 
 ```abide
-type DosageForm =
+enum DosageForm =
   Tablet { mg: Int }
   | Liquid { ml: Int }
   | Injection { dose_mg: Int }

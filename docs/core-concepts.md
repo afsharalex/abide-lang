@@ -13,15 +13,15 @@ Define the vocabulary of your domain.
 **Types** name the concepts:
 
 ```abide
-type OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
-type Currency = USD | EUR | GBP
-type Address { street: String, city: String, zip: String }
+enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
+enum Currency = USD | EUR | GBP
+struct Address { street: String, city: String, zip: String }
 ```
 
-Enums define finite state spaces. Records group related data. Algebraic data types combine both:
+Enums (`enum`) define finite state spaces. Structs (`struct`) group related data. Algebraic data types combine both:
 
 ```abide
-type DosageForm =
+enum DosageForm =
   Tablet { mg: Int }
   | Liquid { ml: Int }
   | Injection { dose_mg: Int, route: String }
@@ -286,7 +286,7 @@ At this layer, you're answering: *"Can I get a mathematical guarantee, not just 
 
 A typical project uses layers incrementally:
 
-1. **Start with structure.** Define your entities and types. Get the vocabulary right.
+1. **Start with structure.** Define your entities, enums, and structs. Get the vocabulary right.
 2. **Add behavior.** Write actions with guards. Define system events. This is where most of the work happens.
 3. **Assert properties.** Write verify blocks to check invariants. Write scenes to validate scenarios. The solver finds bugs you didn't think of.
 4. **Verify critical algorithms** *(when needed)*. If a function needs correctness guarantees beyond "the types check," add contracts and loop invariants.

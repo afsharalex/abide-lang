@@ -1,11 +1,11 @@
 use crate::ast::{
-    ActionInvoc, AxiomDecl, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock, CreateField,
-    EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind, FieldDecl,
-    FieldPat, FnDecl, ForBlock, GivenItem, IncludeDecl, InvocArg, LemmaDecl, LetBind, MatchArm,
-    ModuleDecl, NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl, QualType,
-    RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem, TheoremDecl,
-    TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl, UseItem, VerifyDecl,
-    VerifyTarget, Visibility, WhenItem,
+    ActionInvoc, AliasDecl, AxiomDecl, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock,
+    CreateField, EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind,
+    FieldDecl, FieldPat, FnDecl, ForBlock, GivenItem, IncludeDecl, InvocArg, LemmaDecl, LetBind,
+    MatchArm, ModuleDecl, NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl,
+    QualType, RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem,
+    TheoremDecl, TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl,
+    UseItem, VerifyDecl, VerifyTarget, Visibility, WhenItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -239,6 +239,8 @@ impl Parser {
                     | Token::Const
                     | Token::Fn
                     | Token::Type
+                    | Token::Enum
+                    | Token::Struct
                     | Token::Entity
                     | Token::System
                     | Token::Pred
@@ -262,7 +264,9 @@ impl Parser {
             Some(Token::Use) => Ok(TopDecl::Use(self.use_decl()?)),
             Some(Token::Const) => Ok(TopDecl::Const(self.const_decl()?)),
             Some(Token::Fn) => Ok(TopDecl::Fn(self.fn_decl()?)),
-            Some(Token::Type) => self.type_or_record_decl(),
+            Some(Token::Type) => self.alias_decl(),
+            Some(Token::Enum) => self.enum_decl(),
+            Some(Token::Struct) => self.struct_decl(),
             Some(Token::Entity) => Ok(TopDecl::Entity(self.entity_decl()?)),
             Some(Token::System) => Ok(TopDecl::System(self.system_decl()?)),
             Some(Token::Pred) => Ok(TopDecl::Pred(self.pred_decl()?)),
@@ -324,12 +328,25 @@ impl Parser {
         self.expect(&Token::Pub)?;
         match self.peek() {
             Some(Token::Type) => {
-                let decl = self.type_or_record_decl()?;
+                let TopDecl::Alias(mut d) = self.alias_decl()? else {
+                    unreachable!()
+                };
+                d.visibility = Visibility::Public;
+                Ok(TopDecl::Alias(d))
+            }
+            Some(Token::Enum) => {
+                let decl = self.enum_decl()?;
                 match decl {
                     TopDecl::Type(mut t) => {
                         t.visibility = Visibility::Public;
                         Ok(TopDecl::Type(t))
                     }
+                    _ => unreachable!(),
+                }
+            }
+            Some(Token::Struct) => {
+                let decl = self.struct_decl()?;
+                match decl {
                     TopDecl::Record(mut r) => {
                         r.visibility = Visibility::Public;
                         Ok(TopDecl::Record(r))
@@ -363,7 +380,7 @@ impl Parser {
                 Ok(TopDecl::Prop(d))
             }
             Some(tok) => Err(ParseError::expected(
-                "`type`, `entity`, `fn`, `const`, `pred`, or `prop` after `pub`",
+                "`type`, `enum`, `struct`, `entity`, `fn`, `const`, `pred`, or `prop` after `pub`",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -473,42 +490,65 @@ impl Parser {
 
     // ── Type Declarations ────────────────────────────────────────────
 
-    fn type_or_record_decl(&mut self) -> Result<TopDecl, ParseError> {
+    /// Parse `enum Name = Variant | Variant`
+    fn enum_decl(&mut self) -> Result<TopDecl, ParseError> {
+        let start = self.expect(&Token::Enum)?;
+        let (name, _) = self.expect_name()?;
+        self.expect(&Token::Eq)?;
+        let variants = self.type_variants()?;
+        let last_span = match variants.last() {
+            Some(
+                TypeVariant::Simple { span, .. }
+                | TypeVariant::Record { span, .. }
+                | TypeVariant::Param { span, .. },
+            ) => *span,
+            None => start,
+        };
+        Ok(TopDecl::Type(TypeDecl {
+            name,
+            visibility: Visibility::Private,
+            variants,
+            span: start.merge(last_span),
+        }))
+    }
+
+    /// Parse `struct Name { fields }`
+    fn struct_decl(&mut self) -> Result<TopDecl, ParseError> {
+        let start = self.expect(&Token::Struct)?;
+        let (name, _) = self.expect_name()?;
+        self.expect(&Token::LBrace)?;
+        let fields = self.comma_sep(&Token::RBrace, Parser::rec_field)?;
+        let end = self.expect(&Token::RBrace)?;
+        Ok(TopDecl::Record(RecordDecl {
+            name,
+            visibility: Visibility::Private,
+            fields,
+            span: start.merge(end),
+        }))
+    }
+
+    /// Parse pipe-separated type variants: `Variant | Variant | ...`
+    fn type_variants(&mut self) -> Result<Vec<TypeVariant>, ParseError> {
+        let mut variants = vec![self.type_variant()?];
+        while self.eat(&Token::Pipe).is_some() {
+            variants.push(self.type_variant()?);
+        }
+        Ok(variants)
+    }
+
+    /// Parse `type Name = TypeRef` — always a type alias.
+    /// Enums use `enum`, structs use `struct`.
+    fn alias_decl(&mut self) -> Result<TopDecl, ParseError> {
         let start = self.expect(&Token::Type)?;
         let (name, _) = self.expect_name()?;
-
-        if self.eat(&Token::LBrace).is_some() {
-            // Record: type Name { fields }
-            let fields = self.comma_sep(&Token::RBrace, Parser::rec_field)?;
-            let end = self.expect(&Token::RBrace)?;
-            Ok(TopDecl::Record(RecordDecl {
-                name,
-                visibility: Visibility::Private,
-                fields,
-                span: start.merge(end),
-            }))
-        } else {
-            // Sum type: type Name = Variant | Variant
-            self.expect(&Token::Eq)?;
-            let mut variants = vec![self.type_variant()?];
-            while self.eat(&Token::Pipe).is_some() {
-                variants.push(self.type_variant()?);
-            }
-            let last_span = match variants.last() {
-                Some(
-                    TypeVariant::Simple { span, .. }
-                    | TypeVariant::Record { span, .. }
-                    | TypeVariant::Param { span, .. },
-                ) => *span,
-                None => start,
-            };
-            Ok(TopDecl::Type(TypeDecl {
-                name,
-                visibility: Visibility::Private,
-                variants,
-                span: start.merge(last_span),
-            }))
-        }
+        self.expect(&Token::Eq)?;
+        let target = self.type_ref()?;
+        Ok(TopDecl::Alias(AliasDecl {
+            span: start.merge(target.span),
+            name,
+            visibility: Visibility::Private,
+            target,
+        }))
     }
 
     fn type_variant(&mut self) -> Result<TypeVariant, ParseError> {
@@ -2502,7 +2542,7 @@ mod tests {
 
     #[test]
     fn pub_type_decl() {
-        let prog = parse_program("pub type OrderStatus = Pending | Paid");
+        let prog = parse_program("pub enum OrderStatus = Pending | Paid");
         assert_eq!(prog.decls.len(), 1);
         if let TopDecl::Type(t) = &prog.decls[0] {
             assert_eq!(t.name, "OrderStatus");
@@ -2529,7 +2569,7 @@ mod tests {
 
     #[test]
     fn private_by_default() {
-        let prog = parse_program("type Status = Active | Inactive");
+        let prog = parse_program("enum Status = Active | Inactive");
         if let TopDecl::Type(t) = &prog.decls[0] {
             assert_eq!(t.visibility, Visibility::Private);
         } else {
@@ -2608,7 +2648,7 @@ mod tests {
 
     #[test]
     fn sum_type() {
-        let prog = parse_program("type OrderStatus = Pending | AwaitingPayment | Paid");
+        let prog = parse_program("enum OrderStatus = Pending | AwaitingPayment | Paid");
         if let TopDecl::Type(t) = &prog.decls[0] {
             assert_eq!(t.name, "OrderStatus");
             assert_eq!(t.variants.len(), 3);
@@ -2619,7 +2659,7 @@ mod tests {
 
     #[test]
     fn record_type() {
-        let prog = parse_program("type Address { street: String, city: String }");
+        let prog = parse_program("struct Address { street: String, city: String }");
         if let TopDecl::Record(r) = &prog.decls[0] {
             assert_eq!(r.name, "Address");
             assert_eq!(r.fields.len(), 2);
@@ -3290,10 +3330,10 @@ mod tests {
 
     #[test]
     fn recovery_does_not_skip_valid_starter() {
-        let src = "import x\ntype Status = A | B";
+        let src = "import x\nenum Status = A | B";
         let (program, errors) = try_parse_recovering(src);
         assert_eq!(errors.len(), 1, "one import error");
-        assert_eq!(program.decls.len(), 1, "type should be recovered");
+        assert_eq!(program.decls.len(), 1, "enum should be recovered");
     }
 
     /// Extract the help text from a ParseError, if present.
@@ -3379,5 +3419,264 @@ mod tests {
             help.contains("requires"),
             "help should suggest 'requires': {help}"
         );
+    }
+
+    // ── DDR-043: enum / struct / type alias tests ───────────────────
+
+    #[test]
+    fn enum_simple() {
+        let prog = parse_program("enum Status = Active | Inactive | Suspended");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Type(t) = &prog.decls[0] {
+            assert_eq!(t.name, "Status");
+            assert_eq!(t.variants.len(), 3);
+            assert!(matches!(&t.variants[0], TypeVariant::Simple { name, .. } if name == "Active"));
+            assert!(
+                matches!(&t.variants[1], TypeVariant::Simple { name, .. } if name == "Inactive")
+            );
+            assert!(
+                matches!(&t.variants[2], TypeVariant::Simple { name, .. } if name == "Suspended")
+            );
+        } else {
+            panic!("expected Type from enum");
+        }
+    }
+
+    #[test]
+    fn enum_adt_with_record_variants() {
+        let src = "enum Shape = Circle { radius: Real } | Rectangle { width: Real, height: Real }";
+        let prog = parse_program(src);
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Type(t) = &prog.decls[0] {
+            assert_eq!(t.name, "Shape");
+            assert_eq!(t.variants.len(), 2);
+            assert!(
+                matches!(&t.variants[0], TypeVariant::Record { name, fields, .. } if name == "Circle" && fields.len() == 1)
+            );
+            assert!(
+                matches!(&t.variants[1], TypeVariant::Record { name, fields, .. } if name == "Rectangle" && fields.len() == 2)
+            );
+        } else {
+            panic!("expected Type from enum");
+        }
+    }
+
+    #[test]
+    fn struct_decl_test() {
+        let src = "struct Address { street: String, city: String, zip: String }";
+        let prog = parse_program(src);
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Record(r) = &prog.decls[0] {
+            assert_eq!(r.name, "Address");
+            assert_eq!(r.fields.len(), 3);
+            assert_eq!(r.fields[0].name, "street");
+            assert_eq!(r.fields[1].name, "city");
+            assert_eq!(r.fields[2].name, "zip");
+        } else {
+            panic!("expected Record from struct");
+        }
+    }
+
+    #[test]
+    fn type_alias_to_tuple() {
+        let prog = parse_program("type Coord = (Real, Real)");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "Coord");
+            assert!(matches!(&a.target.kind, TypeRefKind::Tuple(ts) if ts.len() == 2));
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn type_alias_to_collection() {
+        let prog = parse_program("type Ids = Set<Id>");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "Ids");
+            assert!(
+                matches!(&a.target.kind, TypeRefKind::Param(name, ts) if name == "Set" && ts.len() == 1)
+            );
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn type_alias_to_builtin() {
+        let prog = parse_program("type Amount = Real");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "Amount");
+            assert!(matches!(&a.target.kind, TypeRefKind::Simple(name) if name == "Real"));
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn pub_enum_struct_type() {
+        let src = r#"pub enum Color = Red | Green | Blue
+pub struct Point { x: Real, y: Real }
+pub type Distance = Real"#;
+        let prog = parse_program(src);
+        assert_eq!(prog.decls.len(), 3);
+        if let TopDecl::Type(t) = &prog.decls[0] {
+            assert_eq!(t.name, "Color");
+            assert_eq!(t.visibility, Visibility::Public);
+            assert_eq!(t.variants.len(), 3);
+        } else {
+            panic!("expected pub Type from enum");
+        }
+        if let TopDecl::Record(r) = &prog.decls[1] {
+            assert_eq!(r.name, "Point");
+            assert_eq!(r.visibility, Visibility::Public);
+            assert_eq!(r.fields.len(), 2);
+        } else {
+            panic!("expected pub Record from struct");
+        }
+        if let TopDecl::Alias(a) = &prog.decls[2] {
+            assert_eq!(a.name, "Distance");
+            assert_eq!(a.visibility, Visibility::Public);
+        } else {
+            panic!("expected pub Alias from type");
+        }
+    }
+
+    #[test]
+    fn type_does_not_produce_enum() {
+        // `type` with pipe-separated variants: type_ref() parses `Pending`
+        // as a simple alias, leaving `| Paid` as trailing junk.
+        let tokens = lex::lex("type OrderStatus = Pending | Paid").expect("lex");
+        let mut parser = Parser::new(tokens);
+        let (prog, errors) = parser.parse_program_recovering();
+        // Should either error or produce an alias (not a multi-variant enum)
+        let has_multi_variant = prog
+            .decls
+            .iter()
+            .any(|d| matches!(d, TopDecl::Type(t) if t.variants.len() > 1));
+        assert!(
+            !has_multi_variant,
+            "type with | should not produce multi-variant enum — use enum"
+        );
+        // The trailing `| Paid` should produce a parse error
+        assert!(
+            !errors.is_empty() || prog.decls.len() != 1,
+            "type with | should produce errors or unexpected decls"
+        );
+    }
+
+    #[test]
+    fn type_does_not_produce_record() {
+        // `type Name { fields }` is not valid — use `struct`
+        let tokens = lex::lex("type Address { street: String }").expect("lex");
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse_program();
+        assert!(
+            result.is_err(),
+            "type with {{ fields }} should be rejected — use struct"
+        );
+    }
+
+    #[test]
+    fn type_alias_to_map() {
+        let prog = parse_program("type Ledger = Map<Id, Real>");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "Ledger");
+            if let TypeRefKind::Param(name, ts) = &a.target.kind {
+                assert_eq!(name, "Map");
+                assert_eq!(ts.len(), 2);
+            } else {
+                panic!("expected Param type ref");
+            }
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn type_alias_triple_tuple() {
+        let prog = parse_program("type RGB = (Int, Int, Int)");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "RGB");
+            if let TypeRefKind::Tuple(ts) = &a.target.kind {
+                assert_eq!(ts.len(), 3);
+            } else {
+                panic!("expected Tuple type ref");
+            }
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn type_alias_function_type() {
+        let prog = parse_program("type Handler = Int -> Bool");
+        assert_eq!(prog.decls.len(), 1);
+        if let TopDecl::Alias(a) = &prog.decls[0] {
+            assert_eq!(a.name, "Handler");
+            assert!(
+                matches!(a.target.kind, TypeRefKind::Fn(_, _)),
+                "expected function type, got {:?}",
+                a.target.kind
+            );
+        } else {
+            panic!("expected Alias, got {:?}", prog.decls[0]);
+        }
+    }
+
+    #[test]
+    fn type_single_name_is_alias() {
+        // type Status = Pending → alias (no backward compat for enums)
+        // Use `enum Status = Pending` for single-variant enums.
+        let prog = parse_program("type Status = Pending");
+        match &prog.decls[0] {
+            TopDecl::Alias(a) => {
+                assert_eq!(a.name, "Status");
+                assert!(
+                    matches!(a.target.kind, TypeRefKind::Simple(ref n) if n == "Pending"),
+                    "expected alias to Pending, got {:?}",
+                    a.target.kind
+                );
+            }
+            other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_rejects_brace_syntax() {
+        let tokens = lex::lex("enum Point { x: Int }").expect("lex");
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse_program();
+        assert!(result.is_err(), "enum with {{ fields }} should be rejected");
+    }
+
+    #[test]
+    fn struct_rejects_eq_syntax() {
+        let tokens = lex::lex("struct Status = A | B").expect("lex");
+        let mut parser = Parser::new(tokens);
+        let result = parser.parse_program();
+        assert!(result.is_err(), "struct with = should be rejected");
+    }
+
+    #[test]
+    fn type_alias_uppercase_function_type() {
+        // type Predicate = User -> Bool — User is uppercase non-builtin
+        // but -> makes it a function type, so it must be an alias, not enum.
+        let prog = parse_program("type Predicate = User -> Bool");
+        match &prog.decls[0] {
+            TopDecl::Alias(a) => {
+                assert_eq!(a.name, "Predicate");
+                assert!(
+                    matches!(a.target.kind, TypeRefKind::Fn(_, _)),
+                    "expected function type, got {:?}",
+                    a.target.kind
+                );
+            }
+            other => panic!("expected Alias, got {other:?}"),
+        }
     }
 }

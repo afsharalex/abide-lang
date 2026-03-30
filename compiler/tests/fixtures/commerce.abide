@@ -6,11 +6,11 @@ include "billing.abide"
 use Billing::{PaymentIntent as PI, open_intent, capture_payment}
 use Billing::PaymentStatus as PS
 
-type OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
-type PaymentStatus = Opened | Captured | Failed
+enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
+enum PaymentStatus = Opened | Captured | Failed
 type Price = Int
 
-type Address { street: String, city: String }
+struct Address { street: String, city: String }
 
 entity Order {
   id: Id
