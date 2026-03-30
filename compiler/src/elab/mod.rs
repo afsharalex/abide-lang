@@ -41,9 +41,60 @@ pub fn elaborate_env(mut env: env::Env) -> (ElabResult, Vec<ElabError>) {
     // Pass 3: Type-check and validate well-formedness
     let (result, check_errors) = check::check(&env);
 
+    // Tag untagged errors with file context.
+    // Resolve/check errors have spans but may lack file tags since those passes
+    // run after collection. Use env.current_file (root file for single-file loads)
+    // or match against DeclInfo files for multi-file.
+    let root_file = env.current_file.clone();
     let mut all_errors = collect_errors;
-    all_errors.extend(resolve_errors);
-    all_errors.extend(check_errors);
+    for mut err in resolve_errors {
+        if err.file.is_none() {
+            if let Some(span) = err.span {
+                if let Some(file) = find_file_for_span(&env, span).or(root_file.clone()) {
+                    err.file = Some(file);
+                }
+            }
+        }
+        all_errors.push(err);
+    }
+    for mut err in check_errors {
+        if err.file.is_none() {
+            if let Some(span) = err.span {
+                if let Some(file) = find_file_for_span(&env, span).or(root_file.clone()) {
+                    err.file = Some(file);
+                }
+            }
+        }
+        all_errors.push(err);
+    }
 
     (result, all_errors)
+}
+
+/// Try to determine which file a span belongs to by checking declaration
+/// and use-declaration spans.
+fn find_file_for_span(env: &env::Env, span: crate::span::Span) -> Option<String> {
+    // Check DeclInfo spans
+    for decl in env.decls.values() {
+        if let (Some(decl_span), Some(ref file)) = (decl.span, &decl.file) {
+            if span.start >= decl_span.start && span.end <= decl_span.end {
+                return Some(file.clone());
+            }
+        }
+    }
+    // Check use declaration spans
+    for entry in &env.use_decls {
+        if let Some(ref file) = entry.source_file {
+            let use_span = match &entry.decl {
+                crate::ast::UseDecl::All { span: s, .. }
+                | crate::ast::UseDecl::Single { span: s, .. }
+                | crate::ast::UseDecl::Alias { span: s, .. }
+                | crate::ast::UseDecl::Items { span: s, .. } => *s,
+            };
+            if span.start >= use_span.start && span.end <= use_span.end {
+                return Some(file.clone());
+            }
+        }
+    }
+    None
 }

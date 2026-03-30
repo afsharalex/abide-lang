@@ -20,6 +20,7 @@
 | [REPL](repl.md) | Interactive specification authoring and live evaluation *(planned)* |
 | [QA Language](qa-language.md) | Structural query language for specs *(planned)* |
 | [Roadmap](roadmap.md) | What works now, what's next, what's deferred |
+| [Error Reference](errors.md) | Error codes (E001–E010), descriptions, and fix guidance |
 | [FAQ](faq.md) | Common questions and clarifications |
 
 ## Maturity

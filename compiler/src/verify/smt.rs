@@ -30,35 +30,35 @@ pub enum SmtValue {
 }
 
 impl SmtValue {
-    /// Extract as Bool, panics if wrong variant.
-    pub fn as_bool(&self) -> &Bool {
+    /// Extract as Bool. Returns error if wrong variant.
+    pub fn as_bool(&self) -> Result<&Bool, String> {
         match self {
-            SmtValue::Bool(b) => b,
-            other => panic!("expected Bool, got {other:?}"),
+            SmtValue::Bool(b) => Ok(b),
+            other => Err(format!("type error: expected Bool, got {other:?}")),
         }
     }
 
-    /// Extract as Int, panics if wrong variant.
-    pub fn as_int(&self) -> &Int {
+    /// Extract as Int. Returns error if wrong variant.
+    pub fn as_int(&self) -> Result<&Int, String> {
         match self {
-            SmtValue::Int(i) => i,
-            other => panic!("expected Int, got {other:?}"),
+            SmtValue::Int(i) => Ok(i),
+            other => Err(format!("type error: expected Int, got {other:?}")),
         }
     }
 
-    /// Extract as Real, panics if wrong variant.
-    pub fn as_real(&self) -> &Real {
+    /// Extract as Real. Returns error if wrong variant.
+    pub fn as_real(&self) -> Result<&Real, String> {
         match self {
-            SmtValue::Real(r) => r,
-            other => panic!("expected Real, got {other:?}"),
+            SmtValue::Real(r) => Ok(r),
+            other => Err(format!("type error: expected Real, got {other:?}")),
         }
     }
 
-    /// Extract as Array, panics if wrong variant.
-    pub fn as_array(&self) -> &Array {
+    /// Extract as Array. Returns error if wrong variant.
+    pub fn as_array(&self) -> Result<&Array, String> {
         match self {
-            SmtValue::Array(a) => a,
-            other => panic!("expected Array, got {other:?}"),
+            SmtValue::Array(a) => Ok(a),
+            other => Err(format!("type error: expected Array, got {other:?}")),
         }
     }
 
@@ -74,15 +74,15 @@ impl SmtValue {
     }
 
     /// Convert to a Bool (for use in assertions).
-    /// Int → Bool via (int != 0), Bool → Bool, Dynamic → Bool (sort cast), others panic.
-    pub fn to_bool(&self) -> Bool {
+    /// Int → Bool via (int != 0), Bool → Bool, Dynamic → Bool (sort cast).
+    pub fn to_bool(&self) -> Result<Bool, String> {
         match self {
-            SmtValue::Bool(b) => b.clone(),
-            SmtValue::Int(i) => i.eq(Int::from_i64(0)).not(),
+            SmtValue::Bool(b) => Ok(b.clone()),
+            SmtValue::Int(i) => Ok(i.eq(Int::from_i64(0)).not()),
             SmtValue::Dynamic(d) => d
                 .as_bool()
-                .unwrap_or_else(|| panic!("cannot convert Dynamic to Bool: {d:?}")),
-            _ => panic!("cannot convert {self:?} to Bool"),
+                .ok_or_else(|| format!("type error: cannot convert Dynamic to Bool: {d:?}")),
+            other => Err(format!("type error: cannot convert {other:?} to Bool")),
         }
     }
 }
@@ -169,11 +169,15 @@ pub fn default_dynamic(ty: &IRType) -> Dynamic {
 }
 
 /// Create a named Z3 Array variable for a Map/Set/Seq field.
-pub fn array_var(name: &str, ty: &IRType) -> SmtValue {
+pub fn array_var(name: &str, ty: &IRType) -> Result<SmtValue, String> {
     let sort = ir_type_to_sort(ty);
-    let domain = sort.array_domain().expect("array_var requires array sort");
-    let range = sort.array_range().expect("array_var requires array sort");
-    SmtValue::Array(Array::new_const(name, &domain, &range))
+    let domain = sort
+        .array_domain()
+        .ok_or_else(|| format!("type error: expected array sort for '{name}', got {ty:?}"))?;
+    let range = sort
+        .array_range()
+        .ok_or_else(|| format!("type error: expected array sort for '{name}', got {ty:?}"))?;
+    Ok(SmtValue::Array(Array::new_const(name, &domain, &range)))
 }
 
 /// Assert that two `SmtValue`s are equal, returning a Z3 Bool constraint.
@@ -181,16 +185,18 @@ pub fn array_var(name: &str, ty: &IRType) -> SmtValue {
 /// Handles same-variant pairs directly. For cross-variant pairs involving
 /// Dynamic (e.g., `Array::select` result vs Int field), coerces the typed
 /// operand to Dynamic and uses Z3's generic equality.
-pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Bool {
+pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
     match (a, b) {
-        (SmtValue::Int(x), SmtValue::Int(y)) => x.eq(y.clone()),
-        (SmtValue::Bool(x), SmtValue::Bool(y)) => x.eq(y.clone()),
-        (SmtValue::Real(x), SmtValue::Real(y)) => x.eq(y.clone()),
-        (SmtValue::Array(x), SmtValue::Array(y)) => x.eq(y.clone()),
-        (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => x.eq(y.clone()),
+        (SmtValue::Int(x), SmtValue::Int(y)) => Ok(x.eq(y.clone())),
+        (SmtValue::Bool(x), SmtValue::Bool(y)) => Ok(x.eq(y.clone())),
+        (SmtValue::Real(x), SmtValue::Real(y)) => Ok(x.eq(y.clone())),
+        (SmtValue::Array(x), SmtValue::Array(y)) => Ok(x.eq(y.clone())),
+        (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => Ok(x.eq(y.clone())),
         // Cross-variant: coerce both to Dynamic for Z3's generic equality
-        (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => d.eq(other.to_dynamic()),
-        _ => panic!("sort mismatch in smt_eq: {a:?} vs {b:?}"),
+        (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => {
+            Ok(d.eq(other.to_dynamic()))
+        }
+        _ => Err(format!("sort mismatch in equality: {a:?} vs {b:?}")),
     }
 }
 
@@ -200,81 +206,88 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Bool {
 ///
 /// Returns the result as an `SmtValue`. Operand types must match.
 #[allow(clippy::too_many_lines, clippy::match_same_arms)]
-pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> SmtValue {
+pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, String> {
     match (op, lhs, rhs) {
-        // Arithmetic (Int) — IR emits "OpAdd", "OpSub", etc.
-        ("OpAdd", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Int(Int::add(&[a, b])),
-        ("OpSub", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Int(Int::sub(&[a, b])),
-        ("OpMul", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Int(Int::mul(&[a, b])),
-        ("OpDiv", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Int(a.div(b)),
-        ("OpMod", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Int(a.modulo(b)),
+        // Arithmetic (Int)
+        ("OpAdd", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(Int::add(&[a, b]))),
+        ("OpSub", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(Int::sub(&[a, b]))),
+        ("OpMul", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(Int::mul(&[a, b]))),
+        ("OpDiv", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(a.div(b))),
+        ("OpMod", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(a.modulo(b))),
 
         // Arithmetic (Real)
-        ("OpAdd", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Real(Real::add(&[a, b])),
-        ("OpSub", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Real(Real::sub(&[a, b])),
-        ("OpMul", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Real(Real::mul(&[a, b])),
-        ("OpDiv", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Real(Real::div(a, b)),
+        ("OpAdd", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Real(Real::add(&[a, b]))),
+        ("OpSub", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Real(Real::sub(&[a, b]))),
+        ("OpMul", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Real(Real::mul(&[a, b]))),
+        ("OpDiv", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Real(Real::div(a, b))),
 
         // Comparison (Int)
-        ("OpEq", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.eq(b)),
-        ("OpNEq", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.eq(b).not()),
-        ("OpLt", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.lt(b)),
-        ("OpGt", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.gt(b)),
-        ("OpLe", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.le(b)),
-        ("OpGe", SmtValue::Int(a), SmtValue::Int(b)) => SmtValue::Bool(a.ge(b)),
+        ("OpEq", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.eq(b))),
+        ("OpNEq", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.eq(b).not())),
+        ("OpLt", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.lt(b))),
+        ("OpGt", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.gt(b))),
+        ("OpLe", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.le(b))),
+        ("OpGe", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(a.ge(b))),
 
         // Comparison (Real)
-        ("OpEq", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(a.eq(b)),
-        ("OpNEq", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(a.eq(b).not()),
-        ("OpLt", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(Real::lt(a, b)),
-        ("OpGt", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(Real::gt(a, b)),
-        ("OpLe", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(Real::le(a, b)),
-        ("OpGe", SmtValue::Real(a), SmtValue::Real(b)) => SmtValue::Bool(Real::ge(a, b)),
+        ("OpEq", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(a.eq(b))),
+        ("OpNEq", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(a.eq(b).not())),
+        ("OpLt", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(Real::lt(a, b))),
+        ("OpGt", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(Real::gt(a, b))),
+        ("OpLe", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(Real::le(a, b))),
+        ("OpGe", SmtValue::Real(a), SmtValue::Real(b)) => Ok(SmtValue::Bool(Real::ge(a, b))),
 
         // Boolean (Bool)
-        ("OpEq", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.eq(b)),
-        ("OpNEq", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.eq(b).not()),
-        ("OpAnd", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
-        ("OpOr", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::or(&[a, b])),
-        ("OpImplies", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.implies(b)),
+        ("OpEq", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(a.eq(b))),
+        ("OpNEq", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(a.eq(b).not())),
+        ("OpAnd", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(Bool::and(&[a, b]))),
+        ("OpOr", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(Bool::or(&[a, b]))),
+        ("OpImplies", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(a.implies(b))),
 
         // Array equality (Map/Set/Seq)
-        ("OpEq", SmtValue::Array(a), SmtValue::Array(b)) => SmtValue::Bool(a.eq(b.clone())),
-        ("OpNEq", SmtValue::Array(a), SmtValue::Array(b)) => SmtValue::Bool(a.eq(b.clone()).not()),
+        ("OpEq", SmtValue::Array(a), SmtValue::Array(b)) => Ok(SmtValue::Bool(a.eq(b.clone()))),
+        ("OpNEq", SmtValue::Array(a), SmtValue::Array(b)) => {
+            Ok(SmtValue::Bool(a.eq(b.clone()).not()))
+        }
 
-        // Composition operators — encode as boolean combinators for now
-        ("OpSeq", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(a.implies(b)),
-        ("OpSameStep", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
-        ("OpUnord", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
-        ("OpConc", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::and(&[a, b])),
-        ("OpXor", SmtValue::Bool(a), SmtValue::Bool(b)) => SmtValue::Bool(Bool::xor(a, b)),
+        // Composition operators
+        ("OpSeq", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(a.implies(b))),
+        ("OpSameStep", SmtValue::Bool(a), SmtValue::Bool(b)) => {
+            Ok(SmtValue::Bool(Bool::and(&[a, b])))
+        }
+        ("OpUnord", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(Bool::and(&[a, b]))),
+        ("OpConc", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(Bool::and(&[a, b]))),
+        ("OpXor", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(Bool::xor(a, b))),
 
         // Dynamic operands — from array select, cast to matching type
         (op, SmtValue::Dynamic(d), other) | (op, other, SmtValue::Dynamic(d)) => {
             let coerced = match other {
                 SmtValue::Int(_) => SmtValue::Int(
                     d.as_int()
-                        .unwrap_or_else(|| panic!("Dynamic→Int cast failed in {op}")),
+                        .ok_or_else(|| format!("type error: Dynamic→Int cast failed in {op}"))?,
                 ),
                 SmtValue::Bool(_) => SmtValue::Bool(
                     d.as_bool()
-                        .unwrap_or_else(|| panic!("Dynamic→Bool cast failed in {op}")),
+                        .ok_or_else(|| format!("type error: Dynamic→Bool cast failed in {op}"))?,
                 ),
                 SmtValue::Real(_) => SmtValue::Real(
                     d.as_real()
-                        .unwrap_or_else(|| panic!("Dynamic→Real cast failed in {op}")),
+                        .ok_or_else(|| format!("type error: Dynamic→Real cast failed in {op}"))?,
                 ),
                 SmtValue::Dynamic(_) => {
-                    // Both Dynamic — try Int (most common for map values)
                     if let Some(i) = d.as_int() {
                         SmtValue::Int(i)
                     } else if let Some(b) = d.as_bool() {
                         SmtValue::Bool(b)
                     } else {
-                        panic!("cannot resolve Dynamic-Dynamic binop: {op}")
+                        return Err(format!(
+                            "type error: cannot resolve Dynamic-Dynamic operand in {op}"
+                        ));
                     }
                 }
-                SmtValue::Array(_) => panic!("cannot apply {op} to Array operand"),
+                SmtValue::Array(_) => {
+                    return Err(format!("type error: cannot apply {op} to Array operand"));
+                }
             };
             if matches!(lhs, SmtValue::Dynamic(_)) {
                 binop(op, &coerced, rhs)
@@ -283,16 +296,16 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> SmtValue {
             }
         }
 
-        _ => panic!("unsupported binop: {op} on {lhs:?}, {rhs:?}"),
+        _ => Err(format!("unsupported binop: {op} on {lhs:?}, {rhs:?}")),
     }
 }
 
 /// Negate a boolean or apply unary minus to an int.
 /// Accepts IR op names: `"OpNot"`, `"OpNeg"`.
-pub fn unop(op: &str, val: &SmtValue) -> SmtValue {
+pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
     match op {
-        "OpNot" | "not" => SmtValue::Bool(val.as_bool().not()),
-        "OpNeg" | "-" => SmtValue::Int(Int::unary_minus(val.as_int())),
-        _ => panic!("unsupported unop: {op}"),
+        "OpNot" | "not" => Ok(SmtValue::Bool(val.as_bool()?.not())),
+        "OpNeg" | "-" => Ok(SmtValue::Int(Int::unary_minus(val.as_int()?))),
+        _ => Err(format!("unsupported unop: {op}")),
     }
 }

@@ -25,6 +25,16 @@ pub enum DeclKind {
     Fn,
 }
 
+/// A use declaration with provenance (source module + source file).
+#[derive(Debug, Clone)]
+pub struct UseDeclEntry {
+    pub decl: UseDecl,
+    /// Module that contains this use declaration.
+    pub source_module: Option<String>,
+    /// File that contains this use declaration.
+    pub source_file: Option<String>,
+}
+
 /// Information about a declaration in the symbol table.
 #[derive(Debug, Clone)]
 pub struct DeclInfo {
@@ -36,6 +46,8 @@ pub struct DeclInfo {
     pub module: Option<String>,
     /// Source span of this declaration (for diagnostic pointing).
     pub span: Option<crate::span::Span>,
+    /// Source file path of this declaration (for cross-file diagnostics).
+    pub file: Option<String>,
 }
 
 /// The elaboration environment (symbol table).
@@ -52,11 +64,12 @@ pub struct DeclInfo {
 #[derive(Debug, Clone)]
 pub struct Env {
     pub module_name: Option<String>,
+    /// Current source file being collected (set by loader, used to tag declarations).
+    pub current_file: Option<String>,
     pub includes: Vec<String>,
-    /// Use declarations paired with their source module (the module of the
-    /// file that declared each `use`). This enables per-use-decl visibility
-    /// checks in multi-module compilation.
-    pub use_decls: Vec<(UseDecl, Option<String>)>,
+    /// Use declarations with provenance (source module + source file).
+    /// Enables per-use-decl visibility checks and file tagging for diagnostics.
+    pub use_decls: Vec<UseDeclEntry>,
     /// Global declaration registry, keyed by `Module::Name` (or bare name if no module).
     pub decls: HashMap<String, DeclInfo>,
     /// Working namespace — bare-name maps used by resolve/check/lower.
@@ -74,6 +87,9 @@ pub struct Env {
     pub consts: HashMap<String, EConst>,
     pub fns: HashMap<String, EFn>,
     pub errors: Vec<ElabError>,
+    /// Structured load errors from included files (lex/IO errors that should be
+    /// rendered through miette rather than downgraded to plain `ElabError` text).
+    pub include_load_errors: Vec<crate::loader::LoadError>,
     /// All known module names (populated from `module` declarations across files).
     pub known_modules: std::collections::HashSet<String>,
     /// Alias map: `local_name` → `canonical_name`. Built during use resolution
@@ -100,6 +116,7 @@ impl Env {
     pub fn new() -> Self {
         Self {
             module_name: None,
+            current_file: None,
             includes: Vec::new(),
             use_decls: Vec::new(),
             decls: HashMap::new(),
@@ -116,6 +133,7 @@ impl Env {
             consts: HashMap::new(),
             fns: HashMap::new(),
             errors: Vec::new(),
+            include_load_errors: Vec::new(),
             known_modules: std::collections::HashSet::new(),
             aliases: HashMap::new(),
             qualified_types: HashMap::new(),
@@ -135,28 +153,32 @@ impl Env {
     pub fn add_decl(&mut self, name: &str, info: DeclInfo) {
         let key = Self::qualified_key(info.module.as_deref(), name);
         if let Some(existing) = self.decls.get(&key) {
-            let err = if let Some(span) = info.span {
+            let mut err = if let Some(span) = info.span {
                 ElabError::with_span(
                     ErrorKind::DuplicateDecl,
-                    format!(
-                        "duplicate declaration: {name} (already declared as {:?})",
-                        existing.kind
-                    ),
-                    String::new(),
+                    format!("duplicate declaration '{name}'"),
+                    "duplicate defined here".to_owned(),
                     span,
                 )
             } else {
                 ElabError::new(
                     ErrorKind::DuplicateDecl,
-                    format!(
-                        "duplicate declaration: {name} (already declared as {:?})",
-                        existing.kind
-                    ),
+                    format!("duplicate declaration '{name}'"),
                     String::new(),
                 )
             };
+            // Point to the original declaration if it has a span.
+            // Use with_secondary_in_file when original is in a different file.
+            if let Some(orig_span) = existing.span {
+                let label = format!("'{name}' first declared here");
+                if let Some(ref orig_file) = existing.file {
+                    err = err.with_secondary_in_file(orig_span, label, orig_file.clone());
+                } else {
+                    err = err.with_secondary(orig_span, label);
+                }
+            }
             self.errors
-                .push(err.with_help("rename one of the declarations"));
+                .push(err.with_help(crate::messages::HELP_DUPLICATE_DECL));
         } else {
             self.decls.insert(key, info);
         }
@@ -392,6 +414,7 @@ impl Env {
             visibility,
             module: self.module_name.clone(),
             span: Some(span),
+            file: self.current_file.clone(),
         }
     }
 

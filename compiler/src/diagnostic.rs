@@ -15,7 +15,7 @@ pub enum AbideError {
     Parse(#[from] ParseError),
 }
 
-#[derive(Error, Diagnostic, Debug)]
+#[derive(Error, Diagnostic, Debug, Clone)]
 #[error("unexpected character")]
 #[diagnostic(code(abide::lex::unexpected))]
 pub struct LexError {

@@ -77,6 +77,7 @@ fn uncurry(expr: &IRExpr) -> (Vec<(String, IRType)>, IRExpr) {
         param,
         param_type,
         body,
+        ..
     } = current
     {
         params.push((param.clone(), param_type.clone()));
@@ -135,8 +136,8 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 fv.insert(name.clone());
             }
         }
-        IRExpr::Lit { .. } | IRExpr::Ctor { .. } | IRExpr::Sorry | IRExpr::Todo => {}
-        IRExpr::Field { expr, .. } | IRExpr::Card { expr } => free_vars_inner(expr, bound, fv),
+        IRExpr::Lit { .. } | IRExpr::Ctor { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {}
+        IRExpr::Field { expr, .. } | IRExpr::Card { expr, .. } => free_vars_inner(expr, bound, fv),
         IRExpr::BinOp { left, right, .. } => {
             free_vars_inner(left, bound, fv);
             free_vars_inner(right, bound, fv);
@@ -153,7 +154,7 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 bound.remove(param);
             }
         }
-        IRExpr::Let { bindings, body } => {
+        IRExpr::Let { bindings, body, .. } => {
             let mut added = Vec::new();
             for b in bindings {
                 free_vars_inner(&b.expr, bound, fv);
@@ -173,10 +174,14 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 bound.remove(var);
             }
         }
-        IRExpr::Always { body } | IRExpr::Eventually { body } | IRExpr::Prime { expr: body } => {
+        IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. }
+        | IRExpr::Prime { expr: body, .. } => {
             free_vars_inner(body, bound, fv);
         }
-        IRExpr::Match { scrutinee, arms } => {
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
             free_vars_inner(scrutinee, bound, fv);
             for arm in arms {
                 let mut arm_bound = bound.clone();
@@ -248,29 +253,35 @@ fn substitute_var_inner(
         IRExpr::Var { .. }
         | IRExpr::Lit { .. }
         | IRExpr::Ctor { .. }
-        | IRExpr::Sorry
-        | IRExpr::Todo => expr,
+        | IRExpr::Sorry { .. }
+        | IRExpr::Todo { .. } => expr,
         IRExpr::Field {
             expr: inner,
             field,
             ty,
+            ..
         } => IRExpr::Field {
             expr: Box::new(substitute_var_inner(*inner, var_name, replacement, repl_fv)),
             field,
             ty,
+            span: None,
         },
         IRExpr::BinOp {
             op,
             left,
             right,
             ty,
+            ..
         } => IRExpr::BinOp {
             op,
             left: Box::new(substitute_var_inner(*left, var_name, replacement, repl_fv)),
             right: Box::new(substitute_var_inner(*right, var_name, replacement, repl_fv)),
             ty,
+            span: None,
         },
-        IRExpr::UnOp { op, operand, ty } => IRExpr::UnOp {
+        IRExpr::UnOp {
+            op, operand, ty, ..
+        } => IRExpr::UnOp {
             op,
             operand: Box::new(substitute_var_inner(
                 *operand,
@@ -279,16 +290,19 @@ fn substitute_var_inner(
                 repl_fv,
             )),
             ty,
+            span: None,
         },
-        IRExpr::App { func, arg, ty } => IRExpr::App {
+        IRExpr::App { func, arg, ty, .. } => IRExpr::App {
             func: Box::new(substitute_var_inner(*func, var_name, replacement, repl_fv)),
             arg: Box::new(substitute_var_inner(*arg, var_name, replacement, repl_fv)),
             ty,
+            span: None,
         },
         IRExpr::Lam {
             param,
             param_type,
             body,
+            ..
         } => {
             if param == var_name {
                 // Shadowed — don't substitute into body
@@ -296,6 +310,7 @@ fn substitute_var_inner(
                     param,
                     param_type,
                     body,
+                    span: None,
                 }
             } else if repl_fv.contains(&param) {
                 // Capture risk: binder name appears free in replacement.
@@ -304,6 +319,7 @@ fn substitute_var_inner(
                 let fresh_var = IRExpr::Var {
                     name: fresh.clone(),
                     ty: param_type.clone(),
+                    span: None,
                 };
                 let renamed_body =
                     substitute_var_inner(*body, &param, &fresh_var, &free_vars(&fresh_var));
@@ -316,16 +332,18 @@ fn substitute_var_inner(
                         replacement,
                         repl_fv,
                     )),
+                    span: None,
                 }
             } else {
                 IRExpr::Lam {
                     param,
                     param_type,
                     body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
+                    span: None,
                 }
             }
         }
-        IRExpr::Let { bindings, body } => {
+        IRExpr::Let { bindings, body, .. } => {
             let mut shadowed = false;
             let mut needs_rename = false;
             // Check if any binding name appears free in replacement
@@ -360,6 +378,7 @@ fn substitute_var_inner(
                             let fresh_var = IRExpr::Var {
                                 name: new.clone(),
                                 ty: b.ty.clone(),
+                                span: None,
                             };
                             new_expr = substitute_var_inner(
                                 new_expr,
@@ -389,6 +408,7 @@ fn substitute_var_inner(
                     let fresh_var = IRExpr::Var {
                         name: new.clone(),
                         ty: IRType::Int, // type doesn't matter for name substitution
+                        span: None,
                     };
                     current_body =
                         substitute_var_inner(current_body, old, &fresh_var, &free_vars(&fresh_var));
@@ -401,6 +421,7 @@ fn substitute_var_inner(
                 IRExpr::Let {
                     bindings: renamed_bindings,
                     body: Box::new(current_body),
+                    span: None,
                 }
             } else {
                 let new_bindings = bindings
@@ -423,6 +444,7 @@ fn substitute_var_inner(
                     .collect();
                 IRExpr::Let {
                     bindings: new_bindings,
+                    span: None,
                     body: if shadowed {
                         body
                     } else {
@@ -431,22 +453,27 @@ fn substitute_var_inner(
                 }
             }
         }
-        IRExpr::Forall { var, domain, body } => {
-            subst_quantifier(var, domain, body, var_name, replacement, repl_fv, true)
-        }
-        IRExpr::Exists { var, domain, body } => {
-            subst_quantifier(var, domain, body, var_name, replacement, repl_fv, false)
-        }
-        IRExpr::Always { body } => IRExpr::Always {
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, true),
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, false),
+        IRExpr::Always { body, .. } => IRExpr::Always {
             body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
+            span: None,
         },
-        IRExpr::Eventually { body } => IRExpr::Eventually {
+        IRExpr::Eventually { body, .. } => IRExpr::Eventually {
             body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
+            span: None,
         },
-        IRExpr::Prime { expr } => IRExpr::Prime {
+        IRExpr::Prime { expr, .. } => IRExpr::Prime {
             expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+            span: None,
         },
-        IRExpr::Match { scrutinee, arms } => {
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
             let new_scrutinee = substitute_var_inner(*scrutinee, var_name, replacement, repl_fv);
             let new_arms = arms
                 .into_iter()
@@ -491,6 +518,7 @@ fn substitute_var_inner(
                                 let fresh_var = IRExpr::Var {
                                     name: fresh.clone(),
                                     ty,
+                                    span: None,
                                 };
                                 let fv_fresh = free_vars(&fresh_var);
                                 if let Some(g) = guard {
@@ -514,6 +542,7 @@ fn substitute_var_inner(
             IRExpr::Match {
                 scrutinee: Box::new(new_scrutinee),
                 arms: new_arms,
+                span: None,
             }
         }
         IRExpr::MapUpdate {
@@ -521,16 +550,19 @@ fn substitute_var_inner(
             key,
             value,
             ty,
+            ..
         } => IRExpr::MapUpdate {
             map: Box::new(substitute_var_inner(*map, var_name, replacement, repl_fv)),
             key: Box::new(substitute_var_inner(*key, var_name, replacement, repl_fv)),
             value: Box::new(substitute_var_inner(*value, var_name, replacement, repl_fv)),
             ty,
+            span: None,
         },
-        IRExpr::Index { map, key, ty } => IRExpr::Index {
+        IRExpr::Index { map, key, ty, .. } => IRExpr::Index {
             map: Box::new(substitute_var_inner(*map, var_name, replacement, repl_fv)),
             key: Box::new(substitute_var_inner(*key, var_name, replacement, repl_fv)),
             ty,
+            span: None,
         },
         IRExpr::SetComp {
             var,
@@ -538,6 +570,7 @@ fn substitute_var_inner(
             filter,
             projection,
             ty,
+            ..
         } => {
             if var == var_name {
                 IRExpr::SetComp {
@@ -546,12 +579,14 @@ fn substitute_var_inner(
                     filter,
                     projection,
                     ty,
+                    span: None,
                 }
             } else if repl_fv.contains(&var) {
                 let fresh = fresh_name(&var);
                 let fresh_var = IRExpr::Var {
                     name: fresh.clone(),
                     ty: domain.clone(),
+                    span: None,
                 };
                 let fv_fresh = free_vars(&fresh_var);
                 let renamed_filter = substitute_var_inner(*filter, &var, &fresh_var, &fv_fresh);
@@ -560,6 +595,7 @@ fn substitute_var_inner(
                 IRExpr::SetComp {
                     var: fresh,
                     domain,
+                    span: None,
                     filter: Box::new(substitute_var_inner(
                         renamed_filter,
                         var_name,
@@ -575,6 +611,7 @@ fn substitute_var_inner(
                 IRExpr::SetComp {
                     var,
                     domain,
+                    span: None,
                     filter: Box::new(substitute_var_inner(
                         *filter,
                         var_name,
@@ -588,21 +625,23 @@ fn substitute_var_inner(
                 }
             }
         }
-        IRExpr::SetLit { elements, ty } => IRExpr::SetLit {
+        IRExpr::SetLit { elements, ty, .. } => IRExpr::SetLit {
             elements: elements
                 .into_iter()
                 .map(|e| substitute_var_inner(e, var_name, replacement, repl_fv))
                 .collect(),
             ty,
+            span: None,
         },
-        IRExpr::SeqLit { elements, ty } => IRExpr::SeqLit {
+        IRExpr::SeqLit { elements, ty, .. } => IRExpr::SeqLit {
             elements: elements
                 .into_iter()
                 .map(|e| substitute_var_inner(e, var_name, replacement, repl_fv))
                 .collect(),
             ty,
+            span: None,
         },
-        IRExpr::MapLit { entries, ty } => IRExpr::MapLit {
+        IRExpr::MapLit { entries, ty, .. } => IRExpr::MapLit {
             entries: entries
                 .into_iter()
                 .map(|(k, v)| {
@@ -613,9 +652,11 @@ fn substitute_var_inner(
                 })
                 .collect(),
             ty,
+            span: None,
         },
-        IRExpr::Card { expr } => IRExpr::Card {
+        IRExpr::Card { expr, .. } => IRExpr::Card {
             expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+            span: None,
         },
     }
 }
@@ -625,7 +666,7 @@ fn substitute_var_inner(
 fn find_var_type(expr: &IRExpr, name: &str) -> Option<IRType> {
     match expr {
         IRExpr::Var { name: n, ty, .. } if n == name => Some(ty.clone()),
-        IRExpr::Field { expr, .. } | IRExpr::Prime { expr } => find_var_type(expr, name),
+        IRExpr::Field { expr, .. } | IRExpr::Prime { expr, .. } => find_var_type(expr, name),
         IRExpr::BinOp { left, right, .. } => {
             find_var_type(left, name).or_else(|| find_var_type(right, name))
         }
@@ -636,13 +677,15 @@ fn find_var_type(expr: &IRExpr, name: &str) -> Option<IRType> {
         IRExpr::Lam { body, .. }
         | IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
-        | IRExpr::Always { body }
-        | IRExpr::Eventually { body } => find_var_type(body, name),
-        IRExpr::Let { bindings, body } => bindings
+        | IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. } => find_var_type(body, name),
+        IRExpr::Let { bindings, body, .. } => bindings
             .iter()
             .find_map(|b| find_var_type(&b.expr, name))
             .or_else(|| find_var_type(body, name)),
-        IRExpr::Match { scrutinee, arms } => find_var_type(scrutinee, name).or_else(|| {
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => find_var_type(scrutinee, name).or_else(|| {
             arms.iter().find_map(|a| {
                 a.guard
                     .as_ref()
@@ -724,12 +767,14 @@ fn subst_quantifier(
                 var: v,
                 domain: d,
                 body: b,
+                span: None,
             }
         } else {
             IRExpr::Exists {
                 var: v,
                 domain: d,
                 body: b,
+                span: None,
             }
         }
     };
@@ -743,6 +788,7 @@ fn subst_quantifier(
         let fresh_var = IRExpr::Var {
             name: fresh.clone(),
             ty: domain.clone(),
+            span: None,
         };
         let fv_fresh = free_vars(&fresh_var);
         let renamed_body = substitute_var_inner(*body, &var, &fresh_var, &fv_fresh);
@@ -775,6 +821,8 @@ mod tests {
         let body = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
+
+            span: None,
         };
         let (params, result) = uncurry(&body);
         assert!(params.is_empty());
@@ -792,8 +840,14 @@ mod tests {
                 body: Box::new(IRExpr::Var {
                     name: "x".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
         let (params, result) = uncurry(&body);
         assert_eq!(params.len(), 2);
@@ -808,12 +862,18 @@ mod tests {
             func: Box::new(IRExpr::Var {
                 name: "p".to_owned(),
                 ty: IRType::Bool,
+
+                span: None,
             }),
             arg: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 42 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
         let (name, args) = decompose_app_chain(&expr).unwrap();
         assert_eq!(name, "p");
@@ -827,18 +887,28 @@ mod tests {
                 func: Box::new(IRExpr::Var {
                     name: "p".to_owned(),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
                 arg: Box::new(IRExpr::Var {
                     name: "a".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
             arg: Box::new(IRExpr::Var {
                 name: "b".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
         let (name, args) = decompose_app_chain(&expr).unwrap();
         assert_eq!(name, "p");
@@ -856,8 +926,13 @@ mod tests {
                 body: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 prop_target: None,
+
+                span: None,
+                file: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -897,15 +972,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "x".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 },
                 prop_target: None,
+
+                span: None,
+                file: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -921,12 +1007,18 @@ mod tests {
             func: Box::new(IRExpr::Var {
                 name: "positive".to_owned(),
                 ty: IRType::Bool,
+
+                span: None,
             }),
             arg: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 5 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let expanded = env.expand_app(&call).unwrap();
@@ -951,9 +1043,16 @@ mod tests {
                     body: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
+
+                    span: None,
                 },
                 prop_target: None,
+
+                span: None,
+                file: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -978,17 +1077,27 @@ mod tests {
                 left: Box::new(IRExpr::Var {
                     name: "x".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Var {
                     name: "y".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 ty: IRType::Int,
+
+                span: None,
             }),
+
+            span: None,
         };
         let replacement = IRExpr::Lit {
             ty: IRType::Int,
             value: LitVal::Int { value: 10 },
+
+            span: None,
         };
         let result = substitute_var(expr, "y", &replacement);
         // x should NOT be replaced, y SHOULD be replaced
@@ -1016,6 +1125,8 @@ mod tests {
             scrutinee: Box::new(IRExpr::Var {
                 name: "scrut".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             arms: vec![IRMatchArm {
                 pattern: IRPattern::PVar {
@@ -1027,18 +1138,28 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Var {
                         name: "y".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     ty: IRType::Int,
+
+                    span: None,
                 },
             }],
+
+            span: None,
         };
         let replacement = IRExpr::Lit {
             ty: IRType::Int,
             value: LitVal::Int { value: 42 },
+
+            span: None,
         };
         let result = substitute_var(expr, "y", &replacement);
         if let IRExpr::Match { arms, .. } = result {
@@ -1067,6 +1188,8 @@ mod tests {
             scrutinee: Box::new(IRExpr::Var {
                 name: "scrut".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             arms: vec![IRMatchArm {
                 pattern: IRPattern::PVar {
@@ -1078,18 +1201,28 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 1 },
+
+                        span: None,
                     }),
                     ty: IRType::Int,
+
+                    span: None,
                 },
             }],
+
+            span: None,
         };
         let replacement = IRExpr::Lit {
             ty: IRType::Int,
             value: LitVal::Int { value: 99 },
+
+            span: None,
         };
         let result = substitute_var(expr, "x", &replacement);
         if let IRExpr::Match { arms, .. } = result {
@@ -1118,6 +1251,8 @@ mod tests {
             scrutinee: Box::new(IRExpr::Var {
                 name: "scrut".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             arms: vec![IRMatchArm {
                 pattern: IRPattern::PVar {
@@ -1129,14 +1264,22 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Var {
                         name: "y".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     ty: IRType::Int,
+
+                    span: None,
                 },
             }],
+
+            span: None,
         };
         // replacement: x + 1 (free var "x")
         let replacement = IRExpr::BinOp {
@@ -1144,12 +1287,18 @@ mod tests {
             left: Box::new(IRExpr::Var {
                 name: "x".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             right: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 1 },
+
+                span: None,
             }),
             ty: IRType::Int,
+
+            span: None,
         };
         let result = substitute_var(expr, "y", &replacement);
         if let IRExpr::Match { arms, .. } = result {
@@ -1188,6 +1337,8 @@ mod tests {
             scrutinee: Box::new(IRExpr::Var {
                 name: "scrut".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             arms: vec![IRMatchArm {
                 pattern: IRPattern::PVar {
@@ -1199,14 +1350,22 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Var {
                         name: "y".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     ty: IRType::Int,
+
+                    span: None,
                 },
             }],
+
+            span: None,
         };
         let fv = free_vars(&expr);
         assert!(fv.contains("scrut"), "scrut should be free");

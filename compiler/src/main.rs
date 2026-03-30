@@ -147,7 +147,9 @@ fn main() -> miette::Result<()> {
                 std::process::exit(1);
             }
             let ir_program = abide::ir::lower(&result);
-            let json = abide::ir::emit_json(&ir_program);
+            let json = abide::ir::emit_json(&ir_program)
+                .into_diagnostic()
+                .wrap_err("failed to serialize IR to JSON")?;
             println!("{json}");
         }
         Command::Verify {
@@ -189,13 +191,8 @@ fn main() -> miette::Result<()> {
             } else {
                 let mut all_passed = true;
                 for r in &results {
-                    println!("{r}");
-                    if matches!(
-                        r,
-                        abide::verify::VerificationResult::Counterexample { .. }
-                            | abide::verify::VerificationResult::SceneFail { .. }
-                            | abide::verify::VerificationResult::Unprovable { .. }
-                    ) {
+                    report_verification_result(r, &sources);
+                    if r.is_failure() {
                         all_passed = false;
                     }
                 }
@@ -243,26 +240,128 @@ fn report_elab_errors(errors: &[abide::elab::error::ElabError], sources: &[(Stri
             let matching_source = if let Some(ref file) = err.file {
                 sources.iter().find(|(name, _)| name == file)
             } else if single_file {
-                // Single-file mode: safe to use the only source
                 sources.first()
             } else {
-                // Multi-file with untagged error: don't guess — fall back to plain text
                 None
             };
 
             if let Some((name, src)) = matching_source {
-                // Verify the span is within the source's range
                 if span.end <= src.len() {
+                    // For cross-file secondary spans, augment help text with location info
+                    let mut render_err = err.clone();
+                    if let (Some(sec_span), Some(ref sec_label), Some(ref sec_file)) = (
+                        err.secondary_span,
+                        &err.secondary_label,
+                        &err.secondary_file,
+                    ) {
+                        if err.file.as_ref() != Some(sec_file) {
+                            // Cross-file: compute line number and append to help
+                            let line =
+                                sources
+                                    .iter()
+                                    .find(|(n, _)| n == sec_file)
+                                    .map_or(0, |(_, s)| {
+                                        s[..sec_span.start.min(s.len())]
+                                            .chars()
+                                            .filter(|&c| c == '\n')
+                                            .count()
+                                            + 1
+                                    });
+                            let loc_note = if line > 0 {
+                                format!("\n  note: {sec_label} ({sec_file}:{line})")
+                            } else {
+                                format!("\n  note: {sec_label} ({sec_file})")
+                            };
+                            let combined = match &render_err.help {
+                                Some(h) => format!("{h}{loc_note}"),
+                                None => loc_note.trim_start().to_owned(),
+                            };
+                            render_err.help = Some(combined);
+                        }
+                    }
                     let named = NamedSource::new(name.clone(), src.clone());
-                    let report = miette::Report::new(err.clone()).with_source_code(named);
+                    let report = miette::Report::new(render_err).with_source_code(named);
                     eprintln!("{report:?}");
                     continue;
                 }
             }
         }
-        // Fallback: plain text for errors without spans, without matching source,
-        // or with out-of-range spans
-        eprintln!("{err}");
+        // Fallback: plain text, but still include cross-file secondary info if present
+        if let (Some(sec_span), Some(ref sec_label), Some(ref sec_file)) = (
+            err.secondary_span,
+            &err.secondary_label,
+            &err.secondary_file,
+        ) {
+            let line = sources
+                .iter()
+                .find(|(n, _)| n == sec_file)
+                .map_or(0, |(_, s)| {
+                    s[..sec_span.start.min(s.len())]
+                        .chars()
+                        .filter(|&c| c == '\n')
+                        .count()
+                        + 1
+                });
+            if line > 0 {
+                eprintln!("{err}\n  note: {sec_label} ({sec_file}:{line})");
+            } else {
+                eprintln!("{err}\n  note: {sec_label} ({sec_file})");
+            }
+        } else {
+            eprintln!("{err}");
+        }
+    }
+}
+
+/// Render a verification result, using miette source snippets for failures.
+fn report_verification_result(
+    result: &abide::verify::VerificationResult,
+    sources: &[(String, String)],
+) {
+    use abide::verify::VerificationResult;
+
+    // For failures with source location, render with miette
+    if result.is_failure() {
+        if let Some(span) = result.span() {
+            let matching_source = if let Some(file) = result.file() {
+                sources.iter().find(|(name, _)| name == file)
+            } else if sources.len() == 1 {
+                sources.first()
+            } else {
+                None
+            };
+
+            if let Some((name, src)) = matching_source {
+                if span.end <= src.len() {
+                    let label = match result {
+                        VerificationResult::Counterexample { name, .. } => {
+                            format!("counterexample found for '{name}'")
+                        }
+                        VerificationResult::SceneFail { name, reason, .. } => {
+                            format!("scene '{name}' failed: {reason}")
+                        }
+                        VerificationResult::Unprovable { name, hint, .. } => {
+                            format!("could not prove '{name}': {hint}")
+                        }
+                        _ => String::new(),
+                    };
+                    let named = NamedSource::new(name.clone(), src.clone());
+                    let diag = miette::miette!(
+                        labels = vec![miette::LabeledSpan::at(span.start..span.end, &label)],
+                        "{}",
+                        result
+                    )
+                    .with_source_code(named);
+                    eprintln!("{diag:?}");
+                    return;
+                }
+            }
+        }
+        // Fallback: plain text for failures without source info
+        eprintln!("{result}");
+    } else {
+        // Success results: plain text
+        println!("{result}");
     }
 }
 
@@ -285,36 +384,70 @@ fn load_and_elaborate(
         }
     }
 
+    // Always render include load errors — even if top-level files also failed,
+    // so the user sees the full picture in mixed-failure runs.
+    for inc_err in &env.include_load_errors {
+        render_load_error(inc_err, sources);
+    }
+
     if !load_errors.is_empty() {
         for err in &load_errors {
-            match err {
-                abide::loader::LoadError::ParseErrors { path, errors } => {
-                    // Render each parse error with source snippet
-                    let src = sources
-                        .iter()
-                        .find(|(name, _)| name == &path.display().to_string())
-                        .or_else(|| {
-                            // Try canonical path match
-                            let canonical = std::fs::canonicalize(path).ok()?;
-                            sources
-                                .iter()
-                                .find(|(name, _)| name == &canonical.display().to_string())
-                        });
-                    for pe in errors {
-                        if let Some((name, text)) = src {
-                            let named = NamedSource::new(name.clone(), text.clone());
-                            let report = miette::Report::new(pe.clone()).with_source_code(named);
-                            eprintln!("{report:?}");
-                        } else {
-                            eprintln!("{pe}");
-                        }
-                    }
-                }
-                other => eprintln!("{other}"),
-            }
+            render_load_error(err, sources);
         }
         return None;
     }
 
-    Some(abide::elab::elaborate_env(env))
+    // Include errors are non-fatal for elaboration (the successfully-loaded
+    // declarations are still available), but we track whether any occurred
+    // so the caller can decide on exit status.
+    let had_include_errors = !env.include_load_errors.is_empty();
+    let (result, mut elab_errors) = abide::elab::elaborate_env(env);
+    if had_include_errors {
+        // Ensure the caller sees a non-empty error list so it exits with failure
+        // even if elaboration itself produced no errors.
+        if elab_errors.is_empty() {
+            elab_errors.push(abide::elab::error::ElabError::new(
+                abide::elab::error::ErrorKind::UndefinedRef,
+                "one or more included files failed to load (see above)",
+                String::new(),
+            ));
+        }
+    }
+    Some((result, elab_errors))
+}
+
+/// Render a single `LoadError` with miette formatting.
+fn render_load_error(err: &abide::loader::LoadError, sources: &[(String, String)]) {
+    match err {
+        abide::loader::LoadError::ParseErrors { path, errors } => {
+            let src = sources
+                .iter()
+                .find(|(name, _)| name == &path.display().to_string())
+                .or_else(|| {
+                    let canonical = std::fs::canonicalize(path).ok()?;
+                    sources
+                        .iter()
+                        .find(|(name, _)| name == &canonical.display().to_string())
+                });
+            for pe in errors {
+                if let Some((name, text)) = src {
+                    let named = NamedSource::new(name.clone(), text.clone());
+                    let report = miette::Report::new(pe.clone()).with_source_code(named);
+                    eprintln!("{report:?}");
+                } else {
+                    eprintln!("{pe}");
+                }
+            }
+        }
+        abide::loader::LoadError::Lex { errors, .. } => {
+            for le in errors {
+                let report = miette::Report::new(le.clone());
+                eprintln!("{report:?}");
+            }
+        }
+        abide::loader::LoadError::Io { path, error } => {
+            let report = miette::miette!("failed to read {}: {error}", path.display());
+            eprintln!("{report:?}");
+        }
+    }
 }

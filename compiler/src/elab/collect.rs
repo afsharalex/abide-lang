@@ -37,8 +37,8 @@ pub fn collect_into(env: &mut Env, program: &ast::Program) {
     // `module` in the file), patch them now that module_name is set.
     if let Some(ref module) = env.module_name {
         for entry in &mut env.use_decls[use_decls_before..] {
-            if entry.1.is_none() {
-                entry.1 = Some(module.clone());
+            if entry.source_module.is_none() {
+                entry.source_module = Some(module.clone());
             }
         }
     }
@@ -76,7 +76,12 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
             // the use still gets recorded — resolve handles None source gracefully
             // by skipping same-module visibility shortcuts.
             let source_module = env.module_name.clone();
-            env.use_decls.push((ud.clone(), source_module));
+            let source_file = env.current_file.clone();
+            env.use_decls.push(crate::elab::env::UseDeclEntry {
+                decl: ud.clone(),
+                source_module,
+                source_file,
+            });
         }
         ast::TopDecl::Const(d) => collect_const(env, d),
         ast::TopDecl::Fn(d) => collect_fn(env, d),
@@ -374,12 +379,12 @@ fn collect_event_item(item: &ast::EventItem) -> EEventAction {
 fn classify_expr(expr: &EExpr) -> EEventAction {
     match expr {
         // Cross-system call: Sys::event(args)
-        EExpr::Call(_, callee, args) => {
-            if let EExpr::Qual(_, sys, ev) = callee.as_ref() {
+        EExpr::Call(_, callee, args, _) => {
+            if let EExpr::Qual(_, sys, ev, _) = callee.as_ref() {
                 return EEventAction::CrossCall(sys.clone(), ev.clone(), extract_named_args(args));
             }
             // Action apply: o.action(args)
-            if let EExpr::Field(_, target, action) = callee.as_ref() {
+            if let EExpr::Field(_, target, action, _) = callee.as_ref() {
                 return EEventAction::Apply(
                     *target.clone(),
                     action.clone(),
@@ -390,8 +395,8 @@ fn classify_expr(expr: &EExpr) -> EEventAction {
             EEventAction::Expr(expr.clone())
         }
         // Action apply with refs: o.action[refs](args)
-        EExpr::CallR(_, callee, refs, args) => {
-            if let EExpr::Field(_, target, action) = callee.as_ref() {
+        EExpr::CallR(_, callee, refs, args, _) => {
+            if let EExpr::Field(_, target, action, _) = callee.as_ref() {
                 return EEventAction::Apply(
                     *target.clone(),
                     action.clone(),
@@ -408,7 +413,7 @@ fn classify_expr(expr: &EExpr) -> EEventAction {
 fn extract_named_args(args: &[EExpr]) -> Vec<EExpr> {
     args.iter()
         .map(|e| match e {
-            EExpr::NamedPair(_, _, inner) => *inner.clone(),
+            EExpr::NamedPair(_, _, inner, _) => *inner.clone(),
             other => other.clone(),
         })
         .collect()
@@ -418,7 +423,7 @@ fn collect_next_item(ni: &ast::NextItem) -> ENextItem {
     match ni {
         ast::NextItem::When {
             condition, event, ..
-        } => ENextItem::When(collect_expr(condition), expr_to_text(&event.kind)),
+        } => ENextItem::When(Box::new(collect_expr(condition)), expr_to_text(&event.kind)),
         ast::NextItem::Else(_) => ENextItem::Else,
     }
 }
@@ -445,6 +450,7 @@ fn collect_pred(env: &mut Env, pd: &ast::PredDecl) {
         params,
         body: collect_expr(&pd.body),
         span: Some(pd.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(DeclKind::Pred, name.clone(), None, pd.visibility, pd.span);
     env.add_decl(name, info);
@@ -463,6 +469,7 @@ fn collect_prop(env: &mut Env, pd: &ast::PropDecl) {
         target,
         body: collect_expr(&pd.body),
         span: Some(pd.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(DeclKind::Prop, name.clone(), None, pd.visibility, pd.span);
     env.add_decl(name, info);
@@ -482,6 +489,7 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
         targets,
         asserts,
         span: Some(vd.span),
+        file: env.current_file.clone(),
     };
     let key = format!("verify:{name}");
     let info = env.make_decl_info(
@@ -559,6 +567,7 @@ fn collect_scene(env: &mut Env, sd: &ast::SceneDecl) {
         whens,
         thens,
         span: Some(sd.span),
+        file: env.current_file.clone(),
     };
     let key = format!("scene:{name}");
     let info = env.make_decl_info(
@@ -607,25 +616,28 @@ fn collect_invoc_arg(arg: &ast::InvocArg) -> EExpr {
     match arg {
         ast::InvocArg::Field { obj, field, .. } => EExpr::Field(
             unresolved.clone(),
-            Box::new(EExpr::Var(unresolved, obj.clone())),
+            Box::new(EExpr::Var(unresolved, obj.clone(), None)),
             field.clone(),
+            None,
         ),
         ast::InvocArg::Simple { name, .. } | ast::InvocArg::State { name, .. } => {
-            EExpr::Var(unresolved, name.clone())
+            EExpr::Var(unresolved, name.clone(), None)
         }
         ast::InvocArg::Int { value, .. } => {
-            EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(*value))
+            EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(*value), None)
         }
         ast::InvocArg::Real { value, .. } => {
-            EExpr::Lit(Ty::Builtin(BuiltinTy::Real), Literal::Real(*value))
+            EExpr::Lit(Ty::Builtin(BuiltinTy::Real), Literal::Real(*value), None)
         }
         ast::InvocArg::Float { value, .. } => {
             let v = parse_float_text(value);
-            EExpr::Lit(Ty::Builtin(BuiltinTy::Float), Literal::Float(v))
+            EExpr::Lit(Ty::Builtin(BuiltinTy::Float), Literal::Float(v), None)
         }
-        ast::InvocArg::Str { value, .. } => {
-            EExpr::Lit(Ty::Builtin(BuiltinTy::String), Literal::Str(value.clone()))
-        }
+        ast::InvocArg::Str { value, .. } => EExpr::Lit(
+            Ty::Builtin(BuiltinTy::String),
+            Literal::Str(value.clone()),
+            None,
+        ),
     }
 }
 
@@ -643,6 +655,7 @@ fn collect_theorem(env: &mut Env, td: &ast::TheoremDecl) {
         invariants: td.invariants.iter().map(collect_expr).collect(),
         shows: td.shows.iter().map(collect_expr).collect(),
         span: Some(td.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(
         DeclKind::Theorem,
@@ -661,6 +674,7 @@ fn collect_axiom(env: &mut Env, ad: &ast::AxiomDecl) {
         name: name.clone(),
         body: collect_expr(&ad.body),
         span: Some(ad.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(
         DeclKind::Axiom,
@@ -679,6 +693,7 @@ fn collect_lemma(env: &mut Env, ld: &ast::LemmaDecl) {
         name: name.clone(),
         body: ld.body.iter().map(collect_expr).collect(),
         span: Some(ld.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(
         DeclKind::Lemma,
@@ -717,6 +732,7 @@ fn collect_fn(env: &mut Env, fd: &ast::FnDecl) {
         ret_ty: ret,
         body: collect_expr(&fd.body),
         span: Some(fd.span),
+        file: env.current_file.clone(),
     };
     let info = env.make_decl_info(DeclKind::Fn, name.clone(), None, fd.visibility, fd.span);
     env.add_decl(name, info);
@@ -730,38 +746,40 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
     let u = || Ty::Unresolved("?".to_owned());
     let bool_ty = || Ty::Builtin(BuiltinTy::Bool);
     let int_ty = || Ty::Builtin(BuiltinTy::Int);
+    let sp = Some(expr.span);
 
     match &expr.kind {
-        ast::ExprKind::Var(n) => EExpr::Var(u(), n.clone()),
-        ast::ExprKind::Int(i) => EExpr::Lit(int_ty(), Literal::Int(*i)),
-        ast::ExprKind::Real(d) => EExpr::Lit(Ty::Builtin(BuiltinTy::Real), Literal::Real(*d)),
+        ast::ExprKind::Var(n) => EExpr::Var(u(), n.clone(), sp),
+        ast::ExprKind::Int(i) => EExpr::Lit(int_ty(), Literal::Int(*i), sp),
+        ast::ExprKind::Real(d) => EExpr::Lit(Ty::Builtin(BuiltinTy::Real), Literal::Real(*d), sp),
         ast::ExprKind::Float(s) => EExpr::Lit(
             Ty::Builtin(BuiltinTy::Float),
             Literal::Float(parse_float_text(s)),
+            sp,
         ),
         ast::ExprKind::Str(s) => {
-            EExpr::Lit(Ty::Builtin(BuiltinTy::String), Literal::Str(s.clone()))
+            EExpr::Lit(Ty::Builtin(BuiltinTy::String), Literal::Str(s.clone()), sp)
         }
-        ast::ExprKind::True => EExpr::Lit(bool_ty(), Literal::Bool(true)),
-        ast::ExprKind::False => EExpr::Lit(bool_ty(), Literal::Bool(false)),
+        ast::ExprKind::True => EExpr::Lit(bool_ty(), Literal::Bool(true), sp),
+        ast::ExprKind::False => EExpr::Lit(bool_ty(), Literal::Bool(false), sp),
 
-        ast::ExprKind::Qual2(s, n) => EExpr::Qual(u(), s.clone(), n.clone()),
-        ast::ExprKind::Qual3(s, t, n) => EExpr::Qual(u(), format!("{s}::{t}"), n.clone()),
-        ast::ExprKind::State1(c) => EExpr::Var(u(), c.clone()),
-        ast::ExprKind::State2(t, c) => EExpr::Qual(u(), t.clone(), c.clone()),
-        ast::ExprKind::State3(s, t, c) => EExpr::Qual(u(), format!("{s}::{t}"), c.clone()),
+        ast::ExprKind::Qual2(s, n) => EExpr::Qual(u(), s.clone(), n.clone(), sp),
+        ast::ExprKind::Qual3(s, t, n) => EExpr::Qual(u(), format!("{s}::{t}"), n.clone(), sp),
+        ast::ExprKind::State1(c) => EExpr::Var(u(), c.clone(), sp),
+        ast::ExprKind::State2(t, c) => EExpr::Qual(u(), t.clone(), c.clone(), sp),
+        ast::ExprKind::State3(s, t, c) => EExpr::Qual(u(), format!("{s}::{t}"), c.clone(), sp),
 
-        ast::ExprKind::Field(e, f) => EExpr::Field(u(), Box::new(collect_expr(e)), f.clone()),
-        ast::ExprKind::Prime(e) => EExpr::Prime(u(), Box::new(collect_expr(e))),
+        ast::ExprKind::Field(e, f) => EExpr::Field(u(), Box::new(collect_expr(e)), f.clone(), sp),
+        ast::ExprKind::Prime(e) => EExpr::Prime(u(), Box::new(collect_expr(e)), sp),
         ast::ExprKind::Call(callee, args) => {
             // Recognize collection literals: Set(1, 2, 3), Seq(1, 2), Map(k1, v1, k2, v2)
             if let ast::ExprKind::Var(name) = &callee.kind {
                 match name.as_str() {
                     "Set" => {
-                        return EExpr::SetLit(u(), args.iter().map(collect_expr).collect());
+                        return EExpr::SetLit(u(), args.iter().map(collect_expr).collect(), sp);
                     }
                     "Seq" => {
-                        return EExpr::SeqLit(u(), args.iter().map(collect_expr).collect());
+                        return EExpr::SeqLit(u(), args.iter().map(collect_expr).collect(), sp);
                     }
                     "Map" => {
                         // Map literal: pairs of (key, value) args
@@ -776,7 +794,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                                 }
                             })
                             .collect();
-                        return EExpr::MapLit(u(), entries);
+                        return EExpr::MapLit(u(), entries, sp);
                     }
                     _ => {}
                 }
@@ -785,6 +803,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                 u(),
                 Box::new(collect_expr(callee)),
                 args.iter().map(collect_expr).collect(),
+                sp,
             )
         }
         ast::ExprKind::CallR(callee, refs, args) => EExpr::CallR(
@@ -792,66 +811,80 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             Box::new(collect_expr(callee)),
             refs.iter().map(collect_expr).collect(),
             args.iter().map(collect_expr).collect(),
+            sp,
         ),
 
         // Unary ops
-        ast::ExprKind::Neg(e) => EExpr::UnOp(int_ty(), UnOp::Neg, Box::new(collect_expr(e))),
-        ast::ExprKind::Not(e) => EExpr::UnOp(bool_ty(), UnOp::Not, Box::new(collect_expr(e))),
-        ast::ExprKind::Card(e) => EExpr::Card(u(), Box::new(collect_expr(e))),
+        ast::ExprKind::Neg(e) => EExpr::UnOp(int_ty(), UnOp::Neg, Box::new(collect_expr(e)), sp),
+        ast::ExprKind::Not(e) => EExpr::UnOp(bool_ty(), UnOp::Not, Box::new(collect_expr(e)), sp),
+        ast::ExprKind::Card(e) => EExpr::Card(u(), Box::new(collect_expr(e)), sp),
 
         // Binary ops: arithmetic
-        ast::ExprKind::Add(a, b) => bin_op(u(), BinOp::Add, a, b),
-        ast::ExprKind::Sub(a, b) => bin_op(u(), BinOp::Sub, a, b),
-        ast::ExprKind::Mul(a, b) => bin_op(u(), BinOp::Mul, a, b),
-        ast::ExprKind::Div(a, b) => bin_op(u(), BinOp::Div, a, b),
-        ast::ExprKind::Mod(a, b) => bin_op(u(), BinOp::Mod, a, b),
+        ast::ExprKind::Add(a, b) => bin_op(u(), BinOp::Add, a, b, sp),
+        ast::ExprKind::Sub(a, b) => bin_op(u(), BinOp::Sub, a, b, sp),
+        ast::ExprKind::Mul(a, b) => bin_op(u(), BinOp::Mul, a, b, sp),
+        ast::ExprKind::Div(a, b) => bin_op(u(), BinOp::Div, a, b, sp),
+        ast::ExprKind::Mod(a, b) => bin_op(u(), BinOp::Mod, a, b, sp),
 
         // Binary ops: comparison (result is Bool)
-        ast::ExprKind::Eq(a, b) => bin_op(bool_ty(), BinOp::Eq, a, b),
-        ast::ExprKind::NEq(a, b) => bin_op(bool_ty(), BinOp::NEq, a, b),
-        ast::ExprKind::Lt(a, b) => bin_op(bool_ty(), BinOp::Lt, a, b),
-        ast::ExprKind::Gt(a, b) => bin_op(bool_ty(), BinOp::Gt, a, b),
-        ast::ExprKind::Le(a, b) => bin_op(bool_ty(), BinOp::Le, a, b),
-        ast::ExprKind::Ge(a, b) => bin_op(bool_ty(), BinOp::Ge, a, b),
+        ast::ExprKind::Eq(a, b) => bin_op(bool_ty(), BinOp::Eq, a, b, sp),
+        ast::ExprKind::NEq(a, b) => bin_op(bool_ty(), BinOp::NEq, a, b, sp),
+        ast::ExprKind::Lt(a, b) => bin_op(bool_ty(), BinOp::Lt, a, b, sp),
+        ast::ExprKind::Gt(a, b) => bin_op(bool_ty(), BinOp::Gt, a, b, sp),
+        ast::ExprKind::Le(a, b) => bin_op(bool_ty(), BinOp::Le, a, b, sp),
+        ast::ExprKind::Ge(a, b) => bin_op(bool_ty(), BinOp::Ge, a, b, sp),
 
         // Binary ops: logical (result is Bool)
-        ast::ExprKind::And(a, b) => bin_op(bool_ty(), BinOp::And, a, b),
-        ast::ExprKind::Or(a, b) => bin_op(bool_ty(), BinOp::Or, a, b),
-        ast::ExprKind::Impl(a, b) => bin_op(bool_ty(), BinOp::Implies, a, b),
+        ast::ExprKind::And(a, b) => bin_op(bool_ty(), BinOp::And, a, b, sp),
+        ast::ExprKind::Or(a, b) => bin_op(bool_ty(), BinOp::Or, a, b, sp),
+        ast::ExprKind::Impl(a, b) => bin_op(bool_ty(), BinOp::Implies, a, b, sp),
 
         // Binary ops: composition
-        ast::ExprKind::Unord(a, b) => bin_op(u(), BinOp::Unord, a, b),
-        ast::ExprKind::Conc(a, b) => bin_op(u(), BinOp::Conc, a, b),
-        ast::ExprKind::Xor(a, b) => bin_op(u(), BinOp::Xor, a, b),
+        ast::ExprKind::Unord(a, b) => bin_op(u(), BinOp::Unord, a, b, sp),
+        ast::ExprKind::Conc(a, b) => bin_op(u(), BinOp::Conc, a, b, sp),
+        ast::ExprKind::Xor(a, b) => bin_op(u(), BinOp::Xor, a, b, sp),
 
         // Membership
         ast::ExprKind::In(a, b) => EExpr::In(
             bool_ty(),
             Box::new(collect_expr(a)),
             Box::new(collect_expr(b)),
+            sp,
         ),
 
         // Temporal
-        ast::ExprKind::Always(e) => EExpr::Always(u(), Box::new(collect_expr(e))),
-        ast::ExprKind::Eventually(e) => EExpr::Eventually(u(), Box::new(collect_expr(e))),
-        ast::ExprKind::AssertExpr(e) => EExpr::Assert(u(), Box::new(collect_expr(e))),
+        ast::ExprKind::Always(e) => EExpr::Always(u(), Box::new(collect_expr(e)), sp),
+        ast::ExprKind::Eventually(e) => EExpr::Eventually(u(), Box::new(collect_expr(e)), sp),
+        ast::ExprKind::AssertExpr(e) => EExpr::Assert(u(), Box::new(collect_expr(e)), sp),
 
         // Assignment
-        ast::ExprKind::Assign(a, b) => {
-            EExpr::Assign(u(), Box::new(collect_expr(a)), Box::new(collect_expr(b)))
-        }
+        ast::ExprKind::Assign(a, b) => EExpr::Assign(
+            u(),
+            Box::new(collect_expr(a)),
+            Box::new(collect_expr(b)),
+            sp,
+        ),
         ast::ExprKind::NamedPair(n, e) => {
-            EExpr::NamedPair(u(), n.clone(), Box::new(collect_expr(e)))
+            EExpr::NamedPair(u(), n.clone(), Box::new(collect_expr(e)), sp)
         }
-        ast::ExprKind::Seq(a, b) => {
-            EExpr::Seq(u(), Box::new(collect_expr(a)), Box::new(collect_expr(b)))
-        }
-        ast::ExprKind::SameStep(a, b) => {
-            EExpr::SameStep(u(), Box::new(collect_expr(a)), Box::new(collect_expr(b)))
-        }
-        ast::ExprKind::Pipe(a, b) => {
-            EExpr::Pipe(u(), Box::new(collect_expr(a)), Box::new(collect_expr(b)))
-        }
+        ast::ExprKind::Seq(a, b) => EExpr::Seq(
+            u(),
+            Box::new(collect_expr(a)),
+            Box::new(collect_expr(b)),
+            sp,
+        ),
+        ast::ExprKind::SameStep(a, b) => EExpr::SameStep(
+            u(),
+            Box::new(collect_expr(a)),
+            Box::new(collect_expr(b)),
+            sp,
+        ),
+        ast::ExprKind::Pipe(a, b) => EExpr::Pipe(
+            u(),
+            Box::new(collect_expr(a)),
+            Box::new(collect_expr(b)),
+            sp,
+        ),
 
         // Quantifiers
         ast::ExprKind::All(v, tr, body) => EExpr::Quant(
@@ -860,6 +893,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
         ast::ExprKind::Exists(v, tr, body) => EExpr::Quant(
             bool_ty(),
@@ -867,6 +901,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
         ast::ExprKind::SomeQ(v, tr, body) => EExpr::Quant(
             bool_ty(),
@@ -874,6 +909,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
         ast::ExprKind::NoQ(v, tr, body) => EExpr::Quant(
             bool_ty(),
@@ -881,6 +917,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
         ast::ExprKind::OneQ(v, tr, body) => EExpr::Quant(
             bool_ty(),
@@ -888,6 +925,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
         ast::ExprKind::LoneQ(v, tr, body) => EExpr::Quant(
             bool_ty(),
@@ -895,6 +933,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             v.clone(),
             resolve_type_ref(tr),
             Box::new(collect_expr(body)),
+            sp,
         ),
 
         // Let bindings
@@ -909,7 +948,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                     )
                 })
                 .collect();
-            EExpr::Let(bs, Box::new(collect_expr(body)))
+            EExpr::Let(bs, Box::new(collect_expr(body)), sp)
         }
 
         // Lambda
@@ -918,7 +957,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                 .iter()
                 .map(|p| (p.name.clone(), resolve_type_ref(&p.ty)))
                 .collect();
-            EExpr::Lam(ps, None, Box::new(collect_expr(body)))
+            EExpr::Lam(ps, None, Box::new(collect_expr(body)), sp)
         }
         ast::ExprKind::LambdaT(params, ret_ty, body) => {
             let ps: Vec<(String, Ty)> = params
@@ -929,11 +968,14 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                 ps,
                 Some(resolve_type_ref(ret_ty)),
                 Box::new(collect_expr(body)),
+                sp,
             )
         }
 
         // Tuple literal
-        ast::ExprKind::TupleLit(es) => EExpr::TupleLit(u(), es.iter().map(collect_expr).collect()),
+        ast::ExprKind::TupleLit(es) => {
+            EExpr::TupleLit(u(), es.iter().map(collect_expr).collect(), sp)
+        }
 
         // Match expression
         ast::ExprKind::Match(scrutinee, arms) => {
@@ -947,7 +989,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                     (pat, guard, body)
                 })
                 .collect();
-            EExpr::Match(Box::new(scrut), earms)
+            EExpr::Match(Box::new(scrut), earms, sp)
         }
 
         // Map/collection operations
@@ -956,10 +998,14 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
             Box::new(collect_expr(m)),
             Box::new(collect_expr(k)),
             Box::new(collect_expr(v)),
+            sp,
         ),
-        ast::ExprKind::Index(m, k) => {
-            EExpr::Index(u(), Box::new(collect_expr(m)), Box::new(collect_expr(k)))
-        }
+        ast::ExprKind::Index(m, k) => EExpr::Index(
+            u(),
+            Box::new(collect_expr(m)),
+            Box::new(collect_expr(k)),
+            sp,
+        ),
         ast::ExprKind::SetComp {
             projection,
             var,
@@ -968,12 +1014,19 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
         } => {
             let dom = resolve_type_ref(domain);
             let proj = projection.as_ref().map(|p| Box::new(collect_expr(p)));
-            EExpr::SetComp(u(), proj, var.clone(), dom, Box::new(collect_expr(filter)))
+            EExpr::SetComp(
+                u(),
+                proj,
+                var.clone(),
+                dom,
+                Box::new(collect_expr(filter)),
+                sp,
+            )
         }
 
         // Stubs
-        ast::ExprKind::Sorry => EExpr::Sorry,
-        ast::ExprKind::Todo => EExpr::Todo,
+        ast::ExprKind::Sorry => EExpr::Sorry(sp),
+        ast::ExprKind::Todo => EExpr::Todo(sp),
     }
 }
 
@@ -995,8 +1048,14 @@ fn collect_pattern(pat: &ast::Pattern) -> EPattern {
     }
 }
 
-fn bin_op(ty: Ty, op: BinOp, a: &ast::Expr, b: &ast::Expr) -> EExpr {
-    EExpr::BinOp(ty, op, Box::new(collect_expr(a)), Box::new(collect_expr(b)))
+fn bin_op(ty: Ty, op: BinOp, a: &ast::Expr, b: &ast::Expr, sp: Option<crate::span::Span>) -> EExpr {
+    EExpr::BinOp(
+        ty,
+        op,
+        Box::new(collect_expr(a)),
+        Box::new(collect_expr(b)),
+        sp,
+    )
 }
 
 fn parse_float_text(s: &str) -> f64 {
@@ -1076,14 +1135,14 @@ include "second.abide""#,
         let env = collect_src("use A::X\nuse B::Y\nuse C::Z");
         assert_eq!(env.use_decls.len(), 3);
         // First should be A::X
-        if let (ast::UseDecl::Single { module, name, .. }, _src) = &env.use_decls[0] {
+        if let ast::UseDecl::Single { module, name, .. } = &env.use_decls[0].decl {
             assert_eq!(module, "A");
             assert_eq!(name, "X");
         } else {
             panic!("expected Single");
         }
         // Third should be C::Z
-        if let (ast::UseDecl::Single { module, name, .. }, _src) = &env.use_decls[2] {
+        if let ast::UseDecl::Single { module, name, .. } = &env.use_decls[2].decl {
             assert_eq!(module, "C");
             assert_eq!(name, "Z");
         } else {

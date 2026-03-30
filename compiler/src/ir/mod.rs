@@ -12,6 +12,11 @@ pub fn lower(result: &ElabResult) -> IRProgram {
 }
 
 /// Emit an IR program as pretty-printed JSON.
-pub fn emit_json(program: &IRProgram) -> String {
-    serde_json::to_string_pretty(program).expect("IR serialization should not fail")
+///
+/// # Errors
+///
+/// Returns an error if serde serialization fails (should not happen with
+/// well-formed IR, but handled gracefully rather than panicking).
+pub fn emit_json(program: &IRProgram) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(program)
 }

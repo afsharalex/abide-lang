@@ -169,7 +169,7 @@ pub enum EEventAction {
 /// Schedule next-block items.
 #[derive(Debug, Clone)]
 pub enum ENextItem {
-    When(EExpr, String),
+    When(Box<EExpr>, String),
     Else,
 }
 
@@ -180,6 +180,7 @@ pub struct EPred {
     pub params: Vec<(String, Ty)>,
     pub body: EExpr,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated property.
@@ -189,6 +190,7 @@ pub struct EProp {
     pub target: Option<String>,
     pub body: EExpr,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated verify block.
@@ -198,6 +200,7 @@ pub struct EVerify {
     pub targets: Vec<(String, i64, i64)>,
     pub asserts: Vec<EExpr>,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated scene.
@@ -209,6 +212,7 @@ pub struct EScene {
     pub whens: Vec<ESceneWhen>,
     pub thens: Vec<EExpr>,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +242,7 @@ pub struct ETheorem {
     pub invariants: Vec<EExpr>,
     pub shows: Vec<EExpr>,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated axiom declaration.
@@ -246,6 +251,7 @@ pub struct EAxiom {
     pub name: String,
     pub body: EExpr,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated lemma block.
@@ -254,6 +260,7 @@ pub struct ELemma {
     pub name: String,
     pub body: Vec<EExpr>,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 /// Elaborated const declaration.
@@ -272,6 +279,7 @@ pub struct EFn {
     pub ret_ty: Ty,
     pub body: EExpr,
     pub span: Option<crate::span::Span>,
+    pub file: Option<String>,
 }
 
 // ── Elaborated expressions ───────────────────────────────────────────
@@ -279,39 +287,78 @@ pub struct EFn {
 /// Type-annotated expression.
 #[derive(Debug, Clone)]
 pub enum EExpr {
-    Lit(Ty, Literal),
-    Var(Ty, String),
-    Field(Ty, Box<EExpr>, String),
-    Prime(Ty, Box<EExpr>),
-    BinOp(Ty, BinOp, Box<EExpr>, Box<EExpr>),
-    UnOp(Ty, UnOp, Box<EExpr>),
-    Call(Ty, Box<EExpr>, Vec<EExpr>),
-    CallR(Ty, Box<EExpr>, Vec<EExpr>, Vec<EExpr>),
-    Qual(Ty, String, String),
-    Quant(Ty, Quantifier, String, Ty, Box<EExpr>),
-    Always(Ty, Box<EExpr>),
-    Eventually(Ty, Box<EExpr>),
-    Assert(Ty, Box<EExpr>),
-    Assign(Ty, Box<EExpr>, Box<EExpr>),
-    NamedPair(Ty, String, Box<EExpr>),
-    Seq(Ty, Box<EExpr>, Box<EExpr>),
-    SameStep(Ty, Box<EExpr>, Box<EExpr>),
-    Let(Vec<(String, Option<Ty>, EExpr)>, Box<EExpr>),
-    Lam(Vec<(String, Ty)>, Option<Ty>, Box<EExpr>),
-    Unresolved(String),
-    TupleLit(Ty, Vec<EExpr>),
-    In(Ty, Box<EExpr>, Box<EExpr>),
-    Card(Ty, Box<EExpr>),
-    Pipe(Ty, Box<EExpr>, Box<EExpr>),
-    Match(Box<EExpr>, Vec<(EPattern, Option<EExpr>, EExpr)>),
-    MapUpdate(Ty, Box<EExpr>, Box<EExpr>, Box<EExpr>),
-    Index(Ty, Box<EExpr>, Box<EExpr>),
-    SetComp(Ty, Option<Box<EExpr>>, String, Ty, Box<EExpr>),
-    SetLit(Ty, Vec<EExpr>),
-    SeqLit(Ty, Vec<EExpr>),
-    MapLit(Ty, Vec<(EExpr, EExpr)>),
-    Sorry,
-    Todo,
+    Lit(Ty, Literal, Option<crate::span::Span>),
+    Var(Ty, String, Option<crate::span::Span>),
+    Field(Ty, Box<EExpr>, String, Option<crate::span::Span>),
+    Prime(Ty, Box<EExpr>, Option<crate::span::Span>),
+    BinOp(Ty, BinOp, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    UnOp(Ty, UnOp, Box<EExpr>, Option<crate::span::Span>),
+    Call(Ty, Box<EExpr>, Vec<EExpr>, Option<crate::span::Span>),
+    CallR(
+        Ty,
+        Box<EExpr>,
+        Vec<EExpr>,
+        Vec<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    Qual(Ty, String, String, Option<crate::span::Span>),
+    Quant(
+        Ty,
+        Quantifier,
+        String,
+        Ty,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    Always(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Eventually(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Assert(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Assign(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    NamedPair(Ty, String, Box<EExpr>, Option<crate::span::Span>),
+    Seq(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    SameStep(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    Let(
+        Vec<(String, Option<Ty>, EExpr)>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    Lam(
+        Vec<(String, Ty)>,
+        Option<Ty>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    Unresolved(String, Option<crate::span::Span>),
+    TupleLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
+    In(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    Card(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Pipe(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    Match(
+        Box<EExpr>,
+        Vec<(EPattern, Option<EExpr>, EExpr)>,
+        Option<crate::span::Span>,
+    ),
+    MapUpdate(
+        Ty,
+        Box<EExpr>,
+        Box<EExpr>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    Index(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
+    SetComp(
+        Ty,
+        Option<Box<EExpr>>,
+        String,
+        Ty,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
+    SetLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
+    SeqLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
+    MapLit(Ty, Vec<(EExpr, EExpr)>, Option<crate::span::Span>),
+    Sorry(Option<crate::span::Span>),
+    Todo(Option<crate::span::Span>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,36 +373,36 @@ impl EExpr {
     /// Get the type annotation of an expression.
     pub fn ty(&self) -> Ty {
         match self {
-            Self::Lit(ty, _)
-            | Self::Var(ty, _)
-            | Self::Field(ty, _, _)
-            | Self::Prime(ty, _)
-            | Self::BinOp(ty, _, _, _)
-            | Self::UnOp(ty, _, _)
-            | Self::Call(ty, _, _)
-            | Self::CallR(ty, _, _, _)
-            | Self::Qual(ty, _, _)
-            | Self::Quant(ty, _, _, _, _)
-            | Self::Always(ty, _)
-            | Self::Eventually(ty, _)
-            | Self::Assert(ty, _)
-            | Self::Assign(ty, _, _)
-            | Self::NamedPair(ty, _, _)
-            | Self::Seq(ty, _, _)
-            | Self::SameStep(ty, _, _)
-            | Self::TupleLit(ty, _)
-            | Self::In(ty, _, _)
-            | Self::Card(ty, _)
-            | Self::Pipe(ty, _, _)
-            | Self::MapUpdate(ty, _, _, _)
-            | Self::Index(ty, _, _)
-            | Self::SetComp(ty, _, _, _, _)
-            | Self::SetLit(ty, _)
-            | Self::SeqLit(ty, _)
-            | Self::MapLit(ty, _) => ty.clone(),
-            Self::Let(_, body) => body.ty(),
-            Self::Match(scrut, _) => scrut.ty(),
-            Self::Sorry | Self::Todo | Self::Lam(_, _, _) | Self::Unresolved(_) => {
+            Self::Lit(ty, _, _)
+            | Self::Var(ty, _, _)
+            | Self::Field(ty, _, _, _)
+            | Self::Prime(ty, _, _)
+            | Self::BinOp(ty, _, _, _, _)
+            | Self::UnOp(ty, _, _, _)
+            | Self::Call(ty, _, _, _)
+            | Self::CallR(ty, _, _, _, _)
+            | Self::Qual(ty, _, _, _)
+            | Self::Quant(ty, _, _, _, _, _)
+            | Self::Always(ty, _, _)
+            | Self::Eventually(ty, _, _)
+            | Self::Assert(ty, _, _)
+            | Self::Assign(ty, _, _, _)
+            | Self::NamedPair(ty, _, _, _)
+            | Self::Seq(ty, _, _, _)
+            | Self::SameStep(ty, _, _, _)
+            | Self::TupleLit(ty, _, _)
+            | Self::In(ty, _, _, _)
+            | Self::Card(ty, _, _)
+            | Self::Pipe(ty, _, _, _)
+            | Self::MapUpdate(ty, _, _, _, _)
+            | Self::Index(ty, _, _, _)
+            | Self::SetComp(ty, _, _, _, _, _)
+            | Self::SetLit(ty, _, _)
+            | Self::SeqLit(ty, _, _)
+            | Self::MapLit(ty, _, _) => ty.clone(),
+            Self::Let(_, body, _) => body.ty(),
+            Self::Match(scrut, _, _) => scrut.ty(),
+            Self::Sorry(_) | Self::Todo(_) | Self::Lam(_, _, _, _) | Self::Unresolved(_, _) => {
                 Ty::Unresolved(String::new())
             }
         }

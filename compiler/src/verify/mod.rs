@@ -39,21 +39,162 @@ pub enum VerificationResult {
         name: String,
         method: String,
         time_ms: u64,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
     },
     /// Property checked to a bounded depth (no counterexample found).
     Checked {
         name: String,
         depth: usize,
         time_ms: u64,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
     },
     /// Counterexample found — a trace of events that violates the property.
-    Counterexample { name: String, trace: Vec<TraceStep> },
+    Counterexample {
+        name: String,
+        trace: Vec<TraceStep>,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
     /// Scene passed — the scenario is satisfiable and assertions hold.
-    ScenePass { name: String, time_ms: u64 },
+    ScenePass {
+        name: String,
+        time_ms: u64,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
     /// Scene failed — the scenario is unsatisfiable or assertions violated.
-    SceneFail { name: String, reason: String },
+    SceneFail {
+        name: String,
+        reason: String,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
     /// Could not prove automatically — needs manual proof.
-    Unprovable { name: String, hint: String },
+    Unprovable {
+        name: String,
+        hint: String,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
+}
+
+impl VerificationResult {
+    /// Attach source location to this result (called by `verify_all` after dispatch).
+    ///
+    /// Only fills in span/file when the result doesn't already carry a more specific
+    /// location (e.g., a per-assertion span set by the internal verification function).
+    fn with_source(
+        self,
+        block_span: Option<crate::span::Span>,
+        block_file: Option<String>,
+    ) -> Self {
+        match self {
+            Self::Proved {
+                name,
+                method,
+                time_ms,
+                span,
+                file,
+            } => Self::Proved {
+                name,
+                method,
+                time_ms,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::Checked {
+                name,
+                depth,
+                time_ms,
+                span,
+                file,
+            } => Self::Checked {
+                name,
+                depth,
+                time_ms,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::Counterexample {
+                name,
+                trace,
+                span,
+                file,
+            } => Self::Counterexample {
+                name,
+                trace,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::ScenePass {
+                name,
+                time_ms,
+                span,
+                file,
+            } => Self::ScenePass {
+                name,
+                time_ms,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::SceneFail {
+                name,
+                reason,
+                span,
+                file,
+            } => Self::SceneFail {
+                name,
+                reason,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::Unprovable {
+                name,
+                hint,
+                span,
+                file,
+            } => Self::Unprovable {
+                name,
+                hint,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+        }
+    }
+
+    /// Is this a failure (counterexample, scene fail, or unprovable)?
+    pub fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Counterexample { .. } | Self::SceneFail { .. } | Self::Unprovable { .. }
+        )
+    }
+
+    /// Source span for diagnostic rendering.
+    pub fn span(&self) -> Option<crate::span::Span> {
+        match self {
+            Self::Proved { span, .. }
+            | Self::Checked { span, .. }
+            | Self::Counterexample { span, .. }
+            | Self::ScenePass { span, .. }
+            | Self::SceneFail { span, .. }
+            | Self::Unprovable { span, .. } => *span,
+        }
+    }
+
+    /// Source file for diagnostic rendering.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::Proved { file, .. }
+            | Self::Checked { file, .. }
+            | Self::Counterexample { file, .. }
+            | Self::ScenePass { file, .. }
+            | Self::SceneFail { file, .. }
+            | Self::Unprovable { file, .. } => file.as_deref(),
+        }
+    }
 }
 
 /// A single step in a counterexample trace.
@@ -111,7 +252,8 @@ impl Default for VerifyConfig {
 ///
 /// Processes verify blocks (tiered: induction → IC3 → BMC), scene blocks (SAT),
 /// and theorem blocks (IC3 → induction).
-/// Returns one result per target.
+/// Returns one result per target, each carrying source location for diagnostic rendering.
+#[allow(clippy::too_many_lines)]
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
     let defs = defenv::DefEnv::from_ir(ir);
@@ -121,7 +263,8 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Checking {}...", verify_block.name);
         }
-        let result = check_verify_block_tiered(ir, &vctx, &defs, verify_block, config);
+        let result = check_verify_block_tiered(ir, &vctx, &defs, verify_block, config)
+            .with_source(verify_block.span, verify_block.file.clone());
         if config.progress {
             eprintln!(" done");
         }
@@ -132,7 +275,8 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Checking scene {}...", scene_block.name);
         }
-        let result = check_scene_block(ir, &vctx, &defs, scene_block);
+        let result = check_scene_block(ir, &vctx, &defs, scene_block)
+            .with_source(scene_block.span, scene_block.file.clone());
         if config.progress {
             eprintln!(" done");
         }
@@ -143,7 +287,8 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Proving {}...", theorem_block.name);
         }
-        let result = check_theorem_block(ir, &vctx, &defs, theorem_block, config);
+        let result = check_theorem_block(ir, &vctx, &defs, theorem_block, config)
+            .with_source(theorem_block.span, theorem_block.file.clone());
         if config.progress {
             eprintln!(" done");
         }
@@ -188,13 +333,18 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
                 continue;
             };
             if func.ty != IRType::Bool {
-                results.push(VerificationResult::Unprovable {
-                    name: format!("prop_{}", func.name),
-                    hint: format!(
-                        "internal error: prop `{}` has non-Bool return type {:?}",
-                        func.name, func.ty
-                    ),
-                });
+                results.push(
+                    VerificationResult::Unprovable {
+                        name: format!("prop_{}", func.name),
+                        hint: format!(
+                            "internal error: prop `{}` has non-Bool return type {:?}",
+                            func.name, func.ty
+                        ),
+                        span: None,
+                        file: None,
+                    }
+                    .with_source(func.span, func.file.clone()),
+                );
                 continue;
             }
             if covered.contains(&func.name) {
@@ -207,13 +357,17 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
                 invariants: vec![],
                 shows: vec![IRExpr::Always {
                     body: Box::new(func.body.clone()),
+                    span: None,
                 }],
+                span: func.span,
+                file: func.file.clone(),
             };
 
             if config.progress {
                 eprint!("Verifying prop {}...", func.name);
             }
-            let result = check_theorem_block(ir, &vctx, &defs, &synthetic_theorem, config);
+            let result = check_theorem_block(ir, &vctx, &defs, &synthetic_theorem, config)
+                .with_source(func.span, func.file.clone());
             if config.progress {
                 eprintln!(" done");
             }
@@ -228,6 +382,36 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
 #[allow(clippy::cast_possible_truncation)]
 fn elapsed_ms(start: &Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// Extract the source span from an `IRExpr` (top-level only).
+fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
+    match e {
+        IRExpr::Lit { span, .. }
+        | IRExpr::Var { span, .. }
+        | IRExpr::Ctor { span, .. }
+        | IRExpr::BinOp { span, .. }
+        | IRExpr::UnOp { span, .. }
+        | IRExpr::App { span, .. }
+        | IRExpr::Lam { span, .. }
+        | IRExpr::Let { span, .. }
+        | IRExpr::Forall { span, .. }
+        | IRExpr::Exists { span, .. }
+        | IRExpr::Field { span, .. }
+        | IRExpr::Prime { span, .. }
+        | IRExpr::Always { span, .. }
+        | IRExpr::Eventually { span, .. }
+        | IRExpr::Match { span, .. }
+        | IRExpr::MapUpdate { span, .. }
+        | IRExpr::Index { span, .. }
+        | IRExpr::SetLit { span, .. }
+        | IRExpr::SeqLit { span, .. }
+        | IRExpr::MapLit { span, .. }
+        | IRExpr::SetComp { span, .. }
+        | IRExpr::Card { span, .. }
+        | IRExpr::Sorry { span, .. }
+        | IRExpr::Todo { span, .. } => *span,
+    }
 }
 
 /// Collect top-level definition names referenced in expressions.
@@ -309,13 +493,13 @@ fn collect_def_refs_inner(expr: &IRExpr, bound: &HashSet<String>, refs: &mut Has
         }
         IRExpr::UnOp { operand, .. }
         | IRExpr::Field { expr: operand, .. }
-        | IRExpr::Prime { expr: operand }
-        | IRExpr::Always { body: operand }
-        | IRExpr::Eventually { body: operand }
-        | IRExpr::Card { expr: operand } => {
+        | IRExpr::Prime { expr: operand, .. }
+        | IRExpr::Always { body: operand, .. }
+        | IRExpr::Eventually { body: operand, .. }
+        | IRExpr::Card { expr: operand, .. } => {
             collect_def_refs_inner(operand, bound, refs);
         }
-        IRExpr::Let { bindings, body } => {
+        IRExpr::Let { bindings, body, .. } => {
             let mut inner_bound = bound.clone();
             for b in bindings {
                 // Binding RHS is evaluated in the outer scope
@@ -324,7 +508,9 @@ fn collect_def_refs_inner(expr: &IRExpr, bound: &HashSet<String>, refs: &mut Has
             }
             collect_def_refs_inner(body, &inner_bound, refs);
         }
-        IRExpr::Match { scrutinee, arms } => {
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
             collect_def_refs_inner(scrutinee, bound, refs);
             for arm in arms {
                 let mut arm_bound = bound.clone();
@@ -412,15 +598,17 @@ fn check_verify_block_tiered(
     // Tier 2: Bounded model checking (unless unbounded-only)
     if config.unbounded_only {
         let techniques = if has_liveness {
-            "induction not applicable (liveness)".to_owned()
+            crate::messages::TIERED_LIVENESS_SKIP.to_owned()
         } else if config.no_ic3 {
-            "induction failed (IC3 skipped via --no-ic3)".to_owned()
+            crate::messages::TIERED_NO_IC3.to_owned()
         } else {
-            "induction and IC3 failed".to_owned()
+            crate::messages::TIERED_BOTH_FAILED.to_owned()
         };
         return VerificationResult::Unprovable {
             name: verify_block.name.clone(),
             hint: format!("{techniques}, and --unbounded-only was specified"),
+            span: None,
+            file: None,
         };
     }
 
@@ -510,7 +698,7 @@ fn try_induction_on_verify(
         .asserts
         .iter()
         .map(|a| match a {
-            IRExpr::Always { body } => body.as_ref(),
+            IRExpr::Always { body, .. } => body.as_ref(),
             other => other,
         })
         .collect();
@@ -560,7 +748,9 @@ fn try_induction_on_verify(
 
         let mut negated = Vec::new();
         for expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, expr, 0);
+            let Ok(prop) = encode_property_at_step(&pool, vctx, defs, expr, 0) else {
+                return None;
+            };
             negated.push(prop.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -586,7 +776,9 @@ fn try_induction_on_verify(
 
         // Assume P at step 0
         for expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, expr, 0);
+            let Ok(prop) = encode_property_at_step(&pool, vctx, defs, expr, 0) else {
+                return None;
+            };
             solver.assert(&prop);
         }
 
@@ -597,7 +789,9 @@ fn try_induction_on_verify(
         // Assert NOT P at step 1
         let mut negated = Vec::new();
         for expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, expr, 1);
+            let Ok(prop) = encode_property_at_step(&pool, vctx, defs, expr, 1) else {
+                return None;
+            };
             negated.push(prop.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -617,6 +811,8 @@ fn try_induction_on_verify(
         name: verify_block.name.clone(),
         method: "1-induction".to_owned(),
         time_ms: elapsed,
+        span: None,
+        file: None,
     })
 }
 
@@ -718,6 +914,8 @@ fn try_ic3_on_verify(
         name: verify_block.name.clone(),
         method: "IC3/PDR".to_owned(),
         time_ms: elapsed,
+        span: None,
+        file: None,
     })
 }
 
@@ -776,6 +974,8 @@ fn check_verify_block(
             name: verify_block.name.clone(),
             depth: bound,
             time_ms: elapsed,
+            span: None,
+            file: None,
         };
     }
 
@@ -828,6 +1028,8 @@ fn check_verify_block(
             return VerificationResult::Unprovable {
                 name: verify_block.name.clone(),
                 hint: format!("unsupported expression kind in verify assert: {kind}"),
+                span: expr_span(assert_expr),
+                file: None,
             };
         }
     }
@@ -841,6 +1043,8 @@ fn check_verify_block(
                         "unsupported expression in {}.{} guard: {kind}",
                         entity.name, trans.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
             for upd in &trans.updates {
@@ -851,6 +1055,8 @@ fn check_verify_block(
                             "unsupported expression in {}.{} update of {}: {kind}",
                             entity.name, trans.name, upd.field
                         ),
+                        span: None,
+                        file: None,
                     };
                 }
             }
@@ -866,6 +1072,8 @@ fn check_verify_block(
                         "unsupported expression in {}.{} event guard: {kind}",
                         sys.name, event.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
             if let Some(kind) = find_unsupported_in_actions(&event.body) {
@@ -875,6 +1083,8 @@ fn check_verify_block(
                         "unsupported expression in {}.{} event body: {kind}",
                         sys.name, event.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -917,7 +1127,17 @@ fn check_verify_block(
     // If UNSAT → property holds at all steps (CHECKED).
     // If SAT → counterexample found.
     let property_at_all_steps =
-        encode_verify_properties(&pool, vctx, defs, &verify_block.asserts, bound);
+        match encode_verify_properties(&pool, vctx, defs, &verify_block.asserts, bound) {
+            Ok(prop) => prop,
+            Err(msg) => {
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: format!("encoding error: {msg}"),
+                    span: None,
+                    file: None,
+                };
+            }
+        };
 
     // Negate the conjunction of all properties across all steps
     solver.assert(property_at_all_steps.not());
@@ -930,12 +1150,23 @@ fn check_verify_block(
             name: verify_block.name.clone(),
             depth: bound,
             time_ms: elapsed,
+            span: None,
+            file: None,
         },
         z3::SatResult::Sat => {
             let trace = extract_counterexample(&solver, &pool, &relevant_entities, bound);
+            // Use the first assert's span when there's only one (common case).
+            // For multi-assert blocks, with_source fills in the block span.
+            let assert_span = if verify_block.asserts.len() == 1 {
+                expr_span(&verify_block.asserts[0])
+            } else {
+                None
+            };
             VerificationResult::Counterexample {
                 name: verify_block.name.clone(),
                 trace,
+                span: assert_span,
+                file: None,
             }
         }
         z3::SatResult::Unknown => {
@@ -949,11 +1180,13 @@ fn check_verify_block(
                     "Z3 timed out after {timeout_display} — try reducing bound, increasing --bmc-timeout, or simplifying property"
                 )
             } else {
-                "Z3 returned unknown — try reducing bound or simplifying property".to_owned()
+                crate::messages::BMC_UNKNOWN.to_owned()
             };
             VerificationResult::Unprovable {
                 name: verify_block.name.clone(),
                 hint,
+                span: None,
+                file: None,
             }
         }
     }
@@ -1027,7 +1260,9 @@ fn check_scene_block(
     if scope.is_empty() {
         return VerificationResult::SceneFail {
             name: scene.name.clone(),
-            reason: "no systems or entities found".to_owned(),
+            reason: crate::messages::SCENE_EMPTY_SCOPE.to_owned(),
+            span: None,
+            file: None,
         };
     }
 
@@ -1071,6 +1306,8 @@ fn check_scene_block(
                     "unsupported expression kind in scene given for {}: {kind}",
                     given.var
                 ),
+                span: None,
+                file: None,
             };
         }
     }
@@ -1087,7 +1324,21 @@ fn check_scene_block(
 
         // Encode the given constraint on this slot's fields at step 0
         let given_ctx = PropertyCtx::new().with_binding(&given.var, &given.entity, current_slot);
-        let constraint = encode_prop_expr(&pool, vctx, defs, &given_ctx, &given.constraint, 0);
+        let constraint = match encode_prop_expr(&pool, vctx, defs, &given_ctx, &given.constraint, 0)
+        {
+            Ok(c) => c,
+            Err(msg) => {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: format!(
+                        "encoding error in given constraint for {}: {msg}",
+                        given.var
+                    ),
+                    span: None,
+                    file: None,
+                };
+            }
+        };
         solver.assert(&constraint);
 
         // Apply entity defaults for fields NOT explicitly constrained by the given block.
@@ -1158,6 +1409,8 @@ fn check_scene_block(
                          only {{one}} is supported",
                         scene_event.system, scene_event.event
                     ),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1173,6 +1426,8 @@ fn check_scene_block(
             return VerificationResult::SceneFail {
                 name: scene.name.clone(),
                 reason: format!("unsupported expression kind in scene then assertion: {kind}"),
+                span: expr_span(assertion),
+                file: None,
             };
         }
     }
@@ -1201,6 +1456,8 @@ fn check_scene_block(
                     "system {} not found for event {}",
                     scene_event.system, scene_event.event
                 ),
+                span: None,
+                file: None,
             };
         };
         let Some(event) = sys.events.iter().find(|e| e.name == scene_event.event) else {
@@ -1210,6 +1467,8 @@ fn check_scene_block(
                     "event {} not found in system {}",
                     scene_event.event, scene_event.system
                 ),
+                span: None,
+                file: None,
             };
         };
 
@@ -1224,6 +1483,8 @@ fn check_scene_block(
                     scene_event.event,
                     event.params.len()
                 ),
+                span: None,
+                file: None,
             };
         }
 
@@ -1235,6 +1496,8 @@ fn check_scene_block(
                         "unsupported expression kind in scene event arg for {}::{}: {kind}",
                         scene_event.system, scene_event.event
                     ),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1243,6 +1506,8 @@ fn check_scene_block(
             return VerificationResult::SceneFail {
                 name: scene.name.clone(),
                 reason,
+                span: None,
+                file: None,
             };
         }
 
@@ -1254,6 +1519,8 @@ fn check_scene_block(
                     "unsupported action in scene event {}::{}: {kind}",
                     scene_event.system, scene_event.event
                 ),
+                span: None,
+                file: None,
             };
         }
 
@@ -1266,7 +1533,20 @@ fn check_scene_block(
                 .fold(arg_ctx, |ctx, (var, (ent, slot))| {
                     ctx.with_binding(var, ent, *slot)
                 });
-            let val = encode_prop_value(&pool, vctx, defs, &arg_ctx, arg, step);
+            let val = match encode_prop_value(&pool, vctx, defs, &arg_ctx, arg, step) {
+                Ok(v) => v,
+                Err(msg) => {
+                    return VerificationResult::SceneFail {
+                        name: scene.name.clone(),
+                        reason: format!(
+                            "encoding error in scene event arg for {}::{}: {msg}",
+                            scene_event.system, scene_event.event
+                        ),
+                        span: None,
+                        file: None,
+                    };
+                }
+            };
             override_params.insert(param.name.clone(), val);
         }
 
@@ -1317,7 +1597,17 @@ fn check_scene_block(
     }
 
     for assertion in &scene.assertions {
-        let prop = encode_prop_expr(&pool, vctx, defs, &then_ctx, assertion, final_step);
+        let prop = match encode_prop_expr(&pool, vctx, defs, &then_ctx, assertion, final_step) {
+            Ok(p) => p,
+            Err(msg) => {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: format!("encoding error in then assertion: {msg}"),
+                    span: expr_span(assertion),
+                    file: None,
+                };
+            }
+        };
         solver.assert(&prop);
     }
 
@@ -1328,14 +1618,20 @@ fn check_scene_block(
         z3::SatResult::Sat => VerificationResult::ScenePass {
             name: scene.name.clone(),
             time_ms: elapsed,
+            span: None,
+            file: None,
         },
         z3::SatResult::Unsat => VerificationResult::SceneFail {
             name: scene.name.clone(),
-            reason: "scenario is unsatisfiable — no execution matches given+when+then".to_owned(),
+            reason: crate::messages::SCENE_UNSATISFIABLE.to_owned(),
+            span: None,
+            file: None,
         },
         z3::SatResult::Unknown => VerificationResult::SceneFail {
             name: scene.name.clone(),
-            reason: "Z3 returned unknown".to_owned(),
+            reason: crate::messages::SCENE_UNKNOWN.to_owned(),
+            span: None,
+            file: None,
         },
     }
 }
@@ -1420,7 +1716,9 @@ fn check_theorem_block(
     if scope.is_empty() {
         return VerificationResult::Unprovable {
             name: theorem.name.clone(),
-            hint: "no systems or entities found for theorem".to_owned(),
+            hint: crate::messages::VERIFY_EMPTY_SCOPE.to_owned(),
+            span: None,
+            file: None,
         };
     }
 
@@ -1434,6 +1732,8 @@ fn check_theorem_block(
                      of systems {:?} — quantifier would be vacuous",
                     theorem.systems
                 ),
+                span: None,
+                file: None,
             };
         }
     }
@@ -1457,34 +1757,35 @@ fn check_theorem_block(
     let mut show_exprs: Vec<&IRExpr> = Vec::new();
     for s in &theorem.shows {
         match s {
-            IRExpr::Always { body } => show_exprs.push(body.as_ref()),
+            IRExpr::Always { body, .. } => show_exprs.push(body.as_ref()),
             _ => show_exprs.push(s),
         }
     }
 
     // Check for `eventually` in show expressions — induction cannot prove liveness.
     // Expand through DefEnv first so pred/prop bodies with `eventually` are detected.
-    for show_expr in &show_exprs {
+    for (i, show_expr) in show_exprs.iter().enumerate() {
         let expanded = expand_through_defs(show_expr, defs);
         if contains_eventually(&expanded) {
             return VerificationResult::Unprovable {
                 name: theorem.name.clone(),
-                hint: "theorem contains `eventually` (possibly in a referenced pred/prop) — \
-                       liveness properties cannot be proved by induction; \
-                       use bounded model checking (verify block) instead"
-                    .to_owned(),
+                hint: crate::messages::THEOREM_LIVENESS_UNSUPPORTED.to_owned(),
+                span: expr_span(theorem.shows.get(i).unwrap_or(show_expr)),
+                file: None,
             };
         }
     }
 
     // Pre-validate: reject unsupported expression forms that would panic during encoding.
     // Expand through DefEnv first — a pred body might contain unsupported forms.
-    for show_expr in &show_exprs {
+    for (i, show_expr) in show_exprs.iter().enumerate() {
         let expanded = expand_through_defs(show_expr, defs);
         if let Some(kind) = find_unsupported_scene_expr(&expanded) {
             return VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: format!("unsupported expression kind in theorem show: {kind}"),
+                span: expr_span(theorem.shows.get(i).unwrap_or(show_expr)),
+                file: None,
             };
         }
     }
@@ -1494,6 +1795,8 @@ fn check_theorem_block(
             return VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: format!("unsupported expression kind in theorem invariant: {kind}"),
+                span: expr_span(inv_expr),
+                file: None,
             };
         }
     }
@@ -1507,6 +1810,8 @@ fn check_theorem_block(
                         "unsupported expression in {}.{} guard: {kind}",
                         entity.name, trans.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
             for upd in &trans.updates {
@@ -1517,6 +1822,8 @@ fn check_theorem_block(
                             "unsupported expression in {}.{} update of {}: {kind}",
                             entity.name, trans.name, upd.field
                         ),
+                        span: None,
+                        file: None,
                     };
                 }
             }
@@ -1531,6 +1838,8 @@ fn check_theorem_block(
                         "unsupported expression in {}.{} event guard: {kind}",
                         sys.name, event.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
             if let Some(kind) = find_unsupported_in_actions(&event.body) {
@@ -1540,6 +1849,8 @@ fn check_theorem_block(
                         "unsupported expression in {}.{} event body: {kind}",
                         sys.name, event.name
                     ),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1552,6 +1863,8 @@ fn check_theorem_block(
             hint: "--bounded-only was specified — theorems require unbounded proof \
                    (induction or IC3), not bounded model checking"
                 .to_owned(),
+            span: None,
+            file: None,
         };
     }
 
@@ -1582,7 +1895,17 @@ fn check_theorem_block(
         // Assert NOT I at step 0 — if UNSAT, invariants hold initially
         let mut negated = Vec::new();
         for inv_expr in &theorem.invariants {
-            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            let inv = match encode_property_at_step(&pool, vctx, defs, inv_expr, 0) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in invariant: {msg}"),
+                        span: expr_span(inv_expr),
+                        file: None,
+                    };
+                }
+            };
             negated.push(inv.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -1598,12 +1921,16 @@ fn check_theorem_block(
                     hint: "invariant does not hold at initial state — \
                            check that invariants are valid for the empty/initial configuration"
                         .to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
             z3::SatResult::Unknown => {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
-                    hint: "Z3 returned unknown when checking invariant base case".to_owned(),
+                    hint: crate::messages::THEOREM_INV_BASE_UNKNOWN.to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1624,7 +1951,17 @@ fn check_theorem_block(
 
         // Assume I at step 0
         for inv_expr in &theorem.invariants {
-            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            let inv = match encode_property_at_step(&pool, vctx, defs, inv_expr, 0) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in invariant: {msg}"),
+                        span: expr_span(inv_expr),
+                        file: None,
+                    };
+                }
+            };
             solver.assert(&inv);
         }
 
@@ -1634,7 +1971,17 @@ fn check_theorem_block(
         // Assert NOT I at step 1
         let mut negated = Vec::new();
         for inv_expr in &theorem.invariants {
-            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 1);
+            let inv = match encode_property_at_step(&pool, vctx, defs, inv_expr, 1) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in invariant: {msg}"),
+                        span: expr_span(inv_expr),
+                        file: None,
+                    };
+                }
+            };
             negated.push(inv.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -1650,12 +1997,16 @@ fn check_theorem_block(
                     hint: "invariant is not preserved by transitions — \
                            the invariant itself is not inductive"
                         .to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
             z3::SatResult::Unknown => {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
-                    hint: "Z3 returned unknown when checking invariant step case".to_owned(),
+                    hint: crate::messages::THEOREM_INV_STEP_UNKNOWN.to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1679,7 +2030,17 @@ fn check_theorem_block(
         // Assert NOT P at step 0 — if UNSAT, P holds at initial state
         let mut negated = Vec::new();
         for show_expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 0);
+            let prop = match encode_property_at_step(&pool, vctx, defs, show_expr, 0) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in show expression: {msg}"),
+                        span: None,
+                        file: None,
+                    };
+                }
+            };
             negated.push(prop.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -1692,13 +2053,17 @@ fn check_theorem_block(
             z3::SatResult::Sat => {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
-                    hint: "base case failed — property does not hold at initial state".to_owned(),
+                    hint: crate::messages::THEOREM_BASE_FAILED.to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
             z3::SatResult::Unknown => {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
-                    hint: "Z3 returned unknown when checking base case".to_owned(),
+                    hint: crate::messages::THEOREM_BASE_UNKNOWN.to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1718,13 +2083,33 @@ fn check_theorem_block(
 
         // Assume invariants at step 0
         for inv_expr in &theorem.invariants {
-            let inv = encode_property_at_step(&pool, vctx, defs, inv_expr, 0);
+            let inv = match encode_property_at_step(&pool, vctx, defs, inv_expr, 0) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in invariant: {msg}"),
+                        span: expr_span(inv_expr),
+                        file: None,
+                    };
+                }
+            };
             solver.assert(&inv);
         }
 
         // Assume P at step 0
         for show_expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 0);
+            let prop = match encode_property_at_step(&pool, vctx, defs, show_expr, 0) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in show expression: {msg}"),
+                        span: None,
+                        file: None,
+                    };
+                }
+            };
             solver.assert(&prop);
         }
 
@@ -1735,7 +2120,17 @@ fn check_theorem_block(
         // Assert NOT P at step 1
         let mut negated = Vec::new();
         for show_expr in &show_exprs {
-            let prop = encode_property_at_step(&pool, vctx, defs, show_expr, 1);
+            let prop = match encode_property_at_step(&pool, vctx, defs, show_expr, 1) {
+                Ok(p) => p,
+                Err(msg) => {
+                    return VerificationResult::Unprovable {
+                        name: theorem.name.clone(),
+                        hint: format!("encoding error in show expression: {msg}"),
+                        span: None,
+                        file: None,
+                    };
+                }
+            };
             negated.push(prop.not());
         }
         let neg_refs: Vec<&Bool> = negated.iter().collect();
@@ -1750,12 +2145,16 @@ fn check_theorem_block(
                     name: theorem.name.clone(),
                     hint: "inductive step failed — property is not preserved by transitions"
                         .to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
             z3::SatResult::Unknown => {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
-                    hint: "Z3 returned unknown when checking inductive step".to_owned(),
+                    hint: crate::messages::THEOREM_STEP_UNKNOWN.to_owned(),
+                    span: None,
+                    file: None,
                 };
             }
         }
@@ -1776,6 +2175,8 @@ fn check_theorem_block(
         name: theorem.name.clone(),
         method,
         time_ms: elapsed,
+        span: None,
+        file: None,
     }
 }
 
@@ -1863,6 +2264,8 @@ fn try_ic3_on_theorem(
                 return Some(VerificationResult::Counterexample {
                     name: theorem.name.clone(),
                     trace: ic3_trace_to_trace_steps(&trace),
+                    span: None,
+                    file: None,
                 });
             }
             ic3::Ic3Result::Violated(_) | ic3::Ic3Result::Unknown(_) => return None,
@@ -1874,6 +2277,8 @@ fn try_ic3_on_theorem(
         name: theorem.name.clone(),
         method: "IC3/PDR".to_owned(),
         time_ms: elapsed,
+        span: None,
+        file: None,
     })
 }
 
@@ -1918,10 +2323,10 @@ impl PropertyCtx {
 fn contains_eventually(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Eventually { .. } => true,
-        IRExpr::Always { body }
+        IRExpr::Always { body, .. }
         | IRExpr::UnOp { operand: body, .. }
         | IRExpr::Field { expr: body, .. }
-        | IRExpr::Prime { expr: body } => contains_eventually(body),
+        | IRExpr::Prime { expr: body, .. } => contains_eventually(body),
         IRExpr::BinOp { left, right, .. }
         | IRExpr::App {
             func: left,
@@ -1973,10 +2378,10 @@ fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) 
         }
         IRExpr::UnOp { operand, .. }
         | IRExpr::Field { expr: operand, .. }
-        | IRExpr::Prime { expr: operand }
-        | IRExpr::Card { expr: operand }
-        | IRExpr::Always { body: operand }
-        | IRExpr::Eventually { body: operand } => {
+        | IRExpr::Prime { expr: operand, .. }
+        | IRExpr::Card { expr: operand, .. }
+        | IRExpr::Always { body: operand, .. }
+        | IRExpr::Eventually { body: operand, .. } => {
             count_entity_quantifiers(operand, counts);
         }
         IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
@@ -2102,51 +2507,68 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
             left,
             right,
             ty,
+            ..
         } => IRExpr::BinOp {
             op: op.clone(),
             left: Box::new(expand_through_defs(left, defs)),
             right: Box::new(expand_through_defs(right, defs)),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::UnOp { op, operand, ty } => IRExpr::UnOp {
+        IRExpr::UnOp {
+            op, operand, ty, ..
+        } => IRExpr::UnOp {
             op: op.clone(),
             operand: Box::new(expand_through_defs(operand, defs)),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::Forall { var, domain, body } => IRExpr::Forall {
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => IRExpr::Forall {
             var: var.clone(),
             domain: domain.clone(),
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
-        IRExpr::Exists { var, domain, body } => IRExpr::Exists {
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => IRExpr::Exists {
             var: var.clone(),
             domain: domain.clone(),
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
-        IRExpr::Always { body } => IRExpr::Always {
+        IRExpr::Always { body, .. } => IRExpr::Always {
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
-        IRExpr::Eventually { body } => IRExpr::Eventually {
+        IRExpr::Eventually { body, .. } => IRExpr::Eventually {
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
         IRExpr::Field {
             expr: inner,
             field,
             ty,
+            ..
         } => IRExpr::Field {
             expr: Box::new(expand_through_defs(inner, defs)),
             field: field.clone(),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::Prime { expr: inner } => IRExpr::Prime {
+        IRExpr::Prime { expr: inner, .. } => IRExpr::Prime {
             expr: Box::new(expand_through_defs(inner, defs)),
+            span: None,
         },
-        IRExpr::App { func, arg, ty } => IRExpr::App {
+        IRExpr::App { func, arg, ty, .. } => IRExpr::App {
             func: Box::new(expand_through_defs(func, defs)),
             arg: Box::new(expand_through_defs(arg, defs)),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::Let { bindings, body } => IRExpr::Let {
+        IRExpr::Let { bindings, body, .. } => IRExpr::Let {
             bindings: bindings
                 .iter()
                 .map(|b| crate::ir::types::LetBinding {
@@ -2156,17 +2578,22 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
                 })
                 .collect(),
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
         IRExpr::Lam {
             param,
             param_type,
             body,
+            ..
         } => IRExpr::Lam {
             param: param.clone(),
             param_type: param_type.clone(),
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
         },
-        IRExpr::Match { scrutinee, arms } => IRExpr::Match {
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => IRExpr::Match {
             scrutinee: Box::new(expand_through_defs(scrutinee, defs)),
             arms: arms
                 .iter()
@@ -2176,25 +2603,30 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
                     body: expand_through_defs(&arm.body, defs),
                 })
                 .collect(),
+            span: None,
         },
         IRExpr::MapUpdate {
             map,
             key,
             value,
             ty,
+            ..
         } => IRExpr::MapUpdate {
             map: Box::new(expand_through_defs(map, defs)),
             key: Box::new(expand_through_defs(key, defs)),
             value: Box::new(expand_through_defs(value, defs)),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::Index { map, key, ty } => IRExpr::Index {
+        IRExpr::Index { map, key, ty, .. } => IRExpr::Index {
             map: Box::new(expand_through_defs(map, defs)),
             key: Box::new(expand_through_defs(key, defs)),
             ty: ty.clone(),
+            span: None,
         },
-        IRExpr::Card { expr: inner } => IRExpr::Card {
+        IRExpr::Card { expr: inner, .. } => IRExpr::Card {
             expr: Box::new(expand_through_defs(inner, defs)),
+            span: None,
         },
         IRExpr::SetComp {
             var,
@@ -2202,6 +2634,7 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
             filter,
             projection,
             ty,
+            ..
         } => IRExpr::SetComp {
             var: var.clone(),
             domain: domain.clone(),
@@ -2210,6 +2643,7 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
                 .as_ref()
                 .map(|p| Box::new(expand_through_defs(p, defs))),
             ty: ty.clone(),
+            span: None,
         },
         _ => expr.clone(),
     }
@@ -2289,9 +2723,9 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
             })
         }
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
-        IRExpr::Sorry => Some("Sorry"),
-        IRExpr::Todo => Some("Todo"),
-        IRExpr::Card { expr } => match expr.as_ref() {
+        IRExpr::Sorry { .. } => Some("Sorry"),
+        IRExpr::Todo { .. } => Some("Todo"),
+        IRExpr::Card { expr, .. } => match expr.as_ref() {
             // Compile-time literal cardinality — always supported
             IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => None,
             // Entity-domain set comprehension — bounded sum over slots
@@ -2310,15 +2744,20 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
         },
         IRExpr::Field { expr, .. }
         | IRExpr::UnOp { operand: expr, .. }
-        | IRExpr::Prime { expr }
-        | IRExpr::Always { body: expr }
-        | IRExpr::Eventually { body: expr } => find_unsupported_scene_expr(expr),
-        IRExpr::BinOp { left, right, .. }
-        | IRExpr::App {
-            func: left,
-            arg: right,
-            ..
-        } => find_unsupported_scene_expr(left).or_else(|| find_unsupported_scene_expr(right)),
+        | IRExpr::Prime { expr, .. }
+        | IRExpr::Always { body: expr, .. }
+        | IRExpr::Eventually { body: expr, .. } => find_unsupported_scene_expr(expr),
+        IRExpr::BinOp { left, right, .. } => {
+            find_unsupported_scene_expr(left).or_else(|| find_unsupported_scene_expr(right))
+        }
+        IRExpr::App { func, arg, .. } => {
+            // After def expansion, remaining App(Var(name), ...) means an
+            // unresolvable function call that can't be encoded in Z3.
+            if matches!(func.as_ref(), IRExpr::Var { .. }) {
+                return Some(crate::messages::PRECHECK_UNRESOLVED_FN);
+            }
+            find_unsupported_scene_expr(func).or_else(|| find_unsupported_scene_expr(arg))
+        }
         IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
             find_unsupported_scene_expr(body)
         }
@@ -2445,23 +2884,23 @@ fn encode_verify_properties(
     defs: &defenv::DefEnv,
     asserts: &[IRExpr],
     bound: usize,
-) -> Bool {
+) -> Result<Bool, String> {
     let mut all_props = Vec::new();
 
     for assert_expr in asserts {
         match assert_expr {
             // `always P` — check P at every step
-            IRExpr::Always { body } => {
+            IRExpr::Always { body, .. } => {
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, defs, body, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, body, step)?;
                     all_props.push(prop);
                 }
             }
             // `eventually P` — check P at some step (disjunction)
-            IRExpr::Eventually { body } => {
+            IRExpr::Eventually { body, .. } => {
                 let mut step_props = Vec::new();
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, defs, body, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, body, step)?;
                     step_props.push(prop);
                 }
                 let refs: Vec<&Bool> = step_props.iter().collect();
@@ -2472,7 +2911,7 @@ fn encode_verify_properties(
             // Plain assertion — check at every step
             other => {
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, defs, other, step);
+                    let prop = encode_property_at_step(pool, vctx, defs, other, step)?;
                     all_props.push(prop);
                 }
             }
@@ -2480,11 +2919,11 @@ fn encode_verify_properties(
     }
 
     if all_props.is_empty() {
-        return Bool::from_bool(true);
+        return Ok(Bool::from_bool(true));
     }
 
     let refs: Vec<&Bool> = all_props.iter().collect();
-    Bool::and(&refs)
+    Ok(Bool::and(&refs))
 }
 
 /// Encode a property expression at a specific BMC step.
@@ -2497,7 +2936,7 @@ fn encode_property_at_step(
     defs: &defenv::DefEnv,
     expr: &IRExpr,
     step: usize,
-) -> Bool {
+) -> Result<Bool, String> {
     let ctx = PropertyCtx::new();
     encode_prop_expr(pool, vctx, defs, &ctx, expr, step)
 }
@@ -2515,7 +2954,7 @@ fn encode_prop_expr(
     ctx: &PropertyCtx,
     expr: &IRExpr,
     step: usize,
-) -> Bool {
+) -> Result<Bool, String> {
     // Try def expansion — but only if the name is NOT shadowed by a local binding
     // (quantifier-bound variables take precedence over definitions).
     if let IRExpr::Var { name, .. } = expr {
@@ -2537,88 +2976,90 @@ fn encode_prop_expr(
             var,
             domain: crate::ir::types::IRType::Entity { name: entity_name },
             body,
+            ..
         } => {
             let n_slots = pool.slots_for(entity_name);
             let mut conjuncts = Vec::new();
             for slot in 0..n_slots {
                 let active = pool.active_at(entity_name, slot, step);
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
                 if let Some(SmtValue::Bool(act)) = active {
                     // active => P(slot)
                     conjuncts.push(act.implies(&body_val));
                 }
             }
             if conjuncts.is_empty() {
-                return Bool::from_bool(true);
+                return Ok(Bool::from_bool(true));
             }
             let refs: Vec<&Bool> = conjuncts.iter().collect();
-            Bool::and(&refs)
+            Ok(Bool::and(&refs))
         }
         // `exists x: Entity | P(x)` — disjunction over active slots
         IRExpr::Exists {
             var,
             domain: crate::ir::types::IRType::Entity { name: entity_name },
             body,
+            ..
         } => {
             let n_slots = pool.slots_for(entity_name);
             let mut disjuncts = Vec::new();
             for slot in 0..n_slots {
                 let active = pool.active_at(entity_name, slot, step);
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
                 if let Some(SmtValue::Bool(act)) = active {
                     // active AND P(slot)
                     disjuncts.push(Bool::and(&[act, &body_val]));
                 }
             }
             if disjuncts.is_empty() {
-                return Bool::from_bool(false);
+                return Ok(Bool::from_bool(false));
             }
             let refs: Vec<&Bool> = disjuncts.iter().collect();
-            Bool::or(&refs)
+            Ok(Bool::or(&refs))
         }
         // Boolean connectives — recurse
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" || op == "OpXor" => {
-            let l = encode_prop_expr(pool, vctx, defs, ctx, left, step);
-            let r = encode_prop_expr(pool, vctx, defs, ctx, right, step);
+            let l = encode_prop_expr(pool, vctx, defs, ctx, left, step)?;
+            let r = encode_prop_expr(pool, vctx, defs, ctx, right, step)?;
             match op.as_str() {
-                "OpAnd" => Bool::and(&[&l, &r]),
-                "OpOr" => Bool::or(&[&l, &r]),
-                "OpImplies" => l.implies(&r),
-                "OpXor" => Bool::xor(&l, &r),
-                _ => unreachable!(),
+                "OpAnd" => Ok(Bool::and(&[&l, &r])),
+                "OpOr" => Ok(Bool::or(&[&l, &r])),
+                "OpImplies" => Ok(l.implies(&r)),
+                "OpXor" => Ok(Bool::xor(&l, &r)),
+                _ => Err(format!("unsupported boolean operator: {op}")),
             }
         }
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let inner = encode_prop_expr(pool, vctx, defs, ctx, operand, step);
-            inner.not()
+            let inner = encode_prop_expr(pool, vctx, defs, ctx, operand, step)?;
+            Ok(inner.not())
         }
         // Nested temporal operators — in BMC, `always P` at a single step
         // is just P (the outer loop iterates over steps), and `eventually P`
         // is also just P at this step (the outer loop handles the disjunction).
-        IRExpr::Always { body } | IRExpr::Eventually { body } => {
+        IRExpr::Always { body, .. } | IRExpr::Eventually { body, .. } => {
             encode_prop_expr(pool, vctx, defs, ctx, body, step)
         }
         // Comparison and other BinOps that produce Bool (OpEq, OpNEq, OpLt, etc.)
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step);
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step);
-            smt::binop(op, &l, &r).to_bool()
+            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
+            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
+            Ok(smt::binop(op, &l, &r)?.to_bool()?)
         }
         // Literals
         IRExpr::Lit {
             value: crate::ir::types::LitVal::Bool { value },
             ..
-        } => Bool::from_bool(*value),
+        } => Ok(Bool::from_bool(*value)),
         // Everything else: encode as value and convert to Bool
         other => {
-            let val = encode_prop_value(pool, vctx, defs, ctx, other, step);
-            val.to_bool()
+            let val = encode_prop_value(pool, vctx, defs, ctx, other, step)?;
+            Ok(val.to_bool()?)
         }
     }
 }
@@ -2636,7 +3077,7 @@ fn encode_prop_value(
     ctx: &PropertyCtx,
     expr: &IRExpr,
     step: usize,
-) -> SmtValue {
+) -> Result<SmtValue, String> {
     // Try def expansion — but only if the name is NOT shadowed by a local binding.
     if let IRExpr::Var { name, .. } = expr {
         if !ctx.bindings.contains_key(name) {
@@ -2653,15 +3094,15 @@ fn encode_prop_value(
 
     match expr {
         IRExpr::Lit { value, .. } => match value {
-            crate::ir::types::LitVal::Int { value } => smt::int_val(*value),
-            crate::ir::types::LitVal::Bool { value } => smt::bool_val(*value),
+            crate::ir::types::LitVal::Int { value } => Ok(smt::int_val(*value)),
+            crate::ir::types::LitVal::Bool { value } => Ok(smt::bool_val(*value)),
             crate::ir::types::LitVal::Real { value }
             | crate::ir::types::LitVal::Float { value } => {
                 #[allow(clippy::cast_possible_truncation)]
                 let scaled = (*value * 1_000_000.0) as i64;
-                smt::real_val(scaled, 1_000_000)
+                Ok(smt::real_val(scaled, 1_000_000))
             }
-            crate::ir::types::LitVal::Str { .. } => smt::int_val(0),
+            crate::ir::types::LitVal::Str { .. } => Ok(smt::int_val(0)),
         },
         // Field access: `var.field` — look up var in bindings, resolve field from bound entity
         IRExpr::Field {
@@ -2671,20 +3112,22 @@ fn encode_prop_value(
             if let IRExpr::Var { name, .. } = recv.as_ref() {
                 if let Some((entity, slot)) = ctx.bindings.get(name) {
                     if let Some(val) = pool.field_at(entity, *slot, field, step) {
-                        return val.clone();
+                        return Ok(val.clone());
                     }
-                    panic!(
+                    return Err(format!(
                         "field not found: {entity}.{field} (var={name}, slot={slot}, step={step})"
-                    );
+                    ));
                 }
             }
             // No binding for receiver — try all bindings to find the field
             for (entity, slot) in ctx.bindings.values() {
                 if let Some(val) = pool.field_at(entity, *slot, field, step) {
-                    return val.clone();
+                    return Ok(val.clone());
                 }
             }
-            panic!("field not found in any bound entity: {field} (step={step})")
+            Err(format!(
+                "field not found in any bound entity: {field} (step={step})"
+            ))
         }
         // Bare variable: check bindings first, then try as field in bound entities
         IRExpr::Var { name, .. } => {
@@ -2696,98 +3139,103 @@ fn encode_prop_value(
                 }
             }
             match matches.len() {
-                0 => panic!(
+                0 => Err(format!(
                     "variable not found in any bound entity context: {name} (bindings: {:?}, step={step})",
                     ctx.bindings.keys().collect::<Vec<_>>()
-                ),
-                1 => matches.into_iter().next().unwrap().2,
-                _ => panic!(
+                )),
+                1 => match matches.into_iter().next() {
+                    Some((_, _, val)) => Ok(val),
+                    None => Err(format!("variable not found: {name} (step={step})")),
+                },
+                _ => Err(format!(
                     "ambiguous bare variable: {name} found in entities {:?} — use qualified access (e.g., var.{name})",
                     matches.iter().map(|(v, e, _)| format!("{v}:{e}")).collect::<Vec<_>>()
-                ),
+                )),
             }
         }
         IRExpr::Ctor {
             enum_name, ctor, ..
         } => {
             let id = vctx.variants.id_of(enum_name, ctor);
-            smt::int_val(id)
+            Ok(smt::int_val(id))
         }
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step);
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step);
-            smt::binop(op, &l, &r)
+            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
+            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
+            Ok(smt::binop(op, &l, &r)?)
         }
         IRExpr::UnOp { op, operand, .. } => {
-            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step);
-            smt::unop(op, &v)
+            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
+            Ok(smt::unop(op, &v)?)
         }
-        IRExpr::Prime { expr } => encode_prop_value(pool, vctx, defs, ctx, expr, step + 1),
+        IRExpr::Prime { expr, .. } => encode_prop_value(pool, vctx, defs, ctx, expr, step + 1),
         // Nested quantifiers in value position — encode as Bool, wrap as SmtValue
-        IRExpr::Forall { .. } | IRExpr::Exists { .. } => {
-            SmtValue::Bool(encode_prop_expr(pool, vctx, defs, ctx, expr, step))
-        }
-        IRExpr::Always { body } => {
-            SmtValue::Bool(encode_prop_expr(pool, vctx, defs, ctx, body, step))
-        }
+        IRExpr::Forall { .. } | IRExpr::Exists { .. } => Ok(SmtValue::Bool(encode_prop_expr(
+            pool, vctx, defs, ctx, expr, step,
+        )?)),
+        IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_expr(
+            pool, vctx, defs, ctx, body, step,
+        )?)),
         IRExpr::MapUpdate {
             map, key, value, ..
         } => {
-            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step);
-            let k = encode_prop_value(pool, vctx, defs, ctx, key, step);
-            let v = encode_prop_value(pool, vctx, defs, ctx, value, step);
-            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step)?;
+            let k = encode_prop_value(pool, vctx, defs, ctx, key, step)?;
+            let v = encode_prop_value(pool, vctx, defs, ctx, value, step)?;
+            Ok(SmtValue::Array(
+                arr.as_array()?.store(&k.to_dynamic(), &v.to_dynamic()),
+            ))
         }
         IRExpr::Index { map, key, .. } => {
-            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step);
-            let k = encode_prop_value(pool, vctx, defs, ctx, key, step);
-            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step)?;
+            let k = encode_prop_value(pool, vctx, defs, ctx, key, step)?;
+            Ok(SmtValue::Dynamic(arr.as_array()?.select(&k.to_dynamic())))
         }
-        IRExpr::MapLit { entries, ty } => {
+        IRExpr::MapLit { entries, ty, .. } => {
             let (key_ty, val_ty) = match ty {
                 IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
-                _ => panic!("MapLit with non-Map type: {ty:?}"),
+                _ => return Err(format!("MapLit with non-Map type: {ty:?}")),
             };
             let key_sort = smt::ir_type_to_sort(key_ty);
             let default_val = smt::default_dynamic(val_ty);
             let mut arr = z3::ast::Array::const_array(&key_sort, &default_val);
             for (k_expr, v_expr) in entries {
-                let k = encode_prop_value(pool, vctx, defs, ctx, k_expr, step);
-                let v = encode_prop_value(pool, vctx, defs, ctx, v_expr, step);
+                let k = encode_prop_value(pool, vctx, defs, ctx, k_expr, step)?;
+                let v = encode_prop_value(pool, vctx, defs, ctx, v_expr, step)?;
                 arr = arr.store(&k.to_dynamic(), &v.to_dynamic());
             }
-            SmtValue::Array(arr)
+            Ok(SmtValue::Array(arr))
         }
-        IRExpr::SetLit { elements, ty } => {
+        IRExpr::SetLit { elements, ty, .. } => {
             let elem_ty = match ty {
                 IRType::Set { element } => element.as_ref(),
-                _ => panic!("SetLit with non-Set type: {ty:?}"),
+                _ => return Err(format!("SetLit with non-Set type: {ty:?}")),
             };
             let elem_sort = smt::ir_type_to_sort(elem_ty);
             let false_val = smt::bool_val(false).to_dynamic();
             let true_val = smt::bool_val(true).to_dynamic();
             let mut arr = z3::ast::Array::const_array(&elem_sort, &false_val);
             for elem in elements {
-                let e = encode_prop_value(pool, vctx, defs, ctx, elem, step);
+                let e = encode_prop_value(pool, vctx, defs, ctx, elem, step)?;
                 arr = arr.store(&e.to_dynamic(), &true_val);
             }
-            SmtValue::Array(arr)
+            Ok(SmtValue::Array(arr))
         }
-        IRExpr::SeqLit { elements, ty } => {
+        IRExpr::SeqLit { elements, ty, .. } => {
             let elem_ty = match ty {
                 IRType::Seq { element } => element.as_ref(),
-                _ => panic!("SeqLit with non-Seq type: {ty:?}"),
+                _ => return Err(format!("SeqLit with non-Seq type: {ty:?}")),
             };
             let default_val = smt::default_dynamic(elem_ty);
             let mut arr = z3::ast::Array::const_array(&z3::Sort::int(), &default_val);
             for (i, elem) in elements.iter().enumerate() {
                 let idx = smt::int_val(i64::try_from(i).unwrap_or(0)).to_dynamic();
-                let v = encode_prop_value(pool, vctx, defs, ctx, elem, step);
+                let v = encode_prop_value(pool, vctx, defs, ctx, elem, step)?;
                 arr = arr.store(&idx, &v.to_dynamic());
             }
-            SmtValue::Array(arr)
+            Ok(SmtValue::Array(arr))
         }
         IRExpr::SetComp {
             var,
@@ -2795,6 +3243,7 @@ fn encode_prop_value(
             filter,
             projection,
             ty,
+            ..
         } => {
             // Set comprehension over entity slots.
             // Simple: { a: E where P(a) } → Array<Int, Bool> (slot index → member)
@@ -2802,7 +3251,11 @@ fn encode_prop_value(
             let n_slots = pool.slots_for(entity_name);
             let result_elem_sort = match (projection.as_ref(), ty) {
                 (Some(_), IRType::Set { element }) => smt::ir_type_to_sort(element),
-                (Some(_), _) => panic!("projection SetComp with non-Set result type: {ty:?}"),
+                (Some(_), _) => {
+                    return Err(format!(
+                        "projection SetComp with non-Set result type: {ty:?}"
+                    ))
+                }
                 (None, _) => z3::Sort::int(), // simple form: slot indices are Int
             };
             let false_val = smt::bool_val(false).to_dynamic();
@@ -2816,14 +3269,14 @@ fn encode_prop_value(
                     _ => continue,
                 };
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
                 // Condition: slot is active AND filter holds
                 let cond = Bool::and(&[&is_active, &filter_val]);
 
                 // Key: what to store true at
                 let key = if let Some(proj_expr) = projection {
                     // Projection: store true at the projected value
-                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step).to_dynamic()
+                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)?.to_dynamic()
                 } else {
                     // Simple: store true at the slot index
                     smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic()
@@ -2833,7 +3286,7 @@ fn encode_prop_value(
                 let stored = arr.store(&key, &true_val);
                 arr = cond.ite(&stored, &arr);
             }
-            SmtValue::Array(arr)
+            Ok(SmtValue::Array(arr))
         }
         IRExpr::SetComp { domain, .. } => {
             // Non-entity domain — should be caught by find_unsupported_scene_expr,
@@ -2841,16 +3294,23 @@ fn encode_prop_value(
             // unconstrained array rather than panicking.
             let sort = smt::ir_type_to_sort(domain);
             let false_val = smt::bool_val(false).to_dynamic();
-            SmtValue::Array(z3::ast::Array::const_array(&sort, &false_val))
+            Ok(SmtValue::Array(z3::ast::Array::const_array(
+                &sort, &false_val,
+            )))
         }
-        IRExpr::Card { expr: inner } => encode_card(pool, vctx, defs, ctx, inner, step),
+        IRExpr::Card { expr: inner, .. } => encode_card(pool, vctx, defs, ctx, inner, step),
         IRExpr::App { func, .. } => {
             if let IRExpr::Var { name, .. } = func.as_ref() {
-                panic!("built-in function `{name}` is not yet supported in verification encoding");
+                return Err(format!(
+                    "function `{name}` reached encoding without expansion \
+                     (should have been caught by pre-validation)"
+                ));
             }
-            panic!("unsupported App expression in property value encoding: {expr:?}")
+            Err(format!(
+                "unsupported App expression reached encoding: {expr:?}"
+            ))
         }
-        _ => panic!("unsupported expression in property value encoding: {expr:?}"),
+        _ => Err(format!("unsupported expression reached encoding: {expr:?}")),
     }
 }
 
@@ -2871,18 +3331,20 @@ fn encode_card(
     ctx: &PropertyCtx,
     inner: &IRExpr,
     step: usize,
-) -> SmtValue {
+) -> Result<SmtValue, String> {
     match inner {
         IRExpr::SetLit { elements, .. } => {
             let unique: std::collections::HashSet<String> =
                 elements.iter().map(|e| format!("{e:?}")).collect();
-            smt::int_val(i64::try_from(unique.len()).unwrap_or(0))
+            Ok(smt::int_val(i64::try_from(unique.len()).unwrap_or(0)))
         }
-        IRExpr::SeqLit { elements, .. } => smt::int_val(i64::try_from(elements.len()).unwrap_or(0)),
+        IRExpr::SeqLit { elements, .. } => {
+            Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0)))
+        }
         IRExpr::MapLit { entries, .. } => {
             let unique_keys: std::collections::HashSet<String> =
                 entries.iter().map(|(k, _)| format!("{k:?}")).collect();
-            smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0))
+            Ok(smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0)))
         }
         // Entity-domain set comprehension: bounded sum over slots
         IRExpr::SetComp {
@@ -2902,20 +3364,18 @@ fn encode_card(
                     _ => continue,
                 };
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step);
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
                 let cond = Bool::and(&[&is_active, &filter_val]);
                 sum_terms.push(cond.ite(&one, &zero));
             }
 
             if sum_terms.is_empty() {
-                return smt::int_val(0);
+                return Ok(smt::int_val(0));
             }
             let refs: Vec<&z3::ast::Int> = sum_terms.iter().collect();
-            SmtValue::Int(z3::ast::Int::add(&refs))
+            Ok(SmtValue::Int(z3::ast::Int::add(&refs)))
         }
-        _ => {
-            panic!("unsupported cardinality expression — should be caught by pre-check: {inner:?}")
-        }
+        _ => Err(format!("unsupported cardinality expression: {inner:?}")),
     }
 }
 
@@ -3011,13 +3471,15 @@ impl std::fmt::Display for VerificationResult {
                 name,
                 method,
                 time_ms,
+                ..
             } => write!(f, "PROVED  {name} (method: {method}, {time_ms}ms)"),
             VerificationResult::Checked {
                 name,
                 depth,
                 time_ms,
+                ..
             } => write!(f, "CHECKED {name} (depth: {depth}, {time_ms}ms)"),
-            VerificationResult::Counterexample { name, trace } => {
+            VerificationResult::Counterexample { name, trace, .. } => {
                 writeln!(f, "COUNTEREXAMPLE {name}")?;
                 for step in trace {
                     if let Some(event) = &step.event {
@@ -3031,13 +3493,13 @@ impl std::fmt::Display for VerificationResult {
                 }
                 Ok(())
             }
-            VerificationResult::ScenePass { name, time_ms } => {
+            VerificationResult::ScenePass { name, time_ms, .. } => {
                 write!(f, "PASS    {name} ({time_ms}ms)")
             }
-            VerificationResult::SceneFail { name, reason } => {
+            VerificationResult::SceneFail { name, reason, .. } => {
                 write!(f, "FAIL    {name}: {reason}")
             }
-            VerificationResult::Unprovable { name, hint } => {
+            VerificationResult::Unprovable { name, hint, .. } => {
                 write!(f, "UNKNOWN {name}: {hint}")
             }
         }
@@ -3096,18 +3558,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -3123,6 +3593,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -3131,6 +3603,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "o".to_owned(),
@@ -3154,6 +3628,8 @@ mod tests {
                 hi: bound,
             }],
             asserts: vec![assert_expr],
+            span: None,
+            file: None,
         };
 
         IRProgram {
@@ -3189,17 +3665,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: -1 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = make_order_ir(property, 3);
@@ -3237,17 +3725,29 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Order".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             },
             3,
         );
@@ -3259,6 +3759,8 @@ mod tests {
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             postcondition: None,
             body: vec![IRAction::Create {
@@ -3269,6 +3771,8 @@ mod tests {
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     },
                     IRCreateField {
@@ -3276,6 +3780,8 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         },
                     },
                 ],
@@ -3328,12 +3834,16 @@ mod tests {
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             postcondition: None,
             body: vec![IRAction::ExprStmt {
                 expr: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
             }],
         }
@@ -3363,17 +3873,25 @@ mod tests {
                             expr: IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             },
                         }],
                         body: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
+
+                        span: None,
                     },
                 }],
                 events: vec![],
                 ordering: vec![],
                 assertions: vec![],
+                span: None,
+                file: None,
             }],
         };
 
@@ -3399,6 +3917,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::CrossCall {
@@ -3407,6 +3927,8 @@ mod tests {
                     args: vec![IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 1 },
+
+                        span: None,
                     }],
                 }],
             }],
@@ -3433,12 +3955,16 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::ExprStmt {
                     expr: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                 }],
             }],
@@ -3469,6 +3995,8 @@ mod tests {
                 }],
                 ordering: vec![],
                 assertions: vec![],
+                span: None,
+                file: None,
             }],
         };
 
@@ -3511,6 +4039,8 @@ mod tests {
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     }),
                 },
             ],
@@ -3523,18 +4053,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Locked".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -3553,6 +4091,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -3566,15 +4106,23 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Account".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "id".to_owned(),
                             ty: IRType::Id,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Var {
                             name: "account_id".to_owned(),
                             ty: IRType::Id,
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "a".to_owned(),
@@ -3620,15 +4168,23 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Account".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             }],
             events: vec![IRSceneEvent {
@@ -3641,9 +4197,13 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Account".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "id".to_owned(),
                     ty: IRType::Id,
+
+                    span: None,
                 }],
                 cardinality: Cardinality::Named("one".to_owned()),
             }],
@@ -3656,16 +4216,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Account".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Locked".to_owned(),
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }],
+            span: None,
+            file: None,
         };
 
         let ir = make_scene_test_ir(scene);
@@ -3696,15 +4266,23 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Account".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             }],
             events: vec![IRSceneEvent {
@@ -3717,9 +4295,13 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Account".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "id".to_owned(),
                     ty: IRType::Id,
+
+                    span: None,
                 }],
                 cardinality: Cardinality::Named("one".to_owned()),
             }],
@@ -3733,16 +4315,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Account".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }],
+            span: None,
+            file: None,
         };
 
         let ir = make_scene_test_ir(scene);
@@ -3763,6 +4355,8 @@ mod tests {
             IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             3,
         );
@@ -3785,18 +4379,32 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Order".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: -1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             }],
+            span: None,
+            file: None,
         });
 
         let results = verify_all(&ir, &VerifyConfig::default());
@@ -3816,6 +4424,8 @@ mod tests {
             IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             3,
         );
@@ -3826,6 +4436,8 @@ mod tests {
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             postcondition: None,
             body: vec![IRAction::Create {
@@ -3836,6 +4448,8 @@ mod tests {
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     },
                     IRCreateField {
@@ -3843,6 +4457,8 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         },
                     },
                 ],
@@ -3867,18 +4483,32 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Order".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             }],
+            span: None,
+            file: None,
         });
 
         let results = verify_all(&ir, &VerifyConfig::default());
@@ -3909,17 +4539,29 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Order".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: -1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             },
             3,
         );
@@ -3954,17 +4596,29 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Order".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             },
             3,
         );
@@ -3975,6 +4629,8 @@ mod tests {
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             postcondition: None,
             body: vec![IRAction::Create {
@@ -3985,6 +4641,8 @@ mod tests {
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     },
                     IRCreateField {
@@ -3992,6 +4650,8 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         },
                     },
                 ],
@@ -4033,17 +4693,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: -1 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
         let ir = make_order_ir(property, 10);
         let config = VerifyConfig {
@@ -4085,17 +4757,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: -1 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
         let ir = make_order_ir(valid_property, 3);
         let results = verify_all(&ir, &VerifyConfig::default());
@@ -4130,6 +4814,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -4138,6 +4824,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -4150,12 +4838,18 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![
                     IRUpdate {
@@ -4165,12 +4859,18 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "x".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Int,
+
+                            span: None,
                         },
                     },
                     IRUpdate {
@@ -4180,12 +4880,18 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "y".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Int,
+
+                            span: None,
                         },
                     },
                 ],
@@ -4202,6 +4908,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -4210,6 +4918,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "c".to_owned(),
@@ -4240,17 +4950,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Counter".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "y".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         // Verify block with this property
@@ -4268,12 +4990,16 @@ mod tests {
                     hi: 20,
                 }],
                 asserts: vec![property.clone()],
+                span: None,
+                file: None,
             }],
             theorems: vec![IRTheorem {
                 name: "counter_bounded_thm".to_owned(),
                 systems: vec!["S".to_owned()],
                 invariants: vec![],
                 shows: vec![property],
+                span: None,
+                file: None,
             }],
             axioms: vec![],
             scenes: vec![],
@@ -4398,6 +5124,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -4406,6 +5134,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -4418,12 +5148,18 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "x".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![
                     IRUpdate {
@@ -4433,12 +5169,18 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "x".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Int,
+
+                            span: None,
                         },
                     },
                     IRUpdate {
@@ -4448,12 +5190,18 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "y".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Int,
+
+                            span: None,
                         },
                     },
                 ],
@@ -4470,6 +5218,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -4478,6 +5228,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "c".to_owned(),
@@ -4508,17 +5260,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Counter".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "y".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         IRProgram {
@@ -4535,12 +5299,16 @@ mod tests {
                     hi: 20,
                 }],
                 asserts: vec![property.clone()],
+                span: None,
+                file: None,
             }],
             theorems: vec![IRTheorem {
                 name: "counter_bounded_thm".to_owned(),
                 systems: vec!["S".to_owned()],
                 invariants: vec![],
                 shows: vec![property],
+                span: None,
+                file: None,
             }],
             axioms: vec![],
             scenes: vec![],
@@ -4570,6 +5338,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "data".to_owned(),
@@ -4580,19 +5350,27 @@ mod tests {
                                 key: Box::new(IRType::Int),
                                 value: Box::new(IRType::Int),
                             },
+
+                            span: None,
                         }),
                         key: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 42 },
+
+                            span: None,
                         }),
                         value: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 100 },
+
+                            span: None,
                         }),
                         ty: IRType::Map {
                             key: Box::new(IRType::Int),
                             value: Box::new(IRType::Int),
                         },
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -4609,6 +5387,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -4622,6 +5402,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -4630,6 +5412,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "s".to_owned(),
@@ -4655,18 +5439,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Store".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "data".to_owned(),
                     ty: IRType::Map {
                         key: Box::new(IRType::Int),
                         value: Box::new(IRType::Int),
                     },
+
+                    span: None,
                 }),
                 key: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 42 },
+
+                    span: None,
                 }),
                 ty: IRType::Int,
+
+                span: None,
             }
         };
 
@@ -4685,8 +5477,14 @@ mod tests {
                     left: Box::new(data_at_42("s")),
                     right: Box::new(data_at_42("s")),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         // Property: data[42] == 100 — false for newly created entities,
@@ -4705,10 +5503,18 @@ mod tests {
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 100 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -4726,6 +5532,8 @@ mod tests {
                         hi: 3,
                     }],
                     asserts: vec![reflex_property],
+                    span: None,
+                    file: None,
                 },
                 IRVerify {
                     name: "map_post_put".to_owned(),
@@ -4735,6 +5543,8 @@ mod tests {
                         hi: 5,
                     }],
                     asserts: vec![post_put_property],
+                    span: None,
+                    file: None,
                 },
             ],
             theorems: vec![],
@@ -4789,6 +5599,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -4824,26 +5636,42 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "M".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "data".to_owned(),
                         ty: map_ty.clone(),
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::MapLit {
                         entries: vec![(
                             IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 42 },
+
+                                span: None,
                             },
                             IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 100 },
+
+                                span: None,
                             },
                         )],
                         ty: map_ty,
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -4860,6 +5688,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -4902,6 +5732,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -4912,6 +5744,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 updates: vec![
                     // store' = store[1 := 42]
@@ -4924,19 +5758,27 @@ mod tests {
                                     key: Box::new(IRType::Int),
                                     value: Box::new(IRType::Int),
                                 },
+
+                                span: None,
                             }),
                             key: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             value: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 42 },
+
+                                span: None,
                             }),
                             ty: IRType::Map {
                                 key: Box::new(IRType::Int),
                                 value: Box::new(IRType::Int),
                             },
+
+                            span: None,
                         },
                     },
                     // count' = count + 1 (scalar frame test alongside map)
@@ -4947,12 +5789,18 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "count".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Int,
+
+                            span: None,
                         },
                     },
                 ],
@@ -4970,6 +5818,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -4983,6 +5833,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -4991,6 +5843,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "k".to_owned(),
@@ -5023,17 +5877,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "KV".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "count".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5050,6 +5916,8 @@ mod tests {
                     hi: 5,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5097,6 +5965,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 // tags' = tags[5 := true] (add 5 to set)
                 updates: vec![IRUpdate {
@@ -5105,16 +5975,24 @@ mod tests {
                         map: Box::new(IRExpr::Var {
                             name: "tags".to_owned(),
                             ty: set_ty.clone(),
+
+                            span: None,
                         }),
                         key: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 5 },
+
+                            span: None,
                         }),
                         value: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ty: set_ty.clone(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -5131,6 +6009,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -5144,6 +6024,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -5152,6 +6034,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "i".to_owned(),
@@ -5181,15 +6065,23 @@ mod tests {
                     ty: IRType::Entity {
                         name: "Item".to_owned(),
                     },
+
+                    span: None,
                 }),
                 field: "tags".to_owned(),
                 ty: set_ty,
+
+                span: None,
             }),
             key: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 5 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let membership_property = IRExpr::Always {
@@ -5204,10 +6096,18 @@ mod tests {
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5224,6 +6124,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![membership_property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5259,6 +6161,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -5273,6 +6177,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -5301,31 +6207,51 @@ mod tests {
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 1 },
+
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 2 },
+
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 3 },
+
+                                    span: None,
                                 },
                             ],
                             ty: set_ty,
+
+                            span: None,
                         }),
                         key: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5342,6 +6268,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5373,6 +6301,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -5387,6 +6317,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -5415,26 +6347,44 @@ mod tests {
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 1 },
+
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 2 },
+
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 3 },
+
+                                    span: None,
                                 },
                             ],
                             ty: set_ty,
+
+                            span: None,
                         }),
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 3 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5451,6 +6401,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5481,6 +6433,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -5494,6 +6448,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -5522,26 +6478,43 @@ mod tests {
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 1 },
+
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
-                                    value: LitVal::Int { value: 1 }, // duplicate
+                                    value: LitVal::Int { value: 1 }, // duplicate,
+                                    span: None,
                                 },
                                 IRExpr::Lit {
                                     ty: IRType::Int,
                                     value: LitVal::Int { value: 2 },
+
+                                    span: None,
                                 },
                             ],
                             ty: set_ty,
+
+                            span: None,
                         }),
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 2 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5558,6 +6531,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5606,6 +6581,8 @@ mod tests {
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
+
+                        span: None,
                     }),
                 },
             ],
@@ -5618,18 +6595,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -5646,6 +6631,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -5659,6 +6646,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -5667,6 +6656,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "o".to_owned(),
@@ -5697,20 +6688,30 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Obj".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
             projection: None,
             ty: IRType::Set {
                 element: Box::new(IRType::Int),
             },
+
+            span: None,
         };
 
         // Property: { o: Obj where o.status == @Active } == { o: Obj where o.status == @Active }
@@ -5722,7 +6723,11 @@ mod tests {
                 left: Box::new(active_set.clone()),
                 right: Box::new(active_set),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5739,6 +6744,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5782,6 +6789,8 @@ mod tests {
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -5796,6 +6805,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -5822,11 +6833,15 @@ mod tests {
             filter: Box::new(IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             }),
             projection: None,
             ty: IRType::Set {
                 element: Box::new(IRType::Int),
             },
+
+            span: None,
         };
 
         let comp_at_0 = IRExpr::Index {
@@ -5834,8 +6849,12 @@ mod tests {
             key: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 0 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let property = IRExpr::Always {
@@ -5844,7 +6863,11 @@ mod tests {
                 left: Box::new(comp_at_0.clone()),
                 right: Box::new(comp_at_0),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5861,6 +6884,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -5904,6 +6929,8 @@ mod tests {
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -5918,6 +6945,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -5940,6 +6969,8 @@ mod tests {
             filter: Box::new(IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             }),
             projection: Some(Box::new(IRExpr::Field {
                 expr: Box::new(IRExpr::Var {
@@ -5947,13 +6978,19 @@ mod tests {
                     ty: IRType::Entity {
                         name: "Obj".to_owned(),
                     },
+
+                    span: None,
                 }),
                 field: "status".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             })),
             ty: IRType::Set {
                 element: Box::new(IRType::Int),
             },
+
+            span: None,
         };
 
         // Property: Index(status_set, Idle_id) == Index(status_set, Idle_id)
@@ -5962,11 +6999,15 @@ mod tests {
         let idle_id = IRExpr::Ctor {
             enum_name: "Status".to_owned(),
             ctor: "Idle".to_owned(),
+
+            span: None,
         };
         let proj_at_idle = IRExpr::Index {
             map: Box::new(status_set),
             key: Box::new(idle_id),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let property = IRExpr::Always {
@@ -5975,7 +7016,11 @@ mod tests {
                 left: Box::new(proj_at_idle.clone()),
                 right: Box::new(proj_at_idle),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -5992,6 +7037,8 @@ mod tests {
                     hi: 3,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -6027,6 +7074,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -6041,6 +7090,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -6059,17 +7110,25 @@ mod tests {
                 IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 10 },
+
+                    span: None,
                 },
                 IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 20 },
+
+                    span: None,
                 },
                 IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 30 },
+
+                    span: None,
                 },
             ],
             ty: seq_ty.clone(),
+
+            span: None,
         };
 
         // Property 1: Seq(10,20,30)[1] == 20
@@ -6086,16 +7145,28 @@ mod tests {
                         key: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 20 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         // Property 2: #Seq(10,20,30) == 3
@@ -6109,14 +7180,24 @@ mod tests {
                     op: "OpEq".to_owned(),
                     left: Box::new(IRExpr::Card {
                         expr: Box::new(seq_lit()),
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 3 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6134,6 +7215,8 @@ mod tests {
                         hi: 3,
                     }],
                     asserts: vec![index_prop],
+                    span: None,
+                    file: None,
                 },
                 IRVerify {
                     name: "seq_card".to_owned(),
@@ -6143,6 +7226,8 @@ mod tests {
                         hi: 3,
                     }],
                     asserts: vec![card_prop],
+                    span: None,
+                    file: None,
                 },
             ],
             theorems: vec![],
@@ -6193,6 +7278,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -6203,6 +7290,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "count".to_owned(),
@@ -6211,12 +7300,18 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "count".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Int,
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -6233,6 +7328,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -6246,6 +7343,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -6254,6 +7353,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "q".to_owned(),
@@ -6281,15 +7382,23 @@ mod tests {
                     ty: IRType::Entity {
                         name: "Q".to_owned(),
                     },
+
+                    span: None,
                 }),
                 field: "items".to_owned(),
                 ty: seq_ty.clone(),
+
+                span: None,
             }),
             key: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 0 },
+
+                span: None,
             }),
             ty: IRType::Int,
+
+            span: None,
         };
 
         // Also check count >= 0 to validate scalar framing alongside Seq.
@@ -6306,6 +7415,8 @@ mod tests {
                         left: Box::new(items_at_0.clone()),
                         right: Box::new(items_at_0),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::BinOp {
                         op: "OpGe".to_owned(),
@@ -6315,19 +7426,33 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "Q".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "count".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6344,6 +7469,8 @@ mod tests {
                     hi: 5,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -6388,6 +7515,8 @@ mod tests {
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
+
+                    span: None,
                 }),
             }],
             transitions: vec![IRTransition {
@@ -6399,18 +7528,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -6427,6 +7564,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -6440,6 +7579,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -6448,6 +7589,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "o".to_owned(),
@@ -6478,20 +7621,30 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Obj".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
             projection: None,
             ty: IRType::Set {
                 element: Box::new(IRType::Int),
             },
+
+            span: None,
         };
 
         // Property: #{ o | Active } >= 0 — always true (count is non-negative).
@@ -6502,13 +7655,21 @@ mod tests {
                 op: "OpGe".to_owned(),
                 left: Box::new(IRExpr::Card {
                     expr: Box::new(active_comp.clone()),
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         // Property: #{ o | Active } <= 2 — true with scope size 2 (at most 2 slots).
@@ -6518,13 +7679,21 @@ mod tests {
                 op: "OpLe".to_owned(),
                 left: Box::new(IRExpr::Card {
                     expr: Box::new(active_comp),
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 2 },
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6542,6 +7711,8 @@ mod tests {
                         hi: 5,
                     }],
                     asserts: vec![non_neg_prop],
+                    span: None,
+                    file: None,
                 },
                 IRVerify {
                     name: "card_bounded".to_owned(),
@@ -6551,6 +7722,8 @@ mod tests {
                         hi: 5,
                     }],
                     asserts: vec![bounded_prop],
+                    span: None,
+                    file: None,
                 },
             ],
             theorems: vec![],
@@ -6595,6 +7768,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -6608,6 +7783,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -6635,16 +7812,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "X".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "n".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6655,6 +7842,8 @@ mod tests {
                 ty: IRType::Bool,
                 body: prop_body,
                 prop_target: Some("S".to_owned()),
+                span: None,
+                file: None,
             }],
             entities: vec![entity],
             systems: vec![system],
@@ -6688,6 +7877,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -6701,6 +7892,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -6717,6 +7910,8 @@ mod tests {
         let prop_ref = IRExpr::Var {
             name: "my_prop".to_owned(),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6728,8 +7923,12 @@ mod tests {
                 body: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 prop_target: Some("S".to_owned()),
+                span: None,
+                file: None,
             }],
             entities: vec![entity],
             systems: vec![system],
@@ -6741,7 +7940,11 @@ mod tests {
                 invariants: vec![],
                 shows: vec![IRExpr::Always {
                     body: Box::new(prop_ref),
+
+                    span: None,
                 }],
+                span: None,
+                file: None,
             }],
             axioms: vec![],
             scenes: vec![],
@@ -6777,8 +7980,12 @@ mod tests {
                 body: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 prop_target: Some("S".to_owned()),
+                span: None,
+                file: None,
             }],
             entities: vec![],
             systems: vec![],
@@ -6821,6 +8028,8 @@ mod tests {
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Off".to_owned(),
+
+                    span: None,
                 }),
             }],
             transitions: vec![IRTransition {
@@ -6830,12 +8039,16 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "On".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -6851,6 +8064,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -6864,6 +8079,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -6872,6 +8089,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![IRAction::Apply {
                             target: "s".to_owned(),
@@ -6902,16 +8121,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "Switch".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Off".to_owned(),
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -6922,6 +8151,8 @@ mod tests {
                 ty: IRType::Bool,
                 body: false_prop_body,
                 prop_target: Some("S".to_owned()),
+                span: None,
+                file: None,
             }],
             entities: vec![entity],
             systems: vec![system],
@@ -6966,6 +8197,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -6978,18 +8211,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7004,18 +8245,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7033,6 +8282,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -7046,6 +8297,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -7054,6 +8307,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -7093,17 +8348,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -7120,6 +8387,8 @@ mod tests {
                     hi: 5,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -7159,6 +8428,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -7171,18 +8442,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7196,18 +8475,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7224,6 +8511,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -7232,6 +8521,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![
                         IRAction::Apply {
@@ -7270,15 +8561,23 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             }],
             events: vec![IRSceneEvent {
@@ -7297,16 +8596,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "F".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 2 },
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }],
+            span: None,
+            file: None,
         };
 
         let ir = IRProgram {
@@ -7346,6 +8655,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -7358,18 +8669,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7383,18 +8702,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7412,6 +8739,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -7425,6 +8754,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -7433,6 +8764,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -7472,17 +8805,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -7497,6 +8842,8 @@ mod tests {
                 systems: vec!["S".to_owned()],
                 invariants: vec![],
                 shows: vec![property],
+                span: None,
+                file: None,
             }],
             axioms: vec![],
             scenes: vec![],
@@ -7534,6 +8881,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -7546,18 +8895,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7571,18 +8928,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7596,18 +8961,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 3 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7625,6 +8998,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -7639,6 +9014,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -7647,6 +9024,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -7671,6 +9050,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -7679,6 +9060,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -7719,17 +9102,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 3 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -7746,6 +9141,8 @@ mod tests {
                     hi: 5,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -7784,6 +9181,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -7796,18 +9195,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7821,18 +9228,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -7850,6 +9265,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -7863,6 +9280,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -7871,6 +9290,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -7915,15 +9336,23 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "F".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::BinOp {
                         op: "OpEq".to_owned(),
@@ -7933,19 +9362,33 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "F".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let ir = IRProgram {
@@ -7962,6 +9405,8 @@ mod tests {
                     hi: 5,
                 }],
                 asserts: vec![property],
+                span: None,
+                file: None,
             }],
             theorems: vec![],
             axioms: vec![],
@@ -8008,6 +9453,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -8016,6 +9463,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -8029,12 +9478,18 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![
                         IRUpdate {
@@ -8042,6 +9497,8 @@ mod tests {
                             value: IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             },
                         },
                         IRUpdate {
@@ -8049,6 +9506,8 @@ mod tests {
                             value: IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 10 },
+
+                                span: None,
                             },
                         },
                     ],
@@ -8069,32 +9528,48 @@ mod tests {
                             left: Box::new(IRExpr::Var {
                                 name: "status".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 1 },
+
+                                span: None,
                             }),
                             ty: IRType::Bool,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::BinOp {
                             op: "OpEq".to_owned(),
                             left: Box::new(IRExpr::Var {
                                 name: "amount".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Var {
                                 name: "expected".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             ty: IRType::Bool,
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -8112,6 +9587,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Create {
@@ -8125,6 +9602,8 @@ mod tests {
                     guard: IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     },
                     postcondition: None,
                     body: vec![IRAction::Choose {
@@ -8133,6 +9612,8 @@ mod tests {
                         filter: Box::new(IRExpr::Lit {
                             ty: IRType::Bool,
                             value: LitVal::Bool { value: true },
+
+                            span: None,
                         }),
                         ops: vec![
                             IRAction::Apply {
@@ -8150,6 +9631,8 @@ mod tests {
                                 args: vec![IRExpr::Var {
                                     name: "amount".to_owned(),
                                     ty: IRType::Int,
+
+                                    span: None,
                                 }],
                             },
                         ],
@@ -8190,15 +9673,23 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "F".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::BinOp {
                         op: "OpEq".to_owned(),
@@ -8208,17 +9699,27 @@ mod tests {
                                 ty: IRType::Entity {
                                     name: "F".to_owned(),
                                 },
+
+                                span: None,
                             }),
                             field: "amount".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             }],
             events: vec![IRSceneEvent {
@@ -8239,15 +9740,23 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 2 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 IRExpr::BinOp {
                     op: "OpEq".to_owned(),
@@ -8257,17 +9766,27 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "amount".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             ],
+            span: None,
+            file: None,
         };
 
         let ir = IRProgram {
@@ -8308,6 +9827,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![
@@ -8320,18 +9841,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 0 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -8345,18 +9874,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 1 },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 2 },
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -8373,6 +9910,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 // ForAll with two Applies on same entity — NOT supported
@@ -8415,15 +9954,23 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "F".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
             }],
             events: vec![IRSceneEvent {
@@ -8442,16 +9989,26 @@ mod tests {
                         ty: IRType::Entity {
                             name: "F".to_owned(),
                         },
+
+                        span: None,
                     }),
                     field: "status".to_owned(),
                     ty: IRType::Int,
+
+                    span: None,
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 2 },
+
+                    span: None,
                 }),
                 ty: IRType::Bool,
+
+                span: None,
             }],
+            span: None,
+            file: None,
         };
 
         let ir = IRProgram {

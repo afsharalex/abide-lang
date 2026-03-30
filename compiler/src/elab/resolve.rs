@@ -81,7 +81,7 @@ fn resolve_use_declarations(env: &mut Env) {
     let use_decls: Vec<_> = env
         .use_decls
         .iter()
-        .filter(|(_, source)| *source == root_module)
+        .filter(|entry| entry.source_module == root_module)
         .cloned()
         .collect();
 
@@ -89,8 +89,10 @@ fn resolve_use_declarations(env: &mut Env) {
     let mut imports: Vec<(String, String, String)> = Vec::new();
     let mut errors: Vec<ElabError> = Vec::new();
 
-    for (ud, source_module) in &use_decls {
-        let importing = source_module.as_deref();
+    for entry in &use_decls {
+        let ud = &entry.decl;
+        let importing = entry.source_module.as_deref();
+        let use_file = entry.source_file.as_deref();
 
         match ud {
             UseDecl::All { module, .. } => {
@@ -108,9 +110,12 @@ fn resolve_use_declarations(env: &mut Env) {
                 }
             }
             UseDecl::Single { module, name, span } => {
-                if let Some(err) =
+                if let Some(mut err) =
                     check_import_target(env, &known_modules, module, name, importing, *span)
                 {
+                    if err.file.is_none() {
+                        err.file = use_file.map(str::to_owned);
+                    }
                     errors.push(err);
                 } else {
                     imports.push((name.clone(), module.clone(), name.clone()));
@@ -122,9 +127,12 @@ fn resolve_use_declarations(env: &mut Env) {
                 alias,
                 span,
             } => {
-                if let Some(err) =
+                if let Some(mut err) =
                     check_import_target(env, &known_modules, module, name, importing, *span)
                 {
+                    if err.file.is_none() {
+                        err.file = use_file.map(str::to_owned);
+                    }
                     errors.push(err);
                 } else {
                     imports.push((alias.clone(), module.clone(), name.clone()));
@@ -146,15 +154,17 @@ fn resolve_use_declarations(env: &mut Env) {
                             span: s,
                         } => (name.as_str(), alias.clone(), *s),
                     };
-                    if let Some(err) =
+                    if let Some(mut err) =
                         check_import_target(env, &known_modules, module, name, importing, item_span)
                     {
+                        if err.file.is_none() {
+                            err.file = use_file.map(str::to_owned);
+                        }
                         errors.push(err);
                     } else {
                         imports.push((local, module.clone(), name.to_string()));
                     }
                 }
-                // Suppress unused variable warning for the parent span
                 let _ = span;
             }
         }
@@ -191,28 +201,51 @@ fn check_import_target(
         return None;
     }
 
-    match env.lookup_decl_qualified(target_module, target_name) {
-        Some(decl) => {
-            // Check visibility: cross-module access requires Public
-            if decl.visibility == Visibility::Private && importing_module != Some(target_module) {
-                Some(ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    format!(
-                        "cannot import private declaration '{target_name}' from module '{target_module}'"
-                    ),
-                    String::new(),
-                    use_span,
-                ).with_help("mark it 'pub' to make it importable"))
-            } else {
-                None
+    if let Some(decl) = env.lookup_decl_qualified(target_module, target_name) {
+        // Check visibility: cross-module access requires Public
+        if decl.visibility == Visibility::Private && importing_module != Some(target_module) {
+            let mut err = ElabError::with_span(
+                ErrorKind::InvalidScope,
+                format!(
+                    "cannot import private declaration '{target_name}' from module '{target_module}'"
+                ),
+                "imported here".to_owned(),
+                use_span,
+            )
+            .with_help(format!(
+                "mark it 'pub' to make it importable: pub {:?} {target_name}",
+                decl.kind
+            ));
+            // Point to the original private declaration
+            if let Some(decl_span) = decl.span {
+                let label = format!("'{target_name}' is private here");
+                if let Some(ref decl_file) = decl.file {
+                    err = err.with_secondary_in_file(decl_span, label, decl_file.clone());
+                } else {
+                    err = err.with_secondary(decl_span, label);
+                }
             }
+            Some(err)
+        } else {
+            None
         }
-        None => Some(ElabError::with_span(
+    } else {
+        // Suggest closest name in the target module
+        let module_names: Vec<String> = env
+            .decls_in_module(target_module)
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        let mut err = ElabError::with_span(
             ErrorKind::UndefinedRef,
             format!("module '{target_module}' does not export '{target_name}'"),
             String::new(),
             use_span,
-        )),
+        );
+        if let Some(closest) = super::check::find_closest_name(target_name, &module_names) {
+            err = err.with_help(format!("did you mean '{closest}'?"));
+        }
+        Some(err)
     }
 }
 
@@ -335,7 +368,7 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
         }
         for ni in &mut system.next_items {
             if let ENextItem::When(cond, _) = ni {
-                *cond = resolve_expr(ctx, &HashSet::new(), cond);
+                **cond = resolve_expr(ctx, &HashSet::new(), cond);
             }
         }
     }
@@ -509,42 +542,50 @@ fn resolve_fns(env: &mut Env, ctx: &Ctx) {
 #[allow(clippy::too_many_lines)]
 fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
     match expr {
-        EExpr::Var(ty, name) => {
+        EExpr::Var(ty, name, sp) => {
             if bound.contains(name) {
                 // Bound variable: keep name and type as-is.
                 // Don't alias-rewrite or constructor-resolve.
-                EExpr::Var(ty.clone(), name.clone())
+                EExpr::Var(ty.clone(), name.clone(), *sp)
             } else {
                 let resolved_name = ctx.canonical_name(name).to_owned();
                 let resolved_ty = resolve_var_type(ctx, &resolved_name);
-                EExpr::Var(resolved_ty, resolved_name)
+                EExpr::Var(resolved_ty, resolved_name, *sp)
             }
         }
-        EExpr::Field(ty, e, f) => {
-            EExpr::Field(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), f.clone())
+        EExpr::Field(ty, e, f, sp) => EExpr::Field(
+            ty.clone(),
+            Box::new(resolve_expr(ctx, bound, e)),
+            f.clone(),
+            *sp,
+        ),
+        EExpr::Prime(ty, e, sp) => {
+            EExpr::Prime(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
         }
-        EExpr::Prime(ty, e) => EExpr::Prime(ty.clone(), Box::new(resolve_expr(ctx, bound, e))),
-        EExpr::BinOp(ty, op, a, b) => EExpr::BinOp(
+        EExpr::BinOp(ty, op, a, b, sp) => EExpr::BinOp(
             ty.clone(),
             *op,
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
         ),
-        EExpr::UnOp(ty, op, e) => {
-            EExpr::UnOp(ty.clone(), *op, Box::new(resolve_expr(ctx, bound, e)))
+        EExpr::UnOp(ty, op, e, sp) => {
+            EExpr::UnOp(ty.clone(), *op, Box::new(resolve_expr(ctx, bound, e)), *sp)
         }
-        EExpr::Call(ty, f, args) => EExpr::Call(
+        EExpr::Call(ty, f, args, sp) => EExpr::Call(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, f)),
             args.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            *sp,
         ),
-        EExpr::CallR(ty, f, refs, args) => EExpr::CallR(
+        EExpr::CallR(ty, f, refs, args, sp) => EExpr::CallR(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, f)),
             refs.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
             args.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            *sp,
         ),
-        EExpr::Quant(ty, q, v, vty, body) => {
+        EExpr::Quant(ty, q, v, vty, body, sp) => {
             let mut inner_bound = bound.clone();
             inner_bound.insert(v.clone());
             EExpr::Quant(
@@ -553,32 +594,43 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                 v.clone(),
                 ctx.resolve_ty(vty),
                 Box::new(resolve_expr(ctx, &inner_bound, body)),
+                *sp,
             )
         }
-        EExpr::Always(ty, e) => EExpr::Always(ty.clone(), Box::new(resolve_expr(ctx, bound, e))),
-        EExpr::Eventually(ty, e) => {
-            EExpr::Eventually(ty.clone(), Box::new(resolve_expr(ctx, bound, e)))
+        EExpr::Always(ty, e, sp) => {
+            EExpr::Always(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
         }
-        EExpr::Assert(ty, e) => EExpr::Assert(ty.clone(), Box::new(resolve_expr(ctx, bound, e))),
-        EExpr::Assign(ty, lhs, rhs) => EExpr::Assign(
+        EExpr::Eventually(ty, e, sp) => {
+            EExpr::Eventually(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::Assert(ty, e, sp) => {
+            EExpr::Assert(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::Assign(ty, lhs, rhs, sp) => EExpr::Assign(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, lhs)),
             Box::new(resolve_expr(ctx, bound, rhs)),
+            *sp,
         ),
-        EExpr::NamedPair(ty, n, e) => {
-            EExpr::NamedPair(ty.clone(), n.clone(), Box::new(resolve_expr(ctx, bound, e)))
-        }
-        EExpr::Seq(ty, a, b) => EExpr::Seq(
+        EExpr::NamedPair(ty, n, e, sp) => EExpr::NamedPair(
+            ty.clone(),
+            n.clone(),
+            Box::new(resolve_expr(ctx, bound, e)),
+            *sp,
+        ),
+        EExpr::Seq(ty, a, b, sp) => EExpr::Seq(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
         ),
-        EExpr::SameStep(ty, a, b) => EExpr::SameStep(
+        EExpr::SameStep(ty, a, b, sp) => EExpr::SameStep(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
         ),
-        EExpr::Let(binds, body) => {
+        EExpr::Let(binds, body, sp) => {
             let mut inner_bound = bound.clone();
             let bs = binds
                 .iter()
@@ -592,9 +644,9 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                     resolved
                 })
                 .collect();
-            EExpr::Let(bs, Box::new(resolve_expr(ctx, &inner_bound, body)))
+            EExpr::Let(bs, Box::new(resolve_expr(ctx, &inner_bound, body)), *sp)
         }
-        EExpr::Lam(params, mret, body) => {
+        EExpr::Lam(params, mret, body, sp) => {
             let mut inner_bound = bound.clone();
             for (n, _) in params {
                 inner_bound.insert(n.clone());
@@ -606,9 +658,10 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                     .collect(),
                 mret.as_ref().map(|t| ctx.resolve_ty(t)),
                 Box::new(resolve_expr(ctx, &inner_bound, body)),
+                *sp,
             )
         }
-        EExpr::Match(scrut, arms) => {
+        EExpr::Match(scrut, arms, sp) => {
             let resolved_scrut = resolve_expr(ctx, bound, scrut);
             let resolved_arms = arms
                 .iter()
@@ -620,9 +673,9 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                     (pat.clone(), resolved_guard, resolved_body)
                 })
                 .collect();
-            EExpr::Match(Box::new(resolved_scrut), resolved_arms)
+            EExpr::Match(Box::new(resolved_scrut), resolved_arms, *sp)
         }
-        EExpr::SetComp(ty, proj, var, vty, filter) => {
+        EExpr::SetComp(ty, proj, var, vty, filter, sp) => {
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone());
             EExpr::SetComp(
@@ -632,20 +685,23 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                 var.clone(),
                 ctx.resolve_ty(vty),
                 Box::new(resolve_expr(ctx, &inner_bound, filter)),
+                *sp,
             )
         }
-        EExpr::MapUpdate(ty, m, k, v) => EExpr::MapUpdate(
+        EExpr::MapUpdate(ty, m, k, v, sp) => EExpr::MapUpdate(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, m)),
             Box::new(resolve_expr(ctx, bound, k)),
             Box::new(resolve_expr(ctx, bound, v)),
+            *sp,
         ),
-        EExpr::Index(ty, m, k) => EExpr::Index(
+        EExpr::Index(ty, m, k, sp) => EExpr::Index(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, m)),
             Box::new(resolve_expr(ctx, bound, k)),
+            *sp,
         ),
-        EExpr::Qual(_, s, n) => {
+        EExpr::Qual(_, s, n, sp) => {
             let ty = ctx
                 .types
                 .get(s.as_str())
@@ -655,22 +711,27 @@ fn resolve_expr(ctx: &Ctx, bound: &HashSet<String>, expr: &EExpr) -> EExpr {
                 })
                 .cloned()
                 .unwrap_or_else(|| Ty::Unresolved(s.clone()));
-            EExpr::Qual(ty, s.clone(), n.clone())
+            EExpr::Qual(ty, s.clone(), n.clone(), *sp)
         }
-        EExpr::TupleLit(ty, es) => EExpr::TupleLit(
+        EExpr::TupleLit(ty, es, sp) => EExpr::TupleLit(
             ty.clone(),
             es.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            *sp,
         ),
-        EExpr::In(ty, a, b) => EExpr::In(
+        EExpr::In(ty, a, b, sp) => EExpr::In(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
         ),
-        EExpr::Card(ty, e) => EExpr::Card(ty.clone(), Box::new(resolve_expr(ctx, bound, e))),
-        EExpr::Pipe(ty, a, b) => EExpr::Pipe(
+        EExpr::Card(ty, e, sp) => {
+            EExpr::Card(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::Pipe(ty, a, b, sp) => EExpr::Pipe(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
+            *sp,
         ),
         e => e.clone(),
     }
@@ -1081,7 +1142,7 @@ mod tests {
         // but collect_into retroactively patches it once the module decl is seen.
         let env = elaborate_src("use Foo::Bar\nmodule MyMod");
         assert_eq!(env.use_decls.len(), 1);
-        let (_, source) = &env.use_decls[0];
+        let source = &env.use_decls[0].source_module;
         assert_eq!(
             source.as_deref(),
             Some("MyMod"),
@@ -1185,8 +1246,8 @@ mod tests {
         assert!(val_const.is_some(), "const val should exist in result");
         let body = &val_const.unwrap().body;
         // The body is Call(Var("double"), [Int(5)]) — "double" not "dbl"
-        if let EExpr::Call(_, func, _) = body {
-            if let EExpr::Var(_, name) = func.as_ref() {
+        if let EExpr::Call(_, func, _, _) = body {
+            if let EExpr::Var(_, name, _) = func.as_ref() {
                 assert_eq!(
                     name, "double",
                     "aliased call should be rewritten to canonical name 'double', got '{name}'"
@@ -1229,8 +1290,8 @@ mod tests {
         let val_const = result.consts.iter().find(|c| c.name == "val").unwrap();
         // The body is Let([(f, _, 42)], Var(f))
         // The inner Var should be "f" (bound), NOT "foo" (alias rewrite)
-        if let EExpr::Let(_, body) = &val_const.body {
-            if let EExpr::Var(_, name) = body.as_ref() {
+        if let EExpr::Let(_, body, _) = &val_const.body {
+            if let EExpr::Var(_, name, _) = body.as_ref() {
                 assert_eq!(
                     name, "f",
                     "let-bound 'f' should NOT be rewritten to alias canonical 'foo', got '{name}'"
@@ -1314,7 +1375,7 @@ mod tests {
 
         let double_fn = result.fns.iter().find(|f| f.name == "double").unwrap();
         // Body should be Var("x") — the param, not rewritten to anything else
-        if let EExpr::Var(_, name) = &double_fn.body {
+        if let EExpr::Var(_, name, _) = &double_fn.body {
             assert_eq!(
                 name, "x",
                 "fn param 'x' should not be alias-rewritten, got '{name}'"
@@ -1354,16 +1415,16 @@ mod tests {
         // Body contains a reference to "o" — should be the param, not the imported fn
         fn find_var_name(e: &EExpr) -> Option<&str> {
             match e {
-                EExpr::Var(_, n) => Some(n),
-                EExpr::BinOp(_, _, l, _) => find_var_name(l),
+                EExpr::Var(_, n, _) => Some(n),
+                EExpr::BinOp(_, _, l, _, _) => find_var_name(l),
                 _ => None,
             }
         }
         // Body is BinOp(OpEq, Var("o"), Var("Pending"))
         // Assert the left side is specifically Var with name "o"
         match &check_pred.body {
-            EExpr::BinOp(_, _, lhs, _) => match lhs.as_ref() {
-                EExpr::Var(_, name) => {
+            EExpr::BinOp(_, _, lhs, _, _) => match lhs.as_ref() {
+                EExpr::Var(_, name, _) => {
                     assert_eq!(
                         name, "o",
                         "pred param 'o' should not be alias-rewritten, got '{name}'"
@@ -1415,7 +1476,7 @@ mod tests {
         assert_eq!(env.axioms.len(), 1);
         let axiom = &env.axioms[0];
         match &axiom.body {
-            EExpr::Quant(_, _, _, domain_ty, _) => {
+            EExpr::Quant(_, _, _, domain_ty, _, _) => {
                 assert!(
                     matches!(domain_ty, Ty::Entity(n) if n == "Bed"),
                     "axiom quantifier domain should be Entity(\"Bed\"), got {domain_ty:?}"

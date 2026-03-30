@@ -95,6 +95,7 @@ pub fn create_slot_pool(
                             IRType::Real | IRType::Float => smt::real_var(&name),
                             IRType::Map { .. } | IRType::Set { .. } | IRType::Seq { .. } => {
                                 smt::array_var(&name, &field.ty)
+                                    .expect("internal: array sort expected for Map/Set/Seq field")
                             }
                             _ => smt::int_var(&name),
                         }
@@ -254,7 +255,7 @@ pub fn encode_action(
 
     // Guard: encode the requires clause for this slot at this step
     let guard = encode_slot_expr(&ctx, &action.guard, step);
-    conjuncts.push(guard.to_bool());
+    conjuncts.push(guard.to_bool().expect("internal: guard to_bool"));
 
     // Updates: for each primed assignment, set the field at step+1
     let updated_fields: Vec<String> = action.updates.iter().map(|u| u.field.clone()).collect();
@@ -262,7 +263,7 @@ pub fn encode_action(
     for update in &action.updates {
         let new_val = encode_slot_expr(&ctx, &update.value, step);
         if let Some(field_next) = pool.field_at(&entity.name, slot, &update.field, step + 1) {
-            conjuncts.push(smt::smt_eq(&new_val, field_next));
+            conjuncts.push(smt::smt_eq(&new_val, field_next).expect("internal: update smt_eq"));
         }
     }
 
@@ -273,7 +274,7 @@ pub fn encode_action(
                 pool.field_at(&entity.name, slot, &field.name, step),
                 pool.field_at(&entity.name, slot, &field.name, step + 1),
             ) {
-                conjuncts.push(smt::smt_eq(curr, next));
+                conjuncts.push(smt::smt_eq(curr, next).expect("internal: frame smt_eq"));
             }
         }
     }
@@ -316,14 +317,15 @@ pub fn encode_action_with_vars(
 
     // Guard: evaluate against read_vars
     let guard = eval_expr_with_vars(&action.guard, entity, read_vars, vctx, params);
-    conjuncts.push(guard.to_bool());
+    conjuncts.push(guard.to_bool().expect("internal: chained guard to_bool"));
 
     // Updates: evaluate value from read_vars, constrain write_vars
     let updated_fields: Vec<String> = action.updates.iter().map(|u| u.field.clone()).collect();
     for update in &action.updates {
         let new_val = eval_expr_with_vars(&update.value, entity, read_vars, vctx, params);
         if let Some(write_val) = write_vars.get(&update.field) {
-            conjuncts.push(smt::smt_eq(&new_val, write_val));
+            conjuncts
+                .push(smt::smt_eq(&new_val, write_val).expect("internal: chained update smt_eq"));
         }
     }
 
@@ -333,7 +335,9 @@ pub fn encode_action_with_vars(
             if let (Some(read_val), Some(write_val)) =
                 (read_vars.get(&field.name), write_vars.get(&field.name))
             {
-                conjuncts.push(smt::smt_eq(read_val, write_val));
+                conjuncts.push(
+                    smt::smt_eq(read_val, write_val).expect("internal: chained frame smt_eq"),
+                );
             }
         }
     }
@@ -404,11 +408,11 @@ fn eval_expr_with_vars(
         } => {
             let l = eval_expr_with_vars(left, entity, vars, vctx, params);
             let r = eval_expr_with_vars(right, entity, vars, vctx, params);
-            smt::binop(op, &l, &r)
+            smt::binop(op, &l, &r).expect("internal: chained binop")
         }
         IRExpr::UnOp { op, operand, .. } => {
             let v = eval_expr_with_vars(operand, entity, vars, vctx, params);
-            smt::unop(op, &v)
+            smt::unop(op, &v).expect("internal: chained unop")
         }
         IRExpr::MapUpdate {
             map, key, value, ..
@@ -416,12 +420,20 @@ fn eval_expr_with_vars(
             let arr = eval_expr_with_vars(map, entity, vars, vctx, params);
             let k = eval_expr_with_vars(key, entity, vars, vctx, params);
             let v = eval_expr_with_vars(value, entity, vars, vctx, params);
-            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+            SmtValue::Array(
+                arr.as_array()
+                    .expect("internal: chained map update as_array")
+                    .store(&k.to_dynamic(), &v.to_dynamic()),
+            )
         }
         IRExpr::Index { map, key, .. } => {
             let arr = eval_expr_with_vars(map, entity, vars, vctx, params);
             let k = eval_expr_with_vars(key, entity, vars, vctx, params);
-            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+            SmtValue::Dynamic(
+                arr.as_array()
+                    .expect("internal: chained index as_array")
+                    .select(&k.to_dynamic()),
+            )
         }
         _ => panic!(
             "unsupported expression in chained action encoding: {:?}",
@@ -482,7 +494,8 @@ pub fn encode_create(
         for (field_name, value_expr) in create_fields {
             let val = encode_slot_expr(&ctx, value_expr, step);
             if let Some(field_next) = pool.field_at(entity_name, slot, field_name, step + 1) {
-                conjuncts.push(smt::smt_eq(&val, field_next));
+                conjuncts
+                    .push(smt::smt_eq(&val, field_next).expect("internal: create field smt_eq"));
             }
         }
 
@@ -499,7 +512,9 @@ pub fn encode_create(
                     if let Some(field_next) =
                         pool.field_at(entity_name, slot, &field.name, step + 1)
                     {
-                        conjuncts.push(smt::smt_eq(&val, field_next));
+                        conjuncts.push(
+                            smt::smt_eq(&val, field_next).expect("internal: create default smt_eq"),
+                        );
                     }
                 }
             }
@@ -552,7 +567,7 @@ pub fn stutter_constraint(pool: &SlotPool, entities: &[IREntity], step: usize) -
                     pool.field_at(&entity.name, slot, &field.name, step),
                     pool.field_at(&entity.name, slot, &field.name, step + 1),
                 ) {
-                    conjuncts.push(smt::smt_eq(curr, next));
+                    conjuncts.push(smt::smt_eq(curr, next).expect("internal: stutter smt_eq"));
                 }
             }
         }
@@ -595,7 +610,8 @@ fn frame_untouched_slots(
                     pool.field_at(&entity.name, slot, &field.name, step),
                     pool.field_at(&entity.name, slot, &field.name, step + 1),
                 ) {
-                    conjuncts.push(smt::smt_eq(curr, next));
+                    conjuncts
+                        .push(smt::smt_eq(curr, next).expect("internal: frame untouched smt_eq"));
                 }
             }
         }
@@ -635,7 +651,7 @@ fn frame_entity_slots_except(
                 pool.field_at(&entity.name, slot, &field.name, step),
                 pool.field_at(&entity.name, slot, &field.name, step + 1),
             ) {
-                conjuncts.push(smt::smt_eq(curr, next));
+                conjuncts.push(smt::smt_eq(curr, next).expect("internal: frame except smt_eq"));
             }
         }
     }
@@ -743,6 +759,7 @@ fn encode_guard_inner(
             var,
             domain: IRType::Entity { name: entity_name },
             body,
+            ..
         } => {
             let n_slots = pool.slots_for(entity_name);
             let mut disjuncts = Vec::new();
@@ -764,6 +781,7 @@ fn encode_guard_inner(
             var,
             domain: IRType::Entity { name: entity_name },
             body,
+            ..
         } => {
             let n_slots = pool.slots_for(entity_name);
             let mut conjuncts = Vec::new();
@@ -802,7 +820,9 @@ fn encode_guard_inner(
         } => Bool::from_bool(*value),
         // Non-boolean expressions (comparisons, field access, etc.) —
         // encode as value using the guard context bindings
-        other => encode_guard_value(pool, vctx, ctx, other, step).to_bool(),
+        other => encode_guard_value(pool, vctx, ctx, other, step)
+            .to_bool()
+            .expect("internal: guard to_bool"),
     }
 }
 
@@ -863,13 +883,13 @@ fn encode_guard_value(
         } => {
             let l = encode_guard_value(pool, vctx, ctx, left, step);
             let r = encode_guard_value(pool, vctx, ctx, right, step);
-            smt::binop(op, &l, &r)
+            smt::binop(op, &l, &r).expect("internal: guard binop")
         }
         IRExpr::UnOp { op, operand, .. } => {
             let v = encode_guard_value(pool, vctx, ctx, operand, step);
-            smt::unop(op, &v)
+            smt::unop(op, &v).expect("internal: guard unop")
         }
-        IRExpr::Prime { expr } => encode_guard_value(pool, vctx, ctx, expr, step + 1),
+        IRExpr::Prime { expr, .. } => encode_guard_value(pool, vctx, ctx, expr, step + 1),
         other => panic!("unsupported expression in guard value encoding: {other:?}"),
     }
 }
@@ -1069,7 +1089,7 @@ fn encode_event_inner(
 
                     // Filter must hold
                     let filt = encode_slot_expr(&ctx, filter, step);
-                    slot_conjuncts.push(filt.to_bool());
+                    slot_conjuncts.push(filt.to_bool().expect("internal: choose filter to_bool"));
 
                     // Apply nested ops — detect multi-apply chains and use
                     // intermediate variables for sequential composition.
@@ -1177,6 +1197,7 @@ fn encode_event_inner(
                                                 | IRType::Set { .. }
                                                 | IRType::Seq { .. } => {
                                                     smt::array_var(&name, &f.ty)
+                                                        .expect("internal: array sort expected for Map/Set/Seq field")
                                                 }
                                                 _ => smt::int_var(&name),
                                             };
@@ -1557,7 +1578,10 @@ fn encode_event_inner(
                                     pool.field_at(ent_name, slot, &field.name, step),
                                     pool.field_at(ent_name, slot, &field.name, step + 1),
                                 ) {
-                                    frame_parts.push(smt::smt_eq(curr, next));
+                                    frame_parts.push(
+                                        smt::smt_eq(curr, next)
+                                            .expect("internal: forall frame smt_eq"),
+                                    );
                                 }
                             }
                         }
@@ -1650,7 +1674,7 @@ fn encode_event_inner(
                     bindings: HashMap::new(),
                 };
                 let val = encode_slot_expr(&expr_ctx, expr, step);
-                conjuncts.push(val.to_bool());
+                conjuncts.push(val.to_bool().expect("internal: expr_stmt to_bool"));
             }
         }
     }
@@ -1760,12 +1784,12 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
         } => {
             let l = encode_slot_expr(ctx, left, step);
             let r = encode_slot_expr(ctx, right, step);
-            smt::binop(op, &l, &r)
+            smt::binop(op, &l, &r).expect("internal: slot binop")
         }
 
         IRExpr::UnOp { op, operand, .. } => {
             let v = encode_slot_expr(ctx, operand, step);
-            smt::unop(op, &v)
+            smt::unop(op, &v).expect("internal: slot unop")
         }
 
         IRExpr::Field {
@@ -1795,7 +1819,7 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
             );
         }
 
-        IRExpr::Prime { expr } => encode_slot_expr(ctx, expr, step + 1),
+        IRExpr::Prime { expr, .. } => encode_slot_expr(ctx, expr, step + 1),
 
         IRExpr::MapUpdate {
             map, key, value, ..
@@ -1803,16 +1827,24 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
             let arr = encode_slot_expr(ctx, map, step);
             let k = encode_slot_expr(ctx, key, step);
             let v = encode_slot_expr(ctx, value, step);
-            SmtValue::Array(arr.as_array().store(&k.to_dynamic(), &v.to_dynamic()))
+            SmtValue::Array(
+                arr.as_array()
+                    .expect("internal: slot map update as_array")
+                    .store(&k.to_dynamic(), &v.to_dynamic()),
+            )
         }
 
         IRExpr::Index { map, key, .. } => {
             let arr = encode_slot_expr(ctx, map, step);
             let k = encode_slot_expr(ctx, key, step);
-            SmtValue::Dynamic(arr.as_array().select(&k.to_dynamic()))
+            SmtValue::Dynamic(
+                arr.as_array()
+                    .expect("internal: slot index as_array")
+                    .select(&k.to_dynamic()),
+            )
         }
 
-        IRExpr::MapLit { entries, ty } => {
+        IRExpr::MapLit { entries, ty, .. } => {
             // Build constant array with default value, then store each entry
             let (key_ty, val_ty) = match ty {
                 IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
@@ -1829,7 +1861,7 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
             SmtValue::Array(arr)
         }
 
-        IRExpr::SetLit { elements, ty } => {
+        IRExpr::SetLit { elements, ty, .. } => {
             // Set as characteristic function: Array<T, Bool>
             let elem_ty = match ty {
                 IRType::Set { element } => element.as_ref(),
@@ -1846,7 +1878,7 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
             SmtValue::Array(arr)
         }
 
-        IRExpr::SeqLit { elements, ty } => {
+        IRExpr::SeqLit { elements, ty, .. } => {
             // Seq as int-indexed array: Array<Int, T>
             let elem_ty = match ty {
                 IRType::Seq { element } => element.as_ref(),
@@ -1862,7 +1894,7 @@ pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> 
             SmtValue::Array(arr)
         }
 
-        IRExpr::Card { expr: inner } => match inner.as_ref() {
+        IRExpr::Card { expr: inner, .. } => match inner.as_ref() {
             IRExpr::SetLit { elements, .. } => {
                 let unique: std::collections::HashSet<String> =
                     elements.iter().map(|e| format!("{e:?}")).collect();
@@ -1943,18 +1975,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -2148,12 +2188,18 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "amount".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "balance".to_owned(),
@@ -2162,12 +2208,18 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "balance".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Var {
                             name: "amount".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         ty: IRType::Int,
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -2262,6 +2314,8 @@ mod tests {
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             },
             postcondition: None,
             body: vec![IRAction::ForAll {
@@ -2274,6 +2328,8 @@ mod tests {
                     args: vec![IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 10 },
+
+                        span: None,
                     }],
                 }],
             }],
@@ -2364,6 +2420,8 @@ mod tests {
             IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: 100 },
+
+                span: None,
             },
         )];
         let formula = encode_create(

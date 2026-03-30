@@ -4,6 +4,7 @@ pub mod elab;
 pub mod ir;
 pub mod lex;
 pub mod loader;
+pub mod messages;
 pub mod parse;
 pub mod span;
 pub mod verify;

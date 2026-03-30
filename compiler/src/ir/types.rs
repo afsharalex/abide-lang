@@ -5,6 +5,8 @@
 
 use serde::Serialize;
 
+use crate::span::Span;
+
 // ── Types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -62,16 +64,22 @@ pub enum IRExpr {
         #[serde(rename = "type")]
         ty: IRType,
         value: LitVal,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Var {
         name: std::string::String,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Ctor {
         #[serde(rename = "enum")]
         enum_name: std::string::String,
         ctor: std::string::String,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     BinOp {
         op: std::string::String,
@@ -79,57 +87,81 @@ pub enum IRExpr {
         right: Box<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     UnOp {
         op: std::string::String,
         operand: Box<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     App {
         func: Box<IRExpr>,
         arg: Box<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Lam {
         param: std::string::String,
         #[serde(rename = "paramType")]
         param_type: IRType,
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Let {
         bindings: Vec<LetBinding>,
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Forall {
         var: std::string::String,
         domain: IRType,
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Exists {
         var: std::string::String,
         domain: IRType,
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Field {
         expr: Box<IRExpr>,
         field: std::string::String,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Prime {
         expr: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Always {
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Eventually {
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Match {
         scrutinee: Box<IRExpr>,
         arms: Vec<IRMatchArm>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     MapUpdate {
         map: Box<IRExpr>,
@@ -137,27 +169,37 @@ pub enum IRExpr {
         value: Box<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     Index {
         map: Box<IRExpr>,
         key: Box<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     SetLit {
         elements: Vec<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     SeqLit {
         elements: Vec<IRExpr>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     MapLit {
         entries: Vec<(IRExpr, IRExpr)>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     SetComp {
         var: std::string::String,
@@ -166,13 +208,23 @@ pub enum IRExpr {
         projection: Option<Box<IRExpr>>,
         #[serde(rename = "type")]
         ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
     },
     /// Cardinality: `#S` — count of elements in a set/collection.
     Card {
         expr: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
     },
-    Sorry,
-    Todo,
+    Sorry {
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    Todo {
+        #[serde(skip)]
+        span: Option<Span>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -347,6 +399,12 @@ pub struct IRVerify {
     pub name: std::string::String,
     pub systems: Vec<IRVerifySystem>,
     pub asserts: Vec<IRExpr>,
+    /// Source span of the verify block (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -362,12 +420,24 @@ pub struct IRTheorem {
     pub systems: Vec<std::string::String>,
     pub invariants: Vec<IRExpr>,
     pub shows: Vec<IRExpr>,
+    /// Source span of the theorem block (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRAxiom {
     pub name: std::string::String,
     pub body: IRExpr,
+    /// Source span of the axiom declaration (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -378,6 +448,12 @@ pub struct IRScene {
     pub events: Vec<IRSceneEvent>,
     pub ordering: Vec<IRExpr>,
     pub assertions: Vec<IRExpr>,
+    /// Source span of the scene block (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -423,6 +499,12 @@ pub struct IRFunction {
     /// None for preds and fns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prop_target: Option<std::string::String>,
+    /// Source span (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
 }
 
 // ── Top-level program ────────────────────────────────────────────────

@@ -272,31 +272,25 @@ impl Parser {
             Some(Token::Lemma) => Ok(TopDecl::Lemma(self.lemma_decl()?)),
             Some(Token::Scene) => Ok(TopDecl::Scene(self.scene_decl()?)),
             Some(Token::Axiom) => Ok(TopDecl::Axiom(self.axiom_decl()?)),
-            // Detect removed/renamed keywords and suggest fixes
-            Some(Token::Name(ref name)) if name == "import" => {
-                Err(ParseError::expected_with_help(
-                    "top-level declaration",
-                    "`import`",
-                    self.cur_span(),
-                    "'import' was removed — use 'module' to declare membership and 'include' for file contents",
-                ))
-            }
-            Some(Token::Name(ref name)) if name == "proof" => {
-                Err(ParseError::expected_with_help(
-                    "top-level declaration",
-                    "`proof`",
-                    self.cur_span(),
-                    "'proof' was replaced by 'theorem' — use 'theorem name for System { show ... }'",
-                ))
-            }
-            Some(Token::Name(ref name)) if name == "field" => {
-                Err(ParseError::expected_with_help(
-                    "top-level declaration",
-                    "`field`",
-                    self.cur_span(),
-                    "'field' keyword was removed — declare fields directly inside entity: 'name: Type'",
-                ))
-            }
+            // Detect invalid keywords and suggest correct syntax
+            Some(Token::Name(ref name)) if name == "import" => Err(ParseError::expected_with_help(
+                "top-level declaration",
+                "`import`",
+                self.cur_span(),
+                crate::messages::HINT_IMPORT_KEYWORD,
+            )),
+            Some(Token::Name(ref name)) if name == "proof" => Err(ParseError::expected_with_help(
+                "top-level declaration",
+                "`proof`",
+                self.cur_span(),
+                crate::messages::HINT_PROOF_KEYWORD,
+            )),
+            Some(Token::Name(ref name)) if name == "field" => Err(ParseError::expected_with_help(
+                "top-level declaration",
+                "`field`",
+                self.cur_span(),
+                crate::messages::HINT_FIELD_KEYWORD_TOP,
+            )),
             Some(tok) => Err(ParseError::expected(
                 "top-level declaration",
                 &format!("`{tok}`"),
@@ -632,12 +626,12 @@ impl Parser {
         match self.peek() {
             Some(Token::Action) => Ok(EntityItem::Action(self.entity_action()?)),
             Some(Token::Name(ref name)) if name == "field" => {
-                // Detect removed 'field' keyword inside entity body
+                // Detect invalid 'field' keyword inside entity body
                 Err(ParseError::expected_with_help(
                     "field declaration or `action`",
                     "`field`",
                     self.cur_span(),
-                    "the 'field' keyword was removed — write fields directly: 'name: Type' or 'name: Type = default'",
+                    crate::messages::HINT_FIELD_KEYWORD_ENTITY,
                 ))
             }
             Some(Token::Name(_)) => Ok(EntityItem::Field(self.field_decl()?)),
@@ -776,7 +770,7 @@ impl Parser {
                 "`use`, `event`, or `next`",
                 "`uses`",
                 self.cur_span(),
-                "'uses' was replaced by 'use' — write 'use EntityName'",
+                crate::messages::HINT_USES_KEYWORD,
             )),
             Some(tok) => Err(ParseError::expected(
                 "`use`, `event`, or `next`",
@@ -815,22 +809,18 @@ impl Parser {
             Some(Token::For) => Ok(EventItem::For(self.for_block()?)),
             Some(Token::Create) => Ok(EventItem::Create(self.create_block()?)),
             // Detect wrong-context keywords with helpful suggestions
-            Some(Token::Given | Token::Then) => {
-                Err(ParseError::expected_with_help(
-                    "event body item",
-                    &format!("`{}`", self.peek().unwrap()),
-                    self.cur_span(),
-                    "event bodies contain: 'choose', 'for', 'create', or expressions like 'entity.action()'",
-                ))
-            }
-            Some(Token::Assert) => {
-                Err(ParseError::expected_with_help(
-                    "event body item",
-                    "`assert`",
-                    self.cur_span(),
-                    "'assert' belongs in verify blocks, not event bodies. Did you mean 'requires'?",
-                ))
-            }
+            Some(Token::Given | Token::Then) => Err(ParseError::expected_with_help(
+                "event body item",
+                &format!("`{}`", self.peek().unwrap()),
+                self.cur_span(),
+                crate::messages::HINT_EVENT_BODY,
+            )),
+            Some(Token::Assert) => Err(ParseError::expected_with_help(
+                "event body item",
+                "`assert`",
+                self.cur_span(),
+                crate::messages::HINT_ASSERT_IN_EVENT,
+            )),
             _ => Ok(EventItem::Expr(self.expr()?)),
         }
     }
@@ -1017,7 +1007,7 @@ impl Parser {
                         "`assert` or `}`",
                         &format!("`{tok}`"),
                         self.cur_span(),
-                        "verify blocks contain 'assert <expression>' statements",
+                        crate::messages::HINT_VERIFY_BODY,
                     ));
                 }
                 None => return Err(ParseError::eof(self.cur_span())),
@@ -1101,7 +1091,7 @@ impl Parser {
                         "`show` or `}`",
                         "`assert`",
                         self.cur_span(),
-                        "theorem blocks use 'show', not 'assert' — write 'show <expression>'",
+                        crate::messages::HINT_THEOREM_BODY,
                     ));
                 }
                 Some(tok) => {
@@ -1109,7 +1099,7 @@ impl Parser {
                         "`show` or `}`",
                         &format!("`{tok}`"),
                         self.cur_span(),
-                        "theorem blocks contain 'show <expression>' statements",
+                        crate::messages::HINT_THEOREM_BODY_SHOW,
                     ));
                 }
                 None => return Err(ParseError::eof(self.cur_span())),
@@ -1286,7 +1276,7 @@ impl Parser {
                 "`given`, `when`, or `then`",
                 &format!("`{tok}`"),
                 self.cur_span(),
-                "scene blocks contain: given { let v = one Entity where ... }, when { action ... }, then { assert ... }",
+                crate::messages::HINT_SCENE_BODY_STRUCTURE,
             )),
             None => Err(ParseError::eof(self.cur_span())),
         }

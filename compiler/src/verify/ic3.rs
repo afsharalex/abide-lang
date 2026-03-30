@@ -796,13 +796,14 @@ fn negate_property_smt_system(
     slots_per_entity: &HashMap<String, usize>,
 ) -> Result<String, String> {
     match property {
-        IRExpr::Always { body } => {
+        IRExpr::Always { body, .. } => {
             negate_property_smt_system(body, entities, vctx, slots_per_entity)
         }
         IRExpr::Forall {
             var,
             domain: IRType::Entity { name: entity_name },
             body,
+            ..
         } => {
             let n_slots = slots_per_entity.get(entity_name).copied().unwrap_or(1);
             let entity = entities
@@ -815,6 +816,7 @@ fn negate_property_smt_system(
                 var: var2,
                 domain: IRType::Entity { name: ent2 },
                 body: inner,
+                ..
             } = body.as_ref()
             {
                 let n_slots2 = slots_per_entity.get(ent2).copied().unwrap_or(1);
@@ -1900,7 +1902,7 @@ fn negate_property_smt_multi(
     n_slots: usize,
 ) -> Result<String, String> {
     match property {
-        IRExpr::Always { body } => negate_property_smt_multi(body, entity, vctx, n_slots),
+        IRExpr::Always { body, .. } => negate_property_smt_multi(body, entity, vctx, n_slots),
         IRExpr::Forall { var, body, .. } => {
             // Check if body is another Forall (nested inter-entity quantifier)
             if let IRExpr::Forall {
@@ -2543,7 +2545,7 @@ fn negate_property_smt(
 ) -> Result<String, String> {
     match property {
         // Strip always — IC3 proves always by construction
-        IRExpr::Always { body } => negate_property_smt(body, entity, vctx),
+        IRExpr::Always { body, .. } => negate_property_smt(body, entity, vctx),
         // Strip forall over entity — IC3 checks per-entity
         IRExpr::Forall { body, .. } => negate_property_smt(body, entity, vctx),
         _ => {
@@ -2623,6 +2625,8 @@ mod tests {
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -2631,6 +2635,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -2644,18 +2650,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -2669,18 +2683,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Shipped".to_owned(),
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -2717,12 +2739,18 @@ mod tests {
             left: Box::new(IRExpr::Var {
                 name: "status".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             right: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: -1 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
@@ -2754,17 +2782,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "total".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
@@ -2786,12 +2826,18 @@ mod tests {
             left: Box::new(IRExpr::Var {
                 name: "status".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             right: Box::new(IRExpr::Ctor {
                 enum_name: "Status".to_owned(),
                 ctor: "Pending".to_owned(),
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
@@ -2814,12 +2860,18 @@ mod tests {
             left: Box::new(IRExpr::Var {
                 name: "status".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             right: Box::new(IRExpr::Ctor {
                 enum_name: "Status".to_owned(),
                 ctor: "Pending".to_owned(),
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
@@ -3014,12 +3066,18 @@ mod tests {
                 expr: IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 1 },
+
+                    span: None,
                 },
             }],
             body: Box::new(IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_single_entity(&entity, &vctx, &property, 5000);
@@ -3052,17 +3110,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "total".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 2, 5000);
@@ -3093,17 +3163,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 2, 5000);
@@ -3125,12 +3207,18 @@ mod tests {
             left: Box::new(IRExpr::Var {
                 name: "status".to_owned(),
                 ty: IRType::Int,
+
+                span: None,
             }),
             right: Box::new(IRExpr::Lit {
                 ty: IRType::Int,
                 value: LitVal::Int { value: -1 },
+
+                span: None,
             }),
             ty: IRType::Bool,
+
+            span: None,
         };
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 1, 5000);
@@ -3170,15 +3258,23 @@ mod tests {
                                     ty: IRType::Entity {
                                         name: "Order".to_owned(),
                                     },
+
+                                    span: None,
                                 }),
                                 field: "total".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 0 },
+
+                                span: None,
                             }),
                             ty: IRType::Bool,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::BinOp {
                             op: "OpGe".to_owned(),
@@ -3188,20 +3284,36 @@ mod tests {
                                     ty: IRType::Entity {
                                         name: "Order".to_owned(),
                                     },
+
+                                    span: None,
                                 }),
                                 field: "total".to_owned(),
                                 ty: IRType::Int,
+
+                                span: None,
                             }),
                             right: Box::new(IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 0 },
+
+                                span: None,
                             }),
                             ty: IRType::Bool,
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 3, 10000);
@@ -3236,17 +3348,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Var {
                             name: "b".to_owned(),
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let result = try_ic3_multi_slot(&entity, &vctx, &property, 3, 5000);
@@ -3285,6 +3409,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -3296,6 +3422,8 @@ mod tests {
                     default: Some(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                 },
             ],
@@ -3308,18 +3436,26 @@ mod tests {
                     left: Box::new(IRExpr::Var {
                         name: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 },
                 updates: vec![IRUpdate {
                     field: "status".to_owned(),
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
+
+                        span: None,
                     },
                 }],
                 postcondition: None,
@@ -3340,6 +3476,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -3373,17 +3511,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "total".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let mut slots = HashMap::new();
@@ -3434,6 +3584,8 @@ mod tests {
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                 },
                 IRField {
@@ -3442,6 +3594,8 @@ mod tests {
                     default: Some(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                 },
             ],
@@ -3455,18 +3609,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -3480,18 +3642,26 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     },
                     updates: vec![IRUpdate {
                         field: "status".to_owned(),
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Shipped".to_owned(),
+
+                            span: None,
                         },
                     }],
                     postcondition: None,
@@ -3509,6 +3679,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -3519,12 +3691,18 @@ mod tests {
                         left: Box::new(IRExpr::Var {
                             name: "status".to_owned(),
                             ty: IRType::Int,
+
+                            span: None,
                         }),
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
+
+                            span: None,
                         }),
                         ty: IRType::Bool,
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "o".to_owned(),
@@ -3567,17 +3745,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "total".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         (ir, property)
@@ -3630,6 +3820,8 @@ mod tests {
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Pending".to_owned(),
+
+                    span: None,
                 }),
             }],
             transitions: vec![], // no transitions defined
@@ -3644,6 +3836,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -3652,6 +3846,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "o".to_owned(),
@@ -3683,6 +3879,8 @@ mod tests {
         let property = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
+
+            span: None,
         };
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
@@ -3706,6 +3904,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -3720,6 +3920,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::CrossCall {
@@ -3750,6 +3952,8 @@ mod tests {
         let property = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
+
+            span: None,
         };
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
@@ -3774,6 +3978,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 1 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -3789,6 +3995,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Create {
@@ -3798,6 +4006,8 @@ mod tests {
                         value: IRExpr::Lit {
                             ty: IRType::Int,
                             value: LitVal::Int { value: 5 },
+
+                            span: None,
                         },
                     }],
                 }],
@@ -3818,6 +4028,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::CrossCall {
@@ -3860,17 +4072,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Item".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "qty".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let mut slots = HashMap::new();
@@ -3907,6 +4131,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::ForAll {
@@ -3961,6 +4187,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -3974,6 +4202,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 1 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -3988,6 +4218,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::ForAll {
@@ -4000,6 +4232,8 @@ mod tests {
                             value: IRExpr::Lit {
                                 ty: IRType::Int,
                                 value: LitVal::Int { value: 3 },
+
+                                span: None,
                             },
                         }],
                     }],
@@ -4039,17 +4273,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Item".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "qty".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Lit {
                         ty: IRType::Int,
                         value: LitVal::Int { value: 0 },
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let mut slots = HashMap::new();
@@ -4079,6 +4325,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: false },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -4087,6 +4335,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "o".to_owned(),
@@ -4123,17 +4373,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let mut slots = HashMap::new();
@@ -4179,17 +4441,29 @@ mod tests {
                             ty: IRType::Entity {
                                 name: "Order".to_owned(),
                             },
+
+                            span: None,
                         }),
                         field: "status".to_owned(),
                         ty: IRType::Int,
+
+                        span: None,
                     }),
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Shipped".to_owned(),
+
+                        span: None,
                     }),
                     ty: IRType::Bool,
+
+                    span: None,
                 }),
+
+                span: None,
             }),
+
+            span: None,
         };
 
         let mut slots = HashMap::new();
@@ -4244,6 +4518,8 @@ mod tests {
                 default: Some(IRExpr::Lit {
                     ty: IRType::Int,
                     value: LitVal::Int { value: 0 },
+
+                    span: None,
                 }),
             }],
             transitions: vec![],
@@ -4258,6 +4534,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::CrossCall {
@@ -4281,6 +4559,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::CrossCall {
@@ -4311,6 +4591,8 @@ mod tests {
         let property = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
+
+            span: None,
         };
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);
@@ -4337,6 +4619,8 @@ mod tests {
                 guard: IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
+
+                    span: None,
                 },
                 postcondition: None,
                 body: vec![IRAction::Choose {
@@ -4345,6 +4629,8 @@ mod tests {
                     filter: Box::new(IRExpr::Lit {
                         ty: IRType::Bool,
                         value: LitVal::Bool { value: true },
+
+                        span: None,
                     }),
                     ops: vec![IRAction::Apply {
                         target: "wrong_var".to_owned(), // mismatch!
@@ -4369,6 +4655,8 @@ mod tests {
         let property = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
+
+            span: None,
         };
         let mut slots = HashMap::new();
         slots.insert("Order".to_owned(), 1);

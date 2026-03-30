@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use crate::elab::collect;
 use crate::elab::env::Env;
-use crate::elab::error::{ElabError, ErrorKind};
 
 /// Load one or more source files into a single elaboration environment.
 ///
@@ -88,6 +87,9 @@ fn load_file_into(
         env.module_name = Some(pm.to_string());
     }
 
+    let saved_file = env.current_file.take();
+    env.current_file = Some(path.display().to_string());
+
     let errors_before = env.errors.len();
     collect::collect_into(env, &program);
 
@@ -102,13 +104,17 @@ fn load_file_into(
     // This file's effective module (either from its own `module` decl or inherited)
     let file_module = env.module_name.clone();
 
-    // Restore the previous module context if it existed.
-    // For the first file (saved=None), keep the file's module as the root.
+    // Restore the previous module/file context.
+    // For the first file (saved=None), keep the file's module/file as the root.
     // For subsequent files, restore so each file gets its own scope.
     if saved_module.is_some() {
         env.module_name = saved_module;
     }
     // else: keep file_module (first file sets the root module)
+    if saved_file.is_some() {
+        env.current_file = saved_file;
+    }
+    // else: keep current_file (first file sets the root file for resolve/check tagging)
 
     // Process include directives: resolve paths relative to this file's directory.
     // Included files inherit this file's module (DDR-028: "contents become part
@@ -136,72 +142,17 @@ fn load_file_into(
                 // Included files inherit this file's module.
                 // Don't short-circuit on error — continue processing sibling includes.
                 if let Err(e) = load_file_into(env, &canonical, visited, file_module.as_deref()) {
-                    match e {
-                        LoadError::ParseErrors {
-                            path: err_path,
-                            errors,
-                        } => {
-                            // Preserve each parse error with its span for diagnostic rendering
-                            let file_tag = err_path.display().to_string();
-                            for pe in &errors {
-                                let (msg, pe_span) = match pe {
-                                    crate::diagnostic::ParseError::Expected {
-                                        expected,
-                                        found,
-                                        span,
-                                        ..
-                                    } => {
-                                        (format!("expected {expected}, found {found}"), Some(*span))
-                                    }
-                                    crate::diagnostic::ParseError::UnexpectedEof { span } => {
-                                        ("unexpected end of input".to_string(), Some(*span))
-                                    }
-                                    crate::diagnostic::ParseError::General {
-                                        msg, span, ..
-                                    } => (msg.clone(), Some(*span)),
-                                };
-                                let err = if let Some(s) = pe_span {
-                                    let abide_span = crate::span::Span {
-                                        start: s.offset(),
-                                        end: s.offset() + s.len(),
-                                    };
-                                    ElabError::with_span(
-                                        ErrorKind::UndefinedRef,
-                                        format!("in included file '{inc_path}': {msg}"),
-                                        String::new(),
-                                        abide_span,
-                                    )
-                                    .in_file(file_tag.clone())
-                                } else {
-                                    ElabError::new(
-                                        ErrorKind::UndefinedRef,
-                                        format!("in included file '{inc_path}': {msg}"),
-                                        String::new(),
-                                    )
-                                };
-                                env.errors.push(err);
-                            }
-                        }
-                        other => {
-                            env.errors.push(ElabError::new(
-                                ErrorKind::UndefinedRef,
-                                format!("error loading included file '{inc_path}': {other}"),
-                                String::new(),
-                            ));
-                        }
-                    }
+                    // Preserve all include load errors as structured LoadError
+                    // for miette rendering (parse, lex, and IO errors alike).
+                    env.include_load_errors.push(e);
                 }
             }
-            Err(e) => {
-                env.errors.push(ElabError::new(
-                    ErrorKind::UndefinedRef,
-                    format!(
-                        "include file not found: '{}' (resolved to '{}')",
-                        inc_path,
-                        resolved.display()
-                    ),
-                    e.to_string(),
-                ));
+            Err(_) => {
+                // File not found — create a structured Io error
+                env.include_load_errors.push(LoadError::Io {
+                    path: resolved,
+                    error: format!("include file not found: '{inc_path}'"),
+                });
             }
         }
     }
@@ -217,39 +168,23 @@ fn canonicalize(path: &Path) -> Result<PathBuf, LoadError> {
 }
 
 /// Errors that can occur during file loading (before elaboration).
-#[derive(Debug)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum LoadError {
-    Io {
-        path: PathBuf,
-        error: String,
-    },
+    #[error("failed to read {}: {error}", path.display())]
+    Io { path: PathBuf, error: String },
+
+    #[error("{} lex error(s) in {}", errors.len(), path.display())]
     Lex {
         path: PathBuf,
         errors: Vec<crate::diagnostic::LexError>,
     },
+
+    #[error("{} parse error(s) in {}", errors.len(), path.display())]
     ParseErrors {
         path: PathBuf,
         errors: Vec<crate::diagnostic::ParseError>,
     },
 }
-
-impl std::fmt::Display for LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoadError::Io { path, error } => {
-                write!(f, "failed to read {}: {error}", path.display())
-            }
-            LoadError::Lex { path, errors } => {
-                write!(f, "lex error in {}: {:?}", path.display(), errors)
-            }
-            LoadError::ParseErrors { path, errors } => {
-                write!(f, "{} parse error(s) in {}", errors.len(), path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for LoadError {}
 
 #[cfg(test)]
 mod tests {
@@ -283,26 +218,19 @@ mod tests {
         // The bad include should produce errors but not block the good include
         assert!(
             load_errors.is_empty(),
-            "top-level load should succeed; include errors go to env.errors: {load_errors:?}"
+            "top-level load should succeed; include errors go to env.include_load_errors: {load_errors:?}"
         );
 
-        // env.errors should contain parse error diagnostics from the bad include
+        // env.include_load_errors should contain the structured parse error from the bad include
         let include_errors: Vec<_> = env
-            .errors
+            .include_load_errors
             .iter()
-            .filter(|e| e.message.contains("included file"))
+            .filter(|e| matches!(e, LoadError::ParseErrors { .. }))
             .collect();
         assert!(
             !include_errors.is_empty(),
-            "should have include parse error in env.errors: {:?}",
-            env.errors
-        );
-
-        // The parse error should have a span (preserved from ParseError)
-        assert!(
-            include_errors.iter().any(|e| e.span.is_some()),
-            "include parse errors should preserve spans: {:?}",
-            include_errors
+            "should have structured ParseErrors in include_load_errors: {:?}",
+            env.include_load_errors
         );
 
         // The good include's type should be present in the env
