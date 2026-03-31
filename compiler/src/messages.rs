@@ -101,6 +101,17 @@ pub const REFINEMENT_PREDICATE_NOT_BOOL: &str = "refinement predicate must have 
 /// Help for refinement predicate type mismatch.
 pub const HELP_REFINEMENT_BOOL: &str = "refinement predicates must evaluate to Bool (e.g., $ > 0)";
 
+/// Help for self-recursive functions missing decreases.
+pub const HELP_SELF_RECURSION_DECREASES: &str =
+    "add a 'decreases' clause to prove termination for recursive functions";
+
+/// Help for mutual fn-fn cycles — all participants need decreases.
+pub const HELP_MUTUAL_FN_DECREASES: &str = "add 'decreases' clauses to all functions in the cycle";
+
+/// Help for circular definitions involving preds/props (decreases not applicable).
+pub const HELP_CIRCULAR_DEFINITION: &str =
+    "preds and props cannot be recursive — break the cycle by inlining or restructuring";
+
 // ── Verification messages ────────────────────────────────────────────
 
 /// Scene check: unsatisfiable scenario.

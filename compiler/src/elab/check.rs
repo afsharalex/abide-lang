@@ -743,14 +743,25 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
     for name in all_names {
         if !visited.contains(&name) {
             if let Some(cycle) = dfs_find_cycle(&name, &deps, &mut visited, &mut in_stack) {
+                let is_self_recursive = cycle.len() == 2 && cycle.first() == cycle.last();
+                // Check if all names in the cycle are fns (decreases is applicable)
+                let cycle_names: Vec<&str> = cycle.iter().map(String::as_str).collect();
+                let all_fns = cycle_names
+                    .iter()
+                    .filter(|n| **n != cycle_names[0] || !is_self_recursive)
+                    .all(|n| env.fns.contains_key(*n));
                 let mut err = ElabError::new(
                     ErrorKind::CyclicDefinition,
                     format!("circular definition detected: {}", cycle.join(" → ")),
                     name.clone(),
                 );
-                err.help = Some(
-                    "recursive functions need a 'decreases' clause for termination checking".into(),
-                );
+                err.help = Some(if is_self_recursive && env.fns.contains_key(&name) {
+                    messages::HELP_SELF_RECURSION_DECREASES.into()
+                } else if all_fns {
+                    messages::HELP_MUTUAL_FN_DECREASES.into()
+                } else {
+                    messages::HELP_CIRCULAR_DEFINITION.into()
+                });
                 errors.push(err);
             }
         }
