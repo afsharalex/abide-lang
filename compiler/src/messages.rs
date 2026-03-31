@@ -95,6 +95,12 @@ pub const WHILE_MULTIPLE_DECREASES: &str =
 /// Error when if/else branches have different types.
 pub const IF_ELSE_TYPE_MISMATCH: &str = "if/else branches have different types";
 
+/// Error when refinement predicate is not Bool.
+pub const REFINEMENT_PREDICATE_NOT_BOOL: &str = "refinement predicate must have type Bool";
+
+/// Help for refinement predicate type mismatch.
+pub const HELP_REFINEMENT_BOOL: &str = "refinement predicates must evaluate to Bool (e.g., $ > 0)";
+
 // ── Verification messages ────────────────────────────────────────────
 
 /// Scene check: unsatisfiable scenario.

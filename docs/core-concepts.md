@@ -229,14 +229,28 @@ fn gcd(a: Int, b: Int): Int
 - `if`/`else` = conditional expression (both branches must have the same type)
 - Block evaluates to its last expression — no explicit `return` keyword
 
-**Refinement types** are under evaluation:
+**Refinement types** constrain values at the type level with predicates. Two forms are supported: type aliases and inline parameter refinements.
 
 ```abide
-// Under evaluation — see Proposal 031
+// Refinement type aliases
+type Positive = Int { $ > 0 }
+type Byte = Int { $ >= 0 and $ <= 255 }
 
-type Positive = Int{$ > 0}
-type Probability = Real{$ >= 0.0 and $ <= 1.0}
+// Inline refinement on parameters
+fn gcd(a: Int{$ > 0}, b: Int{$ > 0}): Int
+  ensures result > 0
+
+// Left-to-right parameter references — each parameter can reference parameters to its left
+fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int
+  ensures result >= lo and result <= hi
+
+// Parameter names can be used directly instead of $
+fn bounded(x: Int{x > 0}, y: Int{y > x}): Int
 ```
+
+The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: Int{$ > 0})` is equivalent to `fn f(x: Int) requires x > 0`.
+
+> **Note:** Refinement types are not allowed on return types — use `ensures` for return value constraints. This keeps the grammar unambiguous with imperative function bodies.
 
 At this layer, you're answering: *"Is this specific algorithm correct?"*
 

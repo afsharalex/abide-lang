@@ -464,7 +464,8 @@ impl Parser {
         let params = self.comma_sep(&Token::RParen, Parser::typed_param)?;
         self.expect(&Token::RParen)?;
         self.expect(&Token::Colon)?;
-        let ret_type = self.type_ref()?;
+        // Return type: no refinement allowed (use ensures for return constraints)
+        let ret_type = self.type_ref_no_refine()?;
         let contracts = self.contracts()?;
         // Two body forms:
         //   = expr     (pure, no contracts or contracts allowed)
@@ -610,6 +611,63 @@ impl Parser {
         }
     }
 
+    /// Parse a type reference without refinement (for fn return types).
+    /// Refinement types on return positions are not allowed — use `ensures` instead.
+    fn type_ref_no_refine(&mut self) -> Result<TypeRef, ParseError> {
+        let lhs = self.type_ref_atom_no_refine()?;
+        if self.eat(&Token::Arrow).is_some() {
+            let rhs = self.type_ref_no_refine()?;
+            let span = lhs.span.merge(rhs.span);
+            Ok(TypeRef {
+                kind: TypeRefKind::Fn(Box::new(lhs), Box::new(rhs)),
+                span,
+            })
+        } else {
+            Ok(lhs)
+        }
+    }
+
+    /// Parse a type ref atom without refinement support.
+    fn type_ref_atom_no_refine(&mut self) -> Result<TypeRef, ParseError> {
+        if self.eat(&Token::LParen).is_some() {
+            let start = self.cur_span();
+            let first = self.type_ref_no_refine()?;
+            if self.eat(&Token::Comma).is_some() {
+                let mut types = vec![first];
+                types.push(self.type_ref_no_refine()?);
+                while self.eat(&Token::Comma).is_some() {
+                    types.push(self.type_ref_no_refine()?);
+                }
+                let end = self.expect(&Token::RParen)?;
+                Ok(TypeRef {
+                    kind: TypeRefKind::Tuple(types),
+                    span: start.merge(end),
+                })
+            } else {
+                let end = self.expect(&Token::RParen)?;
+                Ok(TypeRef {
+                    kind: TypeRefKind::Paren(Box::new(first)),
+                    span: start.merge(end),
+                })
+            }
+        } else {
+            let (name, start) = self.expect_name()?;
+            if self.eat(&Token::Lt).is_some() {
+                let types = self.comma_sep(&Token::Gt, Parser::type_ref)?;
+                let end = self.expect(&Token::Gt)?;
+                Ok(TypeRef {
+                    kind: TypeRefKind::Param(name, types),
+                    span: start.merge(end),
+                })
+            } else {
+                Ok(TypeRef {
+                    kind: TypeRefKind::Simple(name),
+                    span: start,
+                })
+            }
+        }
+    }
+
     fn type_ref_atom(&mut self) -> Result<TypeRef, ParseError> {
         if self.eat(&Token::LParen).is_some() {
             let start = self.cur_span();
@@ -639,8 +697,31 @@ impl Parser {
             if self.eat(&Token::Lt).is_some() {
                 let types = self.comma_sep(&Token::Gt, Parser::type_ref)?;
                 let end = self.expect(&Token::Gt)?;
-                Ok(TypeRef {
+                let base = TypeRef {
                     kind: TypeRefKind::Param(name, types),
+                    span: start.merge(end),
+                };
+                // Check for refinement: T<A> { pred }
+                if self.eat(&Token::LBrace).is_some() {
+                    let pred = self.expr()?;
+                    let end_r = self.expect(&Token::RBrace)?;
+                    Ok(TypeRef {
+                        kind: TypeRefKind::RefineParam(Box::new(base), Box::new(pred)),
+                        span: start.merge(end_r),
+                    })
+                } else {
+                    Ok(base)
+                }
+            } else if self.eat(&Token::LBrace).is_some() {
+                // Refinement type: T { pred }
+                let pred = self.expr()?;
+                let end = self.expect(&Token::RBrace)?;
+                let base = TypeRef {
+                    kind: TypeRefKind::Simple(name),
+                    span: start,
+                };
+                Ok(TypeRef {
+                    kind: TypeRefKind::Refine(Box::new(base), Box::new(pred)),
                     span: start.merge(end),
                 })
             } else {
@@ -1987,6 +2068,14 @@ impl Parser {
     fn expr_atom(&mut self) -> Result<Expr, ParseError> {
         let start = self.cur_span();
         match self.peek() {
+            // Refinement placeholder: $
+            Some(Token::Dollar) => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Var("$".to_owned()),
+                    span: start,
+                })
+            }
             // State atoms: @Name, @Name::Name, @Name::Name::Name
             Some(Token::At) => {
                 self.advance();
@@ -4105,6 +4194,84 @@ pub type Distance = Real"#;
                     "single-expr block should unwrap, got {:?}",
                     f.body.kind
                 );
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    // ── Refinement type tests ───────────────────────────────────────
+
+    #[test]
+    fn refinement_type_alias() {
+        let prog = parse_program("type Positive = Int { $ > 0 }");
+        match &prog.decls[0] {
+            TopDecl::Alias(a) => match &a.target.kind {
+                TypeRefKind::Refine(base, pred) => {
+                    assert!(matches!(base.kind, TypeRefKind::Simple(ref n) if n == "Int"));
+                    assert!(matches!(pred.kind, ExprKind::Gt(_, _)));
+                }
+                other => panic!("expected Refine, got {other:?}"),
+            },
+            other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refinement_param_type() {
+        let prog = parse_program("fn f(x: Int{ $ > 0 }): Int = x");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert!(matches!(f.params[0].ty.kind, TypeRefKind::Refine(_, _)));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refinement_left_to_right() {
+        let prog = parse_program("fn clamp(lo: Int, hi: Int{ $ > lo }): Int = hi");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.params.len(), 2);
+                assert!(matches!(f.params[0].ty.kind, TypeRefKind::Simple(_)));
+                assert!(matches!(f.params[1].ty.kind, TypeRefKind::Refine(_, _)));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refinement_dollar_in_expr() {
+        let prog = parse_program("type Byte = Int { $ >= 0 and $ <= 255 }");
+        match &prog.decls[0] {
+            TopDecl::Alias(a) => {
+                assert!(matches!(a.target.kind, TypeRefKind::Refine(_, _)));
+            }
+            other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fn_body_not_confused_with_refinement() {
+        // fn without contracts + { body } must parse as fn body, not refinement
+        let prog = parse_program("fn sign(x: Int): Int { if x > 0 { 1 } else { 0 } }");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert!(matches!(f.ret_type.kind, TypeRefKind::Simple(ref n) if n == "Int"));
+                assert!(matches!(f.body.kind, ExprKind::IfElse { .. }));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refinement_param_name() {
+        let prog = parse_program("fn g(x: Int{ x > 0 }, y: Int{ y > x }): Int = y");
+        match &prog.decls[0] {
+            TopDecl::Fn(f) => {
+                assert_eq!(f.params.len(), 2);
+                assert!(matches!(f.params[0].ty.kind, TypeRefKind::Refine(_, _)));
+                assert!(matches!(f.params[1].ty.kind, TypeRefKind::Refine(_, _)));
             }
             other => panic!("expected Fn, got {other:?}"),
         }

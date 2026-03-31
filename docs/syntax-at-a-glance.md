@@ -42,6 +42,31 @@ Type aliases give a new name to an existing type.
 
 ---
 
+### Refinement Types
+
+```abide
+// Refinement type aliases — constrain values with predicates
+type Positive = Int { $ > 0 }
+type Byte = Int { $ >= 0 and $ <= 255 }
+
+// Inline refinement on parameters
+fn gcd(a: Int{$ > 0}, b: Int{$ > 0}): Int
+
+// Parameter names can reference earlier parameters (left-to-right)
+fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int
+
+// Parameter names can be used instead of $
+fn bounded(x: Int{x > 0}, y: Int{y > x}): Int
+```
+
+The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts.
+
+Refinement types are not allowed on return types — use `ensures` for return constraints.
+
+`Implemented`
+
+---
+
 ### Algebraic Data Types
 
 ```abide

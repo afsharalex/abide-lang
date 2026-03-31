@@ -35,6 +35,25 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     for (name, ty) in &env.types {
         let decl_span = env.lookup_decl(name).and_then(|d| d.span);
         errors.extend(check_type(ty, decl_span));
+        // Check refinement predicates in type aliases
+        if let Ty::Refinement(_, pred) = ty {
+            if let Some(pred_ty) = expr_type(pred) {
+                if !matches!(pred_ty, Ty::Builtin(BuiltinTy::Bool) | Ty::Unresolved(_)) {
+                    let mut err = ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "{} (type alias '{}')",
+                            messages::REFINEMENT_PREDICATE_NOT_BOOL,
+                            name
+                        ),
+                        name.clone(),
+                    );
+                    err.span = expr_span(pred);
+                    err.help = Some(messages::HELP_REFINEMENT_BOOL.into());
+                    errors.push(err);
+                }
+            }
+        }
     }
     for entity in env.entities.values() {
         errors.extend(check_entity(entity, &all_known_names));
@@ -43,9 +62,10 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
         errors.extend(check_system(env, system));
     }
 
-    // Check fn contracts
+    // Check fn contracts and refinement predicates
     for f in env.fns.values() {
         errors.extend(check_fn_contracts(f));
+        errors.extend(check_refinement_predicates(f));
     }
 
     // Check for cyclic pred/prop definitions
@@ -600,6 +620,32 @@ fn check_fn_contracts(f: &EFn) -> Vec<ElabError> {
     errors
 }
 
+/// Check that refinement predicates on fn parameters are Bool.
+fn check_refinement_predicates(f: &EFn) -> Vec<ElabError> {
+    let mut errors = Vec::new();
+    for (param_name, param_ty) in &f.params {
+        if let Ty::Refinement(_, pred) = param_ty {
+            if let Some(ty) = expr_type(pred) {
+                if !matches!(ty, Ty::Builtin(BuiltinTy::Bool) | Ty::Unresolved(_)) {
+                    let mut err = ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "{} (parameter '{}')",
+                            messages::REFINEMENT_PREDICATE_NOT_BOOL,
+                            param_name
+                        ),
+                        f.name.clone(),
+                    );
+                    err.span = expr_span(pred);
+                    err.help = Some(messages::HELP_REFINEMENT_BOOL.into());
+                    errors.push(err);
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// Extract the type annotation from an elaborated expression (if available).
 fn expr_type(e: &EExpr) -> Option<&Ty> {
     match e {
@@ -697,11 +743,15 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
     for name in all_names {
         if !visited.contains(&name) {
             if let Some(cycle) = dfs_find_cycle(&name, &deps, &mut visited, &mut in_stack) {
-                errors.push(ElabError::new(
+                let mut err = ElabError::new(
                     ErrorKind::CyclicDefinition,
                     format!("circular definition detected: {}", cycle.join(" → ")),
                     name.clone(),
-                ));
+                );
+                err.help = Some(
+                    "recursive functions need a 'decreases' clause for termination checking".into(),
+                );
+                errors.push(err);
             }
         }
     }

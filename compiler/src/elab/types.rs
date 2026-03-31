@@ -5,7 +5,7 @@
 //! representation; these types carry semantic information.
 
 /// Semantic type representation (resolved from parse-level `TypeRef`/`Name`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Ty {
     /// Sum type: name + constructor names
     Enum(String, Vec<String>),
@@ -31,6 +31,8 @@ pub enum Ty {
     Map(Box<Ty>, Box<Ty>),
     /// (A, B, ...)
     Tuple(Vec<Ty>),
+    /// Refinement type: base type + predicate (Int { $ > 0 })
+    Refinement(Box<Ty>, Box<EExpr>),
 }
 
 impl Ty {
@@ -49,6 +51,7 @@ impl Ty {
             Self::Seq(_) => "Seq",
             Self::Map(_, _) => "Map",
             Self::Tuple(_) => "Tuple",
+            Self::Refinement(base, _) => base.name(),
         }
     }
 }

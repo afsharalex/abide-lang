@@ -42,6 +42,7 @@ impl Ctx {
 pub fn resolve(env: &mut Env) {
     resolve_use_declarations(env);
     resolve_all_types(env);
+    resolve_type_refinement_predicates(env);
 
     let ctx = Ctx::from_env(env);
     resolve_entities(env, &ctx);
@@ -259,6 +260,19 @@ fn resolve_all_types(env: &mut Env) {
     }
 }
 
+/// Resolve `$` in refinement predicates of type aliases.
+/// For `type Positive = Int { $ > 0 }`, binds `$` to `Int` before resolving the predicate.
+fn resolve_type_refinement_predicates(env: &mut Env) {
+    let ctx = Ctx::from_env(env);
+    for ty in env.types.values_mut() {
+        if let Ty::Refinement(base, pred) = ty {
+            let mut bound = HashMap::new();
+            bound.insert("$".to_owned(), (**base).clone());
+            **pred = resolve_expr(&ctx, &bound, pred);
+        }
+    }
+}
+
 fn resolve_ty(types: &HashMap<String, Ty>, entities: &[String], ty: &Ty) -> Ty {
     match ty {
         Ty::Unresolved(n) => {
@@ -294,6 +308,10 @@ fn resolve_ty(types: &HashMap<String, Ty>, entities: &[String], ty: &Ty) -> Ty {
             Box::new(resolve_ty(types, entities, v)),
         ),
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| resolve_ty(types, entities, t)).collect()),
+        Ty::Refinement(base, pred) => {
+            let resolved_base = resolve_ty(types, entities, base);
+            Ty::Refinement(Box::new(resolved_base), pred.clone())
+        }
         _ => ty.clone(),
     }
 }
@@ -314,18 +332,13 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
                 .iter()
                 .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
                 .collect();
-            action.params = action
-                .params
-                .iter()
-                .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
-                .collect();
-            // Bind ref params and value params so they aren't alias-rewritten
-            let mut action_bound: HashMap<String, Ty> = action
+            let ref_bound: HashMap<String, Ty> = action
                 .refs
                 .iter()
                 .map(|(n, t)| (n.clone(), t.clone()))
                 .collect();
-            action_bound.extend(action.params.iter().map(|(n, t)| (n.clone(), t.clone())));
+            let (resolved_params, action_bound) = resolve_params_lr(ctx, &action.params, ref_bound);
+            action.params = resolved_params;
             action.requires = action
                 .requires
                 .iter()
@@ -345,17 +358,9 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
 fn resolve_systems(env: &mut Env, ctx: &Ctx) {
     for system in env.systems.values_mut() {
         for event in &mut system.events {
-            event.params = event
-                .params
-                .iter()
-                .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
-                .collect();
-            // Bind event params so they aren't alias-rewritten
-            let event_bound: HashMap<String, Ty> = event
-                .params
-                .iter()
-                .map(|(n, t)| (n.clone(), t.clone()))
-                .collect();
+            let (resolved_params, event_bound) =
+                resolve_params_lr(ctx, &event.params, HashMap::new());
+            event.params = resolved_params;
             event.requires = event
                 .requires
                 .iter()
@@ -433,16 +438,8 @@ fn resolve_event_action(ctx: &Ctx, bound: &HashMap<String, Ty>, ea: &EEventActio
 
 fn resolve_preds(env: &mut Env, ctx: &Ctx) {
     for pred in env.preds.values_mut() {
-        pred.params = pred
-            .params
-            .iter()
-            .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
-            .collect();
-        let bound: HashMap<String, Ty> = pred
-            .params
-            .iter()
-            .map(|(n, t)| (n.clone(), t.clone()))
-            .collect();
+        let (resolved_params, bound) = resolve_params_lr(ctx, &pred.params, HashMap::new());
+        pred.params = resolved_params;
         pred.body = resolve_expr(ctx, &bound, &pred.body);
     }
 }
@@ -536,20 +533,44 @@ fn resolve_consts(env: &mut Env, ctx: &Ctx) {
     }
 }
 
+/// Resolve parameters left-to-right with refinement predicate binding.
+/// Each param's refinement predicate can reference params declared to its left.
+/// `$` and the param name are both bound to the base type inside predicates.
+/// Returns (`resolved_params`, `bound_map`).
+fn resolve_params_lr(
+    ctx: &Ctx,
+    params: &[(String, Ty)],
+    initial_bound: HashMap<String, Ty>,
+) -> (Vec<(String, Ty)>, HashMap<String, Ty>) {
+    let mut bound = initial_bound;
+    let mut resolved_params = Vec::new();
+    for (name, ty) in params {
+        let resolved_ty = ctx.resolve_ty(ty);
+        let final_ty = match &resolved_ty {
+            Ty::Refinement(base, pred) => {
+                let mut pred_bound = bound.clone();
+                pred_bound.insert("$".to_owned(), (**base).clone());
+                pred_bound.insert(name.clone(), (**base).clone());
+                let resolved_pred = resolve_expr(ctx, &pred_bound, pred);
+                Ty::Refinement(base.clone(), Box::new(resolved_pred))
+            }
+            _ => resolved_ty.clone(),
+        };
+        let base_ty = match &final_ty {
+            Ty::Refinement(base, _) => (**base).clone(),
+            t => t.clone(),
+        };
+        bound.insert(name.clone(), base_ty);
+        resolved_params.push((name.clone(), final_ty));
+    }
+    (resolved_params, bound)
+}
+
 fn resolve_fns(env: &mut Env, ctx: &Ctx) {
     for f in env.fns.values_mut() {
-        f.params = f
-            .params
-            .iter()
-            .map(|(n, t)| (n.clone(), ctx.resolve_ty(t)))
-            .collect();
+        let (resolved_params, bound) = resolve_params_lr(ctx, &f.params, HashMap::new());
+        f.params = resolved_params;
         f.ret_ty = ctx.resolve_ty(&f.ret_ty);
-        let bound: HashMap<String, Ty> = f
-            .params
-            .iter()
-            .map(|(n, t)| (n.clone(), t.clone()))
-            .collect();
-        // Resolve contract expressions (ensures gets 'result' in scope)
         let mut bound_with_result = bound.clone();
         bound_with_result.insert("result".to_owned(), f.ret_ty.clone());
         f.contracts = f

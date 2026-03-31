@@ -203,6 +203,8 @@ pub enum Token {
     RBrace,
     #[token("_")]
     Underscore,
+    #[token("$")]
+    Dollar,
 
     // ── Literals ──────────────────────────────────────────────────────
     #[regex("[a-zA-Z][a-zA-Z0-9_]*", |lex| lex.slice().to_owned())]
@@ -325,6 +327,7 @@ impl std::fmt::Display for Token {
             Self::LBrace => write!(f, "{{"),
             Self::RBrace => write!(f, "}}"),
             Self::Underscore => write!(f, "_"),
+            Self::Dollar => write!(f, "$"),
             Self::Name(s) | Self::FloatLit(s) => write!(f, "{s}"),
             Self::IntLit(n) => write!(f, "{n}"),
             Self::DoubleLit(n) => write!(f, "{n}"),

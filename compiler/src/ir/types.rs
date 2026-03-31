@@ -46,6 +46,10 @@ pub enum IRType {
     Tuple {
         elements: Vec<IRType>,
     },
+    Refinement {
+        base: Box<IRType>,
+        predicate: Box<IRExpr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

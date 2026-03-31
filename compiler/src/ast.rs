@@ -186,6 +186,10 @@ pub enum TypeRefKind {
     Tuple(Vec<TypeRef>),
     /// `(A)` — grouping
     Paren(Box<TypeRef>),
+    /// `T { pred }` — refinement type
+    Refine(Box<TypeRef>, Box<Expr>),
+    /// `T<A> { pred }` — refined parameterized type
+    RefineParam(Box<TypeRef>, Box<Expr>),
 }
 
 // ── Entity Declarations ──────────────────────────────────────────────

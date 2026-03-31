@@ -184,6 +184,11 @@ pub fn resolve_type_ref(tr: &ast::TypeRef) -> Ty {
             Ty::Fn(Box::new(resolve_type_ref(a)), Box::new(resolve_type_ref(b)))
         }
         ast::TypeRefKind::Paren(inner) => resolve_type_ref(inner),
+        ast::TypeRefKind::Refine(base, pred) | ast::TypeRefKind::RefineParam(base, pred) => {
+            let base_ty = resolve_type_ref(base);
+            let pred_expr = collect_expr(pred);
+            Ty::Refinement(Box::new(base_ty), Box::new(pred_expr))
+        }
     }
 }
 

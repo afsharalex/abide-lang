@@ -108,6 +108,7 @@ pub fn ir_type_to_sort(ty: &IRType) -> Sort {
         IRType::Seq { element } => Sort::array(&Sort::int(), &ir_type_to_sort(element)),
         IRType::Map { key, value } => Sort::array(&ir_type_to_sort(key), &ir_type_to_sort(value)),
         IRType::Tuple { .. } => Sort::int(), // tuples as uninterpreted for now
+        IRType::Refinement { base, .. } => ir_type_to_sort(base), // use base type sort
     }
 }
 

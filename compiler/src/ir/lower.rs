@@ -92,6 +92,10 @@ fn lower_ty(ty: &E::Ty) -> IRType {
         E::Ty::Tuple(ts) => IRType::Tuple {
             elements: ts.iter().map(lower_ty).collect(),
         },
+        E::Ty::Refinement(base, pred) => IRType::Refinement {
+            base: Box::new(lower_ty(base)),
+            predicate: Box::new(lower_expr(pred)),
+        },
     }
 }
 
@@ -158,17 +162,35 @@ fn lower_while_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Option<IRD
 }
 
 fn lower_fn(ef: &E::EFn) -> IRFunction {
-    let ret_ty = lower_ty(&ef.ret_ty);
-    let fn_ty = ef
+    // Extract refinement predicates from params, strip refinement from types
+    let stripped_params: Vec<(String, E::Ty)> = ef
         .params
+        .iter()
+        .map(|(n, t)| match t {
+            E::Ty::Refinement(base, _) => (n.clone(), (**base).clone()),
+            _ => (n.clone(), t.clone()),
+        })
+        .collect();
+    let refinement_requires: Vec<IRExpr> = ef
+        .params
+        .iter()
+        .filter_map(|(name, ty)| {
+            if let E::Ty::Refinement(_, pred) = ty {
+                Some(subst_dollar(name, &lower_expr(pred)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let ret_ty = lower_ty(&ef.ret_ty);
+    let fn_ty = stripped_params
         .iter()
         .rev()
         .fold(ret_ty.clone(), |acc, (_, pt)| IRType::Fn {
             param: Box::new(lower_ty(pt)),
             result: Box::new(acc),
         });
-    let body = ef
-        .params
+    let body = stripped_params
         .iter()
         .rev()
         .fold(lower_expr(&ef.body), |acc, (pn, pt)| IRExpr::Lam {
@@ -177,17 +199,102 @@ fn lower_fn(ef: &E::EFn) -> IRFunction {
             body: Box::new(acc),
             span: ef.span,
         });
-    let (requires, ensures, decreases) = lower_contracts(&ef.contracts);
+    let (mut requires, ensures, decreases) = lower_contracts(&ef.contracts);
+    // Prepend refinement-derived requires before explicit contracts
+    let mut all_requires = refinement_requires;
+    all_requires.append(&mut requires);
     IRFunction {
         name: ef.name.clone(),
         ty: fn_ty,
         body,
         prop_target: None,
-        requires,
+        requires: all_requires,
         ensures,
         decreases,
         span: ef.span,
         file: ef.file.clone(),
+    }
+}
+
+/// Substitute `$` with a parameter name in an IR expression.
+fn subst_dollar(name: &str, expr: &IRExpr) -> IRExpr {
+    match expr {
+        IRExpr::Var {
+            name: n, ty, span, ..
+        } if n == "$" => IRExpr::Var {
+            name: name.to_owned(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            span,
+        } => IRExpr::BinOp {
+            op: op.clone(),
+            left: Box::new(subst_dollar(name, left)),
+            right: Box::new(subst_dollar(name, right)),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::UnOp {
+            op,
+            operand,
+            ty,
+            span,
+        } => IRExpr::UnOp {
+            op: op.clone(),
+            operand: Box::new(subst_dollar(name, operand)),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::App {
+            func,
+            arg,
+            ty,
+            span,
+        } => IRExpr::App {
+            func: Box::new(subst_dollar(name, func)),
+            arg: Box::new(subst_dollar(name, arg)),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Field {
+            expr: e,
+            field,
+            ty,
+            span,
+        } => IRExpr::Field {
+            expr: Box::new(subst_dollar(name, e)),
+            field: field.clone(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            span,
+        } if var != "$" => IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(subst_dollar(name, body)),
+            span: *span,
+        },
+        IRExpr::Exists {
+            var,
+            domain,
+            body,
+            span,
+        } if var != "$" => IRExpr::Exists {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(subst_dollar(name, body)),
+            span: *span,
+        },
+        _ => expr.clone(),
     }
 }
 
@@ -260,6 +367,10 @@ fn lower_field(ef: &E::EField) -> IRField {
 }
 
 fn lower_action(ea: &E::EAction) -> IRTransition {
+    // Extract refinement predicates from params and add to guard
+    let refinement_reqs = extract_param_refinements(&ea.params);
+    let mut all_requires: Vec<&E::EExpr> = refinement_reqs.iter().collect();
+    all_requires.extend(ea.requires.iter());
     IRTransition {
         name: ea.name.clone(),
         refs: ea
@@ -273,14 +384,71 @@ fn lower_action(ea: &E::EAction) -> IRTransition {
         params: ea
             .params
             .iter()
-            .map(|(pn, pt)| IRTransParam {
-                name: pn.clone(),
-                ty: lower_ty(pt),
+            .map(|(pn, pt)| {
+                let base_ty = match pt {
+                    E::Ty::Refinement(base, _) => base,
+                    t => t,
+                };
+                IRTransParam {
+                    name: pn.clone(),
+                    ty: lower_ty(base_ty),
+                }
             })
             .collect(),
-        guard: lower_guard(&ea.requires),
+        guard: lower_guard_refs(&all_requires),
         updates: extract_updates(&ea.body),
         postcondition: None,
+    }
+}
+
+/// Extract refinement predicates from params, substituting $ with param name.
+fn extract_param_refinements(params: &[(String, E::Ty)]) -> Vec<E::EExpr> {
+    params
+        .iter()
+        .filter_map(|(name, ty)| {
+            if let E::Ty::Refinement(_, pred) = ty {
+                Some(subst_dollar_elab(name, pred))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Substitute $ with a parameter name in an elaborated expression.
+fn subst_dollar_elab(name: &str, expr: &E::EExpr) -> E::EExpr {
+    match expr {
+        E::EExpr::Var(ty, n, sp) if n == "$" => E::EExpr::Var(ty.clone(), name.to_owned(), *sp),
+        E::EExpr::BinOp(ty, op, a, b, sp) => E::EExpr::BinOp(
+            ty.clone(),
+            *op,
+            Box::new(subst_dollar_elab(name, a)),
+            Box::new(subst_dollar_elab(name, b)),
+            *sp,
+        ),
+        E::EExpr::UnOp(ty, op, e, sp) => {
+            E::EExpr::UnOp(ty.clone(), *op, Box::new(subst_dollar_elab(name, e)), *sp)
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// Lower a list of expression references (not owned) to a conjunction guard.
+fn lower_guard_refs(reqs: &[&E::EExpr]) -> IRExpr {
+    match reqs {
+        [] => IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        },
+        [e] => lower_expr(e),
+        [e, rest @ ..] => IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(lower_expr(e)),
+            right: Box::new(lower_guard_refs(rest)),
+            ty: IRType::Bool,
+            span: None,
+        },
     }
 }
 
@@ -337,17 +505,27 @@ fn lower_event(ev: &E::EEvent) -> IREvent {
     } else {
         Some(lower_guard(&ev.ensures))
     };
+    // Extract refinement predicates from params and add to guard
+    let refinement_reqs = extract_param_refinements(&ev.params);
+    let mut all_requires: Vec<&E::EExpr> = refinement_reqs.iter().collect();
+    all_requires.extend(ev.requires.iter());
     IREvent {
         name: ev.name.clone(),
         params: ev
             .params
             .iter()
-            .map(|(pn, pt)| IRTransParam {
-                name: pn.clone(),
-                ty: lower_ty(pt),
+            .map(|(pn, pt)| {
+                let base_ty = match pt {
+                    E::Ty::Refinement(base, _) => base,
+                    t => t,
+                };
+                IRTransParam {
+                    name: pn.clone(),
+                    ty: lower_ty(base_ty),
+                }
             })
             .collect(),
-        guard: lower_guard(&ev.requires),
+        guard: lower_guard_refs(&all_requires),
         postcondition: post,
         body: ev.body.iter().map(lower_event_action).collect(),
     }
