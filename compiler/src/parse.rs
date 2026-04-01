@@ -12,42 +12,82 @@ use crate::lex::Token;
 use crate::span::Span;
 
 // ── Binding powers (Pratt parser) ────────────────────────────────────
-// Level 0 (|,||,^|,|>): l=1  r=2   (left-assoc)
-// Level 1 (->):          l=3  r=3   (right-assoc)
-// Level 2 (&):           l=5  r=6   (left-assoc)
-// Level 3 (implies):     l=7  r=7   (right-assoc)
-// Level 4 (=):           l=9  r=9   (right-assoc)
-// Level 5 (or):          l=11 r=12  (left-assoc)
-// Level 6 (and):         l=13 r=14  (left-assoc)
-// Level 7 (not):         prefix r=15
-// Level 8 (==,!=,in):    l=17 r=18  (left-assoc)
-// Level 9 (<,>,<=,>=):   l=19 r=20  (left-assoc)
-// Level 10 (+,-):        l=21 r=22  (left-assoc)
-// Level 11 (*,/,%):      l=23 r=24  (left-assoc)
-// Level 12 (neg,#):      prefix r=25
-// Level 13 (',.,(),[]()): postfix l=27
-// Level 14 (atoms):      parsed directly
+// ── Binding power constants ──────────────────────────────────────────
+//
+// Pratt parser binding powers. Left/right bp encode precedence and
+// associativity: left-assoc uses l < r, right-assoc uses l = r.
+// Higher numbers bind tighter. Gaps between levels allow future insertion.
+//
+// Composition operators — four distinct levels (DDR-006):
+//   |, ^|, |>  →  choice (loosest composition)
+//   ||         →  concurrent
+//   &          →  same-step
+//   ->         →  sequence (tightest composition)
+
+/// Choice operators: |, ^|, |> (loosest composition, left-assoc)
+const BP_CHOICE: (u8, u8) = (1, 2);
+/// Concurrent: || (left-assoc)
+const BP_CONCURRENT: (u8, u8) = (3, 4);
+/// Same-step: & (left-assoc)
+const BP_SAME_STEP: (u8, u8) = (5, 6);
+/// Sequence: -> (tightest composition, right-assoc)
+const BP_SEQUENCE: (u8, u8) = (7, 7);
+/// Named pair: name: expr (same level as choice)
+const BP_NAMED_PAIR: u8 = 1;
+/// Named pair rhs starts above choice
+const BP_NAMED_PAIR_RHS: u8 = 3;
+
+/// Implies (right-assoc)
+const BP_IMPLIES: (u8, u8) = (9, 9);
+/// Prefix operators at implies level: always, eventually, assert, quantifiers, let, lambda, match
+const BP_PREFIX_EXPR: u8 = 9;
+/// Assignment: = (right-assoc)
+const BP_ASSIGN: (u8, u8) = (11, 11);
+/// Or (left-assoc)
+const BP_OR: (u8, u8) = (13, 14);
+/// And (left-assoc)
+const BP_AND: (u8, u8) = (15, 16);
+/// Not (prefix)
+const BP_NOT: u8 = 17;
+/// Not operand bp (binds tighter than and)
+const BP_NOT_RHS: u8 = 17;
+/// Equality: ==, != (left-assoc)
+const BP_EQUALITY: (u8, u8) = (19, 20);
+// Membership `in` shares `BP_EQUALITY` level.
+/// Comparison: <, >, <=, >= (left-assoc)
+const BP_COMPARISON: (u8, u8) = (21, 22);
+/// Additive: +, - (left-assoc)
+const BP_ADDITIVE: (u8, u8) = (23, 24);
+/// Multiplicative: *, /, % (left-assoc)
+const BP_MULTIPLICATIVE: (u8, u8) = (25, 26);
+/// Unary prefix: -, # (negation, cardinality)
+const BP_UNARY: u8 = 27;
+/// Unary operand bp (binds at multiplicative level so -a*b = (-a)*b)
+const BP_UNARY_RHS: u8 = 27;
+/// Postfix: ', ., (), [] (prime, field, call, index)
+const BP_POSTFIX: u8 = 29;
 
 fn infix_bp(op: &Token) -> Option<(u8, u8)> {
     match op {
-        Token::Pipe | Token::PipePipe | Token::CaretPipe | Token::PipeGt => Some((1, 2)),
-        Token::Arrow => Some((3, 3)),
-        Token::Amp => Some((5, 6)),
-        Token::Implies => Some((7, 7)),
-        Token::Eq => Some((9, 9)),
-        Token::Or => Some((11, 12)),
-        Token::And => Some((13, 14)),
-        Token::EqEq | Token::BangEq | Token::In => Some((17, 18)),
-        Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => Some((19, 20)),
-        Token::Plus | Token::Minus => Some((21, 22)),
-        Token::Star | Token::Slash | Token::Percent => Some((23, 24)),
+        Token::Pipe | Token::CaretPipe | Token::PipeGt => Some(BP_CHOICE),
+        Token::PipePipe => Some(BP_CONCURRENT),
+        Token::Amp => Some(BP_SAME_STEP),
+        Token::Arrow => Some(BP_SEQUENCE),
+        Token::Implies => Some(BP_IMPLIES),
+        Token::Eq => Some(BP_ASSIGN),
+        Token::Or => Some(BP_OR),
+        Token::And => Some(BP_AND),
+        Token::EqEq | Token::BangEq | Token::In => Some(BP_EQUALITY),
+        Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => Some(BP_COMPARISON),
+        Token::Plus | Token::Minus => Some(BP_ADDITIVE),
+        Token::Star | Token::Slash | Token::Percent => Some(BP_MULTIPLICATIVE),
         _ => None,
     }
 }
 
 fn postfix_bp(op: &Token) -> Option<u8> {
     match op {
-        Token::Prime | Token::Dot | Token::LParen | Token::LBracket => Some(27),
+        Token::Prime | Token::Dot | Token::LParen | Token::LBracket => Some(BP_POSTFIX),
         _ => None,
     }
 }
@@ -1776,12 +1816,12 @@ impl Parser {
             // Named pair: only when lhs is Var and next is Colon (not ColonColon)
             if matches!(self.peek(), Some(Token::Colon))
                 && matches!(&lhs.kind, ExprKind::Var(_))
-                && 1 >= min_bp
+                && BP_NAMED_PAIR >= min_bp
             {
                 if let ExprKind::Var(name) = &lhs.kind {
                     let name = name.clone();
                     self.advance(); // consume :
-                    let rhs = self.expr_bp(3)?; // rhs is Expr1
+                    let rhs = self.expr_bp(BP_NAMED_PAIR_RHS)?;
                     let span = start.merge(rhs.span);
                     lhs = Expr {
                         kind: ExprKind::NamedPair(name, Box::new(rhs)),
@@ -1818,68 +1858,64 @@ impl Parser {
     fn expr_prefix(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let start = self.cur_span();
         match self.peek() {
-            // Level 12 prefix: unary negation
-            Some(Token::Minus) if min_bp <= 25 => {
+            // Unary negation: -x
+            Some(Token::Minus) if min_bp <= BP_UNARY => {
                 self.advance();
-                let operand = self.expr_bp(25)?;
+                let operand = self.expr_bp(BP_UNARY_RHS)?;
                 Ok(Expr {
                     kind: ExprKind::Neg(Box::new(operand)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            // Level 12 prefix: cardinality
-            Some(Token::Hash) if min_bp <= 25 => {
+            // Cardinality: #s
+            Some(Token::Hash) if min_bp <= BP_UNARY => {
                 self.advance();
-                let operand = self.expr_bp(25)?;
+                let operand = self.expr_bp(BP_UNARY_RHS)?;
                 Ok(Expr {
                     kind: ExprKind::Card(Box::new(operand)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            // Level 7 prefix: not
-            Some(Token::Not) if min_bp <= 15 => {
+            // Logical not
+            Some(Token::Not) if min_bp <= BP_NOT => {
                 self.advance();
-                let operand = self.expr_bp(15)?;
+                let operand = self.expr_bp(BP_NOT_RHS)?;
                 Ok(Expr {
                     kind: ExprKind::Not(Box::new(operand)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            // Level 3 prefix: temporal
-            Some(Token::Always) if min_bp <= 7 => {
+            // Temporal/quantifier/let/lambda/match prefix forms
+            Some(Token::Always) if min_bp <= BP_PREFIX_EXPR => {
                 self.advance();
-                let body = self.expr_bp(7)?;
+                let body = self.expr_bp(BP_PREFIX_EXPR)?;
                 Ok(Expr {
                     kind: ExprKind::Always(Box::new(body)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            Some(Token::Eventually) if min_bp <= 7 => {
+            Some(Token::Eventually) if min_bp <= BP_PREFIX_EXPR => {
                 self.advance();
-                let body = self.expr_bp(7)?;
+                let body = self.expr_bp(BP_PREFIX_EXPR)?;
                 Ok(Expr {
                     kind: ExprKind::Eventually(Box::new(body)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            Some(Token::Assert) if min_bp <= 7 => {
+            Some(Token::Assert) if min_bp <= BP_PREFIX_EXPR => {
                 self.advance();
-                let body = self.expr_bp(7)?;
+                let body = self.expr_bp(BP_PREFIX_EXPR)?;
                 Ok(Expr {
                     kind: ExprKind::AssertExpr(Box::new(body)),
                     span: start.merge(self.prev_span()),
                 })
             }
-            // Level 3: quantifiers
             Some(
                 Token::All | Token::Exists | Token::Some | Token::No | Token::One | Token::Lone,
-            ) if min_bp <= 7 => self.parse_quantifier(),
-            // Level 3: let ... in
-            Some(Token::Let) if min_bp <= 7 => self.parse_let_expr(),
-            // Level 3: lambda
-            Some(Token::Fn) if min_bp <= 7 => self.parse_lambda(),
-            // Level 3: match
-            Some(Token::Match) if min_bp <= 7 => self.parse_match_expr(),
+            ) if min_bp <= BP_PREFIX_EXPR => self.parse_quantifier(),
+            Some(Token::Let) if min_bp <= BP_PREFIX_EXPR => self.parse_let_expr(),
+            Some(Token::Fn) if min_bp <= BP_PREFIX_EXPR => self.parse_lambda(),
+            Some(Token::Match) if min_bp <= BP_PREFIX_EXPR => self.parse_match_expr(),
             // Atoms
             _ => self.expr_atom(),
         }
@@ -2225,8 +2261,8 @@ impl Parser {
                     self.pos = saved;
                 }
                 // Projection form: expr | var: Type where filter
-                // Parse at bp=2 to stop before `|` (which is bp 1)
-                let projection = self.expr_bp(2)?;
+                // Parse above choice level to stop before `|`
+                let projection = self.expr_bp(BP_CHOICE.1)?;
                 self.expect(&Token::Pipe)?;
                 let (var, _) = self.expect_name()?;
                 self.expect(&Token::Colon)?;
@@ -4274,6 +4310,89 @@ pub type Distance = Real"#;
                 assert!(matches!(f.params[1].ty.kind, TypeRefKind::Refine(_, _)));
             }
             other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    // ── Composition operator precedence tests (DDR-006) ─────────
+
+    #[test]
+    fn seq_tighter_than_same_step() {
+        // a -> b & c should parse as (a -> b) & c
+        let prog = parse_program("pred p(a: Int, b: Int, c: Int) = a -> b & c");
+        match &prog.decls[0] {
+            TopDecl::Pred(p) => {
+                assert!(matches!(p.body.kind, ExprKind::SameStep(_, _)));
+                if let ExprKind::SameStep(lhs, _) = &p.body.kind {
+                    assert!(matches!(lhs.kind, ExprKind::Seq(_, _)));
+                }
+            }
+            other => panic!("expected Pred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_step_tighter_than_concurrent() {
+        // a & b || c should parse as (a & b) || c
+        let prog = parse_program("pred p(a: Int, b: Int, c: Int) = a & b || c");
+        match &prog.decls[0] {
+            TopDecl::Pred(p) => {
+                assert!(matches!(p.body.kind, ExprKind::Conc(_, _)));
+                if let ExprKind::Conc(lhs, _) = &p.body.kind {
+                    assert!(matches!(lhs.kind, ExprKind::SameStep(_, _)));
+                }
+            }
+            other => panic!("expected Pred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_tighter_than_unordered() {
+        // a || b | c should parse as (a || b) | c
+        let prog = parse_program("pred p(a: Int, b: Int, c: Int) = a || b | c");
+        match &prog.decls[0] {
+            TopDecl::Pred(p) => {
+                assert!(matches!(p.body.kind, ExprKind::Unord(_, _)));
+                if let ExprKind::Unord(lhs, _) = &p.body.kind {
+                    assert!(matches!(lhs.kind, ExprKind::Conc(_, _)));
+                }
+            }
+            other => panic!("expected Pred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_composition_precedence() {
+        // a -> b & c | d should parse as ((a -> b) & c) | d
+        let prog = parse_program("pred p(a: Int, b: Int, c: Int, d: Int) = a -> b & c | d");
+        match &prog.decls[0] {
+            TopDecl::Pred(p) => {
+                // outermost: | (unordered)
+                assert!(matches!(p.body.kind, ExprKind::Unord(_, _)));
+                if let ExprKind::Unord(lhs, _) = &p.body.kind {
+                    // middle: & (same-step)
+                    assert!(matches!(lhs.kind, ExprKind::SameStep(_, _)));
+                    if let ExprKind::SameStep(inner, _) = &lhs.kind {
+                        // innermost: -> (seq)
+                        assert!(matches!(inner.kind, ExprKind::Seq(_, _)));
+                    }
+                }
+            }
+            other => panic!("expected Pred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seq_right_assoc() {
+        // a -> b -> c should parse as a -> (b -> c)
+        let prog = parse_program("pred p(a: Int, b: Int, c: Int) = a -> b -> c");
+        match &prog.decls[0] {
+            TopDecl::Pred(p) => {
+                assert!(matches!(p.body.kind, ExprKind::Seq(_, _)));
+                if let ExprKind::Seq(_, rhs) = &p.body.kind {
+                    assert!(matches!(rhs.kind, ExprKind::Seq(_, _)));
+                }
+            }
+            other => panic!("expected Pred, got {other:?}"),
         }
     }
 }

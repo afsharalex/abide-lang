@@ -381,9 +381,9 @@ approve ^| reject                 // exclusive composition (exactly one)
 x |> validate |> process          // pipe operator
 ```
 
-`->` = temporal sequence (A then B). `&` = same-step. `|` = unordered. `||` = concurrent. `^|` = exclusive (one or the other, not both). `|>` = pipe (value flows left to right).
+Precedence (tightest to loosest): `->` > `&` > `||` > `|`, `^|`. So `a -> b & c | d` parses as `((a -> b) & c) | d`. Use parentheses to override.
 
-`Evolving`
+`Implemented`
 
 ---
 

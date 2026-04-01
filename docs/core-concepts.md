@@ -168,6 +168,8 @@ approve ^| reject            // exclusive — exactly one happens, not both
 
 These let you express complex event relationships: "submit must happen before pay, which must happen before ship" (`->`), "deposit and logging happen atomically" (`&`), "the system either approves or rejects, never both" (`^|`).
 
+Precedence (tightest to loosest): `->` > `&` > `||` > `|`, `^|`. So `a -> b & c | d` parses as `((a -> b) & c) | d`. Use parentheses to override default precedence.
+
 **Bounded vs. unbounded checking:**
 
 `verify` blocks with bounds (`[0..500]`) will use bounded model checking — the solver explores finite depth. For many common safety properties, the solver will also attempt to **discharge them as unbounded proofs automatically** when the property is inductive or the state space is finite. When automatic unbounded checking fails, `theorem` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends. *(Solver backend in development.)*
