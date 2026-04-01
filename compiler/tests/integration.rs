@@ -559,3 +559,124 @@ entity Order {
         "should suggest 'Confirmed' for 'Confirmd': help={help}"
     );
 }
+
+// ── QA Runner Integration Tests ─────────────────────────────────────
+
+#[test]
+fn qa_script_all_pass() {
+    let script = std::path::Path::new("tests/fixtures/test_pass.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, false);
+    assert!(
+        result.failed == 0,
+        "all assertions should pass: {} failed, output: {:?}",
+        result.failed,
+        result.output
+    );
+    assert!(
+        result.passed > 0,
+        "should have at least one passing assertion"
+    );
+    assert_eq!(result.passed, 4, "should have 4 passing assertions");
+}
+
+#[test]
+fn qa_script_assertion_failure() {
+    let script = std::path::Path::new("tests/fixtures/test_fail.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, false);
+    assert_eq!(result.failed, 1, "one assertion should fail");
+    assert_eq!(result.passed, 1, "one assertion should pass");
+    assert!(
+        result.output.iter().any(|l| l.contains("FAIL")),
+        "output should contain FAIL"
+    );
+}
+
+#[test]
+fn qa_script_json_output() {
+    let script = std::path::Path::new("tests/fixtures/test_pass.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, true);
+    assert_eq!(result.failed, 0);
+    for line in &result.output {
+        assert!(
+            line.starts_with('{'),
+            "JSON output lines should be JSON objects: {line}"
+        );
+    }
+}
+
+#[test]
+fn qa_script_load_from_file() {
+    let script = std::path::Path::new("tests/fixtures/test_pass.qa");
+    // -f flag with a single file
+    let spec_file = std::path::Path::new("tests/fixtures/commerce.abide");
+    let result = abide::qa::runner::run_qa_script(script, Some(spec_file), false);
+    // With -f preloading + script's own load, commerce is loaded (possibly double-loaded
+    // but module system deduplicates). Assertions should still pass.
+    assert_eq!(result.failed, 0, "assertions should pass with -f preload");
+}
+
+#[test]
+fn qa_script_load_from_directory() {
+    // Create a temp directory with a single .abide file
+    let tmp = tempfile::TempDir::new().unwrap();
+    let spec_dir = tmp.path().join("specs");
+    std::fs::create_dir(&spec_dir).unwrap();
+    std::fs::copy(
+        "tests/fixtures/hypo_base.abide",
+        spec_dir.join("ticket.abide"),
+    )
+    .unwrap();
+
+    let script_path = tmp.path().join("test.qa");
+    std::fs::write(&script_path, "ask entities\n").unwrap();
+
+    // Use -f to load the spec directory
+    let result = abide::qa::runner::run_qa_script(&script_path, Some(&spec_dir), false);
+    assert!(result.executed > 0, "should execute at least one statement");
+    assert!(
+        !result.output.iter().any(|l| l.starts_with("error:")),
+        "should not have errors: {:?}",
+        result.output
+    );
+}
+
+#[test]
+fn qa_script_missing_file() {
+    let script = std::path::Path::new("tests/fixtures/nonexistent.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, false);
+    assert_eq!(result.executed, 0);
+    assert!(
+        result.output.iter().any(|l| l.contains("error")),
+        "should report error for missing file"
+    );
+}
+
+#[test]
+fn qa_base_spec_no_cycles() {
+    // Base spec only: Open -> InProgress -> Closed, no cycles
+    let script = std::path::Path::new("tests/fixtures/test_no_hypothetical.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, false);
+    assert_eq!(
+        result.failed, 0,
+        "base spec should have no cycles: {:?}",
+        result.output
+    );
+    assert_eq!(result.passed, 2, "should have 2 passing assertions");
+}
+
+#[test]
+fn qa_hypothetical_merges_modules() {
+    // Base + hypothetical reopen: merging creates a cycle (Closed -> Open)
+    let script = std::path::Path::new("tests/fixtures/test_hypothetical.qa");
+    let result = abide::qa::runner::run_qa_script(script, None, false);
+    assert_eq!(
+        result.failed, 0,
+        "hypothetical should merge and create cycles.\npassed: {}, failed: {}, executed: {}\noutput: {:?}",
+        result.passed, result.failed, result.executed, result.output
+    );
+    assert_eq!(
+        result.passed, 3,
+        "should have 3 passing assertions.\noutput: {:?}",
+        result.output
+    );
+}

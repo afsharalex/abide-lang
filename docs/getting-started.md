@@ -164,8 +164,42 @@ Key module system concepts:
 - `include "file.abide"` includes a file's contents into the current module
 - Systems and events are always public; entity fields are always private
 
+## Explore with the REPL
+
+The REPL lets you interactively explore your specs:
+
+```sh
+$ abide repl commerce/
+Loaded 2 entities, 1 system
+
+abide> /qa
+qa> ask reachable Order.status -> @Shipped
+true
+qa> ask terminal Order.status
+@Shipped, @Cancelled
+qa> /quit
+```
+
+Switch between Abide mode (write definitions) and QA mode (query the spec) with `/qa` and `/abide`. See the [REPL guide](repl.md) for details.
+
+## Run QA Scripts
+
+Automate structural checks with `.qa` scripts:
+
+```sh
+$ abide qa checks.qa
+  PASS: assert reachable Order.status -> @Shipped
+  PASS: assert not cycles Order.status
+
+=== QA: 2 passed, 0 failed (2 executed) ===
+```
+
+See the [QA Language](qa-language.md) guide.
+
 ## Next Steps
 
 - [Syntax at a Glance](syntax-at-a-glance.md) — quick reference for all constructs
 - [Core Concepts](core-concepts.md) — the five specification layers
+- [REPL](repl.md) — interactive specification exploration
+- [QA Language](qa-language.md) — structural analysis queries
 - [Examples](examples.md) — more specs to learn from

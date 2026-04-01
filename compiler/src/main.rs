@@ -67,6 +67,31 @@ enum Command {
         #[arg(long)]
         progress: bool,
     },
+
+    /// Run QA structural analysis scripts
+    #[command(name = "qa")]
+    Qa {
+        /// QA script file (.qa)
+        script: PathBuf,
+
+        /// Load specs from this directory before running the script
+        #[arg(short = 'f', long = "from")]
+        spec_dir: Option<PathBuf>,
+
+        /// Output format: human (default) or json
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Start interactive REPL
+    Repl {
+        /// Path to load specs from (file or directory)
+        path: Option<PathBuf>,
+
+        /// Use Vi keybindings instead of Emacs
+        #[arg(long)]
+        vi: bool,
+    },
 }
 
 /// Default timeout for Tier 1 induction attempts, in seconds.
@@ -200,6 +225,35 @@ fn main() -> miette::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        Command::Qa {
+            script,
+            spec_dir,
+            format,
+        } => {
+            let json_mode = format == "json";
+            let result = abide::qa::runner::run_qa_script(&script, spec_dir.as_deref(), json_mode);
+            for line in &result.output {
+                println!("{line}");
+            }
+            if result.failed > 0 || result.executed == 0 {
+                if !json_mode {
+                    println!(
+                        "\n=== QA: {} passed, {} failed ({} executed) ===",
+                        result.passed, result.failed, result.executed
+                    );
+                }
+                std::process::exit(1);
+            }
+            if !json_mode {
+                println!(
+                    "\n=== QA: {} passed, {} failed ({} executed) ===",
+                    result.passed, result.failed, result.executed
+                );
+            }
+        }
+        Command::Repl { path, vi } => {
+            abide::repl::run_repl(path.as_deref(), vi);
         }
     }
 

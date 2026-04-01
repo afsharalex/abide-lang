@@ -1,0 +1,5 @@
+// QA test script — one assertion should fail
+load "commerce.abide"
+
+assert reachable Order.status -> @Shipped
+assert reachable Order.status -> @Refunded

@@ -17,6 +17,21 @@ The compiler uses subcommands. Most commands accept one or more `.abide` source 
 | `abide elaborate <files...>` | Load file(s), run elaboration (collection, resolution, checking) |
 | `abide emit-ir <files...>` | Load file(s), run the full frontend pipeline and emit IR as JSON |
 | `abide verify <files...>` | Load file(s), verify: model checking, scene checking, theorem proving |
+| `abide qa <script.qa>` | Run QA structural analysis script |
+| `abide repl [path]` | Start interactive REPL |
+
+### `abide qa` Options
+
+| Flag | Description |
+|------|-------------|
+| `-f, --from <path>` | Load specs from this directory or file before running the script |
+| `--format <human\|json>` | Output format (default: human) |
+
+### `abide repl` Options
+
+| Flag | Description |
+|------|-------------|
+| `--vi` | Use Vi keybindings instead of Emacs |
 
 ### `abide verify` Options
 

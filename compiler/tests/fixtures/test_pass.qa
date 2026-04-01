@@ -1,0 +1,7 @@
+// QA test script — all assertions should pass
+load "commerce.abide"
+
+assert reachable Order.status -> @Shipped
+assert reachable Order.status -> @Cancelled
+assert not reachable Order.status -> @Refunded
+assert not cycles Order.status

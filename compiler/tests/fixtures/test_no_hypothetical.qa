@@ -1,0 +1,5 @@
+// QA test: base spec without hypothetical has no cycles
+load "hypo_base.abide"
+
+assert reachable Ticket.status -> @Closed
+assert not cycles Ticket.status

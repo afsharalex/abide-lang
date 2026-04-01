@@ -414,3 +414,31 @@ fn validate_address(a: Address): Bool = todo
 `sorry` = "trust me, this is valid" (silent, for deliberate stubs). `todo` = "this is unfinished" (compiler warns). Both compile and act as valid expressions of any type.
 
 `Stable`
+
+---
+
+### QA Language (`.qa` files)
+
+```qa
+load "commerce/"
+
+ask entities
+ask reachable Order.status -> @Shipped
+assert not cycles Order.status
+explain path Order.status @Pending -> @Shipped
+
+abide {
+  module Commerce
+  entity Order {
+    action refund() requires status == @Confirmed { status' = @Refunded }
+  }
+}
+
+assert reachable Order.status -> @Refunded
+```
+
+QA queries run against a FlowModel (state graphs extracted from IR). No SMT — instant responses. `abide { }` blocks extend entities with hypothetical actions for "what if" testing.
+
+Run with `abide qa script.qa` or interactively via `abide repl` with `/qa` mode.
+
+`Implemented`

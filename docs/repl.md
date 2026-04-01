@@ -1,6 +1,6 @@
 # The Abide REPL
 
-> Planned feature — not yet implemented.
+> Implemented in v0.
 
 The Abide REPL is a live evaluation environment for interactive specification authoring and exploration. Modeled after Clojure's nREPL and Common Lisp's SLIME: load source files, experiment with definitions against a live universe, and switch to QA mode for instant structural queries.
 
@@ -89,20 +89,38 @@ abide repl order.abide       # load a file (+ dependencies)
 | `/qa` | Switch to QA mode |
 | `/abide` | Switch to Abide mode |
 
-## Editor Integration (nREPL Server)
+## Keybindings
 
-The REPL supports a server mode for editor integration:
+Emacs keybindings are the default (`Ctrl+A`, `Ctrl+E`, `Ctrl+K`, `Ctrl+R`, etc.). Use `--vi` for Vi mode:
 
 ```sh
-abide repl --port 7888       # start nREPL server (editor connects)
-abide repl                   # start interactive TUI (default)
+abide repl --vi commerce/
 ```
 
-The server accepts the same commands as the interactive REPL. Editor plugins (VS Code, Emacs, Neovim) connect and send/receive structured messages. This enables:
+Tab completion is context-aware:
+- In QA mode: QA verbs → subcommands → entity/field/state names
+- In Abide mode: keywords → definition names
+- `@` prefix completes state atoms (`@Pending`, `@Shipped`)
+- `Entity.` completes field names
 
-- Evaluate a selection from an `.abide` file in the live universe
-- Run QA queries and display results inline
-- Auto-reload on file save
+## Multi-Line Input
+
+Unbalanced braces or parentheses continue input on the next line:
+
+```
+abide> entity Order {
+.....>   action refund() requires status == @Confirmed {
+.....>     status' = @Refunded
+.....>   }
+.....> }
+  OK: (added to in-memory environment)
+```
+
+`Ctrl+C` on a continuation line clears the buffer without exiting.
+
+## Editor Integration
+
+Editor integration (evaluate selections, inline results, QA from the editor) is provided by a separate LSP server (`abide-lsp`). See the editor integration documentation for details.
 
 ## How It Works
 

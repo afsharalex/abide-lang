@@ -1,0 +1,23 @@
+// QA test: hypothetical entity extension via abide block
+// Base spec has Open -> InProgress -> Closed (no cycles)
+// Abide block adds reopen: Closed -> Open (creates a cycle)
+load "hypo_base.abide"
+
+abide {
+  module HypoTest
+
+  entity Ticket {
+    action reopen()
+      requires status == @Closed
+    {
+      status' = @Open
+    }
+  }
+}
+
+// With the hypothetical, states should be reachable
+assert reachable Ticket.status -> @Closed
+assert reachable Ticket.status -> @InProgress
+
+// The reopen action creates a cycle
+assert cycles Ticket.status

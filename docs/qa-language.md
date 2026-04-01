@@ -1,6 +1,6 @@
 # The QA Language
 
-> Planned feature — not yet implemented.
+> Implemented in v0.
 
 QA (Query Abide) is a small, purpose-built language for querying specifications structurally. It answers questions about your spec without running the solver — what states are reachable, where are the cycles, what transitions exist, what events touch a field.
 
@@ -120,43 +120,56 @@ explain not reachable Order.status -> @Refunded:
 
 ## Hypothetical Scenarios
 
-QA scripts can test "what if" scenarios by loading additional `.abide` files that extend existing modules. Each hypothetical file declares the module it extends — the module system merges them.
+QA scripts can test "what if" scenarios using inline `abide { }` blocks that extend existing entities with new actions. The block must declare its module so the extension merges correctly:
 
-**Hypothetical file:**
-```abide
-// tests/hypotheticals/refund.abide
-module Commerce
-
-entity Order {
-  action refund() requires status == @Confirmed {
-    status' = @Refunded
-  }
-}
-```
-
-**QA script testing the hypothetical:**
 ```
 // tests/refund.qa
 load "src/commerce/"
-load "tests/hypotheticals/refund.abide"
+
+abide {
+  module Commerce
+
+  entity Order {
+    action refund() requires status == @Confirmed {
+      status' = @Refunded
+    }
+  }
+}
 
 assert reachable Order.status -> @Refunded
 explain path Order.status @Pending -> @Refunded
 ```
 
-This lets you explore design alternatives without modifying production specs. Different scripts can load different combinations of hypotheticals.
+The `abide { }` block adds the `refund` action to the existing `Order` entity in-memory. The original spec files are not modified. This lets you explore design alternatives without changing production specs.
+
+**Key rules:**
+- `abide { }` blocks must include a `module` declaration matching the loaded specs
+- Actions and fields are merged into existing entities (new actions added, existing ones preserved)
+- `load` stays pure — it loads Abide files normally; duplicate entities across files are errors
+- The `FlowModel` is rebuilt after each `abide { }` block
+
+## Name Disambiguation
+
+QA commands (`ask reachable ...`) and user function calls (`ask(x)`) are syntactically disjoint. The parser distinguishes by the second token — a QA subcommand keyword vs a parenthesis:
+
+```
+ask reachable Order.status -> @Shipped    // QA command (ask + reachable)
+ask(42)                                    // user function call (ask + parenthesis)
+```
+
+If a user-defined name shadows a QA subcommand keyword, the module qualifier resolves the ambiguity: `Commerce::reachable(x)`.
 
 ## Key Design Decisions
 
-**QA is its own language.** Not embedded Abide, not a library. Three statement types (`ask`/`explain`/`assert`) plus `load`. Simple grammar, easy to learn, easy to parse.
+**QA is its own language.** Not embedded Abide, not a library. Four statement types (`ask`/`explain`/`assert`/`load`) plus `abide { }` blocks. Simple grammar, easy to learn, easy to parse.
 
 **Graph-based, not solver-based.** QA queries execute against a FlowModel — a precomputed graph of state transitions extracted from the IR. No SMT solver invocation. Responses are instant (microseconds). Solver-backed analysis belongs to `abide verify`.
 
 **`explain` over `why_not`.** One keyword for both positive and negative diagnostics. `explain reachable ...` tells you why something is reachable. `explain not reachable ...` tells you why not.
 
-**No Abide code in `.qa` files.** Hypotheticals live in separate `.abide` files loaded via `load`. This avoids mixed-language parsing and keeps scripts focused on queries.
+**`--format json` for CI.** Machine-readable output for automated pipelines. Each result is a JSON object.
 
-## Block-Form Queries *(v0.1)*
+## Block-Form Queries
 
 For power users, advanced relational queries:
 
@@ -168,4 +181,4 @@ ask {
 }
 ```
 
-Available predicates: `state`, `transition`, `initial`, `terminal`, `invariant`, `event`, `cross_call`. This is a small relational query language over the FlowModel.
+Available predicates: `state`, `transition`, `initial`, `terminal`. This is a small relational query language over the FlowModel.

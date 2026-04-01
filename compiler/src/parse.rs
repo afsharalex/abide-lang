@@ -92,6 +92,21 @@ fn postfix_bp(op: &Token) -> Option<u8> {
     }
 }
 
+/// Parse a string into a `Program`. Convenience wrapper for REPL use.
+pub fn parse_string(input: &str) -> Result<crate::ast::Program, ParseError> {
+    let tokens = crate::lex::lex(input).map_err(|errs| ParseError::General {
+        msg: errs
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+        span: (0..0).into(),
+        help: None,
+    })?;
+    let mut parser = Parser::new(tokens);
+    parser.parse_program()
+}
+
 // ── Parser state ─────────────────────────────────────────────────────
 
 pub struct Parser {

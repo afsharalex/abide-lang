@@ -6,5 +6,7 @@ pub mod lex;
 pub mod loader;
 pub mod messages;
 pub mod parse;
+pub mod qa;
+pub mod repl;
 pub mod span;
 pub mod verify;
