@@ -50,16 +50,24 @@ fn collect_top_decl(env: &mut Env, decl: &ast::TopDecl) {
             env.known_modules.insert(d.name.clone());
             match &env.module_name {
                 Some(existing) if existing != &d.name => {
-                    env.errors.push(ElabError::with_span(
-                        ErrorKind::DuplicateDecl,
-                        format!(
-                            "conflicting module declaration: '{}' (already declared as '{}')",
-                            d.name, existing
-                        ),
-                        String::new(),
-                        d.span,
-                    ));
-                    // Keep first module name — don't overwrite on conflict
+                    if env.module_inherited {
+                        // The current module was inherited from a parent include.
+                        // This file declares its own module — override the inherited one.
+                        env.module_name = Some(d.name.clone());
+                        env.module_inherited = false;
+                    } else {
+                        // Genuine conflict: two explicit module declarations in
+                        // the same file or compilation scope.
+                        env.errors.push(ElabError::with_span(
+                            ErrorKind::DuplicateDecl,
+                            format!(
+                                "conflicting module declaration: '{}' (already declared as '{}')",
+                                d.name, existing
+                            ),
+                            String::new(),
+                            d.span,
+                        ));
+                    }
                 }
                 None => {
                     env.module_name = Some(d.name.clone());

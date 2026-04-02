@@ -15,7 +15,14 @@ use super::types::{
 
 // ── Top-level lowering ───────────────────────────────────────────────
 
+/// Resolve an alias to its canonical name, or return the name as-is.
+fn canonical<'a>(aliases: &'a std::collections::HashMap<String, String>, name: &'a str) -> &'a str {
+    aliases.get(name).map_or(name, String::as_str)
+}
+
 pub fn lower(er: &E::ElabResult) -> IRProgram {
+    let a = &er.aliases;
+
     // All definitions (fn, pred, prop) are lowered uniformly into IRFunction.
     // pred is fn -> Bool with params. prop is nullary fn -> Bool.
     let mut functions: Vec<IRFunction> = Vec::new();
@@ -34,11 +41,11 @@ pub fn lower(er: &E::ElabResult) -> IRProgram {
         constants: er.consts.iter().map(lower_const).collect(),
         functions,
         entities: er.entities.iter().map(lower_entity).collect(),
-        systems: er.systems.iter().map(lower_system).collect(),
-        verifies: er.verifies.iter().map(lower_verify).collect(),
-        theorems: er.theorems.iter().map(lower_theorem).collect(),
+        systems: er.systems.iter().map(|s| lower_system(s, a)).collect(),
+        verifies: er.verifies.iter().map(|v| lower_verify(v, a)).collect(),
+        theorems: er.theorems.iter().map(|t| lower_theorem(t, a)).collect(),
         axioms: er.axioms.iter().map(lower_axiom).collect(),
-        scenes: er.scenes.iter().map(lower_scene).collect(),
+        scenes: er.scenes.iter().map(|s| lower_scene(s, a)).collect(),
     }
 }
 
@@ -490,16 +497,16 @@ fn extract_updates(body: &[E::EExpr]) -> Vec<IRUpdate> {
 
 // ── Systems ──────────────────────────────────────────────────────────
 
-fn lower_system(es: &E::ESystem) -> IRSystem {
+fn lower_system(es: &E::ESystem, aliases: &std::collections::HashMap<String, String>) -> IRSystem {
     IRSystem {
         name: es.name.clone(),
-        entities: es.uses.clone(),
-        events: es.events.iter().map(lower_event).collect(),
+        entities: es.uses.iter().map(|u| canonical(aliases, u).to_owned()).collect(),
+        events: es.events.iter().map(|ev| lower_event(ev, aliases)).collect(),
         schedule: lower_schedule(&es.next_items),
     }
 }
 
-fn lower_event(ev: &E::EEvent) -> IREvent {
+fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, String>) -> IREvent {
     let post = if ev.ensures.is_empty() {
         None
     } else {
@@ -527,25 +534,28 @@ fn lower_event(ev: &E::EEvent) -> IREvent {
             .collect(),
         guard: lower_guard_refs(&all_requires),
         postcondition: post,
-        body: ev.body.iter().map(lower_event_action).collect(),
+        body: ev.body.iter().map(|a| lower_event_action(a, aliases)).collect(),
     }
 }
 
-fn lower_event_action(ea: &E::EEventAction) -> IRAction {
+fn lower_event_action(
+    ea: &E::EEventAction,
+    aliases: &std::collections::HashMap<String, String>,
+) -> IRAction {
     match ea {
         E::EEventAction::Choose(v, ty, guard, body) => IRAction::Choose {
             var: v.clone(),
             entity: ty.name().to_owned(),
             filter: Box::new(lower_expr(guard)),
-            ops: body.iter().map(lower_event_action).collect(),
+            ops: body.iter().map(|a| lower_event_action(a, aliases)).collect(),
         },
         E::EEventAction::ForAll(v, ty, body) => IRAction::ForAll {
             var: v.clone(),
             entity: ty.name().to_owned(),
-            ops: body.iter().map(lower_event_action).collect(),
+            ops: body.iter().map(|a| lower_event_action(a, aliases)).collect(),
         },
         E::EEventAction::Create(entity, fields) => IRAction::Create {
-            entity: entity.clone(),
+            entity: canonical(aliases, entity).to_owned(),
             fields: fields
                 .iter()
                 .map(|(fn_, fe)| IRCreateField {
@@ -555,7 +565,7 @@ fn lower_event_action(ea: &E::EEventAction) -> IRAction {
                 .collect(),
         },
         E::EEventAction::CrossCall(sys, ev, args) => IRAction::CrossCall {
-            system: sys.clone(),
+            system: canonical(aliases, sys).to_owned(),
             event: ev.clone(),
             args: args.iter().map(lower_expr).collect(),
         },
@@ -595,14 +605,14 @@ fn lower_schedule(items: &[E::ENextItem]) -> IRSchedule {
 
 // ── Verification ─────────────────────────────────────────────────────
 
-fn lower_verify(ev: &E::EVerify) -> IRVerify {
+fn lower_verify(ev: &E::EVerify, aliases: &std::collections::HashMap<String, String>) -> IRVerify {
     IRVerify {
         name: ev.name.clone(),
         systems: ev
             .targets
             .iter()
             .map(|(n, lo, hi)| IRVerifySystem {
-                name: n.clone(),
+                name: canonical(aliases, n).to_owned(),
                 lo: *lo,
                 hi: *hi,
             })
@@ -613,10 +623,10 @@ fn lower_verify(ev: &E::EVerify) -> IRVerify {
     }
 }
 
-fn lower_theorem(et: &E::ETheorem) -> IRTheorem {
+fn lower_theorem(et: &E::ETheorem, aliases: &std::collections::HashMap<String, String>) -> IRTheorem {
     IRTheorem {
         name: et.name.clone(),
-        systems: et.targets.clone(),
+        systems: et.targets.iter().map(|t| canonical(aliases, t).to_owned()).collect(),
         invariants: et.invariants.iter().map(lower_expr).collect(),
         shows: et.shows.iter().map(lower_expr).collect(),
         span: et.span,
@@ -633,7 +643,7 @@ fn lower_axiom(ea: &E::EAxiom) -> IRAxiom {
     }
 }
 
-fn lower_scene(es: &E::EScene) -> IRScene {
+fn lower_scene(es: &E::EScene, aliases: &std::collections::HashMap<String, String>) -> IRScene {
     let (actions, assumes): (Vec<_>, Vec<_>) = es
         .whens
         .iter()
@@ -641,9 +651,9 @@ fn lower_scene(es: &E::EScene) -> IRScene {
 
     IRScene {
         name: es.name.clone(),
-        systems: es.targets.clone(),
-        givens: es.givens.iter().map(lower_given).collect(),
-        events: actions.iter().map(|w| lower_scene_action(w)).collect(),
+        systems: es.targets.iter().map(|t| canonical(aliases, t).to_owned()).collect(),
+        givens: es.givens.iter().map(|g| lower_given(g, aliases)).collect(),
+        events: actions.iter().map(|w| lower_scene_action(w, aliases)).collect(),
         ordering: assumes
             .iter()
             .filter_map(|w| match w {
@@ -657,7 +667,7 @@ fn lower_scene(es: &E::EScene) -> IRScene {
     }
 }
 
-fn lower_given(g: &E::ESceneGiven) -> IRSceneGiven {
+fn lower_given(g: &E::ESceneGiven, aliases: &std::collections::HashMap<String, String>) -> IRSceneGiven {
     let constraint = match &g.condition {
         Some(e) => lower_expr(e),
         None => IRExpr::Lit {
@@ -668,12 +678,12 @@ fn lower_given(g: &E::ESceneGiven) -> IRSceneGiven {
     };
     IRSceneGiven {
         var: g.var.clone(),
-        entity: g.entity_type.clone(),
+        entity: canonical(aliases, &g.entity_type).to_owned(),
         constraint,
     }
 }
 
-fn lower_scene_action(w: &E::ESceneWhen) -> IRSceneEvent {
+fn lower_scene_action(w: &E::ESceneWhen, aliases: &std::collections::HashMap<String, String>) -> IRSceneEvent {
     match w {
         E::ESceneWhen::Action {
             var,
@@ -683,7 +693,7 @@ fn lower_scene_action(w: &E::ESceneWhen) -> IRSceneEvent {
             card,
         } => IRSceneEvent {
             var: var.clone(),
-            system: system.clone(),
+            system: canonical(aliases, system).to_owned(),
             event: event.clone(),
             args: args.iter().map(lower_expr).collect(),
             cardinality: card_from_text(card.as_deref()),
@@ -1207,7 +1217,7 @@ mod tests {
             span: Some(sp),
             file: Some("/test.abide".to_owned()),
         };
-        let ir = lower_verify(&ev);
+        let ir = lower_verify(&ev, &std::collections::HashMap::new());
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/test.abide"));
     }
@@ -1227,7 +1237,7 @@ mod tests {
             span: Some(sp),
             file: Some("/proof.abide".to_owned()),
         };
-        let ir = lower_theorem(&et);
+        let ir = lower_theorem(&et, &std::collections::HashMap::new());
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/proof.abide"));
     }
@@ -1244,7 +1254,7 @@ mod tests {
             span: Some(sp),
             file: Some("/scene.abide".to_owned()),
         };
-        let ir = lower_scene(&es);
+        let ir = lower_scene(&es, &std::collections::HashMap::new());
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/scene.abide"));
     }

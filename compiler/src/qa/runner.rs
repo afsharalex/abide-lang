@@ -181,11 +181,31 @@ fn load_and_build_model(
         ]);
     }
 
-    let (env, load_errors, _all_paths) = loader::load_files(paths);
+    let (mut env, load_errors, _all_paths) = loader::load_files(paths);
 
     if !load_errors.is_empty() {
         let errors: Vec<String> = load_errors.iter().map(|e| format!("error: {e}")).collect();
         return Err(errors);
+    }
+
+    // Include-level load errors (lex/parse/IO in transitively included files)
+    // are non-fatal for the loader but must block QA/REPL — a partial model
+    // gives incorrect query results.
+    if !env.include_load_errors.is_empty() {
+        let errors: Vec<String> = env
+            .include_load_errors
+            .iter()
+            .map(|e| format!("error: {e}"))
+            .collect();
+        return Err(errors);
+    }
+
+    // When multiple top-level files were loaded (e.g., directory load or
+    // multiple load statements), don't privilege any single file's module
+    // as root. Clear module_name so build_working_namespace includes all
+    // modules — otherwise only the first file's module is visible.
+    if paths.len() > 1 {
+        env.module_name = None;
     }
 
     let base_env = env.clone();
@@ -214,6 +234,14 @@ fn load_and_build_model(
 /// The overlay must declare `module X` so its entities get the correct
 /// qualified key (e.g., `Commerce::Order`) matching the base env.
 fn merge_env_overlay(dst: &mut crate::elab::env::Env, src: &crate::elab::env::Env) {
+    // Module-level metadata: known_modules, use_decls, decls registry.
+    // These feed build_working_namespace() and resolve_use_declarations().
+    dst.known_modules.extend(src.known_modules.iter().cloned());
+    dst.use_decls.extend(src.use_decls.iter().cloned());
+    for (key, info) in &src.decls {
+        dst.decls.insert(key.clone(), info.clone());
+    }
+
     for (name, ty) in &src.types {
         dst.types.insert(name.clone(), ty.clone());
     }
@@ -250,6 +278,14 @@ fn merge_env_overlay(dst: &mut crate::elab::env::Env, src: &crate::elab::env::En
     for (name, c) in &src.consts {
         dst.consts.insert(name.clone(), c.clone());
     }
+    // Verification/proof declarations (Vec-backed, not map-backed).
+    // These are appended — multiple verify/scene/theorem blocks with different
+    // names can coexist.
+    dst.verifies.extend(src.verifies.iter().cloned());
+    dst.scenes.extend(src.scenes.iter().cloned());
+    dst.theorems.extend(src.theorems.iter().cloned());
+    dst.axioms.extend(src.axioms.iter().cloned());
+    dst.lemmas.extend(src.lemmas.iter().cloned());
 }
 
 /// Rebuild a `FlowModel` from an env (re-elaborate and lower).
@@ -279,17 +315,19 @@ fn resolve_load_path(script_dir: &Path, path_str: &str) -> PathBuf {
     }
 }
 
-/// Collect all `.abide` files from a directory (non-recursive for now).
+/// Collect all `.abide` files from a directory recursively, sorted
+/// alphabetically for deterministic load order.
 fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("abide") {
-                paths.push(path);
-            } else if path.is_dir() {
-                // Recurse into subdirectories
-                collect_abide_files(&path, paths);
-            }
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return,
+    };
+    entries.sort();
+    for path in entries {
+        if path.extension().and_then(|e| e.to_str()) == Some("abide") {
+            paths.push(path);
+        } else if path.is_dir() {
+            collect_abide_files(&path, paths);
         }
     }
 }

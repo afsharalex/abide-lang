@@ -506,6 +506,9 @@ pub struct ElabResult {
     pub module_name: Option<String>,
     pub includes: Vec<String>,
     pub use_decls: Vec<crate::ast::UseDecl>,
+    /// Alias → canonical name map from use declarations (e.g., `WSlot` → `Slot`).
+    /// Used by IR lowering to canonicalize entity/system references.
+    pub aliases: std::collections::HashMap<String, String>,
     pub types: Vec<EType>,
     pub entities: Vec<EEntity>,
     pub systems: Vec<ESystem>,

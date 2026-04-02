@@ -1,6 +1,9 @@
+use std::path::PathBuf;
+
 use abide::elab;
 use abide::ir;
 use abide::lex;
+use abide::loader;
 use abide::parse::Parser;
 
 fn parse_file(path: &str) -> abide::ast::Program {
@@ -22,12 +25,59 @@ fn parse_file(path: &str) -> abide::ast::Program {
 fn elaborate_file(path: &str) -> elab::types::ElabResult {
     let program = parse_file(path);
     let (result, errors) = elab::elaborate(&program);
-    for err in &errors {
+    let actual_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    for err in &actual_errors {
         eprintln!("{path}: {err}");
     }
-    assert!(errors.is_empty(), "{path} should elaborate without errors");
+    assert!(
+        actual_errors.is_empty(),
+        "{path} should elaborate without errors"
+    );
     result
 }
+
+/// Load and elaborate via the multi-file loader (handles include/use).
+fn load_and_elaborate_files(paths: &[&str]) -> elab::types::ElabResult {
+    let path_bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let (env, load_errors, _all_paths) = loader::load_files(&path_bufs);
+    assert!(
+        load_errors.is_empty(),
+        "{paths:?} should load without errors: {load_errors:?}"
+    );
+    assert!(
+        env.include_load_errors.is_empty(),
+        "{paths:?} should have no include errors: {:?}",
+        env.include_load_errors
+    );
+
+    let (result, errors) = elab::elaborate_env(env);
+    let actual_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    for err in &actual_errors {
+        eprintln!("{paths:?}: {err}");
+    }
+    assert!(
+        actual_errors.is_empty(),
+        "{paths:?} should elaborate without errors"
+    );
+    result
+}
+
+fn lower_loaded_files(paths: &[&str]) -> ir::types::IRProgram {
+    let result = load_and_elaborate_files(paths);
+    ir::lower(&result)
+}
+
+/// Commerce fixture: multi-file via include (commerce.abide includes billing.abide).
+const COMMERCE_FIXTURE: &[&str] = &["tests/fixtures/commerce.abide"];
+
+/// Logistics fixture: two includes, wildcard + aliased imports.
+const LOGISTICS_FIXTURE: &[&str] = &["tests/fixtures/logistics.abide"];
 
 #[test]
 fn parse_simple() {
@@ -85,13 +135,71 @@ fn elaborate_auth() {
 
 #[test]
 fn elaborate_commerce() {
-    let result = elaborate_file("tests/fixtures/commerce.abide");
+    // Multi-file: commerce + billing modules loaded together
+    let result = load_and_elaborate_files(COMMERCE_FIXTURE);
     assert!(
         result.systems.len() >= 2,
         "should have Commerce and Billing"
     );
     assert!(!result.scenes.is_empty(), "should have scenes");
     assert!(!result.theorems.is_empty(), "should have proofs");
+}
+
+#[test]
+fn elaborate_logistics() {
+    // Multi-file: logistics includes shipping + warehouse,
+    // uses wildcard (Shipping::*) and aliases (Warehouse::Slot as WSlot).
+    let result = load_and_elaborate_files(LOGISTICS_FIXTURE);
+    assert!(
+        result.systems.len() >= 1,
+        "should have Logistics system"
+    );
+    assert!(
+        result.entities.len() >= 2,
+        "should have Package (wildcard) and WSlot (alias), got {}",
+        result.entities.len()
+    );
+    assert!(
+        result.preds.len() >= 2,
+        "should have preds using alias and wildcard names"
+    );
+}
+
+#[test]
+fn lower_logistics() {
+    let prog = lower_loaded_files(LOGISTICS_FIXTURE);
+    assert!(!prog.verifies.is_empty(), "should have verify blocks");
+    assert!(!prog.scenes.is_empty(), "should have scene blocks");
+    let json = ir::emit_json(&prog).expect("IR serialization should succeed");
+    let _parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+}
+
+#[test]
+fn verify_logistics_fixture() {
+    let prog = lower_loaded_files(LOGISTICS_FIXTURE);
+    let results =
+        abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    // logistics_safety: uses WSlot alias in quantifier — should verify
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                | abide::verify::VerificationResult::Checked { name, .. }
+                if name == "logistics_safety"
+        )),
+        "logistics_safety should be PROVED or CHECKED, got: {:?}",
+        results
+    );
+    // reserve_and_ship scene uses aliased (WSlot) and wildcard (Package) entity names
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                if name == "reserve_and_ship"
+        )),
+        "reserve_and_ship scene should PASS, got: {:?}",
+        results
+    );
 }
 
 #[test]
@@ -134,7 +242,8 @@ fn lower_simple() {
 
 #[test]
 fn lower_commerce() {
-    let prog = lower_file("tests/fixtures/commerce.abide");
+    // Multi-file: commerce + billing modules loaded together
+    let prog = lower_loaded_files(COMMERCE_FIXTURE);
     assert!(prog.systems.len() >= 2, "should have Commerce and Billing");
     assert!(!prog.verifies.is_empty(), "should have IR verifies");
     assert!(!prog.scenes.is_empty(), "should have IR scenes");
@@ -146,11 +255,11 @@ fn lower_commerce() {
 
 #[test]
 fn lower_all_fixtures() {
-    for name in &["simple", "auth", "commerce", "inventory", "workflow"] {
+    // Single-file fixtures
+    for name in &["simple", "auth", "inventory", "workflow"] {
         let path = format!("tests/fixtures/{name}.abide");
         let prog = lower_file(&path);
         let json = ir::emit_json(&prog).expect("IR serialization should succeed");
-        // Verify it's valid JSON
         let parsed: serde_json::Value =
             serde_json::from_str(&json).unwrap_or_else(|e| panic!("{name}: invalid JSON: {e}"));
         assert!(parsed.is_object(), "{name}: top-level should be object");
@@ -161,6 +270,22 @@ fn lower_all_fixtures() {
         assert!(
             parsed["entities"].is_array(),
             "{name}: should have entities array"
+        );
+    }
+    // Multi-file fixture (commerce + billing modules)
+    {
+        let prog = lower_loaded_files(COMMERCE_FIXTURE);
+        let json = ir::emit_json(&prog).expect("IR serialization should succeed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("commerce: invalid JSON: {e}"));
+        assert!(parsed.is_object(), "commerce: top-level should be object");
+        assert!(
+            parsed["types"].is_array(),
+            "commerce: should have types array"
+        );
+        assert!(
+            parsed["entities"].is_array(),
+            "commerce: should have entities array"
         );
     }
 }
@@ -271,7 +396,10 @@ fn verify_inventory_fixture() {
 
 #[test]
 fn verify_commerce_fixture() {
-    let results = verify_file("tests/fixtures/commerce.abide");
+    // Multi-file: commerce.abide includes billing.abide
+    let prog = lower_loaded_files(COMMERCE_FIXTURE);
+    let results =
+        abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
     // commerce_smoke: COUNTEREXAMPLE (expected — eventually in bounded check)
     assert!(
         results.iter().any(|r| matches!(

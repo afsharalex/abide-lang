@@ -105,6 +105,18 @@ impl ReplState {
 
 /// Merge declarations from `src` into `dst`, printing warnings for redefinitions.
 fn merge_overlay(dst: &mut Env, src: &Env) {
+    // Module-level metadata: known_modules, use_decls, decls registry.
+    // These feed build_working_namespace() and resolve_use_declarations().
+    dst.known_modules.extend(src.known_modules.iter().cloned());
+    dst.use_decls.extend(src.use_decls.iter().cloned());
+    for (key, info) in &src.decls {
+        if dst.decls.contains_key(key) {
+            let bare = key.rsplit("::").next().unwrap_or(key);
+            println!("  warning: redefining '{bare}'");
+        }
+        dst.decls.insert(key.clone(), info.clone());
+    }
+
     for (name, ty) in &src.types {
         if dst.types.contains_key(name) {
             println!("  warning: redefining type '{name}'");
@@ -154,6 +166,42 @@ fn merge_overlay(dst: &mut Env, src: &Env) {
             println!("  warning: redefining const '{name}'");
         }
         dst.consts.insert(name.clone(), c.clone());
+    }
+    // Verification/proof declarations (Vec-backed, not map-backed).
+    for v in &src.verifies {
+        if dst.verifies.iter().any(|existing| existing.name == v.name) {
+            println!("  warning: redefining verify '{}'", v.name);
+            dst.verifies.retain(|existing| existing.name != v.name);
+        }
+        dst.verifies.push(v.clone());
+    }
+    for s in &src.scenes {
+        if dst.scenes.iter().any(|existing| existing.name == s.name) {
+            println!("  warning: redefining scene '{}'", s.name);
+            dst.scenes.retain(|existing| existing.name != s.name);
+        }
+        dst.scenes.push(s.clone());
+    }
+    for t in &src.theorems {
+        if dst.theorems.iter().any(|existing| existing.name == t.name) {
+            println!("  warning: redefining theorem '{}'", t.name);
+            dst.theorems.retain(|existing| existing.name != t.name);
+        }
+        dst.theorems.push(t.clone());
+    }
+    for a in &src.axioms {
+        if dst.axioms.iter().any(|existing| existing.name == a.name) {
+            println!("  warning: redefining axiom '{}'", a.name);
+            dst.axioms.retain(|existing| existing.name != a.name);
+        }
+        dst.axioms.push(a.clone());
+    }
+    for l in &src.lemmas {
+        if dst.lemmas.iter().any(|existing| existing.name == l.name) {
+            println!("  warning: redefining lemma '{}'", l.name);
+            dst.lemmas.retain(|existing| existing.name != l.name);
+        }
+        dst.lemmas.push(l.clone());
     }
 }
 
@@ -507,23 +555,42 @@ fn load_base_env(path: &Path) -> Result<Env, Vec<String>> {
         return Err(vec!["no .abide files found".to_owned()]);
     }
 
-    let (env, load_errors, _) = loader::load_files(&paths);
+    let (mut env, load_errors, _) = loader::load_files(&paths);
     if !load_errors.is_empty() {
         return Err(load_errors.iter().map(|e| format!("{e}")).collect());
+    }
+
+    // Include-level load errors (lex/parse/IO in transitively included files)
+    // must block REPL startup — a partial environment gives wrong results.
+    if !env.include_load_errors.is_empty() {
+        return Err(env
+            .include_load_errors
+            .iter()
+            .map(|e| format!("{e}"))
+            .collect());
+    }
+
+    // When loading from a directory (multiple files), don't privilege any
+    // single file's module as root. Clear module_name so
+    // build_working_namespace includes all modules.
+    if paths.len() > 1 {
+        env.module_name = None;
     }
 
     Ok(env)
 }
 
 fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("abide") {
-                paths.push(path);
-            } else if path.is_dir() {
-                collect_abide_files(&path, paths);
-            }
+    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return,
+    };
+    entries.sort();
+    for path in entries {
+        if path.extension().and_then(|e| e.to_str()) == Some("abide") {
+            paths.push(path);
+        } else if path.is_dir() {
+            collect_abide_files(&path, paths);
         }
     }
 }

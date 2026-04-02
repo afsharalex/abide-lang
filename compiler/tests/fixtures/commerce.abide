@@ -1,13 +1,14 @@
 // Full Commerce example: entities with actions, system events,
 // cross-system calls, choose + for, verify, proof, scene, module/use
+//
+// This is a multi-file fixture: billing.abide provides the Billing module.
 
 module Commerce
 include "billing.abide"
-use Billing::{PaymentIntent as PI, open_intent, capture_payment}
+use Billing::*
 use Billing::PaymentStatus as PS
 
 enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
-enum PaymentStatus = Opened | Captured | Failed
 type Price = Int
 
 struct Address { street: String, city: String }
@@ -36,23 +37,6 @@ entity Order {
   action cancel()
     requires status == @Pending {
     status' = @Cancelled
-  }
-}
-
-entity PaymentIntent {
-  order_id: Id
-  amount: Price
-  status: PaymentStatus = @Opened
-
-  action capture()
-    requires status == @Opened
-    requires amount > 0 {
-    status' = @Captured
-  }
-
-  action fail()
-    requires status == @Opened {
-    status' = @Failed
   }
 }
 
@@ -94,31 +78,6 @@ system Commerce {
   }
 }
 
-system Billing {
-  use PaymentIntent
-
-  event open_intent(order_id: Id, amount: Price) {
-    create PaymentIntent {
-      order_id = order_id
-      amount = amount
-      status = @Opened
-    }
-  }
-
-  event capture_payment(order_id: Id)
-    requires exists p: PaymentIntent | p.order_id == order_id and p.status == @Opened
-    ensures exists p: PaymentIntent | p.order_id == order_id and p.status == @Captured {
-    choose p: PaymentIntent where p.order_id == order_id {
-      p.capture()
-    }
-    Commerce::confirm_payment(order_id: order_id)
-  }
-
-  next {
-    else => idle
-  }
-}
-
 pred non_negative_order_total(o: Order) = o.total >= 0
 
 prop commerce_safe for Commerce = always all o: Order | non_negative_order_total(o)
@@ -132,6 +91,9 @@ verify commerce_smoke for Commerce[0..5] {
 verify billing_safety for Billing[0..5] {
   assert always all p: PaymentIntent | p.status == @Captured implies p.amount > 0
 }
+
+// Uses PS alias (imported as Billing::PaymentStatus as PS)
+pred payment_opened(p: PaymentIntent) = p.status == @Opened
 
 // Unbounded proof — human-guided, emits obligations to Agda
 theorem order_total_non_negative for Commerce

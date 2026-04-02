@@ -64,6 +64,10 @@ pub struct DeclInfo {
 #[derive(Debug, Clone)]
 pub struct Env {
     pub module_name: Option<String>,
+    /// Whether the current module_name was inherited from a parent file via include
+    /// (as opposed to declared by this file's own `module` declaration).
+    /// When true, a `module` declaration in this file overrides it without conflict.
+    pub module_inherited: bool,
     /// Current source file being collected (set by loader, used to tag declarations).
     pub current_file: Option<String>,
     pub includes: Vec<String>,
@@ -116,6 +120,7 @@ impl Env {
     pub fn new() -> Self {
         Self {
             module_name: None,
+            module_inherited: false,
             current_file: None,
             includes: Vec::new(),
             use_decls: Vec::new(),
@@ -277,8 +282,11 @@ impl Env {
 
     fn key_matches_module(key: &str, module: Option<&str>) -> bool {
         if key.contains("::") {
-            let key_module = key.rsplit_once("::").unwrap().0;
-            module.is_some_and(|m| m == key_module)
+            match module {
+                Some(m) => key.rsplit_once("::").unwrap().0 == m,
+                // No root module (e.g., directory load) — include all modules.
+                None => true,
+            }
         } else {
             true
         }

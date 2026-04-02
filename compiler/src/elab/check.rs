@@ -75,6 +75,7 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
         module_name: env.module_name.clone(),
         includes: env.includes.clone(),
         use_decls: env.use_decls.iter().map(|e| e.decl.clone()).collect(),
+        aliases: env.aliases.clone(),
         types: env
             .types
             .iter()
@@ -309,8 +310,15 @@ fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     let sys_ctx = format!("system {}", system.name);
 
     let entity_names: Vec<String> = env.entities.keys().cloned().collect();
+    // Also accept canonical entity names (the entity's declared name may differ
+    // from the working namespace key when imported via alias).
+    let canonical_names: std::collections::HashSet<String> = env
+        .entities
+        .values()
+        .map(|e| e.name.clone())
+        .collect();
     for entity_name in &system.uses {
-        if env.lookup_entity(entity_name).is_none() {
+        if env.lookup_entity(entity_name).is_none() && !canonical_names.contains(entity_name) {
             let mut err = if let Some(span) = system.span {
                 ElabError::with_span(
                     ErrorKind::UndefinedRef,

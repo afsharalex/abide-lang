@@ -14,22 +14,29 @@ use super::types::{EContract, EEventAction, EExpr, ENextItem, EPattern, ESceneWh
 /// Immutable context for expression resolution, cloned once from Env.
 struct Ctx {
     types: HashMap<String, Ty>,
-    entity_names: Vec<String>,
+    /// Map from entity key (possibly alias) → canonical entity name.
+    /// Used by resolve_ty to create Ty::Entity with canonical names.
+    entity_canonical: HashMap<String, String>,
     /// Alias → canonical name map for rewriting aliased references.
     aliases: HashMap<String, String>,
 }
 
 impl Ctx {
     fn from_env(env: &Env) -> Self {
+        let entity_canonical: HashMap<String, String> = env
+            .entities
+            .iter()
+            .map(|(key, entity)| (key.clone(), entity.name.clone()))
+            .collect();
         Self {
             types: env.types.clone(),
-            entity_names: env.entities.keys().cloned().collect(),
+            entity_canonical,
             aliases: env.aliases.clone(),
         }
     }
 
     fn resolve_ty(&self, ty: &Ty) -> Ty {
-        resolve_ty(&self.types, &self.entity_names, ty)
+        resolve_ty(&self.types, &self.entity_canonical, ty)
     }
 
     /// Resolve an alias to its canonical name, or return the name as-is.
@@ -96,8 +103,27 @@ fn resolve_use_declarations(env: &mut Env) {
         let use_file = entry.source_file.as_deref();
 
         match ud {
-            UseDecl::All { module, .. } => {
+            UseDecl::All { module, span } => {
                 if !known_modules.contains(module) {
+                    // In multi-module mode (at least one module declaration exists),
+                    // an unknown module is likely a typo or missing file — warn.
+                    // In single-file / no-module mode, skip silently.
+                    if !known_modules.is_empty() {
+                        let mut warn = ElabError::with_span(
+                            ErrorKind::UndefinedRef,
+                            format!("unknown module '{module}' in use declaration"),
+                            "module not found".to_owned(),
+                            *span,
+                        )
+                        .with_help(format!(
+                            "no module '{module}' was loaded — check the module name or ensure the file is included"
+                        ));
+                        warn.severity = super::error::Severity::Warning;
+                        if let Some(f) = use_file {
+                            warn.file = Some(f.to_owned());
+                        }
+                        env.errors.push(warn);
+                    }
                     continue;
                 }
                 let public_decls: Vec<String> = env
@@ -196,9 +222,23 @@ fn check_import_target(
     use_span: crate::span::Span,
 ) -> Option<ElabError> {
     if !known_modules.contains(target_module) {
-        // Module not loaded — don't error. In single-file mode this is expected
-        // (cross-module use declarations are aspirational). Only validate targets
-        // in modules that are actually loaded.
+        // In multi-module mode, warn about unknown module references.
+        // In single-file / no-module mode, skip silently.
+        // This is a warning (not error) because the module may simply
+        // not be loaded in this compilation unit.
+        if !known_modules.is_empty() {
+            let mut warn = ElabError::with_span(
+                ErrorKind::UndefinedRef,
+                format!("unknown module '{target_module}' in use declaration"),
+                "module not found".to_owned(),
+                use_span,
+            )
+            .with_help(format!(
+                "no module '{target_module}' was loaded — check the module name or ensure the file is included"
+            ));
+            warn.severity = super::error::Severity::Warning;
+            return Some(warn);
+        }
         return None;
     }
 
@@ -254,9 +294,13 @@ fn check_import_target(
 
 fn resolve_all_types(env: &mut Env) {
     let snapshot = env.types.clone();
-    let entity_names: Vec<String> = env.entities.keys().cloned().collect();
+    let entity_canonical: HashMap<String, String> = env
+        .entities
+        .iter()
+        .map(|(key, entity)| (key.clone(), entity.name.clone()))
+        .collect();
     for ty in env.types.values_mut() {
-        *ty = resolve_ty(&snapshot, &entity_names, ty);
+        *ty = resolve_ty(&snapshot, &entity_canonical, ty);
     }
 }
 
@@ -273,13 +317,15 @@ fn resolve_type_refinement_predicates(env: &mut Env) {
     }
 }
 
-fn resolve_ty(types: &HashMap<String, Ty>, entities: &[String], ty: &Ty) -> Ty {
+fn resolve_ty(types: &HashMap<String, Ty>, entities: &HashMap<String, String>, ty: &Ty) -> Ty {
     match ty {
         Ty::Unresolved(n) => {
             if let Some(t) = types.get(n.as_str()) {
                 t.clone()
-            } else if entities.contains(n) {
-                Ty::Entity(n.clone())
+            } else if let Some(canonical) = entities.get(n.as_str()) {
+                // Use the entity's canonical name (from its declaration),
+                // not the possibly-aliased import key.
+                Ty::Entity(canonical.clone())
             } else {
                 ty.clone()
             }
@@ -986,18 +1032,38 @@ mod tests {
     }
 
     #[test]
-    fn use_all_unknown_module_silently_skipped() {
-        // Unknown modules are silently skipped — they may be in unloaded files.
-        // Only loaded modules trigger validation.
+    fn use_all_unknown_module_warns_in_multi_module_mode() {
+        // In multi-module mode (module declaration present), unknown modules
+        // should produce a warning — likely a typo or missing file.
         let env = elaborate_src("module Importer\nuse NoSuchModule::*");
+        let module_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| {
+                e.message.contains("unknown module")
+                    && matches!(e.severity, crate::elab::error::Severity::Warning)
+            })
+            .collect();
+        assert!(
+            !module_warnings.is_empty(),
+            "unknown module in multi-module mode should warn, got: {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn use_all_unknown_module_skipped_without_modules() {
+        // Without any module declaration, unknown module refs are silently
+        // skipped — single-file mode with aspirational use declarations.
+        let env = elaborate_src("use NoSuchModule::*");
         let module_errors: Vec<_> = env
             .errors
             .iter()
-            .filter(|e| e.message.contains("NoSuchModule"))
+            .filter(|e| e.message.contains("unknown module"))
             .collect();
         assert!(
             module_errors.is_empty(),
-            "unknown module in use M::* should be silently skipped, got: {:?}",
+            "unknown module in no-module mode should be silently skipped, got: {:?}",
             module_errors
         );
     }

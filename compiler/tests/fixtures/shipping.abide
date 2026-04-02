@@ -1,0 +1,21 @@
+// Shipping module — used by logistics.abide for multi-module alias testing
+
+module Shipping
+
+pub enum ShipStatus = Pending | InTransit | Delivered
+
+pub entity Package {
+  id: Id
+  status: ShipStatus = @Pending
+  weight: Int
+
+  action ship()
+    requires status == @Pending {
+    status' = @InTransit
+  }
+
+  action deliver()
+    requires status == @InTransit {
+    status' = @Delivered
+  }
+}

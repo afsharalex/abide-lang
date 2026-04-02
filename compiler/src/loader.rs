@@ -83,8 +83,11 @@ fn load_file_into(
 
     // If this file is included and the parent has a module, pre-set it
     // so declarations without their own `module` decl inherit the parent's.
+    // Mark as inherited so the collector allows the file's own `module`
+    // declaration to override it without "conflicting module" error.
     if let Some(pm) = parent_module {
         env.module_name = Some(pm.to_string());
+        env.module_inherited = true;
     }
 
     let saved_file = env.current_file.take();
@@ -109,6 +112,7 @@ fn load_file_into(
     // For subsequent files, restore so each file gets its own scope.
     if saved_module.is_some() {
         env.module_name = saved_module;
+        env.module_inherited = false;
     }
     // else: keep file_module (first file sets the root module)
     if saved_file.is_some() {
