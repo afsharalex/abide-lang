@@ -16,11 +16,13 @@ use crate::ir::types::{IRExpr, IRProgram, IRType};
 /// Global counter for generating fresh variable names during alpha-renaming.
 static FRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A single definition entry: parameters + body.
+/// A single definition entry: parameters + body + contracts.
 #[derive(Debug, Clone)]
 pub struct DefEntry {
     pub params: Vec<(String, IRType)>,
     pub body: IRExpr,
+    /// Requires clauses (preconditions). Empty for most preds/props.
+    pub requires: Vec<IRExpr>,
 }
 
 /// Definition environment built from `IRProgram.functions`.
@@ -35,7 +37,14 @@ impl DefEnv {
         let mut defs = HashMap::new();
         for f in &program.functions {
             let (params, body) = uncurry(&f.body);
-            defs.insert(f.name.clone(), DefEntry { params, body });
+            defs.insert(
+                f.name.clone(),
+                DefEntry {
+                    params,
+                    body,
+                    requires: f.requires.clone(),
+                },
+            );
         }
         Self { defs }
     }
@@ -65,6 +74,29 @@ impl DefEnv {
         }
         Some(substitute_all(&entry.body, &entry.params, &args))
     }
+
+    /// Get the substituted preconditions for a function call.
+    ///
+    /// For `f(a, b)` where `f` has `requires P(x, y)`, returns `[P(a, b)]`
+    /// with actual arguments substituted for formal parameters.
+    /// Returns `None` if the expression is not a recognized call, or `Some(vec![])`
+    /// if the function has no requires clauses.
+    pub fn call_preconditions(&self, expr: &IRExpr) -> Option<Vec<IRExpr>> {
+        let (name, args) = decompose_app_chain(expr)?;
+        let entry = self.defs.get(&name)?;
+        if entry.params.len() != args.len() {
+            return None;
+        }
+        if entry.requires.is_empty() {
+            return Some(vec![]);
+        }
+        let preconditions = entry
+            .requires
+            .iter()
+            .map(|req| substitute_all(req, &entry.params, &args))
+            .collect();
+        Some(preconditions)
+    }
 }
 
 /// Peel off `Lam` wrappers to extract parameter list and innermost body.
@@ -84,6 +116,28 @@ fn uncurry(expr: &IRExpr) -> (Vec<(String, IRType)>, IRExpr) {
         current = body;
     }
     (params, current.clone())
+}
+
+/// Extract the function name from an `App` chain (without decomposing args).
+///
+/// `App(App(Var("f"), a1), a2)` → `Some("f")`
+pub fn decompose_app_chain_name(expr: &IRExpr) -> Option<String> {
+    let mut current = expr;
+    while let IRExpr::App { func, .. } = current {
+        current = func.as_ref();
+    }
+    if let IRExpr::Var { name, .. } = current {
+        Some(name.clone())
+    } else {
+        None
+    }
+}
+
+/// Decompose a curried `App` chain into the function name and argument list (public).
+///
+/// `App(App(Var("p"), a1), a2)` → `Some(("p", [a1, a2]))`
+pub fn decompose_app_chain_public(expr: &IRExpr) -> Option<(String, Vec<IRExpr>)> {
+    decompose_app_chain(expr)
 }
 
 /// Decompose a curried `App` chain into the function name and argument list.

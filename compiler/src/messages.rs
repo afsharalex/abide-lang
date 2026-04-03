@@ -164,6 +164,37 @@ pub const THEOREM_BASE_UNKNOWN: &str = "Z3 returned unknown when checking base c
 /// Theorem proving: inductive step Z3 unknown.
 pub const THEOREM_STEP_UNKNOWN: &str = "Z3 returned unknown when checking inductive step";
 
+// ── Function contract verification messages ─────────────────────────
+
+/// Loop invariant does not hold on entry.
+pub const FN_LOOP_INIT_FAILED: &str = "loop invariant does not hold on entry";
+
+/// Loop invariant is not preserved by iteration.
+pub const FN_LOOP_PRESERVATION_FAILED: &str = "loop invariant is not preserved by iteration";
+
+/// Loop termination could not be proved.
+pub const FN_LOOP_TERMINATION_FAILED: &str =
+    "loop termination could not be proved: decreases measure may \
+     not strictly decrease or may be negative";
+
+/// While loop requires at least one invariant.
+pub const FN_LOOP_NO_INVARIANT: &str =
+    "while loop in function with ensures requires at least one loop invariant — \
+     add 'invariant <expr>' to the while loop";
+
+/// Function call precondition not satisfied at call site.
+pub const FN_CALL_PRECONDITION_FAILED: &str =
+    "precondition of called function may not hold at this call site";
+
+/// Recursive function termination could not be proved.
+pub const FN_TERMINATION_FAILED: &str =
+    "recursive call does not provably decrease the termination measure";
+
+/// Constructor field destructuring not supported.
+pub const FN_CTOR_FIELDS_UNSUPPORTED: &str =
+    "constructor field destructuring is not yet supported in fn contract verification — \
+     enums with data fields require algebraic datatype encoding";
+
 // ── Loader messages ─────────────────────────────────────────────────
 
 /// Help for circular include errors.

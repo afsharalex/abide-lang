@@ -709,6 +709,15 @@ fn resolve_consts(env: &mut Env, ctx: &Ctx) {
 /// Each param's refinement predicate can reference params declared to its left.
 /// `$` and the param name are both bound to the base type inside predicates.
 /// Returns (`resolved_params`, `bound_map`).
+/// Unwrap `Ty::Alias` wrappers to get to the underlying type.
+fn unwrap_alias_ty(ty: &Ty) -> &Ty {
+    let mut current = ty;
+    while let Ty::Alias(_, inner) = current {
+        current = inner;
+    }
+    current
+}
+
 fn resolve_params_lr(
     ctx: &Ctx,
     params: &[(String, Ty)],
@@ -718,7 +727,9 @@ fn resolve_params_lr(
     let mut resolved_params = Vec::new();
     for (name, ty) in params {
         let resolved_ty = ctx.resolve_ty(ty);
-        let final_ty = match &resolved_ty {
+        // Unwrap Alias wrappers so alias-based refinements like `x: Positive`
+        // (where `type Positive = Int { $ > 0 }`) are resolved correctly.
+        let final_ty = match unwrap_alias_ty(&resolved_ty) {
             Ty::Refinement(base, pred) => {
                 let mut pred_bound = bound.clone();
                 pred_bound.insert("$".to_owned(), (**base).clone());
@@ -728,7 +739,7 @@ fn resolve_params_lr(
             }
             _ => resolved_ty.clone(),
         };
-        let base_ty = match &final_ty {
+        let base_ty = match unwrap_alias_ty(&final_ty) {
             Ty::Refinement(base, _) => (**base).clone(),
             t => t.clone(),
         };

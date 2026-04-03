@@ -63,6 +63,10 @@ enum Command {
         #[arg(long)]
         no_prop_verify: bool,
 
+        /// Skip function contract verification
+        #[arg(long)]
+        no_fn_verify: bool,
+
         /// Show progress messages during verification
         #[arg(long)]
         progress: bool,
@@ -186,6 +190,7 @@ fn main() -> miette::Result<()> {
             ic3_timeout,
             no_ic3,
             no_prop_verify,
+            no_fn_verify,
             progress,
         } => {
             let mut sources = read_sources_for_diagnostics(&files);
@@ -207,6 +212,7 @@ fn main() -> miette::Result<()> {
                 ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
                 no_ic3,
                 no_prop_verify,
+                no_fn_verify,
                 progress,
             };
 
@@ -403,6 +409,9 @@ fn report_verification_result(
                         }
                         VerificationResult::Unprovable { name, hint, .. } => {
                             format!("could not prove '{name}': {hint}")
+                        }
+                        VerificationResult::FnContractFailed { name, .. } => {
+                            format!("fn contract violated for '{name}'")
                         }
                         _ => String::new(),
                     };

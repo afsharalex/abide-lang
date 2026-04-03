@@ -196,6 +196,36 @@ $ abide qa checks.qa
 
 See the [QA Language](qa-language.md) guide.
 
+## Verify Algorithms
+
+Beyond system-level properties, Abide verifies function contracts. Attach `requires`, `ensures`, and `decreases` to functions with imperative bodies:
+
+```abide
+fn gcd(a: Int, b: Int): Int
+  requires a > 0
+  requires b >= 0
+  ensures result > 0
+  decreases b
+{
+  var x = a
+  var y = b
+  while y != 0
+    invariant x > 0
+    invariant y >= 0
+    decreases y
+  {
+    var temp = y
+    y = x % y
+    x = temp
+  }
+  x
+}
+```
+
+`abide verify` automatically proves that the body satisfies the postcondition, that while-loop invariants are maintained, and that recursive calls decrease the termination measure. Preconditions are checked at every call site.
+
+Refinement types provide a shorthand — `fn f(x: Int { $ > 0 })` is equivalent to `fn f(x: Int) requires x > 0`, and type aliases like `type Positive = Int { $ > 0 }` work the same way.
+
 ## Next Steps
 
 - [Syntax at a Glance](syntax-at-a-glance.md) — quick reference for all constructs

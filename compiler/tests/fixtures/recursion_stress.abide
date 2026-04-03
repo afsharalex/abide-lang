@@ -1,0 +1,111 @@
+module RecursionStress
+
+// ── Match with enum constructor patterns ────────────────────────────
+
+enum Op = Add | Negate
+
+fn eval(op: Op, n: Int, acc: Int): Int
+  requires n >= 0
+  requires acc >= 0
+  decreases n
+  ensures result >= 0
+{
+  if n == 0 {
+    acc
+  } else {
+    match op {
+      Add => eval(op, n - 1, acc + 1)
+      Negate => eval(op, n - 1, acc)
+    }
+  }
+}
+
+// ── Deep nesting: match inside if ───────────────────────────────────
+
+fn deep_nesting(n: Int, flag: Bool): Int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  if n == 0 {
+    0
+  } else {
+    if flag {
+      match n {
+        _ if n == 1 => 1
+        _ => deep_nesting(n - 1, false)
+      }
+    } else {
+      deep_nesting(n - 1, true)
+    }
+  }
+}
+
+// ── Three-way match: guards, multiple recursive calls in last arm ───
+
+fn three_way(n: Int): Int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  match n {
+    _ if n == 0 => 0
+    _ if n == 1 => 1
+    _ => three_way(n - 1) + three_way(n - 2)
+  }
+}
+
+// ── Recursive call through single match wildcard (prior arm excluded)
+
+fn depth(x: Int): Int
+  requires x >= 0
+  decreases x
+  ensures result >= 0
+{
+  match x {
+    _ if x == 0 => 0
+    _ => 1 + depth(x - 1)
+  }
+}
+
+// ── Multi-step let chain before recursive call ──────────────────────
+
+fn chain_let(n: Int): Int
+  requires n >= 0
+  decreases n
+  ensures result == 0
+{
+  if n == 0 {
+    0
+  } else {
+    var a = n
+    var b = a - 1
+    chain_let(b)
+  }
+}
+
+// ── BAD: match arm doesn't decrease ─────────────────────────────────
+
+fn bad_match_no_decrease(n: Int): Int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  match n {
+    _ if n == 0 => 0
+    _ => bad_match_no_decrease(n)
+  }
+}
+
+// ── BAD: match arm violates requires ────────────────────────────────
+
+fn bad_match_precond(n: Int): Int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  match n {
+    _ if n == 0 => 0
+    _ => bad_match_precond(0 - n)
+  }
+}

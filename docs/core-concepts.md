@@ -172,9 +172,9 @@ Precedence (tightest to loosest): `->` > `&` > `||` > `|`, `^|`. So `a -> b & c 
 
 **Bounded vs. unbounded checking:**
 
-`verify` blocks with bounds (`[0..500]`) will use bounded model checking — the solver explores finite depth. For many common safety properties, the solver will also attempt to **discharge them as unbounded proofs automatically** when the property is inductive or the state space is finite. When automatic unbounded checking fails, `theorem` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends. *(Solver backend in development.)*
+`verify` blocks with bounds (`[0..500]`) use bounded model checking — the solver explores finite depth. For many common safety properties, the solver also attempts to **discharge them as unbounded proofs automatically** via induction and IC3/PDR when the property is inductive or the state space is finite. When automatic unbounded checking fails, `theorem` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends.
 
-**Interactive exploration** *(planned)* — the [REPL](repl.md) and [QA language](qa-language.md) let you explore specifications interactively:
+**Interactive exploration** — the [REPL](repl.md) and [QA language](qa-language.md) let you explore specifications interactively:
 
 ```
 $ abide repl commerce/
@@ -250,9 +250,16 @@ fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int
 fn bounded(x: Int{x > 0}, y: Int{y > x}): Int
 ```
 
-The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: Int{$ > 0})` is equivalent to `fn f(x: Int) requires x > 0`.
+The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: Int{$ > 0})` is equivalent to `fn f(x: Int) requires x > 0`. Both inline refinements and refinement type aliases (like `type Positive = Int { $ > 0 }`) are enforced at call sites.
 
 > **Note:** Refinement types are not allowed on return types — use `ensures` for return value constraints. This keeps the grammar unambiguous with imperative function bodies.
+
+**Verification model** — function contracts are verified automatically by `abide verify`:
+
+- **Postcondition verification:** For each fn with `ensures`, the verifier proves that the body satisfies the postcondition given the precondition. While loops are verified via Hoare logic (invariant init, preservation, and termination).
+- **Call-site precondition checking:** At every call site, the verifier proves that the arguments satisfy the callee's `requires`. This includes refinement-type predicates, which desugar to `requires`.
+- **Termination verification:** For recursive functions with `decreases`, the verifier proves that each recursive call strictly decreases the measure and satisfies the callee's precondition.
+- **Modular verification:** Recursive calls trust the function's own `ensures` (proved by induction over the decreasing measure). Each function is verified in isolation — the verifier does not inline recursive bodies.
 
 At this layer, you're answering: *"Is this specific algorithm correct?"*
 

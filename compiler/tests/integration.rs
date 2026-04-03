@@ -892,3 +892,1075 @@ fn circular_include_exits_nonzero_even_with_warnings() {
         "CLI should exit non-zero for circular include even when warnings are present"
     );
 }
+
+// ── Function contract verification integration tests ────────────────
+
+#[test]
+fn verify_contracts_fixture() {
+    let prog = lower_file("tests/fixtures/contracts.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // abs: ensures result >= 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "abs"
+        )),
+        "abs contract should be PROVED"
+    );
+
+    // max: ensures result >= a, ensures result >= b
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "max"
+        )),
+        "max contract should be PROVED"
+    );
+
+    // clamp: requires lo <= hi, ensures result >= lo, ensures result <= hi
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "clamp"
+        )),
+        "clamp contract should be PROVED"
+    );
+
+    // double and is_positive have no ensures — should NOT produce results
+    assert!(
+        !results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+            | abide::verify::VerificationResult::FnContractFailed { name, .. }
+                if name == "double" || name == "is_positive"
+        )),
+        "fns without ensures should not produce contract verification results"
+    );
+
+    // Total: exactly 3 contract results
+    let fn_results: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { .. }
+            | abide::verify::VerificationResult::FnContractFailed { .. }
+        ))
+        .collect();
+    assert_eq!(fn_results.len(), 3, "should verify exactly 3 fn contracts");
+}
+
+#[test]
+fn verify_contracts_cli_output() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg("tests/fixtures/contracts.abide")
+        .output()
+        .expect("run CLI");
+    assert!(output.status.success(), "CLI should succeed for valid contracts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PROVED  fn abs"), "should show abs proved");
+    assert!(stdout.contains("PROVED  fn max"), "should show max proved");
+    assert!(stdout.contains("PROVED  fn clamp"), "should show clamp proved");
+}
+
+#[test]
+fn verify_contracts_no_fn_verify_flag() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg("--no-fn-verify")
+        .arg("tests/fixtures/contracts.abide")
+        .output()
+        .expect("run CLI");
+    // With --no-fn-verify, no fn contract results should appear
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("PROVED  fn"),
+        "no fn contract results should appear with --no-fn-verify"
+    );
+}
+
+#[test]
+fn verify_contracts_failing_ensures() {
+    // Create a spec with a function that has a wrong ensures
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("bad.abide");
+    std::fs::write(
+        &file,
+        "module Bad\n\nfn identity(x: Int): Int\n  ensures result > x\n{\n  x\n}\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "CLI should fail for violated fn contract"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("identity") || stderr.contains("contract violated"),
+        "should mention the failing function: {stderr}"
+    );
+}
+
+// ── Imperative while-loop verification tests ────────────────────────
+
+#[test]
+fn verify_imperative_fixture() {
+    let prog = lower_file("tests/fixtures/imperative.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // sum_to: while loop with invariant total >= 0, ensures result >= 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "sum_to"
+        )),
+        "sum_to should be PROVED"
+    );
+
+    // gcd_imperative: while loop with invariant x > 0 ∧ y >= 0, ensures result > 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "gcd_imperative"
+        )),
+        "gcd_imperative should be PROVED"
+    );
+
+    // abs and max: pure if/else with ensures
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "abs"
+        )),
+        "abs should be PROVED"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "max"
+        )),
+        "max should be PROVED"
+    );
+
+    // Exactly 4 fn contracts verified (sum_to, gcd, abs, max)
+    let fn_results: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { .. }
+            | abide::verify::VerificationResult::FnContractFailed { .. }
+        ))
+        .collect();
+    assert_eq!(fn_results.len(), 4, "should verify exactly 4 fn contracts in imperative.abide");
+}
+
+#[test]
+fn verify_while_loop_missing_invariant() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("weak.abide");
+    std::fs::write(
+        &file,
+        "module Weak\n\n\
+         fn counting(n: Int): Int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 var i = 0\n\
+         \x20 while i < n\n\
+         \x20   decreases n - i\n\
+         \x20 {\n\
+         \x20   x = x + i\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "while loop without invariant should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires at least one loop invariant"),
+        "should report missing invariant: {stderr}"
+    );
+}
+
+#[test]
+fn verify_nested_while_unsound_invariant_rejected() {
+    // Inner loop sets x = 1 but outer loop claims invariant x == 0.
+    // Must NOT be proved — this was a soundness bug.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("nested.abide");
+    std::fs::write(
+        &file,
+        "module Nested\n\n\
+         fn nested_unsound(n: Int): Int\n\
+         \x20 requires n > 0\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 var i = 0\n\
+         \x20 while i < n\n\
+         \x20   invariant x == 0\n\
+         \x20   invariant i >= 0\n\
+         \x20   decreases n - i\n\
+         \x20 {\n\
+         \x20   var j = 0\n\
+         \x20   while j < 3\n\
+         \x20     invariant j >= 0\n\
+         \x20     decreases 3 - j\n\
+         \x20   {\n\
+         \x20     x = 1\n\
+         \x20     j = j + 1\n\
+         \x20   }\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "nested while with broken invariant must NOT be proved"
+    );
+}
+
+#[test]
+fn verify_valid_nested_while_proves() {
+    // Valid nested while: total only increases, invariant total >= 0 is correct.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("nested_valid.abide");
+    std::fs::write(
+        &file,
+        "module NestedValid\n\n\
+         fn matrix_sum(rows: Int, cols: Int): Int\n\
+         \x20 requires rows >= 0\n\
+         \x20 requires cols >= 0\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 var total = 0\n\
+         \x20 var i = 0\n\
+         \x20 while i < rows\n\
+         \x20   invariant total >= 0\n\
+         \x20   invariant i >= 0\n\
+         \x20   decreases rows - i\n\
+         \x20 {\n\
+         \x20   var j = 0\n\
+         \x20   while j < cols\n\
+         \x20     invariant total >= 0\n\
+         \x20     invariant j >= 0\n\
+         \x20     decreases cols - j\n\
+         \x20   {\n\
+         \x20     total = total + 1\n\
+         \x20     j = j + 1\n\
+         \x20   }\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 total\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "valid nested while should be proved"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PROVED  fn matrix_sum"),
+        "should show matrix_sum proved: {stdout}"
+    );
+}
+
+#[test]
+fn verify_imperative_if_else_with_assignments() {
+    // if/else branches with only assignments must be handled imperatively,
+    // not routed through the pure encoder.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("if_assign.abide");
+    std::fs::write(
+        &file,
+        "module IfAssign\n\n\
+         fn conditional_assign(flag: Bool): Int\n\
+         \x20 ensures result > 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 if flag {\n\
+         \x20   x = 1\n\
+         \x20 } else {\n\
+         \x20   x = 2\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "imperative if/else with assignments should be proved"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PROVED  fn conditional_assign"),
+        "should show conditional_assign proved: {stdout}"
+    );
+}
+
+#[test]
+fn verify_branch_condition_propagated_to_loop() {
+    // A while loop inside an if-branch should be able to use the branch
+    // condition as a loop invariant. Previously this failed because branch
+    // conditions were not threaded into loop verification.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("branch_cond.abide");
+    std::fs::write(
+        &file,
+        "module BranchCond\n\n\
+         fn branch_inner(flag: Bool): Int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 if flag {\n\
+         \x20   var i = 0\n\
+         \x20   while i < 1\n\
+         \x20     invariant flag\n\
+         \x20     invariant i >= 0\n\
+         \x20     decreases 1 - i\n\
+         \x20   {\n\
+         \x20     i = i + 1\n\
+         \x20   }\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "branch condition should be available as loop invariant"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PROVED  fn branch_inner"),
+        "should prove branch_inner: {stdout}"
+    );
+}
+
+#[test]
+fn verify_nested_loop_requires_invariant() {
+    // Inner loops must have invariants — same rule as top-level loops.
+    // Previously inner loops without invariants were silently accepted.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("inner_no_inv.abide");
+    std::fs::write(
+        &file,
+        "module InnerNoInv\n\n\
+         fn inner_no_inv(n: Int): Int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result == n\n\
+         {\n\
+         \x20 var i = 0\n\
+         \x20 while i < n\n\
+         \x20   invariant i >= 0\n\
+         \x20   invariant i <= n\n\
+         \x20   decreases n - i\n\
+         \x20 {\n\
+         \x20   var j = 0\n\
+         \x20   while j < 3\n\
+         \x20     decreases 3 - j\n\
+         \x20   {\n\
+         \x20     j = j + 1\n\
+         \x20   }\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 i\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "inner loop without invariant must not be proved"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires at least one loop invariant"),
+        "should report missing invariant for inner loop: {stderr}"
+    );
+}
+
+#[test]
+fn verify_unreachable_branch_loop_does_not_pollute() {
+    // A while loop in an unreachable branch (if flag { if not flag { ... } })
+    // must not pollute the solver — even with `invariant false`.
+    // Previously, post-loop assertions were unguarded and collapsed the proof.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("unreachable.abide");
+    std::fs::write(
+        &file,
+        "module Unreachable\n\n\
+         fn unreachable_branch_bug(flag: Bool): Int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var x = 1\n\
+         \x20 if flag {\n\
+         \x20   if not flag {\n\
+         \x20     while x > 0\n\
+         \x20       invariant false\n\
+         \x20       decreases x\n\
+         \x20     {\n\
+         \x20       x = x - 1\n\
+         \x20     }\n\
+         \x20   }\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "unreachable branch with invariant false must NOT prove a wrong postcondition"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("contract violated") || stderr.contains("FAILED"),
+        "should report contract violation: {stderr}"
+    );
+}
+
+#[test]
+fn verify_unreachable_branch_in_loop_body_does_not_pollute() {
+    // Same as the top-level unreachable-branch test, but the unreachable
+    // branch is inside a loop body. The inner loop's `invariant false`
+    // must not collapse the outer loop's preservation/termination VCs.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("loop_branch.abide");
+    std::fs::write(
+        &file,
+        "module LoopBranch\n\n\
+         fn loop_branch_pollute(flag: Bool): Int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 1\n\
+         \x20   invariant x == 0\n\
+         \x20   decreases 1 - x\n\
+         \x20 {\n\
+         \x20   if flag {\n\
+         \x20     if not flag {\n\
+         \x20       while x < 1\n\
+         \x20         invariant false\n\
+         \x20         decreases 1 - x\n\
+         \x20       {\n\
+         \x20         x = x + 1\n\
+         \x20       }\n\
+         \x20     }\n\
+         \x20   }\n\
+         \x20   x = 1\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "unreachable branch inside loop body must NOT prove a wrong postcondition"
+    );
+}
+
+// ── Phase 2: Call-site precondition checking ────────────────────────
+
+#[test]
+fn verify_call_site_preconditions() {
+    let prog = lower_file("tests/fixtures/call_site.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // caller_good: requires x > 0 satisfies safe_div's requires b != 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "caller_good"
+        )),
+        "caller_good should be PROVED"
+    );
+
+    // caller_literal: safe_div(10, 2), literal 2 != 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "caller_literal"
+        )),
+        "caller_literal should be PROVED"
+    );
+
+    // caller_bad: no guarantee x != 0, precondition violated
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, .. }
+                if name == "fn_caller_bad"
+        )),
+        "caller_bad should be UNKNOWN (precondition failure)"
+    );
+
+    // add_positive: nested calls, both a > 0 and b > 0 satisfy requires x > 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "add_positive"
+        )),
+        "add_positive should be PROVED"
+    );
+
+    // nested_no_requires: positive(a) + positive(b) without requires a > 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, .. }
+                if name == "fn_nested_no_requires"
+        )),
+        "nested_no_requires should be UNKNOWN (nested call precondition failure)"
+    );
+}
+
+#[test]
+fn verify_call_site_cli_output() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg("tests/fixtures/call_site.abide")
+        .output()
+        .expect("run CLI");
+    // CLI should exit non-zero because caller_bad fails
+    assert!(
+        !output.status.success(),
+        "should fail due to caller_bad precondition violation"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PROVED  fn caller_good"), "caller_good proved: {stdout}");
+    assert!(stdout.contains("PROVED  fn caller_literal"), "caller_literal proved: {stdout}");
+    assert!(stdout.contains("PROVED  fn add_positive"), "add_positive proved: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("precondition") && stderr.contains("caller_bad"),
+        "should report precondition failure for caller_bad: {stderr}"
+    );
+}
+
+#[test]
+fn verify_system_call_site_value_position() {
+    // Call with violated precondition in value position (positive(0) == 0).
+    // Must be rejected regardless of polarity or position.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("val_call.abide");
+    std::fs::write(
+        &file,
+        "module ValCall\n\n\
+         fn positive(x: Int): Int\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 x\n\
+         }\n\n\
+         enum Dummy = A\n\
+         entity DummyE { status: Dummy = @A }\n\
+         system S { use DummyE }\n\n\
+         verify bad_prop for S[0..1] {\n\
+         \x20 assert positive(0) == 0\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "value-position call with violated precondition must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("precondition"),
+        "value call: should report precondition violation: {stderr}"
+    );
+}
+
+#[test]
+fn verify_system_call_site_under_negation() {
+    // Call with violated precondition under negation (not ok(0)).
+    // Must be rejected — polarity must not affect precondition checking.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("neg_call.abide");
+    std::fs::write(
+        &file,
+        "module NegCall\n\n\
+         fn ok(x: Int): Bool\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 true\n\
+         }\n\n\
+         enum Dummy = A\n\
+         entity DummyE { status: Dummy = @A }\n\
+         system S { use DummyE }\n\n\
+         verify neg_bad for S[0..1] {\n\
+         \x20 assert not ok(0)\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "negated call with violated precondition must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("precondition"),
+        "neg call: should report precondition violation: {stderr}"
+    );
+}
+
+#[test]
+fn verify_system_guarded_call_not_rejected() {
+    // A call guarded by an implication whose antecedent is false must NOT
+    // be rejected — the precondition is only required when reachable.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("guarded.abide");
+    std::fs::write(
+        &file,
+        "module Guarded\n\n\
+         fn positive(x: Int): Bool\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 true\n\
+         }\n\n\
+         enum Dummy = A\n\
+         entity DummyE { status: Dummy = @A }\n\
+         system S { use DummyE }\n\n\
+         verify guarded for S[0..1] {\n\
+         \x20 assert (0 > 0) implies positive(0)\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "guarded call with false antecedent must not be rejected"
+    );
+}
+
+#[test]
+fn verify_leaked_path_guard_does_not_suppress_violation() {
+    // A failed encoding in one block must not leak its path guard
+    // into the next block and suppress a real precondition violation.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("leaked.abide");
+    std::fs::write(
+        &file,
+        "module Leaked\n\n\
+         fn positive(x: Int): Int\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 x\n\
+         }\n\n\
+         enum Dummy = A\n\
+         entity DummyE { status: Dummy = @A }\n\
+         system S { use DummyE }\n\n\
+         verify bad_encode for S[0..1] {\n\
+         \x20 assert (0 > 0) implies (x == 0)\n\
+         }\n\n\
+         verify should_fail for S[0..1] {\n\
+         \x20 assert positive(0) == 0\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(!output.status.success(), "should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // should_fail must report a precondition violation, not be PROVED
+    assert!(
+        stderr.contains("should_fail") && stderr.contains("precondition"),
+        "should_fail must report precondition violation, not be suppressed: {stderr}"
+    );
+}
+
+// ── Phase 3: Termination verification ───────────────────────────────
+
+#[test]
+fn verify_termination_fixture() {
+    let prog = lower_file("tests/fixtures/termination.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // factorial: termination proved + postcondition proved
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "factorial"
+        )),
+        "factorial should be PROVED"
+    );
+
+    // fib: termination proved + postcondition proved
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "fib"
+        )),
+        "fib should be PROVED"
+    );
+
+    // bad_recurse: termination fails (n+1 does not decrease)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_recurse" && hint.contains("termination")
+        )),
+        "bad_recurse should fail termination"
+    );
+
+    // no_recursion: trivially terminating + postcondition proved
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "no_recursion"
+        )),
+        "no_recursion should be PROVED"
+    );
+
+    // bad_precond: recursive call f(-1) violates requires n >= 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_precond" && hint.contains("precondition")
+        )),
+        "bad_precond should fail with precondition violation"
+    );
+    // bad_precond should NOT have a PROVED result (postcondition skipped after termination failure)
+    assert!(
+        !results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "bad_precond"
+        )),
+        "bad_precond must not be PROVED after termination failure"
+    );
+
+    // via_local: recursive call through local var binding works
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "via_local"
+        )),
+        "via_local should be PROVED (local var binding resolved)"
+    );
+}
+
+#[test]
+fn verify_termination_cli_output() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg("tests/fixtures/termination.abide")
+        .output()
+        .expect("run CLI");
+    // Should exit non-zero because bad_recurse fails
+    assert!(!output.status.success(), "should fail due to bad_recurse");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PROVED  fn factorial"), "factorial proved: {stdout}");
+    assert!(stdout.contains("PROVED  fn fib"), "fib proved: {stdout}");
+    assert!(stdout.contains("PROVED  fn no_recursion"), "no_recursion proved: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bad_recurse") && stderr.contains("termination"),
+        "should report termination failure for bad_recurse: {stderr}"
+    );
+}
+
+// ── Recursion stress tests: complex match/pattern/binding shapes ────
+
+#[test]
+fn verify_recursion_stress_fixture() {
+    let prog = lower_file("tests/fixtures/recursion_stress.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // Valid: enum match with recursive calls in both arms
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "eval"
+        )),
+        "eval should be PROVED (enum match, both arms decrease)"
+    );
+
+    // Valid: match inside if inside if (deep nesting)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "deep_nesting"
+        )),
+        "deep_nesting should be PROVED (match inside nested if)"
+    );
+
+    // Valid: three-way guarded match, two recursive calls in last arm
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "three_way"
+        )),
+        "three_way should be PROVED (3-arm guarded match)"
+    );
+
+    // Valid: wildcard match with prior arm exclusion
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "depth"
+        )),
+        "depth should be PROVED (wildcard match, prior arm excluded)"
+    );
+
+    // Valid: multi-step let chain before recursive call
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "chain_let"
+        )),
+        "chain_let should be PROVED (let chain)"
+    );
+
+    // BAD: match arm doesn't decrease
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_match_no_decrease" && hint.contains("termination")
+        )),
+        "bad_match_no_decrease should fail (measure doesn't decrease)"
+    );
+
+    // BAD: match arm violates requires
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_match_precond" && hint.contains("precondition")
+        )),
+        "bad_match_precond should fail (recursive call violates requires)"
+    );
+
+    // Neither bad function should be PROVED
+    assert!(
+        !results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "bad_match_no_decrease" || name == "bad_match_precond"
+        )),
+        "bad functions must not be PROVED"
+    );
+}
+
+// ── Phase 4: Refinement type enforcement at call sites ──────────────
+
+#[test]
+fn verify_refinement_call_site_fixture() {
+    let prog = lower_file("tests/fixtures/refinement_call_site.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // call_literal: literal 2 satisfies $ != 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_literal"
+        )),
+        "call_literal should be PROVED"
+    );
+
+    // call_variable: requires b > 0 implies b != 0 (refinement satisfied)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_variable"
+        )),
+        "call_variable should be PROVED"
+    );
+
+    // call_both: both refinements satisfied by caller requires
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_both"
+        )),
+        "call_both should be PROVED"
+    );
+
+    // call_bad: no guarantee b != 0 (refinement violated)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_call_bad" && hint.contains("precondition")
+        )),
+        "call_bad should fail (refinement not satisfied)"
+    );
+
+    // call_one_bad: only first refinement satisfied
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_call_one_bad" && hint.contains("precondition")
+        )),
+        "call_one_bad should fail (second refinement not satisfied)"
+    );
+
+    // ── Alias-based refinement types ────────────────────────────────
+
+    // double_pos: Positive alias refinement desugared to requires x > 0
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "double_pos"
+        )),
+        "double_pos should be PROVED (alias refinement as requires)"
+    );
+
+    // call_alias_literal: literal 5 satisfies Positive ($ > 0)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_alias_literal"
+        )),
+        "call_alias_literal should be PROVED"
+    );
+
+    // call_alias_good: requires x > 0 satisfies Positive
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_alias_good"
+        )),
+        "call_alias_good should be PROVED"
+    );
+
+    // call_alias_subtype: Positive (> 0) implies NonNeg (>= 0)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_alias_subtype"
+        )),
+        "call_alias_subtype should be PROVED (subtype relation)"
+    );
+
+    // call_alias_bad: no guarantee x > 0 for Positive alias
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_call_alias_bad" && hint.contains("precondition")
+        )),
+        "call_alias_bad should fail (alias refinement not satisfied)"
+    );
+
+    // call_alias_wrong: NonNeg (>= 0) does not imply Positive (> 0)
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_call_alias_wrong" && hint.contains("precondition")
+        )),
+        "call_alias_wrong should fail (NonNeg doesn't imply Positive)"
+    );
+}

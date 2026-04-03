@@ -44,6 +44,7 @@ The compiler uses subcommands. Most commands accept one or more `.abide` source 
 | `--ic3-timeout <N>` | IC3/PDR timeout in seconds (default: 10) |
 | `--no-ic3` | Skip IC3/PDR verification (for speed) |
 | `--no-prop-verify` | Skip automatic prop verification |
+| `--no-fn-verify` | Skip function contract verification |
 | `--progress` | Print progress messages to stderr during verification |
 
 The `--bounded-only` and `--unbounded-only` flags are mutually exclusive.
@@ -59,6 +60,16 @@ PROVED  complex_invariant (method: IC3/PDR, 1200ms)
 CHECKED liveness_check (depth: 10, 200ms)
 PASS    happy_path (3ms)
 ```
+
+**Verify functions with contracts (postconditions, termination, call-site preconditions):**
+
+```sh
+$ abide verify examples/algorithms.abide
+PROVED  fn factorial (contract, 18ms)
+PROVED  fn gcd (contract, 5ms)
+```
+
+Function contracts (`requires`/`ensures`/`decreases`) are verified automatically as part of `abide verify`. Use `--no-fn-verify` to skip this for faster iteration on system-level properties.
 
 **Verify multiple files together (multi-module):**
 

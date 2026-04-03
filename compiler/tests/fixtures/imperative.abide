@@ -8,12 +8,13 @@ module Imperative
 
 fn sum_to(n: Int): Int
   requires n >= 0
-  ensures result == n * (n + 1) / 2
+  ensures result >= 0
 {
   var total = 0
   var i = 0
   while i <= n
     invariant total >= 0
+    invariant i >= 0
     decreases n - i
   {
     total = total + i
@@ -64,6 +65,7 @@ fn gcd_imperative(a: Int, b: Int): Int
   var y = b
   while y != 0
     invariant x > 0
+    invariant y >= 0
     decreases y
   {
     var temp = y

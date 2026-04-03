@@ -14,6 +14,7 @@ pub mod harness;
 pub mod ic3;
 pub mod smt;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -75,6 +76,20 @@ pub enum VerificationResult {
     Unprovable {
         name: String,
         hint: String,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
+    /// Function contract (ensures) proved — body satisfies postcondition.
+    FnContractProved {
+        name: String,
+        time_ms: u64,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
+    /// Function contract (ensures) violated — counterexample found.
+    FnContractFailed {
+        name: String,
+        counterexample: Vec<(String, String)>, // (param_name, value)
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
@@ -161,14 +176,39 @@ impl VerificationResult {
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
+            Self::FnContractProved {
+                name,
+                time_ms,
+                span,
+                file,
+            } => Self::FnContractProved {
+                name,
+                time_ms,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
+            Self::FnContractFailed {
+                name,
+                counterexample,
+                span,
+                file,
+            } => Self::FnContractFailed {
+                name,
+                counterexample,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
         }
     }
 
-    /// Is this a failure (counterexample, scene fail, or unprovable)?
+    /// Is this a failure (counterexample, scene fail, fn contract fail, or unprovable)?
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
-            Self::Counterexample { .. } | Self::SceneFail { .. } | Self::Unprovable { .. }
+            Self::Counterexample { .. }
+                | Self::SceneFail { .. }
+                | Self::Unprovable { .. }
+                | Self::FnContractFailed { .. }
         )
     }
 
@@ -180,7 +220,9 @@ impl VerificationResult {
             | Self::Counterexample { span, .. }
             | Self::ScenePass { span, .. }
             | Self::SceneFail { span, .. }
-            | Self::Unprovable { span, .. } => *span,
+            | Self::Unprovable { span, .. }
+            | Self::FnContractProved { span, .. }
+            | Self::FnContractFailed { span, .. } => *span,
         }
     }
 
@@ -192,7 +234,9 @@ impl VerificationResult {
             | Self::Counterexample { file, .. }
             | Self::ScenePass { file, .. }
             | Self::SceneFail { file, .. }
-            | Self::Unprovable { file, .. } => file.as_deref(),
+            | Self::Unprovable { file, .. }
+            | Self::FnContractProved { file, .. }
+            | Self::FnContractFailed { file, .. } => file.as_deref(),
         }
     }
 }
@@ -226,6 +270,8 @@ pub struct VerifyConfig {
     pub no_ic3: bool,
     /// Skip automatic prop verification.
     pub no_prop_verify: bool,
+    /// Skip function contract verification.
+    pub no_fn_verify: bool,
     /// Print progress messages to stderr.
     pub progress: bool,
 }
@@ -241,6 +287,7 @@ impl Default for VerifyConfig {
             ic3_timeout_ms: 10000,
             no_ic3: false,
             no_prop_verify: false,
+            no_fn_verify: false,
             progress: false,
         }
     }
@@ -263,12 +310,26 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Checking {}...", verify_block.name);
         }
+        clear_prop_precondition_obligations();
+        clear_path_guard_stack();
         let result = check_verify_block_tiered(ir, &vctx, &defs, verify_block, config)
             .with_source(verify_block.span, verify_block.file.clone());
         if config.progress {
             eprintln!(" done");
         }
-        results.push(result);
+        // Check context-sensitive precondition obligations accumulated during encoding
+        if let Some(violation) = check_prop_precondition_obligations() {
+            results.push(
+                VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: violation,
+                    span: verify_block.span,
+                    file: verify_block.file.clone(),
+                },
+            );
+        } else {
+            results.push(result);
+        }
     }
 
     for scene_block in &ir.scenes {
@@ -287,12 +348,32 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprint!("Proving {}...", theorem_block.name);
         }
+        clear_prop_precondition_obligations();
+        clear_path_guard_stack();
         let result = check_theorem_block(ir, &vctx, &defs, theorem_block, config)
             .with_source(theorem_block.span, theorem_block.file.clone());
         if config.progress {
             eprintln!(" done");
         }
-        results.push(result);
+        if let Some(violation) = check_prop_precondition_obligations() {
+            results.push(
+                VerificationResult::Unprovable {
+                    name: theorem_block.name.clone(),
+                    hint: violation,
+                    span: theorem_block.span,
+                    file: theorem_block.file.clone(),
+                },
+            );
+        } else {
+            results.push(result);
+        }
+    }
+
+    // ── Verify function contracts ───────────────────────────────────
+    // For each fn with ensures, prove that the body satisfies the
+    // postcondition given the precondition.
+    if !config.no_fn_verify {
+        verify_fn_contracts(ir, &vctx, &defs, config, &mut results);
     }
 
     // ── Auto-verify props ───────────────────────────────────────────
@@ -376,6 +457,2067 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
     }
 
     results
+}
+
+// ── Function contract verification ──────────────────────────────────
+
+/// Verify function contracts (ensures clauses) for all functions.
+///
+/// For each fn with non-empty `ensures` and no `prop_target` (i.e., not a prop):
+/// - Declare Z3 variables for each parameter
+/// - Assert requires as assumptions
+/// - Assert NOT(ensures[result := body]) and check for counterexample
+/// - UNSAT = postcondition holds; SAT = counterexample
+fn verify_fn_contracts(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+    results: &mut Vec<VerificationResult>,
+) {
+    for func in &ir.functions {
+        // Skip props (system-level properties, not fn contracts)
+        if func.prop_target.is_some() {
+            continue;
+        }
+
+        // Termination verification: for fns with decreases, prove
+        // recursive calls decrease the measure AND satisfy the callee's requires.
+        let mut termination_failed = false;
+        if let Some(ref dec) = func.decreases {
+            if !dec.star {
+                if config.progress {
+                    eprint!("Checking termination of fn {}...", func.name);
+                }
+                let start = Instant::now();
+                let term_result = verify_fn_termination(func, vctx, defs);
+                let _time_ms = elapsed_ms(&start);
+                if config.progress {
+                    eprintln!(" done");
+                }
+                if let Err(msg) = term_result {
+                    results.push(VerificationResult::Unprovable {
+                        name: format!("fn_{}", func.name),
+                        hint: msg,
+                        span: func.span,
+                        file: func.file.clone(),
+                    });
+                    termination_failed = true;
+                }
+            }
+        }
+
+        // Skip fns without ensures clauses
+        if func.ensures.is_empty() {
+            continue;
+        }
+
+        // Skip postcondition verification if termination failed — the
+        // recursive-call ensures assumptions are unsound without valid
+        // termination + callee preconditions at recursive call sites.
+        if termination_failed {
+            continue;
+        }
+
+        if config.progress {
+            eprint!("Verifying fn {}...", func.name);
+        }
+
+        let start = Instant::now();
+        let result = verify_single_fn_contract(func, vctx, defs);
+        let time_ms = elapsed_ms(&start);
+
+        let vr = match result {
+            Ok(()) => VerificationResult::FnContractProved {
+                name: func.name.clone(),
+                time_ms,
+                span: func.span,
+                file: func.file.clone(),
+            },
+            Err(FnContractError::Counterexample(ce)) => VerificationResult::FnContractFailed {
+                name: func.name.clone(),
+                counterexample: ce,
+                span: func.span,
+                file: func.file.clone(),
+            },
+            Err(FnContractError::EncodingError(msg)) => VerificationResult::Unprovable {
+                name: format!("fn_{}", func.name),
+                hint: msg,
+                span: func.span,
+                file: func.file.clone(),
+            },
+        };
+
+        if config.progress {
+            eprintln!(" done");
+        }
+        results.push(vr);
+    }
+}
+
+/// Error from fn contract verification.
+enum FnContractError {
+    /// Counterexample: parameter assignments that violate the ensures clause.
+    Counterexample(Vec<(String, String)>),
+    /// Encoding error: couldn't translate the expression to Z3.
+    EncodingError(String),
+}
+
+/// Verify a single function's ensures clauses against its body.
+///
+/// For `fn f(x: Int, y: Int): Int requires P ensures Q = body`:
+/// Check: ∀ x, y. P(x, y) → Q[result := body(x, y)]
+/// Negated: ∃ x, y. P(x, y) ∧ ¬Q[result := body(x, y)]
+/// UNSAT = proved, SAT = counterexample
+fn verify_single_fn_contract(
+    func: &crate::ir::types::IRFunction,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    let solver = Solver::new();
+
+    // Uncurry the function to get params and body
+    let entry = defs.get(&func.name).ok_or_else(|| {
+        FnContractError::EncodingError(format!("function '{}' not found in DefEnv", func.name))
+    })?;
+
+    let params = &entry.params;
+    let body = &entry.body;
+
+    // Create Z3 variables for each parameter
+    let mut env: HashMap<String, SmtValue> = HashMap::new();
+    for (name, ty) in params {
+        let var = make_z3_var(name, ty).map_err(FnContractError::EncodingError)?;
+        env.insert(name.clone(), var);
+    }
+
+    // Assert requires as assumptions
+    for req in &func.requires {
+        let req_val =
+            encode_pure_expr(req, &env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        let req_bool = req_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        solver.assert(&req_bool);
+    }
+
+    // Encode the body using the imperative-aware encoder.
+    // This handles While loops via Hoare-logic:
+    //   - Verifies loop invariant init/preservation/termination as side conditions
+    //   - Accumulates post-loop constraints (invariant ∧ ¬cond), properly guarded
+    //     by branch conditions when inside if/else
+    //   - Updates env with fresh post-loop variables
+    let mut solver_constraints = Vec::new();
+    let body_val =
+        encode_fn_body(body, &mut env, &mut solver_constraints, &func.requires, &[], Some(func), vctx, defs)?;
+
+    // Assert accumulated constraints (post-loop invariants, branch-guarded)
+    for c in &solver_constraints {
+        solver.assert(c);
+    }
+
+    // Assert ensures constraints from recursive self-calls (modular reasoning).
+    // These assume the function's postcondition holds for recursive calls,
+    // which is sound because Phase 1 proves the postcondition by induction.
+    for c in &take_recursive_call_constraints() {
+        solver.assert(c);
+    }
+
+    // Bind result to the body's return value
+    env.insert("result".to_owned(), body_val);
+
+    // Assert negation of ensures: looking for counterexample to postcondition
+    let mut ensures_bools = Vec::new();
+    for ens in &func.ensures {
+        let ens_val = encode_pure_expr(ens, &env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let ens_bool = ens_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        ensures_bools.push(ens_bool);
+    }
+
+    let ensures_refs: Vec<&Bool> = ensures_bools.iter().collect();
+    let all_ensures = Bool::and(&ensures_refs);
+    solver.assert(&all_ensures.not());
+
+    // Check
+    match solver.check() {
+        z3::SatResult::Unsat => Ok(()), // Proved: no counterexample exists
+        z3::SatResult::Sat => {
+            // Extract counterexample
+            let model = solver.get_model().unwrap();
+            let mut ce = Vec::new();
+            for (name, ty) in params {
+                let val = env.get(name).unwrap();
+                let val_str = extract_model_value(&model, val, &vctx.variants, ty);
+                ce.push((name.clone(), val_str));
+            }
+            Err(FnContractError::Counterexample(ce))
+        }
+        z3::SatResult::Unknown => Err(FnContractError::EncodingError(
+            "solver returned unknown (timeout or incomplete theory)".to_owned(),
+        )),
+    }
+}
+
+// ── Imperative body encoding (Hoare-logic for while loops) ──────────
+
+/// Global counter for generating fresh post-loop variable names.
+static LOOP_VAR_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Thread-local accumulator for ensures constraints from recursive self-calls.
+// When encode_recursive_self_call creates a fresh result variable, it also
+// encodes the function's ensures clauses (with actual args + result var
+// substituted) and pushes them here. The caller asserts them on the main solver.
+thread_local! {
+    static RECURSIVE_CALL_CONSTRAINTS: RefCell<Vec<Bool>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn push_recursive_call_constraint(c: Bool) {
+    RECURSIVE_CALL_CONSTRAINTS.with(|v| v.borrow_mut().push(c));
+}
+
+fn take_recursive_call_constraints() -> Vec<Bool> {
+    RECURSIVE_CALL_CONSTRAINTS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+// Thread-local accumulator for call-site precondition obligations found
+// during system-verification property encoding (encode_prop_expr /
+// encode_prop_value). Each obligation is a Z3 Bool that represents
+// `path_condition → precondition`. After encoding, these are checked
+// as a conjunction: if any obligation is falsifiable, the property
+// has a call-site precondition violation.
+thread_local! {
+    static PROP_PRECOND_OBLIGATIONS: RefCell<Vec<(Bool, String)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Record a precondition obligation during property encoding.
+/// `obligation` is `path_guard → precondition` (already guarded).
+fn record_prop_precondition_obligation(obligation: Bool, fn_name: String) {
+    PROP_PRECOND_OBLIGATIONS.with(|v| {
+        v.borrow_mut().push((obligation, fn_name));
+    });
+}
+
+/// Take (and clear) all recorded precondition obligations.
+fn take_prop_precondition_obligations() -> Vec<(Bool, String)> {
+    PROP_PRECOND_OBLIGATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Clear all recorded precondition obligations (call before encoding).
+fn clear_prop_precondition_obligations() {
+    PROP_PRECOND_OBLIGATIONS.with(|v| v.borrow_mut().clear());
+}
+
+// Thread-local path guard stack. When encoding inside `A implies B`,
+// the path guard for B is `A` (the call is only reachable when A is true).
+// Nested implications accumulate: `A implies (B implies f(x))` has
+// path guard `A ∧ B` for the `f(x)` call.
+thread_local! {
+    static PROP_PATH_GUARD: RefCell<Vec<Bool>> = const { RefCell::new(Vec::new()) };
+}
+
+fn push_path_guard(guard: Bool) {
+    PROP_PATH_GUARD.with(|v| v.borrow_mut().push(guard));
+}
+
+fn pop_path_guard() {
+    PROP_PATH_GUARD.with(|v| v.borrow_mut().pop());
+}
+
+fn clear_path_guard_stack() {
+    PROP_PATH_GUARD.with(|v| v.borrow_mut().clear());
+}
+
+/// Get the current path guard (conjunction of all guards on the stack).
+/// Returns `true` if the stack is empty (unconditional context).
+fn current_path_guard() -> Bool {
+    PROP_PATH_GUARD.with(|v| {
+        let guards = v.borrow();
+        if guards.is_empty() {
+            Bool::from_bool(true)
+        } else {
+            let refs: Vec<&Bool> = guards.iter().collect();
+            Bool::and(&refs)
+        }
+    })
+}
+
+/// Check accumulated precondition obligations. Returns the first
+/// violation found (a function name whose precondition is falsifiable).
+fn check_prop_precondition_obligations() -> Option<String> {
+    let obligations = take_prop_precondition_obligations();
+    for (obligation, fn_name) in &obligations {
+        let vc = Solver::new();
+        vc.assert(&obligation.not());
+        if vc.check() != z3::SatResult::Unsat {
+            return Some(format!(
+                "precondition of '{fn_name}' may not hold at call site in property"
+            ));
+        }
+    }
+    None
+}
+
+/// Encode a function body that may contain imperative constructs (While, VarDecl, Block).
+///
+/// Unlike `encode_pure_expr`, this function:
+/// - Threads the environment through Block expressions (sequential env mutation)
+/// - Verifies while-loop invariants via Hoare-logic side conditions
+/// - Creates fresh post-loop variables and asserts invariant ∧ ¬cond on the solver
+/// `solver_constraints` accumulates Z3 Bool assertions that must hold
+/// (e.g., post-loop invariants). These are NOT asserted immediately — the
+/// caller decides how to assert them (e.g., guarded by branch conditions).
+///
+/// `extra_assumptions` carries Z3 Bool facts known to be true in the current
+/// context — e.g., branch conditions from enclosing if/else. These are threaded
+/// to loop verification so that branch-local invariants (like `invariant flag`
+/// inside `if flag { ... }`) can be verified.
+fn encode_fn_body(
+    expr: &IRExpr,
+    env: &mut HashMap<String, SmtValue>,
+    solver_constraints: &mut Vec<Bool>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    self_fn: Option<&crate::ir::types::IRFunction>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<SmtValue, FnContractError> {
+    match expr {
+        // Lam: peel off the lambda, bind the param, recurse
+        IRExpr::Lam {
+            param,
+            param_type,
+            body,
+            ..
+        } => {
+            if !env.contains_key(param) {
+                let var = make_z3_var(param, param_type)
+                    .map_err(FnContractError::EncodingError)?;
+                env.insert(param.clone(), var);
+            }
+            encode_fn_body(body, env, solver_constraints, fn_requires, extra_assumptions, self_fn, vctx, defs)
+        }
+
+        // VarDecl: evaluate init, extend env, recurse into rest
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            let val = encode_pure_expr(init, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            env.insert(name.clone(), val);
+            encode_fn_body(rest, env, solver_constraints, fn_requires, extra_assumptions, self_fn, vctx, defs)
+        }
+
+        // Block: thread env through each expression sequentially
+        IRExpr::Block { exprs, .. } => {
+            if exprs.is_empty() {
+                return Ok(smt::bool_val(true));
+            }
+            let mut last = smt::bool_val(true);
+            for e in exprs {
+                last = encode_fn_body(e, env, solver_constraints, fn_requires, extra_assumptions, self_fn, vctx, defs)?;
+            }
+            Ok(last)
+        }
+
+        // While: Hoare-logic verification
+        IRExpr::While {
+            cond,
+            invariants,
+            decreases,
+            body,
+            ..
+        } => encode_while_hoare(
+            cond,
+            invariants,
+            decreases,
+            body,
+            env,
+            solver_constraints,
+            fn_requires,
+            extra_assumptions,
+            vctx,
+            defs,
+        ),
+
+        // Assignment: BinOp(OpEq, Var(name), expr) in imperative context
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ..
+        } if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) => {
+            if let IRExpr::Var { name, .. } = left.as_ref() {
+                if env.contains_key(name) {
+                    let val = encode_pure_expr(right, env, vctx, defs)
+                        .map_err(FnContractError::EncodingError)?;
+                    env.insert(name.clone(), val);
+                    return Ok(smt::bool_val(true));
+                }
+            }
+            encode_pure_expr(expr, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)
+        }
+
+        // IfElse with possible imperative branches
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            if contains_imperative(then_body)
+                || else_body.as_ref().map_or(false, |e| contains_imperative(e))
+            {
+                encode_imperative_if_else(
+                    cond,
+                    then_body,
+                    else_body.as_deref(),
+                    env,
+                    solver_constraints,
+                    fn_requires,
+                    extra_assumptions,
+                    self_fn,
+                    vctx,
+                    defs,
+                )
+            } else {
+                let precheck = PrecheckCtx {
+                    fn_requires,
+                    extra_assumptions,
+                    self_fn,
+                };
+                encode_pure_expr_checked(expr, env, vctx, defs, &precheck)
+                    .map_err(FnContractError::EncodingError)
+            }
+        }
+
+        // Everything else (including App): delegate to pure encoder with
+        // precondition checking enabled. This ensures ALL nested function
+        // calls have their preconditions verified, not just top-level ones.
+        _ => {
+            let precheck = PrecheckCtx {
+                fn_requires,
+                extra_assumptions,
+                self_fn,
+            };
+            encode_pure_expr_checked(expr, env, vctx, defs, &precheck)
+                .map_err(FnContractError::EncodingError)
+        }
+    }
+}
+
+/// Check if an expression contains imperative constructs (While, VarDecl, mutable assignment).
+fn contains_imperative(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::While { .. } | IRExpr::VarDecl { .. } => true,
+        // Assignment: BinOp(OpEq, Var(_), _) is an imperative mutation
+        IRExpr::BinOp { op, left, .. }
+            if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) =>
+        {
+            true
+        }
+        IRExpr::Block { exprs, .. } => exprs.iter().any(contains_imperative),
+        IRExpr::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => {
+            contains_imperative(then_body)
+                || else_body.as_ref().map_or(false, |e| contains_imperative(e))
+        }
+        _ => false,
+    }
+}
+
+/// Encode a while loop using Hoare-logic verification.
+///
+/// Verification conditions:
+/// 1. **Init**: invariant holds with current env values
+/// 2. **Preservation**: invariant ∧ cond → invariant[after body]
+/// 3. **Termination** (if decreases): measure ≥ 0 ∧ measure decreases
+/// 4. **Post-loop**: create fresh vars, assert invariant ∧ ¬cond, update env
+#[allow(clippy::too_many_arguments)]
+fn encode_while_hoare(
+    cond: &IRExpr,
+    invariants: &[IRExpr],
+    decreases: &Option<crate::ir::types::IRDecreases>,
+    body: &IRExpr,
+    env: &mut HashMap<String, SmtValue>,
+    solver_constraints: &mut Vec<Bool>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<SmtValue, FnContractError> {
+    // ── Step 1: Identify variables modified by the loop body ─────────
+    let mut modified = Vec::new();
+    collect_modified_vars(body, &mut modified);
+    modified.sort();
+    modified.dedup();
+
+    // ── Step 2: Verify loop conditions (init, preservation, termination) ──
+    verify_loop_conditions(cond, invariants, decreases, body, &modified, env, fn_requires, extra_assumptions, vctx, defs)?;
+
+    // ── Step 3: Post-loop abstraction ───────────────────────────────
+    // Create fresh Z3 variables for all modified variables.
+    // Assert invariant ∧ ¬cond on the main solver.
+    // Update env with fresh post-loop variables.
+    let counter = LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for var_name in &modified {
+        if let Some(old_val) = env.get(var_name) {
+            // Create a fresh Z3 variable for the post-loop value
+            let fresh_name = format!("{var_name}_post_{counter}");
+            let fresh_var = make_z3_var_from_smt(&fresh_name, old_val);
+            env.insert(var_name.clone(), fresh_var);
+        }
+    }
+
+    // Accumulate post-loop constraints (invariant ∧ ¬cond).
+    // These are NOT asserted directly — the caller will assert them,
+    // potentially guarded by branch conditions if inside an if/else.
+    for inv in invariants {
+        let inv_val = encode_pure_expr(inv, env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let inv_bool = inv_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        solver_constraints.push(inv_bool);
+    }
+
+    // ¬cond (loop exited)
+    let cond_val = encode_pure_expr(cond, env, vctx, defs)
+        .map_err(FnContractError::EncodingError)?;
+    let cond_bool = cond_val
+        .to_bool()
+        .map_err(FnContractError::EncodingError)?;
+    solver_constraints.push(cond_bool.not());
+
+    // The while loop itself produces no meaningful value — it's executed
+    // for side effects (env mutation). Return a unit-like value.
+    Ok(smt::bool_val(true))
+}
+
+/// Verify the three Hoare-logic conditions for a while loop:
+/// 1. Invariant initialization
+/// 2. Invariant preservation
+/// 3. Termination (if decreases clause present)
+#[allow(clippy::too_many_arguments)]
+fn verify_loop_conditions(
+    cond: &IRExpr,
+    invariants: &[IRExpr],
+    decreases: &Option<crate::ir::types::IRDecreases>,
+    body: &IRExpr,
+    modified: &[String],
+    env: &HashMap<String, SmtValue>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    if invariants.is_empty() {
+        return Err(FnContractError::EncodingError(
+            crate::messages::FN_LOOP_NO_INVARIANT.to_owned(),
+        ));
+    }
+
+    verify_loop_init(invariants, env, fn_requires, extra_assumptions, vctx, defs)?;
+    verify_loop_preservation(cond, invariants, body, modified, env, fn_requires, extra_assumptions, vctx, defs)?;
+
+    if let Some(dec) = decreases {
+        if !dec.star {
+            verify_loop_termination(
+                cond, invariants, &dec.measures, body, modified, env, fn_requires,
+                extra_assumptions, vctx, defs,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// VC1: Verify that the loop invariant holds at initialization.
+///
+/// Check: ¬invariant(env) is UNSAT → invariant always holds with current values.
+fn verify_loop_init(
+    invariants: &[IRExpr],
+    env: &HashMap<String, SmtValue>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    let vc_solver = Solver::new();
+
+    // Assert function preconditions and any outer context assumptions
+    for req in fn_requires {
+        let req_val = encode_pure_expr(req, env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let req_bool = req_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        vc_solver.assert(&req_bool);
+    }
+    for assumption in extra_assumptions {
+        vc_solver.assert(assumption);
+    }
+
+    // Assert ¬invariant — looking for counterexample to init
+    let mut inv_bools = Vec::new();
+    for inv in invariants {
+        let inv_val = encode_pure_expr(inv, env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let inv_bool = inv_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        inv_bools.push(inv_bool);
+    }
+    let inv_refs: Vec<&Bool> = inv_bools.iter().collect();
+    let all_inv = Bool::and(&inv_refs);
+    vc_solver.assert(&all_inv.not());
+
+    match vc_solver.check() {
+        z3::SatResult::Unsat => Ok(()),
+        z3::SatResult::Sat | z3::SatResult::Unknown => {
+            Err(FnContractError::EncodingError(
+                crate::messages::FN_LOOP_INIT_FAILED.to_owned(),
+            ))
+        }
+    }
+}
+
+/// VC2: Verify invariant preservation — one iteration maintains the invariant.
+///
+/// Check: invariant ∧ cond ∧ body → invariant
+/// Negated: invariant ∧ cond ∧ ¬invariant[post_body] is UNSAT
+#[allow(clippy::too_many_arguments)]
+fn verify_loop_preservation(
+    cond: &IRExpr,
+    invariants: &[IRExpr],
+    body: &IRExpr,
+    modified: &[String],
+    env: &HashMap<String, SmtValue>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    let vc_solver = Solver::new();
+
+    // Create fresh "pre-iteration" variables for all modified vars.
+    let counter = LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut pre_env = env.clone();
+    for var_name in modified {
+        if let Some(old_val) = env.get(var_name) {
+            let fresh_name = format!("{var_name}_pre_{counter}");
+            let fresh_var = make_z3_var_from_smt(&fresh_name, old_val);
+            pre_env.insert(var_name.clone(), fresh_var);
+        }
+    }
+
+    // Assume function preconditions and outer context
+    for req in fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        vc_solver.assert(
+            &req_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?,
+        );
+    }
+    for assumption in extra_assumptions {
+        vc_solver.assert(assumption);
+    }
+
+    // Assume invariant holds for pre-iteration values.
+    // Collect as Bool values too, for inner loop context.
+    let mut inner_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    for inv in invariants {
+        let inv_val = encode_pure_expr(inv, &pre_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let inv_bool = inv_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        vc_solver.assert(&inv_bool);
+        inner_assumptions.push(inv_bool);
+    }
+
+    // Assume condition holds (we're inside the loop)
+    let cond_val = encode_pure_expr(cond, &pre_env, vctx, defs)
+        .map_err(FnContractError::EncodingError)?;
+    let cond_bool = cond_val
+        .to_bool()
+        .map_err(FnContractError::EncodingError)?;
+    vc_solver.assert(&cond_bool);
+    inner_assumptions.push(cond_bool);
+
+    // Also add fn_requires as Bool for inner loop context
+    for req in fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        inner_assumptions.push(
+            req_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?,
+        );
+    }
+
+    // Execute the body to get post-iteration variable values
+    let mut post_env = pre_env.clone();
+    let mut body_constraints = Vec::new();
+    execute_loop_body(body, &mut post_env, &mut body_constraints, &inner_assumptions, vctx, defs)?;
+
+    // Assert any constraints from nested loops (inner invariant ∧ ¬inner_cond)
+    for c in &body_constraints {
+        vc_solver.assert(c);
+    }
+
+    // Assert ¬invariant[post] — looking for counterexample to preservation
+    let mut post_inv_bools = Vec::new();
+    for inv in invariants {
+        let inv_val = encode_pure_expr(inv, &post_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let inv_bool = inv_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        post_inv_bools.push(inv_bool);
+    }
+    let post_refs: Vec<&Bool> = post_inv_bools.iter().collect();
+    let all_post = Bool::and(&post_refs);
+    vc_solver.assert(&all_post.not());
+
+    match vc_solver.check() {
+        z3::SatResult::Unsat => Ok(()),
+        z3::SatResult::Sat | z3::SatResult::Unknown => {
+            Err(FnContractError::EncodingError(
+                crate::messages::FN_LOOP_PRESERVATION_FAILED.to_owned(),
+            ))
+        }
+    }
+}
+
+/// VC3: Verify termination — decreases measure is non-negative and strictly decreases.
+///
+/// Check: invariant ∧ cond → D ≥ 0 ∧ D[post] < D[pre]
+#[allow(clippy::too_many_arguments)]
+fn verify_loop_termination(
+    cond: &IRExpr,
+    invariants: &[IRExpr],
+    measures: &[IRExpr],
+    body: &IRExpr,
+    modified: &[String],
+    env: &HashMap<String, SmtValue>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    let vc_solver = Solver::new();
+
+    // Create fresh pre-iteration variables
+    let counter = LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut pre_env = env.clone();
+    for var_name in modified {
+        if let Some(old_val) = env.get(var_name) {
+            let fresh_name = format!("{var_name}_term_{counter}");
+            let fresh_var = make_z3_var_from_smt(&fresh_name, old_val);
+            pre_env.insert(var_name.clone(), fresh_var);
+        }
+    }
+
+    // Assume requires ∧ extra_assumptions ∧ invariant ∧ cond
+    let mut inner_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    for req in fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let req_bool = req_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        vc_solver.assert(&req_bool);
+        inner_assumptions.push(req_bool);
+    }
+    for assumption in extra_assumptions {
+        vc_solver.assert(assumption);
+    }
+    for inv in invariants {
+        let inv_val = encode_pure_expr(inv, &pre_env, vctx, defs)
+            .map_err(FnContractError::EncodingError)?;
+        let inv_bool = inv_val
+            .to_bool()
+            .map_err(FnContractError::EncodingError)?;
+        vc_solver.assert(&inv_bool);
+        inner_assumptions.push(inv_bool);
+    }
+    let cond_val = encode_pure_expr(cond, &pre_env, vctx, defs)
+        .map_err(FnContractError::EncodingError)?;
+    let cond_bool = cond_val
+        .to_bool()
+        .map_err(FnContractError::EncodingError)?;
+    vc_solver.assert(&cond_bool);
+    inner_assumptions.push(cond_bool);
+
+    // Evaluate decreases measure before iteration
+    let pre_measures: Vec<SmtValue> = measures
+        .iter()
+        .map(|m| encode_pure_expr(m, &pre_env, vctx, defs).map_err(FnContractError::EncodingError))
+        .collect::<Result<_, _>>()?;
+
+    // Execute body
+    let mut post_env = pre_env.clone();
+    let mut body_constraints = Vec::new();
+    execute_loop_body(body, &mut post_env, &mut body_constraints, &inner_assumptions, vctx, defs)?;
+
+    // Assert any constraints from nested loops
+    for c in &body_constraints {
+        vc_solver.assert(c);
+    }
+
+    // Evaluate decreases measure after iteration
+    let post_measures: Vec<SmtValue> = measures
+        .iter()
+        .map(|m| encode_pure_expr(m, &post_env, vctx, defs).map_err(FnContractError::EncodingError))
+        .collect::<Result<_, _>>()?;
+
+    // For single measure: assert ¬(pre ≥ 0 ∧ post < pre)
+    // For multiple measures: lexicographic ordering (first that differs must decrease)
+    // Start with single measure (most common)
+    if pre_measures.len() == 1 {
+        let pre_m = pre_measures[0]
+            .as_int()
+            .map_err(FnContractError::EncodingError)?;
+        let post_m = post_measures[0]
+            .as_int()
+            .map_err(FnContractError::EncodingError)?;
+        let bounded = pre_m.ge(z3::ast::Int::from_i64(0));
+        let decreases_strict = post_m.lt(pre_m);
+        let term_ok = Bool::and(&[&bounded, &decreases_strict]);
+        vc_solver.assert(&term_ok.not());
+    } else {
+        // Lexicographic: ∃ i. (∀ j < i. mⱼ_post == mⱼ_pre) ∧ mᵢ_post < mᵢ_pre ∧ mᵢ_pre ≥ 0
+        let mut lex_cases = Vec::new();
+        for i in 0..pre_measures.len() {
+            let mut conjuncts = Vec::new();
+            // All measures before i are equal
+            for j in 0..i {
+                let pre_j = pre_measures[j]
+                    .as_int()
+                    .map_err(FnContractError::EncodingError)?;
+                let post_j = post_measures[j]
+                    .as_int()
+                    .map_err(FnContractError::EncodingError)?;
+                conjuncts.push(pre_j.eq(post_j.clone()));
+            }
+            // Measure i strictly decreases and is bounded
+            let pre_i = pre_measures[i]
+                .as_int()
+                .map_err(FnContractError::EncodingError)?;
+            let post_i = post_measures[i]
+                .as_int()
+                .map_err(FnContractError::EncodingError)?;
+            conjuncts.push(pre_i.ge(z3::ast::Int::from_i64(0)));
+            conjuncts.push(post_i.lt(pre_i));
+            let refs: Vec<&Bool> = conjuncts.iter().collect();
+            lex_cases.push(Bool::and(&refs));
+        }
+        let lex_refs: Vec<&Bool> = lex_cases.iter().collect();
+        let lex_ok = Bool::or(&lex_refs);
+        vc_solver.assert(&lex_ok.not());
+    }
+
+    match vc_solver.check() {
+        z3::SatResult::Unsat => Ok(()),
+        z3::SatResult::Sat | z3::SatResult::Unknown => {
+            Err(FnContractError::EncodingError(
+                crate::messages::FN_LOOP_TERMINATION_FAILED.to_owned(),
+            ))
+        }
+    }
+}
+
+/// Execute a while loop body, updating the environment with post-iteration values.
+///
+/// Processes assignments (`BinOp(OpEq, Var(name), expr)`) sequentially,
+/// VarDecl for local temporaries, nested Blocks, and nested While loops.
+///
+/// `constraints` accumulates Z3 Bool assertions that must hold after execution
+/// (e.g., inner loop postconditions: invariant ∧ ¬cond on fresh post-loop vars).
+/// `assumptions` are Z3 Bool facts known to be true in the current context
+/// (e.g., outer loop invariant ∧ outer condition ∧ fn requires). These are
+/// passed as additional assumptions when verifying inner loop conditions.
+fn execute_loop_body(
+    body: &IRExpr,
+    env: &mut HashMap<String, SmtValue>,
+    constraints: &mut Vec<Bool>,
+    assumptions: &[Bool],
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), FnContractError> {
+    match body {
+        IRExpr::Block { exprs, .. } => {
+            for e in exprs {
+                execute_loop_body(e, env, constraints, assumptions, vctx, defs)?;
+            }
+            Ok(())
+        }
+
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            let val = encode_pure_expr(init, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            env.insert(name.clone(), val);
+            execute_loop_body(rest, env, constraints, assumptions, vctx, defs)
+        }
+
+        // Assignment: var = expr
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ..
+        } if op == "OpEq" => {
+            if let IRExpr::Var { name, .. } = left.as_ref() {
+                let val = encode_pure_expr(right, env, vctx, defs)
+                    .map_err(FnContractError::EncodingError)?;
+                env.insert(name.clone(), val);
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let cond_val = encode_pure_expr(cond, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let cond_bool = cond_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+
+            // Then-branch: collect constraints separately, guard with cond
+            let mut then_assumptions: Vec<Bool> = assumptions.to_vec();
+            then_assumptions.push(cond_bool.clone());
+            let mut then_constraints: Vec<Bool> = Vec::new();
+            let mut then_env = env.clone();
+            execute_loop_body(then_body, &mut then_env, &mut then_constraints, &then_assumptions, vctx, defs)?;
+
+            // Else-branch: collect constraints separately, guard with ¬cond
+            let mut else_assumptions: Vec<Bool> = assumptions.to_vec();
+            else_assumptions.push(cond_bool.not());
+            let mut else_constraints: Vec<Bool> = Vec::new();
+            let mut else_env = env.clone();
+            if let Some(eb) = else_body {
+                execute_loop_body(eb, &mut else_env, &mut else_constraints, &else_assumptions, vctx, defs)?;
+            }
+
+            // Guard branch constraints before propagating to the shared vector
+            for c in then_constraints {
+                constraints.push(cond_bool.implies(&c));
+            }
+            for c in else_constraints {
+                constraints.push(cond_bool.not().implies(&c));
+            }
+
+            // Merge: for each variable that changed in either branch,
+            // set it to ite(cond, then_val, else_val)
+            let all_keys: HashSet<String> = then_env
+                .keys()
+                .chain(else_env.keys())
+                .cloned()
+                .collect();
+            for key in all_keys {
+                let then_val = then_env.get(&key);
+                let else_val = else_env.get(&key);
+                if let (Some(tv), Some(ev)) = (then_val, else_val) {
+                    let merged = encode_ite(&cond_bool, tv, ev)
+                        .map_err(FnContractError::EncodingError)?;
+                    env.insert(key, merged);
+                }
+            }
+            Ok(())
+        }
+
+        // Nested while loop: apply Hoare-logic abstraction.
+        // The inner loop's effects must be modeled via invariant ∧ ¬cond,
+        // not silently dropped.
+        IRExpr::While {
+            cond: inner_cond,
+            invariants: inner_invs,
+            decreases: inner_dec,
+            body: inner_body,
+            ..
+        } => {
+            // Collect variables modified by the inner loop
+            let mut inner_modified = Vec::new();
+            collect_modified_vars(inner_body, &mut inner_modified);
+            inner_modified.sort();
+            inner_modified.dedup();
+
+            // Verify the inner loop's own conditions (init, preservation, termination).
+            // Pass the outer context (outer invariant ∧ outer cond ∧ fn requires)
+            // as extra assumptions so the inner loop can depend on them.
+            // Inner loops are held to the same invariant requirement as top-level loops.
+            verify_loop_conditions(
+                inner_cond,
+                inner_invs,
+                inner_dec,
+                inner_body,
+                &inner_modified,
+                env,
+                &[],         // no fn_requires (captured in assumptions)
+                assumptions, // outer context: invariant ∧ cond ∧ requires
+                vctx,
+                defs,
+            )?;
+
+            // Post-loop abstraction: havoc modified variables, then
+            // add inner invariant ∧ ¬inner_cond as constraints.
+            let counter =
+                LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for var_name in &inner_modified {
+                if let Some(old_val) = env.get(var_name) {
+                    let fresh_name = format!("{var_name}_inner_{counter}");
+                    let fresh_var = make_z3_var_from_smt(&fresh_name, old_val);
+                    env.insert(var_name.clone(), fresh_var);
+                }
+            }
+
+            // Assert inner invariant holds for post-loop values
+            for inv in inner_invs {
+                let inv_val = encode_pure_expr(inv, env, vctx, defs)
+                    .map_err(FnContractError::EncodingError)?;
+                let inv_bool = inv_val
+                    .to_bool()
+                    .map_err(FnContractError::EncodingError)?;
+                constraints.push(inv_bool);
+            }
+
+            // Assert ¬inner_cond (inner loop exited)
+            let cond_val = encode_pure_expr(inner_cond, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let cond_bool = cond_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+            constraints.push(cond_bool.not());
+
+            Ok(())
+        }
+
+        // Ignore other expressions in the body (assertions, etc.)
+        _ => Ok(()),
+    }
+}
+
+/// Collect variable names that are modified by assignments in a loop body.
+fn collect_modified_vars(body: &IRExpr, modified: &mut Vec<String>) {
+    match body {
+        IRExpr::Block { exprs, .. } => {
+            for e in exprs {
+                collect_modified_vars(e, modified);
+            }
+        }
+        IRExpr::VarDecl { rest, .. } => {
+            collect_modified_vars(rest, modified);
+        }
+        IRExpr::BinOp { op, left, .. } if op == "OpEq" => {
+            if let IRExpr::Var { name, .. } = left.as_ref() {
+                modified.push(name.clone());
+            }
+        }
+        IRExpr::IfElse {
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_modified_vars(then_body, modified);
+            if let Some(eb) = else_body {
+                collect_modified_vars(eb, modified);
+            }
+        }
+        IRExpr::While { body: inner, .. } => {
+            collect_modified_vars(inner, modified);
+        }
+        _ => {}
+    }
+}
+
+/// Encode a recursive self-call: instead of expanding the body (which
+/// would diverge), return a fresh Z3 variable constrained by the
+/// function's `ensures` clauses with actual arguments substituted.
+///
+/// This implements modular verification: we trust the postcondition for
+/// recursive calls (after Phase 1 proves it holds for all cases via induction).
+fn encode_recursive_self_call(
+    self_fn: &crate::ir::types::IRFunction,
+    actual_args: &[IRExpr],
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<SmtValue, String> {
+    static REC_CALL_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    // Determine the return type
+    let ret_ty = extract_return_type(&self_fn.ty);
+
+    // Create a fresh Z3 variable for the return value
+    let counter = REC_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fresh_name = format!("{}_rec_{counter}", self_fn.name);
+    let result_var = make_z3_var(&fresh_name, &ret_ty)?;
+
+    // If the function has ensures clauses, constrain the result.
+    // Substitute: formal params → actual args, "result" → fresh var.
+    if !self_fn.ensures.is_empty() {
+        let entry = defs.get(&self_fn.name);
+        if let Some(entry) = entry {
+            let params = &entry.params;
+            if params.len() == actual_args.len() {
+                // Build an env with actual arg values for formal param names
+                let mut call_env = env.clone();
+                for (i, (param_name, _)) in params.iter().enumerate() {
+                    let val = encode_pure_expr(&actual_args[i], env, vctx, defs)?;
+                    call_env.insert(param_name.clone(), val);
+                }
+                call_env.insert("result".to_owned(), result_var.clone());
+
+                // Encode ensures clauses with actual args substituted.
+                // These are pushed to a thread-local accumulator and asserted
+                // on the main solver by the caller (verify_single_fn_contract).
+                // This implements modular verification: we assume the ensures
+                // hold for recursive calls (Phase 1 proves this by induction).
+                for ens in &self_fn.ensures {
+                    if let Ok(ens_val) = encode_pure_expr(ens, &call_env, vctx, defs) {
+                        if let Ok(ens_bool) = ens_val.to_bool() {
+                            push_recursive_call_constraint(ens_bool);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result_var)
+}
+
+/// Extract the return type from a (curried) function type.
+fn extract_return_type(ty: &crate::ir::types::IRType) -> crate::ir::types::IRType {
+    let mut current = ty;
+    while let crate::ir::types::IRType::Fn { result, .. } = current {
+        current = result;
+    }
+    current.clone()
+}
+
+// ── Function termination verification ───────────────────────────────
+
+/// Verify termination for a recursive function with a `decreases` clause.
+///
+/// Walks the function body to find all recursive call sites (calls to
+/// `func.name`). For each call site, extracts the path condition (branch
+/// conditions that must be true for the call to be reached) and the actual
+/// arguments. Then checks:
+///
+/// `requires ∧ path_condition → measure(actual_args) < measure(formal_params) ∧ measure(actual_args) ≥ 0`
+///
+/// Returns `Ok(())` if all recursive calls provably decrease the measure,
+/// or `Err(message)` if any call fails.
+fn verify_fn_termination(
+    func: &crate::ir::types::IRFunction,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<(), String> {
+    let dec = func.decreases.as_ref().ok_or_else(|| {
+        "internal error: verify_fn_termination called without decreases".to_owned()
+    })?;
+    if dec.star {
+        return Ok(()); // decreases * — skip termination checking
+    }
+
+    // Uncurry the function to get params and body
+    let entry = defs.get(&func.name).ok_or_else(|| {
+        format!("function '{}' not found in DefEnv", func.name)
+    })?;
+    let params = &entry.params;
+
+    // Create Z3 variables for each parameter
+    let mut env: HashMap<String, SmtValue> = HashMap::new();
+    for (name, ty) in params {
+        let var = make_z3_var(name, ty)?;
+        env.insert(name.clone(), var);
+    }
+
+    // Find all recursive call sites with their path conditions
+    // call_sites: (path_conditions, actual_args, env_at_call_site)
+    let mut call_sites: Vec<(Vec<Bool>, Vec<IRExpr>, HashMap<String, SmtValue>)> = Vec::new();
+    let mut body_env = env.clone();
+    collect_recursive_calls(
+        &entry.body,
+        &func.name,
+        params,
+        &mut body_env,
+        vctx,
+        defs,
+        &mut Vec::new(), // path conditions
+        &mut call_sites,
+    )?;
+
+    if call_sites.is_empty() {
+        return Ok(()); // no recursive calls — trivially terminating
+    }
+
+    // Encode fn requires as Bool values
+    let mut requires_bools: Vec<Bool> = Vec::new();
+    for req in &func.requires {
+        let req_val = encode_pure_expr(req, &env, vctx, defs)?;
+        requires_bools.push(req_val.to_bool()?);
+    }
+
+    // Encode the decreases measures for the formal parameters
+    let pre_measures: Vec<SmtValue> = dec
+        .measures
+        .iter()
+        .map(|m| encode_pure_expr(m, &env, vctx, defs))
+        .collect::<Result<_, _>>()?;
+
+    // Check each recursive call site
+    for (path_conds, actual_args, call_env) in &call_sites {
+        // Evaluate actual arg values in the call-site env
+        let mut substituted_env = env.clone();
+        for (i, (param_name, _)) in params.iter().enumerate() {
+            if i < actual_args.len() {
+                let val = encode_pure_expr(&actual_args[i], call_env, vctx, defs)?;
+                substituted_env.insert(param_name.clone(), val);
+            }
+        }
+
+        // Evaluate measures with actual args
+        let post_measures: Vec<SmtValue> = dec
+            .measures
+            .iter()
+            .map(|m| encode_pure_expr(m, &substituted_env, vctx, defs))
+            .collect::<Result<_, _>>()?;
+
+        // Evaluate callee requires with actual args (for precondition check)
+        let mut callee_requires_bools: Vec<Bool> = Vec::new();
+        for req in &func.requires {
+            let req_val = encode_pure_expr(req, &substituted_env, vctx, defs)?;
+            callee_requires_bools.push(req_val.to_bool()?);
+        }
+
+        // ── VC1: Callee precondition ────────────────────────────────
+        // requires(caller) ∧ path_condition → requires(actual_args)
+        {
+            let vc_solver = Solver::new();
+            for req_bool in &requires_bools {
+                vc_solver.assert(req_bool);
+            }
+            for pc in path_conds {
+                vc_solver.assert(pc);
+            }
+            // Assert ¬callee_requires — looking for counterexample
+            let callee_refs: Vec<&Bool> = callee_requires_bools.iter().collect();
+            let all_callee_req = Bool::and(&callee_refs);
+            vc_solver.assert(&all_callee_req.not());
+            if vc_solver.check() != z3::SatResult::Unsat {
+                return Err(
+                    crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned(),
+                );
+            }
+        }
+
+        // ── VC2: Measure decreases and is bounded ───────────────────
+        // requires(caller) ∧ path_condition → post_measure < pre_measure ∧ post_measure ≥ 0
+        {
+            let vc_solver = Solver::new();
+            for req_bool in &requires_bools {
+                vc_solver.assert(req_bool);
+            }
+            for pc in path_conds {
+                vc_solver.assert(pc);
+            }
+
+            if pre_measures.len() == 1 {
+                // Single measure: post < pre ∧ post ≥ 0
+                let pre_m = pre_measures[0].as_int()?;
+                let post_m = post_measures[0].as_int()?;
+                let bounded = post_m.ge(z3::ast::Int::from_i64(0));
+                let decreases_strict = post_m.lt(pre_m);
+                let term_ok = Bool::and(&[&bounded, &decreases_strict]);
+                vc_solver.assert(&term_ok.not());
+            } else {
+                // Lexicographic: ∃ i. (∀ j < i. mⱼ_post == mⱼ_pre) ∧ mᵢ_post < mᵢ_pre ∧ mᵢ_post ≥ 0
+                let mut lex_cases = Vec::new();
+                for i in 0..pre_measures.len() {
+                    let mut conjuncts = Vec::new();
+                    for j in 0..i {
+                        let pre_j = pre_measures[j].as_int()?;
+                        let post_j = post_measures[j].as_int()?;
+                        conjuncts.push(pre_j.eq(post_j.clone()));
+                    }
+                    let pre_i = pre_measures[i].as_int()?;
+                    let post_i = post_measures[i].as_int()?;
+                    conjuncts.push(post_i.ge(z3::ast::Int::from_i64(0)));
+                    conjuncts.push(post_i.lt(pre_i));
+                    let refs: Vec<&Bool> = conjuncts.iter().collect();
+                    lex_cases.push(Bool::and(&refs));
+                }
+                let lex_refs: Vec<&Bool> = lex_cases.iter().collect();
+                let lex_ok = Bool::or(&lex_refs);
+                vc_solver.assert(&lex_ok.not());
+            }
+
+            match vc_solver.check() {
+                z3::SatResult::Unsat => {}
+                _ => {
+                    return Err(
+                        crate::messages::FN_TERMINATION_FAILED.to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively walk a function body to find all recursive call sites.
+///
+/// Collects `(path_conditions, actual_arguments)` for each call to `fn_name`.
+/// The path conditions are Z3 Bool expressions representing the branch
+/// conditions that must hold for the call to be reached.
+#[allow(clippy::too_many_arguments)]
+fn collect_recursive_calls(
+    expr: &IRExpr,
+    fn_name: &str,
+    params: &[(String, crate::ir::types::IRType)],
+    env: &mut HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    path_conds: &mut Vec<Bool>,
+    call_sites: &mut Vec<(Vec<Bool>, Vec<IRExpr>, HashMap<String, SmtValue>)>,
+) -> Result<(), String> {
+    match expr {
+        IRExpr::App { .. } => {
+            if let Some((name, args)) = defenv::decompose_app_chain_public(expr) {
+                if name == fn_name && args.len() == params.len() {
+                    // Record the env snapshot at this call site so that
+                    // local variables (let/var bindings) are available
+                    // when evaluating the actual arguments later.
+                    call_sites.push((path_conds.clone(), args, env.clone()));
+                }
+            }
+            if let IRExpr::App { func, arg, .. } = expr {
+                collect_recursive_calls(func, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+                collect_recursive_calls(arg, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            }
+        }
+        IRExpr::Lam { param, param_type, body, .. } => {
+            // Lam introduces a binding — create a Z3 var for it
+            if !env.contains_key(param) {
+                if let Ok(var) = make_z3_var(param, param_type) {
+                    env.insert(param.clone(), var);
+                }
+            }
+            collect_recursive_calls(body, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            collect_recursive_calls(left, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            collect_recursive_calls(right, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
+        IRExpr::UnOp { operand, .. } => {
+            collect_recursive_calls(operand, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let cond_val = encode_pure_expr(cond, env, vctx, defs)?;
+            let cond_bool = cond_val.to_bool()?;
+
+            path_conds.push(cond_bool.clone());
+            collect_recursive_calls(then_body, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            path_conds.pop();
+
+            if let Some(eb) = else_body {
+                path_conds.push(cond_bool.not());
+                collect_recursive_calls(eb, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+                path_conds.pop();
+            }
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_recursive_calls(scrutinee, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            let scrut_val = encode_pure_expr(scrutinee, env, vctx, defs)?;
+
+            // Match arms are sequential: arm k is reached only if all prior
+            // arm conditions (pattern ∧ guard) were false. Accumulate the
+            // negation of prior arm conditions as path context.
+            let mut prior_negations: Vec<Bool> = Vec::new();
+            for arm in arms {
+                let pat_cond = encode_pattern_cond(&scrut_val, &arm.pattern, &HashMap::new(), vctx)?;
+                let full_arm_cond = if let Some(guard) = &arm.guard {
+                    let guard_val = encode_pure_expr(guard, env, vctx, defs)?;
+                    let guard_bool = guard_val.to_bool()?;
+                    Bool::and(&[&pat_cond, &guard_bool])
+                } else {
+                    pat_cond.clone()
+                };
+
+                // This arm's path: prior arms all failed + this arm matched
+                let n_prior = prior_negations.len();
+                for neg in &prior_negations {
+                    path_conds.push(neg.clone());
+                }
+                path_conds.push(pat_cond);
+                if let Some(guard) = &arm.guard {
+                    let guard_val = encode_pure_expr(guard, env, vctx, defs)?;
+                    path_conds.push(guard_val.to_bool()?);
+                    collect_recursive_calls(&arm.body, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+                    path_conds.pop(); // guard
+                } else {
+                    collect_recursive_calls(&arm.body, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+                }
+                path_conds.pop(); // pattern
+                // Pop prior negations
+                for _ in 0..n_prior {
+                    path_conds.pop();
+                }
+
+                // For subsequent arms: this arm's condition was false
+                prior_negations.push(full_arm_cond.not());
+            }
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            for b in bindings {
+                collect_recursive_calls(&b.expr, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+                // Extend env with the binding so it's available in the body
+                if let Ok(val) = encode_pure_expr(&b.expr, env, vctx, defs) {
+                    env.insert(b.name.clone(), val);
+                }
+            }
+            collect_recursive_calls(body, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
+        IRExpr::Block { exprs, .. } => {
+            for e in exprs {
+                collect_recursive_calls(e, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            }
+        }
+        IRExpr::VarDecl { name, init, rest, .. } => {
+            collect_recursive_calls(init, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+            // Extend env with the var declaration
+            if let Ok(val) = encode_pure_expr(init, env, vctx, defs) {
+                env.insert(name.clone(), val);
+            }
+            collect_recursive_calls(rest, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Create a fresh Z3 variable with the same sort as an existing SmtValue.
+fn make_z3_var_from_smt(name: &str, template: &SmtValue) -> SmtValue {
+    match template {
+        SmtValue::Int(_) => smt::int_var(name),
+        SmtValue::Bool(_) => smt::bool_var(name),
+        SmtValue::Real(_) => smt::real_var(name),
+        SmtValue::Array(_) | SmtValue::Dynamic(_) => {
+            // For arrays/dynamic, fall back to int (best effort)
+            smt::int_var(name)
+        }
+    }
+}
+
+/// Encode an imperative if/else that may contain while loops or assignments.
+///
+/// Evaluates both branches with cloned environments, then merges
+/// modified variables using ITE on the condition.
+#[allow(clippy::too_many_arguments)]
+fn encode_imperative_if_else(
+    cond: &IRExpr,
+    then_body: &IRExpr,
+    else_body: Option<&IRExpr>,
+    env: &mut HashMap<String, SmtValue>,
+    solver_constraints: &mut Vec<Bool>,
+    fn_requires: &[IRExpr],
+    extra_assumptions: &[Bool],
+    self_fn: Option<&crate::ir::types::IRFunction>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<SmtValue, FnContractError> {
+    let cond_val = encode_pure_expr(cond, env, vctx, defs)
+        .map_err(FnContractError::EncodingError)?;
+    let cond_bool = cond_val
+        .to_bool()
+        .map_err(FnContractError::EncodingError)?;
+
+    // Then-branch: condition is known true → add it as assumption.
+    // Collect constraints separately so they can be guarded by cond.
+    let mut then_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    then_assumptions.push(cond_bool.clone());
+    let mut then_constraints: Vec<Bool> = Vec::new();
+    let mut then_env = env.clone();
+    let then_val = encode_fn_body(
+        then_body, &mut then_env, &mut then_constraints, fn_requires, &then_assumptions, self_fn, vctx, defs,
+    )?;
+
+    // Else-branch: condition is known false → add ¬cond as assumption.
+    let mut else_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    else_assumptions.push(cond_bool.not());
+    let mut else_constraints: Vec<Bool> = Vec::new();
+    let mut else_env = env.clone();
+    let else_val = if let Some(eb) = else_body {
+        encode_fn_body(eb, &mut else_env, &mut else_constraints, fn_requires, &else_assumptions, self_fn, vctx, defs)?
+    } else {
+        smt::bool_val(true)
+    };
+
+    // Merge environments: for variables that differ between branches, use ITE
+    let all_keys: HashSet<String> = then_env
+        .keys()
+        .chain(else_env.keys())
+        .cloned()
+        .collect();
+    for key in all_keys {
+        let then_v = then_env.get(&key);
+        let else_v = else_env.get(&key);
+        if let (Some(tv), Some(ev)) = (then_v, else_v) {
+            let merged = encode_ite(&cond_bool, tv, ev)
+                .map_err(FnContractError::EncodingError)?;
+            env.insert(key, merged);
+        }
+    }
+
+    // Guard branch constraints with the branch condition.
+    // Then-branch constraints hold only when cond is true.
+    // Else-branch constraints hold only when cond is false.
+    // This prevents unreachable-branch facts from polluting the solver.
+    for c in then_constraints {
+        solver_constraints.push(cond_bool.implies(&c));
+    }
+    for c in else_constraints {
+        solver_constraints.push(cond_bool.not().implies(&c));
+    }
+
+    // The value of the if/else expression
+    encode_ite(&cond_bool, &then_val, &else_val).map_err(FnContractError::EncodingError)
+}
+
+/// Create a Z3 variable for a given IR type.
+/// Check that a function call's arguments satisfy the callee's preconditions.
+fn make_z3_var(name: &str, ty: &crate::ir::types::IRType) -> Result<SmtValue, String> {
+    use crate::ir::types::IRType;
+    match ty {
+        IRType::Int | IRType::Id | IRType::String => Ok(smt::int_var(name)),
+        IRType::Bool => Ok(smt::bool_var(name)),
+        IRType::Real | IRType::Float => Ok(smt::real_var(name)),
+        IRType::Enum { .. } => Ok(smt::int_var(name)),
+        IRType::Refinement { base, .. } => make_z3_var(name, base),
+        IRType::Set { .. } | IRType::Seq { .. } | IRType::Map { .. } => {
+            smt::array_var(name, ty)
+        }
+        _ => Err(format!(
+            "unsupported parameter type for fn contract verification: {ty:?}"
+        )),
+    }
+}
+
+/// Encode a pure expression (no entity pools, no time steps) to Z3.
+///
+/// Used for function contract verification where expressions reference
+/// only function parameters and locally bound variables.
+#[allow(clippy::too_many_lines)]
+/// Context for call-site precondition checking inside `encode_pure_expr`.
+///
+/// When present, every `App` expansion checks that the callee's `requires`
+/// hold in the current context (fn_requires + extra_assumptions).
+struct PrecheckCtx<'a> {
+    fn_requires: &'a [IRExpr],
+    extra_assumptions: &'a [Bool],
+    /// The function being verified — recursive self-calls are not expanded
+    /// but instead return a fresh variable constrained by the function's ensures.
+    self_fn: Option<&'a crate::ir::types::IRFunction>,
+}
+
+fn encode_pure_expr(
+    expr: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<SmtValue, String> {
+    encode_pure_expr_inner(expr, env, vctx, defs, None)
+}
+
+fn encode_pure_expr_checked(
+    expr: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: &PrecheckCtx<'_>,
+) -> Result<SmtValue, String> {
+    encode_pure_expr_inner(expr, env, vctx, defs, Some(precheck))
+}
+
+#[allow(clippy::too_many_lines)]
+fn encode_pure_expr_inner(
+    expr: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    match expr {
+        IRExpr::Lit { value, ty, .. } => encode_pure_lit(value, ty),
+
+        IRExpr::Var { name, .. } => {
+            if let Some(val) = env.get(name) {
+                return Ok(val.clone());
+            }
+            if let Some(expanded) = defs.expand_var(name) {
+                return encode_pure_expr_inner(&expanded, env, vctx, defs, precheck);
+            }
+            Err(format!("unbound variable in fn contract: '{name}'"))
+        }
+
+        IRExpr::Ctor {
+            enum_name, ctor, ..
+        } => {
+            let id = vctx.variants.id_of(enum_name, ctor);
+            Ok(smt::int_val(id))
+        }
+
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            let lhs = encode_pure_expr_inner(left, env, vctx, defs, precheck)?;
+            let rhs = encode_pure_expr_inner(right, env, vctx, defs, precheck)?;
+            smt::binop(op, &lhs, &rhs)
+        }
+
+        IRExpr::UnOp { op, operand, .. } => {
+            let val = encode_pure_expr_inner(operand, env, vctx, defs, precheck)?;
+            smt::unop(op, &val)
+        }
+
+        IRExpr::App { .. } => {
+            // Determine if this is a recursive self-call
+            let is_self_call = precheck
+                .and_then(|ctx| ctx.self_fn)
+                .and_then(|sf| {
+                    defenv::decompose_app_chain_name(expr)
+                        .filter(|name| name == &sf.name)
+                })
+                .is_some();
+
+            // Check preconditions for NON-self calls.
+            // Self-call preconditions are checked by Phase 3 (termination VC)
+            // with proper path conditions from the enclosing branch structure.
+            if !is_self_call {
+                if let Some(ctx) = precheck {
+                    if let Some(preconditions) = defs.call_preconditions(expr) {
+                        if !preconditions.is_empty() {
+                            let mut context_bools: Vec<Bool> = Vec::new();
+                            for req in ctx.fn_requires {
+                                let req_val = encode_pure_expr(req, env, vctx, defs)?;
+                                context_bools.push(req_val.to_bool()?);
+                            }
+                            for assumption in ctx.extra_assumptions {
+                                context_bools.push(assumption.clone());
+                            }
+                            for pre in &preconditions {
+                                let pre_val = encode_pure_expr(pre, env, vctx, defs)?;
+                                let pre_bool = pre_val.to_bool()?;
+                                let vc_solver = Solver::new();
+                                for ctx_bool in &context_bools {
+                                    vc_solver.assert(ctx_bool);
+                                }
+                                vc_solver.assert(&pre_bool.not());
+                                if vc_solver.check() != z3::SatResult::Unsat {
+                                    return Err(
+                                        crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Handle recursive self-calls: don't expand, return fresh
+            // variable constrained by the function's ensures (modular reasoning).
+            if let Some(ctx) = precheck {
+                if let Some(self_f) = ctx.self_fn {
+                    if let Some((call_name, call_args)) =
+                        defenv::decompose_app_chain_public(expr)
+                    {
+                        if call_name == self_f.name {
+                            return encode_recursive_self_call(
+                                self_f, &call_args, env, vctx, defs,
+                            );
+                        }
+                    }
+                }
+            }
+            // Expand via DefEnv
+            if let Some(expanded) = defs.expand_app(expr) {
+                return encode_pure_expr_inner(&expanded, env, vctx, defs, precheck);
+            }
+            Err(format!(
+                "could not expand function application in fn contract"
+            ))
+        }
+
+        IRExpr::Let { bindings, body, .. } => {
+            let mut extended_env = env.clone();
+            for b in bindings {
+                let val = encode_pure_expr_inner(&b.expr, &extended_env, vctx, defs, precheck)?;
+                extended_env.insert(b.name.clone(), val);
+            }
+            encode_pure_expr_inner(body, &extended_env, vctx, defs, precheck)
+        }
+
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let cond_val = encode_pure_expr_inner(cond, env, vctx, defs, precheck)?;
+            let cond_bool = cond_val.to_bool()?;
+            let then_val = encode_pure_expr_inner(then_body, env, vctx, defs, precheck)?;
+            match else_body {
+                Some(eb) => {
+                    let else_val = encode_pure_expr_inner(eb, env, vctx, defs, precheck)?;
+                    encode_ite(&cond_bool, &then_val, &else_val)
+                }
+                None => {
+                    let then_bool = then_val.to_bool()?;
+                    Ok(SmtValue::Bool(cond_bool.implies(&then_bool)))
+                }
+            }
+        }
+
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            let scrut_val = encode_pure_expr_inner(scrutinee, env, vctx, defs, precheck)?;
+            encode_pure_match(&scrut_val, arms, env, vctx, defs, precheck)
+        }
+
+        IRExpr::Forall { var, .. } => Err(format!(
+            "quantifiers in fn contracts not yet supported (forall {var})"
+        )),
+
+        IRExpr::Exists { var, .. } => Err(format!(
+            "quantifiers in fn contracts not yet supported (exists {var})"
+        )),
+
+        IRExpr::Index { map, key, .. } => {
+            let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
+            let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
+            let arr = map_val.as_array()?;
+            Ok(SmtValue::Dynamic(arr.select(&key_val.to_dynamic())))
+        }
+
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
+            let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
+            let val = encode_pure_expr_inner(value, env, vctx, defs, precheck)?;
+            let arr = map_val.as_array()?;
+            Ok(SmtValue::Array(
+                arr.store(&key_val.to_dynamic(), &val.to_dynamic()),
+            ))
+        }
+
+        IRExpr::SetLit { elements, ty, .. } => {
+            let elem_ty = match ty {
+                crate::ir::types::IRType::Set { element } => element.as_ref(),
+                _ => return Err("SetLit type is not Set".to_owned()),
+            };
+            let elem_sort = smt::ir_type_to_sort(elem_ty);
+            let false_dyn = smt::default_dynamic(&crate::ir::types::IRType::Bool);
+            let mut arr = z3::ast::Array::const_array(&elem_sort, &false_dyn);
+            let true_dyn =
+                z3::ast::Dynamic::from_ast(&z3::ast::Bool::from_bool(true));
+            for e in elements {
+                let elem = encode_pure_expr_inner(e, env, vctx, defs, precheck)?;
+                arr = arr.store(&elem.to_dynamic(), &true_dyn);
+            }
+            Ok(SmtValue::Array(arr))
+        }
+
+        IRExpr::SeqLit { elements, .. } => {
+            let default = smt::default_dynamic(&crate::ir::types::IRType::Int);
+            let mut arr = z3::ast::Array::const_array(&z3::Sort::int(), &default);
+            for (i, e) in elements.iter().enumerate() {
+                let elem = encode_pure_expr_inner(e, env, vctx, defs, precheck)?;
+                let idx =
+                    z3::ast::Dynamic::from_ast(&z3::ast::Int::from_i64(i as i64));
+                arr = arr.store(&idx, &elem.to_dynamic());
+            }
+            Ok(SmtValue::Array(arr))
+        }
+
+        IRExpr::MapLit { entries, ty, .. } => {
+            let (key_ty, val_ty) = match ty {
+                crate::ir::types::IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
+                _ => return Err("MapLit type is not Map".to_owned()),
+            };
+            let key_sort = smt::ir_type_to_sort(key_ty);
+            let default = smt::default_dynamic(val_ty);
+            let mut arr = z3::ast::Array::const_array(&key_sort, &default);
+            for (k, v) in entries {
+                let key_val = encode_pure_expr_inner(k, env, vctx, defs, precheck)?;
+                let val_val = encode_pure_expr_inner(v, env, vctx, defs, precheck)?;
+                arr = arr.store(&key_val.to_dynamic(), &val_val.to_dynamic());
+            }
+            Ok(SmtValue::Array(arr))
+        }
+
+        IRExpr::Card { .. } => Err("cardinality (#) not supported in fn contracts".to_owned()),
+        IRExpr::SetComp { .. } => {
+            Err("set comprehension not supported in fn contracts".to_owned())
+        }
+        IRExpr::Always { .. } | IRExpr::Eventually { .. } => {
+            Err("temporal operators not allowed in fn contracts".to_owned())
+        }
+        IRExpr::Prime { .. } => Err("prime (next-state) not allowed in fn contracts".to_owned()),
+        IRExpr::Field { .. } => {
+            Err("entity field access not allowed in fn contracts".to_owned())
+        }
+        IRExpr::Lam { .. } => Err("lambda expressions not supported in fn contracts".to_owned()),
+
+        IRExpr::Block { exprs, .. } => {
+            if exprs.is_empty() {
+                return Ok(smt::bool_val(true));
+            }
+            let mut last = smt::bool_val(true);
+            for e in exprs {
+                last = encode_pure_expr_inner(e, env, vctx, defs, precheck)?;
+            }
+            Ok(last)
+        }
+
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            let val = encode_pure_expr_inner(init, env, vctx, defs, precheck)?;
+            let mut extended_env = env.clone();
+            extended_env.insert(name.clone(), val);
+            encode_pure_expr_inner(rest, &extended_env, vctx, defs, precheck)
+        }
+
+        IRExpr::While { .. } => {
+            Err(crate::messages::FN_LOOP_NO_INVARIANT.to_owned())
+        }
+
+        IRExpr::Sorry { .. } => Ok(smt::bool_val(true)),
+        IRExpr::Todo { .. } => Err("todo expression in fn contract body".to_owned()),
+    }
+}
+
+/// Encode a literal value to Z3.
+fn encode_pure_lit(
+    value: &crate::ir::types::LitVal,
+    _ty: &crate::ir::types::IRType,
+) -> Result<SmtValue, String> {
+    use crate::ir::types::LitVal;
+    match value {
+        LitVal::Int { value } => Ok(smt::int_val(*value)),
+        LitVal::Bool { value } => Ok(smt::bool_val(*value)),
+        LitVal::Real { value } => {
+            // Approximate: convert f64 to rational
+            #[allow(clippy::cast_possible_truncation)]
+            let scaled = (*value * 1_000_000.0) as i64;
+            Ok(smt::real_val(scaled, 1_000_000))
+        }
+        LitVal::Float { value } => {
+            #[allow(clippy::cast_possible_truncation)]
+            let scaled = (*value * 1_000_000.0) as i64;
+            Ok(smt::real_val(scaled, 1_000_000))
+        }
+        LitVal::Str { value } => {
+            // Strings are encoded as Int (see smt::ir_type_to_sort).
+            // Each distinct string literal must produce a distinct Int constant.
+            // We use a deterministic hash so "a" != "b" but "a" == "a".
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            // Use the lower 62 bits to stay safely in i64 range
+            let hash = (hasher.finish() & 0x3FFF_FFFF_FFFF_FFFF) as i64;
+            Ok(smt::int_val(hash))
+        }
+    }
+}
+
+/// Encode an if-then-else at the SmtValue level.
+fn encode_ite(
+    cond: &z3::ast::Bool,
+    then_val: &SmtValue,
+    else_val: &SmtValue,
+) -> Result<SmtValue, String> {
+    match (then_val, else_val) {
+        (SmtValue::Int(t), SmtValue::Int(e)) => Ok(SmtValue::Int(cond.ite(t, e))),
+        (SmtValue::Bool(t), SmtValue::Bool(e)) => Ok(SmtValue::Bool(cond.ite(t, e))),
+        (SmtValue::Real(t), SmtValue::Real(e)) => Ok(SmtValue::Real(cond.ite(t, e))),
+        (SmtValue::Array(t), SmtValue::Array(e)) => Ok(SmtValue::Array(cond.ite(t, e))),
+        (SmtValue::Dynamic(t), SmtValue::Dynamic(e)) => Ok(SmtValue::Dynamic(cond.ite(t, e))),
+        // Cross-variant: coerce to Dynamic
+        _ => {
+            let t_dyn = then_val.to_dynamic();
+            let e_dyn = else_val.to_dynamic();
+            Ok(SmtValue::Dynamic(cond.ite(&t_dyn, &e_dyn)))
+        }
+    }
+}
+
+/// Encode a match expression in the pure context.
+///
+/// Each arm is encoded as an ITE chain:
+/// match e { P1 => b1, P2 => b2, _ => b3 }
+/// → ite(P1(e), b1, ite(P2(e), b2, b3))
+fn encode_pure_match(
+    scrut: &SmtValue,
+    arms: &[crate::ir::types::IRMatchArm],
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    if arms.is_empty() {
+        return Err("empty match expression".to_owned());
+    }
+
+    let mut result: Option<SmtValue> = None;
+
+    for arm in arms.iter().rev() {
+        let arm_cond = encode_pattern_cond(scrut, &arm.pattern, env, vctx)?;
+        let mut arm_env = env.clone();
+        bind_pattern_vars(&arm.pattern, scrut, &mut arm_env)?;
+
+        let full_cond = if let Some(guard) = &arm.guard {
+            let guard_val = encode_pure_expr_inner(guard, &arm_env, vctx, defs, precheck)?;
+            let guard_bool = guard_val.to_bool()?;
+            SmtValue::Bool(Bool::and(&[&arm_cond, &guard_bool]))
+        } else {
+            SmtValue::Bool(arm_cond.clone())
+        };
+
+        let body_val = encode_pure_expr_inner(&arm.body, &arm_env, vctx, defs, precheck)?;
+
+        result = Some(match result {
+            Some(else_val) => {
+                let cond_bool = full_cond.to_bool()?;
+                encode_ite(&cond_bool, &body_val, &else_val)?
+            }
+            None => body_val, // last arm = default
+        });
+    }
+
+    result.ok_or_else(|| "empty match".to_owned())
+}
+
+/// Encode a pattern match condition as a Z3 Bool.
+fn encode_pattern_cond(
+    scrut: &SmtValue,
+    pattern: &crate::ir::types::IRPattern,
+    _env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+) -> Result<z3::ast::Bool, String> {
+    use crate::ir::types::IRPattern;
+    match pattern {
+        IRPattern::PWild | IRPattern::PVar { .. } => Ok(Bool::from_bool(true)),
+        IRPattern::PCtor { name, .. } => {
+            let scrut_int = scrut.as_int()?;
+            for ((type_name, variant_name), id) in &vctx.variants.to_id {
+                if variant_name == name || format!("{type_name}::{variant_name}") == *name {
+                    return Ok(scrut_int.eq(z3::ast::Int::from_i64(*id)));
+                }
+            }
+            Err(format!("unknown constructor pattern: {name}"))
+        }
+        IRPattern::POr { left, right } => {
+            let l = encode_pattern_cond(scrut, left, _env, vctx)?;
+            let r = encode_pattern_cond(scrut, right, _env, vctx)?;
+            Ok(Bool::or(&[&l, &r]))
+        }
+    }
+}
+
+/// Bind pattern variables into the environment.
+///
+/// Returns Err if the pattern uses constructor field destructuring, which
+/// requires algebraic datatype encoding not yet available in fn contracts.
+fn bind_pattern_vars(
+    pattern: &crate::ir::types::IRPattern,
+    scrut: &SmtValue,
+    env: &mut HashMap<String, SmtValue>,
+) -> Result<(), String> {
+    use crate::ir::types::IRPattern;
+    match pattern {
+        IRPattern::PVar { name } => {
+            env.insert(name.clone(), scrut.clone());
+            Ok(())
+        }
+        IRPattern::PWild => Ok(()),
+        IRPattern::PCtor { fields, .. } => {
+            if !fields.is_empty() {
+                return Err(crate::messages::FN_CTOR_FIELDS_UNSUPPORTED.to_owned());
+            }
+            Ok(())
+        }
+        IRPattern::POr { left, right } => {
+            bind_pattern_vars(left, scrut, env)?;
+            bind_pattern_vars(right, scrut, env)
+        }
+    }
+}
+
+/// Extract a human-readable value from a Z3 model for counterexample display.
+fn extract_model_value(
+    model: &z3::Model,
+    val: &SmtValue,
+    variants: &context::VariantMap,
+    ty: &crate::ir::types::IRType,
+) -> String {
+    match val {
+        SmtValue::Int(i) => {
+            if let Some(model_val) = model.eval(i, true) {
+                let s = model_val.to_string();
+                // Check if this is an enum — try to decode the int to a variant name
+                if let crate::ir::types::IRType::Enum { .. } = ty {
+                    if let Ok(id) = s.parse::<i64>() {
+                        if let Some((type_name, variant_name)) = variants.name_of(id) {
+                            return format!("@{type_name}::{variant_name}");
+                        }
+                    }
+                }
+                s
+            } else {
+                "?".to_owned()
+            }
+        }
+        SmtValue::Bool(b) => model
+            .eval(b, true)
+            .map_or("?".to_owned(), |v| v.to_string()),
+        SmtValue::Real(r) => model
+            .eval(r, true)
+            .map_or("?".to_owned(), |v| v.to_string()),
+        _ => "?".to_owned(),
+    }
 }
 
 /// Elapsed time in milliseconds, saturating to `u64::MAX`.
@@ -2973,6 +5115,24 @@ fn encode_prop_expr(
         }
     }
     if let IRExpr::App { .. } = expr {
+        // Record context-sensitive precondition obligations.
+        // Each obligation is guarded by the current path condition,
+        // so calls inside `A implies f(0)` only require the precondition
+        // when A is true.
+        if let Some(preconditions) = defs.call_preconditions(expr) {
+            let fn_name = defenv::decompose_app_chain_name(expr)
+                .unwrap_or_else(|| "(unknown)".to_owned());
+            let path_guard = current_path_guard();
+            for pre in &preconditions {
+                if let Ok(pre_bool) = encode_prop_expr(pool, vctx, defs, ctx, pre, step) {
+                    // Obligation: path_guard → precondition
+                    record_prop_precondition_obligation(
+                        path_guard.implies(&pre_bool),
+                        fn_name.clone(),
+                    );
+                }
+            }
+        }
         if let Some(expanded) = defs.expand_app(expr) {
             return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
         }
@@ -3032,7 +5192,19 @@ fn encode_prop_expr(
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" || op == "OpXor" => {
             let l = encode_prop_expr(pool, vctx, defs, ctx, left, step)?;
-            let r = encode_prop_expr(pool, vctx, defs, ctx, right, step)?;
+            // For implication, the RHS is only reachable when the LHS is true.
+            // Push the LHS as a path guard so that precondition obligations
+            // inside the RHS are guarded by it. Use a scope guard to ensure
+            // pop happens even if encoding the RHS returns an error.
+            let is_implies = op == "OpImplies";
+            if is_implies {
+                push_path_guard(l.clone());
+            }
+            let r_result = encode_prop_expr(pool, vctx, defs, ctx, right, step);
+            if is_implies {
+                pop_path_guard();
+            }
+            let r = r_result?;
             match op.as_str() {
                 "OpAnd" => Ok(Bool::and(&[&l, &r])),
                 "OpOr" => Ok(Bool::or(&[&l, &r])),
@@ -3095,6 +5267,20 @@ fn encode_prop_value(
         }
     }
     if let IRExpr::App { .. } = expr {
+        // Record context-sensitive precondition obligations (same as encode_prop_expr)
+        if let Some(preconditions) = defs.call_preconditions(expr) {
+            let fn_name = defenv::decompose_app_chain_name(expr)
+                .unwrap_or_else(|| "(unknown)".to_owned());
+            let path_guard = current_path_guard();
+            for pre in &preconditions {
+                if let Ok(pre_bool) = encode_prop_expr(pool, vctx, defs, ctx, pre, step) {
+                    record_prop_precondition_obligation(
+                        path_guard.implies(&pre_bool),
+                        fn_name.clone(),
+                    );
+                }
+            }
+        }
         if let Some(expanded) = defs.expand_app(expr) {
             return encode_prop_value(pool, vctx, defs, ctx, &expanded, step);
         }
@@ -3509,6 +5695,20 @@ impl std::fmt::Display for VerificationResult {
             }
             VerificationResult::Unprovable { name, hint, .. } => {
                 write!(f, "UNKNOWN {name}: {hint}")
+            }
+            VerificationResult::FnContractProved { name, time_ms, .. } => {
+                write!(f, "PROVED  fn {name} (contract, {time_ms}ms)")
+            }
+            VerificationResult::FnContractFailed {
+                name,
+                counterexample,
+                ..
+            } => {
+                writeln!(f, "FAILED  fn {name} (contract violated)")?;
+                for (param, value) in counterexample {
+                    writeln!(f, "    {param} = {value}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -10056,5 +12256,455 @@ mod tests {
             }
             other => panic!("ForAll multi-apply in scene should produce SceneFail, got: {other}"),
         }
+    }
+
+    // ── Function contract verification tests ────────────────────────
+
+    /// Helper: build an IR program with a single function (no entities/systems).
+    fn make_fn_ir(func: IRFunction) -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![func],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            scenes: vec![],
+        }
+    }
+
+    /// fn double(x: Int): Int ensures result == x + x = x + x
+    /// Postcondition should be proved.
+    #[test]
+    fn fn_contract_simple_ensures_proved() {
+        let func = IRFunction {
+            name: "double".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![],
+            ensures: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "result".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::FnContractProved { name, .. } if name == "double"),
+            "expected FnContractProved, got: {}",
+            results[0]
+        );
+    }
+
+    /// fn bad(x: Int): Int ensures result > x = x
+    /// Body is just x, but ensures says result > x. Should fail.
+    #[test]
+    fn fn_contract_ensures_fails() {
+        let func = IRFunction {
+            name: "bad".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::Var {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![],
+            ensures: vec![IRExpr::BinOp {
+                op: "OpGt".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "result".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Var {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::FnContractFailed { name, counterexample, .. }
+                if name == "bad" && !counterexample.is_empty()),
+            "expected FnContractFailed with counterexample, got: {}",
+            results[0]
+        );
+    }
+
+    /// fn no_contract(x: Int): Int = x + 1
+    /// No ensures clause — should be skipped entirely.
+    #[test]
+    fn fn_contract_no_ensures_skipped() {
+        let func = IRFunction {
+            name: "no_contract".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![],
+            ensures: vec![],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 0, "fn without ensures should produce no results");
+    }
+
+    /// fn clamp(x: Int, lo: Int, hi: Int): Int
+    ///   requires lo <= hi
+    ///   ensures result >= lo
+    ///   ensures result <= hi
+    /// = if x < lo then lo else if x > hi then hi else x
+    #[test]
+    fn fn_contract_with_requires_and_multiple_ensures() {
+        let func = IRFunction {
+            name: "clamp".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Fn {
+                    param: Box::new(IRType::Int),
+                    result: Box::new(IRType::Fn {
+                        param: Box::new(IRType::Int),
+                        result: Box::new(IRType::Int),
+                    }),
+                }),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::Lam {
+                    param: "lo".to_owned(),
+                    param_type: IRType::Int,
+                    body: Box::new(IRExpr::Lam {
+                        param: "hi".to_owned(),
+                        param_type: IRType::Int,
+                        body: Box::new(IRExpr::IfElse {
+                            cond: Box::new(IRExpr::BinOp {
+                                op: "OpLt".to_owned(),
+                                left: Box::new(IRExpr::Var {
+                                    name: "x".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                }),
+                                right: Box::new(IRExpr::Var {
+                                    name: "lo".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                }),
+                                ty: IRType::Bool,
+                                span: None,
+                            }),
+                            then_body: Box::new(IRExpr::Var {
+                                name: "lo".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            else_body: Some(Box::new(IRExpr::IfElse {
+                                cond: Box::new(IRExpr::BinOp {
+                                    op: "OpGt".to_owned(),
+                                    left: Box::new(IRExpr::Var {
+                                        name: "x".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    right: Box::new(IRExpr::Var {
+                                        name: "hi".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    ty: IRType::Bool,
+                                    span: None,
+                                }),
+                                then_body: Box::new(IRExpr::Var {
+                                    name: "hi".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                }),
+                                else_body: Some(Box::new(IRExpr::Var {
+                                    name: "x".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                })),
+                                span: None,
+                            })),
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![IRExpr::BinOp {
+                op: "OpLe".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "lo".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Var {
+                    name: "hi".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }],
+            ensures: vec![
+                IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "result".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "lo".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                IRExpr::BinOp {
+                    op: "OpLe".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "result".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "hi".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+            ],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0], VerificationResult::FnContractProved { name, .. } if name == "clamp"),
+            "expected FnContractProved for clamp, got: {}",
+            results[0]
+        );
+    }
+
+    /// fn only_requires(x: Int): Int requires x > 0 = x
+    /// Has requires but no ensures — should be skipped.
+    #[test]
+    fn fn_contract_only_requires_skipped() {
+        let func = IRFunction {
+            name: "only_requires".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::Var {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![IRExpr::BinOp {
+                op: "OpGt".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "x".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }],
+            ensures: vec![],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let results = verify_all(&ir, &VerifyConfig::default());
+        assert_eq!(results.len(), 0, "fn with only requires should produce no results");
+    }
+
+    /// --no-fn-verify skips fn contract verification.
+    #[test]
+    fn fn_contract_skipped_with_flag() {
+        let func = IRFunction {
+            name: "double".to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            body: IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Int,
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            },
+            prop_target: None,
+            requires: vec![],
+            ensures: vec![IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "result".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }],
+            decreases: None,
+            span: None,
+            file: None,
+        };
+
+        let ir = make_fn_ir(func);
+        let config = VerifyConfig {
+            no_fn_verify: true,
+            ..VerifyConfig::default()
+        };
+        let results = verify_all(&ir, &config);
+        assert_eq!(results.len(), 0, "no_fn_verify should skip fn contract verification");
     }
 }

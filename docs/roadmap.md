@@ -17,40 +17,41 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Pure functions (`fn ... = expr`) | Implemented |
 | Constants (`const`) | Implemented |
 | Match expressions (patterns, guards, or-patterns, wildcards) | Implemented |
-| Verify blocks with bounds (`verify for System[0..N]`) | Syntax implemented, solver backend in progress |
-| Scene blocks (given/when/then) | Syntax implemented, solver backend in progress |
-| Theorem, lemma, and axiom blocks | Syntax implemented, backend not yet connected |
 | Temporal operators (`always`, `eventually`, `implies`) | Implemented |
 | Composition operators (`->`, `&`, `\|`, `\|\|`, `^|`, `\|>`) | Implemented |
 | Quantifiers (`all`, `some`, `no`, `one`, `lone`, `exists`) | Implemented |
 | `theorem` and `axiom` keywords | Implemented |
 | Sorry/todo stubs | Implemented |
 | Compiler type-checking | Implemented |
+| Module system (`module`, `include`, `pub` visibility) | Implemented |
+| Z3 integration (verify, scene, theorem blocks) | Implemented |
+| Tiered verification (induction, IC3/PDR, bounded fallback) | Implemented |
+| Counterexample and witness traces | Implemented |
+| [REPL](repl.md) (interactive specification exploration) | Implemented |
+| [QA language](qa-language.md) (`ask`/`explain`/`assert`) | Implemented |
+| QA scripts (`.qa` files for CI/CD) | Implemented |
+| Function contracts (`requires`/`ensures`/`decreases`) | Verified |
+| Imperative `fn` bodies (`var`, `while`, `if`/`else`) | Verified |
+| Refinement types (`Int { $ > 0 }`, type aliases) | Verified |
+| Termination measures (`decreases` for recursion and loops) | Verified |
+| Call-site precondition checking (modular verification) | Verified |
+| Automatic `prop` verification | Implemented |
+| Circular include/use detection | Implemented |
 
 ## Next (v0.1)
 
 | Feature | Description |
 |---------|-------------|
 | FSM blocks | Authoritative state transition graphs inside entities |
-| Module system | `module` declarations, `include`, `pub` visibility |
-| Z3 integration | SMT solver backend for verify and scene blocks |
-| Tiered verification | Automatic unbounded proofs where possible, bounded fallback |
-| Trace output | Counterexample and witness traces from the solver |
-| [REPL](repl.md) | Interactive specification authoring with live evaluation and mode switching |
-| [QA language](qa-language.md) | Structural query language (`ask`/`explain`/`assert`) for specs |
-| QA scripts | Scriptable structural checks (`.qa` files) for CI/CD |
+| `impl` blocks | Concrete type narrowing for implementation verification |
+| Generic types | Parameterized types (`List[T]`, `Option[T]`) |
+| Traits | Verified behavioral contracts with field bindings |
 
 ## Future (v0.2+)
 
 | Feature | Description |
 |---------|-------------|
-| Imperative `fn` bodies | `var`, `while`, `if`/`else` inside verified functions |
-| Refinement types | `Int{I64 \| $ > 0}` — types with embedded constraints |
-| `impl` blocks | Concrete type narrowing for implementation verification |
-| Termination measures | `decreases` clauses for recursive functions and loops |
-| Generic types | Parameterized types (`List[T]`, `Option[T]`) |
-| Traits | Verified behavioral contracts with field bindings |
 | Proof backends | Export proof obligations to Agda, Lean 4, or Rocq |
 | Simulation mode | Forward-simulate event sequences without the solver |
-| Visual analyzer | Graphical state machine visualization, transition exploration, and interactive simulation |
-| nREPL server | Editor integration for VS Code, Emacs, Neovim via REPL server mode |
+| Visual analyzer | Graphical state machine visualization and interactive simulation |
+| Editor integration | LSP server, Tree-sitter grammar, VS Code/Neovim/Emacs plugins |

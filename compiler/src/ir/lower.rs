@@ -13,6 +13,20 @@ use super::types::{
     LitVal,
 };
 
+/// Unwrap `Ty::Alias` wrappers to get to the underlying type.
+///
+/// `Alias("Positive", Refinement(Int, pred))` → `Refinement(Int, pred)`
+/// This is needed because type aliases like `type Positive = Int { $ > 0 }`
+/// are stored as `Alias("Positive", Refinement(...))`, and the lowering
+/// needs to see the `Refinement` to extract `requires` clauses.
+fn unwrap_alias(ty: &E::Ty) -> &E::Ty {
+    let mut current = ty;
+    while let E::Ty::Alias(_, inner) = current {
+        current = inner;
+    }
+    current
+}
+
 // ── Top-level lowering ───────────────────────────────────────────────
 
 /// Resolve an alias to its canonical name, or return the name as-is.
@@ -169,11 +183,14 @@ fn lower_while_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Option<IRD
 }
 
 fn lower_fn(ef: &E::EFn) -> IRFunction {
-    // Extract refinement predicates from params, strip refinement from types
+    // Extract refinement predicates from params, strip refinement from types.
+    // Unwrap Alias wrappers so that alias-based refinements like `x: Positive`
+    // (where `type Positive = Int { $ > 0 }`) are handled the same as inline
+    // refinements like `x: Int { $ > 0 }`.
     let stripped_params: Vec<(String, E::Ty)> = ef
         .params
         .iter()
-        .map(|(n, t)| match t {
+        .map(|(n, t)| match unwrap_alias(t) {
             E::Ty::Refinement(base, _) => (n.clone(), (**base).clone()),
             _ => (n.clone(), t.clone()),
         })
@@ -182,7 +199,7 @@ fn lower_fn(ef: &E::EFn) -> IRFunction {
         .params
         .iter()
         .filter_map(|(name, ty)| {
-            if let E::Ty::Refinement(_, pred) = ty {
+            if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
                 Some(subst_dollar(name, &lower_expr(pred)))
             } else {
                 None
@@ -392,9 +409,9 @@ fn lower_action(ea: &E::EAction) -> IRTransition {
             .params
             .iter()
             .map(|(pn, pt)| {
-                let base_ty = match pt {
-                    E::Ty::Refinement(base, _) => base,
-                    t => t,
+                let base_ty = match unwrap_alias(pt) {
+                    E::Ty::Refinement(base, _) => base.as_ref(),
+                    _ => pt,
                 };
                 IRTransParam {
                     name: pn.clone(),
@@ -413,7 +430,7 @@ fn extract_param_refinements(params: &[(String, E::Ty)]) -> Vec<E::EExpr> {
     params
         .iter()
         .filter_map(|(name, ty)| {
-            if let E::Ty::Refinement(_, pred) = ty {
+            if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
                 Some(subst_dollar_elab(name, pred))
             } else {
                 None
@@ -522,9 +539,9 @@ fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, Strin
             .params
             .iter()
             .map(|(pn, pt)| {
-                let base_ty = match pt {
-                    E::Ty::Refinement(base, _) => base,
-                    t => t,
+                let base_ty = match unwrap_alias(pt) {
+                    E::Ty::Refinement(base, _) => base.as_ref(),
+                    _ => pt,
                 };
                 IRTransParam {
                     name: pn.clone(),
