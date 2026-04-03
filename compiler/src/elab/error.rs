@@ -17,6 +17,7 @@ pub enum ErrorKind {
     InvalidScope,
     MissingField,
     CyclicDefinition,
+    CyclicImport,
 }
 
 impl ErrorKind {
@@ -33,6 +34,7 @@ impl ErrorKind {
             Self::ParamMismatch => "E008",
             Self::InvalidDefault => "E009",
             Self::MissingField => "E010",
+            Self::CyclicImport => "E011",
         }
     }
 
@@ -44,6 +46,7 @@ impl ErrorKind {
             Self::TypeMismatch => "type mismatch",
             Self::InvalidPrime => "invalid primed variable",
             Self::CyclicDefinition => "cyclic definition",
+            Self::CyclicImport => "circular import dependency",
             Self::InvalidScope => "invalid scope or visibility",
             Self::AmbiguousRef => "ambiguous reference",
             Self::ParamMismatch => "parameter mismatch",
@@ -78,6 +81,11 @@ impl ErrorKind {
             Self::CyclicDefinition => {
                 "A definition refers to itself (directly or transitively), creating \
                  an infinite loop. Break the cycle by restructuring the definitions."
+            }
+            Self::CyclicImport => {
+                "Two or more modules import from each other (directly or transitively), \
+                 creating a circular dependency. Break the cycle by removing one of the \
+                 use declarations or merging the modules."
             }
             Self::InvalidScope => {
                 "A declaration was accessed from a scope where it is not visible. \
@@ -410,6 +418,7 @@ mod tests {
             ErrorKind::TypeMismatch,
             ErrorKind::InvalidPrime,
             ErrorKind::CyclicDefinition,
+            ErrorKind::CyclicImport,
             ErrorKind::InvalidScope,
             ErrorKind::AmbiguousRef,
             ErrorKind::ParamMismatch,

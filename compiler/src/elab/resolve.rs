@@ -83,6 +83,11 @@ fn resolve_use_declarations(env: &mut Env) {
     let known_modules = env.known_modules.clone();
     let root_module = env.module_name.clone();
 
+    // Check for circular use dependencies reachable from the root module.
+    // Scoped so unrelated cycles in other workspace modules don't block
+    // compilation of the target module.
+    check_use_cycles(env, root_module.as_deref());
+
     // Only process use declarations from the current root module.
     // Use declarations from other loaded modules should not affect
     // the root module's namespace.
@@ -209,6 +214,127 @@ fn resolve_use_declarations(env: &mut Env) {
             env.aliases.insert(local_name.clone(), source_name.clone());
         }
     }
+}
+
+/// Check for circular dependencies in `use` declarations between modules.
+///
+/// Builds a module dependency graph (source_module → target_module) from all
+/// use declarations and detects cycles reachable from the root module via DFS.
+/// Scoped to the root so unrelated cycles elsewhere in the workspace don't
+/// block compilation of unaffected modules.
+///
+/// Currently a **warning** — the flat qualified-store resolution does not
+/// recurse and cannot loop. This will be upgraded to an error if/when
+/// transitive re-export semantics are added.
+fn check_use_cycles(env: &mut Env, root_module: Option<&str>) {
+    use std::collections::{BTreeMap as Map, BTreeSet as Set};
+
+    // When root_module is None (directory-load / QA / REPL), no use
+    // declarations are actually materialized (the filter at line ~97
+    // matches source_module == None, which no loaded module has).
+    // Skip the check to stay consistent with resolution behavior.
+    let Some(root) = root_module else {
+        return;
+    };
+
+    // Build adjacency: module → sorted set of modules it imports from.
+    // BTreeMap/BTreeSet for deterministic iteration order.
+    let mut deps: Map<String, Set<String>> = Map::new();
+    let mut first_span: Map<(String, String), (crate::span::Span, Option<String>)> = Map::new();
+
+    for entry in &env.use_decls {
+        let Some(ref src) = entry.source_module else {
+            continue;
+        };
+        let target = match &entry.decl {
+            UseDecl::All { module, .. }
+            | UseDecl::Single { module, .. }
+            | UseDecl::Alias { module, .. }
+            | UseDecl::Items { module, .. } => module,
+        };
+        if src == target {
+            continue; // same-module import, not a cross-module dependency
+        }
+        if !env.known_modules.contains(target) {
+            continue; // unknown module, already warned about elsewhere
+        }
+        deps.entry(src.clone()).or_default().insert(target.clone());
+        let edge_key = (src.clone(), target.clone());
+        if !first_span.contains_key(&edge_key) {
+            let span = match &entry.decl {
+                UseDecl::All { span, .. }
+                | UseDecl::Single { span, .. }
+                | UseDecl::Alias { span, .. }
+                | UseDecl::Items { span, .. } => *span,
+            };
+            first_span.insert(edge_key, (span, entry.source_file.clone()));
+        }
+    }
+
+    if deps.is_empty() {
+        return;
+    }
+
+    // DFS cycle detection — only from the root module.
+    let mut visited = Set::new();
+    let mut in_stack = Set::new();
+
+    if let Some(cycle) = dfs_use_cycle(root, &deps, &mut visited, &mut in_stack, &mut Vec::new()) {
+        let chain = cycle.join(" → ");
+        let (span, file) = if cycle.len() >= 2 {
+            first_span
+                .get(&(cycle[0].clone(), cycle[1].clone()))
+                .cloned()
+                .unwrap_or((crate::span::Span { start: 0, end: 0 }, None))
+        } else {
+            (crate::span::Span { start: 0, end: 0 }, None)
+        };
+        let mut warn = ElabError::with_span(
+            ErrorKind::CyclicImport,
+            format!("circular use dependency: {chain}"),
+            "use declaration creates cycle".to_owned(),
+            span,
+        )
+        .with_help(crate::messages::HELP_CIRCULAR_USE);
+        warn.severity = super::error::Severity::Warning;
+        if let Some(f) = file {
+            warn.file = Some(f);
+        }
+        env.errors.push(warn);
+    }
+}
+
+fn dfs_use_cycle(
+    node: &str,
+    deps: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    visited: &mut std::collections::BTreeSet<String>,
+    in_stack: &mut std::collections::BTreeSet<String>,
+    path: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    visited.insert(node.to_owned());
+    in_stack.insert(node.to_owned());
+    path.push(node.to_owned());
+
+    if let Some(neighbors) = deps.get(node) {
+        // BTreeSet iterates in sorted order — deterministic cycle reporting.
+        for neighbor in neighbors {
+            if in_stack.contains(neighbor.as_str()) {
+                let pos = path.iter().position(|p| p == neighbor).unwrap_or(0);
+                let mut cycle: Vec<String> = path[pos..].to_vec();
+                cycle.push(neighbor.clone());
+                return Some(cycle);
+            }
+            if !visited.contains(neighbor.as_str()) {
+                if let Some(cycle) = dfs_use_cycle(neighbor, deps, visited, in_stack, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+    }
+
+    path.pop();
+    in_stack.remove(node);
+    None
 }
 
 /// Check that an import target exists, belongs to the right module, and is public.
@@ -1078,6 +1204,186 @@ mod tests {
                 .any(|e| e.message.contains("does not export")),
             "use M::N where N doesn't exist should error, got: {:?}",
             env.errors
+        );
+    }
+
+    /// Helper: build a multi-module Env from source strings, add use decls,
+    /// then resolve. Returns the Env for inspection.
+    fn elaborate_multi_module(
+        modules: &[&str],
+        use_edges: &[(&str, &str)],
+        root: Option<&str>,
+    ) -> Env {
+        use crate::elab::env::{Env, UseDeclEntry};
+
+        let mut env = Env::new();
+        for src in modules {
+            let saved = env.module_name.take();
+            env.module_name = None;
+            let tokens = lex::lex(src).unwrap();
+            let mut p = Parser::new(tokens);
+            let prog = p.parse_program().unwrap();
+            collect::collect_into(&mut env, &prog);
+            if saved.is_some() {
+                env.module_name = saved;
+            }
+        }
+
+        let span = crate::span::Span { start: 0, end: 0 };
+        for (src, tgt) in use_edges {
+            env.use_decls.push(UseDeclEntry {
+                decl: crate::ast::UseDecl::All {
+                    module: (*tgt).to_owned(),
+                    span,
+                },
+                source_module: Some((*src).to_owned()),
+                source_file: None,
+            });
+        }
+
+        env.module_name = root.map(str::to_owned);
+        env.build_working_namespace();
+        resolve(&mut env);
+        env
+    }
+
+    #[test]
+    fn circular_use_warned() {
+        // Module A uses B, Module B uses A → cycle warning (not error).
+        let env = elaborate_multi_module(
+            &["module A\npub enum AType = X", "module B\npub enum BType = Y"],
+            &[("A", "B"), ("B", "A")],
+            Some("A"),
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| {
+                e.message.contains("circular use")
+                    && matches!(e.severity, crate::elab::error::Severity::Warning)
+                    && matches!(e.kind, crate::elab::error::ErrorKind::CyclicImport)
+            })
+            .collect();
+        assert!(
+            !cycle_warnings.is_empty(),
+            "circular A↔B use should produce a CyclicImport warning, got: {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn transitive_use_cycle_warned() {
+        // A uses B, B uses C, C uses A → cycle warning.
+        let env = elaborate_multi_module(
+            &[
+                "module A\npub enum AT = X",
+                "module B\npub enum BT = Y",
+                "module C\npub enum CT = Z",
+            ],
+            &[("A", "B"), ("B", "C"), ("C", "A")],
+            Some("A"),
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("circular use"))
+            .collect();
+        assert!(
+            !cycle_warnings.is_empty(),
+            "transitive A→B→C→A cycle should be detected, got: {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn non_circular_use_ok() {
+        // A uses B, C uses B → no cycle.
+        let env = elaborate_multi_module(
+            &[
+                "module A\npub enum AT = X",
+                "module B\npub enum BT = Y",
+                "module C\npub enum CT = Z",
+            ],
+            &[("A", "B"), ("C", "B")],
+            Some("A"),
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("circular use"))
+            .collect();
+        assert!(
+            cycle_warnings.is_empty(),
+            "fan-in should not be a cycle, got: {:?}",
+            cycle_warnings
+        );
+    }
+
+    #[test]
+    fn self_use_ignored() {
+        // Module A uses A::* — same-module, not a cross-module dependency.
+        let env = elaborate_multi_module(
+            &["module A\npub enum AT = X"],
+            &[("A", "A")],
+            Some("A"),
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("circular use"))
+            .collect();
+        assert!(
+            cycle_warnings.is_empty(),
+            "same-module use should not trigger cycle: {:?}",
+            cycle_warnings
+        );
+    }
+
+    #[test]
+    fn unreachable_cycle_not_reported_for_root() {
+        // Modules D↔E form a cycle, but root module C only uses B (no cycle).
+        // The cycle in D↔E should not be reported when compiling C.
+        let env = elaborate_multi_module(
+            &[
+                "module B\npub enum BT = Y",
+                "module C\npub enum CT = Z",
+                "module D\npub enum DT = W",
+                "module E\npub enum ET = V",
+            ],
+            &[("C", "B"), ("D", "E"), ("E", "D")],
+            Some("C"),
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("circular use"))
+            .collect();
+        assert!(
+            cycle_warnings.is_empty(),
+            "cycle in D↔E should not affect root module C, got: {:?}",
+            cycle_warnings
+        );
+    }
+
+    #[test]
+    fn no_root_module_skips_cycle_check() {
+        // In directory-load / QA / REPL mode, root_module is None.
+        // No use decls are materialized in that mode, so the cycle
+        // check should be skipped entirely — even if cycles exist.
+        let env = elaborate_multi_module(
+            &["module A\npub enum AT = X", "module B\npub enum BT = Y"],
+            &[("A", "B"), ("B", "A")],
+            None, // no root module — directory-load mode
+        );
+        let cycle_warnings: Vec<_> = env
+            .errors
+            .iter()
+            .filter(|e| e.message.contains("circular use"))
+            .collect();
+        assert!(
+            cycle_warnings.is_empty(),
+            "no-root mode should skip cycle check entirely, got: {:?}",
+            cycle_warnings
         );
     }
 

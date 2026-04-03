@@ -808,3 +808,87 @@ fn qa_hypothetical_merges_modules() {
         result.output
     );
 }
+
+// ── Circular include integration tests ──────────────────────────────
+
+#[test]
+fn circular_include_produces_load_error() {
+    // Multi-file: a.abide includes b.abide, b.abide includes a.abide → CircularInclude
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    let a_path = dir.path().join("a.abide");
+    std::fs::write(&a_path, "include \"b.abide\"\nenum AType = X").unwrap();
+
+    let b_path = dir.path().join("b.abide");
+    std::fs::write(&b_path, "include \"a.abide\"\nenum BType = Y").unwrap();
+
+    let (env, load_errors, _) = loader::load_files(&[a_path]);
+    assert!(load_errors.is_empty(), "top-level should succeed");
+
+    let circular: Vec<_> = env
+        .include_load_errors
+        .iter()
+        .filter(|e| matches!(e, loader::LoadError::CircularInclude { .. }))
+        .collect();
+    assert_eq!(
+        circular.len(),
+        1,
+        "should detect exactly one circular include: {:?}",
+        env.include_load_errors
+    );
+}
+
+#[test]
+fn circular_include_cli_exits_nonzero() {
+    // The CLI should exit with non-zero when include errors are present.
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    let a_path = dir.path().join("a.abide");
+    std::fs::write(&a_path, "include \"b.abide\"").unwrap();
+
+    let b_path = dir.path().join("b.abide");
+    std::fs::write(&b_path, "include \"a.abide\"").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("elaborate")
+        .arg(&a_path)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "CLI should exit non-zero for circular include"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("circular include"),
+        "stderr should mention circular include, got: {stderr}"
+    );
+}
+
+#[test]
+fn circular_include_exits_nonzero_even_with_warnings() {
+    // Regression: include cycle + unrelated warning (e.g., unknown module in use)
+    // must still exit non-zero. Previously the synthetic hard error was only
+    // injected when elab_errors was empty, so warnings prevented it.
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    let a_path = dir.path().join("a.abide");
+    std::fs::write(
+        &a_path,
+        "module Test\ninclude \"b.abide\"\nuse Missing::*\nenum A = X",
+    )
+    .unwrap();
+
+    let b_path = dir.path().join("b.abide");
+    std::fs::write(&b_path, "include \"a.abide\"\nenum B = Y").unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("elaborate")
+        .arg(&a_path)
+        .output()
+        .expect("run CLI");
+    assert!(
+        !output.status.success(),
+        "CLI should exit non-zero for circular include even when warnings are present"
+    );
+}

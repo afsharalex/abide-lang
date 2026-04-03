@@ -163,3 +163,13 @@ pub const THEOREM_BASE_UNKNOWN: &str = "Z3 returned unknown when checking base c
 
 /// Theorem proving: inductive step Z3 unknown.
 pub const THEOREM_STEP_UNKNOWN: &str = "Z3 returned unknown when checking inductive step";
+
+// ── Loader messages ─────────────────────────────────────────────────
+
+/// Help for circular include errors.
+pub const HELP_CIRCULAR_INCLUDE: &str =
+    "break the cycle by removing one of the include directives or restructuring into separate modules";
+
+/// Help for circular use dependency errors.
+pub const HELP_CIRCULAR_USE: &str =
+    "break the cycle by removing one of the use declarations or merging the modules";

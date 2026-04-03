@@ -464,15 +464,15 @@ fn load_and_elaborate(
     let had_include_errors = !env.include_load_errors.is_empty();
     let (result, mut elab_errors) = abide::elab::elaborate_env(env);
     if had_include_errors {
-        // Ensure the caller sees a non-empty error list so it exits with failure
-        // even if elaboration itself produced no errors.
-        if elab_errors.is_empty() {
-            elab_errors.push(abide::elab::error::ElabError::new(
-                abide::elab::error::ErrorKind::UndefinedRef,
-                "one or more included files failed to load (see above)",
-                String::new(),
-            ));
-        }
+        // Always inject a hard error when include files failed to load,
+        // regardless of whether elaboration produced its own errors/warnings.
+        // This ensures the CLI exits non-zero even if the only elaboration
+        // diagnostics are warnings (which don't trigger has_errors).
+        elab_errors.push(abide::elab::error::ElabError::new(
+            abide::elab::error::ErrorKind::UndefinedRef,
+            "one or more included files failed to load (see above)",
+            String::new(),
+        ));
     }
     Some((result, elab_errors))
 }
@@ -508,6 +508,18 @@ fn render_load_error(err: &abide::loader::LoadError, sources: &[(String, String)
         }
         abide::loader::LoadError::Io { path, error } => {
             let report = miette::miette!("failed to read {}: {error}", path.display());
+            eprintln!("{report:?}");
+        }
+        abide::loader::LoadError::CircularInclude { chain } => {
+            let names: Vec<String> = chain
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            let report = miette::miette!(
+                help = abide::messages::HELP_CIRCULAR_INCLUDE,
+                "circular include detected: {}",
+                names.join(" → ")
+            );
             eprintln!("{report:?}");
         }
     }

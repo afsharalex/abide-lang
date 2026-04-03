@@ -26,12 +26,15 @@ use crate::elab::env::Env;
 pub fn load_files(paths: &[PathBuf]) -> (Env, Vec<LoadError>, Vec<PathBuf>) {
     let mut env = Env::new();
     let mut visited = HashSet::new();
+    let mut include_stack = Vec::new();
     let mut errors = Vec::new();
 
     for path in paths {
         match canonicalize(path) {
             Ok(canonical) => {
-                if let Err(e) = load_file_into(&mut env, &canonical, &mut visited, None) {
+                if let Err(e) =
+                    load_file_into(&mut env, &canonical, &mut visited, &mut include_stack, None)
+                {
                     errors.push(e);
                 }
             }
@@ -47,17 +50,41 @@ pub fn load_files(paths: &[PathBuf]) -> (Env, Vec<LoadError>, Vec<PathBuf>) {
 ///
 /// `parent_module`: if Some, this file was included by a file declaring that module.
 /// Included files without their own `module` declaration inherit the parent's module.
+///
+/// `include_stack` tracks the current chain of files being processed (for cycle
+/// detection). `visited` tracks all files ever loaded (for diamond dedup).
+/// A cycle is a back-edge in the include stack; a diamond is the same file
+/// reached via different paths — only cycles are errors.
 #[allow(clippy::too_many_lines)]
 fn load_file_into(
     env: &mut Env,
     path: &Path,
     visited: &mut HashSet<PathBuf>,
+    include_stack: &mut Vec<PathBuf>,
     parent_module: Option<&str>,
 ) -> Result<(), LoadError> {
     if !visited.insert(path.to_owned()) {
         return Ok(());
     }
 
+    // Push before, pop after — the closure ensures cleanup on all exit
+    // paths (? returns, early returns, normal completion).
+    include_stack.push(path.to_owned());
+    let result = load_file_inner(env, path, visited, include_stack, parent_module);
+    include_stack.pop();
+    result
+}
+
+/// Inner logic for `load_file_into`, separated so the caller can
+/// guarantee push/pop around every exit path.
+#[allow(clippy::too_many_lines)]
+fn load_file_inner(
+    env: &mut Env,
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    include_stack: &mut Vec<PathBuf>,
+    parent_module: Option<&str>,
+) -> Result<(), LoadError> {
     let src = std::fs::read_to_string(path).map_err(|e| LoadError::Io {
         path: path.to_owned(),
         error: e.to_string(),
@@ -140,12 +167,33 @@ fn load_file_into(
         let resolved = base_dir.join(inc_path);
         match canonicalize(&resolved) {
             Ok(canonical) => {
+                // Check for circular include: if the canonical path is already
+                // on the include stack, we have a cycle (A → B → A).
+                // This is distinct from diamond dedup (visited set) — diamonds
+                // are fine, cycles are errors.
+                if include_stack.contains(&canonical) {
+                    let mut chain: Vec<PathBuf> = include_stack
+                        .iter()
+                        .skip_while(|p| **p != canonical)
+                        .cloned()
+                        .collect();
+                    chain.push(canonical);
+                    env.include_load_errors
+                        .push(LoadError::CircularInclude { chain });
+                    continue;
+                }
                 if visited.contains(&canonical) {
                     continue;
                 }
                 // Included files inherit this file's module.
                 // Don't short-circuit on error — continue processing sibling includes.
-                if let Err(e) = load_file_into(env, &canonical, visited, file_module.as_deref()) {
+                if let Err(e) = load_file_into(
+                    env,
+                    &canonical,
+                    visited,
+                    include_stack,
+                    file_module.as_deref(),
+                ) {
                     // Preserve all include load errors as structured LoadError
                     // for miette rendering (parse, lex, and IO errors alike).
                     env.include_load_errors.push(e);
@@ -188,12 +236,226 @@ pub enum LoadError {
         path: PathBuf,
         errors: Vec<crate::diagnostic::ParseError>,
     },
+
+    #[error("{}", format_circular_chain(chain))]
+    CircularInclude { chain: Vec<PathBuf> },
+}
+
+fn format_circular_chain(chain: &[PathBuf]) -> String {
+    let names: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
+    format!("circular include detected: {}", names.join(" → "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn circular_include_detected() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let a_path = dir.path().join("a.abide");
+        let mut a = std::fs::File::create(&a_path).unwrap();
+        writeln!(a, "include \"b.abide\"").unwrap();
+
+        let b_path = dir.path().join("b.abide");
+        let mut b = std::fs::File::create(&b_path).unwrap();
+        writeln!(b, "include \"a.abide\"").unwrap();
+
+        let (env, load_errors, _) = load_files(&[a_path]);
+        assert!(load_errors.is_empty(), "top-level should succeed");
+
+        let circular: Vec<_> = env
+            .include_load_errors
+            .iter()
+            .filter(|e| matches!(e, LoadError::CircularInclude { .. }))
+            .collect();
+        assert_eq!(
+            circular.len(),
+            1,
+            "should detect exactly one circular include: {:?}",
+            env.include_load_errors
+        );
+
+        if let LoadError::CircularInclude { chain } = &circular[0] {
+            assert!(
+                chain.len() >= 2,
+                "chain should have at least 2 entries (cycle): {chain:?}"
+            );
+            // Chain should end where it started
+            assert_eq!(
+                chain.first().unwrap().file_name(),
+                chain.last().unwrap().file_name(),
+                "chain should be a cycle"
+            );
+        }
+    }
+
+    #[test]
+    fn self_include_detected() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let path = dir.path().join("self.abide");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "include \"self.abide\"").unwrap();
+
+        let (env, load_errors, _) = load_files(&[path]);
+        assert!(load_errors.is_empty());
+
+        let circular: Vec<_> = env
+            .include_load_errors
+            .iter()
+            .filter(|e| matches!(e, LoadError::CircularInclude { .. }))
+            .collect();
+        assert_eq!(circular.len(), 1, "self-include should be detected");
+    }
+
+    #[test]
+    fn deep_cycle_detected() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let a_path = dir.path().join("a.abide");
+        let mut a = std::fs::File::create(&a_path).unwrap();
+        writeln!(a, "include \"b.abide\"").unwrap();
+
+        let b_path = dir.path().join("b.abide");
+        let mut b = std::fs::File::create(&b_path).unwrap();
+        writeln!(b, "include \"c.abide\"").unwrap();
+
+        let c_path = dir.path().join("c.abide");
+        let mut c = std::fs::File::create(&c_path).unwrap();
+        writeln!(c, "include \"a.abide\"").unwrap();
+
+        let (env, load_errors, _) = load_files(&[a_path]);
+        assert!(load_errors.is_empty());
+
+        let circular: Vec<_> = env
+            .include_load_errors
+            .iter()
+            .filter(|e| matches!(e, LoadError::CircularInclude { .. }))
+            .collect();
+        assert_eq!(circular.len(), 1, "3-file cycle should be detected");
+
+        if let LoadError::CircularInclude { chain } = &circular[0] {
+            assert!(
+                chain.len() >= 3,
+                "chain should have at least 3 entries: {chain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diamond_include_not_error() {
+        // A includes B and C; both B and C include D.
+        // This is a diamond (not a cycle) — should not error.
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let d_path = dir.path().join("d.abide");
+        let mut d = std::fs::File::create(&d_path).unwrap();
+        writeln!(d, "enum Shared = X | Y").unwrap();
+
+        let b_path = dir.path().join("b.abide");
+        let mut b = std::fs::File::create(&b_path).unwrap();
+        writeln!(b, "include \"d.abide\"").unwrap();
+
+        let c_path = dir.path().join("c.abide");
+        let mut c = std::fs::File::create(&c_path).unwrap();
+        writeln!(c, "include \"d.abide\"").unwrap();
+
+        let a_path = dir.path().join("a.abide");
+        let mut a = std::fs::File::create(&a_path).unwrap();
+        writeln!(a, "include \"b.abide\"").unwrap();
+        writeln!(a, "include \"c.abide\"").unwrap();
+
+        let (env, load_errors, _) = load_files(&[a_path]);
+        assert!(load_errors.is_empty());
+        assert!(
+            env.include_load_errors.is_empty(),
+            "diamond should not produce errors: {:?}",
+            env.include_load_errors
+        );
+    }
+
+    #[test]
+    fn cycle_does_not_block_siblings() {
+        // A includes B (which cycles back to A) and C (valid).
+        // C should still load successfully.
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let a_path = dir.path().join("a.abide");
+        let mut a = std::fs::File::create(&a_path).unwrap();
+        writeln!(a, "include \"b.abide\"").unwrap();
+        writeln!(a, "include \"c.abide\"").unwrap();
+
+        let b_path = dir.path().join("b.abide");
+        let mut b = std::fs::File::create(&b_path).unwrap();
+        writeln!(b, "include \"a.abide\"").unwrap();
+
+        let c_path = dir.path().join("c.abide");
+        let mut c = std::fs::File::create(&c_path).unwrap();
+        writeln!(c, "enum GoodType = A | B").unwrap();
+
+        let (env, load_errors, _) = load_files(&[a_path]);
+        assert!(load_errors.is_empty());
+
+        // Should have one circular error from B → A
+        let circular: Vec<_> = env
+            .include_load_errors
+            .iter()
+            .filter(|e| matches!(e, LoadError::CircularInclude { .. }))
+            .collect();
+        assert_eq!(circular.len(), 1, "should detect cycle through B");
+
+        // C should still have been loaded
+        let has_good_type = env.types.values().any(|ty| {
+            if let crate::elab::types::Ty::Enum(name, _) = ty {
+                name == "GoodType"
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_good_type,
+            "good sibling C should still load despite cycle through B"
+        );
+    }
+
+    #[test]
+    fn failed_include_does_not_poison_stack() {
+        // A includes bad.abide (parse error) and then includes good.abide
+        // which also includes bad.abide. The failed load of bad.abide must
+        // not leave it on the include stack, otherwise good.abide's include
+        // of bad.abide would be falsely reported as a circular include.
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let bad_path = dir.path().join("bad.abide");
+        let mut bad = std::fs::File::create(&bad_path).unwrap();
+        writeln!(bad, "import \"broken\"").unwrap(); // parse error
+
+        let good_path = dir.path().join("good.abide");
+        let mut good = std::fs::File::create(&good_path).unwrap();
+        writeln!(good, "include \"bad.abide\"").unwrap();
+
+        let main_path = dir.path().join("main.abide");
+        let mut main_f = std::fs::File::create(&main_path).unwrap();
+        writeln!(main_f, "include \"bad.abide\"").unwrap();
+        writeln!(main_f, "include \"good.abide\"").unwrap();
+
+        let (env, load_errors, _) = load_files(&[main_path]);
+        assert!(load_errors.is_empty(), "top-level should succeed");
+
+        // Should have parse errors for bad.abide but NO circular include errors
+        let circular: Vec<_> = env
+            .include_load_errors
+            .iter()
+            .filter(|e| matches!(e, LoadError::CircularInclude { .. }))
+            .collect();
+        assert!(
+            circular.is_empty(),
+            "failed include must not cause false circular detection: {circular:?}"
+        );
+    }
 
     #[test]
     fn bad_include_does_not_block_good_sibling() {
