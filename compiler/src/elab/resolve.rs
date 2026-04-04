@@ -19,6 +19,8 @@ struct Ctx {
     entity_canonical: HashMap<String, String>,
     /// Alias → canonical name map for rewriting aliased references.
     aliases: HashMap<String, String>,
+    /// Constructor field info for enums with record variants.
+    variant_fields: HashMap<String, Vec<(String, Vec<(String, Ty)>)>>,
 }
 
 impl Ctx {
@@ -32,6 +34,7 @@ impl Ctx {
             types: env.types.clone(),
             entity_canonical,
             aliases: env.aliases.clone(),
+            variant_fields: env.variant_fields.clone(),
         }
     }
 
@@ -858,6 +861,64 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
         }
         EExpr::Assert(ty, e, sp) => {
             EExpr::Assert(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::Assume(ty, e, sp) => {
+            EExpr::Assume(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::CtorRecord(ty, qual, name, fields, sp) => {
+            // Resolve the type: find which enum contains this constructor
+            let resolved_ty = if matches!(ty, Ty::Unresolved(_)) {
+                if let Some(q) = qual {
+                    // Qualified: @Enum::Ctor — look up the enum directly
+                    ctx.types.get(q.as_str()).cloned().unwrap_or_else(|| ty.clone())
+                } else {
+                    // Unqualified: @Ctor { field: val, ... }
+                    // Disambiguate by matching user-provided field names against
+                    // each candidate enum's declared fields. This avoids HashMap
+                    // iteration order nondeterminism when multiple enums share
+                    // a constructor name.
+                    let user_field_names: Vec<&str> =
+                        fields.iter().map(|(n, _)| n.as_str()).collect();
+                    let mut candidates: Vec<&Ty> = Vec::new();
+                    for t in ctx.types.values() {
+                        if let Ty::Enum(en, ctors) = t {
+                            if ctors.contains(name) {
+                                // Check if declared fields match user fields
+                                if let Some(variants) = ctx.variant_fields.get(en.as_str()) {
+                                    for (vname, vfields) in variants {
+                                        if vname == name {
+                                            let decl_names: Vec<&str> =
+                                                vfields.iter().map(|(n, _)| n.as_str()).collect();
+                                            if user_field_names.iter().all(|f| decl_names.contains(f)) {
+                                                candidates.push(t);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // No field info — fieldless enum, include as candidate
+                                    candidates.push(t);
+                                }
+                            }
+                        }
+                    }
+                    if candidates.len() == 1 {
+                        candidates[0].clone()
+                    } else {
+                        // Zero or multiple matches — leave unresolved, check phase handles it
+                        ty.clone()
+                    }
+                }
+            } else {
+                ty.clone()
+            };
+            EExpr::CtorRecord(
+                resolved_ty,
+                qual.clone(),
+                name.clone(),
+                fields.iter().map(|(n, e)| (n.clone(), resolve_expr(ctx, bound, e))).collect(),
+                *sp,
+            )
         }
         EExpr::Assign(ty, lhs, rhs, sp) => EExpr::Assign(
             ty.clone(),

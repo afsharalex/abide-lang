@@ -112,6 +112,10 @@ pub const HELP_MUTUAL_FN_DECREASES: &str = "add 'decreases' clauses to all funct
 pub const HELP_CIRCULAR_DEFINITION: &str =
     "preds and props cannot be recursive — break the cycle by inlining or restructuring";
 
+/// Help for ambiguous constructor records.
+pub const HELP_AMBIGUOUS_CTOR: &str =
+    "use a qualified form like @Enum::Ctor { ... } to disambiguate";
+
 // ── Verification messages ────────────────────────────────────────────
 
 /// Scene check: unsatisfiable scenario.
@@ -189,6 +193,13 @@ pub const FN_CALL_PRECONDITION_FAILED: &str =
 /// Recursive function termination could not be proved.
 pub const FN_TERMINATION_FAILED: &str =
     "recursive call does not provably decrease the termination measure";
+
+/// Assertion in fn body failed — could not prove it holds at that point.
+pub const FN_ASSERT_FAILED: &str = "assertion may not hold at this point in the function body";
+
+/// Assume warning — condition not verified, user takes responsibility.
+pub const FN_ASSUME_WARNING: &str =
+    "assume: condition not verified — user asserts this holds without proof";
 
 /// Constructor field destructuring not supported.
 pub const FN_CTOR_FIELDS_UNSUPPORTED: &str =

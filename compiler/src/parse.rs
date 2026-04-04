@@ -650,6 +650,29 @@ impl Parser {
         })
     }
 
+    /// Check if the current position starts a constructor record: `{ Name : ...`.
+    /// Distinguished from a block body by the `Name :` pattern after `{`.
+    fn is_ctor_record_start(&self) -> bool {
+        matches!(self.peek_at(0), Some(Token::LBrace))
+            && matches!(self.peek_at(1), Some(Token::Name(_)))
+            && matches!(self.peek_at(2), Some(Token::Colon))
+    }
+
+    /// Parse constructor field arguments: `{ field: expr, field: expr, ... }`
+    fn parse_ctor_fields(&mut self) -> Result<(Vec<(String, Expr)>, Span), ParseError> {
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
+            let (name, _) = self.expect_name()?;
+            self.expect(&Token::Colon)?;
+            let value = self.expr()?;
+            fields.push((name, value));
+            self.eat(&Token::Comma);
+        }
+        let end = self.expect(&Token::RBrace)?;
+        Ok((fields, end))
+    }
+
     // ── Type References ──────────────────────────────────────────────
 
     fn type_ref(&mut self) -> Result<TypeRef, ParseError> {
@@ -1925,6 +1948,14 @@ impl Parser {
                     span: start.merge(self.prev_span()),
                 })
             }
+            Some(Token::Assume) if min_bp <= BP_PREFIX_EXPR => {
+                self.advance();
+                let body = self.expr_bp(BP_PREFIX_EXPR)?;
+                Ok(Expr {
+                    kind: ExprKind::AssumeExpr(Box::new(body)),
+                    span: start.merge(self.prev_span()),
+                })
+            }
             Some(
                 Token::All | Token::Exists | Token::Some | Token::No | Token::One | Token::Lone,
             ) if min_bp <= BP_PREFIX_EXPR => self.parse_quantifier(),
@@ -2128,6 +2159,7 @@ impl Parser {
                 })
             }
             // State atoms: @Name, @Name::Name, @Name::Name::Name
+            // With optional record fields: @Name { field: expr, ... }
             Some(Token::At) => {
                 self.advance();
                 let (n1, n1_span) = self.expect_name()?;
@@ -2139,12 +2171,24 @@ impl Parser {
                             kind: ExprKind::State3(n1, n2, n3),
                             span: start.merge(n3_span),
                         })
+                    } else if self.is_ctor_record_start() {
+                        let (fields, end) = self.parse_ctor_fields()?;
+                        Ok(Expr {
+                            kind: ExprKind::State2Record(n1, n2, fields),
+                            span: start.merge(end),
+                        })
                     } else {
                         Ok(Expr {
                             kind: ExprKind::State2(n1, n2),
                             span: start.merge(n2_span),
                         })
                     }
+                } else if self.is_ctor_record_start() {
+                    let (fields, end) = self.parse_ctor_fields()?;
+                    Ok(Expr {
+                        kind: ExprKind::State1Record(n1, fields),
+                        span: start.merge(end),
+                    })
                 } else {
                     Ok(Expr {
                         kind: ExprKind::State1(n1),

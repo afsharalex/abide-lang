@@ -35,6 +35,13 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Refinement types (`Int { $ > 0 }`, type aliases) | Verified |
 | Termination measures (`decreases` for recursion and loops) | Verified |
 | Call-site precondition checking (modular verification) | Verified |
+| `assert`/`assume` in fn bodies (VC generation, ADMITTED diagnostic) | Verified |
+| `sorry` diagnostic (ADMITTED, skips all verification) | Verified |
+| Quantifiers in fn contracts (`all`/`exists` over Int/Bool/Real/Enum/Refinement) | Verified |
+| Set cardinality (`#Set(...)`, `#Seq(...)`) with semantic dedup | Verified |
+| Set comprehension in fn contracts (`{ x: T where P(x) }`) | Verified |
+| Constructor field destructuring (Z3 ADTs, `@Ctor { field: val }`) | Verified |
+| Lambda expressions in fn contracts (currying, partial application) | Verified |
 | Automatic `prop` verification | Implemented |
 | Circular include/use detection | Implemented |
 

@@ -226,6 +226,45 @@ fn gcd(a: Int, b: Int): Int
 
 Refinement types provide a shorthand — `fn f(x: Int { $ > 0 })` is equivalent to `fn f(x: Int) requires x > 0`, and type aliases like `type Positive = Int { $ > 0 }` work the same way.
 
+Use `assert` and `assume` inside function bodies for intermediate verification:
+
+```abide
+fn checked_divide(a: Int, b: Int): Int
+  requires b != 0
+{
+  assert b != 0    // verified from requires, then available as fact
+  a / b
+}
+```
+
+Use `sorry` to admit a function's proof obligation while you work on it:
+
+```abide
+fn complex_algorithm(x: Int): Int
+  ensures result > 0
+{
+  sorry    // reports ADMITTED — skips verification
+}
+```
+
+Quantifiers, constructor patterns, and lambdas work in function contracts:
+
+```abide
+enum Option = None | Some { value: Int }
+
+fn get_or(o: Option, d: Int): Int
+  ensures match o {
+    Some { value: v } => result == v
+    None => result == d
+  }
+{
+  match o {
+    Some { value: v } => v
+    None => d
+  }
+}
+```
+
 ## Next Steps
 
 - [Syntax at a Glance](syntax-at-a-glance.md) — quick reference for all constructs

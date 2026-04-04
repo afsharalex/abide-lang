@@ -20,7 +20,7 @@ pub enum IRType {
     Float,
     Enum {
         name: std::string::String,
-        constructors: Vec<std::string::String>,
+        variants: Vec<IRVariant>,
     },
     Record {
         name: std::string::String,
@@ -59,6 +59,50 @@ pub struct IRRecordField {
     pub ty: IRType,
 }
 
+/// A constructor variant of an enum type.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRVariant {
+    pub name: std::string::String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<IRVariantField>,
+}
+
+/// A field within a constructor variant.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRVariantField {
+    pub name: std::string::String,
+    #[serde(rename = "type")]
+    pub ty: IRType,
+}
+
+impl IRVariant {
+    /// Create a fieldless variant (simple enum constructor).
+    pub fn simple(name: impl Into<std::string::String>) -> Self {
+        Self {
+            name: name.into(),
+            fields: vec![],
+        }
+    }
+}
+
+impl IRType {
+    /// For Enum types, return variant names as strings (convenience accessor).
+    pub fn enum_variant_names(&self) -> Vec<&str> {
+        match self {
+            IRType::Enum { variants, .. } => variants.iter().map(|v| v.name.as_str()).collect(),
+            _ => vec![],
+        }
+    }
+
+    /// For Enum types, check if any variant has fields.
+    pub fn has_variant_fields(&self) -> bool {
+        match self {
+            IRType::Enum { variants, .. } => variants.iter().any(|v| !v.fields.is_empty()),
+            _ => false,
+        }
+    }
+}
+
 // ── Expressions ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -82,6 +126,10 @@ pub enum IRExpr {
         #[serde(rename = "enum")]
         enum_name: std::string::String,
         ctor: std::string::String,
+        /// Field arguments for record constructors (e.g., `@Some { value: 1 }`).
+        /// Empty for fieldless constructors.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        args: Vec<(std::string::String, IRExpr)>,
         #[serde(skip)]
         span: Option<Span>,
     },
@@ -226,6 +274,20 @@ pub enum IRExpr {
         span: Option<Span>,
     },
     Todo {
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    /// `assert expr` — verification condition: prove expr holds at this point.
+    /// After the assert, expr can be assumed true for subsequent code.
+    Assert {
+        expr: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    /// `assume expr` — add expr as an assumption without proof.
+    /// The user takes responsibility for its truth. Emits a warning.
+    Assume {
+        expr: Box<IRExpr>,
         #[serde(skip)]
         span: Option<Span>,
     },

@@ -84,7 +84,9 @@ fn checked_divide(a: Int, b: Int): Int
   a / b
 }
 
-fn with_assertion(x: Int): Int {
+fn with_assertion(x: Int): Int
+  requires x > 0
+{
   assert x > 0
   x + 1
 }

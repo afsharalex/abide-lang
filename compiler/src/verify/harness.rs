@@ -1936,7 +1936,7 @@ fn encode_slot_literal(lit: &LitVal) -> SmtValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IRField, IRUpdate};
+    use crate::ir::types::{IRField, IRUpdate, IRVariant};
     use z3::Solver;
 
     fn make_order_entity() -> IREntity {
@@ -1952,11 +1952,11 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "OrderStatus".to_owned(),
-                        constructors: vec![
-                            "Pending".to_owned(),
-                            "Confirmed".to_owned(),
-                            "Shipped".to_owned(),
-                        ],
+                        variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
+                ],
                     },
                     default: None,
                 },
@@ -1981,7 +1981,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -1993,7 +1993,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -2007,6 +2007,7 @@ mod tests {
             variants: super::super::context::VariantMap::new(),
             enum_ranges: HashMap::new(),
             entities: HashMap::new(),
+            adt_sorts: HashMap::new(),
         };
         let (min, max) = vctx.variants.register_enum(
             "OrderStatus",
@@ -2232,6 +2233,7 @@ mod tests {
             variants: super::super::context::VariantMap::new(),
             enum_ranges: HashMap::new(),
             entities: HashMap::new(),
+            adt_sorts: HashMap::new(),
         }
     }
 

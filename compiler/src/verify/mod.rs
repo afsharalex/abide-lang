@@ -86,6 +86,15 @@ pub enum VerificationResult {
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
+    /// Function contract admitted — body contains `assume` or `sorry`.
+    /// Not a failure (exit code 0), but visually distinct from PROVED.
+    FnContractAdmitted {
+        name: String,
+        reason: String,
+        time_ms: u64,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
     /// Function contract (ensures) violated — counterexample found.
     FnContractFailed {
         name: String,
@@ -187,6 +196,19 @@ impl VerificationResult {
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
+            Self::FnContractAdmitted {
+                name,
+                reason,
+                time_ms,
+                span,
+                file,
+            } => Self::FnContractAdmitted {
+                name,
+                reason,
+                time_ms,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
             Self::FnContractFailed {
                 name,
                 counterexample,
@@ -222,6 +244,7 @@ impl VerificationResult {
             | Self::SceneFail { span, .. }
             | Self::Unprovable { span, .. }
             | Self::FnContractProved { span, .. }
+            | Self::FnContractAdmitted { span, .. }
             | Self::FnContractFailed { span, .. } => *span,
         }
     }
@@ -236,6 +259,7 @@ impl VerificationResult {
             | Self::SceneFail { file, .. }
             | Self::Unprovable { file, .. }
             | Self::FnContractProved { file, .. }
+            | Self::FnContractAdmitted { file, .. }
             | Self::FnContractFailed { file, .. } => file.as_deref(),
         }
     }
@@ -481,6 +505,32 @@ fn verify_fn_contracts(
             continue;
         }
 
+        // Skip fns without ensures clauses AND without assert/assume/sorry.
+        // Functions with assert must be verified even without ensures — the
+        // assert itself is a verification obligation. Functions with sorry
+        // should report ADMITTED even without ensures.
+        let has_asserts = body_contains_assert(&func.body);
+        let has_sorry = body_contains_sorry(&func.body);
+        if func.ensures.is_empty() && !has_asserts && !has_sorry {
+            continue;
+        }
+
+        // Sorry in body: admit the entire proof obligation — postcondition,
+        // termination, everything — without attempting any verification.
+        // Sorry means "I know this is unproved" (like Lean's sorry or Agda's
+        // postulate). Checked before termination so that `sorry` in a
+        // recursive body doesn't report spurious termination failures.
+        if has_sorry {
+            results.push(VerificationResult::FnContractAdmitted {
+                name: func.name.clone(),
+                reason: "sorry in body".to_owned(),
+                time_ms: 0,
+                span: func.span,
+                file: func.file.clone(),
+            });
+            continue;
+        }
+
         // Termination verification: for fns with decreases, prove
         // recursive calls decrease the measure AND satisfy the callee's requires.
         let mut termination_failed = false;
@@ -507,11 +557,6 @@ fn verify_fn_contracts(
             }
         }
 
-        // Skip fns without ensures clauses
-        if func.ensures.is_empty() {
-            continue;
-        }
-
         // Skip postcondition verification if termination failed — the
         // recursive-call ensures assumptions are unsound without valid
         // termination + callee preconditions at recursive call sites.
@@ -527,7 +572,15 @@ fn verify_fn_contracts(
         let result = verify_single_fn_contract(func, vctx, defs);
         let time_ms = elapsed_ms(&start);
 
+        let has_assume = body_contains_assume(&func.body);
         let vr = match result {
+            Ok(()) if has_assume => VerificationResult::FnContractAdmitted {
+                name: func.name.clone(),
+                reason: "assume in body".to_owned(),
+                time_ms,
+                span: func.span,
+                file: func.file.clone(),
+            },
             Ok(()) => VerificationResult::FnContractProved {
                 name: func.name.clone(),
                 time_ms,
@@ -576,6 +629,9 @@ fn verify_single_fn_contract(
 ) -> Result<(), FnContractError> {
     let solver = Solver::new();
 
+    // Clear lambda axioms from any prior verification target
+    clear_lambda_axioms();
+
     // Uncurry the function to get params and body
     let entry = defs.get(&func.name).ok_or_else(|| {
         FnContractError::EncodingError(format!("function '{}' not found in DefEnv", func.name))
@@ -584,10 +640,10 @@ fn verify_single_fn_contract(
     let params = &entry.params;
     let body = &entry.body;
 
-    // Create Z3 variables for each parameter
+    // Create Z3 variables for each parameter (using vctx for ADT-encoded enums)
     let mut env: HashMap<String, SmtValue> = HashMap::new();
     for (name, ty) in params {
-        let var = make_z3_var(name, ty).map_err(FnContractError::EncodingError)?;
+        let var = make_z3_var_ctx(name, ty, Some(vctx)).map_err(FnContractError::EncodingError)?;
         env.insert(name.clone(), var);
     }
 
@@ -641,6 +697,13 @@ fn verify_single_fn_contract(
     let all_ensures = Bool::and(&ensures_refs);
     solver.assert(&all_ensures.not());
 
+    // Assert lambda definitional axioms AFTER all encoding (body + ensures).
+    // Lambdas may appear in either body or ensures; all their axioms must be
+    // available before the solver check.
+    for axiom in &clone_lambda_axioms() {
+        solver.assert(axiom);
+    }
+
     // Check
     match solver.check() {
         z3::SatResult::Unsat => Ok(()), // Proved: no counterexample exists
@@ -683,6 +746,42 @@ fn push_recursive_call_constraint(c: Bool) {
 fn take_recursive_call_constraints() -> Vec<Bool> {
     RECURSIVE_CALL_CONSTRAINTS.with(|v| std::mem::take(&mut *v.borrow_mut()))
 }
+
+// Thread-local accumulator for lambda definitional axioms.
+// When a lambda is encoded as a Z3 uninterpreted function, its
+// definitional axiom (forall params. f(params) == body) is pushed here.
+// The caller asserts them on the main solver.
+thread_local! {
+    static LAMBDA_AXIOMS: RefCell<Vec<Bool>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn push_lambda_axiom(axiom: Bool) {
+    LAMBDA_AXIOMS.with(|v| v.borrow_mut().push(axiom));
+}
+
+/// Get a copy of all accumulated lambda axioms (non-destructive).
+/// Every solver that may encounter lambda applications needs these.
+fn clone_lambda_axioms() -> Vec<Bool> {
+    LAMBDA_AXIOMS.with(|v| v.borrow().clone())
+}
+
+/// Clear all accumulated lambda axioms (call between verification targets).
+fn clear_lambda_axioms() {
+    LAMBDA_AXIOMS.with(|v| v.borrow_mut().clear());
+}
+
+/// Assert all accumulated lambda axioms on a solver.
+/// Call this on every fresh VC solver (assert, loop, precondition checks).
+fn assert_lambda_axioms_on(solver: &Solver) {
+    for axiom in &clone_lambda_axioms() {
+        solver.assert(axiom);
+    }
+}
+
+/// Counter for generating unique lambda function names.
+static LAMBDA_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // Thread-local accumulator for call-site precondition obligations found
 // during system-verification property encoding (encode_prop_expr /
@@ -897,6 +996,74 @@ fn encode_fn_body(
             }
         }
 
+        // Assert: generate a VC to prove the assertion holds at this point,
+        // then make the assertion truth available as a fact for subsequent code.
+        IRExpr::Assert { expr: assert_expr, span } => {
+            let assert_val = encode_pure_expr(assert_expr, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let assert_bool = assert_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+
+            // VC check: prove assert_expr holds given fn_requires + extra_assumptions + accumulated constraints
+            let vc_solver = Solver::new();
+            assert_lambda_axioms_on(&vc_solver);
+            // Assert function preconditions
+            for req in fn_requires {
+                let req_val = encode_pure_expr(req, env, vctx, defs)
+                    .map_err(FnContractError::EncodingError)?;
+                let req_bool = req_val
+                    .to_bool()
+                    .map_err(FnContractError::EncodingError)?;
+                vc_solver.assert(&req_bool);
+            }
+            // Assert extra assumptions (e.g., from enclosing branches)
+            for assumption in extra_assumptions {
+                vc_solver.assert(assumption);
+            }
+            // Assert all accumulated solver constraints (loop postconditions, etc.)
+            for c in solver_constraints.iter() {
+                vc_solver.assert(c);
+            }
+            // Assert negation of the assertion — looking for a counterexample
+            vc_solver.assert(&assert_bool.not());
+            assert_lambda_axioms_on(&vc_solver);
+
+            match vc_solver.check() {
+                z3::SatResult::Unsat => {
+                    // Proved: assertion holds. Make it available as a fact.
+                    solver_constraints.push(assert_bool);
+                    Ok(smt::bool_val(true))
+                }
+                z3::SatResult::Sat | z3::SatResult::Unknown => {
+                    Err(FnContractError::EncodingError(
+                        if let Some(sp) = span {
+                            format!(
+                                "{} (at byte offset {}..{})",
+                                crate::messages::FN_ASSERT_FAILED,
+                                sp.start, sp.end,
+                            )
+                        } else {
+                            crate::messages::FN_ASSERT_FAILED.to_owned()
+                        },
+                    ))
+                }
+            }
+        }
+
+        // Assume: add the expression as a fact without proof.
+        // The user takes responsibility for its truth.
+        IRExpr::Assume { expr: assume_expr, .. } => {
+            let assume_val = encode_pure_expr(assume_expr, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let assume_bool = assume_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+            // Push as a solver constraint — assumed true for subsequent code
+            solver_constraints.push(assume_bool);
+            Ok(smt::bool_val(true))
+        }
+
         // Everything else (including App): delegate to pure encoder with
         // precondition checking enabled. This ensures ALL nested function
         // calls have their preconditions verified, not just top-level ones.
@@ -915,7 +1082,7 @@ fn encode_fn_body(
 /// Check if an expression contains imperative constructs (While, VarDecl, mutable assignment).
 fn contains_imperative(expr: &IRExpr) -> bool {
     match expr {
-        IRExpr::While { .. } | IRExpr::VarDecl { .. } => true,
+        IRExpr::While { .. } | IRExpr::VarDecl { .. } | IRExpr::Assert { .. } | IRExpr::Assume { .. } => true,
         // Assignment: BinOp(OpEq, Var(_), _) is an imperative mutation
         IRExpr::BinOp { op, left, .. }
             if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) =>
@@ -932,6 +1099,208 @@ fn contains_imperative(expr: &IRExpr) -> bool {
                 || else_body.as_ref().map_or(false, |e| contains_imperative(e))
         }
         _ => false,
+    }
+}
+
+/// Check if a function body contains any `assert` or `assume` statements.
+/// Used to determine if a function without `ensures` should still be verified.
+///
+/// Walks the entire expression tree — assert/assume may appear nested inside
+/// any expression form (e.g., `x + (assert false)`), not just at statement level.
+fn body_contains_assert(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Assert { .. } | IRExpr::Assume { .. } => true,
+        IRExpr::Block { exprs, .. } => exprs.iter().any(body_contains_assert),
+        IRExpr::Lam { body, .. }
+        | IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. } => body_contains_assert(body),
+        IRExpr::VarDecl {
+            init, rest, ..
+        } => body_contains_assert(init) || body_contains_assert(rest),
+        IRExpr::While {
+            cond,
+            invariants,
+            body,
+            ..
+        } => {
+            body_contains_assert(cond)
+                || invariants.iter().any(body_contains_assert)
+                || body_contains_assert(body)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            body_contains_assert(cond)
+                || body_contains_assert(then_body)
+                || else_body.as_ref().map_or(false, |e| body_contains_assert(e))
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            body_contains_assert(left) || body_contains_assert(right)
+        }
+        IRExpr::UnOp { operand, .. } => body_contains_assert(operand),
+        IRExpr::App { func, arg, .. } => {
+            body_contains_assert(func) || body_contains_assert(arg)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| body_contains_assert(&b.expr)) || body_contains_assert(body)
+        }
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => body_contains_assert(body),
+        IRExpr::Field { expr, .. }
+        | IRExpr::Prime { expr, .. }
+        | IRExpr::Card { expr, .. } => body_contains_assert(expr),
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            body_contains_assert(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().map_or(false, body_contains_assert)
+                        || body_contains_assert(&a.body)
+                })
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            body_contains_assert(map)
+                || body_contains_assert(key)
+                || body_contains_assert(value)
+        }
+        IRExpr::Index { map, key, .. } => {
+            body_contains_assert(map) || body_contains_assert(key)
+        }
+        IRExpr::SetComp {
+            filter, projection, ..
+        } => {
+            body_contains_assert(filter)
+                || projection.as_ref().map_or(false, |p| body_contains_assert(p))
+        }
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            elements.iter().any(body_contains_assert)
+        }
+        IRExpr::MapLit { entries, .. } => {
+            entries.iter().any(|(k, v)| body_contains_assert(k) || body_contains_assert(v))
+        }
+        IRExpr::Lit { .. }
+        | IRExpr::Var { .. }
+        | IRExpr::Ctor { .. }
+        | IRExpr::Sorry { .. }
+        | IRExpr::Todo { .. } => false,
+    }
+}
+
+/// Check if a function body contains any `assume` statement (specifically).
+/// Used to determine if a verified function should be reported as ADMITTED.
+fn body_contains_assume(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Assume { .. } => true,
+        IRExpr::Assert { expr, .. } => body_contains_assume(expr),
+        IRExpr::Block { exprs, .. } => exprs.iter().any(body_contains_assume),
+        IRExpr::Lam { body, .. } => body_contains_assume(body),
+        IRExpr::VarDecl { init, rest, .. } => {
+            body_contains_assume(init) || body_contains_assume(rest)
+        }
+        IRExpr::While { cond, invariants, body, .. } => {
+            body_contains_assume(cond)
+                || invariants.iter().any(body_contains_assume)
+                || body_contains_assume(body)
+        }
+        IRExpr::IfElse { cond, then_body, else_body, .. } => {
+            body_contains_assume(cond)
+                || body_contains_assume(then_body)
+                || else_body.as_ref().map_or(false, |e| body_contains_assume(e))
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            body_contains_assume(left) || body_contains_assume(right)
+        }
+        IRExpr::UnOp { operand, .. } => body_contains_assume(operand),
+        IRExpr::App { func, arg, .. } => {
+            body_contains_assume(func) || body_contains_assume(arg)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| body_contains_assume(&b.expr)) || body_contains_assume(body)
+        }
+        IRExpr::Match { scrutinee, arms, .. } => {
+            body_contains_assume(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().map_or(false, body_contains_assume)
+                        || body_contains_assume(&a.body)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Check if a function body contains `sorry`.
+/// Used to short-circuit verification — sorry admits the entire proof obligation.
+///
+/// Walks the entire expression tree so nested forms like `x + sorry` are detected.
+fn body_contains_sorry(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Sorry { .. } => true,
+        IRExpr::Block { exprs, .. } => exprs.iter().any(body_contains_sorry),
+        IRExpr::Lam { body, .. }
+        | IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. } => body_contains_sorry(body),
+        IRExpr::VarDecl { init, rest, .. } => {
+            body_contains_sorry(init) || body_contains_sorry(rest)
+        }
+        IRExpr::While { cond, invariants, body, .. } => {
+            body_contains_sorry(cond)
+                || invariants.iter().any(body_contains_sorry)
+                || body_contains_sorry(body)
+        }
+        IRExpr::IfElse { cond, then_body, else_body, .. } => {
+            body_contains_sorry(cond)
+                || body_contains_sorry(then_body)
+                || else_body.as_ref().map_or(false, |e| body_contains_sorry(e))
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            body_contains_sorry(left) || body_contains_sorry(right)
+        }
+        IRExpr::UnOp { operand, .. } => body_contains_sorry(operand),
+        IRExpr::App { func, arg, .. } => {
+            body_contains_sorry(func) || body_contains_sorry(arg)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| body_contains_sorry(&b.expr)) || body_contains_sorry(body)
+        }
+        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => body_contains_sorry(body),
+        IRExpr::Field { expr, .. }
+        | IRExpr::Prime { expr, .. }
+        | IRExpr::Card { expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. } => body_contains_sorry(expr),
+        IRExpr::Match { scrutinee, arms, .. } => {
+            body_contains_sorry(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().map_or(false, body_contains_sorry)
+                        || body_contains_sorry(&a.body)
+                })
+        }
+        IRExpr::MapUpdate { map, key, value, .. } => {
+            body_contains_sorry(map)
+                || body_contains_sorry(key)
+                || body_contains_sorry(value)
+        }
+        IRExpr::Index { map, key, .. } => {
+            body_contains_sorry(map) || body_contains_sorry(key)
+        }
+        IRExpr::SetComp { filter, projection, .. } => {
+            body_contains_sorry(filter)
+                || projection.as_ref().map_or(false, |p| body_contains_sorry(p))
+        }
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            elements.iter().any(body_contains_sorry)
+        }
+        IRExpr::MapLit { entries, .. } => {
+            entries.iter().any(|(k, v)| body_contains_sorry(k) || body_contains_sorry(v))
+        }
+        IRExpr::Lit { .. }
+        | IRExpr::Var { .. }
+        | IRExpr::Ctor { .. }
+        | IRExpr::Todo { .. } => false,
     }
 }
 
@@ -1053,6 +1422,7 @@ fn verify_loop_init(
     defs: &defenv::DefEnv,
 ) -> Result<(), FnContractError> {
     let vc_solver = Solver::new();
+    assert_lambda_axioms_on(&vc_solver);
 
     // Assert function preconditions and any outer context assumptions
     for req in fn_requires {
@@ -1081,6 +1451,9 @@ fn verify_loop_init(
     let all_inv = Bool::and(&inv_refs);
     vc_solver.assert(&all_inv.not());
 
+    // Assert lambda axioms after all encoding (invariants may contain lambdas)
+    assert_lambda_axioms_on(&vc_solver);
+
     match vc_solver.check() {
         z3::SatResult::Unsat => Ok(()),
         z3::SatResult::Sat | z3::SatResult::Unknown => {
@@ -1108,6 +1481,7 @@ fn verify_loop_preservation(
     defs: &defenv::DefEnv,
 ) -> Result<(), FnContractError> {
     let vc_solver = Solver::new();
+    assert_lambda_axioms_on(&vc_solver);
 
     // Create fresh "pre-iteration" variables for all modified vars.
     let counter = LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1191,6 +1565,9 @@ fn verify_loop_preservation(
     let all_post = Bool::and(&post_refs);
     vc_solver.assert(&all_post.not());
 
+    // Assert lambda axioms after all encoding
+    assert_lambda_axioms_on(&vc_solver);
+
     match vc_solver.check() {
         z3::SatResult::Unsat => Ok(()),
         z3::SatResult::Sat | z3::SatResult::Unknown => {
@@ -1218,6 +1595,7 @@ fn verify_loop_termination(
     defs: &defenv::DefEnv,
 ) -> Result<(), FnContractError> {
     let vc_solver = Solver::new();
+    assert_lambda_axioms_on(&vc_solver);
 
     // Create fresh pre-iteration variables
     let counter = LOOP_VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1328,6 +1706,9 @@ fn verify_loop_termination(
         let lex_ok = Bool::or(&lex_refs);
         vc_solver.assert(&lex_ok.not());
     }
+
+    // Assert lambda axioms after all encoding
+    assert_lambda_axioms_on(&vc_solver);
 
     match vc_solver.check() {
         z3::SatResult::Unsat => Ok(()),
@@ -1512,7 +1893,61 @@ fn execute_loop_body(
             Ok(())
         }
 
-        // Ignore other expressions in the body (assertions, etc.)
+        // Assert in loop body: VC check using assumptions (invariant ∧ cond ∧ fn_requires)
+        // as context. If proved, assertion becomes available as a fact for subsequent code.
+        IRExpr::Assert { expr: assert_expr, span } => {
+            let assert_val = encode_pure_expr(assert_expr, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let assert_bool = assert_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+
+            // VC check: prove assert_expr holds given current assumptions + constraints
+            let vc_solver = Solver::new();
+            assert_lambda_axioms_on(&vc_solver);
+            for assumption in assumptions {
+                vc_solver.assert(assumption);
+            }
+            for c in constraints.iter() {
+                vc_solver.assert(c);
+            }
+            vc_solver.assert(&assert_bool.not());
+            assert_lambda_axioms_on(&vc_solver);
+
+            match vc_solver.check() {
+                z3::SatResult::Unsat => {
+                    // Proved: assertion holds in loop body. Make available as fact.
+                    constraints.push(assert_bool);
+                    Ok(())
+                }
+                z3::SatResult::Sat | z3::SatResult::Unknown => {
+                    Err(FnContractError::EncodingError(
+                        if let Some(sp) = span {
+                            format!(
+                                "{} (at byte offset {}..{})",
+                                crate::messages::FN_ASSERT_FAILED,
+                                sp.start, sp.end,
+                            )
+                        } else {
+                            crate::messages::FN_ASSERT_FAILED.to_owned()
+                        },
+                    ))
+                }
+            }
+        }
+
+        // Assume in loop body: add as a fact without proof.
+        IRExpr::Assume { expr: assume_expr, .. } => {
+            let assume_val = encode_pure_expr(assume_expr, env, vctx, defs)
+                .map_err(FnContractError::EncodingError)?;
+            let assume_bool = assume_val
+                .to_bool()
+                .map_err(FnContractError::EncodingError)?;
+            constraints.push(assume_bool);
+            Ok(())
+        }
+
+        // Ignore other expressions in the body (pure, no side effects — correct to drop)
         _ => Ok(()),
     }
 }
@@ -1717,6 +2152,7 @@ fn verify_fn_termination(
         // requires(caller) ∧ path_condition → requires(actual_args)
         {
             let vc_solver = Solver::new();
+            assert_lambda_axioms_on(&vc_solver);
             for req_bool in &requires_bools {
                 vc_solver.assert(req_bool);
             }
@@ -1738,6 +2174,7 @@ fn verify_fn_termination(
         // requires(caller) ∧ path_condition → post_measure < pre_measure ∧ post_measure ≥ 0
         {
             let vc_solver = Solver::new();
+            assert_lambda_axioms_on(&vc_solver);
             for req_bool in &requires_bools {
                 vc_solver.assert(req_bool);
             }
@@ -1922,6 +2359,9 @@ fn collect_recursive_calls(
             }
             collect_recursive_calls(rest, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
         }
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            collect_recursive_calls(expr, fn_name, params, env, vctx, defs, path_conds, call_sites)?;
+        }
         _ => {}
     }
     Ok(())
@@ -1933,8 +2373,8 @@ fn make_z3_var_from_smt(name: &str, template: &SmtValue) -> SmtValue {
         SmtValue::Int(_) => smt::int_var(name),
         SmtValue::Bool(_) => smt::bool_var(name),
         SmtValue::Real(_) => smt::real_var(name),
-        SmtValue::Array(_) | SmtValue::Dynamic(_) => {
-            // For arrays/dynamic, fall back to int (best effort)
+        SmtValue::Array(_) | SmtValue::Dynamic(_) | SmtValue::Func(_) => {
+            // For arrays/dynamic/func, fall back to int (best effort)
             smt::int_var(name)
         }
     }
@@ -2018,13 +2458,32 @@ fn encode_imperative_if_else(
 /// Create a Z3 variable for a given IR type.
 /// Check that a function call's arguments satisfy the callee's preconditions.
 fn make_z3_var(name: &str, ty: &crate::ir::types::IRType) -> Result<SmtValue, String> {
+    make_z3_var_ctx(name, ty, None)
+}
+
+fn make_z3_var_ctx(
+    name: &str,
+    ty: &crate::ir::types::IRType,
+    vctx: Option<&VerifyContext>,
+) -> Result<SmtValue, String> {
     use crate::ir::types::IRType;
     match ty {
         IRType::Int | IRType::Id | IRType::String => Ok(smt::int_var(name)),
         IRType::Bool => Ok(smt::bool_var(name)),
         IRType::Real | IRType::Float => Ok(smt::real_var(name)),
-        IRType::Enum { .. } => Ok(smt::int_var(name)),
-        IRType::Refinement { base, .. } => make_z3_var(name, base),
+        IRType::Enum {
+            name: enum_name, ..
+        } => {
+            // Use ADT sort if the enum has constructor fields
+            if let Some(ctx) = vctx {
+                if let Some(dt) = ctx.adt_sorts.get(enum_name) {
+                    let var = z3::ast::Dynamic::new_const(name, &dt.sort);
+                    return Ok(SmtValue::Dynamic(var));
+                }
+            }
+            Ok(smt::int_var(name))
+        }
+        IRType::Refinement { base, .. } => make_z3_var_ctx(name, base, vctx),
         IRType::Set { .. } | IRType::Seq { .. } | IRType::Map { .. } => {
             smt::array_var(name, ty)
         }
@@ -2092,8 +2551,91 @@ fn encode_pure_expr_inner(
         }
 
         IRExpr::Ctor {
-            enum_name, ctor, ..
+            enum_name, ctor, args, ..
         } => {
+            // ADT-encoded enum: use constructor function with field arguments
+            if let Some(dt) = vctx.adt_sorts.get(enum_name) {
+                for variant in &dt.variants {
+                    if variant.constructor.name() == *ctor {
+                        let arity = variant.accessors.len();
+                        if arity > 0 && args.is_empty() {
+                            return Err(format!(
+                                "constructor '{ctor}' of '{enum_name}' requires {arity} \
+                                 field argument(s) — use @{enum_name}::{ctor} {{ ... }}"
+                            ));
+                        }
+                        if args.is_empty() {
+                            // Nullary constructor (no fields)
+                            let result = variant.constructor.apply(&[]);
+                            return Ok(dynamic_to_smt_value(result));
+                        }
+
+                        // Validate and reorder field arguments by declared order.
+                        // Accessor names define the canonical field order.
+                        let declared_names: Vec<std::string::String> = variant
+                            .accessors
+                            .iter()
+                            .map(|a| a.name())
+                            .collect();
+
+                        // Check for unknown fields
+                        for (field_name, _) in args {
+                            if !declared_names.iter().any(|d| d == field_name) {
+                                return Err(format!(
+                                    "unknown field '{field_name}' in constructor '{ctor}' \
+                                     of '{enum_name}' — declared fields: {}",
+                                    declared_names.join(", ")
+                                ));
+                            }
+                        }
+
+                        // Check for duplicates
+                        let mut seen = std::collections::HashSet::new();
+                        for (field_name, _) in args {
+                            if !seen.insert(field_name.as_str()) {
+                                return Err(format!(
+                                    "duplicate field '{field_name}' in constructor '{ctor}'"
+                                ));
+                            }
+                        }
+
+                        // Check arity
+                        if args.len() != arity {
+                            let missing: Vec<&str> = declared_names
+                                .iter()
+                                .filter(|d| !args.iter().any(|(n, _)| n == d.as_str()))
+                                .map(|s| s.as_str())
+                                .collect();
+                            return Err(format!(
+                                "constructor '{ctor}' of '{enum_name}' requires {arity} \
+                                 field(s) but got {} — missing: {}",
+                                args.len(),
+                                missing.join(", ")
+                            ));
+                        }
+
+                        // Build args in declared field order (not source order)
+                        let args_map: HashMap<&str, &IRExpr> = args
+                            .iter()
+                            .map(|(n, e)| (n.as_str(), e))
+                            .collect();
+                        let mut z3_args: Vec<z3::ast::Dynamic> = Vec::new();
+                        for decl_name in &declared_names {
+                            let field_expr = args_map[decl_name.as_str()];
+                            let val = encode_pure_expr_inner(
+                                field_expr, env, vctx, defs, precheck,
+                            )?;
+                            z3_args.push(val.to_dynamic());
+                        }
+
+                        let arg_refs: Vec<&dyn z3::ast::Ast> =
+                            z3_args.iter().map(|a| a as &dyn z3::ast::Ast).collect();
+                        let result = variant.constructor.apply(&arg_refs);
+                        return Ok(dynamic_to_smt_value(result));
+                    }
+                }
+            }
+            // Flat Int encoding for fieldless enums
             let id = vctx.variants.id_of(enum_name, ctor);
             Ok(smt::int_val(id))
         }
@@ -2140,6 +2682,7 @@ fn encode_pure_expr_inner(
                                 let pre_val = encode_pure_expr(pre, env, vctx, defs)?;
                                 let pre_bool = pre_val.to_bool()?;
                                 let vc_solver = Solver::new();
+                                assert_lambda_axioms_on(&vc_solver);
                                 for ctx_bool in &context_bools {
                                     vc_solver.assert(ctx_bool);
                                 }
@@ -2169,6 +2712,49 @@ fn encode_pure_expr_inner(
                     }
                 }
             }
+            // Collect the full curried application chain: App(App(f, a), b) → (f, [a, b])
+            // Then check if the base function is a lambda (Func-valued).
+            {
+                let mut base = expr;
+                let mut arg_exprs: Vec<&IRExpr> = Vec::new();
+                while let IRExpr::App { func, arg, .. } = base {
+                    arg_exprs.push(arg);
+                    base = func;
+                }
+                arg_exprs.reverse(); // collected in reverse order
+
+                // Try encoding the base function
+                let func_result = encode_pure_expr_inner(base, env, vctx, defs, precheck);
+                if let Ok(SmtValue::Func(ref ft)) = func_result {
+                    let (ref func_decl, ref param_sorts, ref range_sort) = **ft;
+                    let arity = param_sorts.len();
+                    let mut z3_args: Vec<z3::ast::Dynamic> = Vec::new();
+                    for arg_expr in &arg_exprs {
+                        let val = encode_pure_expr_inner(arg_expr, env, vctx, defs, precheck)?;
+                        z3_args.push(val.to_dynamic());
+                    }
+
+                    if arg_exprs.len() == arity {
+                        // Full application
+                        let arg_refs: Vec<&dyn z3::ast::Ast> =
+                            z3_args.iter().map(|a| a as &dyn z3::ast::Ast).collect();
+                        let result = func_decl.apply(&arg_refs);
+                        return Ok(dynamic_to_smt_value(result));
+                    } else if arg_exprs.len() < arity {
+                        // Partial application
+                        return encode_partial_application(
+                            func_decl, param_sorts, range_sort, &z3_args,
+                        );
+                    } else {
+                        return Err(format!(
+                            "too many arguments — function expects {arity} but got {}",
+                            arg_exprs.len()
+                        ));
+                    }
+                }
+                // If base is not Func-valued, fall through to DefEnv / self-call
+            }
+
             // Expand via DefEnv
             if let Some(expanded) = defs.expand_app(expr) {
                 return encode_pure_expr_inner(&expanded, env, vctx, defs, precheck);
@@ -2215,19 +2801,43 @@ fn encode_pure_expr_inner(
             encode_pure_match(&scrut_val, arms, env, vctx, defs, precheck)
         }
 
-        IRExpr::Forall { var, .. } => Err(format!(
-            "quantifiers in fn contracts not yet supported (forall {var})"
-        )),
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => encode_z3_quantifier(true, var, domain, body, env, vctx, defs, precheck),
 
-        IRExpr::Exists { var, .. } => Err(format!(
-            "quantifiers in fn contracts not yet supported (exists {var})"
-        )),
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => encode_z3_quantifier(false, var, domain, body, env, vctx, defs, precheck),
 
-        IRExpr::Index { map, key, .. } => {
+        IRExpr::Index { map, key, ty, .. } => {
             let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
             let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
             let arr = map_val.as_array()?;
-            Ok(SmtValue::Dynamic(arr.select(&key_val.to_dynamic())))
+            let result = arr.select(&key_val.to_dynamic());
+            // Cast to typed SmtValue when the IR declares a known type
+            // (e.g., `e in Set<T>` has ty=Bool, `map[k]` has ty=ValueType).
+            // This avoids Dynamic→Bool conversion failures for lambda arrays.
+            match ty {
+                crate::ir::types::IRType::Bool => {
+                    match result.as_bool() {
+                        Some(b) => Ok(SmtValue::Bool(b)),
+                        None => Ok(SmtValue::Dynamic(result)),
+                    }
+                }
+                crate::ir::types::IRType::Int | crate::ir::types::IRType::Id => {
+                    match result.as_int() {
+                        Some(i) => Ok(SmtValue::Int(i)),
+                        None => Ok(SmtValue::Dynamic(result)),
+                    }
+                }
+                crate::ir::types::IRType::Real | crate::ir::types::IRType::Float => {
+                    match result.as_real() {
+                        Some(r) => Ok(SmtValue::Real(r)),
+                        None => Ok(SmtValue::Dynamic(result)),
+                    }
+                }
+                _ => Ok(SmtValue::Dynamic(result)),
+            }
         }
 
         IRExpr::MapUpdate {
@@ -2287,9 +2897,187 @@ fn encode_pure_expr_inner(
             Ok(SmtValue::Array(arr))
         }
 
-        IRExpr::Card { .. } => Err("cardinality (#) not supported in fn contracts".to_owned()),
-        IRExpr::SetComp { .. } => {
-            Err("set comprehension not supported in fn contracts".to_owned())
+        IRExpr::Card { expr: inner, .. } => match inner.as_ref() {
+            // Set cardinality: count semantically distinct elements.
+            // Encode each element to Z3, then use the "first occurrence"
+            // pattern: element i is counted iff it differs from all prior
+            // elements. This correctly handles `#Set(1, 1 + 0)` = 1.
+            IRExpr::SetLit { elements, .. } => {
+                if elements.is_empty() {
+                    return Ok(smt::int_val(0));
+                }
+                let z3_elems: Vec<SmtValue> = elements
+                    .iter()
+                    .map(|e| encode_pure_expr_inner(e, env, vctx, defs, precheck))
+                    .collect::<Result<_, _>>()?;
+
+                let one = z3::ast::Int::from_i64(1);
+                let zero = z3::ast::Int::from_i64(0);
+                let mut terms: Vec<z3::ast::Int> = Vec::new();
+
+                for (i, vi) in z3_elems.iter().enumerate() {
+                    if i == 0 {
+                        // First element always counts
+                        terms.push(one.clone());
+                    } else {
+                        // Count iff different from all prior elements
+                        let mut diff_from_prior: Vec<Bool> = Vec::new();
+                        for vj in &z3_elems[..i] {
+                            let neq = smt::smt_neq(vi, vj)?;
+                            diff_from_prior.push(neq);
+                        }
+                        let refs: Vec<&Bool> = diff_from_prior.iter().collect();
+                        let is_first = Bool::and(&refs);
+                        terms.push(is_first.ite(&one, &zero));
+                    }
+                }
+
+                let refs: Vec<&z3::ast::Int> = terms.iter().collect();
+                Ok(SmtValue::Int(z3::ast::Int::add(&refs)))
+            }
+            IRExpr::SeqLit { elements, .. } => {
+                Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0)))
+            }
+            IRExpr::MapLit { entries, .. } => {
+                if entries.is_empty() {
+                    return Ok(smt::int_val(0));
+                }
+                // Same first-occurrence pattern for map keys
+                let z3_keys: Vec<SmtValue> = entries
+                    .iter()
+                    .map(|(k, _)| encode_pure_expr_inner(k, env, vctx, defs, precheck))
+                    .collect::<Result<_, _>>()?;
+
+                let one = z3::ast::Int::from_i64(1);
+                let zero = z3::ast::Int::from_i64(0);
+                let mut terms: Vec<z3::ast::Int> = Vec::new();
+
+                for (i, ki) in z3_keys.iter().enumerate() {
+                    if i == 0 {
+                        terms.push(one.clone());
+                    } else {
+                        let mut diff: Vec<Bool> = Vec::new();
+                        for kj in &z3_keys[..i] {
+                            diff.push(smt::smt_neq(ki, kj)?);
+                        }
+                        let refs: Vec<&Bool> = diff.iter().collect();
+                        let is_first = Bool::and(&refs);
+                        terms.push(is_first.ite(&one, &zero));
+                    }
+                }
+
+                let refs: Vec<&z3::ast::Int> = terms.iter().collect();
+                Ok(SmtValue::Int(z3::ast::Int::add(&refs)))
+            }
+            // Cardinality of non-literal: encode the inner expression and
+            // reject if it's not a form we can reason about.
+            _ => Err(
+                "cardinality (#) of non-literal collections not supported in fn contracts — \
+                 use #Set(...), #Seq(...), or #Map(...)"
+                    .to_owned(),
+            ),
+        },
+        // Set comprehension: { x: T where P(x) }
+        // Encode as Z3 lambda array with domain restriction:
+        //   simple:     λx. domain_pred(x) ∧ P(x)
+        //   projection: λy. ∃x. domain_pred(x) ∧ P(x) ∧ f(x) == y
+        IRExpr::SetComp {
+            var,
+            domain,
+            filter,
+            projection,
+            ..
+        } => {
+            // Create a fresh Z3 constant for the comprehension variable
+            let bound_var = make_z3_var(var, domain)?;
+            let mut inner_env = env.clone();
+            inner_env.insert(var.to_owned(), bound_var.clone());
+
+            // Encode the filter predicate with the bound variable in scope
+            let filter_val =
+                encode_pure_expr_inner(filter, &inner_env, vctx, defs, precheck)?;
+            let filter_bool = filter_val.to_bool()?;
+
+            // Build domain predicate for restricted types (enum, refinement)
+            let domain_pred = build_domain_predicate(
+                domain, &bound_var, &inner_env, vctx, defs, precheck,
+            )?;
+
+            // Combine filter with domain predicate: domain_pred ∧ filter
+            let restricted_filter = match domain_pred {
+                Some(dp) => Bool::and(&[&dp, &filter_bool]),
+                None => filter_bool,
+            };
+
+            if let Some(proj) = projection {
+                // Projection comprehension: { f(x) | x: T where P(x) }
+                // Encode as: λy. ∃x. domain_pred(x) ∧ P(x) ∧ f(x) == y
+                let proj_val =
+                    encode_pure_expr_inner(proj, &inner_env, vctx, defs, precheck)?;
+
+                let proj_var_name = format!("{var}__proj");
+                let proj_bound = make_z3_var_from_smt(&proj_var_name, &proj_val);
+
+                let eq = smt::smt_eq(&proj_val, &proj_bound)?;
+                let body = Bool::and(&[&restricted_filter, &eq]);
+
+                let exists_body = match &bound_var {
+                    SmtValue::Int(i) => {
+                        z3::ast::exists_const(&[i as &dyn z3::ast::Ast], &[], &body)
+                    }
+                    SmtValue::Bool(b) => {
+                        z3::ast::exists_const(&[b as &dyn z3::ast::Ast], &[], &body)
+                    }
+                    SmtValue::Real(r) => {
+                        z3::ast::exists_const(&[r as &dyn z3::ast::Ast], &[], &body)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported set comprehension domain: {domain:?}"
+                        ))
+                    }
+                };
+
+                let body_dyn = z3::ast::Dynamic::from_ast(&exists_body);
+                let arr = match &proj_bound {
+                    SmtValue::Int(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    SmtValue::Bool(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    SmtValue::Real(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported set comprehension projection type: {proj_val:?}"
+                        ))
+                    }
+                };
+                Ok(SmtValue::Array(arr))
+            } else {
+                // Simple comprehension: { x: T where P(x) }
+                // Encode as: λx. domain_pred(x) ∧ P(x)
+                let body_dyn = z3::ast::Dynamic::from_ast(&restricted_filter);
+                let arr = match &bound_var {
+                    SmtValue::Int(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    SmtValue::Bool(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    SmtValue::Real(v) => {
+                        z3::ast::lambda_const(&[v as &dyn z3::ast::Ast], &body_dyn)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unsupported set comprehension domain: {domain:?}"
+                        ))
+                    }
+                };
+                Ok(SmtValue::Array(arr))
+            }
         }
         IRExpr::Always { .. } | IRExpr::Eventually { .. } => {
             Err("temporal operators not allowed in fn contracts".to_owned())
@@ -2298,7 +3086,9 @@ fn encode_pure_expr_inner(
         IRExpr::Field { .. } => {
             Err("entity field access not allowed in fn contracts".to_owned())
         }
-        IRExpr::Lam { .. } => Err("lambda expressions not supported in fn contracts".to_owned()),
+        IRExpr::Lam { .. } => {
+            encode_lambda(expr, env, vctx, defs, precheck)
+        }
 
         IRExpr::Block { exprs, .. } => {
             if exprs.is_empty() {
@@ -2324,9 +3114,304 @@ fn encode_pure_expr_inner(
             Err(crate::messages::FN_LOOP_NO_INVARIANT.to_owned())
         }
 
+        IRExpr::Assert { .. } => {
+            Err("assert in pure expression context — assert is an imperative statement and must appear in a function body block".to_owned())
+        }
+        IRExpr::Assume { .. } => {
+            Err("assume in pure expression context — assume is an imperative statement and must appear in a function body block".to_owned())
+        }
+
         IRExpr::Sorry { .. } => Ok(smt::bool_val(true)),
         IRExpr::Todo { .. } => Err("todo expression in fn contract body".to_owned()),
     }
+}
+
+/// Build a domain predicate for restricted types (enum, refinement).
+/// Returns `None` for unrestricted types (Int, Bool, Real, etc.).
+///
+/// Used by both quantifier encoding and set comprehension encoding to
+/// constrain bound variables to their declared domain.
+#[allow(clippy::too_many_arguments)]
+fn build_domain_predicate(
+    domain: &crate::ir::types::IRType,
+    bound_var: &SmtValue,
+    inner_env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<Option<Bool>, String> {
+    use crate::ir::types::IRType;
+    match domain {
+        IRType::Enum {
+            name,
+            variants: vs,
+        } => {
+            let var_int = bound_var.as_int()?;
+            let ids: Vec<i64> = vs
+                .iter()
+                .map(|v| vctx.variants.id_of(name, &v.name))
+                .collect();
+            let min_id = *ids.iter().min().unwrap();
+            let max_id = *ids.iter().max().unwrap();
+            let lo = smt::int_val(min_id);
+            let hi = smt::int_val(max_id);
+            Ok(Some(Bool::and(&[
+                &var_int.ge(lo.as_int().unwrap()),
+                &var_int.le(hi.as_int().unwrap()),
+            ])))
+        }
+        IRType::Refinement { predicate, .. } => {
+            let mut pred_env = inner_env.clone();
+            pred_env.insert("$".to_owned(), bound_var.clone());
+            let pred_val =
+                encode_pure_expr_inner(predicate, &pred_env, vctx, defs, precheck)?;
+            Ok(Some(pred_val.to_bool()?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Encode a Z3 native quantifier (forall / exists) for non-entity domains.
+///
+/// Creates a fresh Z3 constant for the bound variable, encodes the body with
+/// that variable in scope, then wraps with `z3::ast::forall_const` or
+/// `z3::ast::exists_const`. No patterns/triggers — Z3 uses MBQI automatically.
+///
+/// For restricted domains (enums, refinement types), the body is guarded by
+/// a domain predicate:
+///   - forall y: E | P(y)  →  forall y: Int | (y ∈ E) implies P(y)
+///   - exists y: E | P(y)  →  exists y: Int | (y ∈ E) and P(y)
+///
+/// Entity-domain quantifiers in system properties still use slot-pool expansion
+/// (complete, decidable). This function handles the general case.
+#[allow(clippy::too_many_arguments)]
+fn encode_z3_quantifier(
+    is_forall: bool,
+    var: &str,
+    domain: &crate::ir::types::IRType,
+    body: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    // Create a fresh Z3 constant for the bound variable
+    let bound_var = make_z3_var(var, domain)?;
+
+    // Extend environment with the bound variable
+    let mut inner_env = env.clone();
+    inner_env.insert(var.to_owned(), bound_var.clone());
+
+    // Encode the body with the bound variable in scope
+    let body_val = encode_pure_expr_inner(body, &inner_env, vctx, defs, precheck)?;
+    let body_bool = body_val.to_bool()?;
+
+    let domain_pred = build_domain_predicate(
+        domain, &bound_var, &inner_env, vctx, defs, precheck,
+    )?;
+
+    // Combine body with domain predicate:
+    //   forall: domain_pred implies body
+    //   exists: domain_pred and body
+    let quantified_body = match domain_pred {
+        Some(dp) => {
+            if is_forall {
+                dp.implies(&body_bool)
+            } else {
+                Bool::and(&[&dp, &body_bool])
+            }
+        }
+        None => body_bool,
+    };
+
+    // Build the Z3 quantifier using the bound variable as a constant
+    let result = match &bound_var {
+        SmtValue::Int(i) => {
+            let bounds: &[&dyn z3::ast::Ast] = &[i];
+            if is_forall {
+                z3::ast::forall_const(bounds, &[], &quantified_body)
+            } else {
+                z3::ast::exists_const(bounds, &[], &quantified_body)
+            }
+        }
+        SmtValue::Bool(b) => {
+            let bounds: &[&dyn z3::ast::Ast] = &[b];
+            if is_forall {
+                z3::ast::forall_const(bounds, &[], &quantified_body)
+            } else {
+                z3::ast::exists_const(bounds, &[], &quantified_body)
+            }
+        }
+        SmtValue::Real(r) => {
+            let bounds: &[&dyn z3::ast::Ast] = &[r];
+            if is_forall {
+                z3::ast::forall_const(bounds, &[], &quantified_body)
+            } else {
+                z3::ast::exists_const(bounds, &[], &quantified_body)
+            }
+        }
+        _ => {
+            return Err(format!(
+                "unsupported quantifier domain type for '{var}': {domain:?}"
+            ));
+        }
+    };
+
+    Ok(SmtValue::Bool(result))
+}
+
+/// Encode a lambda expression as a Z3 uninterpreted function with a
+/// definitional axiom.
+///
+/// For `fn(x: T): R => body`:
+/// 1. Uncurry nested Lams to get all parameters
+/// 2. Create `FuncDecl::new("__lambda_N", domain_sorts, range_sort)`
+/// 3. Create Z3 bound variables for each parameter
+/// 4. Encode the body with parameters in scope
+/// 5. Assert definitional axiom: `forall params. f(params) == body`
+/// 6. Return `SmtValue::Func(func_decl)`
+///
+/// Handles curried lambdas: `Lam(x, Lam(y, body))` → `f(x, y) == body`.
+fn encode_lambda(
+    expr: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    // Uncurry: collect all nested Lam parameters
+    let mut params: Vec<(&str, &crate::ir::types::IRType)> = Vec::new();
+    let mut current = expr;
+    while let IRExpr::Lam {
+        param,
+        param_type,
+        body,
+        ..
+    } = current
+    {
+        params.push((param.as_str(), param_type));
+        current = body;
+    }
+    let body_expr = current;
+
+    if params.is_empty() {
+        return Err("empty lambda (no parameters)".to_owned());
+    }
+
+    // Create Z3 variables for parameters (ADT-aware via vctx)
+    let mut inner_env = env.clone();
+    let mut bound_vars: Vec<SmtValue> = Vec::new();
+    let mut domain_sorts: Vec<z3::Sort> = Vec::new();
+    for (pname, pty) in &params {
+        let var = make_z3_var_ctx(pname, pty, Some(vctx))?;
+        // Extract the sort from the created variable
+        use z3::ast::Ast;
+        let sort = var.to_dynamic().get_sort();
+        domain_sorts.push(sort);
+        inner_env.insert((*pname).to_owned(), var.clone());
+        bound_vars.push(var);
+    }
+    let domain_refs: Vec<&z3::Sort> = domain_sorts.iter().collect();
+
+    // Encode the body with all params in scope
+    let body_val = encode_pure_expr_inner(body_expr, &inner_env, vctx, defs, precheck)?;
+
+    // Determine range sort from the encoded body value
+    use z3::ast::Ast;
+    let range_sort = body_val.to_dynamic().get_sort();
+
+    // Create the uninterpreted function
+    let lambda_id = LAMBDA_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let func_name = format!("__lambda_{lambda_id}");
+    let func_decl = z3::FuncDecl::new(func_name.as_str(), &domain_refs, &range_sort);
+
+    // Build the definitional axiom: forall params. f(params) == body
+    // Use Dynamic for all parameter types (works for scalars and ADTs)
+    let bound_dyns: Vec<z3::ast::Dynamic> = bound_vars
+        .iter()
+        .map(SmtValue::to_dynamic)
+        .collect();
+    let app_args: Vec<&dyn z3::ast::Ast> = bound_dyns
+        .iter()
+        .map(|d| d as &dyn z3::ast::Ast)
+        .collect();
+    let app_result = func_decl.apply(&app_args);
+    let app_smt = dynamic_to_smt_value(app_result);
+    let eq = smt::smt_eq(&app_smt, &body_val)?;
+
+    // Quantify over all parameters using Dynamic binders
+    let bounds: Vec<&dyn z3::ast::Ast> = bound_dyns
+        .iter()
+        .map(|d| d as &dyn z3::ast::Ast)
+        .collect();
+    let axiom = z3::ast::forall_const(&bounds, &[], &eq);
+
+    push_lambda_axiom(axiom);
+
+    Ok(SmtValue::Func(std::rc::Rc::new((func_decl, domain_sorts, range_sort))))
+}
+
+/// Encode a partial application as a new uninterpreted function.
+///
+/// Given `f(a1, ..., ak)` where `f` has arity `n > k`, creates a fresh
+/// function `g(x_{k+1}, ..., x_n)` with axiom:
+///   `forall x_{k+1}, ..., x_n. g(x_{k+1}, ..., x_n) = f(a1, ..., ak, x_{k+1}, ..., x_n)`
+///
+/// This models currying: `add(1)` creates `inc(y) = add(1, y)`.
+fn encode_partial_application(
+    orig_func: &z3::FuncDecl,
+    param_sorts: &[z3::Sort],
+    range_sort: &z3::Sort,
+    bound_args: &[z3::ast::Dynamic],
+) -> Result<SmtValue, String> {
+    let remaining_param_sorts: Vec<z3::Sort> =
+        param_sorts[bound_args.len()..].to_vec();
+    let remaining_sort_refs: Vec<&z3::Sort> = remaining_param_sorts.iter().collect();
+
+    // Create fresh function symbol for the partial application
+    let partial_id = LAMBDA_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial_name = format!("__partial_{partial_id}");
+    let partial_func =
+        z3::FuncDecl::new(partial_name.as_str(), &remaining_sort_refs, range_sort);
+
+    // Create bound variables for the remaining parameters
+    let mut remaining_vars: Vec<z3::ast::Dynamic> = Vec::new();
+    for (i, sort) in remaining_param_sorts.iter().enumerate() {
+        let var_name = format!("__parg_{partial_id}_{i}");
+        remaining_vars.push(z3::ast::Dynamic::new_const(var_name.as_str(), sort));
+    }
+
+    // Build: g(x_{k+1}, ..., x_n)
+    let partial_arg_refs: Vec<&dyn z3::ast::Ast> =
+        remaining_vars.iter().map(|v| v as &dyn z3::ast::Ast).collect();
+    let partial_app = partial_func.apply(&partial_arg_refs);
+
+    // Build: f(a1, ..., ak, x_{k+1}, ..., x_n)
+    let mut full_args: Vec<z3::ast::Dynamic> = bound_args.to_vec();
+    full_args.extend(remaining_vars.iter().cloned());
+    let full_arg_refs: Vec<&dyn z3::ast::Ast> =
+        full_args.iter().map(|v| v as &dyn z3::ast::Ast).collect();
+    let full_app = orig_func.apply(&full_arg_refs);
+
+    // Definitional axiom: g(remaining) == f(bound, remaining)
+    let eq = partial_app.eq(full_app);
+
+    // Quantify over remaining parameters
+    let bounds: Vec<&dyn z3::ast::Ast> =
+        remaining_vars.iter().map(|v| v as &dyn z3::ast::Ast).collect();
+    let axiom = if !bounds.is_empty() {
+        z3::ast::forall_const(&bounds, &[], &eq)
+    } else {
+        eq
+    };
+
+    push_lambda_axiom(axiom);
+
+    Ok(SmtValue::Func(std::rc::Rc::new((
+        partial_func,
+        remaining_param_sorts,
+        range_sort.clone(),
+    ))))
 }
 
 /// Encode a literal value to Z3.
@@ -2406,7 +3491,7 @@ fn encode_pure_match(
     for arm in arms.iter().rev() {
         let arm_cond = encode_pattern_cond(scrut, &arm.pattern, env, vctx)?;
         let mut arm_env = env.clone();
-        bind_pattern_vars(&arm.pattern, scrut, &mut arm_env)?;
+        bind_pattern_vars(&arm.pattern, scrut, &mut arm_env, vctx)?;
 
         let full_cond = if let Some(guard) = &arm.guard {
             let guard_val = encode_pure_expr_inner(guard, &arm_env, vctx, defs, precheck)?;
@@ -2430,7 +3515,28 @@ fn encode_pure_match(
     result.ok_or_else(|| "empty match".to_owned())
 }
 
+/// Find the ADT sort that matches a scrutinee's Z3 sort.
+/// Returns `(enum_name, &DatatypeSort)` if found.
+fn resolve_scrut_adt<'a>(
+    scrut: &SmtValue,
+    vctx: &'a VerifyContext,
+) -> Option<(&'a str, &'a z3::DatatypeSort)> {
+    if let SmtValue::Dynamic(d) = scrut {
+        use z3::ast::Ast;
+        let scrut_sort = d.get_sort().to_string();
+        for (name, dt) in &vctx.adt_sorts {
+            if dt.sort.to_string() == scrut_sort {
+                return Some((name.as_str(), dt));
+            }
+        }
+    }
+    None
+}
+
 /// Encode a pattern match condition as a Z3 Bool.
+///
+/// Constructor patterns are resolved against the scrutinee's ADT sort
+/// (type-directed), not by scanning all ADTs globally.
 fn encode_pattern_cond(
     scrut: &SmtValue,
     pattern: &crate::ir::types::IRPattern,
@@ -2441,6 +3547,23 @@ fn encode_pattern_cond(
     match pattern {
         IRPattern::PWild | IRPattern::PVar { .. } => Ok(Bool::from_bool(true)),
         IRPattern::PCtor { name, .. } => {
+            // Type-directed: resolve against the scrutinee's ADT sort
+            if let Some((_enum_name, dt)) = resolve_scrut_adt(scrut, vctx) {
+                for variant in &dt.variants {
+                    let ctor_name = variant.constructor.name();
+                    if ctor_name == *name
+                        || format!("{_enum_name}::{ctor_name}") == *name
+                    {
+                        let scrut_dyn = scrut.to_dynamic();
+                        let result = variant.tester.apply(&[&scrut_dyn]);
+                        return result
+                            .as_bool()
+                            .ok_or_else(|| format!("ADT tester did not return Bool for {name}"));
+                    }
+                }
+                return Err(format!("unknown constructor '{name}' for enum '{_enum_name}'"));
+            }
+            // Fallback: flat Int encoding for fieldless enums
             let scrut_int = scrut.as_int()?;
             for ((type_name, variant_name), id) in &vctx.variants.to_id {
                 if variant_name == name || format!("{type_name}::{variant_name}") == *name {
@@ -2459,12 +3582,14 @@ fn encode_pattern_cond(
 
 /// Bind pattern variables into the environment.
 ///
-/// Returns Err if the pattern uses constructor field destructuring, which
-/// requires algebraic datatype encoding not yet available in fn contracts.
+/// For ADT-encoded enums with constructor fields, extracts field values
+/// using Z3 datatype accessor functions. For fieldless enums, no bindings
+/// are needed from the constructor itself.
 fn bind_pattern_vars(
     pattern: &crate::ir::types::IRPattern,
     scrut: &SmtValue,
     env: &mut HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
 ) -> Result<(), String> {
     use crate::ir::types::IRPattern;
     match pattern {
@@ -2473,16 +3598,61 @@ fn bind_pattern_vars(
             Ok(())
         }
         IRPattern::PWild => Ok(()),
-        IRPattern::PCtor { fields, .. } => {
-            if !fields.is_empty() {
-                return Err(crate::messages::FN_CTOR_FIELDS_UNSUPPORTED.to_owned());
+        IRPattern::PCtor { name, fields } => {
+            if fields.is_empty() {
+                return Ok(());
             }
-            Ok(())
+            // Type-directed: resolve against the scrutinee's ADT sort
+            if let Some((_enum_name, dt)) = resolve_scrut_adt(scrut, vctx) {
+                for variant in &dt.variants {
+                    let ctor_name = variant.constructor.name();
+                    if ctor_name == *name
+                        || !_enum_name.is_empty() && format!("{_enum_name}::{ctor_name}") == *name
+                    {
+                        // Extract fields by name — match each pattern field to
+                        // the accessor with the same name, not by position.
+                        let scrut_dyn = scrut.to_dynamic();
+                        for field_pat in fields {
+                            let accessor = variant
+                                .accessors
+                                .iter()
+                                .find(|a| a.name() == field_pat.name)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "unknown field '{}' in pattern for constructor '{name}'",
+                                        field_pat.name
+                                    )
+                                })?;
+                            let field_val = accessor.apply(&[&scrut_dyn]);
+                            let smt_val = dynamic_to_smt_value(field_val);
+                            bind_pattern_vars(&field_pat.pattern, &smt_val, env, vctx)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            Err(format!(
+                "constructor field destructuring requires algebraic datatype encoding — \
+                 enum variant '{name}' not found in registered ADT sorts"
+            ))
         }
         IRPattern::POr { left, right } => {
-            bind_pattern_vars(left, scrut, env)?;
-            bind_pattern_vars(right, scrut, env)
+            bind_pattern_vars(left, scrut, env, vctx)?;
+            bind_pattern_vars(right, scrut, env, vctx)
         }
+    }
+}
+
+/// Convert a Z3 Dynamic value to an SmtValue, attempting type-specific conversions.
+fn dynamic_to_smt_value(d: z3::ast::Dynamic) -> SmtValue {
+    if let Some(i) = d.as_int() {
+        SmtValue::Int(i)
+    } else if let Some(b) = d.as_bool() {
+        SmtValue::Bool(b)
+    } else if let Some(r) = d.as_real() {
+        SmtValue::Real(r)
+    } else {
+        SmtValue::Dynamic(d)
     }
 }
 
@@ -2551,6 +3721,8 @@ fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
         | IRExpr::MapLit { span, .. }
         | IRExpr::SetComp { span, .. }
         | IRExpr::Card { span, .. }
+        | IRExpr::Assert { span, .. }
+        | IRExpr::Assume { span, .. }
         | IRExpr::Sorry { span, .. }
         | IRExpr::Todo { span, .. }
         | IRExpr::Block { span, .. }
@@ -4922,6 +6094,8 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
             elements.iter().find_map(find_unsupported_scene_expr)
         }
         IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
+        IRExpr::Assert { .. } => Some("Assert"),
+        IRExpr::Assume { .. } => Some("Assume"),
         IRExpr::Block { .. } => Some("Block"),
         IRExpr::VarDecl { .. } => Some("VarDecl"),
         IRExpr::While { .. } => Some("While"),
@@ -5630,6 +6804,7 @@ fn extract_counterexample(
                             SmtValue::Array(a) => model
                                 .eval(a, true)
                                 .map_or_else(|| "?".to_owned(), |v| format!("{v}")),
+                            SmtValue::Func(_) => "?".to_owned(),
                         };
                         let entity_label = if n_slots > 1 {
                             format!("{}[{}]", entity.name, slot)
@@ -5699,6 +6874,14 @@ impl std::fmt::Display for VerificationResult {
             VerificationResult::FnContractProved { name, time_ms, .. } => {
                 write!(f, "PROVED  fn {name} (contract, {time_ms}ms)")
             }
+            VerificationResult::FnContractAdmitted {
+                name,
+                reason,
+                time_ms,
+                ..
+            } => {
+                write!(f, "ADMITTED fn {name} ({reason}, {time_ms}ms)")
+            }
             VerificationResult::FnContractFailed {
                 name,
                 counterexample,
@@ -5728,10 +6911,10 @@ mod tests {
             name: "OrderStatus".to_owned(),
             ty: IRType::Enum {
                 name: "OrderStatus".to_owned(),
-                constructors: vec![
-                    "Pending".to_owned(),
-                    "Confirmed".to_owned(),
-                    "Shipped".to_owned(),
+                variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
                 ],
             },
         };
@@ -5748,11 +6931,11 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "OrderStatus".to_owned(),
-                        constructors: vec![
-                            "Pending".to_owned(),
-                            "Confirmed".to_owned(),
-                            "Shipped".to_owned(),
-                        ],
+                        variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
+                ],
                     },
                     default: None,
                 },
@@ -5772,7 +6955,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -5784,7 +6967,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -5944,7 +7127,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -5988,7 +7171,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     },
@@ -6226,7 +7409,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Active".to_owned(), "Locked".to_owned()],
+                variants: vec![IRVariant::simple("Active"), IRVariant::simple("Locked")],
             },
         };
 
@@ -6242,12 +7425,12 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "Status".to_owned(),
-                        constructors: vec!["Active".to_owned(), "Locked".to_owned()],
+                        variants: vec![IRVariant::simple("Active"), IRVariant::simple("Locked")],
                     },
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                 },
@@ -6267,7 +7450,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -6279,7 +7462,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Locked".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -6387,7 +7570,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -6435,7 +7618,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Locked".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,
@@ -6485,7 +7668,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -6534,7 +7717,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,
@@ -6665,7 +7848,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     },
@@ -6702,7 +7885,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -6815,7 +7998,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -6858,7 +8041,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "OrderStatus".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     },
@@ -8768,7 +9951,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
             },
         };
 
@@ -8784,12 +9967,12 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "Status".to_owned(),
-                        constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                        variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
                     },
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                 },
@@ -8809,7 +9992,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -8821,7 +10004,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -8907,7 +10090,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,
@@ -8982,7 +10165,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
             },
         };
 
@@ -8992,12 +10175,12 @@ mod tests {
                 name: "status".to_owned(),
                 ty: IRType::Enum {
                     name: "Status".to_owned(),
-                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                    variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
                 },
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
             }],
@@ -9122,7 +10305,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
             },
         };
 
@@ -9132,12 +10315,12 @@ mod tests {
                 name: "status".to_owned(),
                 ty: IRType::Enum {
                     name: "Status".to_owned(),
-                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                    variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
                 },
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
             }],
@@ -9207,7 +10390,7 @@ mod tests {
         let idle_id = IRExpr::Ctor {
             enum_name: "Status".to_owned(),
             ctor: "Idle".to_owned(),
-
+            args: vec![],
             span: None,
         };
         let proj_at_idle = IRExpr::Index {
@@ -9708,7 +10891,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
             },
         };
 
@@ -9718,12 +10901,12 @@ mod tests {
                 name: "status".to_owned(),
                 ty: IRType::Enum {
                     name: "Status".to_owned(),
-                    constructors: vec!["Idle".to_owned(), "Active".to_owned()],
+                    variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
                 },
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Idle".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
             }],
@@ -9742,7 +10925,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Idle".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -9754,7 +10937,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Active".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -9840,7 +11023,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Active".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,
@@ -10231,7 +11414,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["On".to_owned(), "Off".to_owned()],
+                variants: vec![IRVariant::simple("On"), IRVariant::simple("Off")],
             },
         };
         let entity = IREntity {
@@ -10240,12 +11423,12 @@ mod tests {
                 name: "status".to_owned(),
                 ty: IRType::Enum {
                     name: "Status".to_owned(),
-                    constructors: vec!["On".to_owned(), "Off".to_owned()],
+                    variants: vec![IRVariant::simple("On"), IRVariant::simple("Off")],
                 },
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Off".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
             }],
@@ -10264,7 +11447,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "On".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -10349,7 +11532,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Off".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,

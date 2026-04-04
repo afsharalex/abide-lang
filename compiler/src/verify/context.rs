@@ -88,14 +88,16 @@ pub struct ActionInfo {
 /// All metadata needed for Z3 encoding, extracted from the IR.
 ///
 /// Built once per verification run. Shared across all verify/scene/theorem checks.
-#[derive(Debug)]
 pub struct VerifyContext {
-    /// Enum variant → integer ID mapping
+    /// Enum variant → integer ID mapping (for fieldless enums)
     pub variants: VariantMap,
     /// Enum type → (`min_id`, `max_id`) for domain constraints
     pub enum_ranges: HashMap<String, (i64, i64)>,
     /// Entity name → field/action metadata
     pub entities: HashMap<String, EntityInfo>,
+    /// Z3 algebraic datatypes for enums with constructor fields.
+    /// Maps enum name → DatatypeSort (sort + variant constructors/testers/accessors).
+    pub adt_sorts: HashMap<String, z3::DatatypeSort>,
 }
 
 impl VerifyContext {
@@ -104,15 +106,39 @@ impl VerifyContext {
         let mut variants = VariantMap::new();
         let mut enum_ranges = HashMap::new();
         let mut entities = HashMap::new();
+        let mut adt_sorts = HashMap::new();
 
         // Register all enum types
         for ty_entry in &ir.types {
             if let IRType::Enum {
-                name, constructors, ..
+                name, variants: vs, ..
             } = &ty_entry.ty
             {
-                let (min, max) = variants.register_enum(name, constructors);
+                let ctor_names: Vec<String> = vs.iter().map(|v| v.name.clone()).collect();
+                let (min, max) = variants.register_enum(name, &ctor_names);
                 enum_ranges.insert(name.clone(), (min, max));
+
+                // Build Z3 ADT for enums with constructor fields
+                if vs.iter().any(|v| !v.fields.is_empty()) {
+                    let mut builder = z3::DatatypeBuilder::new(name.as_str());
+                    for v in vs {
+                        let fields: Vec<(&str, z3::DatatypeAccessor)> = v
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                (
+                                    f.name.as_str(),
+                                    z3::DatatypeAccessor::Sort(
+                                        crate::verify::smt::ir_type_to_sort(&f.ty),
+                                    ),
+                                )
+                            })
+                            .collect();
+                        builder = builder.variant(&v.name, fields);
+                    }
+                    let dt = builder.finish();
+                    adt_sorts.insert(name.clone(), dt);
+                }
             }
         }
 
@@ -152,6 +178,7 @@ impl VerifyContext {
             variants,
             enum_ranges,
             entities,
+            adt_sorts,
         }
     }
 }

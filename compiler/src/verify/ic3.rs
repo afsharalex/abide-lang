@@ -2596,10 +2596,10 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec![
-                    "Pending".to_owned(),
-                    "Confirmed".to_owned(),
-                    "Shipped".to_owned(),
+                variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
                 ],
             },
         };
@@ -2616,16 +2616,16 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "Status".to_owned(),
-                        constructors: vec![
-                            "Pending".to_owned(),
-                            "Confirmed".to_owned(),
-                            "Shipped".to_owned(),
-                        ],
+                        variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
+                ],
                     },
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                 },
@@ -2656,7 +2656,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -2668,7 +2668,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     }],
@@ -2689,7 +2689,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -2701,7 +2701,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Shipped".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     }],
@@ -2832,7 +2832,7 @@ mod tests {
             right: Box::new(IRExpr::Ctor {
                 enum_name: "Status".to_owned(),
                 ctor: "Pending".to_owned(),
-
+                args: vec![],
                 span: None,
             }),
             ty: IRType::Bool,
@@ -2866,7 +2866,7 @@ mod tests {
             right: Box::new(IRExpr::Ctor {
                 enum_name: "Status".to_owned(),
                 ctor: "Pending".to_owned(),
-
+                args: vec![],
                 span: None,
             }),
             ty: IRType::Bool,
@@ -3174,7 +3174,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -3391,7 +3391,7 @@ mod tests {
             name: "OrderStatus".to_owned(),
             ty: IRType::Enum {
                 name: "OrderStatus".to_owned(),
-                constructors: vec!["Pending".to_owned(), "Confirmed".to_owned()],
+                variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Confirmed")],
             },
         };
 
@@ -3417,12 +3417,12 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "OrderStatus".to_owned(),
-                        constructors: vec!["Pending".to_owned(), "Confirmed".to_owned()],
+                        variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Confirmed")],
                     },
                     default: Some(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                 },
@@ -3442,7 +3442,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -3454,7 +3454,7 @@ mod tests {
                     value: IRExpr::Ctor {
                         enum_name: "OrderStatus".to_owned(),
                         ctor: "Confirmed".to_owned(),
-
+                        args: vec![],
                         span: None,
                     },
                 }],
@@ -3555,10 +3555,10 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec![
-                    "Pending".to_owned(),
-                    "Confirmed".to_owned(),
-                    "Shipped".to_owned(),
+                variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
                 ],
             },
         };
@@ -3575,16 +3575,16 @@ mod tests {
                     name: "status".to_owned(),
                     ty: IRType::Enum {
                         name: "Status".to_owned(),
-                        constructors: vec![
-                            "Pending".to_owned(),
-                            "Confirmed".to_owned(),
-                            "Shipped".to_owned(),
-                        ],
+                        variants: vec![
+                    IRVariant::simple("Pending"),
+                    IRVariant::simple("Confirmed"),
+                    IRVariant::simple("Shipped"),
+                ],
                     },
                     default: Some(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                 },
@@ -3615,7 +3615,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -3627,7 +3627,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     }],
@@ -3648,7 +3648,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Confirmed".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -3660,7 +3660,7 @@ mod tests {
                         value: IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Shipped".to_owned(),
-
+                            args: vec![],
                             span: None,
                         },
                     }],
@@ -3697,7 +3697,7 @@ mod tests {
                         right: Box::new(IRExpr::Ctor {
                             enum_name: "Status".to_owned(),
                             ctor: "Pending".to_owned(),
-
+                            args: vec![],
                             span: None,
                         }),
                         ty: IRType::Bool,
@@ -3805,7 +3805,7 @@ mod tests {
             name: "Status".to_owned(),
             ty: IRType::Enum {
                 name: "Status".to_owned(),
-                constructors: vec!["Pending".to_owned(), "Done".to_owned()],
+                variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
             },
         };
 
@@ -3815,12 +3815,12 @@ mod tests {
                 name: "status".to_owned(),
                 ty: IRType::Enum {
                     name: "Status".to_owned(),
-                    constructors: vec!["Pending".to_owned(), "Done".to_owned()],
+                    variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
                 },
                 default: Some(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: "Pending".to_owned(),
-
+                    args: vec![],
                     span: None,
                 }),
             }],
@@ -4384,7 +4384,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Pending".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,
@@ -4452,7 +4452,7 @@ mod tests {
                     right: Box::new(IRExpr::Ctor {
                         enum_name: "Status".to_owned(),
                         ctor: "Shipped".to_owned(),
-
+                        args: vec![],
                         span: None,
                     }),
                     ty: IRType::Bool,

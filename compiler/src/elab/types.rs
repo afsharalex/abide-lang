@@ -326,6 +326,7 @@ pub enum EExpr {
     Always(Ty, Box<EExpr>, Option<crate::span::Span>),
     Eventually(Ty, Box<EExpr>, Option<crate::span::Span>),
     Assert(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Assume(Ty, Box<EExpr>, Option<crate::span::Span>),
     Assign(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
     NamedPair(Ty, String, Box<EExpr>, Option<crate::span::Span>),
     Seq(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
@@ -396,6 +397,15 @@ pub enum EExpr {
         Option<Box<EExpr>>,
         Option<crate::span::Span>,
     ),
+    /// Record constructor: @Some { value: 1 }
+    /// CtorRecord(ty, qualifier, ctor_name, fields, span)
+    CtorRecord(
+        Ty,
+        Option<String>,
+        String,
+        Vec<(String, EExpr)>,
+        Option<crate::span::Span>,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -423,6 +433,7 @@ impl EExpr {
             | Self::Always(ty, _, _)
             | Self::Eventually(ty, _, _)
             | Self::Assert(ty, _, _)
+            | Self::Assume(ty, _, _)
             | Self::Assign(ty, _, _, _)
             | Self::NamedPair(ty, _, _, _)
             | Self::Seq(ty, _, _, _)
@@ -445,6 +456,7 @@ impl EExpr {
             Self::VarDecl(_, _, _, rest, _) => rest.ty(),
             Self::While(_, _, _, _) => Ty::Unresolved(String::new()),
             Self::IfElse(_, then_body, _, _) => then_body.ty(),
+            Self::CtorRecord(ty, _, _, _, _) => ty.clone(),
             Self::Sorry(_) | Self::Todo(_) | Self::Lam(_, _, _, _) | Self::Unresolved(_, _) => {
                 Ty::Unresolved(String::new())
             }

@@ -231,7 +231,9 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
         }
         IRExpr::Always { body, .. }
         | IRExpr::Eventually { body, .. }
-        | IRExpr::Prime { expr: body, .. } => {
+        | IRExpr::Prime { expr: body, .. }
+        | IRExpr::Assert { expr: body, .. }
+        | IRExpr::Assume { expr: body, .. } => {
             free_vars_inner(body, bound, fv);
         }
         IRExpr::Match {
@@ -564,6 +566,14 @@ fn substitute_var_inner(
         IRExpr::Prime { expr, .. } => IRExpr::Prime {
             expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
             span: None,
+        },
+        IRExpr::Assert { expr, span } => IRExpr::Assert {
+            expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+            span,
+        },
+        IRExpr::Assume { expr, span } => IRExpr::Assume {
+            expr: Box::new(substitute_var_inner(*expr, var_name, replacement, repl_fv)),
+            span,
         },
         IRExpr::Match {
             scrutinee, arms, ..

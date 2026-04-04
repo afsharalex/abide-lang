@@ -404,14 +404,22 @@ Set quantifiers with formal semantics. `all`/`exists` are standard logical quant
 
 ---
 
-### Sorry and Todo
+### Sorry, Todo, Assert, Assume
 
 ```abide
-fn calculate_risk(o: Order): Real = sorry
-fn validate_address(a: Address): Bool = todo
+fn calculate_risk(o: Order): Real = sorry   // ADMITTED — skips all verification
+fn validate_address(a: Address): Bool = todo // verification error — implementation missing
+
+fn checked_divide(a: Int, b: Int): Int
+  requires b != 0
+{
+  assert b != 0    // VC: proved from requires, then available as fact
+  assume a >= 0    // trusted assumption (function reports ADMITTED)
+  a / b
+}
 ```
 
-`sorry` = "trust me, this is valid" (silent, for deliberate stubs). `todo` = "this is unfinished" (compiler warns). Both compile and act as valid expressions of any type.
+`sorry` = admits the entire proof obligation (postcondition + termination). Reports `ADMITTED`. `todo` = placeholder that causes a verification error. `assert` = verifier-checked assertion (generates a VC). `assume` = trusted assumption (no VC, function reports `ADMITTED`).
 
 `Stable`
 

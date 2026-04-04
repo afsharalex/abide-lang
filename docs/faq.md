@@ -67,12 +67,17 @@ The constructs most likely to evolve: theorem block internals, module system, tr
 
 ### What does `sorry` do?
 
-`sorry` is a stub expression that the compiler accepts as valid at any type. It lets you sketch a specification top-down — define the structure first, then fill in details later. `sorry` is silent (no warnings by default). `todo` is similar but emits a compiler warning.
+`sorry` admits a function's entire proof obligation — postcondition, termination, everything. The function reports `ADMITTED` instead of `PROVED`, making it visually clear that the proof is incomplete. This is analogous to Lean's `sorry` or Agda's `postulate`.
 
 ```abide
-fn risk_score(o: Order): Real = sorry     // will implement later
-fn validate(a: Address): Bool = todo       // not yet written, compiler warns
+fn risk_score(o: Order): Real
+  ensures result >= 0.0
+{
+  sorry     // reports: ADMITTED fn risk_score (sorry in body, 0ms)
+}
 ```
+
+`todo` is similar but causes a verification error (not admission). Use `sorry` when you intend to prove later; use `todo` when the implementation is missing.
 
 ### How do I express "this should never happen"?
 

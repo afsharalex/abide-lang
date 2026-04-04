@@ -254,12 +254,59 @@ The `$` placeholder references the value being constrained. Refinement predicate
 
 > **Note:** Refinement types are not allowed on return types — use `ensures` for return value constraints. This keeps the grammar unambiguous with imperative function bodies.
 
+**Imperative verification statements** — `assert` and `assume` can appear in function bodies:
+
+```abide
+fn checked_divide(a: Int, b: Int): Int
+  requires b != 0
+{
+  assert b != 0     // VC: proved from requires, then available as fact
+  assume a >= 0     // user-asserted without proof (reported as ADMITTED)
+  a / b
+}
+```
+
+- `assert P` generates a verification condition — the verifier proves `P` holds at that point, then `P` is available as a fact for subsequent code. If the assertion cannot be proved, the function reports a verification failure.
+- `assume P` adds `P` as an assumption without proof. Functions containing `assume` are reported as `ADMITTED` instead of `PROVED`.
+- `sorry` admits the entire proof obligation — the function reports `ADMITTED` and skips all verification (postcondition, termination, everything).
+
+**Quantifiers, collections, and data types** are supported in function contracts:
+
+```abide
+// Quantifiers in ensures/requires (Z3 native encoding)
+fn identity(x: Int): Int
+  ensures all y: Int | result >= y implies x >= y
+{ x }
+
+// Set operations: cardinality and set comprehension
+fn count(): Int
+  ensures result == 3
+{ #Set(1, 2, 3) }
+
+// Constructor field destructuring (Z3 algebraic datatypes)
+enum Shape = Circle { radius: Int } | Rect { w: Int, h: Int }
+
+fn perimeter(s: Shape): Int
+{
+  match s {
+    Circle { radius: r } => 2 * r
+    Rect { w: w, h: h } => 2 * (w + h)
+  }
+}
+
+// Lambda expressions (uninterpreted functions + axioms)
+fn apply(): Int
+  ensures result == 2
+{ (fn(y: Int): Int => y + 1)(1) }
+```
+
 **Verification model** — function contracts are verified automatically by `abide verify`:
 
 - **Postcondition verification:** For each fn with `ensures`, the verifier proves that the body satisfies the postcondition given the precondition. While loops are verified via Hoare logic (invariant init, preservation, and termination).
 - **Call-site precondition checking:** At every call site, the verifier proves that the arguments satisfy the callee's `requires`. This includes refinement-type predicates, which desugar to `requires`.
 - **Termination verification:** For recursive functions with `decreases`, the verifier proves that each recursive call strictly decreases the measure and satisfies the callee's precondition.
 - **Modular verification:** Recursive calls trust the function's own `ensures` (proved by induction over the decreasing measure). Each function is verified in isolation — the verifier does not inline recursive bodies.
+- **Assert/assume:** `assert` generates a VC at each occurrence. `assume` strengthens the proof context without proof. Functions with `assume` or `sorry` report `ADMITTED`.
 
 At this layer, you're answering: *"Is this specific algorithm correct?"*
 

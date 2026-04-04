@@ -37,85 +37,122 @@ fn canonical<'a>(aliases: &'a std::collections::HashMap<String, String>, name: &
 pub fn lower(er: &E::ElabResult) -> IRProgram {
     let a = &er.aliases;
 
+    // Build variant info map from elaborated types so that lower_ty can
+    // carry constructor field information into IRType::Enum.
+    let variant_info: std::collections::HashMap<String, &[E::EVariant]> = er
+        .types
+        .iter()
+        .map(|t| (t.name.clone(), t.variants.as_slice()))
+        .collect();
+
     // All definitions (fn, pred, prop) are lowered uniformly into IRFunction.
     // pred is fn -> Bool with params. prop is nullary fn -> Bool.
     let mut functions: Vec<IRFunction> = Vec::new();
     for f in &er.fns {
-        functions.push(lower_fn(f));
+        functions.push(lower_fn(f, &variant_info));
     }
     for pred in &er.preds {
-        functions.push(lower_pred(pred));
+        functions.push(lower_pred(pred, &variant_info));
     }
     for prop in &er.props {
-        functions.push(lower_prop(prop));
+        functions.push(lower_prop(prop, &variant_info));
     }
 
     IRProgram {
-        types: er.types.iter().map(lower_type).collect(),
-        constants: er.consts.iter().map(lower_const).collect(),
+        types: er.types.iter().map(|t| lower_type(t, &variant_info)).collect(),
+        constants: er.consts.iter().map(|c| lower_const(c, &variant_info)).collect(),
         functions,
-        entities: er.entities.iter().map(lower_entity).collect(),
-        systems: er.systems.iter().map(|s| lower_system(s, a)).collect(),
-        verifies: er.verifies.iter().map(|v| lower_verify(v, a)).collect(),
-        theorems: er.theorems.iter().map(|t| lower_theorem(t, a)).collect(),
-        axioms: er.axioms.iter().map(lower_axiom).collect(),
-        scenes: er.scenes.iter().map(|s| lower_scene(s, a)).collect(),
+        entities: er.entities.iter().map(|e| lower_entity(e, &variant_info)).collect(),
+        systems: er.systems.iter().map(|s| lower_system(s, a, &variant_info)).collect(),
+        verifies: er.verifies.iter().map(|v| lower_verify(v, a, &variant_info)).collect(),
+        theorems: er.theorems.iter().map(|t| lower_theorem(t, a, &variant_info)).collect(),
+        axioms: er.axioms.iter().map(|ax| lower_axiom(ax, &variant_info)).collect(),
+        scenes: er.scenes.iter().map(|s| lower_scene(s, a, &variant_info)).collect(),
     }
 }
 
 // ── Types ────────────────────────────────────────────────────────────
 
-fn lower_type(et: &E::EType) -> IRTypeEntry {
+type VariantInfo<'a> = std::collections::HashMap<String, &'a [E::EVariant]>;
+
+fn lower_type(et: &E::EType, vi: &VariantInfo<'_>) -> IRTypeEntry {
     IRTypeEntry {
         name: et.name.clone(),
-        ty: lower_ty(&et.ty),
+        ty: lower_ty(&et.ty, vi),
     }
 }
 
-fn lower_ty(ty: &E::Ty) -> IRType {
+fn lower_ty(ty: &E::Ty, vi: &VariantInfo<'_>) -> IRType {
     match ty {
-        E::Ty::Enum(n, cs) => IRType::Enum {
-            name: n.clone(),
-            constructors: cs.clone(),
-        },
+        E::Ty::Enum(n, cs) => {
+            // Look up field info from the elab variant map
+            let variants = if let Some(elab_variants) = vi.get(n.as_str()) {
+                elab_variants
+                    .iter()
+                    .map(|ev| match ev {
+                        E::EVariant::Simple(name) => super::types::IRVariant::simple(name),
+                        E::EVariant::Record(name, fields) => super::types::IRVariant {
+                            name: name.clone(),
+                            fields: fields
+                                .iter()
+                                .map(|(fname, fty)| super::types::IRVariantField {
+                                    name: fname.clone(),
+                                    ty: lower_ty(fty, vi),
+                                })
+                                .collect(),
+                        },
+                        E::EVariant::Param(name, _tys) => super::types::IRVariant::simple(name),
+                    })
+                    .collect()
+            } else {
+                // Fallback: no elab info, treat all constructors as fieldless
+                cs.iter()
+                    .map(|c| super::types::IRVariant::simple(c))
+                    .collect()
+            };
+            IRType::Enum {
+                name: n.clone(),
+                variants,
+            }
+        }
         E::Ty::Record(n, fs) => IRType::Record {
             name: n.clone(),
             fields: fs
                 .iter()
                 .map(|(fn_, ft)| IRRecordField {
                     name: fn_.clone(),
-                    ty: lower_ty(ft),
+                    ty: lower_ty(ft, vi),
                 })
                 .collect(),
         },
-        E::Ty::Alias(_, t) => lower_ty(t),
+        E::Ty::Alias(_, t) => lower_ty(t, vi),
         E::Ty::Builtin(b) => lower_builtin(*b),
         E::Ty::Param(n, _) => IRType::Record {
             name: n.clone(),
             fields: Vec::new(),
         },
         E::Ty::Fn(a, b) => IRType::Fn {
-            param: Box::new(lower_ty(a)),
-            result: Box::new(lower_ty(b)),
+            param: Box::new(lower_ty(a, vi)),
+            result: Box::new(lower_ty(b, vi)),
         },
         E::Ty::Entity(n) => IRType::Entity { name: n.clone() },
         E::Ty::Unresolved(_) => IRType::String,
         E::Ty::Set(a) => IRType::Set {
-            element: Box::new(lower_ty(a)),
+            element: Box::new(lower_ty(a, vi)),
         },
         E::Ty::Seq(a) => IRType::Seq {
-            element: Box::new(lower_ty(a)),
+            element: Box::new(lower_ty(a, vi)),
         },
         E::Ty::Map(k, v) => IRType::Map {
-            key: Box::new(lower_ty(k)),
-            value: Box::new(lower_ty(v)),
+            key: Box::new(lower_ty(k, vi)),
+            value: Box::new(lower_ty(v, vi)),
         },
         E::Ty::Tuple(ts) => IRType::Tuple {
-            elements: ts.iter().map(lower_ty).collect(),
+            elements: ts.iter().map(|t| lower_ty(t, vi)).collect(),
         },
         E::Ty::Refinement(base, pred) => IRType::Refinement {
-            base: Box::new(lower_ty(base)),
-            predicate: Box::new(lower_expr(pred)),
+            base: Box::new(lower_ty(base, vi)),
+            predicate: Box::new(lower_expr(pred, vi)),
         },
     }
 }
@@ -133,25 +170,25 @@ fn lower_builtin(b: E::BuiltinTy) -> IRType {
 
 // ── Constants and Functions ──────────────────────────────────────────
 
-fn lower_const(ec: &E::EConst) -> IRConst {
+fn lower_const(ec: &E::EConst, vi: &VariantInfo<'_>) -> IRConst {
     IRConst {
         name: ec.name.clone(),
-        ty: lower_ty(&ec.body.ty()),
-        value: lower_expr(&ec.body),
+        ty: lower_ty(&ec.body.ty(), vi),
+        value: lower_expr(&ec.body, vi),
     }
 }
 
-fn lower_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Vec<IRExpr>, Option<IRDecreases>) {
+fn lower_contracts(contracts: &[E::EContract], vi: &VariantInfo<'_>) -> (Vec<IRExpr>, Vec<IRExpr>, Option<IRDecreases>) {
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     let mut decreases = None;
     for c in contracts {
         match c {
-            E::EContract::Requires(e) => requires.push(lower_expr(e)),
-            E::EContract::Ensures(e) => ensures.push(lower_expr(e)),
+            E::EContract::Requires(e) => requires.push(lower_expr(e, vi)),
+            E::EContract::Ensures(e) => ensures.push(lower_expr(e, vi)),
             E::EContract::Decreases { measures, star } => {
                 decreases = Some(IRDecreases {
-                    measures: measures.iter().map(lower_expr).collect(),
+                    measures: measures.iter().map(|m| lower_expr(m, vi)).collect(),
                     star: *star,
                 });
             }
@@ -164,15 +201,15 @@ fn lower_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Vec<IRExpr>, Opt
 }
 
 /// Extract invariants and decreases from while-loop contracts.
-fn lower_while_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Option<IRDecreases>) {
+fn lower_while_contracts(contracts: &[E::EContract], vi: &VariantInfo<'_>) -> (Vec<IRExpr>, Option<IRDecreases>) {
     let mut invariants = Vec::new();
     let mut decreases = None;
     for c in contracts {
         match c {
-            E::EContract::Invariant(e) => invariants.push(lower_expr(e)),
+            E::EContract::Invariant(e) => invariants.push(lower_expr(e, vi)),
             E::EContract::Decreases { measures, star } => {
                 decreases = Some(IRDecreases {
-                    measures: measures.iter().map(lower_expr).collect(),
+                    measures: measures.iter().map(|m| lower_expr(m, vi)).collect(),
                     star: *star,
                 });
             }
@@ -182,7 +219,7 @@ fn lower_while_contracts(contracts: &[E::EContract]) -> (Vec<IRExpr>, Option<IRD
     (invariants, decreases)
 }
 
-fn lower_fn(ef: &E::EFn) -> IRFunction {
+fn lower_fn(ef: &E::EFn, vi: &VariantInfo<'_>) -> IRFunction {
     // Extract refinement predicates from params, strip refinement from types.
     // Unwrap Alias wrappers so that alias-based refinements like `x: Positive`
     // (where `type Positive = Int { $ > 0 }`) are handled the same as inline
@@ -200,30 +237,30 @@ fn lower_fn(ef: &E::EFn) -> IRFunction {
         .iter()
         .filter_map(|(name, ty)| {
             if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
-                Some(subst_dollar(name, &lower_expr(pred)))
+                Some(subst_dollar(name, &lower_expr(pred, vi)))
             } else {
                 None
             }
         })
         .collect();
-    let ret_ty = lower_ty(&ef.ret_ty);
+    let ret_ty = lower_ty(&ef.ret_ty, vi);
     let fn_ty = stripped_params
         .iter()
         .rev()
         .fold(ret_ty.clone(), |acc, (_, pt)| IRType::Fn {
-            param: Box::new(lower_ty(pt)),
+            param: Box::new(lower_ty(pt, vi)),
             result: Box::new(acc),
         });
     let body = stripped_params
         .iter()
         .rev()
-        .fold(lower_expr(&ef.body), |acc, (pn, pt)| IRExpr::Lam {
+        .fold(lower_expr(&ef.body, vi), |acc, (pn, pt)| IRExpr::Lam {
             param: pn.clone(),
-            param_type: lower_ty(pt),
+            param_type: lower_ty(pt, vi),
             body: Box::new(acc),
             span: ef.span,
         });
-    let (mut requires, ensures, decreases) = lower_contracts(&ef.contracts);
+    let (mut requires, ensures, decreases) = lower_contracts(&ef.contracts, vi);
     // Prepend refinement-derived requires before explicit contracts
     let mut all_requires = refinement_requires;
     all_requires.append(&mut requires);
@@ -324,22 +361,22 @@ fn subst_dollar(name: &str, expr: &IRExpr) -> IRExpr {
 
 /// Lower a pred to an `IRFunction`. `pred p(x: T) = body` becomes a curried
 /// function returning Bool: `Lam(x, T, body)` with type `T -> Bool`.
-fn lower_pred(ep: &E::EPred) -> IRFunction {
+fn lower_pred(ep: &E::EPred, vi: &VariantInfo<'_>) -> IRFunction {
     let fn_ty = ep
         .params
         .iter()
         .rev()
         .fold(IRType::Bool, |acc, (_, pt)| IRType::Fn {
-            param: Box::new(lower_ty(pt)),
+            param: Box::new(lower_ty(pt, vi)),
             result: Box::new(acc),
         });
     let body = ep
         .params
         .iter()
         .rev()
-        .fold(lower_expr(&ep.body), |acc, (pn, pt)| IRExpr::Lam {
+        .fold(lower_expr(&ep.body, vi), |acc, (pn, pt)| IRExpr::Lam {
             param: pn.clone(),
-            param_type: lower_ty(pt),
+            param_type: lower_ty(pt, vi),
             body: Box::new(acc),
             span: ep.span,
         });
@@ -358,11 +395,11 @@ fn lower_pred(ep: &E::EPred) -> IRFunction {
 
 /// Lower a prop to an `IRFunction`. `prop p = body` becomes a nullary function
 /// returning Bool: body is the expression, type is `Bool`.
-fn lower_prop(ep: &E::EProp) -> IRFunction {
+fn lower_prop(ep: &E::EProp, vi: &VariantInfo<'_>) -> IRFunction {
     IRFunction {
         name: ep.name.clone(),
         ty: IRType::Bool,
-        body: lower_expr(&ep.body),
+        body: lower_expr(&ep.body, vi),
         prop_target: ep.target.clone(),
         requires: vec![],
         ensures: vec![],
@@ -374,23 +411,23 @@ fn lower_prop(ep: &E::EProp) -> IRFunction {
 
 // ── Entities ─────────────────────────────────────────────────────────
 
-fn lower_entity(ee: &E::EEntity) -> IREntity {
+fn lower_entity(ee: &E::EEntity, vi: &VariantInfo<'_>) -> IREntity {
     IREntity {
         name: ee.name.clone(),
-        fields: ee.fields.iter().map(lower_field).collect(),
-        transitions: ee.actions.iter().map(lower_action).collect(),
+        fields: ee.fields.iter().map(|f| lower_field(f, vi)).collect(),
+        transitions: ee.actions.iter().map(|a| lower_action(a, vi)).collect(),
     }
 }
 
-fn lower_field(ef: &E::EField) -> IRField {
+fn lower_field(ef: &E::EField, vi: &VariantInfo<'_>) -> IRField {
     IRField {
         name: ef.name.clone(),
-        ty: lower_ty(&ef.ty),
-        default: ef.default.as_ref().map(lower_expr),
+        ty: lower_ty(&ef.ty, vi),
+        default: ef.default.as_ref().map(|d| lower_expr(d, vi)),
     }
 }
 
-fn lower_action(ea: &E::EAction) -> IRTransition {
+fn lower_action(ea: &E::EAction, vi: &VariantInfo<'_>) -> IRTransition {
     // Extract refinement predicates from params and add to guard
     let refinement_reqs = extract_param_refinements(&ea.params);
     let mut all_requires: Vec<&E::EExpr> = refinement_reqs.iter().collect();
@@ -415,12 +452,12 @@ fn lower_action(ea: &E::EAction) -> IRTransition {
                 };
                 IRTransParam {
                     name: pn.clone(),
-                    ty: lower_ty(base_ty),
+                    ty: lower_ty(base_ty, vi),
                 }
             })
             .collect(),
-        guard: lower_guard_refs(&all_requires),
-        updates: extract_updates(&ea.body),
+        guard: lower_guard_refs(&all_requires, vi),
+        updates: extract_updates(&ea.body, vi),
         postcondition: None,
     }
 }
@@ -458,43 +495,43 @@ fn subst_dollar_elab(name: &str, expr: &E::EExpr) -> E::EExpr {
 }
 
 /// Lower a list of expression references (not owned) to a conjunction guard.
-fn lower_guard_refs(reqs: &[&E::EExpr]) -> IRExpr {
+fn lower_guard_refs(reqs: &[&E::EExpr], vi: &VariantInfo<'_>) -> IRExpr {
     match reqs {
         [] => IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
             span: None,
         },
-        [e] => lower_expr(e),
+        [e] => lower_expr(e, vi),
         [e, rest @ ..] => IRExpr::BinOp {
             op: "OpAnd".to_owned(),
-            left: Box::new(lower_expr(e)),
-            right: Box::new(lower_guard_refs(rest)),
+            left: Box::new(lower_expr(e, vi)),
+            right: Box::new(lower_guard_refs(rest, vi)),
             ty: IRType::Bool,
             span: None,
         },
     }
 }
 
-fn lower_guard(reqs: &[E::EExpr]) -> IRExpr {
+fn lower_guard(reqs: &[E::EExpr], vi: &VariantInfo<'_>) -> IRExpr {
     match reqs {
         [] => IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
             span: None,
         },
-        [e] => lower_expr(e),
+        [e] => lower_expr(e, vi),
         [e, rest @ ..] => IRExpr::BinOp {
             op: "OpAnd".to_owned(),
-            left: Box::new(lower_expr(e)),
-            right: Box::new(lower_guard(rest)),
+            left: Box::new(lower_expr(e, vi)),
+            right: Box::new(lower_guard(rest, vi)),
             ty: IRType::Bool,
             span: None,
         },
     }
 }
 
-fn extract_updates(body: &[E::EExpr]) -> Vec<IRUpdate> {
+fn extract_updates(body: &[E::EExpr], vi: &VariantInfo<'_>) -> Vec<IRUpdate> {
     body.iter()
         .filter_map(|e| {
             if let E::EExpr::Assign(_, lhs, rhs, _) = e {
@@ -502,7 +539,7 @@ fn extract_updates(body: &[E::EExpr]) -> Vec<IRUpdate> {
                     if let E::EExpr::Var(_, field, _) = inner.as_ref() {
                         return Some(IRUpdate {
                             field: field.clone(),
-                            value: lower_expr(rhs),
+                            value: lower_expr(rhs, vi),
                         });
                     }
                 }
@@ -514,20 +551,20 @@ fn extract_updates(body: &[E::EExpr]) -> Vec<IRUpdate> {
 
 // ── Systems ──────────────────────────────────────────────────────────
 
-fn lower_system(es: &E::ESystem, aliases: &std::collections::HashMap<String, String>) -> IRSystem {
+fn lower_system(es: &E::ESystem, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRSystem {
     IRSystem {
         name: es.name.clone(),
         entities: es.uses.iter().map(|u| canonical(aliases, u).to_owned()).collect(),
-        events: es.events.iter().map(|ev| lower_event(ev, aliases)).collect(),
-        schedule: lower_schedule(&es.next_items),
+        events: es.events.iter().map(|ev| lower_event(ev, aliases, vi)).collect(),
+        schedule: lower_schedule(&es.next_items, vi),
     }
 }
 
-fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, String>) -> IREvent {
+fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IREvent {
     let post = if ev.ensures.is_empty() {
         None
     } else {
-        Some(lower_guard(&ev.ensures))
+        Some(lower_guard(&ev.ensures, vi))
     };
     // Extract refinement predicates from params and add to guard
     let refinement_reqs = extract_param_refinements(&ev.params);
@@ -545,31 +582,32 @@ fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, Strin
                 };
                 IRTransParam {
                     name: pn.clone(),
-                    ty: lower_ty(base_ty),
+                    ty: lower_ty(base_ty, vi),
                 }
             })
             .collect(),
-        guard: lower_guard_refs(&all_requires),
+        guard: lower_guard_refs(&all_requires, vi),
         postcondition: post,
-        body: ev.body.iter().map(|a| lower_event_action(a, aliases)).collect(),
+        body: ev.body.iter().map(|a| lower_event_action(a, aliases, vi)).collect(),
     }
 }
 
 fn lower_event_action(
     ea: &E::EEventAction,
     aliases: &std::collections::HashMap<String, String>,
+    vi: &VariantInfo<'_>,
 ) -> IRAction {
     match ea {
         E::EEventAction::Choose(v, ty, guard, body) => IRAction::Choose {
             var: v.clone(),
             entity: ty.name().to_owned(),
-            filter: Box::new(lower_expr(guard)),
-            ops: body.iter().map(|a| lower_event_action(a, aliases)).collect(),
+            filter: Box::new(lower_expr(guard, vi)),
+            ops: body.iter().map(|a| lower_event_action(a, aliases, vi)).collect(),
         },
         E::EEventAction::ForAll(v, ty, body) => IRAction::ForAll {
             var: v.clone(),
             entity: ty.name().to_owned(),
-            ops: body.iter().map(|a| lower_event_action(a, aliases)).collect(),
+            ops: body.iter().map(|a| lower_event_action(a, aliases, vi)).collect(),
         },
         E::EEventAction::Create(entity, fields) => IRAction::Create {
             entity: canonical(aliases, entity).to_owned(),
@@ -577,23 +615,23 @@ fn lower_event_action(
                 .iter()
                 .map(|(fn_, fe)| IRCreateField {
                     name: fn_.clone(),
-                    value: lower_expr(fe),
+                    value: lower_expr(fe, vi),
                 })
                 .collect(),
         },
         E::EEventAction::CrossCall(sys, ev, args) => IRAction::CrossCall {
             system: canonical(aliases, sys).to_owned(),
             event: ev.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|a| lower_expr(a, vi)).collect(),
         },
         E::EEventAction::Apply(target, act, refs, args) => IRAction::Apply {
             target: extract_target_name(target),
             transition: act.clone(),
             refs: refs.iter().map(extract_target_name).collect(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|a| lower_expr(a, vi)).collect(),
         },
         E::EEventAction::Expr(e) => IRAction::ExprStmt {
-            expr: lower_expr(e),
+            expr: lower_expr(e, vi),
         },
     }
 }
@@ -605,12 +643,12 @@ fn extract_target_name(e: &E::EExpr) -> String {
     }
 }
 
-fn lower_schedule(items: &[E::ENextItem]) -> IRSchedule {
+fn lower_schedule(items: &[E::ENextItem], vi: &VariantInfo<'_>) -> IRSchedule {
     let when = items
         .iter()
         .filter_map(|ni| match ni {
             E::ENextItem::When(cond, ev_name) => Some(IRSchedWhen {
-                condition: lower_expr(cond),
+                condition: lower_expr(cond, vi),
                 event: ev_name.clone(),
             }),
             E::ENextItem::Else => None,
@@ -622,7 +660,7 @@ fn lower_schedule(items: &[E::ENextItem]) -> IRSchedule {
 
 // ── Verification ─────────────────────────────────────────────────────
 
-fn lower_verify(ev: &E::EVerify, aliases: &std::collections::HashMap<String, String>) -> IRVerify {
+fn lower_verify(ev: &E::EVerify, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRVerify {
     IRVerify {
         name: ev.name.clone(),
         systems: ev
@@ -634,33 +672,33 @@ fn lower_verify(ev: &E::EVerify, aliases: &std::collections::HashMap<String, Str
                 hi: *hi,
             })
             .collect(),
-        asserts: ev.asserts.iter().map(lower_expr).collect(),
+        asserts: ev.asserts.iter().map(|e| lower_expr(e, vi)).collect(),
         span: ev.span,
         file: ev.file.clone(),
     }
 }
 
-fn lower_theorem(et: &E::ETheorem, aliases: &std::collections::HashMap<String, String>) -> IRTheorem {
+fn lower_theorem(et: &E::ETheorem, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRTheorem {
     IRTheorem {
         name: et.name.clone(),
         systems: et.targets.iter().map(|t| canonical(aliases, t).to_owned()).collect(),
-        invariants: et.invariants.iter().map(lower_expr).collect(),
-        shows: et.shows.iter().map(lower_expr).collect(),
+        invariants: et.invariants.iter().map(|e| lower_expr(e, vi)).collect(),
+        shows: et.shows.iter().map(|e| lower_expr(e, vi)).collect(),
         span: et.span,
         file: et.file.clone(),
     }
 }
 
-fn lower_axiom(ea: &E::EAxiom) -> IRAxiom {
+fn lower_axiom(ea: &E::EAxiom, vi: &VariantInfo<'_>) -> IRAxiom {
     IRAxiom {
         name: ea.name.clone(),
-        body: lower_expr(&ea.body),
+        body: lower_expr(&ea.body, vi),
         span: ea.span,
         file: ea.file.clone(),
     }
 }
 
-fn lower_scene(es: &E::EScene, aliases: &std::collections::HashMap<String, String>) -> IRScene {
+fn lower_scene(es: &E::EScene, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRScene {
     let (actions, assumes): (Vec<_>, Vec<_>) = es
         .whens
         .iter()
@@ -669,24 +707,24 @@ fn lower_scene(es: &E::EScene, aliases: &std::collections::HashMap<String, Strin
     IRScene {
         name: es.name.clone(),
         systems: es.targets.iter().map(|t| canonical(aliases, t).to_owned()).collect(),
-        givens: es.givens.iter().map(|g| lower_given(g, aliases)).collect(),
-        events: actions.iter().map(|w| lower_scene_action(w, aliases)).collect(),
+        givens: es.givens.iter().map(|g| lower_given(g, aliases, vi)).collect(),
+        events: actions.iter().map(|w| lower_scene_action(w, aliases, vi)).collect(),
         ordering: assumes
             .iter()
             .filter_map(|w| match w {
-                E::ESceneWhen::Assume(e) => Some(lower_expr(e)),
+                E::ESceneWhen::Assume(e) => Some(lower_expr(e, vi)),
                 E::ESceneWhen::Action { .. } => None,
             })
             .collect(),
-        assertions: es.thens.iter().map(lower_expr).collect(),
+        assertions: es.thens.iter().map(|e| lower_expr(e, vi)).collect(),
         span: es.span,
         file: es.file.clone(),
     }
 }
 
-fn lower_given(g: &E::ESceneGiven, aliases: &std::collections::HashMap<String, String>) -> IRSceneGiven {
+fn lower_given(g: &E::ESceneGiven, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRSceneGiven {
     let constraint = match &g.condition {
-        Some(e) => lower_expr(e),
+        Some(e) => lower_expr(e, vi),
         None => IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
@@ -700,7 +738,7 @@ fn lower_given(g: &E::ESceneGiven, aliases: &std::collections::HashMap<String, S
     }
 }
 
-fn lower_scene_action(w: &E::ESceneWhen, aliases: &std::collections::HashMap<String, String>) -> IRSceneEvent {
+fn lower_scene_action(w: &E::ESceneWhen, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRSceneEvent {
     match w {
         E::ESceneWhen::Action {
             var,
@@ -712,7 +750,7 @@ fn lower_scene_action(w: &E::ESceneWhen, aliases: &std::collections::HashMap<Str
             var: var.clone(),
             system: canonical(aliases, system).to_owned(),
             event: event.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|a| lower_expr(a, vi)).collect(),
             cardinality: card_from_text(card.as_deref()),
         },
         E::ESceneWhen::Assume(_) => unreachable!("assumes partitioned out"),
@@ -735,10 +773,10 @@ fn card_from_text(s: Option<&str>) -> Cardinality {
 // ── Expression lowering ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn lower_expr(e: &E::EExpr) -> IRExpr {
+fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
     match e {
         E::EExpr::Lit(ty, lit, sp) => IRExpr::Lit {
-            ty: lower_ty(ty),
+            ty: lower_ty(ty, vi),
             value: lower_lit(lit),
             span: *sp,
         },
@@ -749,63 +787,64 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                     return IRExpr::Ctor {
                         enum_name: enum_name.clone(),
                         ctor: n.clone(),
+                        args: vec![],
                         span: *sp,
                     };
                 }
             }
             IRExpr::Var {
                 name: n.clone(),
-                ty: lower_ty(ty),
+                ty: lower_ty(ty, vi),
                 span: *sp,
             }
         }
         E::EExpr::Field(ty, expr, f, sp) => IRExpr::Field {
-            expr: Box::new(lower_expr(expr)),
+            expr: Box::new(lower_expr(expr, vi)),
             field: f.clone(),
-            ty: lower_ty(ty),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Prime(_, expr, sp) => IRExpr::Prime {
-            expr: Box::new(lower_expr(expr)),
+            expr: Box::new(lower_expr(expr, vi)),
             span: *sp,
         },
         E::EExpr::BinOp(ty, op, a, b, sp) => IRExpr::BinOp {
             op: format!("{:?}", lower_binop(*op)),
-            left: Box::new(lower_expr(a)),
-            right: Box::new(lower_expr(b)),
-            ty: lower_ty(ty),
+            left: Box::new(lower_expr(a, vi)),
+            right: Box::new(lower_expr(b, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::UnOp(ty, op, expr, sp) => IRExpr::UnOp {
             op: format!("{:?}", lower_unop(*op)),
-            operand: Box::new(lower_expr(expr)),
-            ty: lower_ty(ty),
+            operand: Box::new(lower_expr(expr, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Call(ty, f, args, sp) => {
-            let lowered_f = lower_expr(f);
-            let ir_ty = lower_ty(ty);
+            let lowered_f = lower_expr(f, vi);
+            let ir_ty = lower_ty(ty, vi);
             let outer_span = *sp;
             args.iter().fold(lowered_f, |acc, arg| IRExpr::App {
                 func: Box::new(acc),
-                arg: Box::new(lower_expr(arg)),
+                arg: Box::new(lower_expr(arg, vi)),
                 ty: ir_ty.clone(),
                 span: outer_span,
             })
         }
         E::EExpr::CallR(ty, f, refs, args, sp) => {
-            let lowered_f = lower_expr(f);
-            let ir_ty = lower_ty(ty);
+            let lowered_f = lower_expr(f, vi);
+            let ir_ty = lower_ty(ty, vi);
             let outer_span = *sp;
             let with_refs = refs.iter().fold(lowered_f, |acc, r| IRExpr::App {
                 func: Box::new(acc),
-                arg: Box::new(lower_expr(r)),
+                arg: Box::new(lower_expr(r, vi)),
                 ty: ir_ty.clone(),
                 span: outer_span,
             });
             args.iter().fold(with_refs, |acc, arg| IRExpr::App {
                 func: Box::new(acc),
-                arg: Box::new(lower_expr(arg)),
+                arg: Box::new(lower_expr(arg, vi)),
                 ty: ir_ty.clone(),
                 span: outer_span,
             })
@@ -816,19 +855,20 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                     return IRExpr::Ctor {
                         enum_name: enum_name.clone(),
                         ctor: n.clone(),
+                        args: vec![],
                         span: *sp,
                     };
                 }
             }
             IRExpr::Var {
                 name: format!("{s}::{n}"),
-                ty: lower_ty(ty),
+                ty: lower_ty(ty, vi),
                 span: *sp,
             }
         }
         E::EExpr::Quant(_, q, v, vty, body, sp) => {
-            let lowered = lower_expr(body);
-            let vt = lower_ty(vty);
+            let lowered = lower_expr(body, vi);
+            let vt = lower_ty(vty, vi);
             match q {
                 E::Quantifier::All => IRExpr::Forall {
                     var: v.clone(),
@@ -859,33 +899,41 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
             }
         }
         E::EExpr::Always(_, expr, sp) => IRExpr::Always {
-            body: Box::new(lower_expr(expr)),
+            body: Box::new(lower_expr(expr, vi)),
             span: *sp,
         },
         E::EExpr::Eventually(_, expr, sp) => IRExpr::Eventually {
-            body: Box::new(lower_expr(expr)),
+            body: Box::new(lower_expr(expr, vi)),
             span: *sp,
         },
-        E::EExpr::Assert(_, expr, _) | E::EExpr::NamedPair(_, _, expr, _) => lower_expr(expr),
+        E::EExpr::Assert(_, expr, sp) => IRExpr::Assert {
+            expr: Box::new(lower_expr(expr, vi)),
+            span: *sp,
+        },
+        E::EExpr::Assume(_, expr, sp) => IRExpr::Assume {
+            expr: Box::new(lower_expr(expr, vi)),
+            span: *sp,
+        },
+        E::EExpr::NamedPair(_, _, expr, _) => lower_expr(expr, vi),
         E::EExpr::Assign(_, lhs, rhs, sp) => IRExpr::BinOp {
             op: "OpEq".to_owned(),
-            left: Box::new(lower_expr(lhs)),
-            right: Box::new(lower_expr(rhs)),
+            left: Box::new(lower_expr(lhs, vi)),
+            right: Box::new(lower_expr(rhs, vi)),
             ty: IRType::Bool,
             span: *sp,
         },
         E::EExpr::Seq(ty, a, b, sp) => IRExpr::BinOp {
             op: "OpSeq".to_owned(),
-            left: Box::new(lower_expr(a)),
-            right: Box::new(lower_expr(b)),
-            ty: lower_ty(ty),
+            left: Box::new(lower_expr(a, vi)),
+            right: Box::new(lower_expr(b, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::SameStep(ty, a, b, sp) => IRExpr::BinOp {
             op: "OpSameStep".to_owned(),
-            left: Box::new(lower_expr(a)),
-            right: Box::new(lower_expr(b)),
-            ty: lower_ty(ty),
+            left: Box::new(lower_expr(a, vi)),
+            right: Box::new(lower_expr(b, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Let(binds, body, sp) => {
@@ -893,26 +941,26 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
                 .iter()
                 .map(|(n, mt, e)| LetBinding {
                     name: n.clone(),
-                    ty: mt.as_ref().map_or(IRType::String, lower_ty),
-                    expr: lower_expr(e),
+                    ty: mt.as_ref().map_or(IRType::String, |t| lower_ty(t, vi)),
+                    expr: lower_expr(e, vi),
                 })
                 .collect();
             IRExpr::Let {
                 bindings: bs,
-                body: Box::new(lower_expr(body)),
+                body: Box::new(lower_expr(body, vi)),
                 span: *sp,
             }
         }
         E::EExpr::Lam(params, _mret, body, sp) => {
             if params.is_empty() {
-                return lower_expr(body);
+                return lower_expr(body, vi);
             }
             params
                 .iter()
                 .rev()
-                .fold(lower_expr(body), |acc, (pn, pt)| IRExpr::Lam {
+                .fold(lower_expr(body, vi), |acc, (pn, pt)| IRExpr::Lam {
                     param: pn.clone(),
-                    param_type: lower_ty(pt),
+                    param_type: lower_ty(pt, vi),
                     body: Box::new(acc),
                     span: *sp,
                 })
@@ -923,8 +971,8 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
             span: *sp,
         },
         E::EExpr::TupleLit(ty, es, sp) => {
-            let lowered: Vec<IRExpr> = es.iter().map(lower_expr).collect();
-            let tuple_ty = lower_ty(ty);
+            let lowered: Vec<IRExpr> = es.iter().map(|e| lower_expr(e, vi)).collect();
+            let tuple_ty = lower_ty(ty, vi);
             let outer_span = *sp;
             lowered.into_iter().fold(
                 IRExpr::Var {
@@ -943,103 +991,134 @@ fn lower_expr(e: &E::EExpr) -> IRExpr {
         E::EExpr::In(_ty, e, s, sp) => {
             // `e in S` → `Index(S, e)` which returns Bool (Set<T> = Array<T, Bool>)
             IRExpr::Index {
-                map: Box::new(lower_expr(s)),
-                key: Box::new(lower_expr(e)),
+                map: Box::new(lower_expr(s, vi)),
+                key: Box::new(lower_expr(e, vi)),
                 ty: IRType::Bool,
                 span: *sp,
             }
         }
         E::EExpr::Card(_ty, expr, sp) => IRExpr::Card {
-            expr: Box::new(lower_expr(expr)),
+            expr: Box::new(lower_expr(expr, vi)),
             span: *sp,
         },
         E::EExpr::Pipe(ty, a, f, sp) => IRExpr::App {
-            func: Box::new(lower_expr(f)),
-            arg: Box::new(lower_expr(a)),
-            ty: lower_ty(ty),
+            func: Box::new(lower_expr(f, vi)),
+            arg: Box::new(lower_expr(a, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Match(scrutinee, arms, sp) => IRExpr::Match {
-            scrutinee: Box::new(lower_expr(scrutinee)),
+            scrutinee: Box::new(lower_expr(scrutinee, vi)),
             arms: arms
                 .iter()
                 .map(|(pat, guard, body)| IRMatchArm {
                     pattern: lower_pattern(pat),
-                    guard: guard.as_ref().map(lower_expr),
-                    body: lower_expr(body),
+                    guard: guard.as_ref().map(|g| lower_expr(g, vi)),
+                    body: lower_expr(body, vi),
                 })
                 .collect(),
             span: *sp,
         },
         E::EExpr::MapUpdate(ty, m, k, v, sp) => IRExpr::MapUpdate {
-            map: Box::new(lower_expr(m)),
-            key: Box::new(lower_expr(k)),
-            value: Box::new(lower_expr(v)),
-            ty: lower_ty(ty),
+            map: Box::new(lower_expr(m, vi)),
+            key: Box::new(lower_expr(k, vi)),
+            value: Box::new(lower_expr(v, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Index(ty, m, k, sp) => IRExpr::Index {
-            map: Box::new(lower_expr(m)),
-            key: Box::new(lower_expr(k)),
-            ty: lower_ty(ty),
+            map: Box::new(lower_expr(m, vi)),
+            key: Box::new(lower_expr(k, vi)),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::SetComp(ty, proj, var, domain, filter, sp) => IRExpr::SetComp {
             var: var.clone(),
-            domain: lower_ty(domain),
-            filter: Box::new(lower_expr(filter)),
-            projection: proj.as_ref().map(|p| Box::new(lower_expr(p))),
-            ty: lower_ty(ty),
+            domain: lower_ty(domain, vi),
+            filter: Box::new(lower_expr(filter, vi)),
+            projection: proj.as_ref().map(|p| Box::new(lower_expr(p, vi))),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::SetLit(ty, elems, sp) => IRExpr::SetLit {
-            elements: elems.iter().map(lower_expr).collect(),
-            ty: lower_ty(ty),
+            elements: elems.iter().map(|e| lower_expr(e, vi)).collect(),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::SeqLit(ty, elems, sp) => IRExpr::SeqLit {
-            elements: elems.iter().map(lower_expr).collect(),
-            ty: lower_ty(ty),
+            elements: elems.iter().map(|e| lower_expr(e, vi)).collect(),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::MapLit(ty, entries, sp) => IRExpr::MapLit {
             entries: entries
                 .iter()
-                .map(|(k, v)| (lower_expr(k), lower_expr(v)))
+                .map(|(k, v)| (lower_expr(k, vi), lower_expr(v, vi)))
                 .collect(),
-            ty: lower_ty(ty),
+            ty: lower_ty(ty, vi),
             span: *sp,
         },
         E::EExpr::Sorry(sp) => IRExpr::Sorry { span: *sp },
         E::EExpr::Todo(sp) => IRExpr::Todo { span: *sp },
         // Imperative constructs
         E::EExpr::Block(items, sp) => IRExpr::Block {
-            exprs: items.iter().map(lower_expr).collect(),
+            exprs: items.iter().map(|e| lower_expr(e, vi)).collect(),
             span: *sp,
         },
         E::EExpr::VarDecl(name, ty, init, rest, sp) => IRExpr::VarDecl {
             name: name.clone(),
-            ty: ty.as_ref().map_or(IRType::String, lower_ty),
-            init: Box::new(lower_expr(init)),
-            rest: Box::new(lower_expr(rest)),
+            ty: ty.as_ref().map_or(IRType::String, |t| lower_ty(t, vi)),
+            init: Box::new(lower_expr(init, vi)),
+            rest: Box::new(lower_expr(rest, vi)),
             span: *sp,
         },
         E::EExpr::While(cond, contracts, body, sp) => {
-            let (invariants, decreases) = lower_while_contracts(contracts);
+            let (invariants, decreases) = lower_while_contracts(contracts, vi);
             IRExpr::While {
-                cond: Box::new(lower_expr(cond)),
+                cond: Box::new(lower_expr(cond, vi)),
                 invariants,
                 decreases,
-                body: Box::new(lower_expr(body)),
+                body: Box::new(lower_expr(body, vi)),
                 span: *sp,
             }
         }
         E::EExpr::IfElse(cond, then_body, else_body, sp) => IRExpr::IfElse {
-            cond: Box::new(lower_expr(cond)),
-            then_body: Box::new(lower_expr(then_body)),
-            else_body: else_body.as_ref().map(|e| Box::new(lower_expr(e))),
+            cond: Box::new(lower_expr(cond, vi)),
+            then_body: Box::new(lower_expr(then_body, vi)),
+            else_body: else_body.as_ref().map(|e| Box::new(lower_expr(e, vi))),
             span: *sp,
         },
+        E::EExpr::CtorRecord(ty, qual, ctor_name, fields, sp) => {
+            // Determine the enum name from the qualifier or the resolved type
+            let enum_name = if let Some(q) = qual {
+                q.clone()
+            } else if let E::Ty::Enum(en, _) = ty {
+                en.clone()
+            } else {
+                // Search through known enum types for this constructor name
+                vi.keys()
+                    .find(|ename| {
+                        vi.get(*ename).map_or(false, |variants| {
+                            variants.iter().any(|v| match v {
+                                E::EVariant::Simple(n)
+                                | E::EVariant::Record(n, _)
+                                | E::EVariant::Param(n, _) => n == ctor_name,
+                            })
+                        })
+                    })
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            IRExpr::Ctor {
+                enum_name,
+                ctor: ctor_name.clone(),
+                args: fields
+                    .iter()
+                    .map(|(fname, fexpr)| (fname.clone(), lower_expr(fexpr, vi)))
+                    .collect(),
+                span: *sp,
+            }
+        }
     }
 }
 
@@ -1177,7 +1256,8 @@ mod tests {
             E::Literal::Int(42),
             Some(sp),
         );
-        let ir = lower_expr(&expr);
+        let vi = VariantInfo::new();
+        let ir = lower_expr(&expr, &vi);
         match ir {
             IRExpr::Lit { span, .. } => assert_eq!(span, Some(sp)),
             other => panic!("expected Lit, got {other:?}"),
@@ -1191,7 +1271,8 @@ mod tests {
             E::Literal::Bool(true),
             None,
         );
-        let ir = lower_expr(&expr);
+        let vi = VariantInfo::new();
+        let ir = lower_expr(&expr, &vi);
         match ir {
             IRExpr::Lit { span, .. } => assert_eq!(span, None),
             other => panic!("expected Lit, got {other:?}"),
@@ -1210,7 +1291,8 @@ mod tests {
             Box::new(b),
             Some(sp),
         );
-        let ir = lower_expr(&expr);
+        let vi = VariantInfo::new();
+        let ir = lower_expr(&expr, &vi);
         match ir {
             IRExpr::BinOp { span, .. } => assert_eq!(span, Some(sp)),
             other => panic!("expected BinOp, got {other:?}"),
@@ -1234,7 +1316,8 @@ mod tests {
             span: Some(sp),
             file: Some("/test.abide".to_owned()),
         };
-        let ir = lower_verify(&ev, &std::collections::HashMap::new());
+        let vi = VariantInfo::new();
+        let ir = lower_verify(&ev, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/test.abide"));
     }
@@ -1254,7 +1337,8 @@ mod tests {
             span: Some(sp),
             file: Some("/proof.abide".to_owned()),
         };
-        let ir = lower_theorem(&et, &std::collections::HashMap::new());
+        let vi = VariantInfo::new();
+        let ir = lower_theorem(&et, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/proof.abide"));
     }
@@ -1271,7 +1355,8 @@ mod tests {
             span: Some(sp),
             file: Some("/scene.abide".to_owned()),
         };
-        let ir = lower_scene(&es, &std::collections::HashMap::new());
+        let vi = VariantInfo::new();
+        let ir = lower_scene(&es, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/scene.abide"));
     }
@@ -1289,7 +1374,8 @@ mod tests {
             span: Some(sp),
             file: Some("/ax.abide".to_owned()),
         };
-        let ir = lower_axiom(&ea);
+        let vi = VariantInfo::new();
+        let ir = lower_axiom(&ea, &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/ax.abide"));
     }
@@ -1306,7 +1392,8 @@ mod tests {
             span: Some(sp),
             file: Some("/fn.abide".to_owned()),
         };
-        let ir = lower_fn(&ef);
+        let vi = VariantInfo::new();
+        let ir = lower_fn(&ef, &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/fn.abide"));
     }
@@ -1325,7 +1412,8 @@ mod tests {
             span: Some(sp),
             file: Some("/pred.abide".to_owned()),
         };
-        let ir = lower_pred(&ep);
+        let vi = VariantInfo::new();
+        let ir = lower_pred(&ep, &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/pred.abide"));
     }
@@ -1344,7 +1432,8 @@ mod tests {
             span: Some(sp),
             file: Some("/prop.abide".to_owned()),
         };
-        let ir = lower_prop(&ep);
+        let vi = VariantInfo::new();
+        let ir = lower_prop(&ep, &vi);
         assert_eq!(ir.span, Some(sp));
         assert_eq!(ir.file.as_deref(), Some("/prop.abide"));
     }

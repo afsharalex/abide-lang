@@ -69,6 +69,15 @@ PROVED  fn factorial (contract, 18ms)
 PROVED  fn gcd (contract, 5ms)
 ```
 
+**Functions with `assume` report ADMITTED, functions with `sorry` skip verification:**
+
+```sh
+$ abide verify spec.abide
+PROVED   fn verified_fn (contract, 12ms)
+ADMITTED fn uses_assume (assume in body, 3ms)
+ADMITTED fn placeholder (sorry in body, 0ms)
+```
+
 Function contracts (`requires`/`ensures`/`decreases`) are verified automatically as part of `abide verify`. Use `--no-fn-verify` to skip this for faster iteration on system-level properties.
 
 **Verify multiple files together (multi-module):**

@@ -90,6 +90,9 @@ pub struct Env {
     pub lemmas: Vec<ELemma>,
     pub consts: HashMap<String, EConst>,
     pub fns: HashMap<String, EFn>,
+    /// Constructor field info for enums with record variants.
+    /// Maps enum_name → Vec<(variant_name, Vec<(field_name, Ty)>)>.
+    pub variant_fields: HashMap<String, Vec<(String, Vec<(String, Ty)>)>>,
     pub errors: Vec<ElabError>,
     /// Structured load errors from included files (lex/IO errors that should be
     /// rendered through miette rather than downgraded to plain `ElabError` text).
@@ -137,6 +140,7 @@ impl Env {
             lemmas: Vec::new(),
             consts: HashMap::new(),
             fns: HashMap::new(),
+            variant_fields: HashMap::new(),
             errors: Vec::new(),
             include_load_errors: Vec::new(),
             known_modules: std::collections::HashSet::new(),

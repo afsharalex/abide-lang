@@ -124,6 +124,27 @@ fn collect_type(env: &mut Env, td: &ast::TypeDecl) {
         })
         .collect();
 
+    // Store constructor field info for record variants (used by IR lowering
+    // to produce IRVariant::fields for Z3 ADT encoding).
+    let field_info: Vec<(String, Vec<(String, Ty)>)> = td
+        .variants
+        .iter()
+        .map(|v| match v {
+            ast::TypeVariant::Simple { name, .. } => (name.clone(), vec![]),
+            ast::TypeVariant::Record { name, fields, .. } => {
+                let fs: Vec<(String, Ty)> = fields
+                    .iter()
+                    .map(|f| (f.name.clone(), resolve_type_ref(&f.ty)))
+                    .collect();
+                (name.clone(), fs)
+            }
+            ast::TypeVariant::Param { name, .. } => (name.clone(), vec![]),
+        })
+        .collect();
+    if field_info.iter().any(|(_, fs)| !fs.is_empty()) {
+        env.variant_fields.insert(name.clone(), field_info);
+    }
+
     let ty = Ty::Enum(name.clone(), variant_names);
     let info = env.make_decl_info(
         DeclKind::Type,
@@ -789,7 +810,21 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
         ast::ExprKind::Qual2(s, n) => EExpr::Qual(u(), s.clone(), n.clone(), sp),
         ast::ExprKind::Qual3(s, t, n) => EExpr::Qual(u(), format!("{s}::{t}"), n.clone(), sp),
         ast::ExprKind::State1(c) => EExpr::Var(u(), c.clone(), sp),
+        ast::ExprKind::State1Record(c, fields) => EExpr::CtorRecord(
+            u(),
+            None,
+            c.clone(),
+            fields.iter().map(|(n, e)| (n.clone(), collect_expr(e))).collect(),
+            sp,
+        ),
         ast::ExprKind::State2(t, c) => EExpr::Qual(u(), t.clone(), c.clone(), sp),
+        ast::ExprKind::State2Record(t, c, fields) => EExpr::CtorRecord(
+            u(),
+            Some(t.clone()),
+            c.clone(),
+            fields.iter().map(|(n, e)| (n.clone(), collect_expr(e))).collect(),
+            sp,
+        ),
         ast::ExprKind::State3(s, t, c) => EExpr::Qual(u(), format!("{s}::{t}"), c.clone(), sp),
 
         ast::ExprKind::Field(e, f) => EExpr::Field(u(), Box::new(collect_expr(e)), f.clone(), sp),
@@ -879,6 +914,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
         ast::ExprKind::Always(e) => EExpr::Always(u(), Box::new(collect_expr(e)), sp),
         ast::ExprKind::Eventually(e) => EExpr::Eventually(u(), Box::new(collect_expr(e)), sp),
         ast::ExprKind::AssertExpr(e) => EExpr::Assert(u(), Box::new(collect_expr(e)), sp),
+        ast::ExprKind::AssumeExpr(e) => EExpr::Assume(u(), Box::new(collect_expr(e)), sp),
 
         // Assignment
         ast::ExprKind::Assign(a, b) => EExpr::Assign(

@@ -27,6 +27,11 @@ pub enum SmtValue {
     Array(Array),
     /// Z3 uninterpreted/dynamic sort — used for complex types and array select results.
     Dynamic(Dynamic),
+    /// Z3 uninterpreted function — used for lambda encodings.
+    /// The function has a definitional axiom asserted on the solver.
+    /// Carries (FuncDecl, param_sorts, range_sort) for partial application.
+    /// Wrapped in Rc because FuncDecl does not implement Clone.
+    Func(std::rc::Rc<(z3::FuncDecl, Vec<z3::Sort>, z3::Sort)>),
 }
 
 impl SmtValue {
@@ -70,6 +75,11 @@ impl SmtValue {
             SmtValue::Real(r) => Dynamic::from_ast(r),
             SmtValue::Array(a) => Dynamic::from_ast(a),
             SmtValue::Dynamic(d) => d.clone(),
+            SmtValue::Func(f) => {
+                // A function value as Dynamic: create a nullary application
+                // (this is a fallback — Func values are normally applied, not coerced)
+                f.0.apply(&[])
+            }
         }
     }
 
@@ -201,6 +211,11 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
     }
 }
 
+/// Compare two `SmtValue`s for inequality: `a != b`.
+pub fn smt_neq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
+    Ok(smt_eq(a, b)?.not())
+}
+
 // ── Binary operations ───────────────────────────────────────────────
 
 /// Apply a binary operation to two `SmtValue`s.
@@ -288,6 +303,9 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
                 }
                 SmtValue::Array(_) => {
                     return Err(format!("type error: cannot apply {op} to Array operand"));
+                }
+                SmtValue::Func(_) => {
+                    return Err(format!("type error: cannot apply {op} to function value"));
                 }
             };
             if matches!(lhs, SmtValue::Dynamic(_)) {

@@ -150,10 +150,7 @@ fn elaborate_logistics() {
     // Multi-file: logistics includes shipping + warehouse,
     // uses wildcard (Shipping::*) and aliases (Warehouse::Slot as WSlot).
     let result = load_and_elaborate_files(LOGISTICS_FIXTURE);
-    assert!(
-        result.systems.len() >= 1,
-        "should have Logistics system"
-    );
+    assert!(result.systems.len() >= 1, "should have Logistics system");
     assert!(
         result.entities.len() >= 2,
         "should have Package (wildcard) and WSlot (alias), got {}",
@@ -177,8 +174,7 @@ fn lower_logistics() {
 #[test]
 fn verify_logistics_fixture() {
     let prog = lower_loaded_files(LOGISTICS_FIXTURE);
-    let results =
-        abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
     // logistics_safety: uses WSlot alias in quantifier — should verify
     assert!(
         results.iter().any(|r| matches!(
@@ -398,8 +394,7 @@ fn verify_inventory_fixture() {
 fn verify_commerce_fixture() {
     // Multi-file: commerce.abide includes billing.abide
     let prog = lower_loaded_files(COMMERCE_FIXTURE);
-    let results =
-        abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
     // commerce_smoke: COUNTEREXAMPLE (expected — eventually in bounded check)
     assert!(
         results.iter().any(|r| matches!(
@@ -944,11 +939,13 @@ fn verify_contracts_fixture() {
     // Total: exactly 3 contract results
     let fn_results: Vec<_> = results
         .iter()
-        .filter(|r| matches!(
-            r,
-            abide::verify::VerificationResult::FnContractProved { .. }
-            | abide::verify::VerificationResult::FnContractFailed { .. }
-        ))
+        .filter(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { .. }
+                    | abide::verify::VerificationResult::FnContractFailed { .. }
+            )
+        })
         .collect();
     assert_eq!(fn_results.len(), 3, "should verify exactly 3 fn contracts");
 }
@@ -960,11 +957,17 @@ fn verify_contracts_cli_output() {
         .arg("tests/fixtures/contracts.abide")
         .output()
         .expect("run CLI");
-    assert!(output.status.success(), "CLI should succeed for valid contracts");
+    assert!(
+        output.status.success(),
+        "CLI should succeed for valid contracts"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("PROVED  fn abs"), "should show abs proved");
     assert!(stdout.contains("PROVED  fn max"), "should show max proved");
-    assert!(stdout.contains("PROVED  fn clamp"), "should show clamp proved");
+    assert!(
+        stdout.contains("PROVED  fn clamp"),
+        "should show clamp proved"
+    );
 }
 
 #[test]
@@ -1055,16 +1058,568 @@ fn verify_imperative_fixture() {
         "max should be PROVED"
     );
 
-    // Exactly 4 fn contracts verified (sum_to, gcd, abs, max)
+    // checked_divide: assert b != 0 with requires b != 0 — should prove
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "checked_divide"
+        )),
+        "checked_divide should be PROVED"
+    );
+
+    // with_assertion: assert x > 0 with requires x > 0 — should prove
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "with_assertion"
+        )),
+        "with_assertion should be PROVED"
+    );
+
+    // Exactly 6 fn contracts verified (sum_to, gcd, abs, max, checked_divide, with_assertion)
     let fn_results: Vec<_> = results
         .iter()
-        .filter(|r| matches!(
-            r,
-            abide::verify::VerificationResult::FnContractProved { .. }
-            | abide::verify::VerificationResult::FnContractFailed { .. }
-        ))
+        .filter(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { .. }
+                    | abide::verify::VerificationResult::FnContractFailed { .. }
+            )
+        })
         .collect();
-    assert_eq!(fn_results.len(), 4, "should verify exactly 4 fn contracts in imperative.abide");
+    assert_eq!(
+        fn_results.len(),
+        6,
+        "should verify exactly 6 fn contracts in imperative.abide"
+    );
+}
+
+#[test]
+fn verify_assert_assume_fixture() {
+    let prog = lower_file("tests/fixtures/assert_assume.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // Assert-only functions should be PROVED
+    for name in &[
+        "assert_true_trivial",
+        "assert_with_requires",
+        "assert_chain",
+        "assert_in_loop",
+        "assert_after_loop",
+        "checked_divide",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be PROVED"
+        );
+    }
+
+    // Assume-containing functions should be ADMITTED (not PROVED)
+    for name in &["assume_then_use", "assume_in_branch"] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractAdmitted { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be ADMITTED (contains assume)"
+        );
+    }
+
+    // Total: 6 proved + 2 admitted = 8 successful verifications
+    let success_count = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { .. }
+                    | abide::verify::VerificationResult::FnContractAdmitted { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        success_count, 8,
+        "should have 8 successful verifications (6 proved + 2 admitted)"
+    );
+}
+
+#[test]
+fn verify_assert_false_fails() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("assert_false.abide");
+    std::fs::write(
+        &file,
+        "module TestFail\n\nfn bad(x: Int): Int\n  ensures result == x\n{\n  assert false\n  x\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // assert false should cause a verification failure
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { hint, .. }
+                if hint.contains("assertion may not hold")
+        )),
+        "assert false should produce an 'assertion may not hold' error"
+    );
+}
+
+#[test]
+fn verify_assert_false_without_ensures_fails() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("assert_false_no_ensures.abide");
+    std::fs::write(
+        &file,
+        "module TestFail\n\nfn bad(x: Int): Int {\n  assert false\n  x\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // assert false should fail even without ensures
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { hint, .. }
+                if hint.contains("assertion may not hold")
+        )),
+        "assert false without ensures should still produce an assertion failure"
+    );
+}
+
+#[test]
+fn verify_nested_assert_in_pure_context_caught() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("nested_assert.abide");
+    std::fs::write(
+        &file,
+        "module TestNested\n\nfn bad(x: Int): Int { x + (assert false) }\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // Nested assert should be detected and produce an error
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { hint, .. }
+                if hint.contains("assert in pure expression context")
+        )),
+        "nested assert in pure expression context should produce an error (not 'No verification targets')"
+    );
+}
+
+#[test]
+fn verify_assume_false_vacuous() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("assume_false.abide");
+    std::fs::write(
+        &file,
+        "module TestAssume\n\nfn vacuous(x: Int): Int\n  ensures result > 999\n{\n  assume false\n  x\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // assume false should vacuously prove the postcondition but report as ADMITTED
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, .. }
+                if name == "vacuous"
+        )),
+        "assume false should be reported as ADMITTED (not PROVED)"
+    );
+}
+
+#[test]
+fn verify_sorry_bool_fn_admitted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("sorry_bool.abide");
+    std::fs::write(
+        &file,
+        "module TestSorry\n\nfn bool_sorry(x: Int): Bool\n  ensures result == true\n{\n  sorry\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "bool_sorry" && reason.contains("sorry")
+        )),
+        "sorry in Bool fn should be ADMITTED (not PROVED)"
+    );
+}
+
+#[test]
+fn verify_sorry_int_fn_admitted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("sorry_int.abide");
+    std::fs::write(
+        &file,
+        "module TestSorry\n\nfn int_sorry(x: Int): Int\n  ensures result > 0\n{\n  sorry\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // sorry in Int fn should be ADMITTED (previously errored with type mismatch)
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "int_sorry" && reason.contains("sorry")
+        )),
+        "sorry in Int fn should be ADMITTED (not type error)"
+    );
+}
+
+#[test]
+fn verify_sorry_no_ensures_admitted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("sorry_no_ensures.abide");
+    std::fs::write(
+        &file,
+        "module TestSorry\n\nfn no_ensures(x: Int): Int {\n  sorry\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "no_ensures" && reason.contains("sorry")
+        )),
+        "sorry without ensures should still be ADMITTED"
+    );
+}
+
+#[test]
+fn verify_sorry_nested_in_binop_admitted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("sorry_nested.abide");
+    std::fs::write(
+        &file,
+        "module TestSorry\n\nfn f(x: Int): Int { x + sorry }\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "f" && reason.contains("sorry")
+        )),
+        "nested sorry (x + sorry) should be ADMITTED, not skipped or type error"
+    );
+}
+
+#[test]
+fn verify_sorry_bypasses_termination() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("sorry_term.abide");
+    std::fs::write(
+        &file,
+        "module TestSorry\n\n\
+         fn f(n: Int): Int\n  ensures result >= 0\n  decreases n\n\
+         {\n  if n > 0 { f(n) } else { sorry }\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    // sorry should bypass termination checking entirely — no UNKNOWN termination error
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "f" && reason.contains("sorry")
+        )),
+        "sorry should bypass termination verification and report ADMITTED"
+    );
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { .. }
+        )),
+        "sorry should not produce any UNKNOWN/Unprovable results"
+    );
+}
+
+#[test]
+fn verify_quantifiers_fixture() {
+    let prog = lower_file("tests/fixtures/quantifiers.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    for name in &[
+        "identity_forall",
+        "exists_witness",
+        "nested_forall",
+        "positive_from_requires",
+        "order_preserving",
+        "enum_forall_exhaustive",
+        "enum_exists",
+        "refinement_forall",
+        "refinement_exists",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be PROVED"
+        );
+    }
+}
+
+#[test]
+fn verify_enum_quantifier_unsound_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("enum_quant.abide");
+    std::fs::write(
+        &file,
+        "module T\n\nenum E = A | B\n\n\
+         fn bad(x: Int): Bool\n  ensures exists y: E | y != @E::A and y != @E::B\n{\n  true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { .. }
+        )),
+        "exists y: E where y is neither A nor B should FAIL (domain restricted to enum values)"
+    );
+}
+
+#[test]
+fn verify_refinement_quantifier_unsound_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("ref_quant.abide");
+    std::fs::write(
+        &file,
+        "module T\n\ntype Positive = Int { $ > 0 }\n\n\
+         fn bad(x: Int): Bool\n  ensures exists y: Positive | y < 0\n{\n  true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { .. }
+        )),
+        "exists y: Positive where y < 0 should FAIL (domain restricted by refinement predicate)"
+    );
+}
+
+#[test]
+fn verify_cardinality_fixture() {
+    let prog = lower_file("tests/fixtures/cardinality.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    for name in &[
+        "set_card_3",
+        "set_card_dedup",
+        "seq_card_4",
+        "seq_card_with_dupes",
+        "card_in_ensures",
+        "card_compare",
+        "empty_set_card",
+        "semantic_dedup",
+        "semantic_dedup_expr",
+        "param_dedup",
+        "comp_membership",
+        "comp_non_membership",
+        "comp_in_ensures",
+        "comp_enum_membership",
+        "comp_enum_non_membership",
+        "comp_refinement_membership",
+        "comp_refinement_non_membership",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be PROVED"
+        );
+    }
+}
+
+#[test]
+fn verify_setcomp_false_membership_fails() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("setcomp_false.abide");
+    std::fs::write(
+        &file,
+        "module T\n\nfn bad(x: Int): Bool\n  ensures 0 in { y: Int where y > 0 }\n{\n  true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { .. }
+        )),
+        "0 in set comprehension where y > 0 should FAIL"
+    );
+}
+
+#[test]
+fn verify_constructor_fields_fixture() {
+    let prog = lower_file("tests/fixtures/constructor_fields.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    for name in &[
+        "get_radius_or_zero",
+        "rect_perimeter",
+        "always_42",
+        "get_or_default",
+        "make_some",
+        "make_none",
+        "reordered_ctor_fields",
+        "reordered_pat_fields",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be PROVED (constructor field destructuring)"
+        );
+    }
+}
+
+#[test]
+fn verify_ctor_missing_field_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("missing_field.abide");
+    std::fs::write(
+        &file,
+        "module T\n\nenum S = R { w: Int, h: Int }\n\n\
+         fn f(): Int\n  ensures true\n{\n  match @R { w: 1 } { _ => 0 }\n}\n",
+    )
+    .unwrap();
+
+    // Front-end should catch missing fields during elaboration
+    let program = parse_file(file.to_str().unwrap());
+    let (_result, errors) = abide::elab::elaborate(&program);
+
+    assert!(
+        errors.iter().any(|e| format!("{e}").contains("missing")),
+        "constructor with missing field should produce elab error"
+    );
+}
+
+#[test]
+fn verify_ctor_unknown_field_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("unknown_field.abide");
+    std::fs::write(
+        &file,
+        "module T\n\nenum S = R { w: Int, h: Int }\n\n\
+         fn f(): Int\n  ensures true\n{\n  match @R { z: 1, w: 2 } { _ => 0 }\n}\n",
+    )
+    .unwrap();
+
+    // Front-end should catch unknown fields during elaboration
+    let program = parse_file(file.to_str().unwrap());
+    let (_result, errors) = abide::elab::elaborate(&program);
+
+    assert!(
+        errors.iter().any(|e| format!("{e}").contains("unknown field")),
+        "constructor with unknown field should produce elab error"
+    );
+}
+
+#[test]
+fn verify_bare_field_ctor_rejected() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("bare_ctor.abide");
+    std::fs::write(
+        &file,
+        "module T\n\nenum Option = None | Some { value: Int }\n\n\
+         fn mk(): Option\n  ensures true\n{\n  @Some\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { hint, .. }
+                if hint.contains("requires") && hint.contains("field argument")
+        )),
+        "bare use of field-bearing constructor should produce arity error, not panic"
+    );
+}
+
+#[test]
+fn verify_lambdas_fixture() {
+    let prog = lower_file("tests/fixtures/lambdas.abide");
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    for name in &[
+        "apply_single",
+        "apply_multi",
+        "apply_three_args",
+        "identity",
+        "let_lambda",
+        "closure",
+        "bool_lambda",
+        "ensures_lambda",
+        "assert_lambda",
+        "partial_app",
+        "multi_partial",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::FnContractProved { name: n, .. }
+                    if n == name
+            )),
+            "{name} should be PROVED"
+        );
+    }
 }
 
 #[test]
@@ -1498,9 +2053,18 @@ fn verify_call_site_cli_output() {
         "should fail due to caller_bad precondition violation"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PROVED  fn caller_good"), "caller_good proved: {stdout}");
-    assert!(stdout.contains("PROVED  fn caller_literal"), "caller_literal proved: {stdout}");
-    assert!(stdout.contains("PROVED  fn add_positive"), "add_positive proved: {stdout}");
+    assert!(
+        stdout.contains("PROVED  fn caller_good"),
+        "caller_good proved: {stdout}"
+    );
+    assert!(
+        stdout.contains("PROVED  fn caller_literal"),
+        "caller_literal proved: {stdout}"
+    );
+    assert!(
+        stdout.contains("PROVED  fn add_positive"),
+        "add_positive proved: {stdout}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("precondition") && stderr.contains("caller_bad"),
@@ -1747,9 +2311,15 @@ fn verify_termination_cli_output() {
     // Should exit non-zero because bad_recurse fails
     assert!(!output.status.success(), "should fail due to bad_recurse");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PROVED  fn factorial"), "factorial proved: {stdout}");
+    assert!(
+        stdout.contains("PROVED  fn factorial"),
+        "factorial proved: {stdout}"
+    );
     assert!(stdout.contains("PROVED  fn fib"), "fib proved: {stdout}");
-    assert!(stdout.contains("PROVED  fn no_recursion"), "no_recursion proved: {stdout}");
+    assert!(
+        stdout.contains("PROVED  fn no_recursion"),
+        "no_recursion proved: {stdout}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("bad_recurse") && stderr.contains("termination"),

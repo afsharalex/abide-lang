@@ -569,6 +569,7 @@ pub enum ExprKind {
     Always(Box<Expr>),
     Eventually(Box<Expr>),
     AssertExpr(Box<Expr>),
+    AssumeExpr(Box<Expr>),
     All(String, TypeRef, Box<Expr>),
     Exists(String, TypeRef, Box<Expr>),
     SomeQ(String, TypeRef, Box<Expr>),
@@ -653,7 +654,11 @@ pub enum ExprKind {
 
     // Level 14: atoms
     State1(String),
+    /// @Name { field: expr, ... } — constructor with fields
+    State1Record(String, Vec<(String, Expr)>),
     State2(String, String),
+    /// @Enum::Name { field: expr, ... } — qualified constructor with fields
+    State2Record(String, String, Vec<(String, Expr)>),
     State3(String, String, String),
     Qual2(String, String),
     Qual3(String, String, String),

@@ -1,0 +1,106 @@
+module AssertAssume
+
+// Assert/Assume verification tests (Phase 1 of verification-gaps.md)
+
+// --- assert true: trivially provable ---
+
+fn assert_true_trivial(x: Int): Int
+  ensures result == x
+{
+  assert true
+  x
+}
+
+// --- assert with requires context ---
+
+fn assert_with_requires(x: Int): Int
+  requires x > 0
+  ensures result > 0
+{
+  assert x > 0
+  x
+}
+
+// --- multiple asserts: each builds on prior ---
+
+fn assert_chain(x: Int, y: Int): Int
+  requires x > 0
+  requires y > 0
+  ensures result > 1
+{
+  assert x > 0
+  assert y > 0
+  assert x + y > 1
+  x + y
+}
+
+// --- assert in while loop body ---
+
+fn assert_in_loop(n: Int): Int
+  requires n >= 0
+  ensures result >= 0
+{
+  var total = 0
+  var i = 0
+  while i <= n
+    invariant total >= 0
+    invariant i >= 0
+    decreases n - i
+  {
+    assert i >= 0
+    total = total + i
+    i = i + 1
+  }
+  total
+}
+
+// --- assert after loop uses invariant ---
+
+fn assert_after_loop(n: Int): Int
+  requires n >= 0
+  ensures result >= 0
+{
+  var total = 0
+  var i = 0
+  while i <= n
+    invariant total >= 0
+    invariant i >= 0
+    decreases n - i
+  {
+    total = total + i
+    i = i + 1
+  }
+  assert total >= 0
+  total
+}
+
+// --- assume followed by code using it ---
+
+fn assume_then_use(x: Int): Int
+  ensures result > 0
+{
+  assume x > 0
+  x
+}
+
+// --- assume in if/else ---
+
+fn assume_in_branch(x: Int): Int
+  ensures result >= 0
+{
+  if x > 0 {
+    x
+  } else {
+    assume x == 0
+    0
+  }
+}
+
+// --- checked_divide: assert precondition holds ---
+
+fn checked_divide(a: Int, b: Int): Int
+  requires b != 0
+{
+  assert b != 0
+  a / b
+}

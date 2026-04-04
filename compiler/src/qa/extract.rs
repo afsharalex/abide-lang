@@ -45,7 +45,7 @@ fn extract_entity_graphs(entity: &IREntity, _ir: &IRProgram) -> Vec<StateGraph> 
     for field in &entity.fields {
         // Only build state graphs for enum-typed fields
         let variants = match &field.ty {
-            IRType::Enum { constructors, .. } => constructors.clone(),
+            IRType::Enum { variants: vs, .. } => vs.iter().map(|v| v.name.clone()).collect::<Vec<_>>(),
             _ => continue,
         };
 
@@ -188,11 +188,15 @@ mod tests {
             name: name.to_owned(),
             ty: IRType::Enum {
                 name: format!("{}Status", name),
-                constructors: variants.iter().map(|s| s.to_string()).collect(),
+                variants: variants
+                    .iter()
+                    .map(|s| crate::ir::types::IRVariant::simple(*s))
+                    .collect(),
             },
             default: default.map(|d| IRExpr::Ctor {
                 enum_name: format!("{}Status", name),
                 ctor: d.to_owned(),
+                args: vec![],
                 span: None,
             }),
         }
@@ -215,6 +219,7 @@ mod tests {
                 right: Box::new(IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: from.to_owned(),
+                    args: vec![],
                     span: None,
                 }),
                 ty: IRType::Bool,
@@ -236,6 +241,7 @@ mod tests {
                 value: IRExpr::Ctor {
                     enum_name: "Status".to_owned(),
                     ctor: to.to_owned(),
+                    args: vec![],
                     span: None,
                 },
             }],
