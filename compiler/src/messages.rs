@@ -128,11 +128,15 @@ pub const SCENE_UNKNOWN: &str = "Z3 returned unknown";
 /// Scene check: no systems or entities found.
 pub const SCENE_EMPTY_SCOPE: &str = "no systems or entities found";
 
-/// Theorem: liveness properties cannot be proved by induction.
+/// Theorem: liveness properties require bounded checking, not unbounded proof.
 pub const THEOREM_LIVENESS_UNSUPPORTED: &str =
-    "theorem contains 'eventually' (possibly in a referenced pred/prop) — \
-     liveness properties cannot be proved by induction; \
-     use bounded model checking (verify block) instead";
+    "theorem contains 'eventually' — \
+     liveness properties require a verify block with fair event declarations";
+
+/// Liveness violation diagnostic label.
+pub fn label_liveness_violation(name: &str) -> String {
+    format!("liveness violation found for '{name}' (infinite counterexample)")
+}
 
 /// BMC: Z3 returned unknown without timeout.
 pub const BMC_UNKNOWN: &str = "Z3 returned unknown — try reducing bound or simplifying property";
@@ -215,3 +219,126 @@ pub const HELP_CIRCULAR_INCLUDE: &str =
 /// Help for circular use dependency errors.
 pub const HELP_CIRCULAR_USE: &str =
     "break the cycle by removing one of the use declarations or merging the modules";
+
+// ── CLI diagnostic labels ──────────────────────────────────────────
+
+/// Diagnostic label for counterexample results.
+pub fn label_counterexample(name: &str) -> String {
+    format!("counterexample found for '{name}'")
+}
+
+/// Diagnostic label for scene failure results.
+pub fn label_scene_fail(name: &str, reason: &str) -> String {
+    format!("scene '{name}' failed: {reason}")
+}
+
+/// Diagnostic label for unprovable results.
+pub fn label_unprovable(name: &str, hint: &str) -> String {
+    format!("could not prove '{name}': {hint}")
+}
+
+/// Diagnostic label for fn contract violation results.
+pub fn label_fn_contract_failed(name: &str) -> String {
+    format!("fn contract violated for '{name}'")
+}
+
+// ── Match exhaustiveness ────────────────────────────────────────────
+
+/// Error for non-exhaustive match expression.
+pub fn non_exhaustive_match(missing: &[&str]) -> String {
+    match missing.len() {
+        1 => format!("non-exhaustive match: missing constructor {}", missing[0]),
+        _ => format!(
+            "non-exhaustive match: missing constructors {}",
+            missing.join(", ")
+        ),
+    }
+}
+
+/// Help text for non-exhaustive match.
+pub const HELP_NON_EXHAUSTIVE_MATCH: &str =
+    "add the missing patterns or use a wildcard `_` to cover all remaining cases";
+
+// ── Scene cardinality and composition ───────────────────────────────
+
+/// Error: ^| used with multi-instance event.
+pub fn scene_xor_multi_instance(scene: &str, var: &str, n: usize) -> String {
+    format!(
+        "scene '{scene}': event '{var}' in `^|` has {n} instances; \
+         exclusive choice requires single-instance cardinality ({{one}} or {{lone}})"
+    )
+}
+
+/// Error: ^| event lacks fire tracking.
+pub fn scene_xor_no_fire_tracking(scene: &str, var: &str) -> String {
+    format!(
+        "scene '{scene}': event '{var}' in `^|` requires \
+         {{lone}} cardinality (has no fire tracking)"
+    )
+}
+
+/// Error: same-step & with multi-instance event.
+pub fn scene_same_step_multi_instance(scene: &str, var_a: &str, n_a: usize, var_b: &str, n_b: usize) -> String {
+    format!(
+        "scene '{scene}': same-step composition `&` requires {{one}} or {{lone}} cardinality; \
+         event '{var_a}' has {n_a} instances, event '{var_b}' has {n_b} instances"
+    )
+}
+
+/// Error: same-step & events touch the same entity type.
+pub fn scene_same_step_entity_conflict(scene: &str, entity: &str) -> String {
+    format!(
+        "scene '{scene}': same-step composition `&` is not supported for events that touch \
+         the same entity type '{entity}'. Use events on different entity types or separate steps."
+    )
+}
+
+// ── Liveness-to-safety reduction ─────────────────────────────────────
+
+/// Method name for liveness proofs via reduction.
+pub const LIVENESS_REDUCTION_METHOD: &str = "liveness-to-safety (1-induction)";
+
+/// Method name for quantified liveness proofs via symmetry reduction.
+pub const SYMMETRY_REDUCTION_METHOD: &str = "symmetry reduction + IC3";
+
+/// Hint when liveness reduction fails.
+pub const LIVENESS_REDUCTION_FAILED: &str =
+    "liveness-to-safety reduction could not prove the property; \
+     try a verify block with bounded lasso BMC for counterexample search";
+
+/// Hint when symmetry reduction fails (asymmetric system or IC3 timeout).
+pub const SYMMETRY_REDUCTION_FAILED: &str =
+    "symmetry reduction could not prove quantified liveness \
+     (asymmetric entity interactions or IC3 timeout); \
+     lasso BMC provides bounded checking";
+
+/// Error: unknown event variable in scene ordering.
+pub fn scene_ordering_unknown_var(scene: &str, var: &str, declared: &str) -> String {
+    format!(
+        "scene '{scene}': ordering references unknown event variable '{var}'; \
+         declared event variables: {declared}"
+    )
+}
+
+// ── Nondeterministic field default validation ───────────────────────
+
+pub fn where_predicate_not_bool(ty_name: &str) -> String {
+    format!("`where` predicate must be a boolean expression, got type {ty_name}")
+}
+
+pub fn in_value_not_constructor(enum_name: &str) -> String {
+    format!("`in` values for {enum_name} field must be constructors (@Name), not expressions")
+}
+
+pub fn enum_default_not_constructor(enum_name: &str, ctors: &str) -> String {
+    format!(
+        "{enum_name} field default must be a constructor (@Name), not an expression; \
+         valid constructors: {ctors}"
+    )
+}
+
+// ── Collection operations ───────────────────────────────────────────
+
+pub fn collection_op_unsupported_arity(type_name: &str, func_name: &str, n: usize) -> String {
+    format!("{type_name}::{func_name} takes {n} arguments, which is not supported")
+}

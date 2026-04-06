@@ -402,16 +402,19 @@ fn report_verification_result(
                 if span.end <= src.len() {
                     let label = match result {
                         VerificationResult::Counterexample { name, .. } => {
-                            format!("counterexample found for '{name}'")
+                            abide::messages::label_counterexample(name)
                         }
                         VerificationResult::SceneFail { name, reason, .. } => {
-                            format!("scene '{name}' failed: {reason}")
+                            abide::messages::label_scene_fail(name, reason)
                         }
                         VerificationResult::Unprovable { name, hint, .. } => {
-                            format!("could not prove '{name}': {hint}")
+                            abide::messages::label_unprovable(name, hint)
                         }
                         VerificationResult::FnContractFailed { name, .. } => {
-                            format!("fn contract violated for '{name}'")
+                            abide::messages::label_fn_contract_failed(name)
+                        }
+                        VerificationResult::LivenessViolation { name, .. } => {
+                            abide::messages::label_liveness_violation(name)
                         }
                         _ => String::new(),
                     };
@@ -423,6 +426,9 @@ fn report_verification_result(
                     )
                     .with_source_code(named);
                     eprintln!("{diag:?}");
+                    // Also print the summary line so UNPROVABLE/COUNTEREXAMPLE etc.
+                    // appear in the same format as success results (PROVED/CHECKED)
+                    eprintln!("{result}");
                     return;
                 }
             }

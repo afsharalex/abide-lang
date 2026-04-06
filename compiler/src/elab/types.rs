@@ -106,11 +106,22 @@ pub struct EEntity {
     pub span: Option<crate::span::Span>,
 }
 
+/// How a field's initial value is specified at the elaboration level.
+#[derive(Debug, Clone)]
+pub enum EFieldDefault {
+    /// `= expr` — deterministic default
+    Value(EExpr),
+    /// `in { expr, expr, ... }` — nondeterministic choice from a finite set
+    In(Vec<EExpr>),
+    /// `where expr` — predicate constraint on the initial value ($ = field value)
+    Where(EExpr),
+}
+
 #[derive(Debug, Clone)]
 pub struct EField {
     pub name: String,
     pub ty: Ty,
-    pub default: Option<EExpr>,
+    pub default: Option<EFieldDefault>,
     pub span: Option<crate::span::Span>,
 }
 
@@ -120,6 +131,7 @@ pub struct EAction {
     pub refs: Vec<(String, Ty)>,
     pub params: Vec<(String, Ty)>,
     pub requires: Vec<EExpr>,
+    pub ensures: Vec<EExpr>,
     pub body: Vec<EExpr>,
     pub span: Option<crate::span::Span>,
 }
@@ -145,6 +157,7 @@ pub struct EScope {
 #[derive(Debug, Clone)]
 pub struct EEvent {
     pub name: String,
+    pub fairness: crate::ast::Fairness,
     pub params: Vec<(String, Ty)>,
     pub requires: Vec<EExpr>,
     pub ensures: Vec<EExpr>,
@@ -325,6 +338,7 @@ pub enum EExpr {
     ),
     Always(Ty, Box<EExpr>, Option<crate::span::Span>),
     Eventually(Ty, Box<EExpr>, Option<crate::span::Span>),
+    Until(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
     Assert(Ty, Box<EExpr>, Option<crate::span::Span>),
     Assume(Ty, Box<EExpr>, Option<crate::span::Span>),
     Assign(Ty, Box<EExpr>, Box<EExpr>, Option<crate::span::Span>),
@@ -371,6 +385,9 @@ pub enum EExpr {
     SetLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
     SeqLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
     MapLit(Ty, Vec<(EExpr, EExpr)>, Option<crate::span::Span>),
+    /// Built-in qualified call: Set::union(s1, s2), Map::domain(m), etc.
+    /// QualCall(result_ty, type_name, func_name, args, span)
+    QualCall(Ty, String, String, Vec<EExpr>, Option<crate::span::Span>),
     Sorry(Option<crate::span::Span>),
     Todo(Option<crate::span::Span>),
     // Imperative constructs
@@ -428,10 +445,12 @@ impl EExpr {
             | Self::UnOp(ty, _, _, _)
             | Self::Call(ty, _, _, _)
             | Self::CallR(ty, _, _, _, _)
+            | Self::QualCall(ty, _, _, _, _)
             | Self::Qual(ty, _, _, _)
             | Self::Quant(ty, _, _, _, _, _)
             | Self::Always(ty, _, _)
             | Self::Eventually(ty, _, _)
+            | Self::Until(ty, _, _, _)
             | Self::Assert(ty, _, _)
             | Self::Assume(ty, _, _)
             | Self::Assign(ty, _, _, _)
@@ -492,6 +511,10 @@ pub enum BinOp {
     Unord,
     Conc,
     Xor,
+    /// `<>` — set union, seq concat, map merge (type-directed)
+    Diamond,
+    /// `!*` — set disjointness
+    Disjoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

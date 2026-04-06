@@ -35,6 +35,10 @@ pub enum Token {
     Action,
     #[token("event")]
     Event,
+    #[token("fair")]
+    Fair,
+    #[token("strong")]
+    Strong,
     #[token("next")]
     Next,
     #[token("when")]
@@ -99,6 +103,8 @@ pub enum Token {
     Always,
     #[token("eventually")]
     Eventually,
+    #[token("until")]
+    Until,
     #[token("all")]
     All,
     #[token("exists")]
@@ -151,10 +157,14 @@ pub enum Token {
     EqEq,
     #[token("!=")]
     BangEq,
+    #[token("!*")]
+    BangStar,
     #[token("=>")]
     FatArrow,
     #[token("=")]
     Eq,
+    #[token("<>")]
+    Diamond,
     #[token("<=")]
     LtEq,
     #[token(">=")]
@@ -244,6 +254,8 @@ impl std::fmt::Display for Token {
             Self::System => write!(f, "system"),
             Self::Action => write!(f, "action"),
             Self::Event => write!(f, "event"),
+            Self::Fair => write!(f, "fair"),
+            Self::Strong => write!(f, "strong"),
             Self::Next => write!(f, "next"),
             Self::When => write!(f, "when"),
             Self::Else => write!(f, "else"),
@@ -275,6 +287,7 @@ impl std::fmt::Display for Token {
             Self::Implies => write!(f, "implies"),
             Self::In => write!(f, "in"),
             Self::Always => write!(f, "always"),
+            Self::Until => write!(f, "until"),
             Self::Eventually => write!(f, "eventually"),
             Self::All => write!(f, "all"),
             Self::Exists => write!(f, "exists"),
@@ -301,8 +314,10 @@ impl std::fmt::Display for Token {
             Self::Hash => write!(f, "#"),
             Self::EqEq => write!(f, "=="),
             Self::BangEq => write!(f, "!="),
+            Self::BangStar => write!(f, "!*"),
             Self::FatArrow => write!(f, "=>"),
             Self::Eq => write!(f, "="),
+            Self::Diamond => write!(f, "<>"),
             Self::LtEq => write!(f, "<="),
             Self::GtEq => write!(f, ">="),
             Self::Lt => write!(f, "<"),
@@ -367,7 +382,7 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src = "module include pub as use const fn type enum struct entity system action event sorry todo mut";
+        let src = "module include pub as use const fn type enum struct entity system action event fair strong sorry todo mut";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -386,6 +401,8 @@ mod tests {
                 Token::System,
                 Token::Action,
                 Token::Event,
+                Token::Fair,
+                Token::Strong,
                 Token::Sorry,
                 Token::Todo,
                 Token::Mut,
@@ -434,7 +451,7 @@ mod tests {
 
     #[test]
     fn symbols() {
-        let src = ":: := . .. @ ' # == != => = <= >= < > + -> - * / % || |> ^| | & : , ( ) [ ] { }";
+        let src = ":: := . .. @ ' # == != !* => = <> <= >= < > + -> - * / % || |> ^| | & : , ( ) [ ] { }";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -448,8 +465,10 @@ mod tests {
                 Token::Hash,
                 Token::EqEq,
                 Token::BangEq,
+                Token::BangStar,
                 Token::FatArrow,
                 Token::Eq,
+                Token::Diamond,
                 Token::LtEq,
                 Token::GtEq,
                 Token::Lt,
@@ -533,12 +552,12 @@ mod tests {
 
     #[test]
     fn string_literals() {
-        let tokens = lex_ok(r#""hello" "billing.abide" "submit""#);
+        let tokens = lex_ok(r#""hello" "billing.ab" "submit""#);
         assert_eq!(
             tokens,
             vec![
                 Token::StringLit("hello".into()),
-                Token::StringLit("billing.abide".into()),
+                Token::StringLit("billing.ab".into()),
                 Token::StringLit("submit".into()),
             ]
         );

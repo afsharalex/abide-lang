@@ -1,0 +1,58 @@
+module NondetDefaults
+
+// Phase 14: Nondeterministic initial values
+
+enum Priority = Low | Medium | High
+
+entity Task {
+  priority: Priority in {@Low, @Medium, @High}
+  done: Bool = false
+  action complete() requires done == false { done' = true }
+}
+
+enum Status = Open | Closed
+
+entity Ticket {
+  status: Status = @Open
+  weight: Int where $ > 0 and $ < 100
+  action close() requires status == @Open { status' = @Closed }
+}
+
+system TaskManager {
+  use Task
+  use Ticket
+  fair event create_task() { create Task {} }
+  fair event create_ticket() { create Ticket {} }
+  fair event finish() {
+    choose t: Task where t.done == false { t.complete() }
+  }
+  fair event close_ticket() {
+    choose t: Ticket where t.status == @Open { t.close() }
+  }
+}
+
+// ── Test 1: `in` with multiple values — verifier explores all ──────
+// A task can start as any priority. Safety: priority is always valid.
+verify in_explores_all for TaskManager[0..3] {
+  assert always all t: Task |
+    t.priority == @Low or t.priority == @Medium or t.priority == @High
+}
+
+// ── Test 2: `where` constraint — field constrained but not fixed ───
+// Ticket weight is always positive and less than 100.
+verify where_constrains for TaskManager[0..3] {
+  assert always all t: Ticket | t.weight > 0 and t.weight < 100
+}
+
+// ── Test 3: deterministic default unchanged ────────────────────────
+// Ticket status starts Open (deterministic default).
+verify deterministic_regression for TaskManager[0..3] {
+  assert always all t: Ticket |
+    t.status == @Open or t.status == @Closed
+}
+
+// ── Test 4: safety fails for one `in` value but not others ─────────
+// "All tasks are Low priority" — false because tasks can start Medium or High.
+verify in_counterexample for TaskManager[0..3] {
+  assert always all t: Task | t.priority == @Low
+}

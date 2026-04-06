@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BuiltinTy, EAction, EContract, EEntity, EExpr, EField, EFn, EPattern, ESystem, EType, EVariant,
-    ElabResult, Ty,
+    BuiltinTy, EAction, EContract, EEntity, EExpr, EField, EFn, EPattern, ESceneWhen, ESystem,
+    EType, EVariant, ElabResult, Ty,
 };
 use crate::messages;
 
@@ -95,6 +95,82 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
 
     // Check for cyclic pred/prop definitions
     errors.extend(check_pred_prop_cycles(env));
+
+    // Check match expression exhaustiveness and collection literal homogeneity
+    for f in env.fns.values() {
+        let fn_ctx = format!("fn {}", f.name);
+        check_match_exhaustiveness(&f.body, &env.types, &env.entities, &mut errors);
+        check_collection_homogeneity(&f.body, &fn_ctx, &mut errors);
+        for c in &f.contracts {
+            match c {
+                EContract::Requires(e) | EContract::Ensures(e) | EContract::Invariant(e) => {
+                    check_match_exhaustiveness(e, &env.types, &env.entities, &mut errors);
+                    check_collection_homogeneity(e, &fn_ctx, &mut errors);
+                }
+                EContract::Decreases { measures, .. } => {
+                    for m in measures {
+                        check_match_exhaustiveness(m, &env.types, &env.entities, &mut errors);
+                    }
+                }
+            }
+        }
+    }
+    for pred in env.preds.values() {
+        check_match_exhaustiveness(&pred.body, &env.types, &env.entities, &mut errors);
+        check_collection_homogeneity(&pred.body, &format!("pred {}", pred.name), &mut errors);
+    }
+    for prop in env.props.values() {
+        check_match_exhaustiveness(&prop.body, &env.types, &env.entities, &mut errors);
+        check_collection_homogeneity(&prop.body, &format!("prop {}", prop.name), &mut errors);
+    }
+    for verify in &env.verifies {
+        for a in &verify.asserts {
+            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_collection_homogeneity(a, &format!("verify {}", verify.name), &mut errors);
+        }
+    }
+    for theorem in &env.theorems {
+        for a in &theorem.shows {
+            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_collection_homogeneity(a, &format!("theorem {}", theorem.name), &mut errors);
+        }
+    }
+    for lemma in &env.lemmas {
+        for a in &lemma.body {
+            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_collection_homogeneity(a, &format!("lemma {}", lemma.name), &mut errors);
+        }
+    }
+    for c in env.consts.values() {
+        check_match_exhaustiveness(&c.body, &env.types, &env.entities, &mut errors);
+        check_collection_homogeneity(&c.body, &format!("const {}", c.name), &mut errors);
+    }
+    for a in &env.axioms {
+        check_match_exhaustiveness(&a.body, &env.types, &env.entities, &mut errors);
+        check_collection_homogeneity(&a.body, &format!("axiom {}", a.name), &mut errors);
+    }
+    for scene in &env.scenes {
+        for given in &scene.givens {
+            if let Some(cond) = &given.condition {
+                check_match_exhaustiveness(cond, &env.types, &env.entities, &mut errors);
+            }
+        }
+        for when in &scene.whens {
+            match when {
+                ESceneWhen::Action { args, .. } => {
+                    for arg in args {
+                        check_match_exhaustiveness(arg, &env.types, &env.entities, &mut errors);
+                    }
+                }
+                ESceneWhen::Assume(e) => {
+                    check_match_exhaustiveness(e, &env.types, &env.entities, &mut errors);
+                }
+            }
+        }
+        for then_expr in &scene.thens {
+            check_match_exhaustiveness(then_expr, &env.types, &env.entities, &mut errors);
+        }
+    }
 
     let result = ElabResult {
         module_name: env.module_name.clone(),
@@ -236,28 +312,89 @@ fn check_entity(entity: &EEntity, all_known_names: &[String]) -> Vec<ElabError> 
 }
 
 fn check_field(entity_name: &str, field: &EField) -> Vec<ElabError> {
-    let Some(ref def_expr) = field.default else {
-        return Vec::new();
+    use crate::elab::types::EFieldDefault;
+
+    let ctx_str = format!("entity {entity_name}, field {}", field.name);
+
+    let def_expr = match &field.default {
+        Some(EFieldDefault::Value(e)) => e,
+        Some(EFieldDefault::In(es)) => {
+            let mut errors = Vec::new();
+            for e in es {
+                // For enum fields: each value must be a valid constructor
+                if let Ty::Enum(_, ctors) = &field.ty {
+                    match e {
+                        EExpr::Var(_, v, _) => {
+                            if !ctors.iter().any(|c| c == v) {
+                                errors.push(ElabError::new(
+                                    ErrorKind::InvalidDefault,
+                                    format!("{v} is not a constructor of {}", field.ty.name()),
+                                    &ctx_str,
+                                ));
+                            }
+                        }
+                        _ => {
+                            errors.push(ElabError::new(
+                                ErrorKind::InvalidDefault,
+                                messages::in_value_not_constructor(&field.ty.name()),
+                                &ctx_str,
+                            ));
+                        }
+                    }
+                }
+                // For non-enum fields: check type compatibility
+                if let Ty::Builtin(expected_bt) = &field.ty {
+                    let ok = match e.ty() {
+                        Ty::Builtin(actual_bt) => actual_bt == *expected_bt,
+                        Ty::Unresolved(_) => true, // not yet resolved, skip
+                        _ => false,
+                    };
+                    if !ok {
+                        errors.push(ElabError::new(
+                            ErrorKind::InvalidDefault,
+                            format!(
+                                "`in` value has type {}, expected {}",
+                                e.ty().name(),
+                                field.ty.name()
+                            ),
+                            &ctx_str,
+                        ));
+                    }
+                }
+            }
+            return errors;
+        }
+        Some(EFieldDefault::Where(pred)) => {
+            // `where` predicate must have Bool type
+            let pred_ty = pred.ty();
+            if !matches!(pred_ty, Ty::Builtin(BuiltinTy::Bool) | Ty::Unresolved(_)) {
+                return vec![ElabError::new(
+                    ErrorKind::InvalidDefault,
+                    messages::where_predicate_not_bool(&pred_ty.name()),
+                    &ctx_str,
+                )];
+            }
+            return Vec::new();
+        }
+        None => return Vec::new(),
     };
 
     match (&field.ty, def_expr) {
         (Ty::Enum(_, ctors), EExpr::Var(_, v, _)) if !ctors.iter().any(|c| c == v) => {
-            let ctx = format!("entity {entity_name}, field {}", field.name);
             let err = if let Some(span) = field.span {
                 ElabError::with_span(
                     ErrorKind::InvalidDefault,
                     format!("{v} is not a constructor of {}", field.ty.name()),
-                    &ctx,
+                    &ctx_str,
                     span,
                 )
             } else {
                 ElabError::new(
                     ErrorKind::InvalidDefault,
                     format!("{v} is not a constructor of {}", field.ty.name()),
-                    &ctx,
+                    &ctx_str,
                 )
             };
-            // Suggest closest matching constructor
             let help = if let Some(closest) = find_closest_name(v, ctors) {
                 format!(
                     "did you mean '@{closest}'? Valid constructors: {}",
@@ -267,6 +404,35 @@ fn check_field(entity_name: &str, field: &EField) -> Vec<ElabError> {
                 format!("valid constructors: {}", ctors.join(", "))
             };
             vec![err.with_help(help)]
+        }
+        // Enum field with non-constructor expression (e.g., numeric literal)
+        (Ty::Enum(name, ctors), _) if !matches!(def_expr, EExpr::Var(_, _, _)) => {
+            vec![ElabError::new(
+                ErrorKind::InvalidDefault,
+                messages::enum_default_not_constructor(name, &ctors.join(", ")),
+                &ctx_str,
+            )]
+        }
+        // Builtin type mismatch (e.g., Int literal for Bool field)
+        (Ty::Builtin(expected_bt), _) => {
+            let ok = match def_expr.ty() {
+                Ty::Builtin(actual_bt) => actual_bt == *expected_bt,
+                Ty::Unresolved(_) => true,
+                _ => false,
+            };
+            if ok {
+                Vec::new()
+            } else {
+                vec![ElabError::new(
+                    ErrorKind::InvalidDefault,
+                    format!(
+                        "default value has type {}, expected {}",
+                        def_expr.ty().name(),
+                        field.ty.name()
+                    ),
+                    &ctx_str,
+                )]
+            }
         }
         _ => Vec::new(),
     }
@@ -421,6 +587,120 @@ fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
 /// missing an `@` prefix. Produces a hint when a name looks like a
 /// constructor but was not resolved.
 #[allow(clippy::too_many_lines)]
+/// Check that collection literals have homogeneous element types.
+/// Called recursively on all expressions.
+fn check_collection_homogeneity(
+    expr: &EExpr,
+    ctx: &str,
+    errors: &mut Vec<ElabError>,
+) {
+    match expr {
+        EExpr::SetLit(_, elems, _) if elems.len() > 1 => {
+            let first_ty = elems[0].ty();
+            for (i, e) in elems.iter().enumerate().skip(1) {
+                let e_ty = e.ty();
+                if !types_compatible(&first_ty, &e_ty) {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "Set literal element {} has type {}, expected {} (matching first element)",
+                            i, e_ty.name(), first_ty.name()
+                        ),
+                        ctx,
+                    ));
+                }
+            }
+        }
+        EExpr::SeqLit(_, elems, _) if elems.len() > 1 => {
+            let first_ty = elems[0].ty();
+            for (i, e) in elems.iter().enumerate().skip(1) {
+                let e_ty = e.ty();
+                if !types_compatible(&first_ty, &e_ty) {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "Seq literal element {} has type {}, expected {} (matching first element)",
+                            i, e_ty.name(), first_ty.name()
+                        ),
+                        ctx,
+                    ));
+                }
+            }
+        }
+        EExpr::MapLit(_, entries, _) if entries.len() > 1 => {
+            let first_k_ty = entries[0].0.ty();
+            let first_v_ty = entries[0].1.ty();
+            for (i, (k, v)) in entries.iter().enumerate().skip(1) {
+                let k_ty = k.ty();
+                let v_ty = v.ty();
+                if !types_compatible(&first_k_ty, &k_ty) {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "Map literal key {} has type {}, expected {} (matching first key)",
+                            i, k_ty.name(), first_k_ty.name()
+                        ),
+                        ctx,
+                    ));
+                }
+                if !types_compatible(&first_v_ty, &v_ty) {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "Map literal value {} has type {}, expected {} (matching first value)",
+                            i, v_ty.name(), first_v_ty.name()
+                        ),
+                        ctx,
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    // Recurse into sub-expressions
+    match expr {
+        EExpr::BinOp(_, _, a, b, _) => {
+            check_collection_homogeneity(a, ctx, errors);
+            check_collection_homogeneity(b, ctx, errors);
+        }
+        EExpr::UnOp(_, _, e, _) | EExpr::Prime(_, e, _) | EExpr::Field(_, e, _, _) => {
+            check_collection_homogeneity(e, ctx, errors);
+        }
+        EExpr::Call(_, f, args, _) => {
+            check_collection_homogeneity(f, ctx, errors);
+            for a in args { check_collection_homogeneity(a, ctx, errors); }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for a in args { check_collection_homogeneity(a, ctx, errors); }
+        }
+        EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) => {
+            for e in elems { check_collection_homogeneity(e, ctx, errors); }
+        }
+        EExpr::MapLit(_, entries, _) => {
+            for (k, v) in entries {
+                check_collection_homogeneity(k, ctx, errors);
+                check_collection_homogeneity(v, ctx, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if two types are compatible (same kind, ignoring unresolved).
+fn types_compatible(a: &Ty, b: &Ty) -> bool {
+    match (a, b) {
+        (Ty::Unresolved(_), _) | (_, Ty::Unresolved(_)) => true,
+        (Ty::Builtin(a), Ty::Builtin(b)) => a == b,
+        (Ty::Enum(na, _), Ty::Enum(nb, _)) => na == nb,
+        (Ty::Set(a), Ty::Set(b)) => types_compatible(a, b),
+        (Ty::Seq(a), Ty::Seq(b)) => types_compatible(a, b),
+        (Ty::Map(ka, va), Ty::Map(kb, vb)) => types_compatible(ka, kb) && types_compatible(va, vb),
+        (Ty::Entity(a), Ty::Entity(b)) => a == b,
+        (Ty::Alias(a, _), Ty::Alias(b, _)) => a == b,
+        _ => false,
+    }
+}
+
 fn check_unresolved_constructors(
     expr: &EExpr,
     ctx: &str,
@@ -479,8 +759,17 @@ fn check_unresolved_constructors(
         | EExpr::NamedPair(_, _, e, _) => {
             check_unresolved_constructors(e, ctx, span, known_names, errors);
         }
+        EExpr::Until(_, l, r, _) => {
+            check_unresolved_constructors(l, ctx, span, known_names, errors);
+            check_unresolved_constructors(r, ctx, span, known_names, errors);
+        }
         EExpr::Call(_, f, args, _) => {
             check_unresolved_constructors(f, ctx, span, known_names, errors);
+            for arg in args {
+                check_unresolved_constructors(arg, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
             for arg in args {
                 check_unresolved_constructors(arg, ctx, span, known_names, errors);
             }
@@ -714,6 +1003,7 @@ fn expr_type(e: &EExpr) -> Option<&Ty> {
         | EExpr::BinOp(ty, _, _, _, _)
         | EExpr::UnOp(ty, _, _, _)
         | EExpr::Call(ty, _, _, _)
+        | EExpr::QualCall(ty, _, _, _, _)
         | EExpr::Field(ty, _, _, _)
         | EExpr::Quant(ty, _, _, _, _, _)
         | EExpr::Always(ty, _, _)
@@ -730,6 +1020,7 @@ fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
         | EExpr::BinOp(_, _, _, _, sp)
         | EExpr::UnOp(_, _, _, sp)
         | EExpr::Call(_, _, _, sp)
+        | EExpr::QualCall(_, _, _, _, sp)
         | EExpr::Field(_, _, _, sp) => *sp,
         _ => None,
     }
@@ -854,6 +1145,11 @@ fn collect_name_refs(
                 collect_name_refs(arg, known_names, bound, refs);
             }
         }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for arg in args {
+                collect_name_refs(arg, known_names, bound, refs);
+            }
+        }
         EExpr::CallR(_, func, ref_args, args, _) => {
             collect_name_refs(func, known_names, bound, refs);
             for arg in ref_args {
@@ -877,6 +1173,10 @@ fn collect_name_refs(
         }
         EExpr::Always(_, e, _) => collect_name_refs(e, known_names, bound, refs),
         EExpr::Eventually(_, e, _) => collect_name_refs(e, known_names, bound, refs),
+        EExpr::Until(_, l, r, _) => {
+            collect_name_refs(l, known_names, bound, refs);
+            collect_name_refs(r, known_names, bound, refs);
+        }
         EExpr::Assert(_, e, _) => collect_name_refs(e, known_names, bound, refs),
         EExpr::Assume(_, e, _) => collect_name_refs(e, known_names, bound, refs),
         EExpr::Assign(_, l, r, _) => {
@@ -1195,7 +1495,8 @@ fn check_ctor_records_in_expr(
         | EExpr::Seq(_, l, r, _)
         | EExpr::SameStep(_, l, r, _)
         | EExpr::Pipe(_, l, r, _)
-        | EExpr::In(_, l, r, _) => {
+        | EExpr::In(_, l, r, _)
+        | EExpr::Until(_, l, r, _) => {
             check_ctor_records_in_expr(l, variant_fields, errors);
             check_ctor_records_in_expr(r, variant_fields, errors);
         }
@@ -1212,6 +1513,11 @@ fn check_ctor_records_in_expr(
         }
         EExpr::Call(_, f, args, _) | EExpr::CallR(_, f, _, args, _) => {
             check_ctor_records_in_expr(f, variant_fields, errors);
+            for a in args {
+                check_ctor_records_in_expr(a, variant_fields, errors);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
             for a in args {
                 check_ctor_records_in_expr(a, variant_fields, errors);
             }
@@ -1392,4 +1698,315 @@ mod tests {
         assert_eq!(hints.len(), 1, "should find hint in binop rhs");
         assert!(hints[0].help.as_ref().unwrap().contains("@Active"));
     }
+}
+
+// ── Match exhaustiveness checking ───────────────────────────────────
+
+/// Walk an expression tree and check every match expression for exhaustiveness.
+///
+/// For each match whose scrutinee has an enum type, verifies that the arms
+/// cover all constructors. Wildcards (`_`) and variable patterns cover all
+/// remaining constructors. Guarded arms are treated conservatively — a guard
+/// does not guarantee coverage (what if the guard is false?).
+fn check_match_exhaustiveness(
+    expr: &EExpr,
+    types: &HashMap<String, Ty>,
+    entities: &HashMap<String, EEntity>,
+    errors: &mut Vec<ElabError>,
+) {
+    match expr {
+        EExpr::Match(scrut, arms, span) => {
+            // Recurse into scrutinee and arm bodies first
+            check_match_exhaustiveness(scrut, types, entities, errors);
+            for (_, guard, body) in arms {
+                if let Some(g) = guard {
+                    check_match_exhaustiveness(g, types, entities, errors);
+                }
+                check_match_exhaustiveness(body, types, entities, errors);
+            }
+
+            // Check exhaustiveness for enum scrutinee types.
+            // Follow alias chains (type A = B; type B = Enum) to find the
+            // underlying enum, using the types map for named aliases.
+            // For field access scrutinees (e.g., o.status), resolve the field
+            // type from the entity definition when the base has an entity type.
+            let scrut_ty = scrut.ty();
+            let resolved_field_ty = if matches!(scrut_ty, Ty::Unresolved(_)) {
+                resolve_field_type(scrut, types, entities)
+            } else {
+                None
+            };
+            let ty_to_check = resolved_field_ty.as_ref().unwrap_or(&scrut_ty);
+            let constructors = match resolve_to_enum(ty_to_check, types) {
+                Some(ctors) => ctors,
+                None => return,
+            };
+
+            // Collect covered constructors from unguarded arms.
+            // An unguarded wildcard/variable covers everything.
+            let mut covered: HashSet<&str> = HashSet::new();
+            let mut has_catchall = false;
+
+            for (pat, guard, _) in arms {
+                if guard.is_some() {
+                    // Guarded arms are conservative — the guard might be false,
+                    // so this arm doesn't guarantee coverage.
+                    continue;
+                }
+                if pattern_is_catchall(pat, constructors) {
+                    has_catchall = true;
+                    break;
+                }
+                collect_covered_ctors(pat, constructors, &mut covered);
+            }
+
+            if has_catchall {
+                return; // Wildcard or variable covers all remaining
+            }
+
+            let missing: Vec<&str> = constructors
+                .iter()
+                .filter(|c| !covered.contains(c.as_str()))
+                .map(String::as_str)
+                .collect();
+
+            if !missing.is_empty() {
+                let mut err = ElabError::new(
+                    ErrorKind::NonExhaustiveMatch,
+                    messages::non_exhaustive_match(&missing),
+                    String::new(),
+                );
+                err.span = *span;
+                err.help = Some(messages::HELP_NON_EXHAUSTIVE_MATCH.into());
+                errors.push(err);
+            }
+        }
+
+        // Recurse into all sub-expressions
+        EExpr::BinOp(_, _, l, r, _)
+        | EExpr::Assign(_, l, r, _)
+        | EExpr::Seq(_, l, r, _)
+        | EExpr::SameStep(_, l, r, _)
+        | EExpr::Pipe(_, l, r, _)
+        | EExpr::In(_, l, r, _)
+        | EExpr::Until(_, l, r, _) => {
+            check_match_exhaustiveness(l, types, entities, errors);
+            check_match_exhaustiveness(r, types, entities, errors);
+        }
+        EExpr::UnOp(_, _, e, _)
+        | EExpr::Always(_, e, _)
+        | EExpr::Eventually(_, e, _)
+        | EExpr::Assert(_, e, _)
+        | EExpr::Assume(_, e, _)
+        | EExpr::Prime(_, e, _)
+        | EExpr::Card(_, e, _)
+        | EExpr::Field(_, e, _, _)
+        | EExpr::NamedPair(_, _, e, _) => {
+            check_match_exhaustiveness(e, types, entities, errors);
+        }
+        EExpr::Call(_, f, args, _) | EExpr::CallR(_, f, _, args, _) => {
+            check_match_exhaustiveness(f, types, entities, errors);
+            for a in args {
+                check_match_exhaustiveness(a, types, entities, errors);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for a in args {
+                check_match_exhaustiveness(a, types, entities, errors);
+            }
+        }
+        EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
+            check_match_exhaustiveness(body, types, entities, errors);
+        }
+        EExpr::Let(binds, body, _) => {
+            for (_, _, e) in binds {
+                check_match_exhaustiveness(e, types, entities, errors);
+            }
+            check_match_exhaustiveness(body, types, entities, errors);
+        }
+        EExpr::IfElse(cond, then_e, else_e, _) => {
+            check_match_exhaustiveness(cond, types, entities, errors);
+            check_match_exhaustiveness(then_e, types, entities, errors);
+            if let Some(el) = else_e {
+                check_match_exhaustiveness(el, types, entities, errors);
+            }
+        }
+        EExpr::Block(items, _) => {
+            for e in items {
+                check_match_exhaustiveness(e, types, entities, errors);
+            }
+        }
+        EExpr::VarDecl(_, _, init, rest, _) => {
+            check_match_exhaustiveness(init, types, entities, errors);
+            check_match_exhaustiveness(rest, types, entities, errors);
+        }
+        EExpr::While(cond, _, body, _) => {
+            check_match_exhaustiveness(cond, types, entities, errors);
+            check_match_exhaustiveness(body, types, entities, errors);
+        }
+        EExpr::CtorRecord(_, _, _, args, _) => {
+            for (_, e) in args {
+                check_match_exhaustiveness(e, types, entities, errors);
+            }
+        }
+        EExpr::MapUpdate(_, m, k, v, _) => {
+            check_match_exhaustiveness(m, types, entities, errors);
+            check_match_exhaustiveness(k, types, entities, errors);
+            check_match_exhaustiveness(v, types, entities, errors);
+        }
+        EExpr::Index(_, m, k, _) => {
+            check_match_exhaustiveness(m, types, entities, errors);
+            check_match_exhaustiveness(k, types, entities, errors);
+        }
+        EExpr::SetComp(_, proj, _, _, filter, _) => {
+            if let Some(p) = proj {
+                check_match_exhaustiveness(p, types, entities, errors);
+            }
+            check_match_exhaustiveness(filter, types, entities, errors);
+        }
+        EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) | EExpr::TupleLit(_, elems, _) => {
+            for e in elems {
+                check_match_exhaustiveness(e, types, entities, errors);
+            }
+        }
+        EExpr::MapLit(_, entries, _) => {
+            for (k, v) in entries {
+                check_match_exhaustiveness(k, types, entities, errors);
+                check_match_exhaustiveness(v, types, entities, errors);
+            }
+        }
+        // Leaves — no sub-expressions to recurse into
+        EExpr::Lit(..)
+        | EExpr::Var(..)
+        | EExpr::Qual(..)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_)
+        | EExpr::Unresolved(..) => {}
+    }
+}
+
+/// Check if a pattern is a catch-all (covers any value regardless of constructor).
+/// Wildcards, bare variables (not constructors), and or-patterns where either
+/// side is a catch-all all qualify.
+fn pattern_is_catchall(pat: &EPattern, constructors: &[String]) -> bool {
+    match pat {
+        EPattern::Wild => true,
+        EPattern::Var(name) => !constructors.iter().any(|c| c == name),
+        EPattern::Or(left, right) => {
+            pattern_is_catchall(left, constructors)
+                || pattern_is_catchall(right, constructors)
+        }
+        EPattern::Ctor(..) => false,
+    }
+}
+
+/// Collect constructor names covered by an unguarded pattern.
+fn collect_covered_ctors<'a>(
+    pat: &'a EPattern,
+    constructors: &'a [String],
+    covered: &mut HashSet<&'a str>,
+) {
+    match pat {
+        EPattern::Var(name) => {
+            // A Var that matches a constructor name covers that constructor
+            if let Some(ctor) = constructors.iter().find(|c| c.as_str() == name) {
+                covered.insert(ctor);
+            }
+            // Otherwise it's a variable binding (catch-all) — handled by pattern_is_catchall
+        }
+        EPattern::Ctor(name, _) => {
+            if let Some(ctor) = constructors.iter().find(|c| c.as_str() == name) {
+                covered.insert(ctor);
+            }
+        }
+        EPattern::Or(left, right) => {
+            collect_covered_ctors(left, constructors, covered);
+            collect_covered_ctors(right, constructors, covered);
+        }
+        EPattern::Wild => {
+            // Catch-all — handled by pattern_is_catchall
+        }
+    }
+}
+
+/// Follow alias chains to find the underlying enum constructors.
+/// Handles `type A = Enum`, `type A = B` where `B = Enum`, etc.
+/// Returns `None` if the type is not an enum (or alias chain to one).
+fn resolve_to_enum<'a>(
+    ty: &'a Ty,
+    types: &'a HashMap<String, Ty>,
+) -> Option<&'a Vec<String>> {
+    let mut current = ty;
+    // Limit iterations to prevent infinite loops on cyclic aliases
+    for _ in 0..20 {
+        match current {
+            Ty::Enum(_, ctors) => return Some(ctors),
+            Ty::Alias(_, inner) => {
+                current = inner.as_ref();
+            }
+            Ty::Unresolved(name) | Ty::Entity(name) => {
+                // Look up named type in the types map
+                match types.get(name.as_str()) {
+                    Some(resolved) => {
+                        current = resolved;
+                    }
+                    None => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Resolve the type of a field-access scrutinee from entity definitions.
+///
+/// When a match scrutinee is `o.status` and `o` has type `Ty::Entity("Order")`,
+/// looks up the `status` field on the `Order` entity to recover the field's type.
+/// This enables exhaustiveness checking for matches on entity fields in contexts
+/// where the field type annotation is unresolved (e.g., scene given variables).
+fn resolve_field_type(
+    expr: &EExpr,
+    types: &HashMap<String, Ty>,
+    entities: &HashMap<String, EEntity>,
+) -> Option<Ty> {
+    if let EExpr::Field(_, base, field_name, _) = expr {
+        let base_ty = base.ty();
+        // Resolve entity name from the base expression's type
+        let entity_name = match &base_ty {
+            Ty::Entity(name) => Some(name.as_str()),
+            Ty::Unresolved(name) if entities.contains_key(name.as_str()) => {
+                Some(name.as_str())
+            }
+            // Follow aliases/type names that resolve to entities
+            _ => {
+                let name = base_ty.name();
+                if entities.contains_key(name) {
+                    Some(name)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(ent_name) = entity_name {
+            if let Some(entity) = entities.get(ent_name) {
+                if let Some(field) = entity.fields.iter().find(|f| f.name == *field_name) {
+                    return Some(field.ty.clone());
+                }
+            }
+        }
+        // Recursive: resolve nested field access (o.inner.status)
+        if matches!(base.as_ref(), EExpr::Field(..)) {
+            if let Some(inner_ty) = resolve_field_type(base, types, entities) {
+                // inner_ty might be an entity — look up the field on it
+                let inner_name = inner_ty.name();
+                if let Some(entity) = entities.get(inner_name) {
+                    if let Some(field) = entity.fields.iter().find(|f| f.name == *field_name) {
+                        return Some(field.ty.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

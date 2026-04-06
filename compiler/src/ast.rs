@@ -208,11 +208,22 @@ pub enum EntityItem {
     Action(EntityAction),
 }
 
+/// How a field's initial value is specified.
+#[derive(Debug, Clone)]
+pub enum FieldDefault {
+    /// `= expr` — deterministic default
+    Value(Expr),
+    /// `in { expr, expr, ... }` — nondeterministic choice from a finite set
+    In(Vec<Expr>),
+    /// `where expr` — predicate constraint on the initial value
+    Where(Expr),
+}
+
 #[derive(Debug, Clone)]
 pub struct FieldDecl {
     pub name: String,
     pub ty: TypeRef,
-    pub default: Option<Expr>,
+    pub default: Option<FieldDefault>,
     pub span: Span,
 }
 
@@ -272,9 +283,21 @@ pub enum SystemItem {
     Next(NextBlock),
 }
 
+/// Fairness level for an event declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fairness {
+    /// No fairness constraint.
+    None,
+    /// Weak fairness (TLA+ WF): if continuously enabled, eventually fires.
+    Weak,
+    /// Strong fairness (TLA+ SF): if repeatedly enabled, eventually fires.
+    Strong,
+}
+
 #[derive(Debug, Clone)]
 pub struct EventDecl {
     pub name: String,
+    pub fairness: Fairness,
     pub params: Vec<Param>,
     pub contracts: Vec<Contract>,
     pub items: Vec<EventItem>,
@@ -294,7 +317,7 @@ pub struct ChooseBlock {
     pub var: String,
     pub ty: String,
     pub condition: Expr,
-    pub body: Vec<Expr>,
+    pub body: Vec<EventItem>,
     pub span: Span,
 }
 
@@ -302,7 +325,7 @@ pub struct ChooseBlock {
 pub struct ForBlock {
     pub var: String,
     pub ty: String,
-    pub body: Vec<Expr>,
+    pub body: Vec<EventItem>,
     pub span: Span,
 }
 
@@ -568,6 +591,7 @@ pub enum ExprKind {
     Impl(Box<Expr>, Box<Expr>),
     Always(Box<Expr>),
     Eventually(Box<Expr>),
+    Until(Box<Expr>, Box<Expr>),
     AssertExpr(Box<Expr>),
     AssumeExpr(Box<Expr>),
     All(String, TypeRef, Box<Expr>),
@@ -610,6 +634,10 @@ pub enum ExprKind {
     Mul(Box<Expr>, Box<Expr>),
     Div(Box<Expr>, Box<Expr>),
     Mod(Box<Expr>, Box<Expr>),
+    /// `a <> b` — set union, seq concat, map merge (type-directed)
+    Diamond(Box<Expr>, Box<Expr>),
+    /// `a !* b` — set disjointness
+    Disjoint(Box<Expr>, Box<Expr>),
 
     // Level 12: unary
     Neg(Box<Expr>),

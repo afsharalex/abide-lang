@@ -48,7 +48,7 @@ false
 ```
 
 **What happened:**
-1. The REPL loaded all `.abide` files from `commerce/`
+1. The REPL loaded all `.ab` files from `commerce/`
 2. In Abide mode, a new `experimental_refund` action was added to `Order` — in memory only
 3. Switching to QA mode, the query confirmed `@Refunded` is now reachable
 4. `/reload` discarded the experiment and reloaded from disk
@@ -56,7 +56,7 @@ false
 
 ## Typical Use
 
-1. Open `.abide` files in your editor
+1. Open `.ab` files in your editor
 2. `abide repl commerce/` in a terminal — loads all modules, builds universe
 3. Edit source files in your editor
 4. `/reload` in the REPL picks up changes from disk
@@ -67,15 +67,15 @@ false
 ## Loading Behavior
 
 ```sh
-abide repl                   # current directory (project config or scan for .abide files)
+abide repl                   # current directory (project config or scan for .ab files)
 abide repl commerce/         # load a directory
-abide repl order.abide       # load a file (+ dependencies)
+abide repl order.ab       # load a file (+ dependencies)
 ```
 
 | Target | Resolution |
 |--------|-----------|
-| No argument | Current directory — project config or scan for `.abide` files |
-| Directory | Load all `.abide` files in the directory tree |
+| No argument | Current directory — project config or scan for `.ab` files |
+| Directory | Load all `.ab` files in the directory tree |
 | Single file | Parse + follow `use`/`include` for dependencies |
 
 ## REPL Commands
@@ -125,7 +125,7 @@ Editor integration (evaluate selections, inline results, QA from the editor) is 
 ## How It Works
 
 ```
-.abide files
+.ab files
     ↓ parse + elaborate + lower
 Core IR (entities, transitions, systems)
     ↓ extract

@@ -18,7 +18,7 @@ The binary is at `target/release/abide`.
 
 ## Write Your First Spec
 
-Create a file called `order.abide`:
+Create a file called `order.ab`:
 
 ```abide
 enum OrderStatus = Pending | Paid | Shipped
@@ -49,7 +49,7 @@ system Commerce {
 ## Check It
 
 ```sh
-abide parse order.abide
+abide parse order.ab
 ```
 
 If the spec parses correctly, the compiler prints the AST. If there's a syntax error, it points to the offending line.
@@ -57,7 +57,7 @@ If the spec parses correctly, the compiler prints the AST. If there's a syntax e
 To verify the spec (induction, IC3/PDR, and bounded model checking):
 
 ```sh
-abide verify order.abide
+abide verify order.ab
 ```
 
 ## What Just Happened
@@ -107,7 +107,7 @@ prop order_safety for Commerce =
 As specs grow, split them into multiple files using the module system:
 
 ```abide
-// types.abide
+// types.ab
 module Commerce
 
 pub enum OrderStatus = Pending | Paid | Shipped
@@ -124,7 +124,7 @@ pub entity Order {
 ```
 
 ```abide
-// system.abide
+// system.ab
 module Commerce
 
 use Commerce::Order
@@ -140,7 +140,7 @@ system Commerce {
 ```
 
 ```abide
-// spec.abide
+// spec.ab
 module Spec
 
 use Commerce::*
@@ -153,7 +153,7 @@ verify order_safety for Commerce[0..50] {
 Verify all files together:
 
 ```sh
-abide verify types.abide system.abide spec.abide
+abide verify types.ab system.ab spec.ab
 ```
 
 Key module system concepts:
@@ -161,7 +161,7 @@ Key module system concepts:
 - `pub` marks declarations visible to other modules (private by default)
 - `use Module::Name` imports a specific declaration; `use Module::*` imports all public names
 - `use Module::Name as Alias` provides a local alias
-- `include "file.abide"` includes a file's contents into the current module
+- `include "file.ab"` includes a file's contents into the current module
 - Systems and events are always public; entity fields are always private
 
 ## Explore with the REPL

@@ -54,6 +54,39 @@ impl DefEnv {
         self.defs.get(name)
     }
 
+    /// Add a proved lemma body expression as a trusted fact.
+    ///
+    /// Stored under the lemma's declared name so that later theorems and verify
+    /// blocks can reference it directly (e.g., `show helper` references a lemma
+    /// named `helper`). For multi-expression lemma bodies, the conjunction of
+    /// all expressions is stored as a single entry.
+    pub fn add_lemma_fact(&mut self, lemma_name: &str, exprs: &[IRExpr]) {
+        let body = if exprs.len() == 1 {
+            exprs[0].clone()
+        } else {
+            // Conjoin multiple body expressions into one
+            let mut result = exprs[0].clone();
+            for expr in &exprs[1..] {
+                result = IRExpr::BinOp {
+                    op: "OpAnd".to_owned(),
+                    left: Box::new(result),
+                    right: Box::new(expr.clone()),
+                    ty: crate::ir::types::IRType::Bool,
+                    span: None,
+                };
+            }
+            result
+        };
+        self.defs.insert(
+            lemma_name.to_owned(),
+            DefEntry {
+                params: vec![],
+                body,
+                requires: vec![],
+            },
+        );
+    }
+
     /// Try to expand a `Var` reference. Returns `Some(body)` for nullary defs (props).
     pub fn expand_var(&self, name: &str) -> Option<IRExpr> {
         let entry = self.defs.get(name)?;
@@ -193,7 +226,8 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
         }
         IRExpr::Lit { .. } | IRExpr::Ctor { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {}
         IRExpr::Field { expr, .. } | IRExpr::Card { expr, .. } => free_vars_inner(expr, bound, fv),
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             free_vars_inner(left, bound, fv);
             free_vars_inner(right, bound, fv);
         }
@@ -222,7 +256,10 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 bound.remove(&name);
             }
         }
-        IRExpr::Forall { var, body, .. } | IRExpr::Exists { var, body, .. } => {
+        IRExpr::Forall { var, body, .. }
+        | IRExpr::Exists { var, body, .. }
+        | IRExpr::One { var, body, .. }
+        | IRExpr::Lone { var, body, .. } => {
             let was_new = bound.insert(var.clone());
             free_vars_inner(body, bound, fv);
             if was_new {
@@ -551,16 +588,27 @@ fn substitute_var_inner(
         }
         IRExpr::Forall {
             var, domain, body, ..
-        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, true),
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, QuantTag::Forall),
         IRExpr::Exists {
             var, domain, body, ..
-        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, false),
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, QuantTag::Exists),
+        IRExpr::One {
+            var, domain, body, ..
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, QuantTag::One),
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => subst_quantifier(var, domain, body, var_name, replacement, repl_fv, QuantTag::Lone),
         IRExpr::Always { body, .. } => IRExpr::Always {
             body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
             span: None,
         },
         IRExpr::Eventually { body, .. } => IRExpr::Eventually {
             body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
+            span: None,
+        },
+        IRExpr::Until { left, right, .. } => IRExpr::Until {
+            left: Box::new(substitute_var_inner(*left, var_name, replacement, repl_fv)),
+            right: Box::new(substitute_var_inner(*right, var_name, replacement, repl_fv)),
             span: None,
         },
         IRExpr::Prime { expr, .. } => IRExpr::Prime {
@@ -848,6 +896,8 @@ fn find_var_type(expr: &IRExpr, name: &str) -> Option<IRType> {
         IRExpr::Lam { body, .. }
         | IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. }
         | IRExpr::Always { body, .. }
         | IRExpr::Eventually { body, .. } => find_var_type(body, name),
         IRExpr::Let { bindings, body, .. } => bindings
@@ -922,7 +972,16 @@ fn rename_in_pattern(
     }
 }
 
-/// Shared logic for Forall/Exists with capture-avoiding substitution.
+/// Tag for which quantifier variant to reconstruct after substitution.
+#[derive(Clone, Copy)]
+enum QuantTag {
+    Forall,
+    Exists,
+    One,
+    Lone,
+}
+
+/// Shared logic for Forall/Exists/One/Lone with capture-avoiding substitution.
 fn subst_quantifier(
     var: String,
     domain: IRType,
@@ -930,24 +989,33 @@ fn subst_quantifier(
     var_name: &str,
     replacement: &IRExpr,
     repl_fv: &HashSet<String>,
-    is_forall: bool,
+    tag: QuantTag,
 ) -> IRExpr {
-    let make = |v: String, d: IRType, b: Box<IRExpr>| {
-        if is_forall {
-            IRExpr::Forall {
-                var: v,
-                domain: d,
-                body: b,
-                span: None,
-            }
-        } else {
-            IRExpr::Exists {
-                var: v,
-                domain: d,
-                body: b,
-                span: None,
-            }
-        }
+    let make = |v: String, d: IRType, b: Box<IRExpr>| match tag {
+        QuantTag::Forall => IRExpr::Forall {
+            var: v,
+            domain: d,
+            body: b,
+            span: None,
+        },
+        QuantTag::Exists => IRExpr::Exists {
+            var: v,
+            domain: d,
+            body: b,
+            span: None,
+        },
+        QuantTag::One => IRExpr::One {
+            var: v,
+            domain: d,
+            body: b,
+            span: None,
+        },
+        QuantTag::Lone => IRExpr::Lone {
+            var: v,
+            domain: d,
+            body: b,
+            span: None,
+        },
     };
 
     if var == var_name {
@@ -1112,6 +1180,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let env = DefEnv::from_ir(&program);
@@ -1173,6 +1242,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let env = DefEnv::from_ir(&program);
@@ -1236,6 +1306,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let env = DefEnv::from_ir(&program);

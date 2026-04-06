@@ -7,7 +7,7 @@ use crate::elab::types as E;
 
 use super::types::{
     Cardinality, IRAction, IRAxiom, IRConst, IRCreateField, IRDecreases, IREntity, IREvent, IRExpr,
-    IRField, IRFieldPat, IRFunction, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene,
+    IRField, IRFieldPat, IRFunction, IRLemma, IRMatchArm, IRPattern, IRProgram, IRRecordField, IRScene,
     IRSceneEvent, IRSceneGiven, IRSchedWhen, IRSchedule, IRSystem, IRTheorem, IRTransParam,
     IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LetBinding,
     LitVal,
@@ -67,6 +67,7 @@ pub fn lower(er: &E::ElabResult) -> IRProgram {
         verifies: er.verifies.iter().map(|v| lower_verify(v, a, &variant_info)).collect(),
         theorems: er.theorems.iter().map(|t| lower_theorem(t, a, &variant_info)).collect(),
         axioms: er.axioms.iter().map(|ax| lower_axiom(ax, &variant_info)).collect(),
+        lemmas: er.lemmas.iter().map(|l| lower_lemma(l, &variant_info)).collect(),
         scenes: er.scenes.iter().map(|s| lower_scene(s, a, &variant_info)).collect(),
     }
 }
@@ -420,10 +421,48 @@ fn lower_entity(ee: &E::EEntity, vi: &VariantInfo<'_>) -> IREntity {
 }
 
 fn lower_field(ef: &E::EField, vi: &VariantInfo<'_>) -> IRField {
+    use crate::elab::types::EFieldDefault;
+    let (default, initial_constraint) = match &ef.default {
+        Some(EFieldDefault::Value(e)) => (Some(lower_expr(e, vi)), None),
+        Some(EFieldDefault::In(es)) => {
+            // default = None: nondeterministic, so induction/IC3 treat as unconstrained
+            // (stronger: proves safety for ALL possible initial values)
+            // constraint = $ == a || $ == b || ...
+            let dollar_var = IRExpr::Var {
+                name: "$".to_owned(),
+                ty: lower_ty(&ef.ty, vi),
+                span: None,
+            };
+            let mut disj: Option<IRExpr> = None;
+            for e in es {
+                let eq = IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(dollar_var.clone()),
+                    right: Box::new(lower_expr(e, vi)),
+                    ty: crate::ir::types::IRType::Bool,
+                    span: None,
+                };
+                disj = Some(match disj {
+                    None => eq,
+                    Some(prev) => IRExpr::BinOp {
+                        op: "OpOr".to_owned(),
+                        left: Box::new(prev),
+                        right: Box::new(eq),
+                        ty: crate::ir::types::IRType::Bool,
+                        span: None,
+                    },
+                });
+            }
+            (None, disj)
+        }
+        Some(EFieldDefault::Where(e)) => (None, Some(lower_expr(e, vi))),
+        None => (None, None),
+    };
     IRField {
         name: ef.name.clone(),
         ty: lower_ty(&ef.ty, vi),
-        default: ef.default.as_ref().map(|d| lower_expr(d, vi)),
+        default,
+        initial_constraint,
     }
 }
 
@@ -458,7 +497,11 @@ fn lower_action(ea: &E::EAction, vi: &VariantInfo<'_>) -> IRTransition {
             .collect(),
         guard: lower_guard_refs(&all_requires, vi),
         updates: extract_updates(&ea.body, vi),
-        postcondition: None,
+        postcondition: if ea.ensures.is_empty() {
+            None
+        } else {
+            Some(lower_guard_refs(&ea.ensures.iter().collect::<Vec<_>>(), vi))
+        },
     }
 }
 
@@ -572,6 +615,11 @@ fn lower_event(ev: &E::EEvent, aliases: &std::collections::HashMap<String, Strin
     all_requires.extend(ev.requires.iter());
     IREvent {
         name: ev.name.clone(),
+        fairness: match ev.fairness {
+            crate::ast::Fairness::None => crate::ir::types::IRFairness::None,
+            crate::ast::Fairness::Weak => crate::ir::types::IRFairness::Weak,
+            crate::ast::Fairness::Strong => crate::ir::types::IRFairness::Strong,
+        },
         params: ev
             .params
             .iter()
@@ -698,6 +746,15 @@ fn lower_axiom(ea: &E::EAxiom, vi: &VariantInfo<'_>) -> IRAxiom {
     }
 }
 
+fn lower_lemma(el: &E::ELemma, vi: &VariantInfo<'_>) -> IRLemma {
+    IRLemma {
+        name: el.name.clone(),
+        body: el.body.iter().map(|e| lower_expr(e, vi)).collect(),
+        span: el.span,
+        file: el.file.clone(),
+    }
+}
+
 fn lower_scene(es: &E::EScene, aliases: &std::collections::HashMap<String, String>, vi: &VariantInfo<'_>) -> IRScene {
     let (actions, assumes): (Vec<_>, Vec<_>) = es
         .whens
@@ -772,6 +829,14 @@ fn card_from_text(s: Option<&str>) -> Cardinality {
 
 // ── Expression lowering ──────────────────────────────────────────────
 
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
     match e {
@@ -808,13 +873,27 @@ fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
             expr: Box::new(lower_expr(expr, vi)),
             span: *sp,
         },
-        E::EExpr::BinOp(ty, op, a, b, sp) => IRExpr::BinOp {
-            op: format!("{:?}", lower_binop(*op)),
-            left: Box::new(lower_expr(a, vi)),
-            right: Box::new(lower_expr(b, vi)),
-            ty: lower_ty(ty, vi),
-            span: *sp,
-        },
+        E::EExpr::BinOp(ty, op, a, b, sp) => {
+            // Type-directed operator overloading: when both operands have
+            // Set type, override arithmetic ops to set ops. This is done HERE
+            // (not in the SMT layer) because the elaborated types distinguish
+            // Set<T> from Map<K,Bool> and Seq<Bool>, which are all Array<_,Bool>
+            // at the SMT level.
+            let resolved_op = match (op, a.ty(), b.ty()) {
+                (E::BinOp::Mul, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetIntersect".to_owned(),
+                (E::BinOp::Sub, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetDiff".to_owned(),
+                (E::BinOp::Le, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetSubset".to_owned(),
+                (E::BinOp::Add, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetUnion".to_owned(),
+                _ => format!("{:?}", lower_binop(*op)),
+            };
+            IRExpr::BinOp {
+                op: resolved_op,
+                left: Box::new(lower_expr(a, vi)),
+                right: Box::new(lower_expr(b, vi)),
+                ty: lower_ty(ty, vi),
+                span: *sp,
+            }
+        }
         E::EExpr::UnOp(ty, op, expr, sp) => IRExpr::UnOp {
             op: format!("{:?}", lower_unop(*op)),
             operand: Box::new(lower_expr(expr, vi)),
@@ -849,6 +928,44 @@ fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
                 span: outer_span,
             })
         }
+        E::EExpr::QualCall(ty, type_name, func_name, args, sp) => {
+            let op = format!("Op{type_name}{}", capitalize(func_name));
+            let lowered_args: Vec<IRExpr> = args.iter().map(|a| lower_expr(a, vi)).collect();
+            match lowered_args.len() {
+                1 => IRExpr::UnOp {
+                    op,
+                    operand: Box::new(lowered_args.into_iter().next().unwrap()),
+                    ty: lower_ty(ty, vi),
+                    span: *sp,
+                },
+                2 => {
+                    let mut iter = lowered_args.into_iter();
+                    IRExpr::BinOp {
+                        op,
+                        left: Box::new(iter.next().unwrap()),
+                        right: Box::new(iter.next().unwrap()),
+                        ty: lower_ty(ty, vi),
+                        span: *sp,
+                    }
+                }
+                0 | 3.. => {
+                    // Emit the qualified call name as a Var so the verifier
+                    // reports a clear error rather than silently mislowering.
+                    IRExpr::Var {
+                        name: format!(
+                            "{}",
+                            crate::messages::collection_op_unsupported_arity(
+                                type_name,
+                                func_name,
+                                lowered_args.len(),
+                            )
+                        ),
+                        ty: lower_ty(ty, vi),
+                        span: *sp,
+                    }
+                }
+            }
+        }
         E::EExpr::Qual(ty, s, n, sp) => {
             if let E::Ty::Enum(enum_name, ctors) = ty {
                 if ctors.contains(n) {
@@ -876,10 +993,19 @@ fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
                     body: Box::new(lowered),
                     span: *sp,
                 },
-                E::Quantifier::Exists
-                | E::Quantifier::Some
-                | E::Quantifier::One
-                | E::Quantifier::Lone => IRExpr::Exists {
+                E::Quantifier::Exists | E::Quantifier::Some => IRExpr::Exists {
+                    var: v.clone(),
+                    domain: vt,
+                    body: Box::new(lowered),
+                    span: *sp,
+                },
+                E::Quantifier::One => IRExpr::One {
+                    var: v.clone(),
+                    domain: vt,
+                    body: Box::new(lowered),
+                    span: *sp,
+                },
+                E::Quantifier::Lone => IRExpr::Lone {
                     var: v.clone(),
                     domain: vt,
                     body: Box::new(lowered),
@@ -904,6 +1030,11 @@ fn lower_expr(e: &E::EExpr, vi: &VariantInfo<'_>) -> IRExpr {
         },
         E::EExpr::Eventually(_, expr, sp) => IRExpr::Eventually {
             body: Box::new(lower_expr(expr, vi)),
+            span: *sp,
+        },
+        E::EExpr::Until(_, left, right, sp) => IRExpr::Until {
+            left: Box::new(lower_expr(left, vi)),
+            right: Box::new(lower_expr(right, vi)),
             span: *sp,
         },
         E::EExpr::Assert(_, expr, sp) => IRExpr::Assert {
@@ -1173,6 +1304,8 @@ enum IRBinOp {
     OpUnord,
     OpConc,
     OpXor,
+    OpDiamond,
+    OpDisjoint,
 }
 
 impl std::fmt::Debug for IRBinOp {
@@ -1195,6 +1328,8 @@ impl std::fmt::Debug for IRBinOp {
             Self::OpUnord => write!(f, "OpUnord"),
             Self::OpConc => write!(f, "OpConc"),
             Self::OpXor => write!(f, "OpXor"),
+            Self::OpDiamond => write!(f, "OpDiamond"),
+            Self::OpDisjoint => write!(f, "OpDisjoint"),
         }
     }
 }
@@ -1218,6 +1353,8 @@ fn lower_binop(op: E::BinOp) -> IRBinOp {
         E::BinOp::Unord => IRBinOp::OpUnord,
         E::BinOp::Conc => IRBinOp::OpConc,
         E::BinOp::Xor => IRBinOp::OpXor,
+        E::BinOp::Diamond => IRBinOp::OpDiamond,
+        E::BinOp::Disjoint => IRBinOp::OpDisjoint,
     }
 }
 
@@ -1314,12 +1451,12 @@ mod tests {
                 None,
             )],
             span: Some(sp),
-            file: Some("/test.abide".to_owned()),
+            file: Some("/test.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_verify(&ev, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/test.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/test.ab"));
     }
 
     #[test]
@@ -1335,12 +1472,12 @@ mod tests {
                 None,
             )],
             span: Some(sp),
-            file: Some("/proof.abide".to_owned()),
+            file: Some("/proof.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_theorem(&et, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/proof.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/proof.ab"));
     }
 
     #[test]
@@ -1353,12 +1490,12 @@ mod tests {
             whens: vec![],
             thens: vec![],
             span: Some(sp),
-            file: Some("/scene.abide".to_owned()),
+            file: Some("/scene.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_scene(&es, &std::collections::HashMap::new(), &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/scene.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/scene.ab"));
     }
 
     #[test]
@@ -1372,12 +1509,12 @@ mod tests {
                 None,
             ),
             span: Some(sp),
-            file: Some("/ax.abide".to_owned()),
+            file: Some("/ax.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_axiom(&ea, &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/ax.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/ax.ab"));
     }
 
     #[test]
@@ -1390,12 +1527,12 @@ mod tests {
             contracts: vec![],
             body: E::EExpr::Var(E::Ty::Builtin(E::BuiltinTy::Int), "x".to_owned(), None),
             span: Some(sp),
-            file: Some("/fn.abide".to_owned()),
+            file: Some("/fn.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_fn(&ef, &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/fn.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/fn.ab"));
     }
 
     #[test]
@@ -1410,12 +1547,12 @@ mod tests {
                 None,
             ),
             span: Some(sp),
-            file: Some("/pred.abide".to_owned()),
+            file: Some("/pred.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_pred(&ep, &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/pred.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/pred.ab"));
     }
 
     #[test]
@@ -1430,11 +1567,11 @@ mod tests {
                 None,
             ),
             span: Some(sp),
-            file: Some("/prop.abide".to_owned()),
+            file: Some("/prop.ab".to_owned()),
         };
         let vi = VariantInfo::new();
         let ir = lower_prop(&ep, &vi);
         assert_eq!(ir.span, Some(sp));
-        assert_eq!(ir.file.as_deref(), Some("/prop.abide"));
+        assert_eq!(ir.file.as_deref(), Some("/prop.ab"));
     }
 }

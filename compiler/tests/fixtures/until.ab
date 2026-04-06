@@ -1,0 +1,66 @@
+module Until
+
+// Until temporal operator tests (Phase 5 of model-verification-gaps.md)
+
+enum Light = Red | Yellow | Green
+
+entity Signal {
+  color: Light = @Red
+  action go_green() requires color == @Red { color' = @Green }
+  action go_yellow() requires color == @Red { color' = @Yellow }
+}
+
+system Direct {
+  use Signal
+  event make_signal() { create Signal {} }
+  event toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+}
+
+system Indirect {
+  use Signal
+  event make_signal() { create Signal {} }
+  event step_yellow() {
+    choose s: Signal where s.color == @Red { s.go_yellow() }
+  }
+}
+
+// Red holds until Green — should PROVE (Red then directly Green)
+verify direct_until for Direct[0..5] {
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+// Red until Green — should FAIL because Red becomes Yellow first
+verify indirect_fails for Indirect[0..5] {
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+system StuckRed {
+  use Signal
+  event make_signal() { create Signal {} }
+  // No event changes color — signals stay Red forever
+}
+
+// Red until Green — should FAIL because Green never occurs
+// (Q never becomes true violates the "until" requirement)
+verify never_green for StuckRed[0..5] {
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+// Until via prop (def expansion path)
+prop stuck_prop = all s: Signal | s.color == @Red until s.color == @Green
+
+verify via_prop for StuckRed[0..5] {
+  assert stuck_prop
+}
+
+// Until via pred (def expansion path)
+pred stuck_pred(s: Signal) = s.color == @Red until s.color == @Green
+
+verify via_pred for StuckRed[0..5] {
+  assert all s: Signal | stuck_pred(s)
+}

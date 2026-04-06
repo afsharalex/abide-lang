@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use crate::ir::types::{IRAction, IREntity, IRExpr, IRProgram, IRSystem, IRType};
 
 use super::model::{
-    ApplyInfo, CrossCall, EventInfo, FlowModel, StateGraph, SystemInfo, TransitionEdge,
+    ActionContract, ApplyInfo, CrossCall, EventInfo, FlowModel, StateGraph, SystemInfo,
+    TransitionEdge,
 };
 
 /// Extract a `FlowModel` from an `IRProgram`.
@@ -30,11 +31,33 @@ pub fn extract(ir: &IRProgram) -> FlowModel {
     let entity_names = ir.entities.iter().map(|e| e.name.clone()).collect();
     let type_names = ir.types.iter().map(|t| t.name.clone()).collect();
 
+    let mut action_contracts = HashMap::new();
+    for entity in &ir.entities {
+        for transition in &entity.transitions {
+            let contract = ActionContract {
+                entity: entity.name.clone(),
+                action: transition.name.clone(),
+                guard: display_ir_expr(&transition.guard),
+                postcondition: transition.postcondition.as_ref().map(display_ir_expr),
+                updates: transition
+                    .updates
+                    .iter()
+                    .map(|u| format!("{}' = {}", u.field, display_ir_expr(&u.value)))
+                    .collect(),
+            };
+            action_contracts.insert(
+                (entity.name.clone(), transition.name.clone()),
+                contract,
+            );
+        }
+    }
+
     FlowModel {
         state_graphs,
         systems,
         entity_names,
         type_names,
+        action_contracts,
     }
 }
 
@@ -178,6 +201,233 @@ fn collect_event_actions(
     }
 }
 
+/// Render an IR expression as a human-readable string for QA output.
+fn display_ir_expr(expr: &IRExpr) -> String {
+    match expr {
+        IRExpr::Lit { value, .. } => match value {
+            crate::ir::types::LitVal::Int { value } => value.to_string(),
+            crate::ir::types::LitVal::Bool { value } => value.to_string(),
+            crate::ir::types::LitVal::Real { value } => value.to_string(),
+            crate::ir::types::LitVal::Float { value } => value.to_string(),
+            crate::ir::types::LitVal::Str { value } => format!("\"{value}\""),
+        },
+        IRExpr::Var { name, .. } => name.clone(),
+        IRExpr::Ctor { ctor, args, .. } => {
+            if args.is_empty() {
+                format!("@{ctor}")
+            } else {
+                let fields: Vec<String> = args
+                    .iter()
+                    .map(|(name, val)| format!("{name}: {}", display_ir_expr(val)))
+                    .collect();
+                format!("@{ctor} {{ {} }}", fields.join(", "))
+            }
+        }
+        IRExpr::Field { expr, field, .. } => {
+            format!("{}.{field}", display_ir_expr(expr))
+        }
+        IRExpr::Prime { expr, .. } => format!("{}'", display_ir_expr(expr)),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            let op_str = match op.as_str() {
+                "OpEq" => "==",
+                "OpNEq" => "!=",
+                "OpLt" => "<",
+                "OpGt" => ">",
+                "OpLe" => "<=",
+                "OpGe" => ">=",
+                "OpAnd" => "and",
+                "OpOr" => "or",
+                "OpAdd" => "+",
+                "OpSub" => "-",
+                "OpMul" => "*",
+                "OpDiv" => "/",
+                "OpMod" => "%",
+                "OpImplies" => "implies",
+                other => other,
+            };
+            format!(
+                "{} {} {}",
+                display_ir_expr(left),
+                op_str,
+                display_ir_expr(right)
+            )
+        }
+        IRExpr::UnOp { op, operand, .. } => {
+            let op_str = match op.as_str() {
+                "OpNot" => "not",
+                "OpNeg" => "-",
+                other => other,
+            };
+            format!("{op_str} {}", display_ir_expr(operand))
+        }
+        IRExpr::Always { body, .. } => format!("always {}", display_ir_expr(body)),
+        IRExpr::Eventually { body, .. } => format!("eventually {}", display_ir_expr(body)),
+        IRExpr::Until { left, right, .. } => {
+            format!("{} until {}", display_ir_expr(left), display_ir_expr(right))
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            let arms_str: Vec<String> = arms
+                .iter()
+                .map(|arm| {
+                    let pat = display_ir_pattern(&arm.pattern);
+                    let guard = arm
+                        .guard
+                        .as_ref()
+                        .map(|g| format!(" if {}", display_ir_expr(g)))
+                        .unwrap_or_default();
+                    format!("{pat}{guard} => {}", display_ir_expr(&arm.body))
+                })
+                .collect();
+            format!("match {} {{ {} }}", display_ir_expr(scrutinee), arms_str.join(", "))
+        }
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => format!(
+            "all {var}: {} | {}",
+            display_ir_type(domain),
+            display_ir_expr(body)
+        ),
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => format!(
+            "exists {var}: {} | {}",
+            display_ir_type(domain),
+            display_ir_expr(body)
+        ),
+        IRExpr::One {
+            var, domain, body, ..
+        } => format!(
+            "one {var}: {} | {}",
+            display_ir_type(domain),
+            display_ir_expr(body)
+        ),
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => format!(
+            "lone {var}: {} | {}",
+            display_ir_type(domain),
+            display_ir_expr(body)
+        ),
+        IRExpr::App { func, arg, .. } => {
+            format!("{}({})", display_ir_expr(func), display_ir_expr(arg))
+        }
+        IRExpr::Lam {
+            param, body, ..
+        } => format!("fn({param}) => {}", display_ir_expr(body)),
+        IRExpr::Let { bindings, body, .. } => {
+            let binds: Vec<String> = bindings
+                .iter()
+                .map(|b| format!("{} = {}", b.name, display_ir_expr(&b.expr)))
+                .collect();
+            format!("let {} in {}", binds.join(", "), display_ir_expr(body))
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let else_str = else_body
+                .as_ref()
+                .map(|e| format!(" else {}", display_ir_expr(e)))
+                .unwrap_or_default();
+            format!(
+                "if {} then {}{}",
+                display_ir_expr(cond),
+                display_ir_expr(then_body),
+                else_str
+            )
+        }
+        IRExpr::Card { expr, .. } => format!("#{}", display_ir_expr(expr)),
+        IRExpr::SetLit { elements, .. } => {
+            let elems: Vec<String> = elements.iter().map(display_ir_expr).collect();
+            format!("Set({})", elems.join(", "))
+        }
+        IRExpr::SeqLit { elements, .. } => {
+            let elems: Vec<String> = elements.iter().map(display_ir_expr).collect();
+            format!("Seq({})", elems.join(", "))
+        }
+        IRExpr::MapLit { entries, .. } => {
+            let pairs: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("({}, {})", display_ir_expr(k), display_ir_expr(v)))
+                .collect();
+            format!("Map({})", pairs.join(", "))
+        }
+        IRExpr::Index { map, key, .. } => {
+            format!("{}[{}]", display_ir_expr(map), display_ir_expr(key))
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => format!(
+            "{}[{} := {}]",
+            display_ir_expr(map),
+            display_ir_expr(key),
+            display_ir_expr(value)
+        ),
+        IRExpr::Assert { expr, .. } => format!("assert {}", display_ir_expr(expr)),
+        IRExpr::Assume { expr, .. } => format!("assume {}", display_ir_expr(expr)),
+        IRExpr::Sorry { .. } => "sorry".to_string(),
+        IRExpr::Todo { .. } => "todo".to_string(),
+        IRExpr::Block { exprs, .. } => {
+            let stmts: Vec<String> = exprs.iter().map(display_ir_expr).collect();
+            format!("{{ {} }}", stmts.join("; "))
+        }
+        _ => format!("{expr:?}"),
+    }
+}
+
+/// Render an IR pattern as a human-readable string.
+fn display_ir_pattern(pat: &crate::ir::types::IRPattern) -> String {
+    use crate::ir::types::IRPattern;
+    match pat {
+        IRPattern::PWild => "_".to_string(),
+        IRPattern::PVar { name } => name.clone(),
+        IRPattern::PCtor { name, fields } => {
+            if fields.is_empty() {
+                name.clone()
+            } else {
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|fp| format!("{}: {}", fp.name, display_ir_pattern(&fp.pattern)))
+                    .collect();
+                format!("{name} {{ {} }}", fs.join(", "))
+            }
+        }
+        IRPattern::POr { left, right } => {
+            format!(
+                "{} | {}",
+                display_ir_pattern(left),
+                display_ir_pattern(right)
+            )
+        }
+    }
+}
+
+/// Render an IR type as a human-readable string.
+fn display_ir_type(ty: &IRType) -> String {
+    match ty {
+        IRType::Bool => "Bool".to_string(),
+        IRType::Int => "Int".to_string(),
+        IRType::Real => "Real".to_string(),
+        IRType::Float => "Float".to_string(),
+        IRType::String => "String".to_string(),
+        IRType::Id => "Id".to_string(),
+        IRType::Enum { name, .. } => name.clone(),
+        IRType::Entity { name } => name.clone(),
+        IRType::Set { element } => format!("Set<{}>", display_ir_type(element)),
+        IRType::Seq { element } => format!("Seq<{}>", display_ir_type(element)),
+        IRType::Map { key, value } => {
+            format!("Map<{}, {}>", display_ir_type(key), display_ir_type(value))
+        }
+        _ => format!("{ty:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +449,7 @@ mod tests {
                 args: vec![],
                 span: None,
             }),
+            initial_constraint: None,
         }
     }
 
@@ -272,6 +523,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let model = extract(&ir);
@@ -300,6 +552,7 @@ mod tests {
                     name: "title".to_owned(),
                     ty: IRType::String,
                     default: None,
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![make_transition("close", "status", Some("Open"), "Closed")],
@@ -313,6 +566,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let model = extract(&ir);
@@ -334,6 +588,7 @@ mod tests {
             name: "Commerce".to_owned(),
             entities: vec!["Order".to_owned()],
             events: vec![IREvent {
+                fairness: crate::ir::types::IRFairness::None,
                 name: "submit_order".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {

@@ -1,0 +1,61 @@
+module LivenessQuantifiedFalse
+
+// Regression tests for quantified liveness soundness.
+//
+// The Ball/Painter system has two fair paint events (green and blue).
+// Since both are fair, some balls are painted Green and others Blue
+// permanently (no recovery from Green/Blue). This makes "all balls green"
+// universally false — only an existential "some ball green" is true.
+//
+// Quantified liveness uses symmetry reduction (Phase 16): prove the
+// property on a 1-slot system, then generalize by entity symmetry.
+// A lasso BMC sanity check with proper weak fairness catches dead-state
+// counterexamples that IC3's coarse justice would miss.
+
+enum Color = Red | Green | Blue
+
+entity Ball {
+  color: Color = @Red
+  action paint_green() requires color == @Red { color' = @Green }
+  action paint_blue() requires color == @Red { color' = @Blue }
+}
+
+system Painter {
+  use Ball
+  fair event spawn_ball() { create Ball {} }
+  fair event green_paint() {
+    choose b: Ball where b.color == @Red { b.paint_green() }
+  }
+  fair event blue_paint() {
+    choose b: Ball where b.color == @Red { b.paint_blue() }
+  }
+}
+
+// ── FALSE: eventually all balls are green ──────────────────────────
+// Some balls get painted Blue permanently, so not ALL can be Green.
+// Symmetry reduction: lasso sanity check finds the dead-state
+// counterexample (ball becomes Blue, no events enabled, Green never
+// holds). Falls back to UNPROVABLE.
+theorem false_eventually_all_green for Painter {
+  show eventually all b: Ball | b.color == @Green
+}
+
+// ── TRUE: each ball eventually gets painted (some color) ───────────
+// With fair green_paint and blue_paint, each Red ball is eventually
+// chosen by one of them. So every ball eventually leaves Red.
+// UNPROVABLE: IC3's BAS monitor with coarse justice is unsound for
+// liveness (misses dead-state lassos), so symmetry reduction correctly
+// declines to use IC3. Sound proof requires k-liveness.
+theorem true_each_eventually_painted for Painter {
+  show always all b: Ball | eventually b.color != @Red
+}
+
+// ── Until theorem (actual until expression) ─────────────────────
+// Each ball stays Red until it gets painted (non-Red).
+// Desugars to (eventually color != @Red) AND (always (color == @Red implies color == @Red))
+// The Forall wrapping fix correctly extracts QuantifiedEventuality + safety.
+// UNPROVABLE: liveness part requires IC3 BAS which is unsound for
+// liveness (dead-state issue). Sound proof requires k-liveness.
+theorem until_painted for Painter {
+  show all b: Ball | b.color == @Red until b.color != @Red
+}

@@ -502,12 +502,38 @@ pub fn encode_create(
         // Apply entity defaults for fields NOT specified in the create block.
         // Without this, unconstrained fields could take any value, making the
         // verification overly permissive.
+        //
+        // When `initial_constraint` is present (from `in {...}` or `where`),
+        // assert the constraint with `$` / field name substituted for the
+        // field's next-step value, instead of fixing to a single default.
         if let Some(ent) = entity_ir {
             for field in &ent.fields {
                 if create_field_names.contains(field.name.as_str()) {
                     continue; // already set by create block
                 }
-                if let Some(ref default_expr) = field.default {
+                if let Some(ref constraint_expr) = field.initial_constraint {
+                    // Nondeterministic: encode the constraint with $ bound to field_next.
+                    if let Some(field_next) =
+                        pool.field_at(entity_name, slot, &field.name, step + 1)
+                    {
+                        let mut params = ctx.params.clone();
+                        params.insert("$".to_owned(), field_next.clone());
+                        params.insert(field.name.clone(), field_next.clone());
+                        let pred_ctx = SlotEncodeCtx {
+                            pool: ctx.pool,
+                            vctx: ctx.vctx,
+                            entity: ctx.entity,
+                            slot: ctx.slot,
+                            params,
+                            bindings: ctx.bindings.clone(),
+                        };
+                        let val = encode_slot_expr(&pred_ctx, constraint_expr, step + 1);
+                        if let SmtValue::Bool(b) = val {
+                            conjuncts.push(b);
+                        }
+                    }
+                } else if let Some(ref default_expr) = field.default {
+                    // Deterministic: field_next == default
                     let val = encode_slot_expr(&ctx, default_expr, step);
                     if let Some(field_next) =
                         pool.field_at(entity_name, slot, &field.name, step + 1)
@@ -948,7 +974,7 @@ pub fn encode_event_with_params(
 
 /// Apply global frame for untouched slots to an event formula.
 /// Called once at the top level — never inside recursive `CrossCall` encoding.
-fn apply_global_frame(
+pub(crate) fn apply_global_frame(
     pool: &SlotPool,
     entities: &[IREntity],
     touched: &HashSet<(String, usize)>,
@@ -960,6 +986,526 @@ fn apply_global_frame(
     all.extend(frame);
     let refs: Vec<&Bool> = all.iter().collect();
     Bool::and(&refs)
+}
+
+/// Encode a non-Apply nested action within the bound context of a Choose or
+/// ForAll iteration. The bound variable's fields at the given slot are made
+/// available via params so nested expressions can reference them (e.g., `o.id`
+/// inside `choose o: Order { create Receipt { order_id = o.id } }`).
+///
+/// Returns `(formulas, additional_touched)` where formulas should be conjoined
+/// with the current slot's constraints and additional_touched contains entity
+/// slots that were modified by the nested action (for global frame tracking).
+#[allow(clippy::too_many_arguments)]
+fn encode_nested_op(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    all_systems: &[IRSystem],
+    op: &IRAction,
+    bound_var: &str,
+    bound_ent_name: &str,
+    bound_entity_ir: &IREntity,
+    bound_slot: usize,
+    step: usize,
+    base_params: &HashMap<String, SmtValue>,
+    depth: usize,
+    // Chain of outer bound variables from enclosing Choose/ForAll scopes.
+    // Each entry is (var_name, entity_name, entity_ir, slot).
+    // Enables Apply targeting an outer variable to resolve to its specific slot
+    // instead of a disjunction over all slots.
+    outer_bindings: &[(&str, &str, &IREntity, usize)],
+) -> (Vec<Bool>, HashSet<(String, usize)>) {
+    let mut formulas = Vec::new();
+    let mut additional_touched: HashSet<(String, usize)> = HashSet::new();
+
+    // Build params that include the bound variable's field mappings for this slot.
+    // This allows nested expressions to resolve `bound_var.field` references.
+    let mut slot_params = base_params.clone();
+    for field in &bound_entity_ir.fields {
+        if let Some(val) = pool.field_at(bound_ent_name, bound_slot, &field.name, step) {
+            slot_params.insert(format!("{bound_var}.{}", field.name), val.clone());
+        }
+    }
+
+    match op {
+        IRAction::Create {
+            entity: create_ent,
+            fields,
+        } => {
+            let create_entity_ir = entities.iter().find(|e| e.name == *create_ent);
+            let create_fields: Vec<(String, IRExpr)> = fields
+                .iter()
+                .map(|f| (f.name.clone(), f.value.clone()))
+                .collect();
+            let create_formula = encode_create(
+                pool,
+                vctx,
+                create_ent,
+                create_entity_ir,
+                &create_fields,
+                step,
+                &slot_params,
+            );
+            formulas.push(create_formula);
+            let n_slots = pool.slots_for(create_ent);
+            for s in 0..n_slots {
+                additional_touched.insert((create_ent.clone(), s));
+            }
+        }
+
+        IRAction::CrossCall {
+            system: target_system,
+            event: event_name,
+            args: cross_args,
+        } => {
+            if let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) {
+                if let Some(target_event) =
+                    target_sys.events.iter().find(|e| e.name == *event_name)
+                {
+                    if target_event.params.len() != cross_args.len() {
+                        formulas.push(Bool::from_bool(false));
+                    } else {
+                        let arg_ctx = SlotEncodeCtx {
+                            pool,
+                            vctx,
+                            entity: bound_ent_name,
+                            slot: bound_slot,
+                            params: slot_params.clone(),
+                            bindings: HashMap::new(),
+                        };
+                        let mut cross_params: HashMap<String, SmtValue> = HashMap::new();
+                        for (target_param, arg_expr) in
+                            target_event.params.iter().zip(cross_args.iter())
+                        {
+                            let val = encode_slot_expr(&arg_ctx, arg_expr, step);
+                            cross_params.insert(target_param.name.clone(), val);
+                        }
+                        let (cross_formula, cross_touched) = encode_event_inner(
+                            pool,
+                            vctx,
+                            entities,
+                            all_systems,
+                            target_event,
+                            step,
+                            depth + 1,
+                            Some(cross_params),
+                        );
+                        formulas.push(cross_formula);
+                        additional_touched.extend(cross_touched);
+                    }
+                }
+            }
+        }
+
+        IRAction::ExprStmt { expr } => {
+            let expr_ctx = SlotEncodeCtx {
+                pool,
+                vctx,
+                entity: bound_ent_name,
+                slot: bound_slot,
+                params: slot_params,
+                bindings: HashMap::new(),
+            };
+            let val = encode_slot_expr(&expr_ctx, expr, step);
+            formulas.push(val.to_bool().expect("internal: nested expr_stmt to_bool"));
+        }
+
+        IRAction::Choose {
+            var: inner_var,
+            entity: inner_ent,
+            filter,
+            ops: inner_ops,
+        } => {
+            let inner_n_slots = pool.slots_for(inner_ent);
+            let inner_entity_ir = entities.iter().find(|e| e.name == *inner_ent);
+            // Augment outer bindings with the current bound variable so that
+            // deeper nested ops can resolve Apply targets to our specific slot.
+            let mut inner_bindings = outer_bindings.to_vec();
+            inner_bindings.push((bound_var, bound_ent_name, bound_entity_ir, bound_slot));
+            let mut inner_slot_options = Vec::new();
+
+            for inner_slot in 0..inner_n_slots {
+                let inner_ctx = SlotEncodeCtx {
+                    pool,
+                    vctx,
+                    entity: inner_ent,
+                    slot: inner_slot,
+                    params: slot_params.clone(),
+                    bindings: HashMap::new(),
+                };
+                let mut inner_conjuncts = Vec::new();
+
+                // Must be active
+                if let Some(SmtValue::Bool(active)) =
+                    pool.active_at(inner_ent, inner_slot, step)
+                {
+                    inner_conjuncts.push(active.clone());
+                }
+                // Filter must hold
+                let filt = encode_slot_expr(&inner_ctx, filter, step);
+                inner_conjuncts
+                    .push(filt.to_bool().expect("internal: nested choose filter to_bool"));
+
+                // Encode inner ops
+                if let Some(inner_ent_ir) = inner_entity_ir {
+                    let mut inner_slot_has_action = false;
+                    for inner_op in inner_ops {
+                        match inner_op {
+                            IRAction::Apply {
+                                target,
+                                transition,
+                                args,
+                                refs: apply_refs,
+                            } if target == inner_var => {
+                                // Target matches inner bound var — encode on inner entity
+                                if let Some(trans) = inner_ent_ir
+                                    .transitions
+                                    .iter()
+                                    .find(|t| t.name == *transition)
+                                {
+                                    let action_params = build_apply_params(
+                                        &inner_ctx,
+                                        trans,
+                                        args,
+                                        apply_refs,
+                                        step,
+                                    );
+                                    let action_formula = encode_action(
+                                        pool,
+                                        vctx,
+                                        inner_ent_ir,
+                                        trans,
+                                        inner_slot,
+                                        step,
+                                        &action_params,
+                                    );
+                                    inner_conjuncts.push(action_formula);
+                                    inner_slot_has_action = true;
+                                }
+                            }
+                            _ => {
+                                // Cross-entity Apply or other nested action —
+                                // delegate to encode_nested_op which resolves the
+                                // target to the correct entity and slot.
+                                let (nested_f, nested_t) = encode_nested_op(
+                                    pool,
+                                    vctx,
+                                    entities,
+                                    all_systems,
+                                    inner_op,
+                                    inner_var,
+                                    inner_ent,
+                                    inner_ent_ir,
+                                    inner_slot,
+                                    step,
+                                    &slot_params,
+                                    depth,
+                                    &inner_bindings,
+                                );
+                                inner_conjuncts.extend(nested_f);
+                                additional_touched.extend(nested_t);
+                            }
+                        }
+                    }
+
+                    // If no op directly acted on the inner chosen slot, frame it
+                    // so the solver cannot mutate it arbitrarily.
+                    if !inner_slot_has_action {
+                        for field in &inner_ent_ir.fields {
+                            if let (Some(curr), Some(next)) = (
+                                pool.field_at(inner_ent, inner_slot, &field.name, step),
+                                pool.field_at(
+                                    inner_ent,
+                                    inner_slot,
+                                    &field.name,
+                                    step + 1,
+                                ),
+                            ) {
+                                inner_conjuncts.push(
+                                    smt::smt_eq(curr, next)
+                                        .expect("internal: nested choose slot frame smt_eq"),
+                                );
+                            }
+                        }
+                        if let (
+                            Some(SmtValue::Bool(act_curr)),
+                            Some(SmtValue::Bool(act_next)),
+                        ) = (
+                            pool.active_at(inner_ent, inner_slot, step),
+                            pool.active_at(inner_ent, inner_slot, step + 1),
+                        ) {
+                            inner_conjuncts.push(act_next.eq(act_curr.clone()));
+                        }
+                    }
+
+                    // Frame other slots of inner entity
+                    let slot_frame =
+                        frame_entity_slots_except(pool, inner_ent_ir, inner_slot, step);
+                    inner_conjuncts.extend(slot_frame);
+                }
+
+                let refs: Vec<&Bool> = inner_conjuncts.iter().collect();
+                if !refs.is_empty() {
+                    inner_slot_options.push(Bool::and(&refs));
+                }
+            }
+
+            let refs: Vec<&Bool> = inner_slot_options.iter().collect();
+            if !refs.is_empty() {
+                formulas.push(Bool::or(&refs));
+            }
+            for s in 0..inner_n_slots {
+                additional_touched.insert((inner_ent.clone(), s));
+            }
+        }
+
+        IRAction::ForAll {
+            var: inner_var,
+            entity: inner_ent,
+            ops: inner_ops,
+        } => {
+            let inner_n_slots = pool.slots_for(inner_ent);
+            let inner_entity_ir = entities.iter().find(|e| e.name == *inner_ent);
+            // Augment outer bindings with current bound variable
+            let mut inner_bindings = outer_bindings.to_vec();
+            inner_bindings.push((bound_var, bound_ent_name, bound_entity_ir, bound_slot));
+
+            for inner_slot in 0..inner_n_slots {
+                let inner_ctx = SlotEncodeCtx {
+                    pool,
+                    vctx,
+                    entity: inner_ent,
+                    slot: inner_slot,
+                    params: slot_params.clone(),
+                    bindings: HashMap::new(),
+                };
+                let mut op_conjuncts = Vec::new();
+
+                if let Some(inner_ent_ir) = inner_entity_ir {
+                    let mut inner_slot_has_action = false;
+                    for inner_op in inner_ops {
+                        match inner_op {
+                            IRAction::Apply {
+                                target,
+                                transition,
+                                args,
+                                refs: apply_refs,
+                            } if target == inner_var => {
+                                // Target matches inner bound var — encode on inner entity
+                                if let Some(trans) = inner_ent_ir
+                                    .transitions
+                                    .iter()
+                                    .find(|t| t.name == *transition)
+                                {
+                                    let action_params = build_apply_params(
+                                        &inner_ctx,
+                                        trans,
+                                        args,
+                                        apply_refs,
+                                        step,
+                                    );
+                                    let action_formula = encode_action(
+                                        pool,
+                                        vctx,
+                                        inner_ent_ir,
+                                        trans,
+                                        inner_slot,
+                                        step,
+                                        &action_params,
+                                    );
+                                    op_conjuncts.push(action_formula);
+                                    inner_slot_has_action = true;
+                                }
+                            }
+                            _ => {
+                                // Cross-entity Apply or other nested action
+                                let (nested_f, nested_t) = encode_nested_op(
+                                    pool,
+                                    vctx,
+                                    entities,
+                                    all_systems,
+                                    inner_op,
+                                    inner_var,
+                                    inner_ent,
+                                    inner_ent_ir,
+                                    inner_slot,
+                                    step,
+                                    &slot_params,
+                                    depth,
+                                    &inner_bindings,
+                                );
+                                op_conjuncts.extend(nested_f);
+                                additional_touched.extend(nested_t);
+                            }
+                        }
+                    }
+
+                    // If no op directly acted on this slot, frame it so the
+                    // solver cannot mutate the active entity's fields.
+                    if !inner_slot_has_action {
+                        for field in &inner_ent_ir.fields {
+                            if let (Some(curr), Some(next)) = (
+                                pool.field_at(inner_ent, inner_slot, &field.name, step),
+                                pool.field_at(
+                                    inner_ent,
+                                    inner_slot,
+                                    &field.name,
+                                    step + 1,
+                                ),
+                            ) {
+                                op_conjuncts.push(
+                                    smt::smt_eq(curr, next)
+                                        .expect("internal: nested forall slot frame smt_eq"),
+                                );
+                            }
+                        }
+                        if let (
+                            Some(SmtValue::Bool(act_curr)),
+                            Some(SmtValue::Bool(act_next)),
+                        ) = (
+                            pool.active_at(inner_ent, inner_slot, step),
+                            pool.active_at(inner_ent, inner_slot, step + 1),
+                        ) {
+                            op_conjuncts.push(act_next.eq(act_curr.clone()));
+                        }
+                    }
+                }
+
+                // For each slot: (active AND ops) OR (!active AND frame)
+                if let Some(SmtValue::Bool(active)) =
+                    pool.active_at(inner_ent, inner_slot, step)
+                {
+                    let active_branch = if op_conjuncts.is_empty() {
+                        active.clone()
+                    } else {
+                        let mut active_parts = vec![active.clone()];
+                        active_parts.extend(op_conjuncts);
+                        let refs: Vec<&Bool> = active_parts.iter().collect();
+                        Bool::and(&refs)
+                    };
+
+                    let mut frame_parts = vec![active.not()];
+                    if let Some(SmtValue::Bool(act_next)) =
+                        pool.active_at(inner_ent, inner_slot, step + 1)
+                    {
+                        frame_parts.push(act_next.eq(active.clone()));
+                    }
+                    if let Some(inner_ent_ir) = inner_entity_ir {
+                        for field in &inner_ent_ir.fields {
+                            if let (Some(curr), Some(next)) = (
+                                pool.field_at(inner_ent, inner_slot, &field.name, step),
+                                pool.field_at(inner_ent, inner_slot, &field.name, step + 1),
+                            ) {
+                                frame_parts.push(
+                                    smt::smt_eq(curr, next)
+                                        .expect("internal: nested forall frame smt_eq"),
+                                );
+                            }
+                        }
+                    }
+
+                    let frame_refs: Vec<&Bool> = frame_parts.iter().collect();
+                    let inactive_branch = Bool::and(&frame_refs);
+                    formulas.push(Bool::or(&[&active_branch, &inactive_branch]));
+                }
+
+                additional_touched.insert((inner_ent.clone(), inner_slot));
+            }
+        }
+
+        IRAction::Apply {
+            target,
+            transition,
+            args,
+            refs: apply_refs,
+        } => {
+            // Resolve which entity and slot the Apply targets.
+            // Priority: immediate bound var → outer bound var chain → entity name/transition fallback
+            let resolved_binding: Option<(&str, &IREntity, usize)> =
+                if target == bound_var {
+                    Some((bound_ent_name, bound_entity_ir, bound_slot))
+                } else {
+                    outer_bindings
+                        .iter()
+                        .find(|(var, _, _, _)| *var == target.as_str())
+                        .map(|(_, ent_name, ent_ir, slot)| (*ent_name, *ent_ir, *slot))
+                };
+
+            if let Some((ent_name, ent_ir, slot)) = resolved_binding {
+                // Target is a bound variable (immediate or outer) — encode on
+                // its specific slot, preserving the chosen slot identity.
+                if let Some(trans) = ent_ir.transitions.iter().find(|t| t.name == *transition)
+                {
+                    let ctx = SlotEncodeCtx {
+                        pool,
+                        vctx,
+                        entity: ent_name,
+                        slot,
+                        params: slot_params,
+                        bindings: HashMap::new(),
+                    };
+                    let action_params = build_apply_params(&ctx, trans, args, apply_refs, step);
+                    let action_formula =
+                        encode_action(pool, vctx, ent_ir, trans, slot, step, &action_params);
+                    formulas.push(action_formula);
+                    additional_touched.insert((ent_name.to_string(), slot));
+                }
+            } else {
+                // Apply targeting an unresolved variable — resolve by entity
+                // name or transition name, encode with slot disjunction.
+                let resolved = entities.iter().find(|e| e.name == *target).or_else(|| {
+                    let matches: Vec<_> = entities
+                        .iter()
+                        .filter(|e| e.transitions.iter().any(|t| t.name == *transition))
+                        .collect();
+                    if matches.len() == 1 {
+                        Some(matches[0])
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ent) = resolved {
+                    let ent_name = &ent.name;
+                    if let Some(trans) =
+                        ent.transitions.iter().find(|t| t.name == *transition)
+                    {
+                        let n_slots = pool.slots_for(ent_name);
+                        let mut slot_options = Vec::new();
+                        for s in 0..n_slots {
+                            let ctx = SlotEncodeCtx {
+                                pool,
+                                vctx,
+                                entity: ent_name,
+                                slot: s,
+                                params: slot_params.clone(),
+                                bindings: HashMap::new(),
+                            };
+                            let action_params =
+                                build_apply_params(&ctx, trans, args, apply_refs, step);
+                            let mut slot_conjuncts = Vec::new();
+                            let formula =
+                                encode_action(pool, vctx, ent, trans, s, step, &action_params);
+                            slot_conjuncts.push(formula);
+                            let slot_frame = frame_entity_slots_except(pool, ent, s, step);
+                            slot_conjuncts.extend(slot_frame);
+                            let refs: Vec<&Bool> = slot_conjuncts.iter().collect();
+                            slot_options.push(Bool::and(&refs));
+                        }
+                        let refs: Vec<&Bool> = slot_options.iter().collect();
+                        if !refs.is_empty() {
+                            formulas.push(Bool::or(&refs));
+                        }
+                        for s in 0..n_slots {
+                            additional_touched.insert((ent_name.clone(), s));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (formulas, additional_touched)
 }
 
 /// Inner recursive implementation of `encode_event` with depth tracking
@@ -975,7 +1521,7 @@ fn apply_global_frame(
 /// Z3 values for the target event's parameters, wiring the caller's args
 /// into the target event instead of creating fresh unconstrained variables.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn encode_event_inner(
+pub(crate) fn encode_event_inner(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],
@@ -1069,6 +1615,7 @@ fn encode_event_inner(
                 // Merge event params with accumulated Choose variable params
                 let mut merged_params = event_params.clone();
                 merged_params.extend(choose_var_params.clone());
+                let mut nested_touched: HashSet<(String, usize)> = HashSet::new();
 
                 for slot in 0..n_slots {
                     let ctx = SlotEncodeCtx {
@@ -1142,9 +1689,25 @@ fn encode_event_inner(
                                         }
                                     }
                                     _ => {
-                                        unimplemented!(
-                                            "nested action in Choose not yet supported: {op:?}"
-                                        )
+                                        if let Some(ent) = entity_ir {
+                                            let (nested_f, nested_t) = encode_nested_op(
+                                                pool,
+                                                vctx,
+                                                entities,
+                                                all_systems,
+                                                op,
+                                                var,
+                                                ent_name,
+                                                ent,
+                                                slot,
+                                                step,
+                                                &merged_params,
+                                                depth,
+                                                &[],
+                                            );
+                                            slot_conjuncts.extend(nested_f);
+                                            nested_touched.extend(nested_t);
+                                        }
                                     }
                                 }
                             }
@@ -1302,9 +1865,25 @@ fn encode_event_inner(
                                         );
                                     }
                                     _ => {
-                                        unimplemented!(
-                                            "nested action in Choose not yet supported: {op:?}"
-                                        )
+                                        if let Some(ent) = entity_ir {
+                                            let (nested_f, nested_t) = encode_nested_op(
+                                                pool,
+                                                vctx,
+                                                entities,
+                                                all_systems,
+                                                op,
+                                                var,
+                                                ent_name,
+                                                ent,
+                                                slot,
+                                                step,
+                                                &merged_params,
+                                                depth,
+                                                &[],
+                                            );
+                                            slot_conjuncts.extend(nested_f);
+                                            nested_touched.extend(nested_t);
+                                        }
                                     }
                                 }
                             }
@@ -1361,6 +1940,8 @@ fn encode_event_inner(
                         touched.insert((ent_name.clone(), slot));
                     }
                 }
+                // Mark entities touched by nested ops (Create, CrossCall, etc.)
+                touched.extend(nested_touched);
 
                 // Register shared Choose variable fields as params for
                 // subsequent actions to resolve `var.field` references.
@@ -1495,12 +2076,18 @@ fn encode_event_inner(
             //   (active AND ops AND active_next) OR (!active AND frame_this_slot)
             // This ensures inactive slots are explicitly framed (not left unconstrained).
             IRAction::ForAll {
-                var: _,
+                var,
                 entity: ent_name,
                 ops,
             } => {
                 let n_slots = pool.slots_for(ent_name);
                 let entity_ir = entities.iter().find(|e| e.name == *ent_name);
+                let mut nested_touched: HashSet<(String, usize)> = HashSet::new();
+                let forall_base_params = {
+                    let mut p = event_params.clone();
+                    p.extend(choose_var_params.clone());
+                    p
+                };
 
                 for slot in 0..n_slots {
                     let ctx = SlotEncodeCtx {
@@ -1508,11 +2095,7 @@ fn encode_event_inner(
                         vctx,
                         entity: ent_name,
                         slot,
-                        params: {
-                            let mut p = event_params.clone();
-                            p.extend(choose_var_params.clone());
-                            p
-                        },
+                        params: forall_base_params.clone(),
                         bindings: HashMap::new(),
                     };
 
@@ -1546,7 +2129,25 @@ fn encode_event_inner(
                                 }
                             }
                             _ => {
-                                unimplemented!("nested action in ForAll not yet supported: {op:?}")
+                                if let Some(ent) = entity_ir {
+                                    let (nested_f, nested_t) = encode_nested_op(
+                                        pool,
+                                        vctx,
+                                        entities,
+                                        all_systems,
+                                        op,
+                                        var,
+                                        ent_name,
+                                        ent,
+                                        slot,
+                                        step,
+                                        &forall_base_params,
+                                        depth,
+                                        &[],
+                                    );
+                                    op_conjuncts.extend(nested_f);
+                                    nested_touched.extend(nested_t);
+                                }
                             }
                         }
                     }
@@ -1594,6 +2195,8 @@ fn encode_event_inner(
 
                     touched.insert((ent_name.clone(), slot));
                 }
+                // Mark entities touched by nested ops (Create, CrossCall, etc.)
+                touched.extend(nested_touched);
             }
 
             IRAction::CrossCall {
@@ -1738,6 +2341,357 @@ pub fn transition_constraints(
 
     let refs: Vec<&Bool> = disjuncts.iter().collect();
     Bool::or(&refs)
+}
+
+// ── Lasso BMC infrastructure ────────────────────────────────────────
+
+/// Per-event fire tracking for lasso fairness.
+///
+/// Creates Boolean indicator variables for each event at each step,
+/// plus stutter indicators. Asserts implications (fire → event formula)
+/// and exactly-one constraints per step.
+pub struct FireTracking {
+    /// `(system_name, event_name)` → vec of Bool per step (fire indicators)
+    pub fire_vars: HashMap<(String, String), Vec<Bool>>,
+    /// Per-step stutter indicators
+    pub stutter_vars: Vec<Bool>,
+    /// All constraints to assert on the solver
+    pub constraints: Vec<Bool>,
+}
+
+/// Build transition constraints with per-event fire tracking.
+///
+/// Like `transition_constraints` but instead of a monolithic disjunction,
+/// creates individual fire variables for each event at each step. This
+/// enables fairness constraints on the lasso loop.
+pub fn transition_constraints_with_fire(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    bound: usize,
+) -> FireTracking {
+    let mut fire_vars: HashMap<(String, String), Vec<Bool>> = HashMap::new();
+    let mut stutter_vars = Vec::new();
+    let mut constraints = Vec::new();
+
+    // Collect all (system, event) pairs
+    let mut event_keys: Vec<(String, String)> = Vec::new();
+    for system in systems {
+        for event in &system.events {
+            let key = (system.name.clone(), event.name.clone());
+            fire_vars.insert(key.clone(), Vec::new());
+            event_keys.push(key);
+        }
+    }
+
+    for step in 0..bound {
+        // Create fire indicator for each event at this step
+        let mut step_indicators: Vec<Bool> = Vec::new();
+
+        for system in systems {
+            for event in &system.events {
+                let key = (system.name.clone(), event.name.clone());
+                let fire_var = smt::bool_var(&format!(
+                    "fire_{}_{}_t{step}",
+                    system.name, event.name
+                ));
+                let fire_bool = fire_var.to_bool().expect("internal: fire var");
+
+                // fire → event_formula
+                let event_formula = encode_event(pool, vctx, entities, systems, event, step);
+                constraints.push(fire_bool.implies(&event_formula));
+
+                fire_vars
+                    .get_mut(&key)
+                    .expect("key exists")
+                    .push(fire_bool.clone());
+                step_indicators.push(fire_bool);
+            }
+        }
+
+        // Create stutter indicator
+        let stutter_var = smt::bool_var(&format!("stutter_t{step}"));
+        let stutter_bool = stutter_var.to_bool().expect("internal: stutter var");
+        let stutter_formula = stutter_constraint(pool, entities, step);
+        constraints.push(stutter_bool.implies(&stutter_formula));
+        step_indicators.push(stutter_bool.clone());
+        stutter_vars.push(stutter_bool);
+
+        // Exactly one fires at this step (at-least-one + at-most-one)
+        let indicator_refs: Vec<&Bool> = step_indicators.iter().collect();
+        constraints.push(Bool::or(&indicator_refs));
+        // At-most-one via pairwise exclusion
+        for i in 0..step_indicators.len() {
+            for j in (i + 1)..step_indicators.len() {
+                constraints.push(
+                    Bool::and(&[&step_indicators[i], &step_indicators[j]]).not(),
+                );
+            }
+        }
+    }
+
+    FireTracking {
+        fire_vars,
+        stutter_vars,
+        constraints,
+    }
+}
+
+/// Lasso loop-back variables and constraints.
+pub struct LassoLoop {
+    /// `loop_indicators[l]` is true iff the loop starts at step l.
+    pub loop_indicators: Vec<Bool>,
+    /// All constraints (exactly-one + conditional loop-back equalities).
+    pub constraints: Vec<Bool>,
+}
+
+/// Create lasso loop-back constraints.
+///
+/// Creates Boolean indicators for each possible loop start l ∈ [0, bound-1].
+/// (Not bound itself — a zero-length loop has no transitions and would allow
+/// degenerate infinite stutter that violates fairness.)
+/// For each l, asserts `loop_l → (state(bound) = state(l))`, meaning all
+/// entity fields and active flags at the last step equal those at step l.
+pub fn lasso_loopback(
+    pool: &SlotPool,
+    entities: &[IREntity],
+) -> LassoLoop {
+    let bound = pool.bound;
+    let mut loop_indicators = Vec::new();
+    let mut constraints = Vec::new();
+
+    for l in 0..bound {
+        let indicator = smt::bool_var(&format!("loop_l_{l}"));
+        let indicator_bool = indicator.to_bool().expect("internal: loop indicator");
+
+        // Loop-back: state(bound) = state(l)
+        let mut equalities = Vec::new();
+        for entity in entities {
+            let n_slots = pool.slots_for(&entity.name);
+            for slot in 0..n_slots {
+                // Active flag equality
+                if let (Some(SmtValue::Bool(at_bound)), Some(SmtValue::Bool(at_l))) = (
+                    pool.active_at(&entity.name, slot, bound),
+                    pool.active_at(&entity.name, slot, l),
+                ) {
+                    equalities.push(at_bound.eq(at_l.clone()));
+                }
+                // Field equalities
+                for field in &entity.fields {
+                    if let (Some(val_bound), Some(val_l)) = (
+                        pool.field_at(&entity.name, slot, &field.name, bound),
+                        pool.field_at(&entity.name, slot, &field.name, l),
+                    ) {
+                        if let Ok(eq) = smt::smt_eq(val_bound, val_l) {
+                            equalities.push(eq);
+                        }
+                    }
+                }
+            }
+        }
+
+        if equalities.is_empty() {
+            // No state to equate — loop-back is trivially true
+            loop_indicators.push(indicator_bool);
+            continue;
+        }
+
+        let eq_refs: Vec<&Bool> = equalities.iter().collect();
+        let loopback_eq = Bool::and(&eq_refs);
+        constraints.push(indicator_bool.implies(&loopback_eq));
+        loop_indicators.push(indicator_bool);
+    }
+
+    // Exactly one loop start
+    let ind_refs: Vec<&Bool> = loop_indicators.iter().collect();
+    constraints.push(Bool::or(&ind_refs));
+    for i in 0..loop_indicators.len() {
+        for j in (i + 1)..loop_indicators.len() {
+            constraints.push(
+                Bool::and(&[&loop_indicators[i], &loop_indicators[j]]).not(),
+            );
+        }
+    }
+
+    LassoLoop {
+        loop_indicators,
+        constraints,
+    }
+}
+
+/// Encode an event's full enabledness predicate at a given step.
+///
+/// An event is "enabled" (in the TLA+ ENABLED sense) if:
+/// 1. Its guard (requires clause) holds at this step
+/// 2. Its body can execute — for Choose, there exists an active entity
+///    matching the filter; for Create, there exists an inactive slot
+///
+/// This is more precise than just checking the guard, which would
+/// incorrectly consider events enabled even when no matching entity exists.
+pub fn encode_event_enabled(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    event: &IREvent,
+    step: usize,
+) -> Bool {
+    let mut conditions = Vec::new();
+
+    // Top-level guard (requires clause)
+    if !matches!(
+        &event.guard,
+        IRExpr::Lit {
+            value: LitVal::Bool { value: true },
+            ..
+        }
+    ) {
+        let params = build_event_params(&event.params, step);
+        conditions.push(encode_guard_expr(pool, vctx, &event.guard, &params, step));
+    }
+
+    // Body preconditions: check that Choose/Create can execute
+    let params = build_event_params(&event.params, step);
+    for action in &event.body {
+        match action {
+            IRAction::Choose {
+                entity: ent_name,
+                filter,
+                ..
+            } => {
+                // Event is enabled only if ∃ active slot matching the filter
+                let n_slots = pool.slots_for(ent_name);
+                let entity_ir = entities.iter().find(|e| e.name == *ent_name);
+                let mut slot_disjuncts = Vec::new();
+                for slot in 0..n_slots {
+                    if let Some(SmtValue::Bool(active)) = pool.active_at(ent_name, slot, step) {
+                        if entity_ir.is_some() {
+                            let ctx = SlotEncodeCtx {
+                                pool,
+                                vctx,
+                                entity: ent_name,
+                                slot,
+                                params: params.clone(),
+                                bindings: HashMap::new(),
+                            };
+                            let filt = encode_slot_expr(&ctx, filter, step);
+                            let filt_bool =
+                                filt.to_bool().unwrap_or_else(|_| Bool::from_bool(false));
+                            slot_disjuncts.push(Bool::and(&[active, &filt_bool]));
+                        }
+                    }
+                }
+                if slot_disjuncts.is_empty() {
+                    // No slots at all → event is never enabled
+                    return Bool::from_bool(false);
+                }
+                let refs: Vec<&Bool> = slot_disjuncts.iter().collect();
+                conditions.push(Bool::or(&refs));
+            }
+            IRAction::Create {
+                entity: ent_name, ..
+            } => {
+                // Event is enabled only if ∃ inactive slot
+                let n_slots = pool.slots_for(ent_name);
+                let mut slot_disjuncts = Vec::new();
+                for slot in 0..n_slots {
+                    if let Some(SmtValue::Bool(active)) = pool.active_at(ent_name, slot, step) {
+                        slot_disjuncts.push(active.not());
+                    }
+                }
+                if slot_disjuncts.is_empty() {
+                    return Bool::from_bool(false);
+                }
+                let refs: Vec<&Bool> = slot_disjuncts.iter().collect();
+                conditions.push(Bool::or(&refs));
+            }
+            _ => {} // Apply, ForAll, CrossCall, ExprStmt — no additional enabledness condition
+        }
+    }
+
+    if conditions.is_empty() {
+        Bool::from_bool(true)
+    } else {
+        let refs: Vec<&Bool> = conditions.iter().collect();
+        Bool::and(&refs)
+    }
+}
+
+/// Build fairness constraints on a lasso loop.
+///
+/// Supports both weak and strong fairness per event:
+///
+/// **Weak fairness** (TLA+ WF): if action A is enabled at EVERY step in
+/// the loop, then A must fire at SOME step in the loop.
+/// `loop_l → ( (∀ step∈[l,bound-1]. enabled(e,step)) → (∃ step∈[l,bound-1]. fire_e(step)) )`
+///
+/// **Strong fairness** (TLA+ SF): if action A is enabled at SOME step in
+/// the loop, then A must fire at SOME step in the loop.
+/// `loop_l → ( (∃ step∈[l,bound-1]. enabled(e,step)) → (∃ step∈[l,bound-1]. fire_e(step)) )`
+///
+/// Strong fairness is strictly stronger than weak: it constrains actions that
+/// are even intermittently enabled, not just continuously enabled.
+pub fn fairness_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    fire: &FireTracking,
+    lasso: &LassoLoop,
+) -> Vec<Bool> {
+    let bound = pool.bound;
+    let mut constraints = Vec::new();
+
+    for system in systems {
+        for event in &system.events {
+            if !event.fairness.is_fair() {
+                continue;
+            }
+            let key = (system.name.clone(), event.name.clone());
+            let fire_vec = match fire.fire_vars.get(&key) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let is_strong = event.fairness == crate::ir::types::IRFairness::Strong;
+
+            for l in 0..bound {
+                let loop_ind = &lasso.loop_indicators[l];
+
+                // Collect enabledness at each loop step
+                let mut enabled_per_step = Vec::new();
+                for step in l..bound {
+                    let enabled =
+                        encode_event_enabled(pool, vctx, entities, event, step);
+                    enabled_per_step.push(enabled);
+                }
+
+                let enabled_condition = if is_strong {
+                    // Strong fairness: enabled at SOME step (disjunction)
+                    let refs: Vec<&Bool> = enabled_per_step.iter().collect();
+                    Bool::or(&refs)
+                } else {
+                    // Weak fairness: enabled at EVERY step (conjunction)
+                    let refs: Vec<&Bool> = enabled_per_step.iter().collect();
+                    Bool::and(&refs)
+                };
+
+                // Fires somewhere in loop
+                let mut fire_disj = Vec::new();
+                for step in l..bound {
+                    fire_disj.push(fire_vec[step].clone());
+                }
+                let fire_refs: Vec<&Bool> = fire_disj.iter().collect();
+                let fires_somewhere = Bool::or(&fire_refs);
+
+                // Fairness: enabled_condition → fires somewhere
+                let fairness = enabled_condition.implies(&fires_somewhere);
+                constraints.push(loop_ind.implies(&fairness));
+            }
+        }
+    }
+
+    constraints
 }
 
 // ── Slot-scoped expression encoding ─────────────────────────────────
@@ -1947,6 +2901,7 @@ mod tests {
                     name: "id".to_owned(),
                     ty: IRType::Id,
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "status".to_owned(),
@@ -1959,11 +2914,13 @@ mod tests {
                 ],
                     },
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "total".to_owned(),
                     ty: IRType::Int,
                     default: None,
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -2176,6 +3133,7 @@ mod tests {
                 name: "balance".to_owned(),
                 ty: IRType::Int,
                 default: None,
+                initial_constraint: None,
             }],
             transitions: vec![IRTransition {
                 name: "deposit".to_owned(),
@@ -2311,6 +3269,7 @@ mod tests {
 
         // Build a ForAll event with deposit action
         let event = IREvent {
+            fairness: crate::ir::types::IRFairness::None,
             name: "deposit_all".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {

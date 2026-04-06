@@ -1,7 +1,7 @@
 // QA test: hypothetical entity extension via abide block
 // Base spec has Open -> InProgress -> Closed (no cycles)
 // Abide block adds reopen: Closed -> Open (creates a cycle)
-load "hypo_base.abide"
+load "hypo_base.ab"
 
 abide {
   module HypoTest

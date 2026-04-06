@@ -1,5 +1,5 @@
 // QA test script — all assertions should pass
-load "commerce.abide"
+load "commerce.ab"
 
 assert reachable Order.status -> @Shipped
 assert reachable Order.status -> @Cancelled

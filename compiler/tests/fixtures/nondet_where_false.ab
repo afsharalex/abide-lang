@@ -1,0 +1,25 @@
+module NondetWhereFalse
+
+// Phase 14 regression: `where false` makes entity uncreatable.
+// BMC and theorem/IC3 paths must agree — both should be vacuously PROVED
+// because no entity of this type can ever exist.
+
+entity Impossible {
+  x: Int where false
+  action noop() requires x == 0 { x' = x }
+}
+
+system S {
+  use Impossible
+  fair event mk() { create Impossible {} }
+}
+
+// Vacuously true: no Impossible entity can ever be created.
+verify where_false_vacuous for S[0..3] {
+  assert always all t: Impossible | false
+}
+
+// Theorem path must also be vacuous (no COUNTEREXAMPLE).
+theorem where_false_theorem for S {
+  show always all t: Impossible | false
+}

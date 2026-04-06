@@ -18,6 +18,7 @@ pub enum ErrorKind {
     MissingField,
     CyclicDefinition,
     CyclicImport,
+    NonExhaustiveMatch,
 }
 
 impl ErrorKind {
@@ -35,6 +36,7 @@ impl ErrorKind {
             Self::InvalidDefault => "E009",
             Self::MissingField => "E010",
             Self::CyclicImport => "E011",
+            Self::NonExhaustiveMatch => "E012",
         }
     }
 
@@ -52,6 +54,7 @@ impl ErrorKind {
             Self::ParamMismatch => "parameter mismatch",
             Self::InvalidDefault => "invalid default value",
             Self::MissingField => "missing required field",
+            Self::NonExhaustiveMatch => "non-exhaustive match",
         }
     }
 
@@ -108,6 +111,11 @@ impl ErrorKind {
             Self::MissingField => {
                 "A required field was not provided. All entity fields without \
                  defaults must be initialized."
+            }
+            Self::NonExhaustiveMatch => {
+                "A match expression does not cover all constructors of the matched \
+                 type. Add the missing patterns or use a wildcard `_` to catch all \
+                 remaining cases."
             }
         }
     }
@@ -377,7 +385,7 @@ mod tests {
             "duplicate here",
             Span { start: 50, end: 60 },
         )
-        .in_file("a.abide".to_owned())
+        .in_file("a.ab".to_owned())
         .with_secondary(Span { start: 10, end: 20 }, "first declared here");
         // secondary_file is None → same file as primary
         let labels: Vec<_> = err.labels().unwrap().collect();
@@ -396,11 +404,11 @@ mod tests {
             "duplicate here",
             Span { start: 50, end: 60 },
         )
-        .in_file("a.abide".to_owned())
+        .in_file("a.ab".to_owned())
         .with_secondary_in_file(
             Span { start: 10, end: 20 },
             "first declared here",
-            "b.abide",
+            "b.ab",
         );
         let labels: Vec<_> = err.labels().unwrap().collect();
         assert_eq!(

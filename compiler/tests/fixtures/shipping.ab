@@ -1,4 +1,4 @@
-// Shipping module — used by logistics.abide for multi-module alias testing
+// Shipping module — used by logistics.ab for multi-module alias testing
 
 module Shipping
 

@@ -30,7 +30,7 @@ entity Order {
 
 Key concepts: enums define state vocabulary, entities hold state, actions transition state with guards, `'` notation distinguishes current from next state.
 
-See: [`examples/order.abide`](../examples/order.abide)
+See: [`examples/order.ab`](../examples/order.ab)
 
 ---
 
@@ -85,7 +85,7 @@ scene successful_deposit for Banking {
 
 Key concepts: `requires`/`ensures` contracts, constants, predicates as named constraints, `verify` with bounded checking, `scene` with given/when/then.
 
-See: [`examples/banking.abide`](../examples/banking.abide)
+See: [`examples/banking.ab`](../examples/banking.ab)
 
 ---
 
@@ -146,7 +146,7 @@ verify review_integrity for Publishing[0..200] {
 
 Key concepts: multi-step state machines, role separation (`reviewer != author_id`), revision counting, liveness properties.
 
-See: [`examples/workflow.abide`](../examples/workflow.abide)
+See: [`examples/workflow.ab`](../examples/workflow.ab)
 
 ---
 
@@ -181,7 +181,7 @@ fn describe(s: Shape): String =
 
 Key concepts: ADT variants with record fields, destructuring, guards (`if`), rest patterns (`..`), wildcards (`_`).
 
-See: [`examples/matching.abide`](../examples/matching.abide)
+See: [`examples/matching.ab`](../examples/matching.ab)
 
 ---
 
@@ -219,7 +219,7 @@ verify cross_system_payment for Commerce[0..100], Billing[0..100] {
 
 Key concepts: multiple systems sharing entities, cross-system event calls (`Commerce::confirm_payment`), multi-system verification bounds.
 
-See: [`examples/commerce.abide`](../examples/commerce.abide)
+See: [`examples/commerce.ab`](../examples/commerce.ab)
 
 ---
 
@@ -267,7 +267,7 @@ lemma refill_decreases {
 
 Key concepts: ADTs with record variants in entity fields, match in functions, refill mechanics with arithmetic, lemma for refill property.
 
-See: [`examples/healthcare.abide`](../examples/healthcare.abide)
+See: [`examples/healthcare.ab`](../examples/healthcare.ab)
 
 ---
 

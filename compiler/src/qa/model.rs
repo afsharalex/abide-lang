@@ -15,6 +15,9 @@ pub struct FlowModel {
     pub entity_names: Vec<String>,
     /// Type names.
     pub type_names: Vec<String>,
+    /// Action contracts per entity.
+    /// Key: `(entity_name, action_name)`
+    pub action_contracts: HashMap<(String, String), ActionContract>,
 }
 
 /// A state machine graph for a single enum-typed field of an entity.
@@ -73,6 +76,21 @@ pub struct CrossCall {
 pub struct ApplyInfo {
     pub entity: String,
     pub action: String,
+}
+
+/// Contract information for an entity action (transition).
+#[derive(Debug, Clone)]
+pub struct ActionContract {
+    /// Entity name.
+    pub entity: String,
+    /// Action/transition name.
+    pub action: String,
+    /// Guard (requires) clause as a human-readable string.
+    pub guard: String,
+    /// Postcondition (ensures) clause, if present.
+    pub postcondition: Option<String>,
+    /// Fields updated by this action.
+    pub updates: Vec<String>,
 }
 
 #[cfg(test)]

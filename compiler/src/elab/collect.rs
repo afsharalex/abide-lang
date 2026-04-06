@@ -257,10 +257,25 @@ fn collect_entity(env: &mut Env, ed: &ast::EntityDecl) {
 }
 
 fn collect_field(f: &ast::FieldDecl) -> EField {
+    use crate::elab::types::EFieldDefault;
+    let default = match &f.default {
+        Some(ast::FieldDefault::Value(expr)) => Some(EFieldDefault::Value(collect_expr(expr))),
+        Some(ast::FieldDefault::In(exprs)) => {
+            let collected: Vec<EExpr> = exprs.iter().map(collect_expr).collect();
+            if collected.len() == 1 {
+                // Single-value `in` is equivalent to `= value`
+                Some(EFieldDefault::Value(collected.into_iter().next().unwrap()))
+            } else {
+                Some(EFieldDefault::In(collected))
+            }
+        }
+        Some(ast::FieldDefault::Where(expr)) => Some(EFieldDefault::Where(collect_expr(expr))),
+        None => None,
+    };
     EField {
         name: f.name.clone(),
         ty: resolve_type_ref(&f.ty),
-        default: f.default.as_ref().map(collect_expr),
+        default,
         span: Some(f.span),
     }
 }
@@ -284,12 +299,21 @@ fn collect_action(a: &ast::EntityAction) -> EAction {
             _ => None,
         })
         .collect();
+    let ensures: Vec<EExpr> = a
+        .contracts
+        .iter()
+        .filter_map(|c| match c {
+            ast::Contract::Ensures { expr, .. } => Some(collect_expr(expr)),
+            _ => None,
+        })
+        .collect();
     let body: Vec<EExpr> = a.body.iter().map(collect_expr).collect();
     EAction {
         name: a.name.clone(),
         refs,
         params,
         requires,
+        ensures,
         body,
         span: Some(a.span),
     }
@@ -366,6 +390,7 @@ fn collect_event(ev: &ast::EventDecl) -> EEvent {
     let body: Vec<EEventAction> = ev.items.iter().map(collect_event_item).collect();
     EEvent {
         name: ev.name.clone(),
+        fairness: ev.fairness,
         params,
         requires,
         ensures,
@@ -380,18 +405,12 @@ fn collect_event_item(item: &ast::EventItem) -> EEventAction {
             cb.var.clone(),
             Ty::Unresolved(cb.ty.clone()),
             collect_expr(&cb.condition),
-            cb.body
-                .iter()
-                .map(|e| classify_expr(&collect_expr(e)))
-                .collect(),
+            cb.body.iter().map(collect_event_item).collect(),
         ),
         ast::EventItem::For(fb) => EEventAction::ForAll(
             fb.var.clone(),
             Ty::Unresolved(fb.ty.clone()),
-            fb.body
-                .iter()
-                .map(|e| classify_expr(&collect_expr(e)))
-                .collect(),
+            fb.body.iter().map(collect_event_item).collect(),
         ),
         ast::EventItem::Create(cb) => EEventAction::Create(
             cb.ty.clone(),
@@ -785,6 +804,32 @@ fn collect_contract(c: &ast::Contract) -> EContract {
 
 // ── Expression collection ────────────────────────────────────────────
 
+/// Recognize qualified built-in collection calls: Set::union, Map::domain, etc.
+/// Returns Some(EExpr) if recognized, None if not a built-in.
+fn collect_qualified_call(
+    type_name: &str,
+    func_name: &str,
+    args: Vec<EExpr>,
+    sp: Option<crate::span::Span>,
+) -> Option<EExpr> {
+    let u = Ty::Unresolved("?".to_owned());
+    let bool_ty = Ty::Builtin(BuiltinTy::Bool);
+    let qc = |ty: Ty| Some(EExpr::QualCall(ty, type_name.to_owned(), func_name.to_owned(), args, sp));
+    match (type_name, func_name) {
+        // Set operations (2-arg: set × set → set/bool)
+        ("Set", "union" | "intersect" | "diff") => qc(u),
+        ("Set", "member" | "subset" | "disjoint") => qc(bool_ty),
+        // Seq operations
+        ("Seq", "head") => qc(u),             // 1-arg: seq → elem
+        ("Seq", "concat") => qc(u),           // 2-arg: seq × seq → seq
+        // Map operations — deferred: requires domain tracking (companion
+        // boolean array alongside value array). See DDR-047.
+        // Users can still use m[k] for lookup, m[k := v] for update,
+        // and `k in m` for set-like membership on Set<K>.
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn collect_expr(expr: &ast::Expr) -> EExpr {
     let u = || Ty::Unresolved("?".to_owned());
@@ -857,6 +902,15 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
                     _ => {}
                 }
             }
+            // Recognize qualified built-in calls: Set::union(s1, s2), Map::domain(m), etc.
+            if let ast::ExprKind::Qual2(type_name, func_name) = &callee.kind {
+                let collected_args: Vec<EExpr> = args.iter().map(collect_expr).collect();
+                if let Some(e) = collect_qualified_call(
+                    type_name, func_name, collected_args, sp,
+                ) {
+                    return e;
+                }
+            }
             EExpr::Call(
                 u(),
                 Box::new(collect_expr(callee)),
@@ -883,6 +937,8 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
         ast::ExprKind::Mul(a, b) => bin_op(u(), BinOp::Mul, a, b, sp),
         ast::ExprKind::Div(a, b) => bin_op(u(), BinOp::Div, a, b, sp),
         ast::ExprKind::Mod(a, b) => bin_op(u(), BinOp::Mod, a, b, sp),
+        ast::ExprKind::Diamond(a, b) => bin_op(u(), BinOp::Diamond, a, b, sp),
+        ast::ExprKind::Disjoint(a, b) => bin_op(bool_ty(), BinOp::Disjoint, a, b, sp),
 
         // Binary ops: comparison (result is Bool)
         ast::ExprKind::Eq(a, b) => bin_op(bool_ty(), BinOp::Eq, a, b, sp),
@@ -913,6 +969,7 @@ fn collect_expr(expr: &ast::Expr) -> EExpr {
         // Temporal
         ast::ExprKind::Always(e) => EExpr::Always(u(), Box::new(collect_expr(e)), sp),
         ast::ExprKind::Eventually(e) => EExpr::Eventually(u(), Box::new(collect_expr(e)), sp),
+        ast::ExprKind::Until(l, r) => EExpr::Until(u(), Box::new(collect_expr(l)), Box::new(collect_expr(r)), sp),
         ast::ExprKind::AssertExpr(e) => EExpr::Assert(u(), Box::new(collect_expr(e)), sp),
         ast::ExprKind::AssumeExpr(e) => EExpr::Assume(u(), Box::new(collect_expr(e)), sp),
 
@@ -1237,17 +1294,17 @@ mod tests {
 
     #[test]
     fn include_paths_tracked() {
-        let env = collect_src(r#"include "billing.abide""#);
-        assert_eq!(env.includes, vec!["billing.abide"]);
+        let env = collect_src(r#"include "billing.ab""#);
+        assert_eq!(env.includes, vec!["billing.ab"]);
     }
 
     #[test]
     fn include_preserves_order() {
         let env = collect_src(
-            r#"include "first.abide"
-include "second.abide""#,
+            r#"include "first.ab"
+include "second.ab""#,
         );
-        assert_eq!(env.includes, vec!["first.abide", "second.abide"]);
+        assert_eq!(env.includes, vec!["first.ab", "second.ab"]);
     }
 
     #[test]

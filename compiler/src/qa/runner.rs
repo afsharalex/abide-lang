@@ -170,7 +170,7 @@ pub fn run_qa_script(script_path: &Path, spec_dir: Option<&Path>, json_mode: boo
     }
 }
 
-/// Load `.abide` files, elaborate, and build a `FlowModel`.
+/// Load `.ab` files, elaborate, and build a `FlowModel`.
 /// Returns the loaded `Env` (for hypothetical extension) and the `FlowModel`.
 fn load_and_build_model(
     paths: &[PathBuf],
@@ -315,7 +315,7 @@ fn resolve_load_path(script_dir: &Path, path_str: &str) -> PathBuf {
     }
 }
 
-/// Collect all `.abide` files from a directory recursively, sorted
+/// Collect all `.ab` files from a directory recursively, sorted
 /// alphabetically for deterministic load order.
 fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -324,7 +324,7 @@ fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     };
     entries.sort();
     for path in entries {
-        if path.extension().and_then(|e| e.to_str()) == Some("abide") {
+        if matches!(path.extension().and_then(|e| e.to_str()), Some("ab" | "abi" | "abp")) {
             paths.push(path);
         } else if path.is_dir() {
             collect_abide_files(&path, paths);

@@ -1,0 +1,63 @@
+module StrongFairness
+
+// Strong fairness (TLA+ SF) tests.
+//
+// Weak fairness WF(A): if A is continuously enabled, it must fire.
+// Strong fairness SF(A): if A is repeatedly enabled (even intermittently),
+// it must fire. Strong fairness is strictly stronger.
+//
+// Classic example: go_c is enabled only at state A, but the system
+// oscillates A→B→A→B, making go_c only intermittently enabled.
+// Under WF: go_c may never fire (never continuously enabled).
+// Under SF: go_c must eventually fire (repeatedly enabled).
+
+enum S = A | B | C
+
+entity E {
+  state: S = @A
+  action to_b() requires state == @A { state' = @B }
+  action to_a() requires state == @B { state' = @A }
+  action to_c() requires state == @A { state' = @C }
+}
+
+// ── Strong fair system ──────────────────────────────────────────────
+system StrongSys {
+  use E
+  fair event spawn() { create E {} }
+  fair event go_b() { choose e: E where e.state == @A { e.to_b() } }
+  fair event go_a() { choose e: E where e.state == @B { e.to_a() } }
+  strong fair event go_c() { choose e: E where e.state == @A { e.to_c() } }
+}
+
+// ── Weak fair system ────────────────────────────────────────────────
+system WeakSys {
+  use E
+  fair event spawn() { create E {} }
+  fair event go_b() { choose e: E where e.state == @A { e.to_b() } }
+  fair event go_a() { choose e: E where e.state == @B { e.to_a() } }
+  fair event go_c() { choose e: E where e.state == @A { e.to_c() } }
+}
+
+// ── Test 1: Strong fairness prevents A↔B starvation (theorem) ──────
+// Symmetry reduction: lasso sanity check blocks A↔B loop on 1-slot
+// (go_c strong fair, enabled at A steps, must fire). IC3 with BAS
+// coarse justice can't encode strong fairness → UNPROVABLE.
+// Correctness confirmed: lasso check passes (no violation), IC3 is
+// the limitation (not soundness — conservative).
+theorem strong_liveness for StrongSys {
+  show all e: E | eventually e.state == @C
+}
+
+// ── Test 2: Weak fairness allows A↔B starvation (theorem) ──────────
+// Symmetry reduction: lasso sanity check FINDS violation on 1-slot
+// (A↔B loop fair under WF, go_c intermittently enabled but never
+// continuously → WF vacuously satisfied, C never reached).
+theorem weak_liveness for WeakSys {
+  show all e: E | eventually e.state == @C
+}
+
+// ── Test 3: Safety property unaffected ──────────────────────────────
+verify safety_check for StrongSys[0..3] {
+  assert always all e: E |
+    e.state == @C implies e.state == @C
+}

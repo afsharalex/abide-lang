@@ -186,6 +186,22 @@ pub enum IRExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    /// `one x: T | P(x)` — exactly one x satisfies P.
+    One {
+        var: std::string::String,
+        domain: IRType,
+        body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    /// `lone x: T | P(x)` — at most one x satisfies P.
+    Lone {
+        var: std::string::String,
+        domain: IRType,
+        body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     Field {
         expr: Box<IRExpr>,
         field: std::string::String,
@@ -206,6 +222,13 @@ pub enum IRExpr {
     },
     Eventually {
         body: Box<IRExpr>,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
+    /// `P until Q` — P holds at every step until Q becomes true.
+    Until {
+        left: Box<IRExpr>,
+        right: Box<IRExpr>,
         #[serde(skip)]
         span: Option<Span>,
     },
@@ -389,7 +412,16 @@ pub struct IRField {
     pub name: std::string::String,
     #[serde(rename = "type")]
     pub ty: IRType,
+    /// Deterministic default value (`= expr`). For `in {a, b, ...}`, this is
+    /// the first value (representative for IC3 initial state encoding).
+    /// `None` when no deterministic default exists (e.g., `where` constraint only).
     pub default: Option<IRExpr>,
+    /// Nondeterministic initial constraint from `in {...}` or `where expr`.
+    /// When present, the create encoding asserts this constraint on the field
+    /// value instead of (or in addition to) the deterministic default.
+    /// Uses `$` as the bound variable for the field value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_constraint: Option<IRExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -431,9 +463,25 @@ pub struct IRSystem {
     pub schedule: IRSchedule,
 }
 
+/// Fairness level for IR events (matches AST `Fairness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IRFairness {
+    None,
+    Weak,
+    Strong,
+}
+
+impl IRFairness {
+    pub fn is_fair(self) -> bool {
+        matches!(self, Self::Weak | Self::Strong)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IREvent {
     pub name: std::string::String,
+    pub fairness: IRFairness,
     pub params: Vec<IRTransParam>,
     pub guard: IRExpr,
     pub postcondition: Option<IRExpr>,
@@ -541,6 +589,18 @@ pub struct IRAxiom {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRLemma {
+    pub name: std::string::String,
+    pub body: Vec<IRExpr>,
+    /// Source span of the lemma block (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub span: Option<Span>,
+    /// Source file path (not serialized — diagnostic use only).
+    #[serde(skip)]
+    pub file: Option<std::string::String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRScene {
     pub name: std::string::String,
     pub systems: Vec<std::string::String>,
@@ -636,6 +696,7 @@ pub struct IRProgram {
     pub verifies: Vec<IRVerify>,
     pub theorems: Vec<IRTheorem>,
     pub axioms: Vec<IRAxiom>,
+    pub lemmas: Vec<IRLemma>,
     pub scenes: Vec<IRScene>,
 }
 

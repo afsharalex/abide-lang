@@ -1,0 +1,17 @@
+module NondetDefaultsInvalid
+
+// Phase 14 regression: invalid nondeterministic defaults must be rejected.
+
+enum Status = Open | Closed
+
+entity BadWhere {
+  x: Int where 42
+}
+
+entity BadIn {
+  s: Status in {1}
+}
+
+entity BadBoolIn {
+  b: Bool in {1}
+}

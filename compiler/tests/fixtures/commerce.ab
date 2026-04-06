@@ -1,10 +1,10 @@
 // Full Commerce example: entities with actions, system events,
 // cross-system calls, choose + for, verify, proof, scene, module/use
 //
-// This is a multi-file fixture: billing.abide provides the Billing module.
+// This is a multi-file fixture: billing.ab provides the Billing module.
 
 module Commerce
-include "billing.abide"
+include "billing.ab"
 use Billing::*
 use Billing::PaymentStatus as PS
 

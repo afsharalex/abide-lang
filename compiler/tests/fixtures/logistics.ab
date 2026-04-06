@@ -2,8 +2,8 @@
 // Tests that aliases flow through elaboration, IR lowering, and verification.
 
 module Logistics
-include "shipping.abide"
-include "warehouse.abide"
+include "shipping.ab"
+include "warehouse.ab"
 
 // Wildcard: all Shipping declarations as bare names
 use Shipping::*

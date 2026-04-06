@@ -1,7 +1,7 @@
 use crate::ast::{
     ActionInvoc, AliasDecl, AxiomDecl, CardValue, ChooseBlock, ConstDecl, Contract, CreateBlock,
     CreateField, EntityAction, EntityDecl, EntityItem, EventDecl, EventItem, Expr, ExprKind,
-    FieldDecl, FieldPat, FnDecl, ForBlock, GivenItem, IncludeDecl, InvocArg, LemmaDecl, LetBind,
+    FieldDecl, FieldDefault, FieldPat, FnDecl, ForBlock, GivenItem, IncludeDecl, InvocArg, LemmaDecl, LetBind,
     MatchArm, ModuleDecl, NextBlock, NextItem, Param, Pattern, PredDecl, Program, PropDecl,
     QualType, RecField, RecordDecl, SceneDecl, SceneItem, SystemDecl, SystemItem, ThenItem,
     TheoremDecl, TopDecl, TypeDecl, TypeRef, TypeRefKind, TypeVariant, TypedParam, UseDecl,
@@ -39,6 +39,8 @@ const BP_NAMED_PAIR_RHS: u8 = 3;
 
 /// Implies (right-assoc)
 const BP_IMPLIES: (u8, u8) = (9, 9);
+/// Until (right-assoc, same level as implies — `P until Q implies R` = `(P until Q) implies R`)
+const BP_UNTIL: (u8, u8) = (10, 9);
 /// Prefix operators at implies level: always, eventually, assert, quantifiers, let, lambda, match
 const BP_PREFIX_EXPR: u8 = 9;
 /// Assignment: = (right-assoc)
@@ -74,12 +76,13 @@ fn infix_bp(op: &Token) -> Option<(u8, u8)> {
         Token::Amp => Some(BP_SAME_STEP),
         Token::Arrow => Some(BP_SEQUENCE),
         Token::Implies => Some(BP_IMPLIES),
+        Token::Until => Some(BP_UNTIL),
         Token::Eq => Some(BP_ASSIGN),
         Token::Or => Some(BP_OR),
         Token::And => Some(BP_AND),
-        Token::EqEq | Token::BangEq | Token::In => Some(BP_EQUALITY),
+        Token::EqEq | Token::BangEq | Token::In | Token::BangStar => Some(BP_EQUALITY),
         Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => Some(BP_COMPARISON),
-        Token::Plus | Token::Minus => Some(BP_ADDITIVE),
+        Token::Plus | Token::Minus | Token::Diamond => Some(BP_ADDITIVE),
         Token::Star | Token::Slash | Token::Percent => Some(BP_MULTIPLICATIVE),
         _ => None,
     }
@@ -858,11 +861,31 @@ impl Parser {
         self.expect(&Token::Colon)?;
         let ty = self.type_ref()?;
         let default = if self.eat(&Token::Eq).is_some() {
-            Some(self.expr_bp(28)?) // atom-level only (Expr14)
+            Some(FieldDefault::Value(self.expr_bp(28)?)) // atom-level only (Expr14)
+        } else if self.eat(&Token::In).is_some() {
+            // in { expr, expr, ... }
+            self.expect(&Token::LBrace)?;
+            let mut exprs = vec![self.expr_bp(28)?];
+            while self.eat(&Token::Comma).is_some() {
+                if self.peek() == Some(&Token::RBrace) {
+                    break; // trailing comma
+                }
+                exprs.push(self.expr_bp(28)?);
+            }
+            self.expect(&Token::RBrace)?;
+            Some(FieldDefault::In(exprs))
+        } else if self.eat(&Token::Where).is_some() {
+            // where predicate
+            Some(FieldDefault::Where(self.expr()?))
         } else {
             None
         };
-        let end_span = default.as_ref().map_or(ty.span, |e| e.span);
+        let end_span = match &default {
+            Some(FieldDefault::Value(e)) => e.span,
+            Some(FieldDefault::In(es)) => es.last().map_or(ty.span, |e| e.span),
+            Some(FieldDefault::Where(e)) => e.span,
+            None => ty.span,
+        };
         Ok(FieldDecl {
             name,
             ty,
@@ -1101,16 +1124,31 @@ impl Parser {
                 let (name, end) = self.expect_name()?;
                 Ok(SystemItem::Uses(name, start.merge(end)))
             }
-            Some(Token::Event) => Ok(SystemItem::Event(self.event_decl()?)),
+            Some(Token::Fair) => {
+                self.advance(); // consume `fair`
+                Ok(SystemItem::Event(
+                    self.event_decl_inner(crate::ast::Fairness::Weak)?,
+                ))
+            }
+            Some(Token::Strong) => {
+                self.advance(); // consume `strong`
+                self.expect(&Token::Fair)?; // expect `fair` after `strong`
+                Ok(SystemItem::Event(
+                    self.event_decl_inner(crate::ast::Fairness::Strong)?,
+                ))
+            }
+            Some(Token::Event) => Ok(SystemItem::Event(
+                self.event_decl_inner(crate::ast::Fairness::None)?,
+            )),
             Some(Token::Next) => Ok(SystemItem::Next(self.next_block()?)),
             Some(Token::Name(ref name)) if name == "uses" => Err(ParseError::expected_with_help(
-                "`use`, `event`, or `next`",
+                "`use`, `event`, `fair event`, `strong fair event`, or `next`",
                 "`uses`",
                 self.cur_span(),
                 crate::messages::HINT_USES_KEYWORD,
             )),
             Some(tok) => Err(ParseError::expected(
-                "`use`, `event`, or `next`",
+                "`use`, `event`, `fair event`, `strong fair event`, or `next`",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -1118,7 +1156,7 @@ impl Parser {
         }
     }
 
-    fn event_decl(&mut self) -> Result<EventDecl, ParseError> {
+    fn event_decl_inner(&mut self, fairness: crate::ast::Fairness) -> Result<EventDecl, ParseError> {
         let start = self.expect(&Token::Event)?;
         let (name, _) = self.expect_name()?;
         self.expect(&Token::LParen)?;
@@ -1133,6 +1171,7 @@ impl Parser {
         let end = self.expect(&Token::RBrace)?;
         Ok(EventDecl {
             name,
+            fairness,
             params,
             contracts,
             items,
@@ -1172,7 +1211,7 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut body = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
-            body.push(self.expr()?);
+            body.push(self.event_item()?);
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(ChooseBlock {
@@ -1192,7 +1231,7 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut body = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) {
-            body.push(self.expr()?);
+            body.push(self.event_item()?);
         }
         let end = self.expect(&Token::RBrace)?;
         Ok(ForBlock {
@@ -2498,6 +2537,7 @@ fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
         Token::Arrow => ExprKind::Seq(Box::new(lhs), Box::new(rhs)),
         Token::Amp => ExprKind::SameStep(Box::new(lhs), Box::new(rhs)),
         Token::Implies => ExprKind::Impl(Box::new(lhs), Box::new(rhs)),
+        Token::Until => ExprKind::Until(Box::new(lhs), Box::new(rhs)),
         Token::Eq => ExprKind::Assign(Box::new(lhs), Box::new(rhs)),
         Token::Or => ExprKind::Or(Box::new(lhs), Box::new(rhs)),
         Token::And => ExprKind::And(Box::new(lhs), Box::new(rhs)),
@@ -2513,6 +2553,8 @@ fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
         Token::Star => ExprKind::Mul(Box::new(lhs), Box::new(rhs)),
         Token::Slash => ExprKind::Div(Box::new(lhs), Box::new(rhs)),
         Token::Percent => ExprKind::Mod(Box::new(lhs), Box::new(rhs)),
+        Token::Diamond => ExprKind::Diamond(Box::new(lhs), Box::new(rhs)),
+        Token::BangStar => ExprKind::Disjoint(Box::new(lhs), Box::new(rhs)),
         _ => unreachable!("not an infix operator: {op}"),
     };
     Expr { kind, span }
@@ -2853,10 +2895,10 @@ mod tests {
 
     #[test]
     fn include_decl() {
-        let prog = parse_program(r#"include "billing.abide""#);
+        let prog = parse_program(r#"include "billing.ab""#);
         assert_eq!(prog.decls.len(), 1);
         if let TopDecl::Include(i) = &prog.decls[0] {
-            assert_eq!(i.path, "billing.abide");
+            assert_eq!(i.path, "billing.ab");
         } else {
             panic!("expected Include");
         }
@@ -3614,7 +3656,7 @@ mod tests {
 
     #[test]
     fn removed_import_keyword() {
-        let err = try_parse(r#"import "billing.abide" as Billing"#).unwrap_err();
+        let err = try_parse(r#"import "billing.ab" as Billing"#).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("import"), "should mention 'import': {msg}");
     }
@@ -3669,7 +3711,7 @@ mod tests {
 
     #[test]
     fn import_help_text_content() {
-        let err = try_parse(r#"import "billing.abide" as Billing"#).unwrap_err();
+        let err = try_parse(r#"import "billing.ab" as Billing"#).unwrap_err();
         let help = extract_help(&err).expect("should have help");
         assert!(
             help.contains("module"),

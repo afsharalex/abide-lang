@@ -539,7 +539,7 @@ fn make_prompt(mode: Mode) -> DefaultPrompt {
     DefaultPrompt::new(segment, DefaultPromptSegment::Empty)
 }
 
-/// Load `.abide` files into a raw `Env` (pre-elaboration).
+/// Load `.ab` files into a raw `Env` (pre-elaboration).
 /// The `Env` is used as the base layer for the REPL state.
 fn load_base_env(path: &Path) -> Result<Env, Vec<String>> {
     let mut paths = Vec::new();
@@ -552,7 +552,7 @@ fn load_base_env(path: &Path) -> Result<Env, Vec<String>> {
     }
 
     if paths.is_empty() {
-        return Err(vec!["no .abide files found".to_owned()]);
+        return Err(vec!["no .ab files found".to_owned()]);
     }
 
     let (mut env, load_errors, _) = loader::load_files(&paths);
@@ -587,7 +587,7 @@ fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     };
     entries.sort();
     for path in entries {
-        if path.extension().and_then(|e| e.to_str()) == Some("abide") {
+        if matches!(path.extension().and_then(|e| e.to_str()), Some("ab" | "abi" | "abp")) {
             paths.push(path);
         } else if path.is_dir() {
             collect_abide_files(&path, paths);

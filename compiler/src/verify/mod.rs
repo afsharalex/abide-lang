@@ -18,15 +18,19 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use z3::ast::Bool;
+use z3::ast::{Bool, Int};
 use z3::Solver;
 
-use crate::ir::types::{IRAction, IRExpr, IRProgram, IRScene, IRTheorem, IRType, IRVerify};
+use crate::ir::types::{
+    IRAction, IREvent, IRExpr, IRProgram, IRScene, IRSceneEvent, IRSystem, IRTheorem, IRType,
+    IRVerify,
+};
 
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool, domain_constraints, encode_event_with_params, initial_state_constraints,
-    symmetry_breaking_constraints, transition_constraints, SlotPool,
+    create_slot_pool, domain_constraints, encode_event_with_params, fairness_constraints,
+    initial_state_constraints, lasso_loopback, symmetry_breaking_constraints,
+    transition_constraints, transition_constraints_with_fire, SlotPool,
 };
 use self::smt::SmtValue;
 
@@ -99,6 +103,17 @@ pub enum VerificationResult {
     FnContractFailed {
         name: String,
         counterexample: Vec<(String, String)>, // (param_name, value)
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
+    /// Liveness violation — lasso-shaped counterexample (infinite execution).
+    /// The trace has a prefix (steps 0..loop_start) and a loop (steps
+    /// loop_start..bound that repeats forever).
+    LivenessViolation {
+        name: String,
+        prefix: Vec<TraceStep>,
+        loop_trace: Vec<TraceStep>,
+        loop_start: usize,
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
@@ -220,10 +235,25 @@ impl VerificationResult {
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
+            Self::LivenessViolation {
+                name,
+                prefix,
+                loop_trace,
+                loop_start,
+                span,
+                file,
+            } => Self::LivenessViolation {
+                name,
+                prefix,
+                loop_trace,
+                loop_start,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
         }
     }
 
-    /// Is this a failure (counterexample, scene fail, fn contract fail, or unprovable)?
+    /// Is this a failure (counterexample, scene fail, fn contract fail, liveness violation, or unprovable)?
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
@@ -231,6 +261,7 @@ impl VerificationResult {
                 | Self::SceneFail { .. }
                 | Self::Unprovable { .. }
                 | Self::FnContractFailed { .. }
+                | Self::LivenessViolation { .. }
         )
     }
 
@@ -245,7 +276,8 @@ impl VerificationResult {
             | Self::Unprovable { span, .. }
             | Self::FnContractProved { span, .. }
             | Self::FnContractAdmitted { span, .. }
-            | Self::FnContractFailed { span, .. } => *span,
+            | Self::FnContractFailed { span, .. }
+            | Self::LivenessViolation { span, .. } => *span,
         }
     }
 
@@ -260,13 +292,14 @@ impl VerificationResult {
             | Self::Unprovable { file, .. }
             | Self::FnContractProved { file, .. }
             | Self::FnContractAdmitted { file, .. }
+            | Self::LivenessViolation { file, .. }
             | Self::FnContractFailed { file, .. } => file.as_deref(),
         }
     }
 }
 
 /// A single step in a counterexample trace.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceStep {
     pub step: usize,
     pub event: Option<String>,
@@ -327,8 +360,29 @@ impl Default for VerifyConfig {
 #[allow(clippy::too_many_lines)]
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     let vctx = context::VerifyContext::from_ir(ir);
-    let defs = defenv::DefEnv::from_ir(ir);
+    let mut defs = defenv::DefEnv::from_ir(ir);
     let mut results = Vec::new();
+
+    // ── Verify lemmas ─────────────────────────────────────────────
+    // Lemmas are system-independent properties. Each body expression
+    // must be a tautology. Processed first so proved lemmas are
+    // available to verify blocks, scenes, and theorems via DefEnv.
+    for lemma_block in &ir.lemmas {
+        if config.progress {
+            eprint!("Proving lemma {}...", lemma_block.name);
+        }
+        let result = check_lemma_block(&vctx, &defs, lemma_block)
+            .with_source(lemma_block.span, lemma_block.file.clone());
+        if config.progress {
+            eprintln!(" done");
+        }
+        // If the lemma proved, add its body to DefEnv under its declared
+        // name so later verify/scene/theorem blocks can reference it.
+        if matches!(&result, VerificationResult::Proved { .. }) {
+            defs.add_lemma_fact(&lemma_block.name, &lemma_block.body);
+        }
+        results.push(result);
+    }
 
     for verify_block in &ir.verifies {
         if config.progress {
@@ -341,7 +395,6 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
         if config.progress {
             eprintln!(" done");
         }
-        // Check context-sensitive precondition obligations accumulated during encoding
         if let Some(violation) = check_prop_precondition_obligations() {
             results.push(
                 VerificationResult::Unprovable {
@@ -1137,7 +1190,8 @@ fn body_contains_assert(expr: &IRExpr) -> bool {
                 || body_contains_assert(then_body)
                 || else_body.as_ref().map_or(false, |e| body_contains_assert(e))
         }
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             body_contains_assert(left) || body_contains_assert(right)
         }
         IRExpr::UnOp { operand, .. } => body_contains_assert(operand),
@@ -1147,7 +1201,10 @@ fn body_contains_assert(expr: &IRExpr) -> bool {
         IRExpr::Let { bindings, body, .. } => {
             bindings.iter().any(|b| body_contains_assert(&b.expr)) || body_contains_assert(body)
         }
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => body_contains_assert(body),
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => body_contains_assert(body),
         IRExpr::Field { expr, .. }
         | IRExpr::Prime { expr, .. }
         | IRExpr::Card { expr, .. } => body_contains_assert(expr),
@@ -1256,7 +1313,8 @@ fn body_contains_sorry(expr: &IRExpr) -> bool {
                 || body_contains_sorry(then_body)
                 || else_body.as_ref().map_or(false, |e| body_contains_sorry(e))
         }
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             body_contains_sorry(left) || body_contains_sorry(right)
         }
         IRExpr::UnOp { operand, .. } => body_contains_sorry(operand),
@@ -1266,7 +1324,10 @@ fn body_contains_sorry(expr: &IRExpr) -> bool {
         IRExpr::Let { bindings, body, .. } => {
             bindings.iter().any(|b| body_contains_sorry(&b.expr)) || body_contains_sorry(body)
         }
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => body_contains_sorry(body),
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => body_contains_sorry(body),
         IRExpr::Field { expr, .. }
         | IRExpr::Prime { expr, .. }
         | IRExpr::Card { expr, .. }
@@ -2642,6 +2703,36 @@ fn encode_pure_expr_inner(
 
         IRExpr::BinOp {
             op, left, right, ..
+        } if op == "OpSeqConcat" => {
+            // Seq::concat: build result array with a's elements at 0..len_a,
+            // b's elements at len_a..len_a+len_b.
+            // Extract concrete elements from SeqLit operands.
+            let a_elems = match left.as_ref() {
+                IRExpr::SeqLit { elements, .. } => elements.clone(),
+                _ => return Err("Seq::concat requires literal operands".to_owned()),
+            };
+            let b_elems = match right.as_ref() {
+                IRExpr::SeqLit { elements, .. } => elements.clone(),
+                _ => return Err("Seq::concat requires literal operands".to_owned()),
+            };
+            // Build combined SeqLit and encode it
+            let mut combined = a_elems;
+            combined.extend(b_elems);
+            let seq_ty = match left.as_ref() {
+                IRExpr::SeqLit { ty, .. } => ty.clone(),
+                _ => crate::ir::types::IRType::Seq {
+                    element: Box::new(crate::ir::types::IRType::Int),
+                },
+            };
+            let combined_lit = IRExpr::SeqLit {
+                elements: combined,
+                ty: seq_ty,
+                span: None,
+            };
+            encode_pure_expr_inner(&combined_lit, env, vctx, defs, precheck)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
         } => {
             let lhs = encode_pure_expr_inner(left, env, vctx, defs, precheck)?;
             let rhs = encode_pure_expr_inner(right, env, vctx, defs, precheck)?;
@@ -2809,6 +2900,14 @@ fn encode_pure_expr_inner(
             var, domain, body, ..
         } => encode_z3_quantifier(false, var, domain, body, env, vctx, defs, precheck),
 
+        IRExpr::One {
+            var, domain, body, ..
+        } => encode_z3_one(var, domain, body, env, vctx, defs, precheck),
+
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => encode_z3_lone(var, domain, body, env, vctx, defs, precheck),
+
         IRExpr::Index { map, key, ty, .. } => {
             let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
             let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
@@ -2855,7 +2954,8 @@ fn encode_pure_expr_inner(
         IRExpr::SetLit { elements, ty, .. } => {
             let elem_ty = match ty {
                 crate::ir::types::IRType::Set { element } => element.as_ref(),
-                _ => return Err("SetLit type is not Set".to_owned()),
+                // Unresolved type: infer element type from first element (Int default)
+                _ => &crate::ir::types::IRType::Int,
             };
             let elem_sort = smt::ir_type_to_sort(elem_ty);
             let false_dyn = smt::default_dynamic(&crate::ir::types::IRType::Bool);
@@ -2869,8 +2969,12 @@ fn encode_pure_expr_inner(
             Ok(SmtValue::Array(arr))
         }
 
-        IRExpr::SeqLit { elements, .. } => {
-            let default = smt::default_dynamic(&crate::ir::types::IRType::Int);
+        IRExpr::SeqLit { elements, ty, .. } => {
+            let elem_ty = match ty {
+                crate::ir::types::IRType::Seq { element } => element.as_ref(),
+                _ => &crate::ir::types::IRType::Int,
+            };
+            let default = smt::default_dynamic(elem_ty);
             let mut arr = z3::ast::Array::const_array(&z3::Sort::int(), &default);
             for (i, e) in elements.iter().enumerate() {
                 let elem = encode_pure_expr_inner(e, env, vctx, defs, precheck)?;
@@ -2884,7 +2988,11 @@ fn encode_pure_expr_inner(
         IRExpr::MapLit { entries, ty, .. } => {
             let (key_ty, val_ty) = match ty {
                 crate::ir::types::IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
-                _ => return Err("MapLit type is not Map".to_owned()),
+                // Unresolved type: infer from entries (Int keys, Bool values as default)
+                _ => (
+                    &crate::ir::types::IRType::Int,
+                    &crate::ir::types::IRType::Bool,
+                ),
             };
             let key_sort = smt::ir_type_to_sort(key_ty);
             let default = smt::default_dynamic(val_ty);
@@ -3079,7 +3187,7 @@ fn encode_pure_expr_inner(
                 Ok(SmtValue::Array(arr))
             }
         }
-        IRExpr::Always { .. } | IRExpr::Eventually { .. } => {
+        IRExpr::Always { .. } | IRExpr::Eventually { .. } | IRExpr::Until { .. } => {
             Err("temporal operators not allowed in fn contracts".to_owned())
         }
         IRExpr::Prime { .. } => Err("prime (next-state) not allowed in fn contracts".to_owned()),
@@ -3146,6 +3254,12 @@ fn build_domain_predicate(
             name,
             variants: vs,
         } => {
+            // ADT-encoded enums (Dynamic): Z3's ADT sort already constrains
+            // the variable to valid constructors — no domain predicate needed.
+            if matches!(bound_var, SmtValue::Dynamic(_)) {
+                return Ok(None);
+            }
+            // Flat Int-encoded enums: restrict to valid variant ID range.
             let var_int = bound_var.as_int()?;
             let ids: Vec<i64> = vs
                 .iter()
@@ -3195,8 +3309,8 @@ fn encode_z3_quantifier(
     defs: &defenv::DefEnv,
     precheck: Option<&PrecheckCtx<'_>>,
 ) -> Result<SmtValue, String> {
-    // Create a fresh Z3 constant for the bound variable
-    let bound_var = make_z3_var(var, domain)?;
+    // Create a fresh Z3 constant for the bound variable (ADT-aware via vctx)
+    let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
 
     // Extend environment with the bound variable
     let mut inner_env = env.clone();
@@ -3224,38 +3338,207 @@ fn encode_z3_quantifier(
         None => body_bool,
     };
 
-    // Build the Z3 quantifier using the bound variable as a constant
-    let result = match &bound_var {
+    let result = build_z3_quantifier(is_forall, &bound_var, &quantified_body, var, domain)?;
+    Ok(SmtValue::Bool(result))
+}
+
+/// Build a domain predicate for a non-entity quantifier in property context.
+///
+/// Bridges the `PropertyCtx` (which uses `locals` for non-entity bindings) to
+/// `build_domain_predicate` (which needs a `HashMap<String, SmtValue>` env).
+/// This ensures refinement type predicates and enum range guards are applied
+/// correctly in verify/theorem property expressions.
+fn prop_domain_predicate(
+    domain: &crate::ir::types::IRType,
+    bound_var: &SmtValue,
+    ctx: &PropertyCtx,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> Result<Option<Bool>, String> {
+    // Build a minimal env from PropertyCtx locals for the pure expression encoder
+    let env: HashMap<String, SmtValue> = ctx.locals.clone();
+    build_domain_predicate(domain, bound_var, &env, vctx, defs, None)
+}
+
+/// Return the number of variants in an enum IR type.
+fn enum_variant_count(ty: &crate::ir::types::IRType) -> usize {
+    match ty {
+        crate::ir::types::IRType::Enum { variants, .. } => variants.len(),
+        _ => 0,
+    }
+}
+
+/// Build a Z3 quantifier (exists_const or forall_const) from a bound variable
+/// and body. Dispatches on the SmtValue variant to extract the Z3 AST node.
+fn build_z3_quantifier(
+    is_forall: bool,
+    bound_var: &SmtValue,
+    body: &Bool,
+    var: &str,
+    domain: &crate::ir::types::IRType,
+) -> Result<Bool, String> {
+    match bound_var {
         SmtValue::Int(i) => {
             let bounds: &[&dyn z3::ast::Ast] = &[i];
             if is_forall {
-                z3::ast::forall_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::forall_const(bounds, &[], body))
             } else {
-                z3::ast::exists_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::exists_const(bounds, &[], body))
             }
         }
         SmtValue::Bool(b) => {
             let bounds: &[&dyn z3::ast::Ast] = &[b];
             if is_forall {
-                z3::ast::forall_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::forall_const(bounds, &[], body))
             } else {
-                z3::ast::exists_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::exists_const(bounds, &[], body))
             }
         }
         SmtValue::Real(r) => {
             let bounds: &[&dyn z3::ast::Ast] = &[r];
             if is_forall {
-                z3::ast::forall_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::forall_const(bounds, &[], body))
             } else {
-                z3::ast::exists_const(bounds, &[], &quantified_body)
+                Ok(z3::ast::exists_const(bounds, &[], body))
             }
         }
-        _ => {
-            return Err(format!(
-                "unsupported quantifier domain type for '{var}': {domain:?}"
-            ));
+        SmtValue::Dynamic(d) => {
+            let bounds: &[&dyn z3::ast::Ast] = &[d];
+            if is_forall {
+                Ok(z3::ast::forall_const(bounds, &[], body))
+            } else {
+                Ok(z3::ast::exists_const(bounds, &[], body))
+            }
         }
+        _ => Err(format!(
+            "unsupported quantifier domain type for '{var}': {domain:?}"
+        )),
+    }
+}
+
+/// Encode `one x: T | P(x)` — exactly one x satisfies P.
+///
+/// Semantics: ∃x. D(x) ∧ P(x) ∧ ∀y. D(y) ∧ P(y) → y = x
+///
+/// where D is the domain predicate (enum range, refinement guard, etc.)
+#[allow(clippy::too_many_arguments)]
+fn encode_z3_one(
+    var: &str,
+    domain: &crate::ir::types::IRType,
+    body: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    // Create bound variable x (ADT-aware via vctx)
+    let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+    let mut x_env = env.clone();
+    x_env.insert(var.to_owned(), x_var.clone());
+
+    // Encode P(x)
+    let p_x = encode_pure_expr_inner(body, &x_env, vctx, defs, precheck)?
+        .to_bool()?;
+
+    // Domain predicate for x
+    let d_x = build_domain_predicate(domain, &x_var, &x_env, vctx, defs, precheck)?;
+
+    // D(x) ∧ P(x)
+    let x_satisfies = match &d_x {
+        Some(dp) => Bool::and(&[dp, &p_x]),
+        None => p_x.clone(),
     };
+
+    // Create a fresh bound variable y (different Z3 name, ADT-aware)
+    let y_name = format!("{var}__unique");
+    let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+    let mut y_env = env.clone();
+    y_env.insert(var.to_owned(), y_var.clone());
+
+    // Encode P(y) — same body, but with y bound to the quantifier variable
+    let p_y = encode_pure_expr_inner(body, &y_env, vctx, defs, precheck)?
+        .to_bool()?;
+
+    // Domain predicate for y
+    let d_y = build_domain_predicate(domain, &y_var, &y_env, vctx, defs, precheck)?;
+
+    // D(y) ∧ P(y) → y = x
+    let y_satisfies = match &d_y {
+        Some(dp) => Bool::and(&[dp, &p_y]),
+        None => p_y,
+    };
+    let y_eq_x = smt::smt_eq(&y_var, &x_var)?;
+    let uniqueness_body = y_satisfies.implies(&y_eq_x);
+
+    // ∀y. D(y) ∧ P(y) → y = x
+    let forall_unique = build_z3_quantifier(true, &y_var, &uniqueness_body, &y_name, domain)?;
+
+    // ∃x. D(x) ∧ P(x) ∧ (∀y. D(y) ∧ P(y) → y = x)
+    let exists_body = Bool::and(&[&x_satisfies, &forall_unique]);
+    let result = build_z3_quantifier(false, &x_var, &exists_body, var, domain)?;
+
+    Ok(SmtValue::Bool(result))
+}
+
+/// Encode `lone x: T | P(x)` — at most one x satisfies P.
+///
+/// Semantics: ∀x, y. D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
+///
+/// where D is the domain predicate (enum range, refinement guard, etc.)
+#[allow(clippy::too_many_arguments)]
+fn encode_z3_lone(
+    var: &str,
+    domain: &crate::ir::types::IRType,
+    body: &IRExpr,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    precheck: Option<&PrecheckCtx<'_>>,
+) -> Result<SmtValue, String> {
+    // Create bound variable x (ADT-aware via vctx)
+    let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+    let mut x_env = env.clone();
+    x_env.insert(var.to_owned(), x_var.clone());
+
+    // Create bound variable y (different Z3 name, ADT-aware)
+    let y_name = format!("{var}__unique");
+    let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+    let mut y_env = env.clone();
+    y_env.insert(var.to_owned(), y_var.clone());
+
+    // Encode P(x) and P(y)
+    let p_x = encode_pure_expr_inner(body, &x_env, vctx, defs, precheck)?
+        .to_bool()?;
+    let p_y = encode_pure_expr_inner(body, &y_env, vctx, defs, precheck)?
+        .to_bool()?;
+
+    // Domain predicates
+    let d_x = build_domain_predicate(domain, &x_var, &x_env, vctx, defs, precheck)?;
+    let d_y = build_domain_predicate(domain, &y_var, &y_env, vctx, defs, precheck)?;
+
+    // D(x) ∧ D(y) ∧ P(x) ∧ P(y)
+    let mut antecedents = Vec::new();
+    if let Some(dp) = &d_x {
+        antecedents.push(dp.clone());
+    }
+    if let Some(dp) = &d_y {
+        antecedents.push(dp.clone());
+    }
+    antecedents.push(p_x);
+    antecedents.push(p_y);
+    let antecedent_refs: Vec<&Bool> = antecedents.iter().collect();
+    let lhs = Bool::and(&antecedent_refs);
+
+    // x = y
+    let x_eq_y = smt::smt_eq(&x_var, &y_var)?;
+
+    // D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
+    let forall_body = lhs.implies(&x_eq_y);
+
+    // ∀y. [body]
+    let inner = build_z3_quantifier(true, &y_var, &forall_body, &y_name, domain)?;
+    // ∀x. ∀y. [body]
+    let result = build_z3_quantifier(true, &x_var, &inner, var, domain)?;
 
     Ok(SmtValue::Bool(result))
 }
@@ -3709,10 +3992,13 @@ fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
         | IRExpr::Let { span, .. }
         | IRExpr::Forall { span, .. }
         | IRExpr::Exists { span, .. }
+        | IRExpr::One { span, .. }
+        | IRExpr::Lone { span, .. }
         | IRExpr::Field { span, .. }
         | IRExpr::Prime { span, .. }
         | IRExpr::Always { span, .. }
         | IRExpr::Eventually { span, .. }
+        | IRExpr::Until { span, .. }
         | IRExpr::Match { span, .. }
         | IRExpr::MapUpdate { span, .. }
         | IRExpr::Index { span, .. }
@@ -3760,7 +4046,10 @@ fn collect_def_refs_inner(expr: &IRExpr, bound: &HashSet<String>, refs: &mut Has
             collect_def_refs_inner(func, bound, refs);
             collect_def_refs_inner(arg, bound, refs);
         }
-        IRExpr::Forall { var, body, .. } | IRExpr::Exists { var, body, .. } => {
+        IRExpr::Forall { var, body, .. }
+        | IRExpr::Exists { var, body, .. }
+        | IRExpr::One { var, body, .. }
+        | IRExpr::Lone { var, body, .. } => {
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone());
             collect_def_refs_inner(body, &inner_bound, refs);
@@ -3783,7 +4072,8 @@ fn collect_def_refs_inner(expr: &IRExpr, bound: &HashSet<String>, refs: &mut Has
                 collect_def_refs_inner(proj, &inner_bound, refs);
             }
         }
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             collect_def_refs_inner(left, bound, refs);
             collect_def_refs_inner(right, bound, refs);
         }
@@ -3863,15 +4153,151 @@ fn collect_pattern_binders(pat: &crate::ir::types::IRPattern, bound: &mut HashSe
 }
 
 /// Convert IC3 trace steps to the shared `TraceStep` format.
-fn ic3_trace_to_trace_steps(ic3_trace: &[ic3::Ic3TraceStep]) -> Vec<TraceStep> {
-    ic3_trace
+fn ic3_trace_to_trace_steps(
+    ic3_trace: &[ic3::Ic3TraceStep],
+    entities: &[crate::ir::types::IREntity],
+    systems: &[crate::ir::types::IRSystem],
+) -> Vec<TraceStep> {
+    let steps: Vec<TraceStep> = ic3_trace
         .iter()
         .map(|s| TraceStep {
             step: s.step,
-            event: None, // IC3 doesn't track which rule/event fired
+            event: None,
             assignments: s.assignments.clone(),
         })
-        .collect()
+        .collect();
+
+    let mut result = steps;
+    for i in 0..result.len().saturating_sub(1) {
+        let event_name = identify_event_from_field_changes(
+            &result[i].assignments,
+            &result[i + 1].assignments,
+            entities,
+            systems,
+        );
+        result[i].event = event_name;
+    }
+    result
+}
+
+/// Best-effort event identification for IC3 traces by comparing field changes
+/// between consecutive steps against event action update signatures.
+///
+/// Matches based on which specific fields changed (not just entity name).
+/// Collects all matching events — if ambiguous, reports "event A or event B".
+fn identify_event_from_field_changes(
+    before: &[(String, String, String)],
+    after: &[(String, String, String)],
+    entities: &[crate::ir::types::IREntity],
+    systems: &[crate::ir::types::IRSystem],
+) -> Option<String> {
+    // Find which (entity, field) pairs changed
+    let mut changed_fields: HashSet<(String, String)> = HashSet::new();
+    for (entity_a, field_a, val_a) in after {
+        let base_entity = entity_a.split('[').next().unwrap_or(entity_a).to_owned();
+        let prev = before.iter().find(|(e, f, _)| e == entity_a && f == field_a);
+        match prev {
+            Some((_, _, val_b)) if val_a != val_b => {
+                changed_fields.insert((base_entity, field_a.clone()));
+            }
+            None => {
+                changed_fields.insert((base_entity, field_a.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    if changed_fields.is_empty() {
+        return None; // stutter
+    }
+
+    // Check if new entities appeared
+    let new_entities: HashSet<String> = after
+        .iter()
+        .filter(|(e, _, _)| !before.iter().any(|(eb, _, _)| eb == e))
+        .map(|(e, _, _)| e.split('[').next().unwrap_or(e).to_owned())
+        .collect();
+
+    // Collect fields that each event's actions modify
+    let mut matches = Vec::new();
+    for system in systems {
+        for event in &system.events {
+            let modified = collect_event_modified_fields(&event.body, entities);
+            let creates = collect_event_created_entities(&event.body);
+
+            // Match: event modifies exactly the fields that changed,
+            // or creates the entities that appeared
+            let fields_match = !modified.is_empty()
+                && modified.iter().all(|(e, f)| changed_fields.contains(&(e.clone(), f.clone())));
+            let creates_match = !creates.is_empty()
+                && creates.iter().any(|e| new_entities.contains(e));
+
+            if fields_match || creates_match {
+                let name = if systems.len() == 1 {
+                    event.name.clone()
+                } else {
+                    format!("{}::{}", system.name, event.name)
+                };
+                matches.push(name);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => None,
+        1 => Some(matches.into_iter().next().unwrap()),
+        _ => Some(matches.join(" or ")),
+    }
+}
+
+/// Collect (entity, field) pairs modified by an event's actions.
+///
+/// Resolves transition/action names to the actual fields they update
+/// by looking up entity IR transitions.
+fn collect_event_modified_fields(
+    actions: &[crate::ir::types::IRAction],
+    entities: &[crate::ir::types::IREntity],
+) -> HashSet<(String, String)> {
+    use crate::ir::types::IRAction;
+    let mut fields = HashSet::new();
+    for action in actions {
+        match action {
+            IRAction::Choose { entity, ops, .. } | IRAction::ForAll { entity, ops, .. } => {
+                for op in ops {
+                    if let IRAction::Apply { transition, .. } = op {
+                        // Resolve transition name to actual updated fields
+                        if let Some(ent_ir) = entities.iter().find(|e| &e.name == entity) {
+                            if let Some(trans) = ent_ir.transitions.iter().find(|t| &t.name == transition) {
+                                for upd in &trans.updates {
+                                    fields.insert((entity.clone(), upd.field.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let nested = collect_event_modified_fields(ops, entities);
+                fields.extend(nested);
+            }
+            _ => {}
+        }
+    }
+    fields
+}
+
+/// Collect entity names created by an event's actions.
+fn collect_event_created_entities(actions: &[crate::ir::types::IRAction]) -> Vec<String> {
+    use crate::ir::types::IRAction;
+    let mut entities = Vec::new();
+    for action in actions {
+        match action {
+            IRAction::Create { entity, .. } => entities.push(entity.clone()),
+            IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                entities.extend(collect_event_created_entities(ops));
+            }
+            _ => {}
+        }
+    }
+    entities
 }
 
 // ── Tiered dispatch for verify blocks ───────────────────────────────
@@ -3894,7 +4320,7 @@ fn check_verify_block_tiered(
     // Check if any assert contains `eventually` — skip induction for liveness
     let has_liveness = verify_block.asserts.iter().any(|a| {
         let expanded = expand_through_defs(a, defs);
-        contains_eventually(&expanded)
+        contains_liveness(&expanded)
     });
 
     // Tier 1a: Try induction (unless bounded-only or liveness)
@@ -3928,6 +4354,42 @@ fn check_verify_block_tiered(
             span: None,
             file: None,
         };
+    }
+
+    // Liveness properties: lasso BMC first (finds violations), then reduction (proves)
+    if has_liveness {
+        let system_names: Vec<String> = verify_block
+            .systems
+            .iter()
+            .map(|vs| vs.name.clone())
+            .collect();
+        let has_fair_events = ir
+            .systems
+            .iter()
+            .filter(|s| system_names.contains(&s.name))
+            .any(|s| s.events.iter().any(|e| e.fairness.is_fair()));
+
+        if has_fair_events {
+            // Tier 2a: Try lasso BMC first — finds violations quickly
+            let lasso_result = check_verify_block_lasso(ir, vctx, defs, verify_block, config);
+            match &lasso_result {
+                VerificationResult::LivenessViolation { .. } => return lasso_result,
+                VerificationResult::Checked { .. } => {
+                    // No violation found at this depth. Try reduction for PROVED.
+                    if !config.bounded_only {
+                        if let Some(proved) =
+                            try_liveness_reduction(ir, vctx, defs, verify_block, config)
+                        {
+                            return proved;
+                        }
+                    }
+                    // Reduction failed — return CHECKED from lasso
+                    return lasso_result;
+                }
+                _ => return lasso_result,
+            }
+        }
+        // No fair events — fall through to linear BMC.
     }
 
     check_verify_block(ir, vctx, defs, verify_block, config)
@@ -4134,6 +4596,1235 @@ fn try_induction_on_verify(
     })
 }
 
+// ── Liveness-to-Safety Reduction (Phase 13) ──────────────────────────
+
+/// A liveness pattern extracted from an assertion.
+enum LivenessPattern {
+    /// `always (P implies eventually Q)` — response property
+    Response {
+        trigger: IRExpr,
+        response: IRExpr,
+    },
+    /// `always eventually Q` — recurrence (trigger is always true, repeating)
+    Recurrence {
+        response: IRExpr,
+    },
+    /// `eventually Q` — bare eventuality (one-shot: Q must hold at least once)
+    Eventuality {
+        response: IRExpr,
+    },
+    /// `eventually always P` — persistence (P eventually holds forever)
+    Persistence {
+        condition: IRExpr,
+    },
+    /// `always (all o: E | P(o) implies eventually Q(o))`
+    QuantifiedResponse {
+        var: String,
+        entity: String,
+        trigger: IRExpr,
+        response: IRExpr,
+    },
+    /// `always (all o: E | eventually Q(o))`
+    QuantifiedRecurrence {
+        var: String,
+        entity: String,
+        response: IRExpr,
+    },
+    /// `eventually (all o: E | Q(o))` or `all o: E | eventually Q(o)` (bare)
+    QuantifiedEventuality {
+        var: String,
+        entity: String,
+        response: IRExpr,
+    },
+    /// `eventually always (all o: E | P(o))`
+    QuantifiedPersistence {
+        var: String,
+        entity: String,
+        condition: IRExpr,
+    },
+}
+
+/// Result of liveness pattern extraction: the recognized liveness pattern
+/// plus any safety conjuncts that must be verified separately.
+///
+/// Safety conjuncts arise from conjunction decomposition (e.g., `until`
+/// desugars to `(eventually Q) AND (always (¬Q → P))`). The liveness
+/// side is extracted as the pattern; the safety side must still be proved.
+struct PatternExtraction {
+    pattern: LivenessPattern,
+    safety_conjuncts: Vec<IRExpr>,
+}
+
+/// Extract a response/recurrence liveness pattern from an assertion.
+///
+/// Recognizes:
+/// - `always (P implies eventually Q)` → Response
+/// - `always eventually Q` → Recurrence
+/// - `always (all o: E | P(o) implies eventually Q(o))` → QuantifiedResponse
+/// - `always (all o: E | eventually Q(o))` → QuantifiedRecurrence
+/// - Conjunctions where one side is liveness and the other is safety
+///
+/// Returns `None` if the expression doesn't match a supported pattern.
+fn extract_liveness_pattern(
+    expr: &IRExpr,
+    defs: &defenv::DefEnv,
+) -> Option<PatternExtraction> {
+    let expanded = expand_through_defs(expr, defs);
+    // Desugar `until` before extraction so `P until Q` becomes
+    // `(eventually Q) AND (always (¬Q → P))`, which the conjunction
+    // case can decompose into liveness + safety.
+    let desugared = desugar_until(&expanded);
+    extract_liveness_pattern_inner(&desugared)
+}
+
+fn extract_liveness_pattern_inner(expr: &IRExpr) -> Option<PatternExtraction> {
+    let pattern = extract_liveness_pattern_with_always(expr, false)?;
+    let safety_conjuncts = strip_liveness_from_conjunction(expr)
+        .into_iter()
+        .collect();
+    Some(PatternExtraction {
+        pattern,
+        safety_conjuncts,
+    })
+}
+
+/// Walk an expression tree and extract the safety side of any conjunction
+/// where one side is liveness and the other is safety.
+///
+/// Preserves surrounding structure (Always, Forall) so the result can be
+/// verified as a standalone safety property.
+///
+/// Returns `None` if no such conjunction exists (pure liveness or no conjunction).
+fn strip_liveness_from_conjunction(expr: &IRExpr) -> Option<IRExpr> {
+    match expr {
+        IRExpr::Always { body, span } => {
+            strip_liveness_from_conjunction(body).map(|inner| IRExpr::Always {
+                body: Box::new(inner),
+                span: *span,
+            })
+        }
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            span,
+        } => strip_liveness_from_conjunction(body).map(|inner| IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(inner),
+            span: *span,
+        }),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" => {
+            let l = contains_liveness(left);
+            let r = contains_liveness(right);
+            match (l, r) {
+                (true, false) => Some(*right.clone()), // left is liveness, right is safety
+                (false, true) => Some(*left.clone()),  // right is liveness, left is safety
+                _ => None,                             // both or neither — can't split
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_liveness_pattern_with_always(expr: &IRExpr, inside_always: bool) -> Option<LivenessPattern> {
+    match expr {
+        // always (body) — mark that we're inside always
+        IRExpr::Always { body, .. } => extract_liveness_pattern_with_always(body, true),
+
+        // all o: Entity | body
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            ..
+        } => {
+            let entity = match domain {
+                IRType::Entity { name } => name.clone(),
+                _ => return extract_liveness_pattern_with_always(body, inside_always),
+            };
+            match body.as_ref() {
+                // all o: E | P implies eventually Q
+                IRExpr::BinOp {
+                    op, left, right, ..
+                } if op == "OpImplies" => {
+                    if let IRExpr::Eventually { body: resp, .. } = right.as_ref() {
+                        if inside_always {
+                            Some(LivenessPattern::QuantifiedResponse {
+                                var: var.clone(),
+                                entity,
+                                trigger: *left.clone(),
+                                response: *resp.clone(),
+                            })
+                        } else {
+                            None // bare `all o | P implies eventually Q` without always
+                        }
+                    } else {
+                        None
+                    }
+                }
+                // all o: E | eventually (always P) → quantified persistence
+                IRExpr::Eventually { body: ev_body, .. }
+                    if matches!(ev_body.as_ref(), IRExpr::Always { .. }) =>
+                {
+                    if let IRExpr::Always { body: inner, .. } = ev_body.as_ref() {
+                        Some(LivenessPattern::QuantifiedPersistence {
+                            var: var.clone(),
+                            entity,
+                            condition: *inner.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                // all o: E | eventually Q
+                IRExpr::Eventually { body: resp, .. } => {
+                    if inside_always {
+                        Some(LivenessPattern::QuantifiedRecurrence {
+                            var: var.clone(),
+                            entity,
+                            response: *resp.clone(),
+                        })
+                    } else {
+                        Some(LivenessPattern::QuantifiedEventuality {
+                            var: var.clone(),
+                            entity,
+                            response: *resp.clone(),
+                        })
+                    }
+                }
+                // all o: E | <conjunction or other> — recurse, then wrap
+                // with quantifier context if the result is non-quantified
+                _ => {
+                    let inner = extract_liveness_pattern_with_always(body, inside_always)?;
+                    Some(match inner {
+                        LivenessPattern::Response { trigger, response } => {
+                            if inside_always {
+                                LivenessPattern::QuantifiedResponse {
+                                    var: var.clone(),
+                                    entity,
+                                    trigger,
+                                    response,
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        LivenessPattern::Recurrence { response } => {
+                            LivenessPattern::QuantifiedRecurrence {
+                                var: var.clone(),
+                                entity,
+                                response,
+                            }
+                        }
+                        LivenessPattern::Eventuality { response } => {
+                            LivenessPattern::QuantifiedEventuality {
+                                var: var.clone(),
+                                entity,
+                                response,
+                            }
+                        }
+                        LivenessPattern::Persistence { condition } => {
+                            LivenessPattern::QuantifiedPersistence {
+                                var: var.clone(),
+                                entity,
+                                condition,
+                            }
+                        }
+                        // Already quantified — leave as-is
+                        other => other,
+                    })
+                },
+            }
+        }
+
+        // P implies eventually Q (only valid inside always)
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpImplies" => {
+            if let IRExpr::Eventually { body: resp, .. } = right.as_ref() {
+                if inside_always {
+                    Some(LivenessPattern::Response {
+                        trigger: *left.clone(),
+                        response: *resp.clone(),
+                    })
+                } else {
+                    None // bare response without always
+                }
+            } else {
+                None
+            }
+        }
+
+        // Conjunction: can't soundly prove A ∧ B by proving one conjunct
+        // Conjunction: from until desugaring (eventually Q) AND (always safety).
+        // If exactly one side is liveness, extract it.
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" => {
+            let l = contains_liveness(left);
+            let r = contains_liveness(right);
+            match (l, r) {
+                (true, false) => extract_liveness_pattern_with_always(left, inside_always),
+                (false, true) => extract_liveness_pattern_with_always(right, inside_always),
+                _ => None,
+            }
+        }
+
+        // eventually (always P) — persistence
+        IRExpr::Eventually { body, .. } if matches!(body.as_ref(), IRExpr::Always { .. }) => {
+            if let IRExpr::Always { body: inner, .. } = body.as_ref() {
+                if let IRExpr::Forall {
+                    var,
+                    domain: IRType::Entity { name },
+                    body: qb,
+                    ..
+                } = inner.as_ref()
+                {
+                    return Some(LivenessPattern::QuantifiedPersistence {
+                        var: var.clone(),
+                        entity: name.clone(),
+                        condition: *qb.clone(),
+                    });
+                }
+                Some(LivenessPattern::Persistence {
+                    condition: *inner.clone(),
+                })
+            } else {
+                None
+            }
+        }
+
+        // eventually Q
+        IRExpr::Eventually { body, .. } => {
+            if let IRExpr::Forall {
+                var,
+                domain: IRType::Entity { name },
+                body: qb,
+                ..
+            } = body.as_ref()
+            {
+                return if inside_always {
+                    Some(LivenessPattern::QuantifiedRecurrence {
+                        var: var.clone(),
+                        entity: name.clone(),
+                        response: *qb.clone(),
+                    })
+                } else {
+                    Some(LivenessPattern::QuantifiedEventuality {
+                        var: var.clone(),
+                        entity: name.clone(),
+                        response: *qb.clone(),
+                    })
+                };
+            }
+            if inside_always {
+                Some(LivenessPattern::Recurrence {
+                    response: *body.clone(),
+                })
+            } else {
+                Some(LivenessPattern::Eventuality {
+                    response: *body.clone(),
+                })
+            }
+        }
+
+        _ => None,
+    }
+}
+
+// ── Symmetry reduction for quantified liveness (Phase 16) ────────────
+//
+// For `always all o: E | P(o) implies eventually Q(o)` with fair events:
+// 1. All entities of type E have identical field types, defaults, and transitions
+// 2. Fair events with `choose o: E where guard` are symmetric: which slot is
+//    chosen is nondeterministic, but fairness guarantees each enabled slot
+//    is eventually served
+// 3. Therefore: if the property is PROVED for a system with 1 slot of type E,
+//    by symmetry it holds for any slot count
+//
+// Symmetry breaks when:
+// - Events contain nested Choose/ForAll over the SAME entity type (inter-entity ref)
+// - The property references multiple entities of the same type
+
+/// Check whether a quantified liveness property is suitable for symmetry reduction.
+///
+/// The symmetry argument requires that all entities of the quantified type are
+/// interchangeable: identical fields, identical transitions, no inter-entity
+/// dependencies. This function checks three conditions:
+///
+/// 1. **Event bodies**: No event has multiple Choose/ForAll over the same entity
+///    type (directly or via CrossCall), which would create inter-entity dependencies.
+///
+/// 2. **CrossCall composition**: If an event body calls into another system via
+///    CrossCall, and that system also Choose/ForAll over the quantified entity type,
+///    the combined event manipulates multiple slots (symmetry broken).
+///
+/// 3. **Property formulas**: The trigger/response expressions must not contain
+///    additional quantifiers (Forall/Exists/One/Lone) over the same entity type,
+///    which would reference multiple slots in the property itself.
+///
+/// Returns `true` if the system is symmetric for the given entity type.
+fn validate_symmetry(
+    entity_name: &str,
+    systems: &[IRSystem],
+    all_systems: &[IRSystem],
+    pattern: &LivenessPattern,
+) -> bool {
+    // ── Condition 1+2: Event bodies + CrossCall targets ──────────────
+    // Count entity references per event, following CrossCall targets
+    // transitively. If any event's combined action tree has 2+ references
+    // to the quantified entity type, symmetry breaks.
+    for sys in systems {
+        for event in &sys.events {
+            let mut count = 0;
+            count_entity_actions_with_crosscall(
+                &event.body,
+                entity_name,
+                all_systems,
+                &mut count,
+                &mut HashSet::new(),
+            );
+            if count >= 2 {
+                return false;
+            }
+        }
+    }
+
+    // ── Condition 3: Property formula quantifiers ────────────────────
+    // The trigger/response must not quantify over the same entity type.
+    // If they do, the property references multiple slots and the 1-slot
+    // reduction would collapse that to a single slot — unsound.
+    let (trigger, response) = match pattern {
+        LivenessPattern::QuantifiedResponse {
+            trigger, response, ..
+        } => (Some(trigger), Some(response)),
+        LivenessPattern::QuantifiedRecurrence { response, .. }
+        | LivenessPattern::QuantifiedEventuality { response, .. } => (None, Some(response)),
+        LivenessPattern::QuantifiedPersistence { condition, .. } => (None, Some(condition)),
+        _ => (None, None),
+    };
+    if let Some(t) = trigger {
+        if expr_quantifies_over_entity(t, entity_name) {
+            return false;
+        }
+    }
+    if let Some(r) = response {
+        if expr_quantifies_over_entity(r, entity_name) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Count Choose/ForAll references to `entity_name` in an action tree,
+/// following CrossCall targets transitively into other systems.
+fn count_entity_actions_with_crosscall(
+    actions: &[IRAction],
+    entity_name: &str,
+    all_systems: &[IRSystem],
+    count: &mut usize,
+    visited_crosscalls: &mut HashSet<(String, String)>,
+) {
+    for action in actions {
+        match action {
+            IRAction::Choose { entity, ops, .. } => {
+                if entity == entity_name {
+                    *count += 1;
+                }
+                count_entity_actions_with_crosscall(
+                    ops,
+                    entity_name,
+                    all_systems,
+                    count,
+                    visited_crosscalls,
+                );
+            }
+            IRAction::ForAll { entity, ops, .. } => {
+                if entity == entity_name {
+                    *count += 1;
+                }
+                count_entity_actions_with_crosscall(
+                    ops,
+                    entity_name,
+                    all_systems,
+                    count,
+                    visited_crosscalls,
+                );
+            }
+            IRAction::CrossCall { system, event, .. } => {
+                let key = (system.clone(), event.clone());
+                if visited_crosscalls.insert(key) {
+                    // Follow into the CrossCall target's event body
+                    if let Some(sys) = all_systems.iter().find(|s| s.name == *system) {
+                        if let Some(evt) = sys.events.iter().find(|e| e.name == *event) {
+                            count_entity_actions_with_crosscall(
+                                &evt.body,
+                                entity_name,
+                                all_systems,
+                                count,
+                                visited_crosscalls,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check whether an IRExpr contains any quantifier (Forall/Exists/One/Lone)
+/// whose domain is the given entity type. This means the expression references
+/// multiple slots of that entity, breaking the symmetry assumption.
+fn expr_quantifies_over_entity(expr: &IRExpr, entity_name: &str) -> bool {
+    match expr {
+        IRExpr::Forall { domain, body, .. }
+        | IRExpr::Exists { domain, body, .. }
+        | IRExpr::One { domain, body, .. }
+        | IRExpr::Lone { domain, body, .. } => {
+            if matches!(domain, IRType::Entity { name } if name == entity_name) {
+                return true;
+            }
+            expr_quantifies_over_entity(body, entity_name)
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            expr_quantifies_over_entity(left, entity_name)
+                || expr_quantifies_over_entity(right, entity_name)
+        }
+        IRExpr::UnOp { operand, .. } | IRExpr::Field { expr: operand, .. } => {
+            expr_quantifies_over_entity(operand, entity_name)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_quantifies_over_entity(cond, entity_name)
+                || expr_quantifies_over_entity(then_body, entity_name)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|e| expr_quantifies_over_entity(e, entity_name))
+        }
+        IRExpr::App { func, arg, .. } => {
+            expr_quantifies_over_entity(func, entity_name)
+                || expr_quantifies_over_entity(arg, entity_name)
+        }
+        IRExpr::Always { body, .. } | IRExpr::Eventually { body, .. } => {
+            expr_quantifies_over_entity(body, entity_name)
+        }
+        IRExpr::SetComp {
+            filter, projection, ..
+        } => {
+            expr_quantifies_over_entity(filter, entity_name)
+                || projection
+                    .as_ref()
+                    .is_some_and(|p| expr_quantifies_over_entity(p, entity_name))
+        }
+        IRExpr::Until { left, right, .. } => {
+            expr_quantifies_over_entity(left, entity_name)
+                || expr_quantifies_over_entity(right, entity_name)
+        }
+        IRExpr::Match { scrutinee, arms, .. } => {
+            expr_quantifies_over_entity(scrutinee, entity_name)
+                || arms
+                    .iter()
+                    .any(|a| expr_quantifies_over_entity(&a.body, entity_name))
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings
+                .iter()
+                .any(|b| expr_quantifies_over_entity(&b.expr, entity_name))
+                || expr_quantifies_over_entity(body, entity_name)
+        }
+        // Leaves: Lit, Var, Ctor, Lambda, SetLit, SeqLit, MapLit, etc.
+        _ => false,
+    }
+}
+
+/// Try symmetry reduction for quantified liveness patterns.
+///
+/// Validates entity symmetry for each quantified pattern. Currently cannot
+/// PROVE properties unboundedly — returns None to fall back to lasso BMC
+/// (CHECKED) or UNPROVABLE.
+///
+/// IC3's BAS monitor encoding uses coarse justice tracking that is fundamentally
+/// unsound for liveness: it under-approximates the accepting condition by
+/// requiring all fair events to have fired, but doesn't account for events that
+/// are never enabled (where fairness is vacuously satisfied). This causes false
+/// PROVED results on systems with reachable dead states. No fixed-depth lasso
+/// sanity check can compensate — the dead state may be arbitrarily deep.
+///
+/// Sound unbounded liveness proofs require either:
+/// - A BAS encoding with per-event enabled tracking (IC3/Spacer struggles with
+///   the additional CHC columns)
+/// - k-liveness (Claessen & Sörensson) which sidesteps BAS entirely
+/// - Manual proof via `axiom ... by "file"`
+fn try_symmetry_reduction(
+    ir: &IRProgram,
+    _vctx: &VerifyContext,
+    _defs: &defenv::DefEnv,
+    patterns: &[(usize, LivenessPattern)],
+    _safety_obligations: &[IRExpr],
+    _system_names: &[String],
+    _scope: &HashMap<String, usize>,
+    _fair_event_keys: &[(String, String)],
+    relevant_systems: &[IRSystem],
+    _config: &VerifyConfig,
+    _start: &Instant,
+    _verify_block: &IRVerify,
+) -> Option<VerificationResult> {
+    // Validate symmetry for each quantified entity type.
+    // Even though we can't PROVE properties here, symmetry validation
+    // is still useful for diagnostics and future k-liveness integration.
+    for (_assert_idx, pattern) in patterns {
+        let entity_name = match pattern {
+            LivenessPattern::QuantifiedResponse { entity, .. }
+            | LivenessPattern::QuantifiedRecurrence { entity, .. }
+            | LivenessPattern::QuantifiedEventuality { entity, .. }
+            | LivenessPattern::QuantifiedPersistence { entity, .. } => entity.as_str(),
+            _ => continue,
+        };
+
+        if !validate_symmetry(entity_name, relevant_systems, &ir.systems, pattern) {
+            return None; // symmetry broken
+        }
+    }
+
+    // Cannot prove quantified liveness unboundedly with current IC3 encoding.
+    // Fall through to lasso BMC (CHECKED) or UNPROVABLE.
+    None
+}
+
+/// Try to prove liveness properties in a verify block via
+/// liveness-to-safety reduction (Biere-Artho-Schuppan 2002).
+///
+/// Reduces `always (P implies eventually Q)` to a safety property
+/// `always (not accepting)` with monitor state, then proves the
+/// safety property via 1-induction.
+///
+/// Returns `Some(Proved)` if the safety property holds unboundedly,
+/// or `None` if the proof fails (caller falls back to lasso BMC).
+#[allow(clippy::too_many_lines)]
+fn try_liveness_reduction(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let start = Instant::now();
+
+    // Build scope (same as try_induction_on_verify)
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut system_names: Vec<String> = Vec::new();
+
+    for vs in &verify_block.systems {
+        system_names.push(vs.name.clone());
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == vs.name) {
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    // Expand scope via CrossCall
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            for ent_name in &sys.entities {
+                scope.entry(ent_name.clone()).or_insert(2);
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        return None;
+    }
+
+    // Adaptive scope from quantifier depth
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        count_entity_quantifiers(&expanded, &mut counts);
+        for (entity, count) in counts {
+            let min_slots = count + 1;
+            if let Some(existing) = scope.get_mut(&entity) {
+                *existing = (*existing).max(min_slots);
+            }
+        }
+    }
+
+    let relevant_entities: Vec<_> = ir
+        .entities
+        .iter()
+        .filter(|e| scope.contains_key(&e.name))
+        .cloned()
+        .collect();
+
+    let relevant_systems: Vec<_> = ir
+        .systems
+        .iter()
+        .filter(|s| system_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // Check if any relevant system has fair events (required for soundness)
+    let has_fair_events = relevant_systems
+        .iter()
+        .any(|s| s.events.iter().any(|e| e.fairness.is_fair()));
+    if !has_fair_events {
+        return None; // can't prove liveness without fairness
+    }
+
+    // Collect fair event keys for justice tracking
+    let fair_event_keys: Vec<(String, String)> = relevant_systems
+        .iter()
+        .flat_map(|s| {
+            s.events
+                .iter()
+                .filter(|e| e.fairness.is_fair())
+                .map(|e| (s.name.clone(), e.name.clone()))
+        })
+        .collect();
+
+    // Extract liveness patterns from all asserts.
+    // ALL liveness asserts must be recognized — if any is unsupported,
+    // the reduction cannot prove the block and must return None.
+    //
+    // Also collect safety conjuncts from conjunction decomposition (e.g., from
+    // desugared `until`). These must be verified separately after the liveness
+    // side is proved.
+    let mut patterns: Vec<(usize, LivenessPattern)> = Vec::new();
+    let mut safety_obligations: Vec<IRExpr> = Vec::new();
+    let mut has_unrecognized_liveness = false;
+    for (i, assert_expr) in verify_block.asserts.iter().enumerate() {
+        let expanded = expand_through_defs(assert_expr, defs);
+        if contains_liveness(&expanded) {
+            if let Some(extraction) = extract_liveness_pattern(assert_expr, defs) {
+                patterns.push((i, extraction.pattern));
+                safety_obligations.extend(extraction.safety_conjuncts);
+            } else {
+                has_unrecognized_liveness = true;
+            }
+        }
+    }
+
+    if patterns.is_empty() || has_unrecognized_liveness {
+        return None; // can't prove: no patterns or some liveness is unsupported
+    }
+
+    // Pre-validate expressions
+    for entity in &relevant_entities {
+        for trans in &entity.transitions {
+            if find_unsupported_scene_expr(&trans.guard).is_some() {
+                return None;
+            }
+            for upd in &trans.updates {
+                if find_unsupported_scene_expr(&upd.value).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    for sys in &relevant_systems {
+        for event in &sys.events {
+            if find_unsupported_scene_expr(&event.guard).is_some() {
+                return None;
+            }
+            if find_unsupported_in_actions(&event.body).is_some() {
+                return None;
+            }
+        }
+    }
+
+    // ── Inductive step (the core of the proof) ──────────────────────
+    // For each liveness assert, build a monitor and check
+    // `not accepting(k+1)` given `not accepting(k)` and one transition.
+    let pool = create_slot_pool(&relevant_entities, &scope, 1);
+    let solver = Solver::new();
+    set_solver_timeout(&solver, config.induction_timeout_ms);
+
+    for c in domain_constraints(&pool, vctx, &relevant_entities) {
+        solver.assert(&c);
+    }
+
+    // Fire tracking for the single transition step (0→1)
+    let fire_tracking =
+        transition_constraints_with_fire(&pool, vctx, &relevant_entities, &relevant_systems, 1);
+    for c in &fire_tracking.constraints {
+        solver.assert(c);
+    }
+
+    // Build a monitor per liveness assert.
+    //
+    // For QUANTIFIED patterns (all o: E | ... eventually ...):
+    //   Build one monitor PER entity slot. This gives universal semantics:
+    //   each slot must independently satisfy the liveness property.
+    //   If ANY slot's monitor can accept, the property is violated.
+    //
+    // For NON-QUANTIFIED patterns: one monitor per assert (as before).
+    let mut accepting_vars_step1: Vec<Bool> = Vec::new();
+
+    for (_assert_idx, pattern) in &patterns {
+        // Determine the slot range for this pattern
+        let (quant_var, quant_entity) = match pattern {
+            LivenessPattern::QuantifiedResponse { var, entity, .. }
+            | LivenessPattern::QuantifiedRecurrence { var, entity, .. }
+            | LivenessPattern::QuantifiedEventuality { var, entity, .. }
+            | LivenessPattern::QuantifiedPersistence { var, entity, .. } => {
+                (Some(var.as_str()), Some(entity.as_str()))
+            }
+            _ => (None, None),
+        };
+
+        let slot_count = if let Some(ent_name) = quant_entity {
+            pool.slots_for(ent_name)
+        } else {
+            1 // non-quantified: single monitor
+        };
+
+        for target_slot in 0..slot_count {
+            // Unique prefix per (assert, slot) to avoid variable name collisions
+            let prefix = if quant_entity.is_some() {
+                format!("mon{_assert_idx}_s{target_slot}")
+            } else {
+                format!("mon{_assert_idx}")
+            };
+
+            let pending_0 = Bool::new_const(format!("{prefix}_pending_t0"));
+            let pending_1 = Bool::new_const(format!("{prefix}_pending_t1"));
+
+            // Saved state: one copy per entity/slot/field (constants — captured at trigger)
+            let mut saved_fields: Vec<(String, usize, String, SmtValue)> = Vec::new();
+            let mut saved_active: Vec<(String, usize, SmtValue)> = Vec::new();
+            for entity in &relevant_entities {
+                let n_slots = pool.slots_for(&entity.name);
+                for slot in 0..n_slots {
+                    for field in &entity.fields {
+                        let name =
+                            format!("{prefix}_saved_{}_s{}_{}", entity.name, slot, field.name);
+                        let var = match &field.ty {
+                            IRType::Bool => smt::bool_var(&name),
+                            IRType::Real | IRType::Float => smt::real_var(&name),
+                            _ => smt::int_var(&name),
+                        };
+                        saved_fields.push((entity.name.clone(), slot, field.name.clone(), var));
+                    }
+                    let act_name = format!("{prefix}_saved_{}_s{}_active", entity.name, slot);
+                    saved_active.push((entity.name.clone(), slot, smt::bool_var(&act_name)));
+                }
+            }
+
+            // Justice counters: one per fair event, at steps 0 and 1
+            let mut justice_0: Vec<Bool> = Vec::new();
+            let mut justice_1: Vec<Bool> = Vec::new();
+            for (i, _key) in fair_event_keys.iter().enumerate() {
+                justice_0.push(Bool::new_const(format!("{prefix}_justice{i}_t0")));
+                justice_1.push(Bool::new_const(format!("{prefix}_justice{i}_t1")));
+            }
+
+            // Build property context: bind quantified variable to this specific slot
+            let ctx = if let (Some(var), Some(ent_name)) = (quant_var, quant_entity) {
+                PropertyCtx::new().with_binding(var, ent_name, target_slot)
+            } else {
+                PropertyCtx::new()
+            };
+
+            let (trigger_0, response_0) = match pattern {
+                LivenessPattern::Response { trigger, response }
+                | LivenessPattern::QuantifiedResponse { trigger, response, .. } => {
+                    let p = encode_prop_expr(&pool, vctx, defs, &ctx, trigger, 0).ok()?;
+                    let q = encode_prop_expr(&pool, vctx, defs, &ctx, response, 0).ok()?;
+                    (p, q)
+                }
+                LivenessPattern::Recurrence { response }
+                | LivenessPattern::QuantifiedRecurrence { response, .. }
+                | LivenessPattern::Eventuality { response }
+                | LivenessPattern::QuantifiedEventuality { response, .. } => {
+                    let q = encode_prop_expr(&pool, vctx, defs, &ctx, response, 0).ok()?;
+                    (Bool::from_bool(true), q)
+                }
+                LivenessPattern::Persistence { condition }
+                | LivenessPattern::QuantifiedPersistence { condition, .. } => {
+                    // ◇□P: trigger=true, response=P. Monitor finds cycles where P never holds.
+                    let p = encode_prop_expr(&pool, vctx, defs, &ctx, condition, 0).ok()?;
+                    (Bool::from_bool(true), p)
+                }
+            };
+
+            // Monitor transition: step 0 → step 1
+            //
+            // trigger_fires = NOT pending_0 AND P(0) AND NOT Q(0)
+            let trigger_fires = Bool::and(&[&pending_0.not(), &trigger_0, &response_0.not()]);
+            // discharge = pending_0 AND Q(0)
+            let discharge = Bool::and(&[&pending_0, &response_0]);
+
+            // pending_1 = ITE(trigger_fires, true, ITE(discharge, false, pending_0))
+            let pending_1_val = trigger_fires.ite(
+                &Bool::from_bool(true),
+                &discharge.ite(&Bool::from_bool(false), &pending_0),
+            );
+            solver.assert(&pending_1.eq(pending_1_val));
+
+            // Saved state capture: on trigger, save current state
+            for (ent, slot, field, saved_var) in &saved_fields {
+                if let Some(current) = pool.field_at(ent, *slot, field, 0) {
+                    let saved_val = smt::smt_ite(&trigger_fires, current, saved_var);
+                    if let Ok(eq) = smt::smt_eq(&saved_val, saved_var) {
+                        solver.assert(&eq);
+                    }
+                }
+            }
+            for (ent, slot, saved_act) in &saved_active {
+                if let Some(SmtValue::Bool(current)) = pool.active_at(ent, *slot, 0) {
+                    let saved_val = trigger_fires.ite(
+                        current,
+                        match saved_act {
+                            SmtValue::Bool(b) => b,
+                            _ => continue,
+                        },
+                    );
+                    if let SmtValue::Bool(s) = saved_act {
+                        solver.assert(&s.eq(saved_val));
+                    }
+                }
+            }
+
+            // Justice tracking: on trigger_fires, reset to just this step's fire.
+            // Otherwise, accumulate: justice_1 = justice_0 OR fire_at_0
+            for (i, key) in fair_event_keys.iter().enumerate() {
+                let fired_at_0 = fire_tracking
+                    .fire_vars
+                    .get(key)
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| Bool::from_bool(false));
+
+                let justice_val = trigger_fires.ite(
+                    &fired_at_0,
+                    &Bool::or(&[&justice_0[i], &fired_at_0]),
+                );
+                solver.assert(&justice_1[i].eq(justice_val));
+            }
+
+            // Loop detection: accepting_1 = pending_1 AND state_matches AND all_justice
+            let mut state_match_parts: Vec<Bool> = Vec::new();
+            for (ent, slot, field, saved_var) in &saved_fields {
+                if let Some(current) = pool.field_at(ent, *slot, field, 1) {
+                    if let Ok(eq) = smt::smt_eq(saved_var, current) {
+                        state_match_parts.push(eq);
+                    }
+                }
+            }
+            for (ent, slot, saved_act) in &saved_active {
+                if let Some(SmtValue::Bool(current)) = pool.active_at(ent, *slot, 1) {
+                    if let SmtValue::Bool(s) = saved_act {
+                        state_match_parts.push(s.eq(current.clone()));
+                    }
+                }
+            }
+
+            let state_matches = if state_match_parts.is_empty() {
+                Bool::from_bool(true)
+            } else {
+                let refs: Vec<&Bool> = state_match_parts.iter().collect();
+                Bool::and(&refs)
+            };
+
+            let all_justice = if justice_1.is_empty() {
+                Bool::from_bool(true)
+            } else {
+                let refs: Vec<&Bool> = justice_1.iter().collect();
+                Bool::and(&refs)
+            };
+
+            let accepting_1 = Bool::and(&[&pending_1, &state_matches, &all_justice]);
+            accepting_vars_step1.push(accepting_1);
+        } // end for target_slot
+    }
+
+    // Inductive hypothesis: no monitor is accepting at step 0
+    // (Since we don't assert accepting_0 explicitly, the solver is free to
+    //  choose any value. We assert NOT accepting_0 as the hypothesis.)
+    // Actually, we need to assert: none of the monitors are accepting at step 0.
+    // The accepting_0 is not materialized — we just don't constrain it.
+    // The hypothesis is that the safety property holds at step k.
+    // For simplicity, assert that no accepting condition holds at step 0.
+    //
+    // Note: we don't need separate accepting_0 variables. The hypothesis
+    // is implicit: we're checking whether accepting can become true after
+    // one transition from ANY state where it's not true.
+    //
+    // We assert: the negation of the safety property at step 1 (any accepting_1 is true)
+    let any_accepting = if accepting_vars_step1.len() == 1 {
+        accepting_vars_step1[0].clone()
+    } else {
+        let refs: Vec<&Bool> = accepting_vars_step1.iter().collect();
+        Bool::or(&refs)
+    };
+    solver.assert(&any_accepting);
+
+    // Check: UNSAT means no transition can make any monitor accepting → PROVED
+    match solver.check() {
+        z3::SatResult::Unsat => {
+            // Liveness part proved. Now verify safety obligations (if any).
+            if !safety_obligations.is_empty() {
+                let safety_verify = IRVerify {
+                    name: verify_block.name.clone(),
+                    systems: verify_block.systems.clone(),
+                    asserts: safety_obligations.clone(),
+                    span: verify_block.span,
+                    file: verify_block.file.clone(),
+                };
+                // Try induction first, then IC3 for safety
+                let safety_proved =
+                    try_induction_on_verify(ir, vctx, defs, &safety_verify, config)
+                        .or_else(|| {
+                            if !config.no_ic3 {
+                                try_ic3_on_verify(ir, vctx, defs, &safety_verify, config)
+                            } else {
+                                None
+                            }
+                        });
+                match safety_proved {
+                    Some(VerificationResult::Proved { .. }) => {
+                        let elapsed = elapsed_ms(&start);
+                        return Some(VerificationResult::Proved {
+                            name: verify_block.name.clone(),
+                            method: crate::messages::LIVENESS_REDUCTION_METHOD.to_owned(),
+                            time_ms: elapsed,
+                            span: None,
+                            file: None,
+                        });
+                    }
+                    _ => {} // safety couldn't be proved — fall through to IC3
+                }
+            } else {
+                let elapsed = elapsed_ms(&start);
+                return Some(VerificationResult::Proved {
+                    name: verify_block.name.clone(),
+                    method: crate::messages::LIVENESS_REDUCTION_METHOD.to_owned(),
+                    time_ms: elapsed,
+                    span: None,
+                    file: None,
+                });
+            }
+        }
+        _ => {} // 1-induction failed — try IC3 below
+    }
+
+    // ── IC3/PDR on the reduced safety property ──────────────────────
+    // 1-induction is too weak for most liveness reductions. IC3 can
+    // automatically discover the strengthening invariants needed.
+    let system_names: Vec<String> = verify_block
+        .systems
+        .iter()
+        .map(|vs| vs.name.clone())
+        .collect();
+
+    // ALL patterns must be proved by IC3. If any fails, the block is not proved.
+    //
+    // For QUANTIFIED patterns: IC3 with coarse justice tracking on the full
+    // multi-slot system is unsound (events firing on other slots satisfy
+    // justice for the wrong slot). Instead, try symmetry reduction: prove
+    // the property on a 1-slot system where coarse justice IS sound (there's
+    // only one slot, so any event on that slot is the target), then
+    // generalize by entity symmetry.
+    let has_quantified = patterns.iter().any(|(_, p)| {
+        matches!(
+            p,
+            LivenessPattern::QuantifiedResponse { .. }
+                | LivenessPattern::QuantifiedRecurrence { .. }
+                | LivenessPattern::QuantifiedEventuality { .. }
+                | LivenessPattern::QuantifiedPersistence { .. }
+        )
+    });
+    if has_quantified {
+        // Try symmetry reduction before falling back to lasso BMC
+        if let Some(result) = try_symmetry_reduction(
+            ir,
+            vctx,
+            defs,
+            &patterns,
+            &safety_obligations,
+            &system_names,
+            &scope,
+            &fair_event_keys,
+            &relevant_systems,
+            config,
+            &start,
+            verify_block,
+        ) {
+            return Some(result);
+        }
+        return None; // symmetry failed — fall back to lasso BMC (CHECKED)
+    }
+
+    let mut all_proved = true;
+    'pattern_loop: for (_assert_idx, pattern) in &patterns {
+        let true_lit = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: crate::ir::types::LitVal::Bool { value: true },
+            span: None,
+        };
+
+        let (actual_trigger, response_expr, ent_var, ent_name) = match pattern {
+            LivenessPattern::Response { trigger, response } => {
+                (trigger as &IRExpr, response as &IRExpr, None, None)
+            }
+            LivenessPattern::Recurrence { response }
+            | LivenessPattern::Eventuality { response } => {
+                (&true_lit as &IRExpr, response as &IRExpr, None, None)
+            }
+            LivenessPattern::Persistence { condition } => {
+                (&true_lit as &IRExpr, condition as &IRExpr, None, None)
+            }
+            LivenessPattern::QuantifiedResponse {
+                var,
+                entity,
+                trigger,
+                response,
+            } => (
+                trigger as &IRExpr,
+                response as &IRExpr,
+                Some(var.as_str()),
+                Some(entity.as_str()),
+            ),
+            LivenessPattern::QuantifiedRecurrence {
+                var,
+                entity,
+                response,
+            }
+            | LivenessPattern::QuantifiedEventuality {
+                var,
+                entity,
+                response,
+            } => (
+                &true_lit as &IRExpr,
+                response as &IRExpr,
+                Some(var.as_str()),
+                Some(entity.as_str()),
+            ),
+            LivenessPattern::QuantifiedPersistence {
+                var,
+                entity,
+                condition,
+            } => (
+                &true_lit as &IRExpr,
+                condition as &IRExpr,
+                Some(var.as_str()),
+                Some(entity.as_str()),
+            ),
+        };
+
+        let is_oneshot = matches!(
+            pattern,
+            LivenessPattern::Eventuality { .. } | LivenessPattern::QuantifiedEventuality { .. }
+        );
+
+        // Determine slot iteration range for quantified vs non-quantified
+        let slot_count = if let Some(ent) = ent_name {
+            scope.get(ent).copied().unwrap_or(1)
+        } else {
+            1 // non-quantified: single IC3 call with target_slot=None
+        };
+
+        for target_slot_idx in 0..slot_count {
+            let target_slot = if ent_var.is_some() {
+                Some(target_slot_idx)
+            } else {
+                None // non-quantified: no per-slot restriction
+            };
+
+            let ic3_result = ic3::try_ic3_liveness(
+                ir,
+                vctx,
+                &system_names,
+                actual_trigger,
+                response_expr,
+                ent_var,
+                ent_name,
+                &fair_event_keys,
+                &scope,
+                is_oneshot,
+                target_slot,
+                config.ic3_timeout_ms / 2,
+            );
+
+            match ic3_result {
+                ic3::Ic3Result::Proved => {
+                    // This slot proved — continue to check remaining slots
+                }
+                _ => {
+                    // Any slot failing means the pattern (and block) is not proved
+                    all_proved = false;
+                    break 'pattern_loop;
+                }
+            }
+        }
+    }
+
+    if all_proved {
+        // Liveness proved via IC3. Now verify safety obligations (if any).
+        if !safety_obligations.is_empty() {
+            let safety_verify = IRVerify {
+                name: verify_block.name.clone(),
+                systems: verify_block.systems.clone(),
+                asserts: safety_obligations,
+                span: verify_block.span,
+                file: verify_block.file.clone(),
+            };
+            let safety_proved =
+                try_induction_on_verify(ir, vctx, defs, &safety_verify, config).or_else(|| {
+                    if !config.no_ic3 {
+                        try_ic3_on_verify(ir, vctx, defs, &safety_verify, config)
+                    } else {
+                        None
+                    }
+                });
+            match safety_proved {
+                Some(VerificationResult::Proved { .. }) => {
+                    let elapsed = elapsed_ms(&start);
+                    return Some(VerificationResult::Proved {
+                        name: verify_block.name.clone(),
+                        method: "liveness-to-safety (IC3/PDR)".to_owned(),
+                        time_ms: elapsed,
+                        span: None,
+                        file: None,
+                    });
+                }
+                _ => return None, // safety couldn't be proved — whole block not proved
+            }
+        }
+
+        let elapsed = elapsed_ms(&start);
+        return Some(VerificationResult::Proved {
+            name: verify_block.name.clone(),
+            method: "liveness-to-safety (IC3/PDR)".to_owned(),
+            time_ms: elapsed,
+            span: None,
+            file: None,
+        });
+    }
+
+    None
+}
+
 /// Try to prove a verify block using IC3/PDR via Z3's Spacer engine.
 ///
 /// IC3 is more powerful than 1-induction: it automatically discovers
@@ -4285,17 +5976,9 @@ fn check_verify_block(
         }
     }
 
-    // If scope is empty (no systems found), return early
-    if scope.is_empty() {
-        let elapsed = elapsed_ms(&start);
-        return VerificationResult::Checked {
-            name: verify_block.name.clone(),
-            depth: bound,
-            time_ms: elapsed,
-            span: None,
-            file: None,
-        };
-    }
+    // NOTE: Do NOT early-return when scope is empty. Properties may contain
+    // non-entity quantifiers (e.g., `all c: Color | P(c)`) that must be checked.
+    // The BMC flow handles empty scope correctly: no slots, no events, stutter only.
 
     // ── 1b. Expand scope to include CrossCall-reachable systems ────
     // Systems called via CrossCall must be included even if not in verify targets.
@@ -4472,7 +6155,9 @@ fn check_verify_block(
             file: None,
         },
         z3::SatResult::Sat => {
-            let trace = extract_counterexample(&solver, &pool, &relevant_entities, bound);
+            let trace = extract_counterexample_with_events(
+                &solver, &pool, vctx, &relevant_entities, &relevant_systems, bound,
+            );
             // Use the first assert's span when there's only one (common case).
             // For multi-assert blocks, with_source fills in the block span.
             let assert_span = if verify_block.asserts.len() == 1 {
@@ -4518,6 +6203,859 @@ fn check_verify_block(
 /// given+when that satisfies then?" This is the dual of verify blocks
 /// (which are universal).
 ///
+// ── Lasso BMC for liveness properties ────────────────────────────────
+
+/// Lasso-shaped BMC for liveness verification with fairness.
+///
+/// A lasso is a trace: s₀ → s₁ → ... → s_l → ... → s_N → s_l (loop back).
+/// The solver searches for a lasso where the liveness property is violated
+/// on the loop (P never holds at any step in the loop). If SAT, this is a
+/// true infinite counterexample. If UNSAT, no violation exists at this bound.
+///
+/// Fairness: for each fair event, if it is enabled somewhere in the loop,
+/// it must fire somewhere in the loop. This excludes degenerate stutter loops.
+#[allow(clippy::too_many_lines)]
+fn check_verify_block_lasso(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> VerificationResult {
+    let start = Instant::now();
+
+    // ── 1. Build scope (same as check_verify_block) ─────────────────
+    let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut bound: usize = 1;
+    let mut system_names: Vec<String> = Vec::new();
+
+    for vs in &verify_block.systems {
+        system_names.push(vs.name.clone());
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let hi = vs.hi.max(1) as usize;
+        bound = bound.max(hi);
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == vs.name) {
+            for ent_name in &sys.entities {
+                let existing = scope.get(ent_name).copied().unwrap_or(0);
+                scope.insert(ent_name.clone(), existing.max(hi));
+            }
+        }
+    }
+
+    if scope.is_empty() {
+        // No entities — lasso BMC requires entity state for loop-back.
+        // Fall back to linear BMC.
+        return check_verify_block(ir, vctx, defs, verify_block, config);
+    }
+
+    // Expand scope for CrossCall targets
+    let mut systems_to_scan = system_names.clone();
+    let mut scanned: HashSet<String> = HashSet::new();
+    while let Some(sys_name) = systems_to_scan.pop() {
+        if !scanned.insert(sys_name.clone()) {
+            continue;
+        }
+        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
+            for event in &sys.events {
+                collect_crosscall_systems(&event.body, &mut systems_to_scan);
+            }
+            if !system_names.contains(&sys.name) {
+                system_names.push(sys.name.clone());
+            }
+            for ent_name in &sys.entities {
+                let existing = scope.get(ent_name).copied().unwrap_or(0);
+                scope.insert(ent_name.clone(), existing.max(bound));
+            }
+        }
+    }
+
+    let relevant_entities: Vec<_> = ir
+        .entities
+        .iter()
+        .filter(|e| scope.contains_key(&e.name))
+        .cloned()
+        .collect();
+    let relevant_systems: Vec<_> = ir
+        .systems
+        .iter()
+        .filter(|s| system_names.contains(&s.name))
+        .cloned()
+        .collect();
+
+    // ── 2. Create pool and solver ───────────────────────────────────
+    let pool = create_slot_pool(&relevant_entities, &scope, bound);
+    let solver = Solver::new();
+    if config.bmc_timeout_ms > 0 {
+        set_solver_timeout(&solver, config.bmc_timeout_ms);
+    }
+
+    // Initial state
+    for c in initial_state_constraints(&pool) {
+        solver.assert(&c);
+    }
+    for c in symmetry_breaking_constraints(&pool) {
+        solver.assert(&c);
+    }
+    for c in domain_constraints(&pool, vctx, &relevant_entities) {
+        solver.assert(&c);
+    }
+
+    // ── 3. Per-event fire tracking + transitions ────────────────────
+    let fire_tracking =
+        transition_constraints_with_fire(&pool, vctx, &relevant_entities, &relevant_systems, bound);
+    for c in &fire_tracking.constraints {
+        solver.assert(c);
+    }
+
+    // ── 4. Lasso loop-back ──────────────────────────────────────────
+    let lasso = lasso_loopback(&pool, &relevant_entities);
+    for c in &lasso.constraints {
+        solver.assert(c);
+    }
+
+    // ── 5. Fairness constraints ─────────────────────────────────────
+    let fair_constraints = fairness_constraints(
+        &pool,
+        vctx,
+        &relevant_entities,
+        &relevant_systems,
+        &fire_tracking,
+        &lasso,
+    );
+    for c in &fair_constraints {
+        solver.assert(c);
+    }
+
+    // ── 6. Check each liveness assert independently ────────────────
+    // Each assert is checked separately — if ANY assert is violated,
+    // the verify block fails. This matches standard semantics: each
+    // assert is an independent obligation.
+    for assert_expr in &verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, defs);
+        let violation = match encode_lasso_liveness_violation(
+            &pool, vctx, defs, &expanded, &lasso.loop_indicators, bound,
+        ) {
+            Ok(v) => v,
+            Err(msg) => {
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: format!("lasso encoding error: {msg}"),
+                    span: expr_span(assert_expr),
+                    file: None,
+                };
+            }
+        };
+
+        // Skip non-liveness asserts (violation is false)
+        // Check: push violation, check SAT, pop
+        solver.push();
+        solver.assert(&violation);
+
+        match solver.check() {
+            z3::SatResult::Sat => {
+                // Found a lasso violating this assert
+                let model = solver.get_model().unwrap();
+                let mut loop_start = 0;
+                for (l, ind) in lasso.loop_indicators.iter().enumerate() {
+                    if let Some(true) = model.eval(ind, true).and_then(|v| v.as_bool()) {
+                        loop_start = l;
+                        break;
+                    }
+                }
+
+                let full_trace = extract_counterexample_with_events(
+                    &solver, &pool, vctx, &relevant_entities, &relevant_systems, bound,
+                );
+                let prefix: Vec<TraceStep> = full_trace
+                    .iter()
+                    .filter(|s| s.step < loop_start)
+                    .cloned()
+                    .collect();
+                let loop_trace: Vec<TraceStep> = full_trace
+                    .iter()
+                    .filter(|s| s.step >= loop_start)
+                    .cloned()
+                    .collect();
+
+                return VerificationResult::LivenessViolation {
+                    name: verify_block.name.clone(),
+                    prefix,
+                    loop_trace,
+                    loop_start,
+                    span: expr_span(assert_expr),
+                    file: None,
+                };
+            }
+            z3::SatResult::Unknown => {
+                solver.pop(1);
+                return VerificationResult::Unprovable {
+                    name: verify_block.name.clone(),
+                    hint: crate::messages::BMC_UNKNOWN.to_owned(),
+                    span: expr_span(assert_expr),
+                    file: None,
+                };
+            }
+            z3::SatResult::Unsat => {
+                solver.pop(1);
+                // This assert passes — continue to next
+            }
+        }
+    }
+
+    // All asserts passed
+    let elapsed = elapsed_ms(&start);
+    VerificationResult::Checked {
+        name: verify_block.name.clone(),
+        depth: bound,
+        time_ms: elapsed,
+        span: None,
+        file: None,
+    }
+}
+
+/// Encode a liveness violation condition for the lasso loop.
+///
+/// Recursively handles:
+/// - `eventually P`: violation = P never holds on loop
+/// - `always body`: strips Always, examines body for response patterns
+/// - Entity quantifiers `all o: E | body`: expands over active slots
+/// - `P implies eventually Q`: response pattern — P triggers, Q never responds
+/// - Safety properties (no `eventually`): returns `false` (no lasso violation)
+fn encode_lasso_liveness_violation(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    assert_expr: &IRExpr,
+    loop_indicators: &[Bool],
+    bound: usize,
+) -> Result<Bool, String> {
+    let ctx = PropertyCtx::new();
+    encode_lasso_violation_inner(pool, vctx, defs, assert_expr, loop_indicators, bound, &ctx)
+}
+
+/// Inner recursive helper for lasso liveness violation encoding.
+/// Carries a `PropertyCtx` for entity quantifier bindings.
+fn encode_lasso_violation_inner(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    expr: &IRExpr,
+    loop_indicators: &[Bool],
+    bound: usize,
+    ctx: &PropertyCtx,
+) -> Result<Bool, String> {
+    match expr {
+        // `eventually P` — violation: P never holds on the loop
+        IRExpr::Eventually { body, .. } => {
+            let mut loop_violations = Vec::new();
+            for (l, loop_ind) in loop_indicators.iter().enumerate() {
+                let mut p_never = Vec::new();
+                for step in l..=bound {
+                    let p = encode_prop_expr(pool, vctx, defs, ctx, body, step)?;
+                    p_never.push(p.not());
+                }
+                let p_never_refs: Vec<&Bool> = p_never.iter().collect();
+                let violation_at_l = Bool::and(&[loop_ind, &Bool::and(&p_never_refs)]);
+                loop_violations.push(violation_at_l);
+            }
+            if loop_violations.is_empty() {
+                return Ok(Bool::from_bool(false));
+            }
+            let refs: Vec<&Bool> = loop_violations.iter().collect();
+            Ok(Bool::or(&refs))
+        }
+
+        // `always body` — strip always, examine body for liveness patterns
+        IRExpr::Always { body, .. } => {
+            encode_lasso_violation_inner(pool, vctx, defs, body, loop_indicators, bound, ctx)
+        }
+
+        // Entity quantifier: `all o: Entity | body` — expand over active slots
+        // and check each for liveness violations (disjunction: ANY slot violated).
+        // The active guard per step is handled inside the inner encoding
+        // (response pattern guards P(t) with active(slot, t)).
+        IRExpr::Forall {
+            var,
+            domain: crate::ir::types::IRType::Entity { name: entity_name },
+            body,
+            ..
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            let mut slot_violations = Vec::new();
+            for slot in 0..n_slots {
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let v = encode_lasso_violation_inner(
+                    pool, vctx, defs, body, loop_indicators, bound, &inner_ctx,
+                )?;
+                slot_violations.push(v);
+            }
+            if slot_violations.is_empty() {
+                return Ok(Bool::from_bool(false));
+            }
+            let refs: Vec<&Bool> = slot_violations.iter().collect();
+            Ok(Bool::or(&refs))
+        }
+
+        // `P implies eventually Q` — response pattern
+        //
+        // Violation on a lasso with loop l..bound:
+        //   P triggers at some step t (anywhere in trace) AND
+        //   Q never holds on the LOOP (steps l..bound).
+        //
+        // Since the loop repeats forever, Q absent from the loop means Q
+        // never holds in the infinite future — regardless of where P triggered.
+        // The trigger can be in the prefix (t < l) or on the loop (t >= l).
+        //
+        // Entity-bound triggers are guarded by the entity's active flag.
+        //
+        // Correct encoding: for each trigger step t, Q must be absent from
+        // step t through the end of the trace [t, bound]. Since the trace
+        // after step bound loops back to step l, and [t, bound] includes
+        // the entire loop [l, bound], Q absent from [t, bound] means Q
+        // never holds in the infinite future from the trigger point.
+        //
+        // Encoding: ∃l. loop_l ∧ ∃t ∈ [0,bound]. active(t) ∧ P(t) ∧ (∀s ∈ [t,bound]. ¬Q(s))
+        IRExpr::BinOp {
+            op,
+            left: trigger,
+            right: response_box,
+            ..
+        } if op == "OpImplies" => {
+            if let IRExpr::Eventually {
+                body: response, ..
+            } = response_box.as_ref()
+            {
+                let mut loop_violations = Vec::new();
+                for (l, loop_ind) in loop_indicators.iter().enumerate() {
+                    // Precompute Q absence on the full loop [l, bound].
+                    // Reused for all triggers at t ≥ l (loop-internal triggers
+                    // wrap around: future is [t,bound] ∪ [l,t-1] = [l,bound]).
+                    let mut q_loop_never = Vec::new();
+                    for s in l..=bound {
+                        let q =
+                            encode_prop_expr(pool, vctx, defs, ctx, response, s)?;
+                        q_loop_never.push(q.not());
+                    }
+                    let q_loop_refs: Vec<&Bool> = q_loop_never.iter().collect();
+                    let q_absent_on_loop = Bool::and(&q_loop_refs);
+
+                    // For each possible trigger step t in the full trace
+                    let mut per_trigger = Vec::new();
+                    for t in 0..=bound {
+                        // Guard with entity active flags at step t
+                        let mut guards = Vec::new();
+                        for (_, (entity_name, slot)) in &ctx.bindings {
+                            if let Some(SmtValue::Bool(act)) =
+                                pool.active_at(entity_name, *slot, t)
+                            {
+                                guards.push(act.clone());
+                            }
+                        }
+                        let p = encode_prop_expr(pool, vctx, defs, ctx, trigger, t)?;
+                        let p_guarded = if guards.is_empty() {
+                            p
+                        } else {
+                            let guard_refs: Vec<&Bool> = guards.iter().collect();
+                            Bool::and(&[&Bool::and(&guard_refs), &p])
+                        };
+
+                        // Q absent from the infinite future starting at step t.
+                        //
+                        // On the lasso s₀..s_l..s_bound → s_l:
+                        // - Trigger in prefix (t < l): future = [t,l-1] ∪ loop.
+                        //   Q absent from [t, bound] covers both (since [t,bound] ⊇ loop).
+                        // - Trigger on loop (t ≥ l): future wraps: [t,bound] ∪ [l,t-1].
+                        //   Q must be absent from the entire loop [l, bound].
+                        //
+                        // Combined: Q absent from [min(t, l), bound].
+                        let q_absent = if t <= l {
+                            // Prefix trigger: need Q absent from [t, l-1] AND on loop
+                            if t < l {
+                                let mut q_prefix = Vec::new();
+                                for s in t..l {
+                                    let q = encode_prop_expr(
+                                        pool, vctx, defs, ctx, response, s,
+                                    )?;
+                                    q_prefix.push(q.not());
+                                }
+                                let prefix_refs: Vec<&Bool> = q_prefix.iter().collect();
+                                Bool::and(&[&Bool::and(&prefix_refs), &q_absent_on_loop])
+                            } else {
+                                // t == l: just the loop
+                                q_absent_on_loop.clone()
+                            }
+                        } else {
+                            // Loop-internal trigger: Q absent on entire loop
+                            q_absent_on_loop.clone()
+                        };
+
+                        per_trigger.push(Bool::and(&[&p_guarded, &q_absent]));
+                    }
+                    let trigger_refs: Vec<&Bool> = per_trigger.iter().collect();
+                    let some_trigger_violated = Bool::or(&trigger_refs);
+
+                    loop_violations
+                        .push(Bool::and(&[loop_ind, &some_trigger_violated]));
+                }
+                if loop_violations.is_empty() {
+                    return Ok(Bool::from_bool(false));
+                }
+                let refs: Vec<&Bool> = loop_violations.iter().collect();
+                return Ok(Bool::or(&refs));
+            }
+            // P implies Q (no eventually) — safety, not liveness
+            Ok(Bool::from_bool(false))
+        }
+
+        // Safety properties or other patterns — no lasso violation
+        _ => Ok(Bool::from_bool(false)),
+    }
+}
+
+/// Collect event indices referenced by ^| (exclusive choice) in ordering expressions.
+fn collect_xor_event_indices(
+    expr: &IRExpr,
+    var_to_idx: &HashMap<&str, usize>,
+    xor_events: &mut HashSet<usize>,
+) {
+    if let IRExpr::BinOp {
+        op, left, right, ..
+    } = expr
+    {
+        if op == "OpXor" {
+            for var in collect_ordering_leaf_vars(left) {
+                if let Some(&idx) = var_to_idx.get(var) {
+                    xor_events.insert(idx);
+                }
+            }
+            for var in collect_ordering_leaf_vars(right) {
+                if let Some(&idx) = var_to_idx.get(var) {
+                    xor_events.insert(idx);
+                }
+            }
+        }
+        collect_xor_event_indices(left, var_to_idx, xor_events);
+        collect_xor_event_indices(right, var_to_idx, xor_events);
+    }
+}
+
+/// Collect event-level same-step pairs from OpSameStep ordering expressions.
+fn collect_same_step_event_pairs(
+    ordering: &[IRExpr],
+    var_to_idx: &HashMap<&str, usize>,
+    pairs: &mut Vec<(usize, usize)>,
+) {
+    for expr in ordering {
+        collect_same_step_event_pairs_expr(expr, var_to_idx, pairs);
+    }
+}
+
+fn collect_same_step_event_pairs_expr(
+    expr: &IRExpr,
+    var_to_idx: &HashMap<&str, usize>,
+    pairs: &mut Vec<(usize, usize)>,
+) {
+    if let IRExpr::BinOp {
+        op, left, right, ..
+    } = expr
+    {
+        if op == "OpSameStep" {
+            let left_vars: Vec<usize> = collect_ordering_leaf_vars(left)
+                .into_iter()
+                .filter_map(|v| var_to_idx.get(v).copied())
+                .collect();
+            let right_vars: Vec<usize> = collect_ordering_leaf_vars(right)
+                .into_iter()
+                .filter_map(|v| var_to_idx.get(v).copied())
+                .collect();
+            for &a in &left_vars {
+                for &b in &right_vars {
+                    pairs.push((a, b));
+                }
+            }
+        }
+        collect_same_step_event_pairs_expr(left, var_to_idx, pairs);
+        collect_same_step_event_pairs_expr(right, var_to_idx, pairs);
+    }
+}
+
+/// Encode scene ordering constraints with multi-instance support.
+/// For multi-instance events, `a -> b` means last instance of a < first instance of b.
+/// `^|` asserts XOR on fire variables.
+fn encode_scene_ordering_v2(
+    expr: &IRExpr,
+    var_to_idx: &HashMap<&str, usize>,
+    event_instance_ranges: &[std::ops::Range<usize>],
+    instances: &[FiringInst],
+    solver: &Solver,
+    scene_name: &str,
+) -> Result<(), String> {
+    match expr {
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => match op.as_str() {
+            "OpSeq" => {
+                // a -> b: last instance of a < first instance of b
+                if let (Some(l_event), Some(r_event)) = (
+                    last_ordering_var(left, var_to_idx),
+                    first_ordering_var(right, var_to_idx),
+                ) {
+                    let l_range = &event_instance_ranges[l_event];
+                    let r_range = &event_instance_ranges[r_event];
+                    if !l_range.is_empty() && !r_range.is_empty() {
+                        let last_l = &instances[l_range.end - 1].step_var;
+                        let first_r = &instances[r_range.start].step_var;
+                        solver.assert(&last_l.lt(first_r.clone()));
+                    }
+                } else {
+                    let left_vars = collect_ordering_leaf_vars(left);
+                    let right_vars = collect_ordering_leaf_vars(right);
+                    if left_vars.is_empty() || right_vars.is_empty() {
+                        return Err(format!(
+                            "scene '{scene_name}': ordering expression references \
+                             unknown event variable in `assume` block"
+                        ));
+                    }
+                }
+                encode_scene_ordering_v2(
+                    left, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+                encode_scene_ordering_v2(
+                    right, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+            }
+            "OpSameStep" => {
+                // Handled by same-step grouping. Recurse for nested.
+                encode_scene_ordering_v2(
+                    left, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+                encode_scene_ordering_v2(
+                    right, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+            }
+            "OpConc" | "OpUnord" => {
+                encode_scene_ordering_v2(
+                    left, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+                encode_scene_ordering_v2(
+                    right, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+            }
+            "OpXor" => {
+                // ^| : exactly one of the two events fires.
+                // XOR on their fires variables.
+                let left_events: Vec<usize> = collect_ordering_leaf_vars(left)
+                    .into_iter()
+                    .filter_map(|v| var_to_idx.get(v).copied())
+                    .collect();
+                let right_events: Vec<usize> = collect_ordering_leaf_vars(right)
+                    .into_iter()
+                    .filter_map(|v| var_to_idx.get(v).copied())
+                    .collect();
+                for &a in &left_events {
+                    for &b in &right_events {
+                        let a_range = &event_instance_ranges[a];
+                        let b_range = &event_instance_ranges[b];
+                        if a_range.is_empty() {
+                            return Err(crate::messages::scene_xor_multi_instance(
+                                scene_name,
+                                &event_var_names_from_idx(a, var_to_idx),
+                                0,
+                            ));
+                        }
+                        if b_range.is_empty() {
+                            return Err(crate::messages::scene_xor_multi_instance(
+                                scene_name,
+                                &event_var_names_from_idx(b, var_to_idx),
+                                0,
+                            ));
+                        }
+                        // ^| requires single-instance events (exactly 1 firing slot).
+                        // Multi-instance ({some}, {N>1}) would allow extra firings
+                        // that bypass the XOR constraint.
+                        if a_range.len() > 1 {
+                            return Err(crate::messages::scene_xor_multi_instance(
+                                scene_name,
+                                &event_var_names_from_idx(a, var_to_idx),
+                                a_range.len(),
+                            ));
+                        }
+                        if b_range.len() > 1 {
+                            return Err(crate::messages::scene_xor_multi_instance(
+                                scene_name,
+                                &event_var_names_from_idx(b, var_to_idx),
+                                b_range.len(),
+                            ));
+                        }
+                        let a_fires = instances[a_range.start]
+                            .fires_var
+                            .as_ref()
+                            .ok_or_else(|| {
+                                crate::messages::scene_xor_no_fire_tracking(
+                                    scene_name,
+                                    &event_var_names_from_idx(a, var_to_idx),
+                                )
+                            })?;
+                        let b_fires = instances[b_range.start]
+                            .fires_var
+                            .as_ref()
+                            .ok_or_else(|| {
+                                crate::messages::scene_xor_no_fire_tracking(
+                                    scene_name,
+                                    &event_var_names_from_idx(b, var_to_idx),
+                                )
+                            })?;
+                        // XOR: (a_fires ∧ ¬b_fires) ∨ (¬a_fires ∧ b_fires)
+                        let xor = Bool::or(&[
+                            &Bool::and(&[a_fires, &b_fires.not()]),
+                            &Bool::and(&[&a_fires.not(), b_fires]),
+                        ]);
+                        solver.assert(&xor);
+                    }
+                }
+                // Recurse for nested
+                encode_scene_ordering_v2(
+                    left, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+                encode_scene_ordering_v2(
+                    right, var_to_idx, event_instance_ranges, instances, solver, scene_name,
+                )?;
+            }
+            _ => {}
+        },
+        IRExpr::Var { .. } => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reverse lookup: event index → variable name
+fn event_var_names_from_idx(idx: usize, var_to_idx: &HashMap<&str, usize>) -> String {
+    var_to_idx
+        .iter()
+        .find(|(_, &i)| i == idx)
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| format!("event_{idx}"))
+}
+
+/// A single firing instance in the scene trace.
+struct FiringInst {
+    event_idx: usize,
+    #[allow(dead_code)]
+    inst_idx: usize,
+    step_var: Int,
+    fires_var: Option<Bool>,
+}
+
+/// Resolved scene event: validated reference to the scene event and its IR.
+struct ResolvedSceneEvent<'a> {
+    scene_event: &'a IRSceneEvent,
+    event_ir: &'a IREvent,
+}
+
+/// Build override_params for a scene event at a given step.
+fn build_scene_event_params(
+    re: &ResolvedSceneEvent<'_>,
+    pool: &harness::SlotPool,
+    vctx: &context::VerifyContext,
+    defs: &defenv::DefEnv,
+    given_bindings: &HashMap<String, (String, usize)>,
+    step: usize,
+    _scene_name: &str,
+) -> Result<HashMap<String, SmtValue>, String> {
+    let mut override_params: HashMap<String, SmtValue> = HashMap::new();
+    for (param, arg) in re.event_ir.params.iter().zip(re.scene_event.args.iter()) {
+        let arg_ctx = PropertyCtx::new();
+        let arg_ctx = given_bindings
+            .iter()
+            .fold(arg_ctx, |ctx, (var, (ent, slot))| {
+                ctx.with_binding(var, ent, *slot)
+            });
+        let val = encode_prop_value(pool, vctx, defs, &arg_ctx, arg, step).map_err(|msg| {
+            format!(
+                "encoding error in scene event arg for {}::{}: {msg}",
+                re.scene_event.system, re.scene_event.event
+            )
+        })?;
+        override_params.insert(param.name.clone(), val);
+    }
+    Ok(override_params)
+}
+
+/// (Phase 10 legacy — replaced by encode_scene_ordering_v2 in Phase 12)
+/// - `OpSeq(a, b)` → `group_step(a) < group_step(b)` (sequence: a before b)
+/// - `OpSameStep(a, b)` → handled by same-step grouping (no constraint emitted here)
+/// - `OpConc/OpUnord(a, b)` → no constraint (both fire, any order)
+/// - `OpXor(a, b)` → error (requires Phase 12 fire-tracking)
+#[allow(dead_code)]
+fn encode_scene_ordering(
+    expr: &IRExpr,
+    var_to_idx: &HashMap<&str, usize>,
+    event_to_step_idx: &[usize],
+    group_step_vars: &[Int],
+    solver: &Solver,
+    scene_name: &str,
+) -> Result<(), String> {
+    match expr {
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            match op.as_str() {
+                "OpSeq" => {
+                    // a -> b: group_step(a) < group_step(b)
+                    // Recurse for chains (a -> b -> c).
+                    if let (Some(l_event), Some(r_event)) = (
+                        last_ordering_var(left, var_to_idx),
+                        first_ordering_var(right, var_to_idx),
+                    ) {
+                        let l_step = event_to_step_idx[l_event];
+                        let r_step = event_to_step_idx[r_event];
+                        if l_step != r_step {
+                            solver.assert(
+                                &group_step_vars[l_step].lt(group_step_vars[r_step].clone()),
+                            );
+                        }
+                        // Same group → already at same step, constraint is trivially satisfied
+                    } else {
+                        let left_vars = collect_ordering_leaf_vars(left);
+                        let right_vars = collect_ordering_leaf_vars(right);
+                        if left_vars.is_empty() || right_vars.is_empty() {
+                            return Err(format!(
+                                "scene '{scene_name}': ordering expression references \
+                                 unknown event variable in `assume` block"
+                            ));
+                        }
+                    }
+                    encode_scene_ordering(
+                        left, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                    encode_scene_ordering(
+                        right, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                }
+                "OpSameStep" => {
+                    // Same-step grouping is handled by collect_same_step_pairs
+                    // before step variable creation. No constraint to emit here.
+                    // Recurse for nested sub-expressions.
+                    encode_scene_ordering(
+                        left, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                    encode_scene_ordering(
+                        right, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                }
+                "OpConc" | "OpUnord" => {
+                    // Both fire, no ordering constraint. Recurse for nested.
+                    encode_scene_ordering(
+                        left, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                    encode_scene_ordering(
+                        right, var_to_idx, event_to_step_idx, group_step_vars, solver, scene_name,
+                    )?;
+                }
+                "OpXor" => {
+                    return Err(format!(
+                        "scene '{scene_name}': exclusive choice `^|` requires \
+                         fire-tracking from scene event cardinality (Phase 12)"
+                    ));
+                }
+                _ => {
+                    // Other BinOps in ordering are unexpected but not fatal —
+                    // skip silently (they may be boolean conditions).
+                }
+            }
+        }
+        IRExpr::Var { .. } => {
+            // Leaf variable — no constraint to emit (constraints come from the parent BinOp)
+        }
+        _ => {
+            // Non-composition expression in ordering — skip
+        }
+    }
+    Ok(())
+}
+
+/// Collect entity type names that an event body touches, including through
+/// CrossCall targets (resolved recursively). Used to check same-step
+/// compatibility — events at the same step must not touch the same entity.
+fn collect_event_body_entities(
+    actions: &[IRAction],
+    systems: &[IRSystem],
+    entities: &mut HashSet<String>,
+    visited: &mut HashSet<(String, String)>,
+) {
+    for action in actions {
+        match action {
+            IRAction::Choose { entity, ops, .. } | IRAction::ForAll { entity, ops, .. } => {
+                entities.insert(entity.clone());
+                collect_event_body_entities(ops, systems, entities, visited);
+            }
+            IRAction::Create { entity, .. } => {
+                entities.insert(entity.clone());
+            }
+            IRAction::Apply { target, .. } => {
+                entities.insert(target.clone());
+            }
+            IRAction::CrossCall {
+                system,
+                event: event_name,
+                ..
+            } => {
+                let key = (system.clone(), event_name.clone());
+                if visited.insert(key) {
+                    if let Some(sys) = systems.iter().find(|s| s.name == *system) {
+                        if let Some(evt) = sys.events.iter().find(|e| e.name == *event_name) {
+                            collect_event_body_entities(
+                                &evt.body, systems, entities, visited,
+                            );
+                        }
+                    }
+                }
+            }
+            IRAction::ExprStmt { .. } => {}
+        }
+    }
+}
+
+/// Collect all event variable names referenced in an ordering expression.
+fn collect_ordering_leaf_vars<'a>(expr: &'a IRExpr) -> Vec<&'a str> {
+    match expr {
+        IRExpr::Var { name, .. } => vec![name.as_str()],
+        IRExpr::BinOp { left, right, .. } => {
+            let mut vars = collect_ordering_leaf_vars(left);
+            vars.extend(collect_ordering_leaf_vars(right));
+            vars
+        }
+        _ => vec![],
+    }
+}
+
+/// Get the step variable index of the last (rightmost) event in an ordering expr.
+/// For `a -> b`, returns index of `b`. For a bare `Var("a")`, returns index of `a`.
+fn last_ordering_var(expr: &IRExpr, var_to_idx: &HashMap<&str, usize>) -> Option<usize> {
+    match expr {
+        IRExpr::Var { name, .. } => var_to_idx.get(name.as_str()).copied(),
+        IRExpr::BinOp { op, right, .. } if op == "OpSeq" => {
+            last_ordering_var(right, var_to_idx)
+        }
+        IRExpr::BinOp { right, .. } => last_ordering_var(right, var_to_idx),
+        _ => None,
+    }
+}
+
+/// Get the step variable index of the first (leftmost) event in an ordering expr.
+/// For `a -> b`, returns index of `a`. For a bare `Var("a")`, returns index of `a`.
+fn first_ordering_var(expr: &IRExpr, var_to_idx: &HashMap<&str, usize>) -> Option<usize> {
+    match expr {
+        IRExpr::Var { name, .. } => var_to_idx.get(name.as_str()).copied(),
+        IRExpr::BinOp { op, left, .. } if op == "OpSeq" => {
+            first_ordering_var(left, var_to_idx)
+        }
+        IRExpr::BinOp { left, .. } => first_ordering_var(left, var_to_idx),
+        _ => None,
+    }
+}
+
 /// 1. Build scope and pool from scene systems
 /// 2. Given: activate one slot per binding, constrain fields at step 0
 /// 3. When: encode each event at its step (ordering from assume)
@@ -4532,6 +7070,25 @@ fn check_scene_block(
 ) -> VerificationResult {
     let start = Instant::now();
     let n_events = scene.events.len();
+
+    // Compute bound from cardinalities: total number of firing instances.
+    // This must happen before pool/scope creation so they have enough capacity.
+    let some_budget = n_events.max(2);
+    let bound = {
+        let mut total: usize = 0;
+        for scene_event in &scene.events {
+            total += match &scene_event.cardinality {
+                crate::ir::types::Cardinality::Named(c) => match c.as_str() {
+                    "one" | "lone" => 1,
+                    "no" => 0,
+                    "some" => some_budget,
+                    _ => 1,
+                },
+                crate::ir::types::Cardinality::Exact { exactly } => *exactly as usize,
+            };
+        }
+        total.max(1)
+    };
 
     // ── 1. Build scope from scene systems ──────────────────────────
     // Each given binding needs one slot. Each entity type referenced
@@ -4554,8 +7111,9 @@ fn check_scene_block(
 
     // Expand from systems — ensure all system entities are in scope.
     // Also follow CrossCalls transitively. Non-given entities need enough
-    // slots for creates during the scenario (each event may create one instance).
-    let default_slots = n_events.max(1);
+    // slots for creates during the scenario. Use the bound (total firing
+    // instances) which accounts for multi-fire cardinalities like {2}/{some}.
+    let default_slots = bound.max(1);
     let mut systems_to_scan = system_names.clone();
     let mut scanned: HashSet<String> = HashSet::new();
     while let Some(sys_name) = systems_to_scan.pop() {
@@ -4570,7 +7128,15 @@ fn check_scene_block(
                 collect_crosscall_systems(&event.body, &mut systems_to_scan);
             }
             for ent_name in &sys.entities {
-                scope.entry(ent_name.clone()).or_insert(default_slots);
+                // Ensure enough slots for given bindings PLUS potential creates.
+                // Given bindings occupy fixed slots at step 0; creates need
+                // additional inactive slots. So total = given_count + default_slots.
+                let given_count = scene.givens.iter()
+                    .filter(|g| g.entity == *ent_name)
+                    .count();
+                let needed = given_count + default_slots;
+                let entry = scope.entry(ent_name.clone()).or_insert(0);
+                *entry = (*entry).max(needed);
             }
         }
     }
@@ -4583,9 +7149,6 @@ fn check_scene_block(
             file: None,
         };
     }
-
-    // Bound = number of events (each event is one step)
-    let bound = n_events;
 
     let relevant_entities: Vec<_> = ir
         .entities
@@ -4713,31 +7276,6 @@ fn check_scene_block(
     }
 
     // ── 4a. Validate scene events and determine referenced vars ────
-    // Reject unsupported cardinalities and validate arity up front.
-    for scene_event in &scene.events {
-        // Only {one} cardinality is supported for scenes
-        match &scene_event.cardinality {
-            crate::ir::types::Cardinality::Named(c) if c == "one" => {}
-            crate::ir::types::Cardinality::Exact { exactly: 1 } => {}
-            other => {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "unsupported cardinality {other:?} for scene event {}::{}; \
-                         only {{one}} is supported",
-                        scene_event.system, scene_event.event
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-        }
-    }
-
-    // Scene ordering (assume blocks) is implicit from event list position.
-    // The assume expressions in scene.ordering are redundant for linear chains
-    // (a -> b -> c matches event list order). Non-linear ordering is not yet
-    // supported but the common linear case works correctly by construction.
 
     for assertion in &scene.assertions {
         if let Some(kind) = find_unsupported_scene_expr(assertion) {
@@ -4761,9 +7299,12 @@ fn check_scene_block(
         refs
     };
 
-    // ── 4b. Encode when events ──────────────────────────────────────
-    // Each event fires at its step index (0-based).
-    for (step, scene_event) in scene.events.iter().enumerate() {
+    // ── 4b. Validate events and resolve IR references ───────────────
+    // Pre-validate all events before encoding. Collect the resolved
+    // (system, event IR) pairs and result variable bindings.
+    let mut resolved_events: Vec<ResolvedSceneEvent<'_>> = Vec::new();
+
+    for scene_event in &scene.events {
         let sys = relevant_systems
             .iter()
             .find(|s| s.name == scene_event.system);
@@ -4790,7 +7331,6 @@ fn check_scene_block(
             };
         };
 
-        // Validate arity: scene args must match event params
         if scene_event.args.len() != event.params.len() {
             return VerificationResult::SceneFail {
                 name: scene.name.clone(),
@@ -4829,7 +7369,6 @@ fn check_scene_block(
             };
         }
 
-        // Pre-validate event body for unsupported action forms
         if let Some(kind) = find_unsupported_in_actions(&event.body) {
             return VerificationResult::SceneFail {
                 name: scene.name.clone(),
@@ -4842,67 +7381,524 @@ fn check_scene_block(
             };
         }
 
-        // Build override_params: resolve scene event args against current bindings.
-        let mut override_params: HashMap<String, SmtValue> = HashMap::new();
-        for (param, arg) in event.params.iter().zip(scene_event.args.iter()) {
-            let arg_ctx = PropertyCtx::new();
-            let arg_ctx = given_bindings
-                .iter()
-                .fold(arg_ctx, |ctx, (var, (ent, slot))| {
-                    ctx.with_binding(var, ent, *slot)
-                });
-            let val = match encode_prop_value(&pool, vctx, defs, &arg_ctx, arg, step) {
-                Ok(v) => v,
-                Err(msg) => {
+        resolved_events.push(ResolvedSceneEvent { scene_event, event_ir: event });
+    }
+
+    // Pre-compute result variable bindings (Creates from event bodies).
+    // This must happen before the step variable encoding so bindings are
+    // available for argument resolution at all possible steps.
+    for re in &resolved_events {
+        if referenced_vars.contains(&re.scene_event.var) {
+            let creates = scan_event_creates(&re.event_ir.body, &relevant_systems);
+            if let Some(result_entity) = creates.first() {
+                let slot = next_slot.entry(result_entity.clone()).or_insert(0);
+                let allocated_slot = *slot;
+                *slot += 1;
+                given_bindings.insert(
+                    re.scene_event.var.clone(),
+                    (result_entity.clone(), allocated_slot),
+                );
+            }
+        }
+    }
+
+    // ── 4c. Resolve cardinalities and build firing instances ────────
+    // Each event's cardinality determines how many firing instances it
+    // gets. Each instance has a step variable (Int) and optionally a
+    // fires variable (Bool) for optional firings.
+    use crate::ir::types::Cardinality;
+
+    let event_var_names: Vec<&str> = scene
+        .events
+        .iter()
+        .map(|e| e.var.as_str())
+        .collect();
+    let _n_ev = event_var_names.len();
+
+    let var_to_idx: HashMap<&str, usize> = event_var_names
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (*v, i))
+        .collect();
+
+    // Collect events involved in ^| — these need {lone} fire tracking.
+    // If declared as {one}, infer {lone} from ^| usage.
+    let mut xor_events: HashSet<usize> = HashSet::new();
+    for ordering_expr in &scene.ordering {
+        collect_xor_event_indices(ordering_expr, &var_to_idx, &mut xor_events);
+    }
+
+    // Resolve cardinality for each event.
+    // Returns (n_instances, min_fires, has_fire_tracking).
+    struct EventCard {
+        n_instances: usize,
+        min_fires: usize,
+        has_fire_tracking: bool,
+    }
+
+    // some_budget already computed above for bound calculation
+
+    let mut event_cards: Vec<EventCard> = Vec::new();
+    for (ei, re) in resolved_events.iter().enumerate() {
+        let card = &re.scene_event.cardinality;
+        let is_xor = xor_events.contains(&ei);
+        let ec = match card {
+            Cardinality::Named(c) => match c.as_str() {
+                "one" if is_xor => EventCard {
+                    n_instances: 1,
+                    min_fires: 0,
+                    has_fire_tracking: true,
+                },
+                "one" => EventCard {
+                    n_instances: 1,
+                    min_fires: 1,
+                    has_fire_tracking: false,
+                },
+                "lone" => EventCard {
+                    n_instances: 1,
+                    min_fires: 0,
+                    has_fire_tracking: true,
+                },
+                "no" => EventCard {
+                    n_instances: 0,
+                    min_fires: 0,
+                    has_fire_tracking: false,
+                },
+                "some" => EventCard {
+                    n_instances: some_budget,
+                    min_fires: 1,
+                    has_fire_tracking: true,
+                },
+                other => {
                     return VerificationResult::SceneFail {
                         name: scene.name.clone(),
                         reason: format!(
-                            "encoding error in scene event arg for {}::{}: {msg}",
-                            scene_event.system, scene_event.event
+                            "unsupported cardinality '{other}' for scene event {}::{}",
+                            re.scene_event.system, re.scene_event.event
                         ),
                         span: None,
                         file: None,
                     };
                 }
+            },
+            Cardinality::Exact { exactly } => {
+                let n = *exactly as usize;
+                if is_xor && n > 1 {
+                    return VerificationResult::SceneFail {
+                        name: scene.name.clone(),
+                        reason: format!(
+                            "event '{}' has cardinality {{{n}}} but appears in `^|`; \
+                             exclusive choice requires {{lone}} cardinality",
+                            re.scene_event.var
+                        ),
+                        span: None,
+                        file: None,
+                    };
+                }
+                EventCard {
+                    n_instances: n,
+                    // When n==1 and event is in ^|, infer {lone}: min_fires=0
+                    // so the XOR constraint controls whether it fires.
+                    min_fires: if is_xor && n == 1 { 0 } else { n },
+                    has_fire_tracking: is_xor,
+                }
+            }
+        };
+        event_cards.push(ec);
+    }
+
+    // Build firing instances. Each instance has a step variable and
+    // optionally a fires variable.
+    let mut instances: Vec<FiringInst> = Vec::new();
+    // Map event index → range of instance indices
+    let mut event_instance_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+
+    for (ei, ec) in event_cards.iter().enumerate() {
+        let start = instances.len();
+        for inst_idx in 0..ec.n_instances {
+            let var_name = event_var_names[ei];
+            let step_var = if ec.n_instances == 1 {
+                Int::new_const(format!("scene_step_{var_name}"))
+            } else {
+                Int::new_const(format!("scene_step_{var_name}_{inst_idx}"))
             };
-            override_params.insert(param.name.clone(), val);
+            let fires_var = if ec.has_fire_tracking {
+                Some(Bool::new_const(format!("scene_fires_{var_name}_{inst_idx}")))
+            } else {
+                None
+            };
+            instances.push(FiringInst {
+                event_idx: ei,
+                inst_idx,
+                step_var,
+                fires_var,
+            });
         }
+        event_instance_ranges.push(start..instances.len());
+    }
 
-        // Encode this specific event at this step with resolved params
-        let event_formula = encode_event_with_params(
-            &pool,
-            vctx,
-            &relevant_entities,
-            &relevant_systems,
-            event,
-            step,
-            override_params,
-        );
-        solver.assert(&event_formula);
+    // Verify instance count matches the pre-computed bound
+    debug_assert_eq!(
+        instances.len().max(1),
+        bound,
+        "instance count should match pre-computed bound"
+    );
 
-        // If this var is referenced by subsequent events, determine the result
-        // entity and bind it. Scan the event body (and CrossCalls) for Creates.
-        if referenced_vars.contains(&scene_event.var) {
-            let creates = scan_event_creates(&event.body, &relevant_systems);
-            if let Some(result_entity) = creates.first() {
-                // Pre-allocate next slot of this entity type
-                let slot = next_slot.entry(result_entity.clone()).or_insert(0);
-                let allocated_slot = *slot;
-                *slot += 1;
+    // Assert bounds: each instance step in [0, bound)
+    for inst in &instances {
+        solver.assert(&inst.step_var.ge(Int::from_i64(0)));
+        solver.assert(&inst.step_var.lt(Int::from_i64(bound as i64)));
+    }
 
-                // Constrain: this slot was activated during this step
-                // (inactive at step → active at step+1)
-                if let Some(SmtValue::Bool(active_next)) =
-                    pool.active_at(result_entity, allocated_slot, step + 1)
-                {
-                    solver.assert(active_next);
+    // Assert internal ordering for multi-instance events: step_0 < step_1 < ...
+    for ec_range in &event_instance_ranges {
+        if ec_range.len() > 1 {
+            for i in ec_range.start..(ec_range.end - 1) {
+                let curr = &instances[i].step_var;
+                let next = &instances[i + 1].step_var;
+                solver.assert(&curr.lt(next.clone()));
+            }
+        }
+    }
+
+    // Assert fire constraints
+    for (ei, ec) in event_cards.iter().enumerate() {
+        let range = &event_instance_ranges[ei];
+        if ec.has_fire_tracking && ec.min_fires > 0 {
+            // {some}: at least min_fires instances must fire
+            let fire_vars: Vec<&Bool> = instances[range.clone()]
+                .iter()
+                .filter_map(|inst| inst.fires_var.as_ref())
+                .collect();
+            if !fire_vars.is_empty() {
+                // At least min_fires must be true.
+                // For {some} (min_fires=1): OR of all fires vars
+                if ec.min_fires == 1 {
+                    solver.assert(&Bool::or(&fire_vars));
+                } else {
+                    // For arbitrary min_fires, encode as: at least N true
+                    // using pairwise: too complex. Since min_fires == n_instances
+                    // for {N} with fire tracking (only via ^|), just assert all.
+                    for fv in &fire_vars {
+                        solver.assert(*fv);
+                    }
+                }
+            }
+        }
+        if !ec.has_fire_tracking && ec.min_fires > 0 {
+            // {one} or {N} without fire tracking: all instances must fire
+            // (already guaranteed by appearing in the disjunction unconditionally)
+        }
+    }
+
+    // Assert distinctness: all instances at different steps, EXCEPT
+    // same-step groups (from &) share a step.
+    // Build same-step groups from OpSameStep ordering expressions.
+    let mut group_parent: Vec<usize> = (0..instances.len()).collect();
+
+    fn find_root(parent: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while parent[r] != r {
+            parent[r] = parent[parent[r]];
+            r = parent[r];
+        }
+        r
+    }
+
+    // For & grouping, map event-level pairs to their first instance
+    // (& only valid for single-instance events)
+    {
+        let mut same_step_event_pairs: Vec<(usize, usize)> = Vec::new();
+        collect_same_step_event_pairs(&scene.ordering, &var_to_idx, &mut same_step_event_pairs);
+        for (a, b) in &same_step_event_pairs {
+            // Validate: & requires single-instance events
+            if event_cards[*a].n_instances != 1 || event_cards[*b].n_instances != 1 {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: crate::messages::scene_same_step_multi_instance(
+                        &scene.name,
+                        event_var_names[*a],
+                        event_cards[*a].n_instances,
+                        event_var_names[*b],
+                        event_cards[*b].n_instances,
+                    ),
+                    span: None,
+                    file: None,
+                };
+            }
+            let inst_a = event_instance_ranges[*a].start;
+            let inst_b = event_instance_ranges[*b].start;
+            let ra = find_root(&mut group_parent, inst_a);
+            let rb = find_root(&mut group_parent, inst_b);
+            if ra != rb {
+                group_parent[rb] = ra;
+            }
+        }
+    }
+
+    // Validate same-step entity conflicts
+    {
+        let inst_group: Vec<usize> = (0..instances.len())
+            .map(|i| find_root(&mut group_parent, i))
+            .collect();
+        let mut group_roots_set: Vec<usize> = Vec::new();
+        for &g in &inst_group {
+            if !group_roots_set.contains(&g) {
+                group_roots_set.push(g);
+            }
+        }
+        for &root in &group_roots_set {
+            let members: Vec<usize> = (0..instances.len())
+                .filter(|i| inst_group[*i] == root)
+                .collect();
+            if members.len() > 1 {
+                let mut seen_entities: HashSet<String> = HashSet::new();
+                for &ii in &members {
+                    let re = &resolved_events[instances[ii].event_idx];
+                    let mut event_entities = HashSet::new();
+                    let mut visited_calls = HashSet::new();
+                    collect_event_body_entities(
+                        &re.event_ir.body,
+                        &relevant_systems,
+                        &mut event_entities,
+                        &mut visited_calls,
+                    );
+                    for ent_name in &event_entities {
+                        if !seen_entities.insert(ent_name.clone()) {
+                            return VerificationResult::SceneFail {
+                                name: scene.name.clone(),
+                                reason: crate::messages::scene_same_step_entity_conflict(
+                                    &scene.name,
+                                    ent_name,
+                                ),
+                                span: None,
+                                file: None,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Assert distinctness between instances NOT in the same group
+    {
+        let inst_group: Vec<usize> = (0..instances.len())
+            .map(|i| find_root(&mut group_parent, i))
+            .collect();
+        for i in 0..instances.len() {
+            for j in (i + 1)..instances.len() {
+                if inst_group[i] == inst_group[j] {
+                    // Same group: assert equal step
+                    solver.assert(&instances[i].step_var.eq(instances[j].step_var.clone()));
+                } else {
+                    // Different groups: assert distinct step
+                    solver.assert(
+                        &instances[i]
+                            .step_var
+                            .eq(instances[j].step_var.clone())
+                            .not(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Validate ordering expression variable names
+    for ordering_expr in &scene.ordering {
+        let leaf_vars = collect_ordering_leaf_vars(ordering_expr);
+        for var_name in &leaf_vars {
+            if !var_to_idx.contains_key(var_name) {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: crate::messages::scene_ordering_unknown_var(
+                        &scene.name,
+                        var_name,
+                        &event_var_names.join(", "),
+                    ),
+                    span: None,
+                    file: None,
+                };
+            }
+        }
+    }
+
+    // Parse and assert ordering constraints from scene.ordering.
+    // For multi-instance events, a -> b means: all of a's instances
+    // precede all of b's instances (last_a < first_b).
+    for ordering_expr in &scene.ordering {
+        if let Err(reason) = encode_scene_ordering_v2(
+            ordering_expr,
+            &var_to_idx,
+            &event_instance_ranges,
+            &instances,
+            &solver,
+            &scene.name,
+        ) {
+            return VerificationResult::SceneFail {
+                name: scene.name.clone(),
+                reason,
+                span: None,
+                file: None,
+            };
+        }
+    }
+
+    // ── 4d. Encode instances at each possible step ──────────────────
+    // At each step k, one instance (or same-step group) fires, or stutter.
+    // Instances with fire tracking only fire when fires_var is true.
+    let inst_group: Vec<usize> = (0..instances.len())
+        .map(|i| find_root(&mut group_parent, i))
+        .collect();
+    let mut inst_group_roots: Vec<usize> = Vec::new();
+    for &g in &inst_group {
+        if !inst_group_roots.contains(&g) {
+            inst_group_roots.push(g);
+        }
+    }
+
+    for step in 0..bound {
+        let mut step_disjuncts: Vec<Bool> = Vec::new();
+
+        for &group_root in &inst_group_roots {
+            let group_members: Vec<usize> = (0..instances.len())
+                .filter(|i| inst_group[*i] == group_root)
+                .collect();
+
+            let step_guard = instances[group_root]
+                .step_var
+                .eq(Int::from_i64(step as i64));
+
+            if group_members.len() == 1 {
+                let ii = group_members[0];
+                let inst = &instances[ii];
+                let re = &resolved_events[inst.event_idx];
+
+                let override_params = match build_scene_event_params(
+                    re, &pool, vctx, defs, &given_bindings, step, &scene.name,
+                ) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        return VerificationResult::SceneFail {
+                            name: scene.name.clone(),
+                            reason,
+                            span: None,
+                            file: None,
+                        };
+                    }
+                };
+
+                if let Some(fires) = &inst.fires_var {
+                    // Optional firing: (step_guard ∧ fires ∧ event) ∨ (step_guard ∧ ¬fires ∧ stutter)
+                    let event_formula = encode_event_with_params(
+                        &pool, vctx, &relevant_entities, &relevant_systems,
+                        re.event_ir, step, override_params,
+                    );
+                    let fires_branch = Bool::and(&[&step_guard, fires, &event_formula]);
+                    let stutter = harness::stutter_constraint(&pool, &relevant_entities, step);
+                    let skip_branch = Bool::and(&[&step_guard, &fires.not(), &stutter]);
+                    step_disjuncts.push(Bool::or(&[&fires_branch, &skip_branch]));
+                } else {
+                    // Must fire
+                    let event_formula = encode_event_with_params(
+                        &pool, vctx, &relevant_entities, &relevant_systems,
+                        re.event_ir, step, override_params,
+                    );
+                    step_disjuncts.push(Bool::and(&[&step_guard, &event_formula]));
+                }
+            } else {
+                // Same-step group: encode combined with fire-tracking.
+                // {lone} members are conditional: fires_var → event, ¬fires_var → skip.
+                // The combined frame covers all potentially touched entities.
+                let mut group_formulas: Vec<Bool> = Vec::new();
+                let mut combined_touched: HashSet<(String, usize)> = HashSet::new();
+
+                for &ii in &group_members {
+                    let inst = &instances[ii];
+                    let re = &resolved_events[inst.event_idx];
+                    let override_params = match build_scene_event_params(
+                        re, &pool, vctx, defs, &given_bindings, step, &scene.name,
+                    ) {
+                        Ok(p) => p,
+                        Err(reason) => {
+                            return VerificationResult::SceneFail {
+                                name: scene.name.clone(),
+                                reason,
+                                span: None,
+                                file: None,
+                            };
+                        }
+                    };
+                    let (formula, touched) = harness::encode_event_inner(
+                        &pool, vctx, &relevant_entities, &relevant_systems,
+                        re.event_ir, step, 0, Some(override_params),
+                    );
+                    // For {lone} members, make the formula conditional on fires_var.
+                    // If not firing, the member contributes nothing — the combined
+                    // frame preserves its entities unchanged.
+                    if let Some(fires) = &inst.fires_var {
+                        group_formulas.push(fires.implies(&formula));
+                    } else {
+                        group_formulas.push(formula);
+                    }
+                    combined_touched.extend(touched);
                 }
 
-                // Bind the scene var to this slot
-                given_bindings.insert(
-                    scene_event.var.clone(),
-                    (result_entity.clone(), allocated_slot),
+                let mut all_parts = vec![step_guard];
+                all_parts.extend(group_formulas);
+                let combined = {
+                    let refs: Vec<&Bool> = all_parts.iter().collect();
+                    Bool::and(&refs)
+                };
+                let framed = harness::apply_global_frame(
+                    &pool, &relevant_entities, &combined_touched, step, combined,
                 );
+                step_disjuncts.push(framed);
+            }
+        }
+
+        // Stutter: no instance fires at this step
+        let mut no_inst_parts: Vec<Bool> = Vec::new();
+        for &root in &inst_group_roots {
+            no_inst_parts
+                .push(instances[root].step_var.eq(Int::from_i64(step as i64)).not());
+        }
+        let stutter = harness::stutter_constraint(&pool, &relevant_entities, step);
+        let no_inst_refs: Vec<&Bool> = no_inst_parts.iter().collect();
+        let no_inst = Bool::and(&no_inst_refs);
+        step_disjuncts.push(Bool::and(&[&no_inst, &stutter]));
+
+        let refs: Vec<&Bool> = step_disjuncts.iter().collect();
+        solver.assert(&Bool::or(&refs));
+    }
+
+    // Assert result variable activation for create events
+    for (ei, re) in resolved_events.iter().enumerate() {
+        if let Some((result_entity, allocated_slot)) = given_bindings.get(&re.scene_event.var)
+        {
+            let is_result = scene
+                .givens
+                .iter()
+                .all(|g| g.var != re.scene_event.var);
+            if is_result {
+                // Use first instance of this event for result activation
+                let range = &event_instance_ranges[ei];
+                if !range.is_empty() {
+                    let first_inst = &instances[range.start];
+                    for step in 0..bound {
+                        if let Some(SmtValue::Bool(active_next)) =
+                            pool.active_at(result_entity, *allocated_slot, step + 1)
+                        {
+                            let mut guard = first_inst
+                                .step_var
+                                .eq(Int::from_i64(step as i64));
+                            if let Some(fires) = &first_inst.fires_var {
+                                guard = Bool::and(&[&guard, fires]);
+                            }
+                            solver.assert(&guard.implies(active_next));
+                        }
+                    }
+                }
             }
         }
     }
@@ -4971,6 +7967,90 @@ fn check_scene_block(
 ///
 /// All phases pass → PROVED. Any fails → UNPROVABLE with hint.
 #[allow(clippy::too_many_lines)]
+/// Verify a lemma block.
+///
+/// Lemmas are system-independent properties: each body expression must be a
+/// tautology (universally true). We encode the conjunction of all body
+/// expressions via the pure expression encoder, negate it, and check UNSAT.
+fn check_lemma_block(
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    lemma: &crate::ir::types::IRLemma,
+) -> VerificationResult {
+    let start = Instant::now();
+
+    if lemma.body.is_empty() {
+        let elapsed = elapsed_ms(&start);
+        return VerificationResult::Proved {
+            name: lemma.name.clone(),
+            method: "lemma (empty body)".to_owned(),
+            time_ms: elapsed,
+            span: lemma.span,
+            file: lemma.file.clone(),
+        };
+    }
+
+    let env: HashMap<String, SmtValue> = HashMap::new();
+
+    // Encode each body expression and conjoin
+    let mut conjuncts = Vec::new();
+    for body_expr in &lemma.body {
+        let expanded = expand_through_defs(body_expr, defs);
+        match encode_pure_expr_inner(&expanded, &env, vctx, defs, None) {
+            Ok(val) => match val.to_bool() {
+                Ok(b) => conjuncts.push(b),
+                Err(e) => {
+                    return VerificationResult::Unprovable {
+                        name: lemma.name.clone(),
+                        hint: format!("lemma body encoding error: {e}"),
+                        span: lemma.span,
+                        file: lemma.file.clone(),
+                    };
+                }
+            },
+            Err(e) => {
+                return VerificationResult::Unprovable {
+                    name: lemma.name.clone(),
+                    hint: format!("lemma body encoding error: {e}"),
+                    span: lemma.span,
+                    file: lemma.file.clone(),
+                };
+            }
+        }
+    }
+
+    let refs: Vec<&Bool> = conjuncts.iter().collect();
+    let lemma_body = Bool::and(&refs);
+
+    // Negate and check: if UNSAT, the lemma is a tautology
+    let solver = Solver::new();
+    assert_lambda_axioms_on(&solver);
+    solver.assert(&lemma_body.not());
+
+    let elapsed = elapsed_ms(&start);
+    match solver.check() {
+        z3::SatResult::Unsat => VerificationResult::Proved {
+            name: lemma.name.clone(),
+            method: "lemma".to_owned(),
+            time_ms: elapsed,
+            span: lemma.span,
+            file: lemma.file.clone(),
+        },
+        z3::SatResult::Sat => VerificationResult::Counterexample {
+            name: lemma.name.clone(),
+            trace: Vec::new(),
+            span: lemma.span,
+            file: lemma.file.clone(),
+        },
+        z3::SatResult::Unknown => VerificationResult::Unprovable {
+            name: lemma.name.clone(),
+            hint: "Z3 returned unknown for lemma".to_owned(),
+            span: lemma.span,
+            file: lemma.file.clone(),
+        },
+    }
+}
+
 fn check_theorem_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -5080,11 +8160,46 @@ fn check_theorem_block(
         }
     }
 
-    // Check for `eventually` in show expressions — induction cannot prove liveness.
+    // Check for `eventually` in show expressions.
+    // Try liveness-to-safety reduction for liveness properties.
     // Expand through DefEnv first so pred/prop bodies with `eventually` are detected.
+    let has_liveness_shows = show_exprs
+        .iter()
+        .any(|e| contains_liveness(&expand_through_defs(e, defs)));
+
+    if has_liveness_shows {
+        // Build a virtual verify block from the theorem's shows for the reduction
+        let virtual_verify = IRVerify {
+            name: theorem.name.clone(),
+            systems: theorem
+                .systems
+                .iter()
+                .map(|s| crate::ir::types::IRVerifySystem {
+                    name: s.clone(),
+                    lo: 0,
+                    hi: 10, // not used by reduction
+                })
+                .collect(),
+            asserts: theorem.shows.clone(),
+            span: theorem.span,
+            file: theorem.file.clone(),
+        };
+        let config = VerifyConfig::default();
+        if let Some(result) = try_liveness_reduction(ir, vctx, defs, &virtual_verify, &config) {
+            return result;
+        }
+        // Reduction failed — can't prove liveness by induction
+        return VerificationResult::Unprovable {
+            name: theorem.name.clone(),
+            hint: crate::messages::LIVENESS_REDUCTION_FAILED.to_owned(),
+            span: None,
+            file: None,
+        };
+    }
+
     for (i, show_expr) in show_exprs.iter().enumerate() {
         let expanded = expand_through_defs(show_expr, defs);
-        if contains_eventually(&expanded) {
+        if contains_liveness(&expanded) {
             return VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: crate::messages::THEOREM_LIVENESS_UNSUPPORTED.to_owned(),
@@ -5579,9 +8694,23 @@ fn try_ic3_on_theorem(
                 // CHC derivation tree, which may reflect the ForAll per-slot
                 // over-approximation (see encode_event_chc doc). For confirmed
                 // traces, users should write a verify block with BMC depth.
+                let relevant_systems: Vec<_> = ir
+                    .systems
+                    .iter()
+                    .filter(|s| system_names.contains(&s.name))
+                    .cloned()
+                    .collect();
+                let relevant_entities: Vec<_> = ir
+                    .entities
+                    .iter()
+                    .filter(|e| scope.contains_key(&e.name))
+                    .cloned()
+                    .collect();
                 return Some(VerificationResult::Counterexample {
                     name: theorem.name.clone(),
-                    trace: ic3_trace_to_trace_steps(&trace),
+                    trace: ic3_trace_to_trace_steps(
+                        &trace, &relevant_entities, &relevant_systems,
+                    ),
                     span: None,
                     file: None,
                 });
@@ -5611,20 +8740,37 @@ fn try_ic3_on_theorem(
 struct PropertyCtx {
     /// Quantifier-bound variables: `var_name` → (`entity_name`, `slot_index`)
     bindings: HashMap<String, (String, usize)>,
+    /// Non-entity quantifier variables: `var_name` → `SmtValue`
+    /// Used for enum/Int/Bool/Real domain quantifiers in verify/theorem properties.
+    locals: HashMap<String, SmtValue>,
 }
 
 impl PropertyCtx {
     fn new() -> Self {
         Self {
             bindings: HashMap::new(),
+            locals: HashMap::new(),
         }
     }
 
-    /// Create a new context with an additional binding.
+    /// Create a new context with an additional entity binding.
     fn with_binding(&self, var: &str, entity: &str, slot: usize) -> Self {
         let mut bindings = self.bindings.clone();
         bindings.insert(var.to_owned(), (entity.to_owned(), slot));
-        Self { bindings }
+        Self {
+            bindings,
+            locals: self.locals.clone(),
+        }
+    }
+
+    /// Create a new context with a non-entity local variable binding.
+    fn with_local(&self, var: &str, val: SmtValue) -> Self {
+        let mut locals = self.locals.clone();
+        locals.insert(var.to_owned(), val);
+        Self {
+            bindings: self.bindings.clone(),
+            locals,
+        }
     }
 }
 
@@ -5638,20 +8784,148 @@ impl PropertyCtx {
 /// Check if an expression contains `Eventually` anywhere in its tree.
 /// Induction cannot prove liveness — detect and reject early.
 #[allow(clippy::match_same_arms)]
-fn contains_eventually(expr: &IRExpr) -> bool {
+/// Recursively desugar `P until Q` into `(eventually Q) and (always (not Q implies P))`.
+///
+/// This decomposition is semantically equivalent to LTL `P U Q` and works
+/// correctly inside entity quantifiers and nested temporal operators, unlike
+/// a top-level-only unrolling approach.
+fn desugar_until(expr: &IRExpr) -> IRExpr {
+    match expr {
+        IRExpr::Until { left, right, .. } => {
+            let p = desugar_until(left);
+            let q = desugar_until(right);
+            // eventually Q
+            let eventually_q = IRExpr::Eventually {
+                body: Box::new(q.clone()),
+                span: None,
+            };
+            // always (not Q implies P)
+            let not_q = IRExpr::UnOp {
+                op: "OpNot".to_owned(),
+                operand: Box::new(q),
+                ty: crate::ir::types::IRType::Bool,
+                span: None,
+            };
+            let not_q_implies_p = IRExpr::BinOp {
+                op: "OpImplies".to_owned(),
+                left: Box::new(not_q),
+                right: Box::new(p),
+                ty: crate::ir::types::IRType::Bool,
+                span: None,
+            };
+            let always_guard = IRExpr::Always {
+                body: Box::new(not_q_implies_p),
+                span: None,
+            };
+            // Conjunction: (eventually Q) and (always (not Q implies P))
+            IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(eventually_q),
+                right: Box::new(always_guard),
+                ty: crate::ir::types::IRType::Bool,
+                span: None,
+            }
+        }
+        // Recurse into subexpressions
+        IRExpr::Always { body, span } => IRExpr::Always {
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::Eventually { body, span } => IRExpr::Eventually {
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::Exists {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Exists {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::One {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::One {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::Lone {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Lone {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(desugar_until(body)),
+            span: *span,
+        },
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            span,
+        } => IRExpr::BinOp {
+            op: op.clone(),
+            left: Box::new(desugar_until(left)),
+            right: Box::new(desugar_until(right)),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::UnOp {
+            op,
+            operand,
+            ty,
+            span,
+        } => IRExpr::UnOp {
+            op: op.clone(),
+            operand: Box::new(desugar_until(operand)),
+            ty: ty.clone(),
+            span: *span,
+        },
+        // Leaf nodes and others — return as-is
+        _ => expr.clone(),
+    }
+}
+
+fn contains_liveness(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Eventually { .. } => true,
+        IRExpr::Until { .. } => true,
         IRExpr::Always { body, .. }
         | IRExpr::UnOp { operand: body, .. }
         | IRExpr::Field { expr: body, .. }
-        | IRExpr::Prime { expr: body, .. } => contains_eventually(body),
+        | IRExpr::Prime { expr: body, .. } => contains_liveness(body),
         IRExpr::BinOp { left, right, .. }
         | IRExpr::App {
             func: left,
             arg: right,
             ..
-        } => contains_eventually(left) || contains_eventually(right),
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => contains_eventually(body),
+        } => contains_liveness(left) || contains_liveness(right),
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => contains_liveness(body),
         _ => false,
     }
 }
@@ -5681,11 +8955,22 @@ fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) 
             domain: crate::ir::types::IRType::Entity { name },
             body,
             ..
+        }
+        | IRExpr::One {
+            domain: crate::ir::types::IRType::Entity { name },
+            body,
+            ..
+        }
+        | IRExpr::Lone {
+            domain: crate::ir::types::IRType::Entity { name },
+            body,
+            ..
         } => {
             *counts.entry(name.clone()).or_insert(0) += 1;
             count_entity_quantifiers(body, counts);
         }
         IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. }
         | IRExpr::App {
             func: left,
             arg: right,
@@ -5702,7 +8987,10 @@ fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<String, usize>) 
         | IRExpr::Eventually { body: operand, .. } => {
             count_entity_quantifiers(operand, counts);
         }
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => {
             count_entity_quantifiers(body, counts);
         }
         // SetComp introduces an entity binder — count it like Forall
@@ -5857,12 +9145,33 @@ fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
             body: Box::new(expand_through_defs(body, defs)),
             span: None,
         },
+        IRExpr::One {
+            var, domain, body, ..
+        } => IRExpr::One {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(expand_through_defs(body, defs)),
+            span: None,
+        },
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => IRExpr::Lone {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: Box::new(expand_through_defs(body, defs)),
+            span: None,
+        },
         IRExpr::Always { body, .. } => IRExpr::Always {
             body: Box::new(expand_through_defs(body, defs)),
             span: None,
         },
         IRExpr::Eventually { body, .. } => IRExpr::Eventually {
             body: Box::new(expand_through_defs(body, defs)),
+            span: None,
+        },
+        IRExpr::Until { left, right, .. } => IRExpr::Until {
+            left: Box::new(expand_through_defs(left, defs)),
+            right: Box::new(expand_through_defs(right, defs)),
             span: None,
         },
         IRExpr::Field {
@@ -5982,12 +9291,16 @@ fn collect_field_refs_in_expr(expr: &IRExpr, var_name: &str, fields: &mut HashSe
             }
             collect_field_refs_in_expr(inner, var_name, fields);
         }
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             collect_field_refs_in_expr(left, var_name, fields);
             collect_field_refs_in_expr(right, var_name, fields);
         }
         IRExpr::UnOp { operand, .. } => collect_field_refs_in_expr(operand, var_name, fields),
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => {
             collect_field_refs_in_expr(body, var_name, fields);
         }
         _ => {}
@@ -6065,7 +9378,8 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
         | IRExpr::Prime { expr, .. }
         | IRExpr::Always { body: expr, .. }
         | IRExpr::Eventually { body: expr, .. } => find_unsupported_scene_expr(expr),
-        IRExpr::BinOp { left, right, .. } => {
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. } => {
             find_unsupported_scene_expr(left).or_else(|| find_unsupported_scene_expr(right))
         }
         IRExpr::App { func, arg, .. } => {
@@ -6076,9 +9390,10 @@ fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str> {
             }
             find_unsupported_scene_expr(func).or_else(|| find_unsupported_scene_expr(arg))
         }
-        IRExpr::Forall { body, .. } | IRExpr::Exists { body, .. } => {
-            find_unsupported_scene_expr(body)
-        }
+        IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => find_unsupported_scene_expr(body),
         IRExpr::MapUpdate {
             map, key, value, ..
         } => find_unsupported_scene_expr(map)
@@ -6212,11 +9527,18 @@ fn encode_verify_properties(
     let mut all_props = Vec::new();
 
     for assert_expr in asserts {
-        match assert_expr {
+        // First expand defs (props/preds) so that any `until` inside
+        // definitions is exposed, THEN desugar until nodes. This ensures
+        // `prop helper = P until Q` followed by `assert helper` gets the
+        // correct multi-step encoding rather than the step-local fallback.
+        let expanded = expand_through_defs(assert_expr, defs);
+        let desugared = desugar_until(&expanded);
+
+        match &desugared {
             // `always P` — check P at every step
             IRExpr::Always { body, .. } => {
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, defs, body, step)?;
+                    let prop = encode_property_at_step(pool, vctx, defs, body.as_ref(), step)?;
                     all_props.push(prop);
                 }
             }
@@ -6224,7 +9546,7 @@ fn encode_verify_properties(
             IRExpr::Eventually { body, .. } => {
                 let mut step_props = Vec::new();
                 for step in 0..=bound {
-                    let prop = encode_property_at_step(pool, vctx, defs, body, step)?;
+                    let prop = encode_property_at_step(pool, vctx, defs, body.as_ref(), step)?;
                     step_props.push(prop);
                 }
                 let refs: Vec<&Bool> = step_props.iter().collect();
@@ -6361,6 +9683,270 @@ fn encode_prop_expr(
             let refs: Vec<&Bool> = disjuncts.iter().collect();
             Ok(Bool::or(&refs))
         }
+        // `one x: Entity | P(x)` — exactly one active slot satisfies P
+        IRExpr::One {
+            var,
+            domain: crate::ir::types::IRType::Entity { name: entity_name },
+            body,
+            ..
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            // Encode P(slot) for each slot, paired with active flag
+            let mut slot_preds = Vec::new();
+            for slot in 0..n_slots {
+                let active = pool.active_at(entity_name, slot, step);
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+                if let Some(SmtValue::Bool(act)) = active {
+                    slot_preds.push(Bool::and(&[act, &body_val]));
+                }
+            }
+            if slot_preds.is_empty() {
+                return Ok(Bool::from_bool(false));
+            }
+            // Exactly one: at least one AND at most one (pairwise exclusion)
+            let at_least_one = {
+                let refs: Vec<&Bool> = slot_preds.iter().collect();
+                Bool::or(&refs)
+            };
+            let mut exclusion_conjuncts = Vec::new();
+            for i in 0..slot_preds.len() {
+                for j in (i + 1)..slot_preds.len() {
+                    // ¬(P(i) ∧ P(j))
+                    exclusion_conjuncts.push(Bool::and(&[&slot_preds[i], &slot_preds[j]]).not());
+                }
+            }
+            if exclusion_conjuncts.is_empty() {
+                // Only one slot — at_least_one is sufficient
+                Ok(at_least_one)
+            } else {
+                let excl_refs: Vec<&Bool> = exclusion_conjuncts.iter().collect();
+                let at_most_one = Bool::and(&excl_refs);
+                Ok(Bool::and(&[&at_least_one, &at_most_one]))
+            }
+        }
+        // `lone x: Entity | P(x)` — at most one active slot satisfies P
+        IRExpr::Lone {
+            var,
+            domain: crate::ir::types::IRType::Entity { name: entity_name },
+            body,
+            ..
+        } => {
+            let n_slots = pool.slots_for(entity_name);
+            let mut slot_preds = Vec::new();
+            for slot in 0..n_slots {
+                let active = pool.active_at(entity_name, slot, step);
+                let inner_ctx = ctx.with_binding(var, entity_name, slot);
+                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+                if let Some(SmtValue::Bool(act)) = active {
+                    slot_preds.push(Bool::and(&[act, &body_val]));
+                }
+            }
+            if slot_preds.len() <= 1 {
+                // 0 or 1 slots — at most one trivially true
+                return Ok(Bool::from_bool(true));
+            }
+            // Pairwise exclusion: no two slots both satisfy
+            let mut exclusion_conjuncts = Vec::new();
+            for i in 0..slot_preds.len() {
+                for j in (i + 1)..slot_preds.len() {
+                    exclusion_conjuncts.push(Bool::and(&[&slot_preds[i], &slot_preds[j]]).not());
+                }
+            }
+            let refs: Vec<&Bool> = exclusion_conjuncts.iter().collect();
+            Ok(Bool::and(&refs))
+        }
+        // ── Non-entity domain quantifiers ──────────────────────────────
+        //
+        // Two strategies:
+        // 1. Fieldless enums: finite expansion over variant indices (decidable).
+        // 2. Everything else (ADT enums, refinement types, Int/Bool/Real):
+        //    Z3 native quantifiers with domain predicates.
+        //
+        // Fieldless-enum finite expansion (Forall = conjunction, Exists = disjunction):
+        IRExpr::Forall {
+            var,
+            domain: domain @ crate::ir::types::IRType::Enum { .. },
+            body,
+            ..
+        } if !domain.has_variant_fields() => {
+            let n = enum_variant_count(domain);
+            let mut conjuncts = Vec::new();
+            for idx in 0..n {
+                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
+                conjuncts.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
+            }
+            if conjuncts.is_empty() {
+                return Ok(Bool::from_bool(true));
+            }
+            let refs: Vec<&Bool> = conjuncts.iter().collect();
+            Ok(Bool::and(&refs))
+        }
+        IRExpr::Exists {
+            var,
+            domain: domain @ crate::ir::types::IRType::Enum { .. },
+            body,
+            ..
+        } if !domain.has_variant_fields() => {
+            let n = enum_variant_count(domain);
+            let mut disjuncts = Vec::new();
+            for idx in 0..n {
+                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
+                disjuncts.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
+            }
+            if disjuncts.is_empty() {
+                return Ok(Bool::from_bool(false));
+            }
+            let refs: Vec<&Bool> = disjuncts.iter().collect();
+            Ok(Bool::or(&refs))
+        }
+        IRExpr::One {
+            var,
+            domain: domain @ crate::ir::types::IRType::Enum { .. },
+            body,
+            ..
+        } if !domain.has_variant_fields() => {
+            let n = enum_variant_count(domain);
+            let mut preds = Vec::new();
+            for idx in 0..n {
+                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
+                preds.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
+            }
+            if preds.is_empty() {
+                return Ok(Bool::from_bool(false));
+            }
+            // Exactly one: at least one AND pairwise exclusion
+            let at_least_one = {
+                let refs: Vec<&Bool> = preds.iter().collect();
+                Bool::or(&refs)
+            };
+            let mut exclusions = Vec::new();
+            for i in 0..preds.len() {
+                for j in (i + 1)..preds.len() {
+                    exclusions.push(Bool::and(&[&preds[i], &preds[j]]).not());
+                }
+            }
+            if exclusions.is_empty() {
+                Ok(at_least_one)
+            } else {
+                let excl_refs: Vec<&Bool> = exclusions.iter().collect();
+                Ok(Bool::and(&[&at_least_one, &Bool::and(&excl_refs)]))
+            }
+        }
+        IRExpr::Lone {
+            var,
+            domain: domain @ crate::ir::types::IRType::Enum { .. },
+            body,
+            ..
+        } if !domain.has_variant_fields() => {
+            let n = enum_variant_count(domain);
+            let mut preds = Vec::new();
+            for idx in 0..n {
+                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
+                preds.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
+            }
+            if preds.len() <= 1 {
+                return Ok(Bool::from_bool(true));
+            }
+            let mut exclusions = Vec::new();
+            for i in 0..preds.len() {
+                for j in (i + 1)..preds.len() {
+                    exclusions.push(Bool::and(&[&preds[i], &preds[j]]).not());
+                }
+            }
+            let refs: Vec<&Bool> = exclusions.iter().collect();
+            Ok(Bool::and(&refs))
+        }
+        // Z3 native quantifiers for all other non-entity domains:
+        // ADT enums (infinite values per constructor), refinement types
+        // (domain predicate restricts range), Int/Bool/Real.
+        //
+        // Domain predicates are applied via build_domain_predicate to
+        // constrain bound variables to their declared domain.
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => {
+            let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let inner_ctx = ctx.with_local(var, bound_var.clone());
+            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
+            let guarded = match dp {
+                Some(d) => d.implies(&body_bool),
+                None => body_bool,
+            };
+            build_z3_quantifier(true, &bound_var, &guarded, var, domain)
+        }
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => {
+            let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let inner_ctx = ctx.with_local(var, bound_var.clone());
+            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
+            let guarded = match dp {
+                Some(d) => Bool::and(&[&d, &body_bool]),
+                None => body_bool,
+            };
+            build_z3_quantifier(false, &bound_var, &guarded, var, domain)
+        }
+        IRExpr::One {
+            var, domain, body, ..
+        } => {
+            // Exactly one: ∃x. D(x) ∧ P(x) ∧ ∀y. D(y) ∧ P(y) → y = x
+            let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let x_ctx = ctx.with_local(var, x_var.clone());
+            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
+            let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
+            let x_satisfies = match &d_x {
+                Some(dp) => Bool::and(&[dp, &p_x]),
+                None => p_x.clone(),
+            };
+
+            let y_name = format!("{var}__unique");
+            let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+            let y_ctx = ctx.with_local(var, y_var.clone());
+            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
+            let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
+            let y_satisfies = match &d_y {
+                Some(dp) => Bool::and(&[dp, &p_y]),
+                None => p_y,
+            };
+
+            let y_eq_x = smt::smt_eq(&y_var, &x_var)?;
+            let forall_unique = build_z3_quantifier(
+                true, &y_var, &y_satisfies.implies(&y_eq_x), &y_name, domain,
+            )?;
+            let exists_body = Bool::and(&[&x_satisfies, &forall_unique]);
+            build_z3_quantifier(false, &x_var, &exists_body, var, domain)
+        }
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => {
+            // At most one: ∀x, y. D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
+            let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let x_ctx = ctx.with_local(var, x_var.clone());
+            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
+            let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
+
+            let y_name = format!("{var}__unique");
+            let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+            let y_ctx = ctx.with_local(var, y_var.clone());
+            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
+            let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
+
+            let mut antecedents = Vec::new();
+            if let Some(dp) = &d_x { antecedents.push(dp.clone()); }
+            if let Some(dp) = &d_y { antecedents.push(dp.clone()); }
+            antecedents.push(p_x);
+            antecedents.push(p_y);
+            let antecedent_refs: Vec<&Bool> = antecedents.iter().collect();
+            let lhs = Bool::and(&antecedent_refs);
+
+            let x_eq_y = smt::smt_eq(&x_var, &y_var)?;
+            let forall_body = lhs.implies(&x_eq_y);
+            let inner = build_z3_quantifier(true, &y_var, &forall_body, &y_name, domain)?;
+            build_z3_quantifier(true, &x_var, &inner, var, domain)
+        }
         // Boolean connectives — recurse
         IRExpr::BinOp {
             op, left, right, ..
@@ -6396,6 +9982,15 @@ fn encode_prop_expr(
         // is also just P at this step (the outer loop handles the disjunction).
         IRExpr::Always { body, .. } | IRExpr::Eventually { body, .. } => {
             encode_prop_expr(pool, vctx, defs, ctx, body, step)
+        }
+        // `P until Q` should not reach here from BMC (desugared at top level
+        // after def expansion). If it does arrive (e.g., from scene encoding or
+        // other non-BMC paths), use same-step: Q(s) ∨ P(s). This is an
+        // over-approximation but avoids unsound false proofs.
+        IRExpr::Until { left, right, .. } => {
+            let q = encode_prop_expr(pool, vctx, defs, ctx, right, step)?;
+            let p = encode_prop_expr(pool, vctx, defs, ctx, left, step)?;
+            Ok(Bool::or(&[&q, &p]))
         }
         // Comparison and other BinOps that produce Bool (OpEq, OpNEq, OpLt, etc.)
         IRExpr::BinOp {
@@ -6497,8 +10092,12 @@ fn encode_prop_value(
                 "field not found in any bound entity: {field} (step={step})"
             ))
         }
-        // Bare variable: check bindings first, then try as field in bound entities
+        // Bare variable: check locals first, then entity bindings, then entity fields
         IRExpr::Var { name, .. } => {
+            // Check non-entity local bindings first (enum/Int/Bool/Real quantifier vars)
+            if let Some(val) = ctx.locals.get(name) {
+                return Ok(val.clone());
+            }
             // Try as a field in each bound entity
             let mut matches = Vec::new();
             for (var, (entity, slot)) in &ctx.bindings {
@@ -6522,10 +10121,70 @@ fn encode_prop_value(
             }
         }
         IRExpr::Ctor {
-            enum_name, ctor, ..
+            enum_name, ctor, args, ..
         } => {
+            // ADT-encoded enum: use constructor function with field arguments
+            if let Some(dt) = vctx.adt_sorts.get(enum_name) {
+                for variant in &dt.variants {
+                    if variant.constructor.name() == *ctor {
+                        if args.is_empty() {
+                            let result = variant.constructor.apply(&[]);
+                            return Ok(dynamic_to_smt_value(result));
+                        }
+                        // Build args in declared field order
+                        let declared_names: Vec<std::string::String> = variant
+                            .accessors
+                            .iter()
+                            .map(|a| a.name())
+                            .collect();
+                        let args_map: HashMap<&str, &IRExpr> = args
+                            .iter()
+                            .map(|(n, e)| (n.as_str(), e))
+                            .collect();
+                        let mut z3_args: Vec<z3::ast::Dynamic> = Vec::new();
+                        for decl_name in &declared_names {
+                            if let Some(field_expr) = args_map.get(decl_name.as_str()) {
+                                let val = encode_prop_value(pool, vctx, defs, ctx, field_expr, step)?;
+                                z3_args.push(val.to_dynamic());
+                            }
+                        }
+                        let arg_refs: Vec<&dyn z3::ast::Ast> =
+                            z3_args.iter().map(|a| a as &dyn z3::ast::Ast).collect();
+                        let result = variant.constructor.apply(&arg_refs);
+                        return Ok(dynamic_to_smt_value(result));
+                    }
+                }
+            }
+            // Flat Int encoding for fieldless enums
             let id = vctx.variants.id_of(enum_name, ctor);
             Ok(smt::int_val(id))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpSeqConcat" => {
+            // Seq::concat on concrete literals: combine elements
+            let a_elems = match left.as_ref() {
+                IRExpr::SeqLit { elements, .. } => elements.clone(),
+                _ => return Err(format!("Seq::concat requires literal operands")),
+            };
+            let b_elems = match right.as_ref() {
+                IRExpr::SeqLit { elements, .. } => elements.clone(),
+                _ => return Err(format!("Seq::concat requires literal operands")),
+            };
+            let mut combined = a_elems;
+            combined.extend(b_elems);
+            let seq_ty = match left.as_ref() {
+                IRExpr::SeqLit { ty, .. } => ty.clone(),
+                _ => crate::ir::types::IRType::Seq {
+                    element: Box::new(crate::ir::types::IRType::Int),
+                },
+            };
+            let combined_lit = IRExpr::SeqLit {
+                elements: combined,
+                ty: seq_ty,
+                span: None,
+            };
+            encode_prop_value(pool, vctx, defs, ctx, &combined_lit, step)
         }
         IRExpr::BinOp {
             op, left, right, ..
@@ -6540,11 +10199,17 @@ fn encode_prop_value(
         }
         IRExpr::Prime { expr, .. } => encode_prop_value(pool, vctx, defs, ctx, expr, step + 1),
         // Nested quantifiers in value position — encode as Bool, wrap as SmtValue
-        IRExpr::Forall { .. } | IRExpr::Exists { .. } => Ok(SmtValue::Bool(encode_prop_expr(
+        IRExpr::Forall { .. }
+        | IRExpr::Exists { .. }
+        | IRExpr::One { .. }
+        | IRExpr::Lone { .. } => Ok(SmtValue::Bool(encode_prop_expr(
             pool, vctx, defs, ctx, expr, step,
         )?)),
         IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_expr(
             pool, vctx, defs, ctx, body, step,
+        )?)),
+        IRExpr::Until { .. } => Ok(SmtValue::Bool(encode_prop_expr(
+            pool, vctx, defs, ctx, expr, step,
         )?)),
         IRExpr::MapUpdate {
             map, key, value, ..
@@ -6753,10 +10418,17 @@ fn encode_card(
 ///
 /// For each step 0..=bound, reads active flags and field values from
 /// the Z3 model and builds `TraceStep` entries.
-fn extract_counterexample(
+/// Extract a counterexample trace with event identification.
+///
+/// For each transition step, evaluates event guards against the model to
+/// determine which event fired. If no event guard is satisfied, the step
+/// is labeled as stutter.
+fn extract_counterexample_with_events(
     solver: &Solver,
     pool: &SlotPool,
+    vctx: &crate::verify::context::VerifyContext,
     entities: &[crate::ir::types::IREntity],
+    systems: &[crate::ir::types::IRSystem],
     bound: usize,
 ) -> Vec<TraceStep> {
     let Some(model) = solver.get_model() else {
@@ -6817,18 +10489,62 @@ fn extract_counterexample(
             }
         }
 
+        // Identify which event fired at this step (for transition steps only)
+        let event_name = if step < bound && !systems.is_empty() {
+            identify_event_at_step(&model, pool, vctx, entities, systems, step)
+        } else {
+            None
+        };
+
         trace.push(TraceStep {
             step,
-            // TODO: Determine which event fired by checking which event's guard+body
-            // constraints are satisfied in the model. Events are encoded as a disjunction
-            // in transition_constraints, so we would need to evaluate each event's formula
-            // against the model to label the step.
-            event: None,
+            event: event_name,
             assignments,
         });
     }
 
     trace
+}
+
+/// Identify which event fired at a given step by evaluating event guards
+/// against the Z3 model.
+///
+/// For each system event, encodes the guard at the given step and checks
+/// if the model satisfies it. Returns the first matching event name, or
+/// None if only stutter occurred.
+fn identify_event_at_step(
+    model: &z3::Model,
+    pool: &SlotPool,
+    vctx: &crate::verify::context::VerifyContext,
+    entities: &[crate::ir::types::IREntity],
+    systems: &[crate::ir::types::IRSystem],
+    step: usize,
+) -> Option<String> {
+    use crate::verify::harness::encode_event;
+
+    // Evaluate each event's full formula (guard + body + frame) against the model.
+    // Collect ALL matching events — if ambiguous, report "event A or event B".
+    let mut matches = Vec::new();
+    for system in systems {
+        for event in &system.events {
+            let formula = encode_event(pool, vctx, entities, systems, event, step);
+            if let Some(val) = model.eval(&formula, true) {
+                if val.as_bool() == Some(true) {
+                    let name = if systems.len() == 1 {
+                        event.name.clone()
+                    } else {
+                        format!("{}::{}", system.name, event.name)
+                    };
+                    matches.push(name);
+                }
+            }
+        }
+    }
+    match matches.len() {
+        0 => None, // stutter
+        1 => Some(matches.into_iter().next().unwrap()),
+        _ => Some(matches.join(" or ")),
+    }
 }
 
 // ── Display ─────────────────────────────────────────────────────────
@@ -6851,7 +10567,9 @@ impl std::fmt::Display for VerificationResult {
             VerificationResult::Counterexample { name, trace, .. } => {
                 writeln!(f, "COUNTEREXAMPLE {name}")?;
                 for step in trace {
-                    if let Some(event) = &step.event {
+                    if step.step == 0 {
+                        writeln!(f, "  step 0: (initial)")?;
+                    } else if let Some(event) = &step.event {
                         writeln!(f, "  step {}: event {event}", step.step)?;
                     } else {
                         writeln!(f, "  step {}:", step.step)?;
@@ -6869,7 +10587,7 @@ impl std::fmt::Display for VerificationResult {
                 write!(f, "FAIL    {name}: {reason}")
             }
             VerificationResult::Unprovable { name, hint, .. } => {
-                write!(f, "UNKNOWN {name}: {hint}")
+                write!(f, "UNPROVABLE {name}: {hint}")
             }
             VerificationResult::FnContractProved { name, time_ms, .. } => {
                 write!(f, "PROVED  fn {name} (contract, {time_ms}ms)")
@@ -6892,6 +10610,42 @@ impl std::fmt::Display for VerificationResult {
                     writeln!(f, "    {param} = {value}")?;
                 }
                 Ok(())
+            }
+            VerificationResult::LivenessViolation {
+                name,
+                prefix,
+                loop_trace,
+                loop_start,
+                ..
+            } => {
+                writeln!(f, "LIVENESS_VIOLATION {name}")?;
+                if !prefix.is_empty() {
+                    writeln!(f, "  prefix (steps 0..{loop_start}):")?;
+                    for step in prefix {
+                        if step.step == 0 {
+                            writeln!(f, "    step 0: (initial)")?;
+                        } else if let Some(event) = &step.event {
+                            writeln!(f, "    step {}: event {event}", step.step)?;
+                        } else {
+                            writeln!(f, "    step {}:", step.step)?;
+                        }
+                        for (entity, field, value) in &step.assignments {
+                            writeln!(f, "      {entity}.{field} = {value}")?;
+                        }
+                    }
+                }
+                writeln!(f, "  loop (repeats forever):")?;
+                for step in loop_trace {
+                    if let Some(event) = &step.event {
+                        writeln!(f, "    step {}: event {event}", step.step)?;
+                    } else {
+                        writeln!(f, "    step {}:", step.step)?;
+                    }
+                    for (entity, field, value) in &step.assignments {
+                        writeln!(f, "      {entity}.{field} = {value}")?;
+                    }
+                }
+                writeln!(f, "    [loops back to step {loop_start}]")
             }
         }
     }
@@ -6926,6 +10680,7 @@ mod tests {
                     name: "id".to_owned(),
                     ty: IRType::Id,
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "status".to_owned(),
@@ -6938,6 +10693,7 @@ mod tests {
                 ],
                     },
                     default: None,
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -6979,6 +10735,7 @@ mod tests {
             name: "Commerce".to_owned(),
             entities: vec!["Order".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "confirm_order".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -7032,6 +10789,7 @@ mod tests {
             verifies: vec![verify],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         }
     }
@@ -7145,6 +10903,7 @@ mod tests {
 
         // Add a create_order event so orders can actually exist
         ir.systems[0].events.push(IREvent {
+            fairness: IRFairness::None,
             name: "create_order".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -7200,6 +10959,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
         let results = verify_all(&ir, &VerifyConfig::default());
@@ -7213,6 +10973,7 @@ mod tests {
                 name: "id".to_owned(),
                 ty: IRType::Id,
                 default: None,
+                initial_constraint: None,
             }],
             transitions: vec![],
         }
@@ -7221,6 +10982,7 @@ mod tests {
     fn make_noop_event(name: &str) -> IREvent {
         IREvent {
             name: name.to_owned(),
+            fairness: IRFairness::None,
             params: vec![],
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
@@ -7251,6 +11013,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![IRScene {
                 name: "let_scene".to_owned(),
                 systems: vec![],
@@ -7303,6 +11066,7 @@ mod tests {
             name: "Caller".to_owned(),
             entities: vec!["Dummy".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "start".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -7332,6 +11096,7 @@ mod tests {
             name: "Callee".to_owned(),
             entities: vec!["Dummy".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "run".to_owned(),
                 params: vec![
                     IRTransParam {
@@ -7373,6 +11138,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![IRScene {
                 name: "crosscall_arity".to_owned(),
                 systems: vec!["Caller".to_owned()],
@@ -7420,6 +11186,7 @@ mod tests {
                     name: "id".to_owned(),
                     ty: IRType::Id,
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "status".to_owned(),
@@ -7433,6 +11200,7 @@ mod tests {
                         args: vec![],
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -7474,6 +11242,7 @@ mod tests {
             name: "Auth".to_owned(),
             entities: vec!["Account".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "lock_account".to_owned(),
                 params: vec![IRTransParam {
                     name: "account_id".to_owned(),
@@ -7538,6 +11307,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![scene],
         }
     }
@@ -7822,6 +11592,7 @@ mod tests {
         );
         // Add a create event so orders can exist
         ir.systems[0].events.push(IREvent {
+            fairness: IRFairness::None,
             name: "create_order".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -8015,6 +11786,7 @@ mod tests {
         );
         // Add create so induction step fails (status changes via confirm)
         ir.systems[0].events.push(IREvent {
+            fairness: IRFairness::None,
             name: "create_order".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -8208,6 +11980,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "y".to_owned(),
@@ -8218,6 +11991,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -8294,6 +12068,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["Counter".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "tick".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -8393,6 +12168,7 @@ mod tests {
                 file: None,
             }],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -8518,6 +12294,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "y".to_owned(),
@@ -8528,6 +12305,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -8604,6 +12382,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["Counter".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "tick".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -8702,6 +12481,7 @@ mod tests {
                 file: None,
             }],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         }
     }
@@ -8721,6 +12501,7 @@ mod tests {
                     value: Box::new(IRType::Int),
                 },
                 default: None,
+                initial_constraint: None,
             }],
             transitions: vec![IRTransition {
                 name: "put".to_owned(),
@@ -8773,6 +12554,7 @@ mod tests {
             entities: vec!["Store".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_store".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -8788,6 +12570,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_put".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -8940,6 +12723,7 @@ mod tests {
             ],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -8977,6 +12761,7 @@ mod tests {
                     value: Box::new(IRType::Int),
                 },
                 default: None,
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -8985,6 +12770,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["M".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_m".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -9084,6 +12870,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9116,6 +12903,7 @@ mod tests {
                         value: Box::new(IRType::Int),
                     },
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "count".to_owned(),
@@ -9126,6 +12914,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -9204,6 +12993,7 @@ mod tests {
             entities: vec!["KV".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_kv".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -9219,6 +13009,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_set".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -9312,6 +13103,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9348,6 +13140,7 @@ mod tests {
                 name: "tags".to_owned(),
                 ty: set_ty.clone(),
                 default: None,
+                initial_constraint: None,
             }],
             transitions: vec![IRTransition {
                 name: "add_tag".to_owned(),
@@ -9395,6 +13188,7 @@ mod tests {
             entities: vec!["Item".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_item".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -9410,6 +13204,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_add".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -9520,6 +13315,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9555,6 +13351,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -9563,6 +13360,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -9664,6 +13462,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9695,6 +13494,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -9703,6 +13503,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -9797,6 +13598,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9827,6 +13629,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -9834,6 +13637,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -9927,6 +13731,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -9962,6 +13767,7 @@ mod tests {
                     name: "id".to_owned(),
                     ty: IRType::Id,
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "status".to_owned(),
@@ -9975,6 +13781,7 @@ mod tests {
                         args: vec![],
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -10017,6 +13824,7 @@ mod tests {
             entities: vec!["Obj".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_obj".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -10032,6 +13840,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_activate".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -10140,6 +13949,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -10183,6 +13993,7 @@ mod tests {
                     args: vec![],
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -10191,6 +14002,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["Obj".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_obj".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -10280,6 +14092,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -10323,6 +14136,7 @@ mod tests {
                     args: vec![],
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -10331,6 +14145,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["Obj".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_obj".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -10433,6 +14248,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -10468,6 +14284,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -10476,6 +14293,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -10623,6 +14441,7 @@ mod tests {
             ],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -10662,6 +14481,7 @@ mod tests {
                     name: "items".to_owned(),
                     ty: seq_ty.clone(),
                     default: None,
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "count".to_owned(),
@@ -10672,6 +14492,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![IRTransition {
@@ -10714,6 +14535,7 @@ mod tests {
             entities: vec!["Q".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_q".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -10729,6 +14551,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_inc".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -10865,6 +14688,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -10909,6 +14733,7 @@ mod tests {
                     args: vec![],
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![IRTransition {
                 name: "activate".to_owned(),
@@ -10950,6 +14775,7 @@ mod tests {
             entities: vec!["Obj".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_obj".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -10965,6 +14791,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_activate".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -11119,6 +14946,7 @@ mod tests {
             ],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11162,6 +14990,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -11169,6 +14998,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -11244,6 +15074,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11274,6 +15105,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![],
         };
@@ -11281,6 +15113,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["X".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "create_x".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -11344,6 +15177,7 @@ mod tests {
                 file: None,
             }],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11392,6 +15226,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11431,6 +15266,7 @@ mod tests {
                     args: vec![],
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![IRTransition {
                 name: "toggle".to_owned(),
@@ -11459,6 +15295,7 @@ mod tests {
             entities: vec!["Switch".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_switch".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -11474,6 +15311,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "do_toggle".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -11562,6 +15400,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11603,6 +15442,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -11680,6 +15520,7 @@ mod tests {
             entities: vec!["F".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_f".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -11695,6 +15536,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "pack_and_ship".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -11795,6 +15637,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -11834,6 +15677,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -11909,6 +15753,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["F".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "pack_and_ship".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -12030,6 +15875,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![scene],
         };
 
@@ -12061,6 +15907,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -12137,6 +15984,7 @@ mod tests {
             entities: vec!["F".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_f".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12152,6 +16000,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "pack_and_ship".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12249,6 +16098,7 @@ mod tests {
                 file: None,
             }],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -12287,6 +16137,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -12396,6 +16247,7 @@ mod tests {
             entities: vec!["F".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_f".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12412,6 +16264,7 @@ mod tests {
                 },
                 // Event ab: a (0→1) then b (1→2) — multi-apply chain
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "ab".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12448,6 +16301,7 @@ mod tests {
                 },
                 // Event bc: b (1→2) then c (2→3) — second multi-apply chain
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "bc".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12549,6 +16403,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -12587,6 +16442,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -12663,6 +16519,7 @@ mod tests {
             entities: vec!["F".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_f".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12678,6 +16535,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "pack_and_ship".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -12813,6 +16671,7 @@ mod tests {
             }],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         };
 
@@ -12859,6 +16718,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
                 IRField {
                     name: "amount".to_owned(),
@@ -12869,6 +16729,7 @@ mod tests {
 
                         span: None,
                     }),
+                    initial_constraint: None,
                 },
             ],
             transitions: vec![
@@ -12985,6 +16846,7 @@ mod tests {
             entities: vec!["F".to_owned()],
             events: vec![
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "create_f".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -13000,6 +16862,7 @@ mod tests {
                     }],
                 },
                 IREvent {
+                    fairness: IRFairness::None,
                     name: "prep_and_finalize".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -13201,6 +17064,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![scene],
         };
 
@@ -13233,6 +17097,7 @@ mod tests {
 
                     span: None,
                 }),
+                initial_constraint: None,
             }],
             transitions: vec![
                 IRTransition {
@@ -13308,6 +17173,7 @@ mod tests {
             name: "S".to_owned(),
             entities: vec!["F".to_owned()],
             events: vec![IREvent {
+                fairness: IRFairness::None,
                 name: "pack_all_and_ship".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -13423,6 +17289,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![scene],
         };
 
@@ -13454,6 +17321,7 @@ mod tests {
             verifies: vec![],
             theorems: vec![],
             axioms: vec![],
+            lemmas: vec![],
             scenes: vec![],
         }
     }

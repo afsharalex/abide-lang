@@ -1,0 +1,195 @@
+module SceneOrdering
+
+// Phase 10: Scene composition operator semantics
+
+enum Status = Pending | Confirmed | Shipped | Delivered | Cancelled
+
+entity Order {
+  id: Id
+  status: Status = @Pending
+
+  action confirm() requires status == @Pending { status' = @Confirmed }
+  action ship() requires status == @Confirmed { status' = @Shipped }
+  action deliver() requires status == @Shipped { status' = @Delivered }
+  action cancel() requires status == @Pending { status' = @Cancelled }
+}
+
+system Commerce {
+  use Order
+
+  event create_order() { create Order {} }
+
+  event confirm_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Pending {
+      o.confirm()
+    }
+  }
+
+  event ship_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Confirmed {
+      o.ship()
+    }
+  }
+
+  event deliver_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Shipped {
+      o.deliver()
+    }
+  }
+
+  event cancel_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Pending {
+      o.cancel()
+    }
+  }
+}
+
+// ── Test 1: Sequence ordering (a -> b) ──────────────────────────────
+// confirm must happen before ship. Should PASS.
+scene confirm_then_ship for Commerce {
+  given {
+    let o = one Order where o.status == @Pending
+  }
+  when {
+    action conf = Commerce::confirm_order(o.id){one}
+    action ship_act = Commerce::ship_order(o.id){one}
+    assume conf -> ship_act
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+
+// ── Test 2: Chain ordering (a -> b -> c) ────────────────────────────
+// confirm -> ship -> deliver: 3 events in strict sequence. Should PASS.
+scene chain_ordering for Commerce {
+  given {
+    let o = one Order where o.status == @Pending
+  }
+  when {
+    action conf = Commerce::confirm_order(o.id){one}
+    action ship_act = Commerce::ship_order(o.id){one}
+    action deliv = Commerce::deliver_order(o.id){one}
+    assume conf -> ship_act -> deliv
+  }
+  then {
+    assert o.status == @Delivered
+  }
+}
+
+// ── Test 3: Reversed list order with assume ─────────────────────────
+// Events listed in reverse but assume enforces correct order.
+// Tests that ordering follows assume, not list position.
+scene reversed_list_order for Commerce {
+  given {
+    let o = one Order where o.status == @Pending
+  }
+  when {
+    action ship_act = Commerce::ship_order(o.id){one}
+    action conf = Commerce::confirm_order(o.id){one}
+    assume conf -> ship_act
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+
+// ── Test 4: Incompatible ordering — should FAIL ─────────────────────
+// ship before confirm is impossible (ship requires Confirmed status).
+scene impossible_order for Commerce {
+  given {
+    let o = one Order where o.status == @Pending
+  }
+  when {
+    action conf = Commerce::confirm_order(o.id){one}
+    action ship_act = Commerce::ship_order(o.id){one}
+    assume ship_act -> conf
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+
+// ── Test 5: No assume — solver chooses order ────────────────────────
+// Without ordering constraint, solver picks valid order.
+scene no_ordering for Commerce {
+  given {
+    let o = one Order where o.status == @Pending
+  }
+  when {
+    action conf = Commerce::confirm_order(o.id){one}
+    action ship_act = Commerce::ship_order(o.id){one}
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+
+// ── Test 6: Same-step with & ────────────────────────────────────────
+// confirm (Order) and log (AuditLog) fire at the same step. Should PASS.
+// Same-step events must touch different entity types.
+
+enum LogKind = Info | Warning
+
+entity AuditLog {
+  kind: LogKind = @Info
+  action mark_warning() requires kind == @Info { kind' = @Warning }
+}
+
+system Audited {
+  use Order
+  use AuditLog
+
+  event confirm_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Pending {
+      o.confirm()
+    }
+  }
+
+  event ship_order(order_id: Id) {
+    choose o: Order where o.id == order_id and o.status == @Confirmed {
+      o.ship()
+    }
+  }
+
+  event log_action() {
+    choose l: AuditLog where l.kind == @Info {
+      l.mark_warning()
+    }
+  }
+}
+
+scene same_step_pair for Audited {
+  given {
+    let o = one Order where o.status == @Pending
+    let l = one AuditLog where l.kind == @Info
+  }
+  when {
+    action conf = Audited::confirm_order(o.id){one}
+    action log_act = Audited::log_action(){one}
+    assume conf & log_act
+  }
+  then {
+    assert o.status == @Confirmed
+    assert l.kind == @Warning
+  }
+}
+
+// ── Test 7: Same-step combined with sequence ────────────────────────
+// (confirm & log) -> ship: the pair fires atomically, then ship.
+scene same_step_then_sequence for Audited {
+  given {
+    let o = one Order where o.status == @Pending
+    let l = one AuditLog where l.kind == @Info
+  }
+  when {
+    action conf = Audited::confirm_order(o.id){one}
+    action log_act = Audited::log_action(){one}
+    action ship_act = Audited::ship_order(o.id){one}
+    assume (conf & log_act) -> ship_act
+  }
+  then {
+    assert o.status == @Shipped
+    assert l.kind == @Warning
+  }
+}

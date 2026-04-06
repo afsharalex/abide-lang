@@ -216,6 +216,20 @@ pub fn smt_neq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
     Ok(smt_eq(a, b)?.not())
 }
 
+/// Conditional select: `if cond then then_val else else_val`.
+/// Both branches must have the same sort.
+pub fn smt_ite(cond: &Bool, then_val: &SmtValue, else_val: &SmtValue) -> SmtValue {
+    match (then_val, else_val) {
+        (SmtValue::Int(t), SmtValue::Int(e)) => SmtValue::Int(cond.ite(t, e)),
+        (SmtValue::Bool(t), SmtValue::Bool(e)) => SmtValue::Bool(cond.ite(t, e)),
+        (SmtValue::Real(t), SmtValue::Real(e)) => SmtValue::Real(cond.ite(t, e)),
+        (SmtValue::Array(t), SmtValue::Array(e)) => SmtValue::Array(cond.ite(t, e)),
+        (SmtValue::Dynamic(t), SmtValue::Dynamic(e)) => SmtValue::Dynamic(cond.ite(t, e)),
+        // Cross-variant: coerce to Dynamic
+        _ => SmtValue::Dynamic(cond.ite(&then_val.to_dynamic(), &else_val.to_dynamic())),
+    }
+}
+
 // ── Binary operations ───────────────────────────────────────────────
 
 /// Apply a binary operation to two `SmtValue`s.
@@ -266,6 +280,115 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
             Ok(SmtValue::Bool(a.eq(b.clone()).not()))
         }
 
+        // ── Collection operations (Set/Seq/Map) ───────────────────────
+        // Sets are Array<T, Bool> (characteristic functions).
+        // Operations use Z3 lambda arrays and quantifiers.
+
+        // ── Set operations (polymorphic over element sort) ────────────
+        // Type-directed overloading (*, -, <=, + on sets) is done at IR
+        // lowering time by checking the EExpr type, NOT here at SMT level.
+        // This avoids confusing Set<T> with Map<K,Bool> or Seq<Bool>.
+        //
+        // Helper: create a fresh quantifier variable matching the array's
+        // domain sort. Uses Ast::get_sort() to extract the element type.
+        //
+        // Set union (<> or Set::union): lambda x. a[x] OR b[x]
+        ("OpDiamond" | "OpSetUnion", SmtValue::Array(a), SmtValue::Array(b)) => {
+            use z3::ast::Ast;
+            let domain = a.get_sort().array_domain().unwrap();
+            let x = Dynamic::fresh_const("su", &domain);
+            let a_x = a.select(&x).as_bool().unwrap();
+            let b_x = b.select(&x).as_bool().unwrap();
+            let body = Bool::or(&[&a_x, &b_x]);
+            let arr = z3::ast::lambda_const(
+                &[&x as &dyn z3::ast::Ast], &Dynamic::from_ast(&body),
+            );
+            Ok(SmtValue::Array(arr))
+        }
+        // Set intersection (* or Set::intersect)
+        ("OpSetIntersect", SmtValue::Array(a), SmtValue::Array(b)) => {
+            use z3::ast::Ast;
+            let domain = a.get_sort().array_domain().unwrap();
+            let x = Dynamic::fresh_const("si", &domain);
+            let a_x = a.select(&x).as_bool().unwrap();
+            let b_x = b.select(&x).as_bool().unwrap();
+            let body = Bool::and(&[&a_x, &b_x]);
+            let arr = z3::ast::lambda_const(
+                &[&x as &dyn z3::ast::Ast], &Dynamic::from_ast(&body),
+            );
+            Ok(SmtValue::Array(arr))
+        }
+        // Set difference (- or Set::diff)
+        ("OpSetDiff", SmtValue::Array(a), SmtValue::Array(b)) => {
+            use z3::ast::Ast;
+            let domain = a.get_sort().array_domain().unwrap();
+            let x = Dynamic::fresh_const("sd", &domain);
+            let a_x = a.select(&x).as_bool().unwrap();
+            let b_x = b.select(&x).as_bool().unwrap();
+            let body = Bool::and(&[&a_x, &b_x.not()]);
+            let arr = z3::ast::lambda_const(
+                &[&x as &dyn z3::ast::Ast], &Dynamic::from_ast(&body),
+            );
+            Ok(SmtValue::Array(arr))
+        }
+        // Set subset (<= or Set::subset): ∀ x. a[x] → b[x]
+        ("OpSetSubset", SmtValue::Array(a), SmtValue::Array(b)) => {
+            use z3::ast::Ast;
+            let domain = a.get_sort().array_domain().unwrap();
+            let x = Dynamic::fresh_const("ss", &domain);
+            let a_x = a.select(&x).as_bool().unwrap();
+            let b_x = b.select(&x).as_bool().unwrap();
+            let body = a_x.implies(&b_x);
+            let q = z3::ast::forall_const(
+                &[&x as &dyn z3::ast::Ast], &[], &body,
+            );
+            Ok(SmtValue::Bool(q))
+        }
+        // Set disjointness (!* or Set::disjoint): ∀ x. ¬(a[x] ∧ b[x])
+        ("OpDisjoint" | "OpSetDisjoint", SmtValue::Array(a), SmtValue::Array(b)) => {
+            use z3::ast::Ast;
+            let domain = a.get_sort().array_domain().unwrap();
+            let x = Dynamic::fresh_const("sj", &domain);
+            let a_x = a.select(&x).as_bool().unwrap();
+            let b_x = b.select(&x).as_bool().unwrap();
+            let body = Bool::and(&[&a_x, &b_x]).not();
+            let q = z3::ast::forall_const(
+                &[&x as &dyn z3::ast::Ast], &[], &body,
+            );
+            Ok(SmtValue::Bool(q))
+        }
+        // Seq concat (<> on Seq or Seq::concat): result[i] = if i < #a then a[i] else b[i - #a]
+        // Since we don't track lengths explicitly in the SMT encoding, we use
+        // array equality semantics: two concatenated arrays agree on all indices.
+        // For finite literal concatenation, this works via store chains.
+        // For symbolic concat, we return the merged array (best-effort).
+        ("OpSeqConcat" | "OpSeqCons", SmtValue::Array(_a), SmtValue::Array(_b)) => {
+            // For now: treat <> on sequences the same as on sets (element-wise OR).
+            // This is correct for set-like usage but not for ordered sequences.
+            // Full ordered concat needs length tracking (deferred to DDR-047).
+            Err("Seq::concat on symbolic sequences requires length tracking; \
+                 use Seq literals directly for concrete concatenation"
+                .to_owned())
+        }
+        // Set member (Set::member(elem, set)): select from characteristic function
+        // Argument order: (elem, set) from surface syntax
+        ("OpSetMember", SmtValue::Int(x), SmtValue::Array(s)) => {
+            Ok(SmtValue::Bool(s.select(&Dynamic::from_ast(x)).as_bool().unwrap()))
+        }
+        ("OpSetMember", SmtValue::Dynamic(x), SmtValue::Array(s)) => {
+            Ok(SmtValue::Bool(s.select(x).as_bool().unwrap()))
+        }
+        ("OpSetMember", SmtValue::Bool(x), SmtValue::Array(s)) => {
+            Ok(SmtValue::Bool(s.select(&Dynamic::from_ast(x)).as_bool().unwrap()))
+        }
+        ("OpSetMember", SmtValue::Real(x), SmtValue::Array(s)) => {
+            Ok(SmtValue::Bool(s.select(&Dynamic::from_ast(x)).as_bool().unwrap()))
+        }
+        // Map merge/has/domain/range: require domain tracking (a companion
+        // boolean array recording which keys are present). Without it, merge
+        // discards left-only keys, domain misses default-valued keys, and has
+        // is unsound for non-Bool maps. Deferred — see DDR-047.
+
         // Composition operators
         ("OpSeq", SmtValue::Bool(a), SmtValue::Bool(b)) => Ok(SmtValue::Bool(a.implies(b))),
         ("OpSameStep", SmtValue::Bool(a), SmtValue::Bool(b)) => {
@@ -290,15 +413,21 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
                     d.as_real()
                         .ok_or_else(|| format!("type error: Dynamic→Real cast failed in {op}"))?,
                 ),
-                SmtValue::Dynamic(_) => {
+                SmtValue::Dynamic(d2) => {
                     if let Some(i) = d.as_int() {
                         SmtValue::Int(i)
                     } else if let Some(b) = d.as_bool() {
                         SmtValue::Bool(b)
                     } else {
-                        return Err(format!(
-                            "type error: cannot resolve Dynamic-Dynamic operand in {op}"
-                        ));
+                        // Both operands are genuine Dynamic (e.g., ADT sorts) —
+                        // use Z3 generic equality/inequality directly.
+                        return match op {
+                            "OpEq" => Ok(SmtValue::Bool(d.eq(d2.clone()))),
+                            "OpNEq" => Ok(SmtValue::Bool(d.eq(d2.clone()).not())),
+                            _ => Err(format!(
+                                "type error: cannot apply {op} to ADT/Dynamic operands"
+                            )),
+                        };
                     }
                 }
                 SmtValue::Array(_) => {
@@ -322,9 +451,48 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
 /// Negate a boolean or apply unary minus to an int.
 /// Accepts IR op names: `"OpNot"`, `"OpNeg"`.
 pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
+    #[allow(unused_imports)]
+    use z3::ast::Ast;
     match op {
         "OpNot" | "not" => Ok(SmtValue::Bool(val.as_bool()?.not())),
         "OpNeg" | "-" => Ok(SmtValue::Int(Int::unary_minus(val.as_int()?))),
+
+        // Collection unary operations
+        "OpSetEmpty" => {
+            use z3::ast::Ast;
+            let arr = val.as_array()?;
+            let sort = arr.get_sort();
+            let empty = z3::ast::Array::const_array(
+                &sort.array_domain().unwrap(),
+                &z3::ast::Bool::from_bool(false),
+            );
+            Ok(SmtValue::Bool(arr.eq(empty)))
+        }
+        "OpSetSize" => {
+            // Set size via cardinality — reuse existing Card encoding path
+            Err("Set::size should use # (cardinality) operator".to_owned())
+        }
+        "OpSeqHead" => {
+            let arr = val.as_array()?;
+            let zero = Int::from_i64(0);
+            Ok(SmtValue::Dynamic(arr.select(&Dynamic::from_ast(&zero))))
+        }
+        "OpSeqTail" => {
+            // Tail is complex: shift indices by -1. For now, return as-is.
+            // Full implementation needs auxiliary length tracking.
+            Err("Seq::tail requires length tracking (not yet implemented in pure expr)".to_owned())
+        }
+        "OpSeqLength" => {
+            // Seq length via cardinality
+            Err("Seq::length should use # (cardinality) operator".to_owned())
+        }
+        "OpSeqEmpty" => {
+            // Check if sequence is empty (length == 0)
+            Err("Seq::empty requires length tracking".to_owned())
+        }
+        // Map::domain, Map::range — deferred: requires domain tracking.
+        // See DDR-047.
+
         _ => Err(format!("unsupported unop: {op}")),
     }
 }

@@ -255,13 +255,13 @@ mod tests {
     fn circular_include_detected() {
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let a_path = dir.path().join("a.abide");
+        let a_path = dir.path().join("a.ab");
         let mut a = std::fs::File::create(&a_path).unwrap();
-        writeln!(a, "include \"b.abide\"").unwrap();
+        writeln!(a, "include \"b.ab\"").unwrap();
 
-        let b_path = dir.path().join("b.abide");
+        let b_path = dir.path().join("b.ab");
         let mut b = std::fs::File::create(&b_path).unwrap();
-        writeln!(b, "include \"a.abide\"").unwrap();
+        writeln!(b, "include \"a.ab\"").unwrap();
 
         let (env, load_errors, _) = load_files(&[a_path]);
         assert!(load_errors.is_empty(), "top-level should succeed");
@@ -296,9 +296,9 @@ mod tests {
     fn self_include_detected() {
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let path = dir.path().join("self.abide");
+        let path = dir.path().join("self.ab");
         let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "include \"self.abide\"").unwrap();
+        writeln!(f, "include \"self.ab\"").unwrap();
 
         let (env, load_errors, _) = load_files(&[path]);
         assert!(load_errors.is_empty());
@@ -315,17 +315,17 @@ mod tests {
     fn deep_cycle_detected() {
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let a_path = dir.path().join("a.abide");
+        let a_path = dir.path().join("a.ab");
         let mut a = std::fs::File::create(&a_path).unwrap();
-        writeln!(a, "include \"b.abide\"").unwrap();
+        writeln!(a, "include \"b.ab\"").unwrap();
 
-        let b_path = dir.path().join("b.abide");
+        let b_path = dir.path().join("b.ab");
         let mut b = std::fs::File::create(&b_path).unwrap();
-        writeln!(b, "include \"c.abide\"").unwrap();
+        writeln!(b, "include \"c.ab\"").unwrap();
 
-        let c_path = dir.path().join("c.abide");
+        let c_path = dir.path().join("c.ab");
         let mut c = std::fs::File::create(&c_path).unwrap();
-        writeln!(c, "include \"a.abide\"").unwrap();
+        writeln!(c, "include \"a.ab\"").unwrap();
 
         let (env, load_errors, _) = load_files(&[a_path]);
         assert!(load_errors.is_empty());
@@ -351,22 +351,22 @@ mod tests {
         // This is a diamond (not a cycle) — should not error.
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let d_path = dir.path().join("d.abide");
+        let d_path = dir.path().join("d.ab");
         let mut d = std::fs::File::create(&d_path).unwrap();
         writeln!(d, "enum Shared = X | Y").unwrap();
 
-        let b_path = dir.path().join("b.abide");
+        let b_path = dir.path().join("b.ab");
         let mut b = std::fs::File::create(&b_path).unwrap();
-        writeln!(b, "include \"d.abide\"").unwrap();
+        writeln!(b, "include \"d.ab\"").unwrap();
 
-        let c_path = dir.path().join("c.abide");
+        let c_path = dir.path().join("c.ab");
         let mut c = std::fs::File::create(&c_path).unwrap();
-        writeln!(c, "include \"d.abide\"").unwrap();
+        writeln!(c, "include \"d.ab\"").unwrap();
 
-        let a_path = dir.path().join("a.abide");
+        let a_path = dir.path().join("a.ab");
         let mut a = std::fs::File::create(&a_path).unwrap();
-        writeln!(a, "include \"b.abide\"").unwrap();
-        writeln!(a, "include \"c.abide\"").unwrap();
+        writeln!(a, "include \"b.ab\"").unwrap();
+        writeln!(a, "include \"c.ab\"").unwrap();
 
         let (env, load_errors, _) = load_files(&[a_path]);
         assert!(load_errors.is_empty());
@@ -383,16 +383,16 @@ mod tests {
         // C should still load successfully.
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let a_path = dir.path().join("a.abide");
+        let a_path = dir.path().join("a.ab");
         let mut a = std::fs::File::create(&a_path).unwrap();
-        writeln!(a, "include \"b.abide\"").unwrap();
-        writeln!(a, "include \"c.abide\"").unwrap();
+        writeln!(a, "include \"b.ab\"").unwrap();
+        writeln!(a, "include \"c.ab\"").unwrap();
 
-        let b_path = dir.path().join("b.abide");
+        let b_path = dir.path().join("b.ab");
         let mut b = std::fs::File::create(&b_path).unwrap();
-        writeln!(b, "include \"a.abide\"").unwrap();
+        writeln!(b, "include \"a.ab\"").unwrap();
 
-        let c_path = dir.path().join("c.abide");
+        let c_path = dir.path().join("c.ab");
         let mut c = std::fs::File::create(&c_path).unwrap();
         writeln!(c, "enum GoodType = A | B").unwrap();
 
@@ -423,29 +423,29 @@ mod tests {
 
     #[test]
     fn failed_include_does_not_poison_stack() {
-        // A includes bad.abide (parse error) and then includes good.abide
-        // which also includes bad.abide. The failed load of bad.abide must
-        // not leave it on the include stack, otherwise good.abide's include
-        // of bad.abide would be falsely reported as a circular include.
+        // A includes bad.ab (parse error) and then includes good.ab
+        // which also includes bad.ab. The failed load of bad.ab must
+        // not leave it on the include stack, otherwise good.ab's include
+        // of bad.ab would be falsely reported as a circular include.
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let bad_path = dir.path().join("bad.abide");
+        let bad_path = dir.path().join("bad.ab");
         let mut bad = std::fs::File::create(&bad_path).unwrap();
         writeln!(bad, "import \"broken\"").unwrap(); // parse error
 
-        let good_path = dir.path().join("good.abide");
+        let good_path = dir.path().join("good.ab");
         let mut good = std::fs::File::create(&good_path).unwrap();
-        writeln!(good, "include \"bad.abide\"").unwrap();
+        writeln!(good, "include \"bad.ab\"").unwrap();
 
-        let main_path = dir.path().join("main.abide");
+        let main_path = dir.path().join("main.ab");
         let mut main_f = std::fs::File::create(&main_path).unwrap();
-        writeln!(main_f, "include \"bad.abide\"").unwrap();
-        writeln!(main_f, "include \"good.abide\"").unwrap();
+        writeln!(main_f, "include \"bad.ab\"").unwrap();
+        writeln!(main_f, "include \"good.ab\"").unwrap();
 
         let (env, load_errors, _) = load_files(&[main_path]);
         assert!(load_errors.is_empty(), "top-level should succeed");
 
-        // Should have parse errors for bad.abide but NO circular include errors
+        // Should have parse errors for bad.ab but NO circular include errors
         let circular: Vec<_> = env
             .include_load_errors
             .iter()
@@ -460,24 +460,24 @@ mod tests {
     #[test]
     fn bad_include_does_not_block_good_sibling() {
         // Create a temp directory with three files:
-        // - main.abide: includes both bad.abide and good.abide
-        // - bad.abide: has a parse error
-        // - good.abide: is valid
+        // - main.ab: includes both bad.ab and good.ab
+        // - bad.ab: has a parse error
+        // - good.ab: is valid
         let dir = tempfile::tempdir().expect("create tempdir");
 
-        let bad_path = dir.path().join("bad.abide");
+        let bad_path = dir.path().join("bad.ab");
         let mut bad = std::fs::File::create(&bad_path).unwrap();
         writeln!(bad, "import \"something\" as X").unwrap(); // removed keyword → parse error
 
-        let good_path = dir.path().join("good.abide");
+        let good_path = dir.path().join("good.ab");
         let mut good = std::fs::File::create(&good_path).unwrap();
         writeln!(good, "enum GoodType = A | B").unwrap();
 
-        let main_path = dir.path().join("main.abide");
+        let main_path = dir.path().join("main.ab");
         let mut main_f = std::fs::File::create(&main_path).unwrap();
         writeln!(main_f, "module Test").unwrap();
-        writeln!(main_f, "include \"bad.abide\"").unwrap();
-        writeln!(main_f, "include \"good.abide\"").unwrap();
+        writeln!(main_f, "include \"bad.ab\"").unwrap();
+        writeln!(main_f, "include \"good.ab\"").unwrap();
 
         let (env, load_errors, _all_paths) = load_files(&[main_path]);
 

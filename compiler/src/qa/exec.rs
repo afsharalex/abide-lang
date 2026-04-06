@@ -137,12 +137,42 @@ pub fn execute_query(model: &FlowModel, query: &Query) -> QueryResult {
         Query::Entities => QueryResult::NameList(model.entity_names.clone()),
         Query::Systems => QueryResult::NameList(model.systems.keys().cloned().collect()),
         Query::Types => QueryResult::NameList(model.type_names.clone()),
-        Query::Invariants { entity } => QueryResult::Error(format!(
-            "invariant queries for '{entity}' not yet implemented"
-        )),
-        Query::Contracts { entity, action } => QueryResult::Error(format!(
-            "contract queries for '{entity}.{action}' not yet implemented"
-        )),
+        Query::Invariants { entity } => {
+            // Return all action contracts (guards) for the entity as invariants.
+            // These are the requires clauses that constrain entity state transitions.
+            let mut invariants: Vec<String> = Vec::new();
+            for ((ent, action), contract) in &model.action_contracts {
+                if ent == entity {
+                    if contract.guard != "true" {
+                        invariants.push(format!("{action}: requires {}", contract.guard));
+                    }
+                }
+            }
+            if invariants.is_empty() {
+                QueryResult::NameList(vec![format!("no action guards found for '{entity}'")])
+            } else {
+                invariants.sort();
+                QueryResult::NameList(invariants)
+            }
+        }
+        Query::Contracts { entity, action } => {
+            match model.action_contracts.get(&(entity.clone(), action.clone())) {
+                Some(contract) => {
+                    let mut parts = Vec::new();
+                    parts.push(format!("requires {}", contract.guard));
+                    if let Some(ref post) = contract.postcondition {
+                        parts.push(format!("ensures {post}"));
+                    }
+                    for update in &contract.updates {
+                        parts.push(format!("updates {update}"));
+                    }
+                    QueryResult::NameList(parts)
+                }
+                None => QueryResult::Error(format!(
+                    "no action '{action}' found on entity '{entity}'"
+                )),
+            }
+        }
         Query::Events { entity, field } => {
             let mut event_names = Vec::new();
             for sys in model.systems.values() {
@@ -419,6 +449,7 @@ mod tests {
             systems,
             entity_names: vec!["Order".to_owned()],
             type_names: vec!["OrderStatus".to_owned()],
+            action_contracts: std::collections::HashMap::new(),
         }
     }
 

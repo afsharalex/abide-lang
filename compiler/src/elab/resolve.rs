@@ -497,8 +497,19 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
     for entity in env.entities.values_mut() {
         for field in &mut entity.fields {
             field.ty = ctx.resolve_ty(&field.ty);
-            if let Some(def) = &mut field.default {
-                *def = resolve_expr(ctx, &HashMap::new(), def);
+            match &mut field.default {
+                Some(crate::elab::types::EFieldDefault::Value(ref mut e)) => {
+                    *e = resolve_expr(ctx, &HashMap::new(), e);
+                }
+                Some(crate::elab::types::EFieldDefault::In(ref mut es)) => {
+                    for e in es.iter_mut() {
+                        *e = resolve_expr(ctx, &HashMap::new(), e);
+                    }
+                }
+                Some(crate::elab::types::EFieldDefault::Where(ref mut e)) => {
+                    *e = resolve_expr(ctx, &HashMap::new(), e);
+                }
+                None => {}
             }
         }
         for action in &mut entity.actions {
@@ -637,10 +648,13 @@ fn resolve_verifies(env: &mut Env, ctx: &Ctx) {
 
 fn resolve_scenes(env: &mut Env, ctx: &Ctx) {
     for scene in &mut env.scenes {
-        // Collect given variables as binders — they scope over when/then sections
+        // Collect given variables as binders — they scope over when/then sections.
+        // Given vars get Ty::Entity so that field accesses (o.status) carry the
+        // entity type, enabling downstream checks like match exhaustiveness.
         let mut scene_bound: HashMap<String, Ty> = HashMap::new();
         for given in &mut scene.givens {
-            scene_bound.insert(given.var.clone(), Ty::Unresolved("?".to_owned()));
+            let resolved_ty = ctx.resolve_ty(&Ty::Unresolved(given.entity_type.clone()));
+            scene_bound.insert(given.var.clone(), resolved_ty);
             if let Some(c) = &given.condition {
                 // Given conditions can reference prior given vars
                 given.condition = Some(resolve_expr(ctx, &scene_bound, c));
@@ -833,6 +847,13 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
             args.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
             *sp,
         ),
+        EExpr::QualCall(ty, type_name, func_name, args, sp) => EExpr::QualCall(
+            ty.clone(),
+            type_name.clone(),
+            func_name.clone(),
+            args.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+            *sp,
+        ),
         EExpr::CallR(ty, f, refs, args, sp) => EExpr::CallR(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, f)),
@@ -858,6 +879,9 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
         }
         EExpr::Eventually(ty, e, sp) => {
             EExpr::Eventually(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        }
+        EExpr::Until(ty, l, r, sp) => {
+            EExpr::Until(ty.clone(), Box::new(resolve_expr(ctx, bound, l)), Box::new(resolve_expr(ctx, bound, r)), *sp)
         }
         EExpr::Assert(ty, e, sp) => {
             EExpr::Assert(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
@@ -1095,6 +1119,45 @@ fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
                 .map(|e| Box::new(resolve_expr(ctx, bound, e))),
             *sp,
         ),
+        // ── Collection literals: resolve elements and infer collection type ──
+        EExpr::SetLit(_ty, elems, sp) => {
+            let resolved_elems: Vec<EExpr> =
+                elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+            // Infer element type from first element (or leave as unresolved)
+            let elem_ty = resolved_elems
+                .first()
+                .map(|e| e.ty().clone())
+                .unwrap_or_else(|| Ty::Unresolved("?".to_owned()));
+            EExpr::SetLit(Ty::Set(Box::new(elem_ty)), resolved_elems, *sp)
+        }
+        EExpr::SeqLit(_ty, elems, sp) => {
+            let resolved_elems: Vec<EExpr> =
+                elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+            let elem_ty = resolved_elems
+                .first()
+                .map(|e| e.ty().clone())
+                .unwrap_or_else(|| Ty::Unresolved("?".to_owned()));
+            EExpr::SeqLit(Ty::Seq(Box::new(elem_ty)), resolved_elems, *sp)
+        }
+        EExpr::MapLit(_ty, entries, sp) => {
+            let resolved_entries: Vec<(EExpr, EExpr)> = entries
+                .iter()
+                .map(|(k, v)| (resolve_expr(ctx, bound, k), resolve_expr(ctx, bound, v)))
+                .collect();
+            let key_ty = resolved_entries
+                .first()
+                .map(|(k, _)| k.ty().clone())
+                .unwrap_or_else(|| Ty::Unresolved("?".to_owned()));
+            let val_ty = resolved_entries
+                .first()
+                .map(|(_, v)| v.ty().clone())
+                .unwrap_or_else(|| Ty::Unresolved("?".to_owned()));
+            EExpr::MapLit(
+                Ty::Map(Box::new(key_ty), Box::new(val_ty)),
+                resolved_entries,
+                *sp,
+            )
+        }
         e => e.clone(),
     }
 }

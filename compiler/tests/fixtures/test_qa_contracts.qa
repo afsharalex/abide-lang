@@ -1,0 +1,11 @@
+// QA test script — invariant and contract queries
+load "commerce.ab"
+
+// Ask for invariants on Order (should list action guards)
+ask invariants on Order
+
+// Ask for contract on a specific action
+ask contracts on Order.submit
+
+// Ask for contract on another action
+ask contracts on Order.ship

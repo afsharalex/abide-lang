@@ -6,7 +6,7 @@
 abide <COMMAND> <FILE...> [OPTIONS]
 ```
 
-The compiler uses subcommands. Most commands accept one or more `.abide` source files. When multiple files are provided, the compiler loads them all into a shared environment, resolves `include` directives transitively, and applies module-scoped `use` declarations before elaboration.
+The compiler uses subcommands. Most commands accept one or more `.ab` source files. When multiple files are provided, the compiler loads them all into a shared environment, resolves `include` directives transitively, and applies module-scoped `use` declarations before elaboration.
 
 ### Implemented Commands
 
@@ -54,7 +54,7 @@ The `--bounded-only` and `--unbounded-only` flags are mutually exclusive.
 **Verify a spec with tiered dispatch (induction → IC3 → BMC fallback):**
 
 ```sh
-$ abide verify examples/order.abide
+$ abide verify examples/order.ab
 PROVED  order_safety (method: 1-induction, 35ms)
 PROVED  complex_invariant (method: IC3/PDR, 1200ms)
 CHECKED liveness_check (depth: 10, 200ms)
@@ -64,7 +64,7 @@ PASS    happy_path (3ms)
 **Verify functions with contracts (postconditions, termination, call-site preconditions):**
 
 ```sh
-$ abide verify examples/algorithms.abide
+$ abide verify examples/algorithms.ab
 PROVED  fn factorial (contract, 18ms)
 PROVED  fn gcd (contract, 5ms)
 ```
@@ -72,7 +72,7 @@ PROVED  fn gcd (contract, 5ms)
 **Functions with `assume` report ADMITTED, functions with `sorry` skip verification:**
 
 ```sh
-$ abide verify spec.abide
+$ abide verify spec.ab
 PROVED   fn verified_fn (contract, 12ms)
 ADMITTED fn uses_assume (assume in body, 3ms)
 ADMITTED fn placeholder (sorry in body, 0ms)
@@ -83,7 +83,7 @@ Function contracts (`requires`/`ensures`/`decreases`) are verified automatically
 **Verify multiple files together (multi-module):**
 
 ```sh
-$ abide verify src/commerce.abide src/billing.abide src/spec.abide
+$ abide verify src/commerce.ab src/billing.ab src/spec.ab
 ```
 
 The compiler loads all files, each declaring its own module. `use` declarations bring cross-module names into scope. `include` directives are resolved relative to the including file.
@@ -91,13 +91,13 @@ The compiler loads all files, each declaring its own module. `use` declarations 
 **Parse a spec and check for syntax errors:**
 
 ```sh
-$ abide parse examples/order.abide
+$ abide parse examples/order.ab
 ```
 
 **Emit IR as JSON:**
 
 ```sh
-$ abide emit-ir examples/order.abide
+$ abide emit-ir examples/order.ab
 ```
 
 ---
@@ -111,8 +111,8 @@ The following subcommands are planned but not yet implemented.
 Type-check a specification file or project.
 
 ```sh
-$ abide check spec.abide
-$ abide check .                    # check all .abide files in directory
+$ abide check spec.ab
+$ abide check .                    # check all .ab files in directory
 ```
 
 Validates types, entity fields, action guards, system composition, and name resolution. Reports errors and warnings. This will be the default command for day-to-day spec authoring.
@@ -122,9 +122,9 @@ Validates types, entity fields, action guards, system composition, and name reso
 Run bounded model checking and automated unbounded proof attempts on `verify` blocks.
 
 ```sh
-$ abide verify spec.abide
-$ abide verify spec.abide --unbounded-only
-$ abide verify spec.abide --bounded-only
+$ abide verify spec.ab
+$ abide verify spec.ab --unbounded-only
+$ abide verify spec.ab --bounded-only
 ```
 
 Expected output:
@@ -147,11 +147,11 @@ The solver attempts unbounded proof first, falls back to bounded checking, and r
 
 ### `abide proof`
 
-Check proof obligations in `.proof.abide` files against external backends.
+Check proof obligations in `.proof.ab` files against external backends.
 
 ```sh
-$ abide proof spec.proof.abide
-$ abide proof spec.proof.abide --backend agda
+$ abide proof spec.proof.ab
+$ abide proof spec.proof.ab --backend agda
 ```
 
 Exports proof obligations to the configured backend (Agda, Lean 4, or Rocq) and reports whether they verify.
@@ -174,7 +174,7 @@ Two modes:
 Forward-simulate random event sequences without the solver.
 
 ```sh
-$ abide simulate spec.abide --steps 50 --seed 42
+$ abide simulate spec.ab --steps 50 --seed 42
 ```
 
 Picks random enabled events, applies them, and prints an Event Calculus-style trace. Useful for exploring system behavior interactively.
@@ -195,9 +195,9 @@ Executes scriptable structural checks (`ask`, `explain`, `assert` commands) agai
 
 | Extension | Purpose | Relevant command |
 |-----------|---------|------------------|
-| `.abide` | Definitions (types, entities, systems, functions) | `check` |
-| `.spec.abide` | Verification (verify, scene blocks) | `verify` |
-| `.proof.abide` | Proofs (theorem, lemma blocks) | `proof` |
+| `.ab` | Definitions (types, entities, systems, functions) | `check` |
+| `.spec.ab` | Verification (verify, scene blocks) | `verify` |
+| `.proof.ab` | Proofs (theorem, lemma blocks) | `proof` |
 | `.qa` | QA scripts | `qa` |
 
 These extensions are conventions, not enforced — the CLI subcommand determines execution mode, not the file extension.

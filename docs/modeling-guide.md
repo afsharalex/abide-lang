@@ -342,9 +342,9 @@ Abide doesn't enforce file structure, but convention helps:
 
 | File pattern | Contents | Purpose |
 |-------------|----------|---------|
-| `*.abide` | Types, entities, systems, functions | Definitions — what the system IS |
-| `*.spec.abide` | Verify blocks, scenes, predicates, properties | Verification — does it work? |
-| `*.proof.abide` | Theorems, lemmas, axioms | Proofs — why does it work? |
+| `*.ab` | Types, entities, systems, functions | Definitions — what the system IS |
+| `*.spec.ab` | Verify blocks, scenes, predicates, properties | Verification — does it work? |
+| `*.proof.ab` | Theorems, lemmas, axioms | Proofs — why does it work? |
 
 Every file declares its module: `module Commerce` at the top. Multiple files can share a module. Use `use Commerce::*` to bring names into scope across modules.
 
