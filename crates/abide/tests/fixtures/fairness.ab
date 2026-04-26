@@ -1,0 +1,88 @@
+module Fairness
+
+// Liveness and fairness tests
+//
+// Fairness lives in `assume { }` blocks on the verification site,
+// not as declaration modifiers.
+
+enum Light = Red | Green
+
+entity Signal {
+  color: Light = @Red
+  action go_green() requires color == @Red { color' = @Green }
+  action go_red() requires color == @Green { color' = @Red }
+}
+
+system FairTraffic(signals: Store<Signal>) {
+
+  command create_signal()
+
+  step create_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+
+  command reset()
+
+  step reset() {
+    choose s: Signal where s.color == @Green { s.go_red() }
+  }
+}
+
+system UnfairTraffic(signals: Store<Signal>) {
+
+  command create_signal()
+
+  step create_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+
+  command reset()
+
+  step reset() {
+    choose s: Signal where s.color == @Green { s.go_red() }
+  }
+}
+
+// Fair events + small scope: liveness should be CHECKED
+verify fair_signal {
+  assume {
+    store signals: Signal[0..3]
+    let fairTraffic = FairTraffic { signals: signals }
+    fair FairTraffic::create_signal
+    fair FairTraffic::toggle
+    fair FairTraffic::reset
+  }
+  assert all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// Unfair toggle: liveness should find LIVENESS_VIOLATION
+// (toggle can be starved, signal stays Red forever)
+// Only `reset` is fair — toggle is intentionally not in the assume block.
+verify unfair_signal {
+  assume {
+    store signals: Signal[0..8]
+    let unfairTraffic = UnfairTraffic { signals: signals }
+    fair UnfairTraffic::reset
+  }
+  assert all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// Safety property (no eventually): should still be PROVED/CHECKED normally
+verify safety_check {
+  assume {
+    store signals: Signal[0..5]
+    let fairTraffic = FairTraffic { signals: signals }
+  }
+  assert always all s: Signal |
+    s.color == @Red or s.color == @Green
+}

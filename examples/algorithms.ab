@@ -9,7 +9,7 @@ module Algorithms
 
 // --- Simple recursion with decreases ---
 
-fn factorial(n: Int): Int
+fn factorial(n: int): int
   requires n >= 0
   ensures result >= 1
   decreases n
@@ -22,7 +22,7 @@ fn factorial(n: Int): Int
 
 // --- Multiple requires clauses ---
 
-fn gcd(a: Int, b: Int): Int
+fn gcd(a: int, b: int): int
   requires a > 0
   requires b >= 0
   ensures result > 0
@@ -36,7 +36,7 @@ fn gcd(a: Int, b: Int): Int
 
 // --- Lexicographic decreases tuple ---
 
-fn ack(m: Int, n: Int): Int
+fn ack(m: int, n: int): int
   requires m >= 0
   requires n >= 0
   decreases m, n
@@ -50,7 +50,7 @@ fn ack(m: Int, n: Int): Int
 
 // --- Decreases * escape hatch ---
 
-fn collatz_steps(n: Int): Int
+fn collatz_steps(n: int): int
   requires n > 0
   decreases *
 {
@@ -63,7 +63,7 @@ fn collatz_steps(n: Int): Int
 
 // --- Ensures only (no decreases) ---
 
-fn abs(x: Int): Int
+fn abs(x: int): int
   ensures result >= 0
 {
   match x {
@@ -72,7 +72,7 @@ fn abs(x: Int): Int
   }
 }
 
-fn max(a: Int, b: Int): Int
+fn max(a: int, b: int): int
   ensures result >= a
   ensures result >= b
 {
@@ -84,6 +84,6 @@ fn max(a: Int, b: Int): Int
 
 // --- No contracts (pure = expr form) ---
 
-fn double(x: Int): Int = x + x
+fn double(x: int): int = x + x
 
-fn is_even(n: Int): Bool = n % 2 == 0
+fn is_even(n: int): bool = n % 2 == 0

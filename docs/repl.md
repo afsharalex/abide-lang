@@ -85,9 +85,29 @@ abide repl order.ab       # load a file (+ dependencies)
 | `/help` | Show available commands and syntax for current mode |
 | `/quit` | Exit the REPL |
 | `/reload` | Reload all files from disk, discard in-memory changes |
+| `/verify` | Run verification against the current in-memory environment |
+| `/simulate [options]` | Run one seeded forward simulation against the current in-memory environment |
+| `/artifacts` | List stored native evidence and simulation artifacts |
+| `/show artifact <selector>` | Show artifact metadata and evidence summary |
+| `/draw artifact <selector>` | Render a timeline view for temporal/operational artifacts |
+| `/state artifact <selector> <n>` | Inspect a specific witness state |
+| `/diff artifact <selector> <a> <b>` | Compare two witness states |
+| `/export artifact <selector> json` | Print raw artifact JSON for one artifact |
 | `/schema` | Show all loaded entities with fields and types |
 | `/qa` | Switch to QA mode |
 | `/abide` | Switch to Abide mode |
+
+Artifact selectors can be a numeric session ID (`1`), a source name (`order_safety`), or a kind-qualified name (`counterexample:order_safety`). Plain names resolve to the latest stored artifact with that source name in the current session.
+
+`/simulate` accepts the same controls as the CLI command, minus file arguments:
+
+```text
+/simulate [--steps N] [--seed N] [--slots N] [--scope Entity=N]... [--system NAME]
+```
+
+Simulation artifacts use the `simulation:<name>` selector form, where `<name>` is the explicit `--system` target when present or the first simulated system name otherwise.
+
+Artifacts are session-local. `/reload` and in-memory definition changes invalidate stored artifacts so you do not inspect evidence for an older program state by mistake.
 
 ## Keybindings
 
@@ -137,3 +157,11 @@ REPL / QA query executor
 The FlowModel is computed on load and rebuilt on `/reload` or after in-memory definitions. All QA queries execute against the FlowModel using graph traversals — no solver invocation, no file I/O. Responses are instant.
 
 Abide mode definitions modify the in-memory IR and rebuild the FlowModel. They don't touch the file system.
+
+`/verify` and `/simulate` use the current in-memory IR, not just the on-disk files. Evidence-bearing verification results and simulation runs are stored as native session-local artifacts. The artifact commands operate on those native objects rather than on flattened terminal output.
+
+Today, the REPL stores:
+- evidence-bearing verification results that already emit native evidence objects: counterexamples, liveness violations, deadlocks, and admitted proof-artifact references
+- native simulation runs produced by `/simulate`
+
+Scene results are still printed by `/verify`, but they do not yet produce native artifacts.

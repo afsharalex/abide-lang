@@ -1,0 +1,206 @@
+module NestedActions
+
+// Nested actions in Choose/ForAll
+
+enum TaskStatus = Open | InProgress | Done
+enum LogKind = Started | Completed
+
+entity Task {
+  status: TaskStatus = @Open
+  action start() requires status == @Open { status' = @InProgress }
+  action complete() requires status == @InProgress { status' = @Done }
+}
+
+entity AuditLog {
+  kind: LogKind = @Started
+  action set_completed() requires kind == @Started { kind' = @Completed }
+}
+
+// ── Test 1: Create inside Choose ────────────────────────────────────
+
+system CreateInChoose(tasks: Store<Task>, auditLogs: Store<AuditLog>) {
+
+  command start_with_log()
+
+  step start_with_log() {
+    choose t: Task where t.status == @Open {
+      t.start()
+      create AuditLog {}
+    }
+  }
+}
+
+// After start_with_log fires, if a task became InProgress then
+// an AuditLog must exist. Should be CHECKED.
+//
+// Opt into stutter so the BMC trace can vacuously hold
+// when no Tasks have been created (the system has no create_task
+// step; under no-stutter the deadlock detector would short-circuit
+// before BMC ran).
+verify create_in_choose {
+  assume {
+    stutter
+    store tasks: Task[0..3]
+    store auditLogs: AuditLog[0..3]
+    let createInChoose = CreateInChoose { tasks: tasks, auditLogs: auditLogs }
+  }
+  assert always (
+    all t: Task | t.status == @InProgress implies
+      exists l: AuditLog | l.kind == @Started
+  )
+}
+
+// ── Test 2: Create inside ForAll ────────────────────────────────────
+
+system CreateInForAll(tasks: Store<Task>, auditLogs: Store<AuditLog>) {
+
+  // For each active task, start it and create an audit log
+  command start_all_with_logs()
+
+  step start_all_with_logs() {
+    for t: Task {
+      t.start()
+      create AuditLog {}
+    }
+  }
+}
+
+// After starting tasks, if any task is InProgress then an AuditLog
+// should exist. Should be CHECKED.
+verify create_in_forall {
+  assume {
+    store tasks: Task[0..3]
+    store auditLogs: AuditLog[0..3]
+    let createInForAll = CreateInForAll { tasks: tasks, auditLogs: auditLogs }
+  }
+  assert always (
+    all t: Task | t.status == @InProgress implies
+      exists l: AuditLog | l.kind == @Started
+  )
+}
+
+// ── Test 3: CrossCall INSIDE Choose ─────────────────────────────────
+
+system Logger(auditLogs: Store<AuditLog>) {
+
+  command log_complete()
+
+  step log_complete() {
+    choose l: AuditLog where l.kind == @Started {
+      l.set_completed()
+    }
+  }
+}
+
+system CrossCallInChoose(tasks: Store<Task>) {
+
+  // CrossCall is nested inside the Choose block
+  command complete_and_log()
+
+  step complete_and_log() {
+    choose t: Task where t.status == @InProgress {
+      t.complete()
+      Logger::log_complete()
+    }
+  }
+}
+
+// After completing a task, it should be Done. Should be CHECKED.
+//
+// Opt into stutter for the same reason as create_in_choose:
+// the system has no create_task step, so a no-stutter trace can't
+// extend past the initial state.
+verify crosscall_in_choose {
+  assume {
+    stutter
+    store tasks: Task[0..3]
+    let crossCallInChoose = CrossCallInChoose { tasks: tasks }
+  }
+  assert always (
+    all t: Task | t.status == @Done implies t.status == @Done
+  )
+}
+
+// ── Test 4: ForAll INSIDE Choose ────────────────────────────────────
+
+entity Worker {
+  status: TaskStatus = @Open
+  action activate() requires status == @Open { status' = @InProgress }
+  action deactivate() requires status == @InProgress { status' = @Open }
+  // start() exists on Worker (goes to Done) — used to verify that nested
+  // Choose framing prevents the solver from applying the wrong action
+  action start() requires status == @Open { status' = @Done }
+}
+
+system ForAllInChoose(tasks: Store<Task>, workers: Store<Worker>) {
+
+  // ForAll is nested inside the Choose block
+  command start_and_deactivate()
+
+  step start_and_deactivate() {
+    choose t: Task where t.status == @Open {
+      t.start()
+      for w: Worker {
+        w.deactivate()
+      }
+    }
+  }
+}
+
+// After the step, if a task is InProgress then no worker should
+// remain InProgress (they were all deactivated). Should be CHECKED.
+//
+// Opt into stutter for the same reason: there is no `create_task` step.
+verify forall_in_choose {
+  assume {
+    stutter
+    store tasks: Task[0..3]
+    store workers: Worker[0..3]
+    let forAllInChoose = ForAllInChoose { tasks: tasks, workers: workers }
+  }
+  assert always (
+    all t: Task | t.status == @InProgress implies
+      no w: Worker | w.status == @InProgress
+  )
+}
+
+// ── Test 5: Cross-entity Apply target ───────────────────────────────
+// Ensures that Apply targets are resolved correctly when the target
+// is not the inner bound variable (e.g., t.start() inside choose w:).
+
+system CrossEntityApply(tasks: Store<Task>, workers: Store<Worker>) {
+
+  command make_task()
+
+  step make_task() { create Task {} }
+
+  command make_worker()
+
+  step make_worker() { create Worker {} }
+
+  // t.start() targets the outer Choose variable, NOT the inner Worker.
+  // The inner Worker slot has NO Apply — it must be framed (unchanged).
+  // Worker.start() exists and goes to @Done, so without framing, the
+  // solver could mutate the Worker to @Done.
+  command start_task_via_inner_choose()
+
+  step start_task_via_inner_choose() {
+    choose t: Task where t.status == @Open {
+      choose w: Worker where w.status == @Open {
+        t.start()
+      }
+    }
+  }
+}
+
+// Worker should never reach Done. Even though Worker.start() exists
+// (Open -> Done), only t.start() fires in the event body. The inner
+// Worker slot must be framed to prevent the solver from mutating it.
+verify cross_entity_target {
+  assume {
+    store tasks: Task[0..5]
+    store workers: Worker[0..5]
+    let crossEntityApply = CrossEntityApply { tasks: tasks, workers: workers }
+  }
+  assert always (all w: Worker | w.status != @Done)
+}

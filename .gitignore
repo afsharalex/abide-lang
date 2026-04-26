@@ -2,6 +2,10 @@
 *.swp
 *.swo
 
-# Keep this repo language-focused
-compiler/target/
-compiler/.z3-trace
+/target
+**/.z3-trace
+vendor/z3/.github/
+vendor/z3/doc/
+vendor/z3/docker/
+vendor/z3/examples/
+vendor/z3/scripts/__pycache__/

@@ -28,9 +28,9 @@ The most important structural decision: what's an entity vs what's a system.
 
 ```abide
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action confirm() requires status == @Pending {
     status' = @Confirmed
@@ -44,11 +44,11 @@ entity Order {
 system Commerce {
   use Order
 
-  event place_order(total: Real) {
+  event place_order(total: real) {
     create Order { total = total }
   }
 
-  event confirm_order(order_id: Id) {
+  event confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.confirm()
     }
@@ -79,11 +79,11 @@ Before writing entities or systems, define the vocabulary of your domain. Enums,
 ```abide
 enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
 enum Priority = Low | Medium | High | Critical
-type Money = Int  // cents, not dollars — avoid floating point in specs
-struct Address { street: String, city: String, zip: String }
+type Money = int  // cents, not dollars — avoid floating point in specs
+struct Address { street: string, city: string, zip: string }
 ```
 
-Enums define finite state spaces. Structs group related data. Type aliases (`type Money = Int`) give meaningful names to built-in types. Together they describe the conceptual landscape before any behavior is added.
+Enums define finite state spaces. Structs group related data. Type aliases (`type Money = int`) give meaningful names to built-in types. Together they describe the conceptual landscape before any behavior is added.
 
 A well-typed spec catches mistakes at the structural level: if `Priority` and `OrderStatus` are different types, you can't accidentally compare them.
 
@@ -112,7 +112,7 @@ This means an entity IS a state machine. The actions define the transitions, the
 Events are what the outside world can trigger. They're defined in systems, and they invoke entity actions:
 
 ```abide
-event freeze_account(account_id: Id)
+event freeze_account(account_id: identity)
   requires exists a: Account | a.id == account_id and a.status == @Active {
   choose a: Account where a.id == account_id {
     a.freeze()
@@ -168,7 +168,7 @@ This says: "with up to 500 entities, try every possible event ordering. Does the
 
 > **Side note on scope:** The scope pre-allocates entity slots — like reserving seats. `Banking[0..500]` means "at most 500 entity instances can exist." The `create` keyword activates a slot. When all slots are active, no more can be created. This is how Alloy works under the hood — the scope IS the universe.
 
-### Run and simulate *(in development — syntax subject to change)*
+### Run and simulate
 
 Per-entity-type scope gives finer control over the verification universe:
 
@@ -192,18 +192,24 @@ run workflow_test ->
 }
 ```
 
-Simulation mode explores random traces for larger systems where exhaustive checking is too expensive:
+Simulation mode explores one seeded forward trace for larger systems where you want execution feedback without invoking the solver:
 
-```abide
-simulate stress_test ->
-  User[100], Order[1000], Payment[500]
-  for 5000
-  traces 200 {
-  assert always (all o: Order | o.total >= 0)
-}
+```sh
+$ abide simulate commerce.ab --steps 200 --seed 42 --slots 8
+$ abide simulate banking.ab --system TransferSystem --steps 100 --seed 7 --scope Account=12 --scope Transfer=6
 ```
 
-Run 200 random traces of 5000 steps each. Not complete, but practical. Most real bugs show up in random traces.
+This runs the current executable system semantics against a concrete in-memory state and prints the resulting operational trace.
+
+Use simulation when you want:
+- a concrete seeded execution
+- quick feedback on event flow and state updates
+- to exercise imperative helper logic without asking the solver for a proof
+
+Do not use simulation as a substitute for `verify` or `scene`:
+- `simulate` is not exhaustive bounded search
+- it does not prove properties
+- it does not execute proof-oriented temporal expressions
 
 ### Theorem — "does it hold for all sizes?"
 
@@ -229,7 +235,7 @@ You don't need to write everything at once. Start with types and entities — ju
 enum OrderStatus = Pending | Confirmed | Shipped
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus
 }
 ```
@@ -238,7 +244,7 @@ Run the checker. See what instances exist. Does the state space look right? Are 
 
 ```abide
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
 
   action confirm() requires status == @Pending { status' = @Confirmed }
@@ -263,7 +269,7 @@ Name your constraints:
 
 ```abide
 pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: Real) = a.balance >= amount
+pred has_funds(a: Account, amount: real) = a.balance >= amount
 
 prop no_overdraft for Banking = always (all a: Account | a.balance >= 0)
 ```
@@ -287,10 +293,10 @@ assert always (all a: Account | is_active(a) implies has_funds(a, 0))
 Pure functions (`fn`) compute values without side effects:
 
 ```abide
-fn calculate_total(subtotal: Real, tax_rate: Real): Real =
+fn calculate_total(subtotal: real, tax_rate: real): real =
   subtotal + (subtotal * tax_rate)
 
-fn is_eligible(age: Int): Bool = age >= 18
+fn is_eligible(age: int): bool = age >= 18
 ```
 
 Functions are great for business rules, derived values, and computations that multiple events share.
@@ -307,17 +313,17 @@ Use `Set`, `Seq`, and `Map` for entity relationships and structured data:
 
 ```abide
 entity Workflow {
-  id: Id
-  name: String
-  node_ids: Set<Id>
-  variables: Map<String, String>
+  id: identity
+  name: string
+  node_ids: Set<identity>
+  variables: Map<string, string>
 }
 ```
 
 Update maps with the `[k := v]` syntax:
 
 ```abide
-action set_variable(key: String, value: String) {
+action set_variable(key: string, value: string) {
   variables' = variables[key := value]
 }
 ```
@@ -359,10 +365,10 @@ For larger projects, separate structure from behavior from verification. For sma
 When different behavior depends on data, use separate events with discriminating `requires` clauses:
 
 ```abide
-event process_standard(order_id: Id)
+event process_standard(order_id: identity)
   requires exists o: Order | o.id == order_id and o.priority == @Standard { ... }
 
-event process_express(order_id: Id)
+event process_express(order_id: identity)
   requires exists o: Order | o.id == order_id and o.priority == @Express { ... }
 ```
 
@@ -376,7 +382,7 @@ Cross-system coordination through event calls:
 system OrderFulfillment {
   use Order
 
-  event fulfill(order_id: Id) {
+  event fulfill(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.ship()
     }
@@ -396,14 +402,14 @@ Model entity creation, state transitions, and (optionally) destruction as a comp
 system SessionManager {
   use Session
 
-  event login(user_id: Id) {
+  event login(user_id: identity) {
     create Session {
       user_id = user_id
       status = @Active
     }
   }
 
-  event logout(session_id: Id) {
+  event logout(session_id: identity) {
     choose s: Session where s.id == session_id {
       s.expire()
     }

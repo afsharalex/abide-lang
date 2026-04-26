@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/abide",
+    "crates/abide-lsp",
+    "crates/abide-core",
+    "crates/abide-syntax",
+    "crates/abide-sema",
+    "crates/abide-ir",
+    "crates/abide-witness",
+    "crates/abide-verify",
+    "crates/abide-qa",
+]
+default-members = ["crates/abide"]
+resolver = "2"

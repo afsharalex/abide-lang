@@ -1,0 +1,63 @@
+module MatchTest
+
+// Match expression examples — exercises all pattern features
+
+enum OrderStatus = Pending | Confirmed | Shipped | Cancelled
+
+enum Shape = Circle { radius: int } | Rectangle { width: int, height: int }
+
+enum Expr = Lit { value: int } | Neg { inner: Expr } | Add { left: Expr, right: Expr }
+
+// Simple constructor patterns
+fn status_label(s: OrderStatus): string
+  = match s {
+    Pending => "waiting"
+    Confirmed => "confirmed"
+    Shipped => "shipped"
+    Cancelled => "cancelled"
+  }
+
+// Record destructuring
+fn area(s: Shape): int
+  = match s {
+    Circle { radius: r } => r * r
+    Rectangle { width: w, height: h } => w * h
+  }
+
+// Guards
+fn classify_shape(s: Shape): string
+  = match s {
+    Circle { radius: r } if r > 100 => "large circle"
+    Circle { radius: r } if r > 10 => "medium circle"
+    Circle { .. } => "small circle"
+    Rectangle { width: w, height: h } if w == h => "square"
+    Rectangle { .. } => "rectangle"
+  }
+
+// Or-patterns
+fn is_terminal(s: OrderStatus): bool
+  = match s {
+    Shipped | Cancelled => true
+    _ => false
+  }
+
+// Wildcard
+fn has_value(s: OrderStatus): bool
+  = match s {
+    Pending => false
+    _ => true
+  }
+
+// Rest pattern (..)
+fn get_radius(s: Shape): int
+  = match s {
+    Circle { radius: r, .. } => r
+    _ => 0
+  }
+
+// Nested patterns (matching inside ADT variants)
+fn is_double_neg(e: Expr): bool
+  = match e {
+    Neg { inner: Neg { inner: _ } } => true
+    _ => false
+  }

@@ -6,17 +6,17 @@ module Workflow
 enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
 
 entity Document {
-  id: Id
+  id: identity
   status: DocStatus = @Draft
-  author_id: Id
-  reviewer_id: Id
-  revision_count: Int = 0
+  author_id: identity
+  reviewer_id: identity
+  revision_count: int = 0
 
   action submit() requires status == @Draft {
     status' = @Submitted
   }
 
-  action begin_review(reviewer: Id)
+  action begin_review(reviewer: identity)
     requires status == @Submitted
     requires reviewer != author_id {
     status' = @UnderReview
@@ -58,7 +58,7 @@ system Publishing {
     d.submit()
   }
 
-  event review(d: Document, reviewer: Id)
+  event review(d: Document, reviewer: identity)
     requires d.status == @Submitted
     requires reviewer != d.author_id {
     d.begin_review(reviewer)

@@ -1,0 +1,33 @@
+module CommandStepQuery
+
+entity Order {
+  id: int = 0
+  status: int = 0
+  total: int = 0
+
+  action mark_paid() {
+    status' = 1
+  }
+}
+
+system Billing(orders: Store<Order>) {
+
+  command charge(order: Order)
+
+  query payable(order: Order) =
+    order.status == 0
+
+  step charge(order: Order)
+    requires payable(order)
+  {
+    order.mark_paid()
+  }
+}
+
+verify billing_safety {
+  assume {
+    store orders: Order[0..2]
+    let billing = Billing { orders: orders }
+  }
+  assert always (all o: Order | o.status == 1 implies o.total >= 0)
+}

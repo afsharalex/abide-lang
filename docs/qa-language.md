@@ -8,7 +8,7 @@ QA runs in two contexts:
 - **Interactive** — via `/qa` mode in the [REPL](repl.md)
 - **Scripted** — via `abide qa script.qa` for CI/CD
 
-## Three Statement Types
+## Statement Types
 
 | Statement | Purpose | Output |
 |-----------|---------|--------|
@@ -16,6 +16,14 @@ QA runs in two contexts:
 | `explain <query>` | Query with reasoning trace | Verbose informational |
 | `assert <query>` | Query, fail if false | CI/CD gate (non-zero exit) |
 | `load "path"` | Load specs from file or directory | N/A (scripts only) |
+| `verify` | Run verification on the current in-memory spec and store evidence-bearing results as artifacts | Verification results + stored artifacts |
+| `simulate [options]` | Run one seeded forward simulation and store the run as an artifact | Simulation summary + stored artifact |
+| `artifacts` | List stored artifacts from earlier `verify` or `simulate` statements | Artifact summaries |
+| `show artifact <selector>` | Show artifact metadata and evidence summary | Artifact details |
+| `draw artifact <selector>` | Draw a timeline view when the artifact is temporal | Timeline |
+| `state artifact <selector> <n>` | Inspect a specific artifact state | State dump |
+| `diff artifact <selector> <a> <b>` | Compare two artifact states | State diff |
+| `export artifact <selector> json` | Print raw artifact JSON | JSON |
 
 ## Query Vocabulary
 
@@ -81,7 +89,7 @@ Assertions return non-zero exit code on failure, making them suitable for CI/CD 
 
 ## QA Scripts
 
-QA scripts are `.qa` files containing `load`, `ask`, `explain`, and `assert` statements. No Abide code — specs are loaded separately.
+QA scripts are `.qa` files containing `load`, `ask`, `explain`, `assert`, `verify`, `simulate`, and artifact inspection statements. `verify` and `simulate` store native artifacts in the current script session; the artifact commands inspect those stored objects rather than scraping terminal output.
 
 ```
 // commerce.qa
@@ -117,6 +125,38 @@ explain not reachable Order.status -> @Refunded:
 
 4/4 assertions passed
 ```
+
+## Artifacts In QA Scripts
+
+`verify` runs the normal verification pipeline against the current in-memory spec and stores any evidence-bearing results as session-local artifacts. `simulate` runs one seeded forward execution and stores the resulting timeline as a native simulation artifact.
+
+```qa
+load "src/commerce/"
+
+verify
+simulate --steps 8 --seed 7 --system Commerce
+artifacts
+show artifact order_safety
+draw artifact simulation:Commerce
+state artifact simulation:Commerce 0
+state artifact counterexample:order_safety 0
+export artifact order_safety json
+```
+
+Artifact selectors can be:
+- a numeric session ID (`1`)
+- a source name (`order_safety`)
+- a kind-qualified name (`counterexample:order_safety`)
+
+Plain names resolve to the latest stored artifact with that source name in the current session. Numeric IDs remain available as low-level handles.
+
+Artifacts are invalidated when the script changes the in-memory spec with an `abide { }` block, because the old evidence may no longer correspond to the new model.
+
+Today, QA stores:
+- evidence-bearing verification results that already emit native evidence objects: counterexamples, liveness violations, deadlocks, and admitted proof-artifact references
+- native simulation runs produced by `simulate`
+
+Scene results are still printed by `verify`, but they do not yet produce native artifacts.
 
 ## Hypothetical Scenarios
 
@@ -161,7 +201,7 @@ If a user-defined name shadows a QA subcommand keyword, the module qualifier res
 
 ## Key Design Decisions
 
-**QA is its own language.** Not embedded Abide, not a library. Four statement types (`ask`/`explain`/`assert`/`load`) plus `abide { }` blocks. Simple grammar, easy to learn, easy to parse.
+**QA is its own language.** Not embedded Abide, not a library. Query statements (`ask`/`explain`/`assert`), load/overlay statements (`load`, `abide { }`), and verification-artifact statements (`verify`, `artifacts`, `show`, `draw`, `state`, `diff`, `export`). Simple grammar, easy to learn, easy to parse.
 
 **Graph-based, not solver-based.** QA queries execute against a FlowModel — a precomputed graph of state transitions extracted from the IR. No SMT solver invocation. Responses are instant (microseconds). Solver-backed analysis belongs to `abide verify`.
 

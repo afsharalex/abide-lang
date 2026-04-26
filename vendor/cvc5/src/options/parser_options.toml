@@ -1,0 +1,105 @@
+id     = "PARSER"
+name   = "Parser"
+
+[[option]]
+  name       = "strictParsing"
+  category   = "common"
+  long       = "strict-parsing"
+  type       = "bool"
+  default    = "false"
+  predicates = ["strictParsing"]
+  help       = "be less tolerant of non-conforming inputs, this is an alias for --parsing-mode=strict"
+
+[[option]]
+  name       = "parsingMode"
+  category   = "expert"
+  long       = "parsing-mode=MODE"
+  type       = "ParsingMode"
+  default    = "DEFAULT"
+  help       = "choose parsing mode, see --parsing-mode=help"
+  help_mode  = "Parsing modes."
+[[option.mode.DEFAULT]]
+  name = "default"
+  help = "Be reasonably tolerant of non-conforming inputs."
+[[option.mode.STRICT]]
+  name = "strict"
+  help = "Be less tolerant of non-conforming inputs."
+[[option.mode.LENIENT]]
+  name = "lenient"
+  help = "Be more tolerant of non-conforming inputs."
+
+[[option]]
+  name       = "semanticChecks"
+  long       = "semantic-checks"
+  category   = "expert"
+  type       = "bool"
+  default    = "DO_SEMANTIC_CHECKS_BY_DEFAULT"
+  help       = "enable semantic checks, including type checks"
+
+[[option]]
+  name       = "globalDeclarations"
+  long       = "global-declarations"
+  category   = "regular"
+  type       = "bool"
+  default    = "false"
+  help       = "force all declarations and definitions to be global when parsing"
+
+[[option]]
+  name       = "freshDeclarations"
+  long       = "fresh-declarations"
+  category   = "regular"
+  type       = "bool"
+  default    = "true"
+  help       = "use API interface for fresh constants when parsing declarations and definitions"
+
+[[option]]
+  name       = "freshBinders"
+  category   = "expert"
+  long       = "fresh-binders"
+  type       = "bool"
+  default    = "false"
+  help       = "construct fresh variables always when parsing binders"
+
+[[option]]
+  name       = "termSortOverloading"
+  category   = "expert"
+  long       = "term-sort-overload"
+  type       = "bool"
+  default    = "true"
+  help       = "allow overloading of terms and sorts"
+
+# this is to support security in the online version, and in other similar
+# contexts (--no-include-file disables filesystem access in TPTP and SMT2
+# parsers) the name --no-include-file is legacy: it also now limits any
+# filesystem access (read or write) for example by using --dump-to (or the
+# equivalent set-option) or set-option
+# :regular-output-channel/:diagnostic-output-channel.  However, the main driver
+# is still permitted to read the input file given on the command-line if any.
+# creation/use of temp files are still permitted (but the paths aren't given by
+# the user).  Also note this is only safe for the version invoked through the
+# main driver, there are ways via the API to get the cvc5 library to open a file
+# for reading or writing and thus leak information from an existing file, or
+# overwrite an existing file with malicious content.
+[[option]]
+  name       = "filesystemAccess"
+  category   = "expert"
+  long       = "filesystem-access"
+  type       = "bool"
+  default    = "true"
+  help       = "limits the file system access if set to false"
+
+[[option]]
+  name       = "forceLogicString"
+  category   = "common"
+  long       = "force-logic=LOGIC"
+  type       = "std::string"
+  default    = '""'
+  help       = "set the logic, and override all further user attempts to change it"
+
+[[option]]
+  name       = "parseSkolemDefinitions"
+  category   = "expert"
+  long       = "parse-skolem-definitions"
+  type       = "bool"
+  default    = "false"
+  help       = "allows the parsing of skolems in the input file"

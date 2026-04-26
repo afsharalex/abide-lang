@@ -15,24 +15,24 @@ Define the vocabulary of your domain.
 ```abide
 enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
 enum Currency = USD | EUR | GBP
-struct Address { street: String, city: String, zip: String }
+struct Address { street: string, city: string, zip: string }
 ```
 
 Enums (`enum`) define finite state spaces. Structs (`struct`) group related data. Algebraic data types combine both:
 
 ```abide
 enum DosageForm =
-  Tablet { mg: Int }
-  | Liquid { ml: Int }
-  | Injection { dose_mg: Int, route: String }
+  Tablet { mg: int }
+  | Liquid { ml: int }
+  | Injection { dose_mg: int, route: string }
 ```
 
 **Entities** are the stateful objects in your domain — things with identity that change over time:
 
 ```abide
 entity Account {
-  id: Id
-  balance: Real
+  id: identity
+  balance: real
   status: AccountStatus = @Active
   currency: Currency = @USD
 }
@@ -54,7 +54,7 @@ Define how things change.
 entity Account {
   // ...fields...
 
-  action deposit(amount: Real)
+  action deposit(amount: real)
     requires status == @Active
     requires amount > 0
     ensures balance' == balance + amount {
@@ -80,7 +80,7 @@ The key notation:
 system Banking {
   use Account
 
-  event deposit(a: Account, amount: Real)
+  event deposit(a: Account, amount: real)
     requires amount > 0 {
     a.deposit(amount)
   }
@@ -97,7 +97,7 @@ Events are the external interface — what the outside world can trigger. They i
 
 ```abide
 pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: Real) = a.balance >= amount
+pred has_funds(a: Account, amount: real) = a.balance >= amount
 
 prop no_overdraft = all a: Account | a.balance >= 0
 ```
@@ -204,7 +204,7 @@ Beyond system-level properties, some specifications need to verify that a specif
 **Function contracts** attach `requires`, `ensures`, and `decreases` clauses to `fn` declarations. **Imperative bodies** provide `var` for mutable locals, `while` loops with `invariant` and `decreases`, and `if`/`else` expressions. Functions with contracts or imperative logic use the `{ body }` form:
 
 ```abide
-fn gcd(a: Int, b: Int): Int
+fn gcd(a: int, b: int): int
   requires a > 0
   requires b >= 0
   ensures result > 0
@@ -223,11 +223,11 @@ fn gcd(a: Int, b: Int): Int
 }
 ```
 
-- `requires` = precondition (must be Bool)
-- `ensures` = postcondition (must be Bool, `result` refers to the return value)
-- `decreases` = termination measure for recursive functions (must be Int, comma-separated for lexicographic tuples, `*` to skip checking)
+- `requires` = precondition (must be bool)
+- `ensures` = postcondition (must be bool, `result` refers to the return value)
+- `decreases` = termination measure for recursive functions (must be int, comma-separated for lexicographic tuples, `*` to skip checking)
 - `var` = mutable local variable (vs `let` for immutable)
-- `while` = loop with optional `invariant` (must be Bool) and `decreases`
+- `while` = loop with optional `invariant` (must be bool) and `decreases`
 - `if`/`else` = conditional expression (both branches must have the same type)
 - Block evaluates to its last expression — no explicit `return` keyword
 
@@ -235,29 +235,29 @@ fn gcd(a: Int, b: Int): Int
 
 ```abide
 // Refinement type aliases
-type Positive = Int { $ > 0 }
-type Byte = Int { $ >= 0 and $ <= 255 }
+type Positive = int { $ > 0 }
+type Byte = int { $ >= 0 and $ <= 255 }
 
 // Inline refinement on parameters
-fn gcd(a: Int{$ > 0}, b: Int{$ > 0}): Int
+fn gcd(a: int{$ > 0}, b: int{$ > 0}): int
   ensures result > 0
 
 // Left-to-right parameter references — each parameter can reference parameters to its left
-fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int
+fn clamp(lo: int, hi: int{$ > lo}, x: int): int
   ensures result >= lo and result <= hi
 
 // Parameter names can be used directly instead of $
-fn bounded(x: Int{x > 0}, y: Int{y > x}): Int
+fn bounded(x: int{x > 0}, y: int{y > x}): int
 ```
 
-The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: Int{$ > 0})` is equivalent to `fn f(x: Int) requires x > 0`. Both inline refinements and refinement type aliases (like `type Positive = Int { $ > 0 }`) are enforced at call sites.
+The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: int{$ > 0})` is equivalent to `fn f(x: int) requires x > 0`. Both inline refinements and refinement type aliases (like `type Positive = int { $ > 0 }`) are enforced at call sites.
 
 > **Note:** Refinement types are not allowed on return types — use `ensures` for return value constraints. This keeps the grammar unambiguous with imperative function bodies.
 
 **Imperative verification statements** — `assert` and `assume` can appear in function bodies:
 
 ```abide
-fn checked_divide(a: Int, b: Int): Int
+fn checked_divide(a: int, b: int): int
   requires b != 0
 {
   assert b != 0     // VC: proved from requires, then available as fact
@@ -274,19 +274,19 @@ fn checked_divide(a: Int, b: Int): Int
 
 ```abide
 // Quantifiers in ensures/requires (Z3 native encoding)
-fn identity(x: Int): Int
-  ensures all y: Int | result >= y implies x >= y
+fn identity(x: int): int
+  ensures all y: int | result >= y implies x >= y
 { x }
 
 // Set operations: cardinality and set comprehension
-fn count(): Int
+fn count(): int
   ensures result == 3
 { #Set(1, 2, 3) }
 
 // Constructor field destructuring (Z3 algebraic datatypes)
-enum Shape = Circle { radius: Int } | Rect { w: Int, h: Int }
+enum Shape = Circle { radius: int } | Rect { w: int, h: int }
 
-fn perimeter(s: Shape): Int
+fn perimeter(s: Shape): int
 {
   match s {
     Circle { radius: r } => 2 * r
@@ -295,9 +295,9 @@ fn perimeter(s: Shape): Int
 }
 
 // Lambda expressions (uninterpreted functions + axioms)
-fn apply(): Int
+fn apply(): int
   ensures result == 2
-{ (fn(y: Int): Int => y + 1)(1) }
+{ (fn(y: int): int => y + 1)(1) }
 ```
 
 **Verification model** — function contracts are verified automatically by `abide verify`:
@@ -347,7 +347,7 @@ For proofs that exceed what Abide can express directly, the planned approach is 
 
 proof module TransferSafety {
   theorem balance_preserved :
-    forall (a b : Account) (amount : Real).
+    forall (a b : Account) (amount : real).
       a.balance + b.balance == a.balance' + b.balance'
   // proof in "proofs/balance.agda"
 }

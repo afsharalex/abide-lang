@@ -1,0 +1,17 @@
+module NondetDefaultsInvalid
+
+// Regression: invalid nondeterministic defaults must be rejected.
+
+enum Status = Open | Closed
+
+entity BadWhere {
+  x: int where 42
+}
+
+entity BadIn {
+  s: Status in {1}
+}
+
+entity BadBoolIn {
+  b: bool in {1}
+}

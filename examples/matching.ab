@@ -4,20 +4,20 @@ module Matching
 // Demonstrates sum types with record variants and comprehensive match syntax.
 
 enum Shape =
-  Circle { radius: Real }
-  | Rectangle { width: Real, height: Real }
-  | Triangle { base: Real, height: Real }
+  Circle { radius: real }
+  | Rectangle { width: real, height: real }
+  | Triangle { base: real, height: real }
   | Point
 
 enum Expr =
-  Lit { value: Int }
+  Lit { value: int }
   | Add { left: Expr, right: Expr }
   | Neg { inner: Expr }
 
 enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
 
 // Simple constructor matching
-fn status_label(s: OrderStatus): String =
+fn status_label(s: OrderStatus): string =
   match s {
     Pending => "waiting"
     Confirmed => "confirmed"
@@ -27,7 +27,7 @@ fn status_label(s: OrderStatus): String =
   }
 
 // Record destructuring
-fn area(s: Shape): Real =
+fn area(s: Shape): real =
   match s {
     Circle { radius: r } => 3.14159 * r * r
     Rectangle { width: w, height: h } => w * h
@@ -36,7 +36,7 @@ fn area(s: Shape): Real =
   }
 
 // Guards
-fn describe(s: Shape): String =
+fn describe(s: Shape): string =
   match s {
     Circle { radius: r } if r > 100 => "large circle"
     Circle { .. } => "circle"
@@ -46,14 +46,14 @@ fn describe(s: Shape): String =
   }
 
 // Or-patterns
-fn is_terminal(s: OrderStatus): Bool =
+fn is_terminal(s: OrderStatus): bool =
   match s {
     Delivered | Cancelled => true
     _ => false
   }
 
 // Nested patterns
-fn is_double_negation(e: Expr): Bool =
+fn is_double_negation(e: Expr): bool =
   match e {
     Neg { inner: Neg { inner: _ } } => true
     _ => false

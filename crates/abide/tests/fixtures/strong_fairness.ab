@@ -1,0 +1,82 @@
+module StrongFairness
+
+// Strong fairness (TLA+ SF) tests.
+//
+// Weak fairness WF(A): if A is continuously enabled, it must fire.
+// Strong fairness SF(A): if A is repeatedly enabled (even intermittently),
+// it must fire. Strong fairness is strictly stronger.
+//
+// Classic example: go_c is enabled only at state A, but the system
+// oscillates A→B→A→B, making go_c only intermittently enabled.
+// Under WF: go_c may never fire (never continuously enabled).
+// Under SF: go_c must eventually fire (repeatedly enabled).
+//
+// POST-SWEEP: fairness lives in `assume { }` blocks on the verification site,
+// not as event-declaration modifiers.
+
+enum S = A | B | C
+
+entity E {
+  state: S = @A
+  action to_b() requires state == @A { state' = @B }
+  action to_a() requires state == @B { state' = @A }
+  action to_c() requires state == @A { state' = @C }
+}
+
+// One system shared between strong and weak fairness theorems —
+// fairness is now a property of the verification site, not the system.
+system Sys(es: Store<E>) {
+
+  command spawn()
+
+  step spawn() { create E {} }
+
+  command go_b()
+
+  step go_b() { choose e: E where e.state == @A { e.to_b() } }
+
+  command go_a()
+
+  step go_a() { choose e: E where e.state == @B { e.to_a() } }
+
+  command go_c()
+
+  step go_c() { choose e: E where e.state == @A { e.to_c() } }
+}
+
+// ── Test 1: Strong fairness prevents A↔B starvation (theorem) ──────
+// Strong fairness on go_c (enabled at A intermittently) forces it to fire,
+// preventing the A↔B starvation loop. IC3 with BAS coarse justice can't
+// encode strong fairness → UNPROVABLE.
+theorem strong_liveness for Sys {
+  assume {
+    fair Sys::spawn
+    fair Sys::go_b
+    fair Sys::go_a
+    strong fair Sys::go_c
+  }
+  show all e: E | eventually e.state == @C
+}
+
+// ── Test 2: Weak fairness allows A↔B starvation (theorem) ──────────
+// Weak fairness on go_c is too weak: A↔B can loop forever, go_c is
+// intermittently enabled but never continuously → WF vacuously satisfied.
+theorem weak_liveness for Sys {
+  assume {
+    fair Sys::spawn
+    fair Sys::go_b
+    fair Sys::go_a
+    fair Sys::go_c
+  }
+  show all e: E | eventually e.state == @C
+}
+
+// ── Test 3: Safety property unaffected ──────────────────────────────
+verify safety_check {
+  assume {
+    store es: E[0..3]
+    let sys = Sys { es: es }
+  }
+  assert always all e: E |
+    e.state == @C implies e.state == @C
+}

@@ -6,7 +6,7 @@ module Imperative
 
 // --- var declarations ---
 
-fn sum_to(n: Int): Int
+fn sum_to(n: int): int
   requires n >= 0
   ensures result == n * (n + 1) / 2
 {
@@ -24,7 +24,7 @@ fn sum_to(n: Int): Int
 
 // --- if/else as expression ---
 
-fn abs(x: Int): Int
+fn abs(x: int): int
   ensures result >= 0
 {
   if x < 0 {
@@ -34,14 +34,14 @@ fn abs(x: Int): Int
   }
 }
 
-fn max(a: Int, b: Int): Int
+fn max(a: int, b: int): int
   ensures result >= a
   ensures result >= b
 {
   if a >= b { a } else { b }
 }
 
-fn sign(x: Int): Int {
+fn sign(x: int): int {
   if x > 0 {
     1
   } else {
@@ -55,7 +55,7 @@ fn sign(x: Int): Int {
 
 // --- while with contracts ---
 
-fn gcd_imperative(a: Int, b: Int): Int
+fn gcd_imperative(a: int, b: int): int
   requires a > 0
   requires b >= 0
   ensures result > 0
@@ -75,30 +75,30 @@ fn gcd_imperative(a: Int, b: Int): Int
 
 // --- assert and assume ---
 
-fn checked_divide(a: Int, b: Int): Int
+fn checked_divide(a: int, b: int): int
   requires b != 0
 {
   assert b != 0
   a / b
 }
 
-fn with_assertion(x: Int): Int {
+fn with_assertion(x: int): int {
   assert x > 0
   x + 1
 }
 
 // --- typed var declarations ---
 
-fn fibonacci(n: Int): Int
+fn fibonacci(n: int): int
   requires n >= 0
 {
-  var a: Int = 0
-  var b: Int = 1
-  var i: Int = 0
+  var a: int = 0
+  var b: int = 1
+  var i: int = 0
   while i < n
     decreases n - i
   {
-    var temp: Int = b
+    var temp: int = b
     b = a + b
     a = temp
     i = i + 1
@@ -108,7 +108,7 @@ fn fibonacci(n: Int): Int
 
 // --- simple block ---
 
-fn compute(x: Int): Int {
+fn compute(x: int): int {
   var doubled = x + x
   var incremented = doubled + 1
   incremented
@@ -116,6 +116,6 @@ fn compute(x: Int): Int {
 
 // --- no contracts (pure = form still works) ---
 
-fn double(x: Int): Int = x + x
+fn double(x: int): int = x + x
 
-fn is_positive(n: Int): Bool = n > 0
+fn is_positive(n: int): bool = n > 0

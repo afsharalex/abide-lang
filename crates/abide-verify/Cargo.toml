@@ -1,0 +1,23 @@
+[package]
+name = "abide-verify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abide-core = { path = "../abide-core" }
+abide-ir = { path = "../abide-ir" }
+abide-witness = { path = "../abide-witness" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+z3 = { version = "0.19", features = ["bundled"] }
+cvc5-rs = { version = "0.3.2" }
+rustsat = "0.7.5"
+rustsat-batsat = "0.7.5"
+
+[dev-dependencies]
+abide-sema = { path = "../abide-sema" }
+abide-syntax = { path = "../abide-syntax" }
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

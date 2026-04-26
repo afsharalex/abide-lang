@@ -1,0 +1,118 @@
+module SymmetryReduction
+
+// Symmetry reduction tests
+//
+// Symmetric system: entities have identical transitions, no inter-entity
+// Choose/ForAll over the same type. Quantified liveness is PROVED by
+// reducing to a 1-slot system and using IC3.
+//
+// Asymmetric system: event body has nested Choose over the same entity
+// type (inter-entity interaction). Symmetry validation fails, falls
+// back to lasso BMC (CHECKED) or UNPROVABLE (theorem).
+//
+// POST-SWEEP: fairness lives in `assume { }` blocks on the verification site.
+
+enum Light = Red | Green
+
+entity Signal {
+  color: Light = @Red
+  action go_green() requires color == @Red { color' = @Green }
+  action go_red() requires color == @Green { color' = @Red }
+}
+
+// ── Symmetric system: standard single-entity Choose ─────────────────
+system SymmetricTraffic(signals: Store<Signal>) {
+
+  command create_signal()
+
+  step create_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+
+  command reset()
+
+  step reset() {
+    choose s: Signal where s.color == @Green { s.go_red() }
+  }
+}
+
+// ── Asymmetric system: nested Choose over same entity type ──────────
+// The swap event chooses two signals and swaps their colors.
+// This breaks entity symmetry (slots interact).
+system AsymmetricTraffic(signals: Store<Signal>) {
+
+  command create_signal()
+
+  step create_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+
+  command swap()
+
+  step swap() {
+    choose s1: Signal where s1.color == @Red {
+      choose s2: Signal where s2.color == @Green {
+        s1.go_green()
+        s2.go_red()
+      }
+    }
+  }
+}
+
+// ── Test 1: Symmetric eventuality — UNPROVABLE ─────────────────────
+// Quantified liveness on the theorem path cannot be proved unboundedly
+// (IC3 BAS encoding unsound for liveness). Sound proof requires k-liveness.
+theorem symmetric_eventuality for SymmetricTraffic {
+  assume {
+    fair SymmetricTraffic::create_signal
+    fair SymmetricTraffic::toggle
+    fair SymmetricTraffic::reset
+  }
+  show all s: Signal | eventually s.color == @Green
+}
+
+// ── Test 2: Symmetric response — UNPROVABLE ─────────────────────────
+// Same as above. Both quantified patterns are UNPROVABLE on theorem path.
+theorem symmetric_response for SymmetricTraffic {
+  assume {
+    fair SymmetricTraffic::create_signal
+    fair SymmetricTraffic::toggle
+    fair SymmetricTraffic::reset
+  }
+  show always all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// ── Test 3: Asymmetric system — must be UNPROVABLE ──────────────────
+// Symmetry validation fails (swap has nested Choose over Signal).
+// Theorem path has no lasso BMC fallback → UNPROVABLE.
+theorem asymmetric_liveness for AsymmetricTraffic {
+  assume {
+    fair AsymmetricTraffic::create_signal
+    fair AsymmetricTraffic::toggle
+    fair AsymmetricTraffic::swap
+  }
+  show always all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// ── Test 4: Symmetric verify block — CHECKED via lasso BMC ──────────
+// Verify blocks fall back to bounded lasso BMC for quantified liveness.
+verify symmetric_verify {
+  assume {
+    store signals: Signal[0..3]
+    let symmetricTraffic = SymmetricTraffic { signals: signals }
+    fair SymmetricTraffic::create_signal
+    fair SymmetricTraffic::toggle
+    fair SymmetricTraffic::reset
+  }
+  assert all s: Signal | eventually s.color == @Green
+}

@@ -1,0 +1,105 @@
+module NondetDefaults
+
+// Nondeterministic initial values
+//
+// Fairness lives in `assume { }` blocks on the verification site.
+
+enum Priority = Low | Medium | High
+
+entity Task {
+  priority: Priority in {@Low, @Medium, @High}
+  done: bool = false
+  action complete() requires done == false { done' = true }
+}
+
+enum Status = Open | Closed
+
+entity Ticket {
+  status: Status = @Open
+  weight: int where $ > 0 and $ < 100
+  action close() requires status == @Open { status' = @Closed }
+}
+
+system TaskManager(tasks: Store<Task>, tickets: Store<Ticket>) {
+  command create_task()
+
+  step create_task() { create Task {} }
+
+  command create_ticket()
+
+  step create_ticket() { create Ticket {} }
+
+  command finish()
+
+  step finish() {
+    choose t: Task where t.done == false { t.complete() }
+  }
+
+  command close_ticket()
+
+  step close_ticket() {
+    choose t: Ticket where t.status == @Open { t.close() }
+  }
+}
+
+// ── Test 1: `in` with multiple values — verifier explores all ──────
+// A task can start as any priority. Safety: priority is always valid.
+verify in_explores_all {
+  assume {
+    store tasks: Task[0..3]
+    store tickets: Ticket[0..3]
+    let taskManager = TaskManager { tasks: tasks, tickets: tickets }
+    fair TaskManager::create_task
+    fair TaskManager::create_ticket
+    fair TaskManager::finish
+    fair TaskManager::close_ticket
+  }
+  assert always all t: Task |
+    t.priority == @Low or t.priority == @Medium or t.priority == @High
+}
+
+// ── Test 2: `where` constraint — field constrained but not fixed ───
+// Ticket weight is always positive and less than 100.
+verify where_constrains {
+  assume {
+    store tasks: Task[0..3]
+    store tickets: Ticket[0..3]
+    let taskManager = TaskManager { tasks: tasks, tickets: tickets }
+    fair TaskManager::create_task
+    fair TaskManager::create_ticket
+    fair TaskManager::finish
+    fair TaskManager::close_ticket
+  }
+  assert always all t: Ticket | t.weight > 0 and t.weight < 100
+}
+
+// ── Test 3: deterministic default unchanged ────────────────────────
+// Ticket status starts Open (deterministic default).
+verify deterministic_regression {
+  assume {
+    store tasks: Task[0..3]
+    store tickets: Ticket[0..3]
+    let taskManager = TaskManager { tasks: tasks, tickets: tickets }
+    fair TaskManager::create_task
+    fair TaskManager::create_ticket
+    fair TaskManager::finish
+    fair TaskManager::close_ticket
+  }
+  assert always all t: Ticket |
+    t.status == @Open or t.status == @Closed
+}
+
+// ── Test 4: safety fails for one `in` value but not others ─────────
+// "All tasks are Low priority" — false because tasks can start Medium or High.
+verify in_counterexample {
+  assume {
+    store tasks: Task[0..3]
+    store tickets: Ticket[0..3]
+    let taskManager = TaskManager { tasks: tasks, tickets: tickets }
+    fair TaskManager::create_task
+    fair TaskManager::create_ticket
+    fair TaskManager::finish
+    fair TaskManager::close_ticket
+  }
+  assert always all t: Task | t.priority == @Low
+}

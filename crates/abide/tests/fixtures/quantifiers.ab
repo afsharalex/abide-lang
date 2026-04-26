@@ -1,0 +1,76 @@
+module Quantifiers
+
+// Quantifier verification tests
+
+// --- forall in ensures ---
+
+fn identity_forall(x: int): int
+  ensures all y: int | result >= y implies x >= y
+{
+  x
+}
+
+// --- exists in ensures ---
+
+fn exists_witness(x: int): int
+  ensures exists y: int | result == x + y
+{
+  x
+}
+
+// --- nested quantifiers ---
+
+fn nested_forall(x: int): int
+  ensures all a: int | all b: int | (a == result and b == result) implies a == b
+{
+  x
+}
+
+// --- forall in requires ---
+
+fn positive_from_requires(x: int): int
+  requires x > 0
+  ensures all y: int | (y > 0 and y <= result) implies y <= x
+{
+  x
+}
+
+// --- forall with implies (identity preserves order) ---
+
+fn order_preserving(x: int): int
+  ensures all a: int | all b: int | (a <= b and a <= result and b >= result) implies a <= b
+{
+  x
+}
+
+// --- enum domain quantifiers ---
+
+enum Color = Red | Green | Blue
+
+fn enum_forall_exhaustive(x: int): bool
+  ensures all c: Color | c == @Color::Red or c == @Color::Green or c == @Color::Blue
+{
+  true
+}
+
+fn enum_exists(x: int): bool
+  ensures exists c: Color | c == @Color::Red
+{
+  true
+}
+
+// --- refinement domain quantifiers ---
+
+type Positive = int { $ > 0 }
+
+fn refinement_forall(x: int): bool
+  ensures all y: Positive | y > 0
+{
+  true
+}
+
+fn refinement_exists(x: int): bool
+  ensures exists y: Positive | y > 100
+{
+  true
+}

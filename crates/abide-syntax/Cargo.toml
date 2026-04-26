@@ -1,0 +1,11 @@
+[package]
+name = "abide-syntax"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abide-core = { path = "../abide-core" }
+logos = "0.14"
+
+[lints.rust]
+unsafe_code = "forbid"

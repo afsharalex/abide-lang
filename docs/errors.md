@@ -41,7 +41,7 @@ An expression has a type that does not match what was expected.
 entity Order {
   status: OrderStatus = @Pending
 
-  action confirm() requires 42 {   // error[E003]: requires expression should be Bool
+  action confirm() requires 42 {   // error[E003]: requires expression should be bool
     status' = @Confirmed
   }
 }
@@ -74,7 +74,7 @@ entity Order {
 A definition refers to itself (directly or transitively), creating an infinite loop.
 
 ```abide
-pred is_valid(x: Int) = is_valid(x)   // error[E005]: circular definition detected
+pred is_valid(x: int) = is_valid(x)   // error[E005]: circular definition detected
 ```
 
 **Fix:** Break the cycle by restructuring the definitions.
@@ -83,17 +83,17 @@ pred is_valid(x: Int) = is_valid(x)   // error[E005]: circular definition detect
 
 ### E006: Invalid Scope or Visibility
 
-A declaration was accessed from a scope where it is not visible.
+A declaration was accessed from a scope where it is not available.
 
 ```abide
-// In module A:
-enum Secret = X | Y                   // private (no `pub`)
+entity Order {
+  derived total = 0
+}
 
-// In module B:
-use A::Secret                         // error[E006]: cannot import private declaration
+derived total = 0                     // error[E006]: invalid scope
 ```
 
-**Fix:** Mark the declaration `pub` to make it accessible from other modules.
+**Fix:** Move the declaration into the scope where it is allowed.
 
 ---
 

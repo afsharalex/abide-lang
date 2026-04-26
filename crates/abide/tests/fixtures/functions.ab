@@ -1,0 +1,134 @@
+module Functions
+
+// Function, constant, predicate, and behavioral examples.
+// Demonstrates: fn contracts, const, pred, prop, verify, theorem,
+// and scene blocks using the current surface syntax.
+
+enum Grade = A | B | C | D | F
+
+enum CourseStatus = Enrolled | Completed | Dropped
+
+const PASSING_GRADE = 70
+const MAX_ENROLLMENT = 30
+
+fn clamp(x: int, lo: int, hi: int): int
+  requires lo <= hi
+  ensures result >= lo
+  ensures result <= hi
+{
+  match x {
+    if x > hi => hi
+    if x < lo => lo
+    _ => x
+  }
+}
+
+fn letter_grade(score: int): Grade
+  requires score >= 0
+  requires score <= 100
+{
+  match score {
+    if score >= 90 => A
+    if score >= 80 => B
+    if score >= 70 => C
+    if score >= 60 => D
+    _ => F
+  }
+}
+
+fn passing_cutoff(score: int): int
+  ensures result >= PASSING_GRADE
+{
+  match score {
+    if score < PASSING_GRADE => PASSING_GRADE
+    _ => score
+  }
+}
+
+fn is_passing(score: int): bool = score >= PASSING_GRADE
+
+entity Student {
+  id: identity
+  status: CourseStatus = @Enrolled
+  score: int
+
+  action complete(final_score: int)
+    requires status == @Enrolled {
+    status' = @Completed
+    score' = final_score
+  }
+
+  action drop_course()
+    requires status == @Enrolled {
+    status' = @Dropped
+  }
+}
+
+pred enrolled(s: Student) = s.status == @Enrolled
+
+pred completed(s: Student) = s.status == @Completed
+
+prop students_have_valid_status for Grading =
+  always all s: Student |
+    s.status == @Enrolled or
+    s.status == @Completed or
+    s.status == @Dropped
+
+system Grading(students: Store<Student>) {
+
+  command enroll_student()
+
+  step enroll_student() {
+    create Student {
+      status = @Enrolled
+      score = 0
+    }
+  }
+
+  command complete_course(student_id: identity, final_score: int)
+
+  step complete_course(student_id: identity, final_score: int)
+    requires exists s: Student in students |
+      s.id == student_id and
+      s.status == @Enrolled {
+    choose s: Student where s.id == student_id {
+      s.complete(final_score)
+    }
+  }
+
+  command drop_student(student_id: identity)
+
+  step drop_student(student_id: identity) {
+    choose s: Student where s.id == student_id {
+      s.drop_course()
+    }
+  }
+}
+
+verify grading_safety {
+  assume {
+    store students: Student[0..20]
+    let grading = Grading { students: students }
+  }
+  assert students_have_valid_status
+}
+
+scene student_completes {
+  given {
+    store students: Student[0..20]
+    let grading = Grading { students: students }
+    let s = one Student in students where s.status == @Enrolled
+  }
+  when {
+    grading.complete_course(s.id, 85)
+  }
+  then {
+    assert completed(s)
+    assert letter_grade(s.score) == @B
+    assert is_passing(s.score)
+  }
+}
+
+theorem all_students_valid for Grading {
+  show students_have_valid_status
+}

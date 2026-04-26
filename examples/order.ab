@@ -6,9 +6,9 @@ module Order
 enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending requires total > 0 {
     status' = @Paid

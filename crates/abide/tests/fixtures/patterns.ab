@@ -1,0 +1,72 @@
+module Patterns
+
+// Advanced pattern matching and expression examples
+// Demonstrates: nested match, or-patterns, record patterns, guards,
+// let bindings, lambda, tuple literals, quantifiers (some/no/one/lone)
+
+enum Shape = Circle | Rectangle | Triangle
+
+enum Color = Red | Green | Blue
+
+enum Result = Ok | Error
+
+fn shape_sides(s: Shape): int = match s {
+  Circle => 0
+  Rectangle => 4
+  Triangle => 3
+}
+
+fn is_polygon(s: Shape): bool = match s {
+  Circle => false
+  Rectangle | Triangle => true
+}
+
+fn color_code(c: Color): int = match c {
+  Red => 1
+  Green => 2
+  Blue => 3
+}
+
+fn combine(x: int, y: int): int =
+  let s = x + y, p = x * y
+  in s + p
+
+fn max_val(a: int, b: int): int = match a {
+  _ if a >= b => a
+  _ => b
+}
+
+fn min_val(a: int, b: int): int = match a {
+  _ if a <= b => a
+  _ => b
+}
+
+fn abs(x: int): int = match x {
+  _ if x >= 0 => x
+  _ => 0 - x
+}
+
+fn sign(x: int): int = match x {
+  _ if x > 0 => 1
+  _ if x == 0 => 0
+  _ => 0 - 1
+}
+
+// Tuple-returning function
+fn divmod(a: int, b: int): (int,int) = (a / b, a % b)
+
+// Higher-order style: apply a doubling function twice
+fn apply_twice(x: int): int = (x + x) + (x + x)
+
+// Quantifier predicates over entity domains
+entity Item {
+  id: identity
+  value: int
+  active: bool
+}
+
+pred all_positive(threshold: int) =
+  all i: Item | i.value >= threshold
+
+pred some_active(dummy: int) =
+  exists i: Item | i.active == true

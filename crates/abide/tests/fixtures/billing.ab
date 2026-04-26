@@ -1,0 +1,45 @@
+// Billing module — cross-module dependency for commerce.ab
+
+module Billing
+
+enum PaymentStatus = Opened | Captured | Failed
+
+entity PaymentIntent {
+  order_id: identity
+  amount: int
+  status: PaymentStatus = @Opened
+
+  action capture()
+    requires status == @Opened
+    requires amount > 0 {
+    status' = @Captured
+  }
+
+  action fail()
+    requires status == @Opened {
+    status' = @Failed
+  }
+}
+
+system Billing(paymentIntents: Store<PaymentIntent>) {
+
+  command open_intent(order_id: identity, amount: int)
+
+  step open_intent(order_id: identity, amount: int) {
+    create PaymentIntent {
+      order_id = order_id
+      amount = amount
+      status = @Opened
+    }
+  }
+
+  command capture_payment(order_id: identity)
+
+  step capture_payment(order_id: identity)
+    requires exists p: PaymentIntent | p.order_id == order_id and p.status == @Opened {
+    choose p: PaymentIntent where p.order_id == order_id {
+      p.capture()
+    }
+    Commerce::confirm_payment(order_id: order_id)
+  }
+}

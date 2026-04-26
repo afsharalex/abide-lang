@@ -1,0 +1,12 @@
+[package]
+name = "abide-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+miette = { version = "7", features = ["fancy"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"

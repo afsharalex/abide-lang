@@ -1,0 +1,126 @@
+module CollectionOps
+
+// Collection operations — comprehensive tests
+
+// ── Set<int> operations via qualified functions ─────────────────────
+
+lemma set_union_int {
+  Set::union(Set(1, 2), Set(2, 3)) == Set(1, 2, 3)
+}
+
+lemma set_intersect_int {
+  Set::intersect(Set(1, 2, 3), Set(2, 3, 4)) == Set(2, 3)
+}
+
+lemma set_diff_int {
+  Set::diff(Set(1, 2, 3), Set(2)) == Set(1, 3)
+}
+
+lemma set_subset_int {
+  Set::subset(Set(1, 2), Set(1, 2, 3))
+}
+
+lemma set_disjoint_int {
+  Set::disjoint(Set(1, 2), Set(3, 4))
+}
+
+lemma set_not_disjoint_int {
+  not Set::disjoint(Set(1, 2), Set(2, 3))
+}
+
+lemma set_member_int {
+  Set::member(1, Set(1, 2, 3))
+}
+
+lemma set_not_member_int {
+  not Set::member(5, Set(1, 2, 3))
+}
+
+// ── Set::member on real (polymorphic) ───────────────────────────────
+
+lemma set_member_real {
+  Set::member(1.5, Set(1.5, 2.5))
+}
+
+// ── Set operations via operators ────────────────────────────────────
+
+lemma set_union_op {
+  Set(1, 2) <> Set(2, 3) == Set(1, 2, 3)
+}
+
+lemma set_disjoint_op {
+  Set(1, 2) !* Set(3, 4)
+}
+
+lemma set_not_disjoint_op {
+  not (Set(1, 2) !* Set(2, 3))
+}
+
+// ── Type-directed operator overloading (*, -, <=) ───────────────────
+// These dispatch to Set ops at IR lowering time based on Set<T> type,
+// NOT at SMT level — so Map<K,bool> and Seq<bool> are not affected.
+
+lemma set_intersect_star {
+  Set(1, 2, 3) * Set(2, 3, 4) == Set(2, 3)
+}
+
+lemma set_diff_minus {
+  Set(1, 2, 3) - Set(2) == Set(1, 3)
+}
+
+lemma set_subset_le {
+  Set(1, 2) <= Set(1, 2, 3)
+}
+
+// ── Seq operations ──────────────────────────────────────────────────
+
+lemma seq_head_int {
+  Seq::head(Seq(10, 20, 30)) == 10
+}
+
+lemma seq_tail_int {
+  Seq::tail(Seq(10, 20, 30)) == Seq(20, 30)
+}
+
+lemma seq_length_int {
+  Seq::length(Seq(10, 20, 30)) == 3
+}
+
+lemma seq_empty_true {
+  Seq::empty(Seq())
+}
+
+lemma seq_empty_false {
+  not Seq::empty(Seq(10))
+}
+
+lemma seq_concat_int {
+  Seq::concat(Seq(10, 20), Seq(30, 40)) == Seq(10, 20, 30, 40)
+}
+
+// Seq<bool> should not crash (was a bug: SeqLit always used int default)
+lemma seq_bool_eq {
+  Seq(true, false) == Seq(true, false)
+}
+
+// ── Map operations ──────────────────────────────────────────────────
+
+lemma map_has_true {
+  Map::has(Map(1, 10, 2, 20), 1)
+}
+
+lemma map_has_false {
+  not Map::has(Map(1, 10, 2, 20), 3)
+}
+
+lemma map_domain_int {
+  Map::domain(Map(1, 10, 2, 20)) == Set(1, 2)
+}
+
+lemma map_range_int {
+  Map::range(Map(1, 10, 2, 20)) == Set(10, 20)
+}
+
+lemma map_merge_right_bias {
+  Map::merge(Map(1, 10, 2, 20), Map(2, 99, 3, 30)) == Map(1, 10, 2, 99, 3, 30)
+}

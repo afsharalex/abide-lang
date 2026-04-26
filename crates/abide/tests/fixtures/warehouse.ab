@@ -1,0 +1,39 @@
+// Warehouse module — used by logistics.ab for multi-module alias testing
+
+module Warehouse
+
+enum SlotStatus = Empty | Reserved | Full
+
+entity Slot {
+  id: identity
+  status: SlotStatus = @Empty
+  capacity: int
+
+  action reserve()
+    requires status == @Empty {
+    status' = @Reserved
+  }
+
+  action fill()
+    requires status == @Reserved {
+    status' = @Full
+  }
+
+  action clear()
+    requires status == @Full {
+    status' = @Empty
+  }
+}
+
+system Warehouse(slots: Store<Slot>) {
+
+  command add_slot(cap: int)
+
+  step add_slot(cap: int) {
+    create Slot {
+      id = cap
+      status = @Empty
+      capacity = cap
+    }
+  }
+}

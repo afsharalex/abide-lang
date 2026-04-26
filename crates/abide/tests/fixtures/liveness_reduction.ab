@@ -1,0 +1,137 @@
+module LivenessReduction
+
+// Liveness-to-safety reduction tests
+//
+// Fairness lives in `assume { }` blocks on the verification site,
+// not as event-declaration modifiers.
+
+enum Light = Red | Green
+
+entity Signal {
+  color: Light = @Red
+  action go_green() requires color == @Red { color' = @Green }
+  action go_red() requires color == @Green { color' = @Red }
+}
+
+system FairSignal(signals: Store<Signal>) {
+
+  command create_signal()
+
+  step create_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+
+  command reset()
+
+  step reset() {
+    choose s: Signal where s.color == @Green { s.go_red() }
+  }
+}
+
+// ── Test 1: Response pattern PROVED unbounded ───────────────────────
+// With fair events, the response property should be PROVED (not just CHECKED).
+verify liveness_proved {
+  assume {
+    store signals: Signal[0..3]
+    let fairSignal = FairSignal { signals: signals }
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  assert always all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// ── Test 2: Recurrence pattern ──────────────────────────────────────
+// eventually Green always holds (create + toggle are fair)
+verify recurrence_proved {
+  assume {
+    store signals: Signal[0..3]
+    let fairSignal = FairSignal { signals: signals }
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  assert always all s: Signal | eventually s.color == @Green
+}
+
+// ── Test 3: Theorem with liveness — PROVED via symmetry reduction ────
+theorem liveness_theorem for FairSignal {
+  assume {
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  show always all s: Signal |
+    s.color == @Red implies eventually s.color == @Green
+}
+
+// ── Test 4: Safety property still uses induction ────────────────────
+// Reduction should not interfere with safety properties
+verify safety_check {
+  assume {
+    store signals: Signal[0..3]
+    let fairSignal = FairSignal { signals: signals }
+  }
+  assert always all s: Signal |
+    s.color == @Green implies s.color == @Green
+}
+
+// ── Test 5: Bare eventuality ────────────────────────────────────────
+// eventually Green — should be CHECKED (lasso) or PROVED (reduction)
+verify bare_eventuality {
+  assume {
+    store signals: Signal[0..3]
+    let fairSignal = FairSignal { signals: signals }
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  assert all s: Signal | eventually s.color == @Green
+}
+
+// ── Test 6: Persistence ─────────────────────────────────────────────
+// eventually always Green — should be CHECKED or PROVED
+// (Signal toggles Red/Green, so persistence of Green may not hold —
+//  the result depends on whether the system can stabilize)
+verify persistence_check {
+  assume {
+    store signals: Signal[0..5]
+    let fairSignal = FairSignal { signals: signals }
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  assert eventually always all s: Signal | s.color == @Green or s.color == @Red
+}
+
+// ── Test 7: Until (conjunction decomposition) ───────────────────────
+// Red until Green: desugars to (eventually Green) AND (always (not Green implies Red))
+// The liveness part should be extracted from the conjunction.
+verify until_check {
+  assume {
+    store signals: Signal[0..3]
+    let fairSignal = FairSignal { signals: signals }
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  assert all s: Signal | s.color == @Red until s.color == @Green
+}
+
+// ── Test 8: Until theorem (unbounded path) ──────────────────────────
+// Same as Test 7 but on the theorem/unbounded path.
+// Desugars to quantified eventuality + safety tautology.
+// PROVED via symmetry reduction: liveness on 1-slot, safety by induction.
+theorem until_theorem for FairSignal {
+  assume {
+    fair FairSignal::create_signal
+    fair FairSignal::toggle
+    fair FairSignal::reset
+  }
+  show all s: Signal | s.color == @Red until s.color == @Green
+}

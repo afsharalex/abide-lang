@@ -1,0 +1,126 @@
+module Cardinality
+
+// Cardinality verification tests
+
+// --- Set literal cardinality ---
+
+fn set_card_3(x: int): int
+  ensures result == 3
+{
+  #Set(1, 2, 3)
+}
+
+fn set_card_dedup(x: int): int
+  ensures result == 2
+{
+  #Set(1, 1, 2)
+}
+
+// --- Seq literal cardinality (no dedup) ---
+
+fn seq_card_4(x: int): int
+  ensures result == 4
+{
+  #Seq(10, 20, 30, 40)
+}
+
+fn seq_card_with_dupes(x: int): int
+  ensures result == 3
+{
+  #Seq(1, 1, 2)
+}
+
+// --- Cardinality in ensures ---
+
+fn card_in_ensures(x: int): bool
+  ensures #Set(1, 2, 3) == 3
+{
+  true
+}
+
+// --- Cardinality comparison ---
+
+fn card_compare(x: int): bool
+  ensures result == true
+{
+  #Set(1, 2, 3) > #Set(4, 5)
+}
+
+// --- Empty set cardinality ---
+
+fn empty_set_card(x: int): int
+  ensures result == 0
+{
+  #Set()
+}
+
+// --- Semantic dedup (not syntactic) ---
+
+fn semantic_dedup(x: int): int
+  ensures result == 1
+{
+  #Set(1, 1 + 0)
+}
+
+fn semantic_dedup_expr(x: int): int
+  ensures result == 2
+{
+  #Set(1, 2, 1 + 1)
+}
+
+fn param_dedup(x: int): int
+  ensures result == 1
+{
+  #Set(x, x + 0)
+}
+
+// --- Set comprehension ---
+
+fn comp_membership(x: int): bool
+  ensures result == true
+{
+  3 in { y: int where y > 0 and y < 10 }
+}
+
+fn comp_non_membership(x: int): bool
+  ensures result == true
+{
+  not (0 in { y: int where y > 0 })
+}
+
+fn comp_in_ensures(x: int): bool
+  requires x > 0
+  ensures x in { y: int where y > 0 }
+{
+  true
+}
+
+// --- Domain-restricted comprehensions ---
+
+enum Color = Red | Green | Blue
+
+fn comp_enum_membership(x: int): bool
+  ensures result == true
+{
+  @Color::Red in { c: Color where true }
+}
+
+fn comp_enum_non_membership(x: int): bool
+  ensures result == true
+{
+  not (99 in { c: Color where true })
+}
+
+type Positive = int { $ > 0 }
+
+fn comp_refinement_membership(x: int): bool
+  ensures result == true
+{
+  5 in { y: Positive where true }
+}
+
+fn comp_refinement_non_membership(x: int): bool
+  ensures result == true
+{
+  not (0 in { y: Positive where true })
+}

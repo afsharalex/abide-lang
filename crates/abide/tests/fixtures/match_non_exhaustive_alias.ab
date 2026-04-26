@@ -1,0 +1,14 @@
+module MatchNonExhaustiveAlias
+
+// Non-exhaustive match through alias chain — should produce E012
+
+enum Color = Red | Green | Blue
+type Traffic = Color
+type Paint = Traffic
+
+// Missing Blue through two alias layers
+fn paint_label(c: Paint): string
+  = match c {
+    Red => "red"
+    Green => "green"
+  }

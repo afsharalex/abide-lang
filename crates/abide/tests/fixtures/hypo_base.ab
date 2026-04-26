@@ -1,0 +1,35 @@
+module HypoTest
+
+enum TicketStatus = Open | InProgress | Closed
+
+entity Ticket {
+  id: identity
+  status: TicketStatus = @Open
+
+  action start()
+    requires status == @Open
+  {
+    status' = @InProgress
+  }
+
+  action close()
+    requires status == @InProgress
+  {
+    status' = @Closed
+  }
+}
+
+system TicketSystem(tickets: Store<Ticket>) {
+
+  command start_ticket(t: Ticket)
+
+  step start_ticket(t: Ticket) {
+    t.start()
+  }
+
+  command close_ticket(t: Ticket)
+
+  step close_ticket(t: Ticket) {
+    t.close()
+  }
+}

@@ -7,9 +7,9 @@ enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped
 enum PaymentStatus = Open | Captured | Failed
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action submit() requires status == @Pending requires total > 0 {
     status' = @AwaitingPayment
@@ -25,9 +25,9 @@ entity Order {
 }
 
 entity PaymentIntent {
-  id: Id
-  order_id: Id
-  amount: Real
+  id: identity
+  order_id: identity
+  amount: real
   status: PaymentStatus = @Open
 
   action capture() requires status == @Open requires amount > 0 {

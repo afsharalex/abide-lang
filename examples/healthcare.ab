@@ -8,9 +8,9 @@ enum PrescriptionStatus = Prescribed | Dispensed | Completed | Cancelled
 enum InsuranceStatus = Active | Expired | Denied
 
 enum DosageForm =
-  Tablet { mg: Int }
-  | Liquid { ml: Int }
-  | Injection { dose_mg: Int }
+  Tablet { mg: int }
+  | Liquid { ml: int }
+  | Injection { dose_mg: int }
 
 enum Priority = Low | Medium | High | Critical
 
@@ -18,13 +18,13 @@ const MAX_REFILLS = 5
 const MAX_DAILY_DOSE = 4000
 
 entity Patient {
-  id: Id
+  id: identity
   status: PatientStatus = @Registered
   insurance: InsuranceStatus = @Active
   priority: Priority = @Low
-  room_number: Int = 0
+  room_number: int = 0
 
-  action admit(room: Int)
+  action admit(room: int)
     requires status == @Registered
     requires insurance == @Active
     requires room > 0 {
@@ -52,11 +52,11 @@ entity Patient {
 }
 
 entity Prescription {
-  id: Id
-  patient_id: Id
+  id: identity
+  patient_id: identity
   status: PrescriptionStatus = @Prescribed
   dosage: DosageForm
-  refills_remaining: Int = 0
+  refills_remaining: int = 0
 
   action dispense()
     requires status == @Prescribed {
@@ -75,7 +75,7 @@ entity Prescription {
   }
 }
 
-fn daily_dose(d: DosageForm): Int =
+fn daily_dose(d: DosageForm): int =
   match d {
     Tablet { mg: m } => m
     Liquid { ml: m } => m * 5
@@ -101,7 +101,7 @@ system Registration {
     sorry
   }
 
-  event admit_patient(p: Patient, room: Int) requires p.insurance == @Active {
+  event admit_patient(p: Patient, room: int) requires p.insurance == @Active {
     p.admit(room)
   }
 

@@ -1,0 +1,162 @@
+name: Install dependencies
+description: Install necessary dependencies on the target system
+inputs:
+  with-documentation:
+    default: false
+  windows-build:
+    default: false
+    type: boolean
+  wasm-build:
+    default: false
+    type: boolean
+  shell:
+    default: bash
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux software
+      if: runner.os == 'Linux'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Install Linux software"
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          ccache \
+          libbsd-dev \
+          libcln-dev \
+          libedit-dev \
+          libgmp-dev \
+          libtinfo-dev \
+          libfl-dev
+        echo "SED=sed" >> $GITHUB_ENV
+        echo "::endgroup::"
+
+    - name: Install software for cross-compiling for arm64 Linux
+      if: runner.os == 'Linux'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Install software for cross-compiling for arm64 Linux"
+        sudo apt-get install -y \
+          gcc-aarch64-linux-gnu \
+          g++-aarch64-linux-gnu
+        echo "::endgroup::"
+
+    - name: Install software for cross-compiling for Windows x86_64
+      # Boolean inputs are actually strings:
+      # https://github.com/actions/runner/issues/1483
+      if: runner.os == 'Linux' && inputs.windows-build == 'true'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Install software for cross-compiling for Windows"
+        sudo apt-get update
+        sudo apt-get install -y \
+          mingw-w64
+
+        # cvc5 requires the POSIX version of MinGW to implement the time limit
+        # using threads
+        sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+        sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+        echo "::endgroup::"
+
+    - name: Install software for WebAssembly compilation
+      # Boolean inputs are actually strings:
+      # https://github.com/actions/runner/issues/1483
+      if: inputs.wasm-build == 'true'
+      shell: bash
+      run: |
+        echo "::group::Install software for WebAssembly compilation"
+        sudo apt-get update
+        git clone https://github.com/emscripten-core/emsdk.git
+        cd emsdk/
+        ./emsdk install '3.1.70'
+        ./emsdk activate '3.1.70'
+        echo "$(pwd)" >> $GITHUB_PATH
+        echo "$(pwd)/upstream/emscripten" >> $GITHUB_PATH
+
+    - name: Install Windows x86_64 software
+      if: runner.os == 'Windows' && runner.arch == 'X64' && inputs.windows-build == 'true'
+      uses: msys2/setup-msys2@v2
+      with:
+        update: true
+        msystem: MINGW64
+        path-type: inherit
+        install: |
+          make
+          mingw-w64-x86_64-autotools
+          mingw-w64-x86_64-ccache
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-gmp
+          zip
+
+    - name: Install Windows arm64 software
+      if: runner.os == 'Windows' && runner.arch == 'ARM64' && inputs.windows-build == 'true'
+      uses: msys2/setup-msys2@v2
+      with:
+        update: true
+        msystem: CLANGARM64
+        path-type: inherit
+        install: |
+          make
+          mingw-w64-clang-aarch64-autotools
+          mingw-w64-clang-aarch64-ccache
+          mingw-w64-clang-aarch64-clang
+          mingw-w64-clang-aarch64-cmake
+          mingw-w64-clang-aarch64-gmp
+          zip
+
+    - name: Set up num_proc variable for Linux and Windows
+      if: runner.os == 'Linux' || runner.os == 'Windows'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Set up num_proc variable for Linux and Windows"
+        echo "num_proc=$(( $(nproc) + 1 ))" >> $GITHUB_ENV
+        echo "::endgroup::"
+
+    # Note: macOS comes with a libedit; it does not need to brew-installed
+    - name: Install macOS software
+      if: runner.os == 'macOS'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Install macOS software"
+        brew config
+        brew untap homebrew/core homebrew/cask
+        brew config
+        if [[ $RUNNER_ARCH == "ARM64" ]]; then
+          AUTOTOOLS="autoconf libtool"
+        fi
+        brew install $AUTOTOOLS \
+          automake \
+          ccache \
+          gnu-sed
+        echo "SED=gsed" >> $GITHUB_ENV
+        echo "num_proc=$(( $(sysctl -n hw.logicalcpu) + 1 ))" >> $GITHUB_ENV
+        echo "::endgroup::"
+
+    # Required by PEP-668
+    - name: Set up Python virtual environment
+      if: runner.os == 'macOS'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Set up Python virtual environment"
+        python3 -m venv ~/.venv
+        echo "$HOME/.venv/bin" >> $GITHUB_PATH
+        echo "::endgroup::"
+    
+    # Required for the installation of Python bindings
+    - name: Upgrade Python pip
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Upgrade Python pip"
+        python3 -m pip install --upgrade pip
+        echo "::endgroup::"
+
+    - name: Install software for documentation
+      if: inputs.with-documentation == 'true'
+      shell: ${{ inputs.shell }}
+      run: |
+        echo "::group::Install software for documentation"
+        sudo apt-get install -y doxygen
+        echo "::endgroup::"

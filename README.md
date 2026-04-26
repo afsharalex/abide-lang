@@ -12,9 +12,9 @@ Abide lets you model system behavior formally — then simulate it, check it aga
 type OrderStatus = Pending | Paid | Shipped
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending requires total > 0 {
     status' = @Paid
@@ -57,6 +57,7 @@ Abide spans five specification layers under one language:
 
 - **New to Abide?** Read the [Getting Started](docs/getting-started.md) guide
 - **Want the syntax quickly?** See [Syntax at a Glance](docs/syntax-at-a-glance.md)
+- **Running the verifier?** See [CLI Reference](docs/cli.md) for `abide verify`, including compact output, `--verbose`, `--debug-evidence`, and report generation via `--report`
 - **Evaluating the direction?** Read [Core Concepts](docs/core-concepts.md) and the [Roadmap](docs/roadmap.md)
 - **Looking for examples?** See [Examples](docs/examples.md) and the `examples/` directory
 
@@ -74,9 +75,11 @@ These are influences on the design, not compatibility guarantees.
 ## Repository Structure
 
 ```
-compiler/    Compiler and checker implementation (Rust)
 docs/        User-facing guides and references
 examples/    Sample Abide specifications
+crates/      Rust workspace crates
+  abide/     Compiler library, CLI, and integration tests
+vendor/      Vendored static solver sources
 stdlib/      Standard library (planned)
 spec/        Language specification notes
 ```
@@ -86,7 +89,6 @@ spec/        Language specification notes
 Requires a Rust toolchain (stable).
 
 ```sh
-cd compiler
 cargo build --release
 ```
 

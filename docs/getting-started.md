@@ -10,7 +10,7 @@
 
 ```sh
 git clone https://github.com/afsharalex/abide-lang.git
-cd abide-lang/compiler
+cd abide-lang
 cargo build --release
 ```
 
@@ -24,9 +24,9 @@ Create a file called `order.ab`:
 enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending requires total > 0 {
     status' = @Paid
@@ -110,12 +110,12 @@ As specs grow, split them into multiple files using the module system:
 // types.ab
 module Commerce
 
-pub enum OrderStatus = Pending | Paid | Shipped
+enum OrderStatus = Pending | Paid | Shipped
 
-pub entity Order {
-  id: Id
+entity Order {
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending {
     status' = @Paid
@@ -158,11 +158,10 @@ abide verify types.ab system.ab spec.ab
 
 Key module system concepts:
 - `module Name` at the top of each file declares which module it belongs to
-- `pub` marks declarations visible to other modules (private by default)
-- `use Module::Name` imports a specific declaration; `use Module::*` imports all public names
+- `use Module::Name` imports a specific declaration; `use Module::*` imports all names declared in that module
 - `use Module::Name as Alias` provides a local alias
 - `include "file.ab"` includes a file's contents into the current module
-- Systems and events are always public; entity fields are always private
+- Entity fields stay local to the entity; modules are organized with `module`, `use`, and `include`
 
 ## Explore with the REPL
 
@@ -201,7 +200,7 @@ See the [QA Language](qa-language.md) guide.
 Beyond system-level properties, Abide verifies function contracts. Attach `requires`, `ensures`, and `decreases` to functions with imperative bodies:
 
 ```abide
-fn gcd(a: Int, b: Int): Int
+fn gcd(a: int, b: int): int
   requires a > 0
   requires b >= 0
   ensures result > 0
@@ -224,12 +223,12 @@ fn gcd(a: Int, b: Int): Int
 
 `abide verify` automatically proves that the body satisfies the postcondition, that while-loop invariants are maintained, and that recursive calls decrease the termination measure. Preconditions are checked at every call site.
 
-Refinement types provide a shorthand — `fn f(x: Int { $ > 0 })` is equivalent to `fn f(x: Int) requires x > 0`, and type aliases like `type Positive = Int { $ > 0 }` work the same way.
+Refinement types provide a shorthand — `fn f(x: int { $ > 0 })` is equivalent to `fn f(x: int) requires x > 0`, and type aliases like `type Positive = int { $ > 0 }` work the same way.
 
 Use `assert` and `assume` inside function bodies for intermediate verification:
 
 ```abide
-fn checked_divide(a: Int, b: Int): Int
+fn checked_divide(a: int, b: int): int
   requires b != 0
 {
   assert b != 0    // verified from requires, then available as fact
@@ -240,7 +239,7 @@ fn checked_divide(a: Int, b: Int): Int
 Use `sorry` to admit a function's proof obligation while you work on it:
 
 ```abide
-fn complex_algorithm(x: Int): Int
+fn complex_algorithm(x: int): int
   ensures result > 0
 {
   sorry    // reports ADMITTED — skips verification
@@ -250,9 +249,9 @@ fn complex_algorithm(x: Int): Int
 Quantifiers, constructor patterns, and lambdas work in function contracts:
 
 ```abide
-enum Option = None | Some { value: Int }
+enum Option = None | Some { value: int }
 
-fn get_or(o: Option, d: Int): Int
+fn get_or(o: Option, d: int): int
   ensures match o {
     Some { value: v } => result == v
     None => result == d

@@ -1,0 +1,159 @@
+module Composition
+
+// Composition operator precedence examples
+// Demonstrates: ->, &, ||, ^|, |, |> and their interactions
+
+// --- Entities and systems for composition context ---
+
+enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+  total: real
+
+  action submit()
+    requires status == @Pending
+  {
+    status' = @Confirmed
+  }
+
+  action pay()
+    requires status == @Confirmed
+  {
+    status' = @Confirmed
+  }
+
+  action ship()
+    requires status == @Confirmed
+  {
+    status' = @Shipped
+  }
+
+  action deliver()
+    requires status == @Shipped
+  {
+    status' = @Delivered
+  }
+
+  action cancel()
+    requires status == @Pending or status == @Confirmed
+  {
+    status' = @Cancelled
+  }
+}
+
+system Commerce(orders: Store<Order>) {
+
+  command submit_order(o: Order)
+
+  step submit_order(o: Order) {
+    o.submit()
+  }
+
+  command pay_order(o: Order)
+
+  step pay_order(o: Order) {
+    o.pay()
+  }
+
+  command ship_order(o: Order)
+
+  step ship_order(o: Order) {
+    o.ship()
+  }
+
+  command deliver_order(o: Order)
+
+  step deliver_order(o: Order) {
+    o.deliver()
+  }
+
+  command cancel_order(o: Order)
+
+  step cancel_order(o: Order) {
+    o.cancel()
+  }
+}
+
+// --- Predicates using composition operators ---
+
+// Sequence: -> (tightest composition, right-assoc)
+// a -> b -> c = a -> (b -> c)
+pred order_flow(sub: bool, pay: bool, ship: bool) =
+  sub -> pay -> ship
+
+// Same-step: & (binds tighter than choice, looser than ->)
+pred atomic_pay_log(pay: bool, log: bool) =
+  pay & log
+
+// Concurrent: || (between & and |)
+pred parallel_process(a: bool, b: bool) =
+  a || b
+
+// Exclusive choice: ^| (same level as |)
+pred decide(approve: bool, reject: bool) =
+  approve ^| reject
+
+// --- Precedence combinations ---
+
+// -> tighter than &: (sub -> pay) & log
+pred seq_then_atomic(sub: bool, pay: bool, log: bool) =
+  sub -> pay & log
+
+// & tighter than ||: (pay & log) || notify
+pred atomic_or_concurrent(pay: bool, log: bool, notify: bool) =
+  pay & log || notify
+
+// || tighter than |: (a || b) | c
+pred concurrent_or_unordered(a: bool, b: bool, c: bool) =
+  a || b | c
+
+// Full precedence: ((sub -> pay) & log) | cancel
+pred full_precedence(sub: bool, pay: bool, log: bool, cancel: bool) =
+  sub -> pay & log | cancel
+
+// --- Verify blocks using composition ---
+
+verify order_lifecycle {
+  assume {
+    store orders: Order[0..10]
+    let commerce = Commerce { orders: orders }
+  }
+  assert always (all o: Order |
+    o.status == @Cancelled implies o.status' == @Cancelled)
+}
+
+// --- Scenes using composition operators ---
+
+scene submit_then_pay {
+  given let o = one Order where o.status == @Pending
+  when let sub = commerce.submit_order(o)
+  when let pay_act = commerce.pay_order(o)
+  when assume sub -> pay_act
+  then assert o.status == @Confirmed
+}
+
+scene pay_or_cancel {
+  given let o = one Order where o.status == @Confirmed
+  when let pay_act = commerce.pay_order(o)
+  when let can = commerce.cancel_order(o)
+  when assume pay_act ^| can
+  then assert o.status == @Confirmed or o.status == @Cancelled
+}
+
+// --- Pipe operator ---
+
+fn double(x: int): int = x + x
+fn increment(x: int): int = x + 1
+
+fn piped(x: int): int = x |> double |> increment
+
+// --- Functions with composition in contracts ---
+
+fn process(a: bool, b: bool, c: bool): bool
+  requires a implies b
+  ensures result == (a and b)
+{
+  a and b
+}

@@ -1,0 +1,34 @@
+module ProofFailures
+
+// Dedicated proof-failure fixture for report rendering.
+// Contains:
+// - a pure lemma failure (countermodel evidence)
+// - a theorem failure over system behavior (behavioral counterexample evidence)
+
+entity Flag {
+  on: bool = false
+}
+
+system Switch(flags: Store<Flag>) {
+  command create_flag()
+
+  step create_flag() {
+    create Flag {}
+  }
+
+  command turn_on()
+
+  step turn_on() {
+    choose f: Flag where not f.on {
+      f.on' = true
+    }
+  }
+}
+
+lemma impossible_lemma {
+  false
+}
+
+theorem never_on for Switch {
+  show always all f: Flag | not f.on
+}

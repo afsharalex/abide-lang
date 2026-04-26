@@ -1,0 +1,98 @@
+module Until
+
+// Until temporal operator tests
+
+enum Light = Red | Yellow | Green
+
+entity Signal {
+  color: Light = @Red
+  action go_green() requires color == @Red { color' = @Green }
+  action go_yellow() requires color == @Red { color' = @Yellow }
+}
+
+system Direct(signals: Store<Signal>) {
+
+  command make_signal()
+
+  step make_signal() { create Signal {} }
+
+  command toggle()
+
+  step toggle() {
+    choose s: Signal where s.color == @Red { s.go_green() }
+  }
+}
+
+system Indirect(signals: Store<Signal>) {
+
+  command make_signal()
+
+  step make_signal() { create Signal {} }
+
+  command step_yellow()
+
+  step step_yellow() {
+    choose s: Signal where s.color == @Red { s.go_yellow() }
+  }
+}
+
+// Red holds until Green — should PROVE (Red then directly Green)
+verify direct_until {
+  assume {
+    store signals: Signal[0..5]
+    let direct = Direct { signals: signals }
+  }
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+// Red until Green — should FAIL because Red becomes Yellow first
+verify indirect_fails {
+  assume {
+    store signals: Signal[0..5]
+    let indirect = Indirect { signals: signals }
+  }
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+system StuckRed(signals: Store<Signal>) {
+
+  command make_signal()
+
+  step make_signal() { create Signal {} }
+  // No step changes color — signals stay Red forever
+}
+
+// Red until Green — should FAIL because Green never occurs
+// (Q never becomes true violates the "until" requirement)
+verify never_green {
+  assume {
+    store signals: Signal[0..5]
+    let stuckRed = StuckRed { signals: signals }
+  }
+  assert all s: Signal |
+    s.color == @Red until s.color == @Green
+}
+
+// Until via prop (def expansion path)
+prop stuck_prop = all s: Signal | s.color == @Red until s.color == @Green
+
+verify via_prop {
+  assume {
+    store signals: Signal[0..5]
+    let stuckRed = StuckRed { signals: signals }
+  }
+  assert stuck_prop
+}
+
+// Until via pred (def expansion path)
+pred stuck_pred(s: Signal) = s.color == @Red until s.color == @Green
+
+verify via_pred {
+  assume {
+    store signals: Signal[0..5]
+    let stuckRed = StuckRed { signals: signals }
+  }
+  assert all s: Signal | stuck_pred(s)
+}

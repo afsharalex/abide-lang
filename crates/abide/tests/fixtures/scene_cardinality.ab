@@ -1,0 +1,236 @@
+module SceneCardinality
+
+// Scene command cardinality + ^| exclusive choice
+
+enum Status = Pending | Confirmed | Shipped | Cancelled
+
+entity Order {
+  id: identity
+  status: Status = @Pending
+  action confirm() requires status == @Pending { status' = @Confirmed }
+  action ship() requires status == @Confirmed { status' = @Shipped }
+  action cancel() requires status == @Pending { status' = @Cancelled }
+}
+
+system Commerce(orders: Store<Order>) {
+
+  command create_order()
+
+  step create_order() { create Order {} }
+
+  command confirm_order(order_id: identity)
+
+  step confirm_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
+  }
+
+  command ship_order(order_id: identity)
+
+  step ship_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Confirmed { o.ship() }
+  }
+
+  command cancel_order(order_id: identity)
+
+  step cancel_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Pending { o.cancel() }
+  }
+}
+
+// ── {lone}: event fires 0 or 1 times ───────────────────────────────
+
+// Exactly one of confirm or cancel fires (both require @Pending). Should PASS.
+scene lone_fires_once {
+  given {
+    store orders: Order[0..2]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    let commerce_confirm_order = commerce.confirm_order(o.id){lone}
+    let commerce_cancel_order = commerce.cancel_order(o.id){lone}
+    assume commerce_confirm_order ^| commerce_cancel_order
+  }
+  then {
+    assert o.status == @Confirmed or o.status == @Cancelled
+  }
+}
+
+// Only confirm fires — cancel is not attempted. Should PASS.
+scene lone_does_not_fire {
+  given {
+    store orders: Order[0..2]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    commerce.confirm_order(o.id){lone}
+  }
+  then {
+    assert o.status == @Confirmed
+  }
+}
+
+// ── {no}: event never fires ─────────────────────────────────────────
+
+// Cancel never fires — order gets confirmed and shipped. Should PASS.
+scene no_cancel {
+  given {
+    store orders: Order[0..2]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    let commerce_confirm_order = commerce.confirm_order(o.id)
+    let commerce_ship_order = commerce.ship_order(o.id)
+    assume commerce_confirm_order -> commerce_ship_order
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+
+// ── {N}: event fires exactly N times ────────────────────────────────
+
+// Create exactly 2 orders. Should PASS.
+scene exact_two_creates {
+  given {
+    store orders: Order[0..2]
+    let commerce = Commerce { orders: orders }
+  }
+  when {
+    commerce.create_order(){2}
+  }
+  then {
+    assert exists o2: Order | o2.status == @Pending
+  }
+}
+
+// ── {some}: event fires 1 or more times ─────────────────────────────
+
+// Create at least one order. Should PASS.
+scene some_creates {
+  given {
+    store orders: Order[0..2]
+    let commerce = Commerce { orders: orders }
+  }
+  when {
+    commerce.create_order(){some}
+  }
+  then {
+    assert exists o2: Order | o2.status == @Pending
+  }
+}
+
+// ── ^| exclusive choice ─────────────────────────────────────────────
+
+enum LogKind = Info | Warning
+entity AuditLog {
+  kind: LogKind = @Info
+  action mark_warning() requires kind == @Info { kind' = @Warning }
+}
+
+system Audited(orders: Store<Order>, auditLogs: Store<AuditLog>) {
+
+  command confirm_order(order_id: identity)
+
+  step confirm_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
+  }
+
+  command cancel_order(order_id: identity)
+
+  step cancel_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Pending { o.cancel() }
+  }
+}
+
+// Exactly one of confirm or cancel fires. Should PASS.
+scene xor_confirm_or_cancel {
+  given {
+    store orders: Order[0..2]
+    let audited = Audited { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    let audited_confirm_order = audited.confirm_order(o.id){1}
+    let audited_cancel_order = audited.cancel_order(o.id){1}
+    assume audited_confirm_order ^| audited_cancel_order
+  }
+  then {
+    assert o.status == @Confirmed or o.status == @Cancelled
+  }
+}
+
+// {lone} inside same-step &: optional event on different entity can skip.
+// confirm (Order) always fires, warn (AuditLog) is optional. Should PASS
+// even if warn skips — AuditLog stays @Info.
+system AuditActions(orders: Store<Order>, auditLogs: Store<AuditLog>) {
+
+  command confirm_order(order_id: identity)
+
+  step confirm_order(order_id: identity) {
+    choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
+  }
+
+  command warn_log()
+
+  step warn_log() {
+    choose l: AuditLog where l.kind == @Info { l.mark_warning() }
+  }
+}
+
+scene lone_in_same_step {
+  given {
+    store orders: Order[0..2]
+    store auditLogs: AuditLog[0..2]
+    let auditActions = AuditActions { orders: orders, auditLogs: auditLogs }
+    let o = one Order in orders where o.status == @Pending
+    let l = one AuditLog in auditLogs where l.kind == @Info
+  }
+  when {
+    let auditActions_confirm_order = auditActions.confirm_order(o.id)
+    let auditActions_warn_log = auditActions.warn_log()
+    assume (auditActions_confirm_order & auditActions_warn_log)
+  }
+  then {
+    // confirm always fires; warn is optional.
+    // Order becomes Confirmed. AuditLog may or may not change.
+    assert o.status == @Confirmed
+  }
+}
+
+// ^| with exact {1} cardinality — should behave like {one}. Should PASS.
+scene xor_exact_one {
+  given {
+    store orders: Order[0..2]
+    let audited = Audited { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    let audited_confirm_order = audited.confirm_order(o.id)
+    let audited_cancel_order = audited.cancel_order(o.id)
+    assume audited_confirm_order ^| audited_cancel_order
+  }
+  then {
+    assert o.status == @Confirmed or o.status == @Cancelled
+  }
+}
+
+// ^| requires both to be IMPOSSIBLE simultaneously — should FAIL
+scene xor_both_required {
+  given {
+    store orders: Order[0..2]
+    let audited = Audited { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  when {
+    let audited_confirm_order = audited.confirm_order(o.id)
+    let audited_cancel_order = audited.cancel_order(o.id)
+    assume audited_confirm_order ^| audited_cancel_order
+  }
+  then {
+    // Can't require both — only one fires
+    assert o.status == @Confirmed and o.status == @Cancelled
+  }
+}

@@ -21,7 +21,7 @@ Sum types. Enums define the vocabulary of state with named constructors.
 ### Structs
 
 ```abide
-struct Address { street: String, city: String }
+struct Address { street: string, city: string }
 ```
 
 Product types with named fields. Structs group related data.
@@ -33,7 +33,7 @@ Product types with named fields. Structs group related data.
 ### Type Aliases
 
 ```abide
-type Price = Int
+type Price = int
 ```
 
 Type aliases give a new name to an existing type.
@@ -46,17 +46,17 @@ Type aliases give a new name to an existing type.
 
 ```abide
 // Refinement type aliases — constrain values with predicates
-type Positive = Int { $ > 0 }
-type Byte = Int { $ >= 0 and $ <= 255 }
+type Positive = int { $ > 0 }
+type Byte = int { $ >= 0 and $ <= 255 }
 
 // Inline refinement on parameters
-fn gcd(a: Int{$ > 0}, b: Int{$ > 0}): Int
+fn gcd(a: int{$ > 0}, b: int{$ > 0}): int
 
 // Parameter names can reference earlier parameters (left-to-right)
-fn clamp(lo: Int, hi: Int{$ > lo}, x: Int): Int
+fn clamp(lo: int, hi: int{$ > lo}, x: int): int
 
 // Parameter names can be used instead of $
-fn bounded(x: Int{x > 0}, y: Int{y > x}): Int
+fn bounded(x: int{x > 0}, y: int{y > x}): int
 ```
 
 The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts.
@@ -71,8 +71,8 @@ Refinement types are not allowed on return types — use `ensures` for return co
 
 ```abide
 enum Shape =
-  Circle { radius: Real }
-  | Rectangle { width: Real, height: Real }
+  Circle { radius: real }
+  | Rectangle { width: real, height: real }
   | Point
 ```
 
@@ -86,9 +86,9 @@ Sum types with record variants. Each variant can carry different fields.
 
 ```abide
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending requires total > 0 {
     status' = @Paid
@@ -118,7 +118,7 @@ The `@` prefix marks state and constructor values. `::` is scope resolution for 
 ### Primed Notation
 
 ```abide
-action withdraw(amount: Real) requires balance >= amount {
+action withdraw(amount: real) requires balance >= amount {
   balance' = balance - amount
 }
 ```
@@ -132,7 +132,7 @@ action withdraw(amount: Real) requires balance >= amount {
 ### Contracts
 
 ```abide
-action deposit(amount: Real)
+action deposit(amount: real)
   requires amount > 0
   requires status == @Active
   ensures balance' == balance + amount {
@@ -152,7 +152,7 @@ action deposit(amount: Real)
 system Banking {
   use Account
 
-  event deposit(a: Account, amount: Real)
+  event deposit(a: Account, amount: real)
     requires amount > 0 {
     a.deposit(amount)
   }
@@ -168,7 +168,7 @@ Systems compose entities and define events. Events are externally triggered oper
 ### Entity Reference Parameters
 
 ```abide
-action transfer_out[to: Account](amount: Real) requires balance >= amount {
+action transfer_out[to: Account](amount: real) requires balance >= amount {
   balance' = balance - amount
 }
 ```
@@ -183,7 +183,7 @@ Square brackets `[to: Account]` declare entity reference parameters — referenc
 
 ```abide
 pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: Real) = a.balance >= amount
+pred has_funds(a: Account, amount: real) = a.balance >= amount
 ```
 
 Named boolean expressions. Reusable in guards, properties, and verification blocks.
@@ -208,8 +208,8 @@ Named assertions about the system. Global (`prop name = ...`) or scoped to an en
 ### Pure Functions
 
 ```abide
-fn max(a: Int, b: Int): Int = if a > b then a else b
-fn risk_score(t: Transfer): Real = sorry
+fn max(a: int, b: int): int = if a > b then a else b
+fn risk_score(t: Transfer): real = sorry
 ```
 
 Named pure functions. `= expr` form for simple definitions. `sorry` stubs a function body that will be filled in later.
@@ -221,7 +221,7 @@ Named pure functions. `= expr` form for simple definitions. `sorry` stubs a func
 ### Function Contracts
 
 ```abide
-fn gcd(a: Int, b: Int): Int
+fn gcd(a: int, b: int): int
   requires a > 0
   requires b >= 0
   ensures result > 0
@@ -243,7 +243,7 @@ Functions with contracts use the `{ body }` form. `requires` = precondition. `en
 ### Imperative Functions
 
 ```abide
-fn sum_to(n: Int): Int
+fn sum_to(n: int): int
   requires n >= 0
 {
   var total = 0
@@ -340,7 +340,7 @@ axiom transfer_preserves_total {
 ### Match Expressions
 
 ```abide
-fn describe(s: Shape): String =
+fn describe(s: Shape): string =
   match s {
     Circle { radius: r } if r > 100 => "large circle"
     Circle { .. } => "circle"
@@ -407,10 +407,10 @@ Set quantifiers with formal semantics. `all`/`exists` are standard logical quant
 ### Sorry, Todo, Assert, Assume
 
 ```abide
-fn calculate_risk(o: Order): Real = sorry   // ADMITTED — skips all verification
-fn validate_address(a: Address): Bool = todo // verification error — implementation missing
+fn calculate_risk(o: Order): real = sorry   // ADMITTED — skips all verification
+fn validate_address(a: Address): bool = todo // verification error — implementation missing
 
-fn checked_divide(a: Int, b: Int): Int
+fn checked_divide(a: int, b: int): int
   requires b != 0
 {
   assert b != 0    // VC: proved from requires, then available as fact

@@ -1,0 +1,97 @@
+module Collections
+
+// Collection types example
+// Demonstrates: Map<K,V>, Set<T>, Seq<T>, map update, index access,
+// set comprehension, cardinality, collection literals, membership
+
+enum Priority = Low | Medium | High | Critical
+
+enum TaskStatus = Open | InProgress | Done
+
+entity Task {
+  id: identity
+  status: TaskStatus = @Open
+  priority: Priority = @Medium
+  tags: Set<identity>
+  metadata: Map<string,int>
+  history: Seq<int>
+
+  action start() requires status == @Open {
+    status' = @InProgress
+  }
+
+  action finish() requires status == @InProgress {
+    status' = @Done
+  }
+
+  action add_tag(tag_id: identity) requires status != @Done {
+    tags' = tags[tag_id := true]
+  }
+
+  action set_meta(key: string, value: int) {
+    metadata' = metadata[key := value]
+  }
+}
+
+const MAX_TASKS = 100
+
+fn priority_weight(p: Priority): int = match p {
+  Low => 1
+  Medium => 2
+  High => 3
+  Critical => 5
+}
+
+pred is_active(t: Task) = t.status != @Done
+
+prop tasks_start_open for TaskMgmt =
+  always (all t: Task | t.status == @Open or t.status == @InProgress or t.status == @Done)
+
+system TaskMgmt(tasks: Store<Task>) {
+
+  command create_task()
+
+  step create_task() {
+    create Task {
+      status = @Open
+      priority = @Medium
+    }
+  }
+
+  command start_task(task_id: identity)
+
+  step start_task(task_id: identity) {
+    choose t: Task where t.id == task_id {
+      t.start()
+    }
+  }
+
+  command finish_task(task_id: identity)
+
+  step finish_task(task_id: identity) {
+    choose t: Task where t.id == task_id {
+      t.finish()
+    }
+  }
+
+  command tag_task(task_id: identity, tag: identity)
+
+  step tag_task(task_id: identity, tag: identity) {
+    choose t: Task where t.id == task_id {
+      t.add_tag(tag)
+    }
+  }
+}
+
+verify task_lifecycle {
+  assume {
+    store tasks: Task[0..20]
+    let taskMgmt = TaskMgmt { tasks: tasks }
+  }
+  assert always (all t: Task | t.status == @Open or t.status == @InProgress or t.status == @Done)
+}
+
+scene task_creation {
+  given let t = one Task where t.status == @Open
+  then assert t.status == @Open
+}

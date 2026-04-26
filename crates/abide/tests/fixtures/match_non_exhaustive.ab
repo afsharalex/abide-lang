@@ -1,0 +1,12 @@
+module MatchNonExhaustive
+
+// Non-exhaustive match — should produce errors
+
+enum Status = Pending | Confirmed | Shipped | Cancelled
+
+// Missing Shipped and Cancelled
+fn describe(s: Status): string
+  = match s {
+    Pending => "waiting"
+    Confirmed => "ready"
+  }

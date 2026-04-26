@@ -1,0 +1,60 @@
+module Termination
+
+// Simple recursion with valid decreases: proved
+fn factorial(n: int): int
+  requires n >= 0
+  decreases n
+  ensures result >= 1
+{
+  if n == 0 { 1 } else { n * factorial(n - 1) }
+}
+
+// Multiple recursive calls, all decrease: proved
+fn fib(n: int): int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  if n == 0 { 0 } else { if n == 1 { 1 } else { fib(n - 1) + fib(n - 2) } }
+}
+
+// Bad recursion: n+1 does not decrease
+fn bad_recurse(n: int): int
+  requires n >= 0
+  decreases n
+  ensures result >= 0
+{
+  if n == 0 { 0 } else { bad_recurse(n + 1) }
+}
+
+// No recursive calls: trivially terminating
+fn no_recursion(n: int): int
+  requires n >= 0
+  decreases n
+  ensures result == n
+{
+  n
+}
+
+// Recursive call violates requires (f(-1) where requires n >= 0)
+fn bad_precond(n: int): int
+  requires n >= 0
+  ensures result >= 0
+  decreases n
+{
+  if n == 0 { 0 } else { bad_precond(-1) }
+}
+
+// Recursive call through local variable binding
+fn via_local(n: int): int
+  requires n >= 0
+  ensures result >= 0
+  decreases n
+{
+  if n == 0 {
+    0
+  } else {
+    var m = n - 1
+    via_local(m)
+  }
+}

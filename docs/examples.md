@@ -14,9 +14,9 @@ The simplest useful spec — an entity with a status enum and two actions.
 enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
-  id: Id
+  id: identity
   status: OrderStatus = @Pending
-  total: Real
+  total: real
 
   action pay() requires status == @Pending requires total > 0 {
     status' = @Paid
@@ -42,18 +42,18 @@ An account with multiple actions, predicates, constants, and verification.
 const MAX_WITHDRAWAL = 10000
 
 entity Account {
-  id: Id
-  balance: Real
+  id: identity
+  balance: real
   status: AccountStatus = @Active
 
-  action deposit(amount: Real)
+  action deposit(amount: real)
     requires status == @Active
     requires amount > 0
     ensures balance' == balance + amount {
     balance' = balance + amount
   }
 
-  action withdraw(amount: Real)
+  action withdraw(amount: real)
     requires status == @Active
     requires amount > 0
     requires amount <= MAX_WITHDRAWAL
@@ -68,7 +68,7 @@ entity Account {
 }
 
 pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: Real) = a.balance >= amount
+pred has_funds(a: Account, amount: real) = a.balance >= amount
 
 verify account_safety for Banking[0..500] {
   assert always (all a: Account | a.balance >= 0)
@@ -97,17 +97,17 @@ A document review lifecycle with role-based guards and temporal properties.
 enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published
 
 entity Document {
-  id: Id
+  id: identity
   status: DocStatus = @Draft
-  author_id: Id
-  reviewer_id: Id
-  revision_count: Int = 0
+  author_id: identity
+  reviewer_id: identity
+  revision_count: int = 0
 
   action submit() requires status == @Draft {
     status' = @Submitted
   }
 
-  action begin_review(reviewer: Id)
+  action begin_review(reviewer: identity)
     requires status == @Submitted
     requires reviewer != author_id {
     status' = @UnderReview
@@ -156,12 +156,12 @@ Sum types with record variants and comprehensive match expressions.
 
 ```abide
 enum Shape =
-  Circle { radius: Real }
-  | Rectangle { width: Real, height: Real }
-  | Triangle { base: Real, height: Real }
+  Circle { radius: real }
+  | Rectangle { width: real, height: real }
+  | Triangle { base: real, height: real }
   | Point
 
-fn area(s: Shape): Real =
+fn area(s: Shape): real =
   match s {
     Circle { radius: r } => 3.14159 * r * r
     Rectangle { width: w, height: h } => w * h
@@ -169,7 +169,7 @@ fn area(s: Shape): Real =
     Point => 0
   }
 
-fn describe(s: Shape): String =
+fn describe(s: Shape): string =
   match s {
     Circle { radius: r } if r > 100 => "large circle"
     Circle { .. } => "circle"
@@ -229,16 +229,16 @@ A condensed healthcare specification showing entities, ADTs, predicates, and pro
 
 ```abide
 enum DosageForm =
-  Tablet { mg: Int }
-  | Liquid { ml: Int }
-  | Injection { dose_mg: Int }
+  Tablet { mg: int }
+  | Liquid { ml: int }
+  | Injection { dose_mg: int }
 
 entity Prescription {
-  id: Id
-  patient_id: Id
+  id: identity
+  patient_id: identity
   status: PrescriptionStatus = @Prescribed
   dosage: DosageForm
-  refills_remaining: Int = 0
+  refills_remaining: int = 0
 
   action dispense() requires status == @Prescribed {
     status' = @Dispensed
@@ -251,7 +251,7 @@ entity Prescription {
   }
 }
 
-fn daily_dose(d: DosageForm): Int =
+fn daily_dose(d: DosageForm): int =
   match d {
     Tablet { mg: m } => m
     Liquid { ml: m } => m * 5

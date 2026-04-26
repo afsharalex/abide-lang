@@ -1,0 +1,52 @@
+module CallSite
+
+// Function with precondition
+fn safe_div(a: int, b: int): int
+  requires b != 0
+{
+  a / b
+}
+
+// Good caller: requires x > 0, so b = x != 0
+fn caller_good(x: int): int
+  requires x > 0
+  ensures result >= 0
+{
+  safe_div(x, x)
+}
+
+// Bad caller: no guarantee x != 0
+fn caller_bad(x: int): int
+  ensures result >= 0
+{
+  safe_div(x, x)
+}
+
+// Caller that passes literal satisfying requires
+fn caller_literal(): int
+  ensures result == 5
+{
+  safe_div(10, 2)
+}
+
+// Nested call: clamp calls a requires-fn internally
+fn positive(x: int): int
+  requires x > 0
+{
+  x
+}
+
+fn add_positive(a: int, b: int): int
+  requires a > 0
+  requires b > 0
+  ensures result > 0
+{
+  positive(a) + positive(b)
+}
+
+// Nested call in BinOp where requires is NOT satisfied — must fail
+fn nested_no_requires(a: int, b: int): int
+  ensures result == a + b
+{
+  positive(a) + positive(b)
+}

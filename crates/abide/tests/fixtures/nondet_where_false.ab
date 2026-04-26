@@ -1,0 +1,44 @@
+module NondetWhereFalse
+
+// Regression: `where false` makes an entity uncreatable.
+// BMC and theorem/IC3 paths must agree — both should be vacuously PROVED
+// because no entity of this type can ever exist.
+//
+// Fairness lives in `assume { }` blocks on the verification site.
+
+entity Impossible {
+  x: int where false
+  action noop() requires x == 0 { x' = x }
+}
+
+system S(impossibles: Store<Impossible>) {
+  command mk()
+
+  step mk() { create Impossible {} }
+}
+
+// Vacuously true: no Impossible entity can ever be created.
+//
+// Opt into stutter so the BMC trace can extend even though
+// `mk` appears enabled to the deadlock detector (an inactive slot
+// exists) but is actually unsatisfiable when fired (the create body
+// asserts `x where false`). With stutter on, the trace can stutter
+// indefinitely with no Impossible entities and the universal
+// quantifier is vacuously true.
+verify where_false_vacuous {
+  assume {
+    store impossibles: Impossible[0..3]
+    let s = S { impossibles: impossibles }
+    stutter
+    fair S::mk
+  }
+  assert always all t: Impossible | false
+}
+
+// Theorem path must also be vacuous (no COUNTEREXAMPLE).
+theorem where_false_theorem for S {
+  assume {
+    fair S::mk
+  }
+  show always all t: Impossible | false
+}

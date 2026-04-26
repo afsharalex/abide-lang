@@ -1,0 +1,30 @@
+module MatchNonExhaustiveScene
+
+// Non-exhaustive match on entity field in a scene — should produce E012
+
+enum OrderStatus = Pending | Confirmed | Shipped
+
+entity Order {
+  status: OrderStatus = @Pending
+}
+
+system S(orders: Store<Order>) {
+  command make()
+
+  step make() { create Order {} }
+}
+
+// match o.status misses Shipped — should produce NonExhaustiveMatch error
+scene bad_scene {
+  given {
+    store orders: Order[0..2]
+    let s = S { orders: orders }
+    let o = one Order in orders where o.status == @Pending
+  }
+  then {
+    assert match o.status {
+      Pending => true
+      Confirmed => false
+    }
+  }
+}

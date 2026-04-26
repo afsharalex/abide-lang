@@ -1,0 +1,97 @@
+// Multi-module fixture: two includes, wildcard import, aliased imports.
+// Tests that aliases flow through elaboration, IR lowering, and verification.
+
+module Logistics
+include "shipping.ab"
+include "warehouse.ab"
+
+// Wildcard: all Shipping declarations as bare names
+use Shipping::*
+
+// Aliased: Warehouse entities and system with short names
+use Warehouse::Slot as WSlot
+use Warehouse::SlotStatus as WStat
+use Warehouse::Warehouse as WH
+
+system Logistics(packages: Store<Package>, wSlots: Store<WSlot>) {
+
+  command ship_package(pkg_id: identity)
+
+  step ship_package(pkg_id: identity)
+    requires exists p: Package | p.id == pkg_id and p.status == @Pending {
+    choose p: Package where p.id == pkg_id {
+      p.ship()
+    }
+  }
+
+  command reserve_slot(slot_id: identity)
+
+  step reserve_slot(slot_id: identity)
+    requires exists s: WSlot | s.id == slot_id and s.status == @Empty {
+    choose s: WSlot where s.id == slot_id {
+      s.reserve()
+    }
+  }
+
+  command fill_slot(slot_id: identity)
+
+  step fill_slot(slot_id: identity)
+    requires exists s: WSlot | s.id == slot_id and s.status == @Reserved {
+    choose s: WSlot where s.id == slot_id {
+      s.fill()
+    }
+  }
+
+  // Cross-call using aliased system name (WH → Warehouse)
+  command provision_slot(cap: int)
+
+  step provision_slot(cap: int) {
+    WH::add_slot(cap: cap)
+  }
+
+  // Create using aliased entity name (WSlot → Slot)
+  command create_slot(cap: int)
+
+  step create_slot(cap: int) {
+    create WSlot {
+      id = cap
+      status = @Empty
+      capacity = cap
+    }
+  }
+}
+
+// Alias used in predicate
+pred slot_available(s: WSlot) = s.status == @Empty
+
+// Wildcard import used in predicate
+pred package_pending(p: Package) = p.status == @Pending
+
+// Verify block uses alias in quantifier — asserts about status (enum), not int
+verify logistics_safety {
+  assume {
+    store packages: Package[0..5]
+    store wSlots: WSlot[0..5]
+    let logistics = Logistics { packages: packages, wSlots: wSlots }
+  }
+  assert always all s: WSlot | slot_available(s) implies s.status == @Empty
+}
+
+// Scene uses both aliased (WSlot) and wildcard (Package) entity names
+scene reserve_and_ship {
+  given {
+    store packages: Package[0..2]
+    store wSlots: WSlot[0..2]
+    let logistics = Logistics { packages: packages, wSlots: wSlots }
+    let s = one WSlot in wSlots where s.capacity == 10
+    let p = one Package in packages where p.weight == 5
+  }
+  when {
+    logistics.reserve_slot(s.id)
+    logistics.ship_package(p.id)
+  }
+  then {
+    assert s.status == @Reserved
+    assert p.status == @InTransit
+  }
+}

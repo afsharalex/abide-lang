@@ -1,0 +1,305 @@
+module Workflow
+
+// Document approval workflow example
+// Demonstrates: multi-step state machines, role-based guards,
+// exclusive choice, temporal liveness, proof obligations
+
+enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
+enum ReviewResult = Pass | Fail | NeedsRevision
+enum Priority = Low | Medium | High | Critical
+
+entity Document {
+  id: identity
+  author_id: identity
+  reviewer_id: identity
+  status: DocStatus = @Draft
+  priority: Priority = @Medium
+  revision_count: int
+
+  action submit()
+    requires status == @Draft {
+    status' = @Submitted
+  }
+
+  action assign_reviewer(reviewer: identity)
+    requires status == @Submitted {
+    status' = @UnderReview
+    reviewer_id' = reviewer
+  }
+
+  action approve()
+    requires status == @UnderReview {
+    status' = @Approved
+  }
+
+  action reject()
+    requires status == @UnderReview {
+    status' = @Rejected
+  }
+
+  action request_revision()
+    requires status == @UnderReview {
+    status' = @Draft
+    revision_count' = revision_count + 1
+  }
+
+  action publish()
+    requires status == @Approved {
+    status' = @Published
+  }
+
+  action archive()
+    requires status == @Published {
+    status' = @Archived
+  }
+
+  action reopen()
+    requires status == @Rejected {
+    status' = @Draft
+    revision_count' = revision_count + 1
+  }
+}
+
+entity AuditEntry {
+  id: identity
+  doc_id: identity
+  action_name: string
+  actor_id: identity
+}
+
+system DocumentMgmt(documents: Store<Document>, auditEntrys: Store<AuditEntry>) {
+
+  command submit_document(doc_id: identity, author_id: identity)
+
+  step submit_document(doc_id: identity, author_id: identity)
+    requires exists d: Document | d.id == doc_id and d.author_id == author_id and d.status == @Draft {
+    choose d: Document where d.id == doc_id {
+      d.submit()
+    }
+    create AuditEntry {
+      doc_id = doc_id
+      action_name = "submit"
+      actor_id = author_id
+    }
+  }
+
+  command assign_review(doc_id: identity, reviewer_id: identity)
+
+  step assign_review(doc_id: identity, reviewer_id: identity)
+    requires exists d: Document | d.id == doc_id and d.status == @Submitted
+    // Reviewer cannot be the author
+    requires exists d: Document | d.id == doc_id and d.author_id != reviewer_id {
+    choose d: Document where d.id == doc_id {
+      d.assign_reviewer(reviewer_id)
+    }
+    create AuditEntry {
+      doc_id = doc_id
+      action_name = "assign_review"
+      actor_id = reviewer_id
+    }
+  }
+
+  // Review produces exactly one of: approve, reject, or request_revision
+  command review_approve(doc_id: identity, reviewer_id: identity)
+
+  step review_approve(doc_id: identity, reviewer_id: identity)
+    requires exists d: Document |
+      d.id == doc_id and
+      d.status == @UnderReview and
+      d.reviewer_id == reviewer_id {
+    choose d: Document where d.id == doc_id {
+      d.approve()
+    }
+    create AuditEntry {
+      doc_id = doc_id
+      action_name = "approve"
+      actor_id = reviewer_id
+    }
+  }
+
+  command review_reject(doc_id: identity, reviewer_id: identity)
+
+  step review_reject(doc_id: identity, reviewer_id: identity)
+    requires exists d: Document |
+      d.id == doc_id and
+      d.status == @UnderReview and
+      d.reviewer_id == reviewer_id {
+    choose d: Document where d.id == doc_id {
+      d.reject()
+    }
+    create AuditEntry {
+      doc_id = doc_id
+      action_name = "reject"
+      actor_id = reviewer_id
+    }
+  }
+
+  command review_revise(doc_id: identity, reviewer_id: identity)
+
+  step review_revise(doc_id: identity, reviewer_id: identity)
+    requires exists d: Document |
+      d.id == doc_id and
+      d.status == @UnderReview and
+      d.reviewer_id == reviewer_id {
+    choose d: Document where d.id == doc_id {
+      d.request_revision()
+    }
+    create AuditEntry {
+      doc_id = doc_id
+      action_name = "request_revision"
+      actor_id = reviewer_id
+    }
+  }
+
+  command publish_document(doc_id: identity)
+
+  step publish_document(doc_id: identity)
+    requires exists d: Document | d.id == doc_id and d.status == @Approved {
+    choose d: Document where d.id == doc_id {
+      d.publish()
+    }
+  }
+
+  command archive_document(doc_id: identity)
+
+  step archive_document(doc_id: identity)
+    requires exists d: Document | d.id == doc_id and d.status == @Published {
+    choose d: Document where d.id == doc_id {
+      d.archive()
+    }
+  }
+
+  command reopen_document(doc_id: identity, author_id: identity)
+
+  step reopen_document(doc_id: identity, author_id: identity)
+    requires exists d: Document |
+      d.id == doc_id and
+      d.status == @Rejected and
+      d.author_id == author_id {
+    choose d: Document where d.id == doc_id {
+      d.reopen()
+    }
+  }
+}
+
+// Predicates
+pred is_terminal(d: Document) =
+  d.status == @Published or d.status == @Archived
+
+pred revision_bounded(d: Document) =
+  d.revision_count >= 0
+
+// Properties
+prop terminal_is_final for DocumentMgmt =
+  always all d: Document |
+    d.status == @Archived implies always d.status == @Archived
+
+prop revisions_non_negative for DocumentMgmt =
+  always all d: Document | revision_bounded(d)
+
+prop review_exclusivity for DocumentMgmt =
+  always all d: Document |
+    d.status == @UnderReview implies
+      eventually (d.status == @Approved ^| d.status == @Rejected ^| d.status == @Draft)
+
+prop eventual_resolution for DocumentMgmt =
+  always all d: Document |
+    d.status == @Submitted implies eventually (is_terminal(d) or d.status == @Draft)
+
+// Bounded checks
+//
+// Opt into stutter: the system has no `create_document`
+// step, so under verify's default no-stutter assumption the BMC
+// trace cannot extend past the initial state. The properties are
+// vacuously true when no Documents exist; stutter lets the trace
+// remain valid through the bound while the verifier checks that.
+verify workflow_safety {
+  assume {
+    stutter
+    store documents: Document[0..10]
+    store auditEntrys: AuditEntry[0..10]
+    let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
+  }
+  assert terminal_is_final
+  assert revisions_non_negative
+  assert review_exclusivity
+}
+
+verify workflow_liveness {
+  assume {
+    stutter
+    store documents: Document[0..5]
+    store auditEntrys: AuditEntry[0..5]
+    let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
+  }
+  assert eventual_resolution
+}
+
+// Proofs
+theorem revision_count_monotonic for DocumentMgmt
+  invariant all d: Document | d.revision_count >= 0 {
+  show always all d: Document |
+    d.revision_count >= 0
+}
+
+// Scenarios
+scene happy_path_submit_to_publish {
+  given {
+    store documents: Document[0..2]
+    store auditEntrys: AuditEntry[0..2]
+    let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
+    let d = one Document in documents where d.status == @Draft and d.revision_count == 0
+  }
+  when {
+    let documentMgmt_submit_document = documentMgmt.submit_document(d.id, d.author_id)
+    let documentMgmt_assign_review = documentMgmt.assign_review(d.id, d.reviewer_id)
+    let documentMgmt_review_approve = documentMgmt.review_approve(d.id, d.reviewer_id)
+    let documentMgmt_publish_document = documentMgmt.publish_document(d.id)
+    assume documentMgmt_submit_document -> documentMgmt_assign_review -> documentMgmt_review_approve -> documentMgmt_publish_document
+  }
+  then {
+    assert d.status == @Published
+    assert d.revision_count == 0
+  }
+}
+
+scene revision_cycle {
+  given {
+    store documents: Document[0..2]
+    store auditEntrys: AuditEntry[0..2]
+    let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
+    let d = one Document in documents where d.status == @Draft and d.revision_count == 0
+  }
+  when {
+    let submit1 = documentMgmt.submit_document(d.id, d.author_id)
+    let assign1 = documentMgmt.assign_review(d.id, d.reviewer_id)
+    let revise = documentMgmt.review_revise(d.id, d.reviewer_id)
+    let submit2 = documentMgmt.submit_document(d.id, d.author_id)
+    let assign2 = documentMgmt.assign_review(d.id, d.reviewer_id)
+    let approve = documentMgmt.review_approve(d.id, d.reviewer_id)
+    assume submit1 -> assign1 -> revise -> submit2 -> assign2 -> approve
+  }
+  then {
+    assert d.status == @Approved
+    assert d.revision_count == 1
+  }
+}
+
+scene rejection_and_reopen {
+  given {
+    store documents: Document[0..2]
+    store auditEntrys: AuditEntry[0..2]
+    let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
+    let d = one Document in documents where d.status == @Draft
+  }
+  when {
+    let documentMgmt_submit_document = documentMgmt.submit_document(d.id, d.author_id)
+    let documentMgmt_assign_review = documentMgmt.assign_review(d.id, d.reviewer_id)
+    let documentMgmt_review_reject = documentMgmt.review_reject(d.id, d.reviewer_id)
+    let documentMgmt_reopen_document = documentMgmt.reopen_document(d.id, d.author_id)
+    assume documentMgmt_submit_document -> documentMgmt_assign_review -> documentMgmt_review_reject -> documentMgmt_reopen_document
+  }
+  then {
+    assert d.status == @Draft
+  }
+}

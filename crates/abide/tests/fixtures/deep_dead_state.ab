@@ -1,0 +1,68 @@
+module DeepDeadState
+
+// Regression test: deep dead-state reachable via 6+ transitions.
+// A chain S0 → S1 → ... → S6 where S6 is a dead non-goal state.
+// The property `eventually state == @Goal` is FALSE (S6 is a dead end
+// where no events are enabled and Goal is never reached).
+//
+// This must NOT be falsely PROVED. Previously, a shallow lasso sanity
+// check (depth 5) missed the S6 dead state, and IC3's coarse justice
+// then falsely proved the property.
+//
+// POST-SWEEP: fairness lives in `assume { }` blocks on the verification site.
+
+enum Chain = S0 | S1 | S2 | S3 | S4 | S5 | S6 | Goal
+
+entity E {
+  state: Chain = @S0
+  action step1() requires state == @S0 { state' = @S1 }
+  action step2() requires state == @S1 { state' = @S2 }
+  action step3() requires state == @S2 { state' = @S3 }
+  action step4() requires state == @S3 { state' = @S4 }
+  action step5() requires state == @S4 { state' = @S5 }
+  action step6() requires state == @S5 { state' = @S6 }
+}
+
+system DeepChain(es: Store<E>) {
+  command spawn()
+
+  step spawn() { create E {} }
+
+  command advance1()
+
+  step advance1() { choose e: E where e.state == @S0 { e.step1() } }
+
+  command advance2()
+
+  step advance2() { choose e: E where e.state == @S1 { e.step2() } }
+
+  command advance3()
+
+  step advance3() { choose e: E where e.state == @S2 { e.step3() } }
+
+  command advance4()
+
+  step advance4() { choose e: E where e.state == @S3 { e.step4() } }
+
+  command advance5()
+
+  step advance5() { choose e: E where e.state == @S4 { e.step5() } }
+
+  command advance6()
+
+  step advance6() { choose e: E where e.state == @S5 { e.step6() } }
+}
+
+// Must NOT be PROVED — S6 is a dead state where Goal never holds.
+theorem deep_dead for DeepChain {
+  assume {
+    fair DeepChain::spawn
+    fair DeepChain::advance1
+    fair DeepChain::advance2
+    fair DeepChain::advance3
+    fair DeepChain::advance4
+    fair DeepChain::advance5
+    fair DeepChain::advance6
+  }
+  show all e: E | eventually e.state == @Goal
+}

@@ -1,0 +1,184 @@
+module Auth
+
+// Authentication & authorization example
+// Demonstrates: shared entity reuse, multiple systems operating
+// on the same entity, cross-system calls, temporal properties
+
+enum UserStatus = Active | Suspended | Locked | Deleted
+enum Role = Admin | Member | Guest
+enum SessionStatus = Valid | Expired | Revoked
+
+entity User {
+  id: identity
+  email: string
+  status: UserStatus = @Active
+  role: Role = @Member
+  failed_attempts: int
+
+  action activate()
+    requires status == @Suspended {
+    status' = @Active
+    failed_attempts' = 0
+  }
+
+  action suspend()
+    requires status == @Active {
+    status' = @Suspended
+  }
+
+  action lock()
+    requires status == @Active
+    requires failed_attempts >= 5 {
+    status' = @Locked
+  }
+
+  action delete()
+    requires status == @Suspended {
+    status' = @Deleted
+  }
+
+  action record_failure()
+    requires status == @Active {
+    failed_attempts' = failed_attempts + 1
+  }
+
+  action reset_failures()
+    requires status == @Active {
+    failed_attempts' = 0
+  }
+}
+
+entity Session {
+  id: identity
+  user_id: identity
+  status: SessionStatus = @Valid
+
+  action expire()
+    requires status == @Valid {
+    status' = @Expired
+  }
+
+  action revoke()
+    requires status == @Valid {
+    status' = @Revoked
+  }
+}
+
+system Auth(users: Store<User>, sessions: Store<Session>) {
+
+  command login(user_id: identity)
+
+  step login(user_id: identity)
+    requires exists u: User | u.id == user_id and u.status == @Active {
+    choose u: User where u.id == user_id {
+      u.reset_failures()
+    }
+    create Session {
+      user_id = user_id
+      status = @Valid
+    }
+  }
+
+  command login_failed(user_id: identity)
+
+  step login_failed(user_id: identity)
+    requires exists u: User | u.id == user_id and u.status == @Active {
+    choose u: User where u.id == user_id {
+      u.record_failure()
+    }
+  }
+
+  command auto_lock(user_id: identity)
+
+  step auto_lock(user_id: identity)
+    requires exists u: User |
+      u.id == user_id and
+      u.status == @Active and
+      u.failed_attempts >= 5 {
+    choose u: User where u.id == user_id {
+      u.lock()
+    }
+    // Revoke all active sessions for locked user
+    for s: Session {
+      s.revoke()
+    }
+  }
+
+  command logout(session_id: identity)
+
+  step logout(session_id: identity)
+    requires exists s: Session | s.id == session_id and s.status == @Valid {
+    choose s: Session where s.id == session_id {
+      s.expire()
+    }
+  }
+
+  command suspend_user(user_id: identity)
+
+  step suspend_user(user_id: identity)
+    requires exists u: User | u.id == user_id and u.status == @Active {
+    choose u: User where u.id == user_id {
+      u.suspend()
+    }
+    for s: Session {
+      s.revoke()
+    }
+  }
+}
+
+// Predicates
+pred user_active(u: User) = u.status == @Active
+pred session_valid(s: Session) = s.status == @Valid
+
+// Properties
+prop no_locked_sessions for Auth =
+  always all s: Session | all u: User |
+    u.status == @Locked and s.user_id == u.id implies s.status != @Valid
+
+prop deleted_is_final for Auth =
+  always all u: User | u.status == @Deleted implies always u.status == @Deleted
+
+// Bounded checks
+//
+// Opt into stutter: the system has no `create_user` command,
+// so under verify's default no-stutter assumption the BMC trace
+// cannot extend past the initial state. The properties are vacuously
+// true when no Users exist; stutter lets the trace remain valid
+// through the bound while the verifier checks that.
+verify auth_safety {
+  assume {
+    stutter
+    store users: User[0..10]
+    store sessions: Session[0..10]
+    let auth = Auth { users: users, sessions: sessions }
+  }
+  assert no_locked_sessions
+  assert deleted_is_final
+  assert always all u: User | u.failed_attempts >= 0
+}
+
+// Unbounded proof
+theorem lockout_correctness for Auth
+  invariant all u: User | u.failed_attempts >= 0
+  invariant all u: User | u.status == @Locked implies u.failed_attempts >= 5 {
+  show always all u: User |
+    u.failed_attempts >= 5 and u.status == @Active implies
+      eventually u.status == @Locked
+}
+
+// Scenario
+scene lockout_after_5_failures {
+  given {
+    store users: User[0..2]
+    let auth = Auth { users: users }
+    let u = one User in users where u.status == @Active and u.failed_attempts == 0
+  }
+  when {
+    let auth_login_failed = auth.login_failed(u.id){5}
+    let auth_auto_lock = auth.auto_lock(u.id)
+    assume auth_login_failed -> auth_auto_lock
+  }
+  then {
+    assert u.status == @Locked
+  }
+}

@@ -1,0 +1,25 @@
+module Simple
+
+// Simple Abide example: types, entities with actions
+
+enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
+type Price = int
+
+struct Address { street: string, city: string }
+
+entity Order {
+  id: identity
+  total: Price
+  status: OrderStatus = @Pending
+
+  action submit()
+    requires status == @Pending
+    requires total > 0 {
+    status' = @AwaitingPayment
+  }
+
+  action mark_paid()
+    requires status == @AwaitingPayment {
+    status' = @Paid
+  }
+}

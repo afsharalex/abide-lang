@@ -1,0 +1,63 @@
+module Refinements
+
+// Refinement type examples
+// Demonstrates: type aliases with predicates, inline parameter refinements,
+// $ placeholder, left-to-right parameter references, combined with contracts
+
+// --- Refinement type aliases ---
+
+type Positive = int { $ > 0 }
+type Byte = int { $ >= 0 and $ <= 255 }
+type NonNeg = int { $ >= 0 }
+
+// --- Inline parameter refinements with $ ---
+
+fn abs(x: int): int
+  ensures result >= 0
+{
+  if x < 0 { 0 - x } else { x }
+}
+
+fn gcd(a: int{$ > 0}, b: int{$ >= 0}): int
+  ensures result > 0
+  decreases b
+{
+  if b == 0 { a } else { gcd(b, a % b) }
+}
+
+// --- Left-to-right parameter references ---
+
+fn clamp(lo: int, hi: int{$ > lo}, x: int): int
+  ensures result >= lo
+  ensures result <= hi
+{
+  if x < lo { lo } else { if x > hi { hi } else { x } }
+}
+
+// --- Parameter name instead of $ ---
+
+fn bounded(x: int{x > 0}, y: int{y > x}): int = y
+
+// --- Using refinement type aliases ---
+
+fn double_positive(x: Positive): int
+  ensures result > 0
+{
+  x + x
+}
+
+fn byte_to_int(b: Byte): int = b
+
+// --- Combined with contracts ---
+
+fn safe_divide(a: int, b: int{$ != 0}): int = a / b
+
+// --- Pure functions with refinement ---
+
+fn is_valid_byte(x: int): bool = x >= 0 and x <= 255
+
+fn successor(n: NonNeg): int
+  ensures result > n
+{
+  n + 1
+}

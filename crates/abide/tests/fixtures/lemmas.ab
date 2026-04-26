@@ -1,0 +1,44 @@
+module Lemmas
+
+// Lemma verification tests
+
+// --- Simple tautologies that should PROVE ---
+
+lemma tautology {
+  true
+}
+
+lemma excluded_middle {
+  all x: bool | x or not x
+}
+
+lemma arith_identity {
+  all x: int | x + 0 == x
+}
+
+// --- Lemma that should FAIL ---
+
+lemma contradiction {
+  false
+}
+
+// --- Enum domain lemma ---
+
+enum Color = Red | Green | Blue
+
+lemma color_exhaustive {
+  all c: Color | c == @Color::Red or c == @Color::Green or c == @Color::Blue
+}
+
+// --- Multi-expression body ---
+
+lemma two_truths {
+  all x: int | x == x
+  all x: int | x + 1 > x
+}
+
+// --- Lambda in lemma body ---
+
+lemma lambda_identity {
+  (fn(x: int): int => x + 1)(0) == 1
+}

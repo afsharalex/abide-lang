@@ -1,0 +1,16 @@
+[package]
+name = "abide-sema"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abide-core = { path = "../abide-core" }
+abide-syntax = { path = "../abide-syntax" }
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"

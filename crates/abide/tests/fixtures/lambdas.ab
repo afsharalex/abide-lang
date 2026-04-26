@@ -1,0 +1,95 @@
+module Lambdas
+
+// Lambda expression tests
+
+// --- Immediate application ---
+
+fn apply_single(): int
+  ensures result == 2
+{
+  (fn(y: int): int => y + 1)(1)
+}
+
+fn apply_multi(): int
+  ensures result == 7
+{
+  (fn(x: int, y: int): int => x + y)(3, 4)
+}
+
+fn apply_three_args(): int
+  ensures result == 12
+{
+  (fn(a: int, b: int, c: int): int => a * b + c)(2, 5, 2)
+}
+
+// --- Lambda identity ---
+
+fn identity(x: int): int
+  ensures result == x
+{
+  (fn(y: int): int => y)(x)
+}
+
+// --- Let-bound lambda ---
+
+fn let_lambda(): int
+  ensures result == 10
+{
+  let f = fn(x: int): int => x * 2
+  in f(5)
+}
+
+// --- Closure over parameter ---
+
+fn closure(x: int): int
+  ensures result == x + 1
+{
+  let inc = fn(y: int): int => y + 1
+  in inc(x)
+}
+
+// --- Lambda with bool return ---
+
+fn bool_lambda(): bool
+  ensures result == true
+{
+  (fn(x: int): bool => x > 0)(42)
+}
+
+// --- Lambda in ensures ---
+
+fn ensures_lambda(): int
+  ensures (fn(x: int): int => x + 1)(0) == 1
+{
+  0
+}
+
+// --- Lambda in assert ---
+
+fn assert_lambda(): int
+  ensures result == 0
+{
+  assert (fn(x: int): int => x + 1)(0) == 1
+  0
+}
+
+// --- Partial application (currying) ---
+
+fn partial_app(): int
+  ensures result == 3
+{
+  let add = fn(x: int, y: int): int => x + y
+  in let inc = add(1)
+     in inc(2)
+}
+
+// --- Multi-step partial application ---
+
+fn multi_partial(): int
+  ensures result == 6
+{
+  let f = fn(a: int, b: int, c: int): int => a + b + c
+  in let g = f(1)
+     in let h = g(2)
+        in h(3)
+}

@@ -1,0 +1,38 @@
+module Contracts
+
+// Function contract examples (non-recursive, for diff testing)
+
+fn abs(x: int): int
+  ensures result >= 0
+{
+  match x {
+    _ if x < 0 => 0 - x
+    _ => x
+  }
+}
+
+fn max_val(a: int, b: int): int
+  ensures result >= a
+  ensures result >= b
+{
+  match a {
+    _ if a >= b => a
+    _ => b
+  }
+}
+
+fn clamp(x: int, lo: int, hi: int): int
+  requires lo <= hi
+  ensures result >= lo
+  ensures result <= hi
+{
+  match x {
+    _ if x < lo => lo
+    _ if x > hi => hi
+    _ => x
+  }
+}
+
+fn double(x: int): int = x + x
+
+fn is_positive(x: int): bool = x > 0

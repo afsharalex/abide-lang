@@ -1,0 +1,132 @@
+// Full Commerce example: entities with actions, system events,
+// cross-system calls, choose + for, verify, proof, scene, module/use
+//
+// This is a multi-file fixture: billing.ab provides the Billing module.
+
+module Commerce
+include "billing.ab"
+use Billing::*
+use Billing::PaymentStatus as PS
+
+enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped | Cancelled
+type Price = int
+
+struct Address { street: string, city: string }
+
+entity Order {
+  id: identity
+  total: Price
+  status: OrderStatus = @Pending
+
+  action submit()
+    requires status == @Pending
+    requires total > 0 {
+    status' = @AwaitingPayment
+  }
+
+  action mark_paid()
+    requires status == @AwaitingPayment {
+    status' = @Paid
+  }
+
+  action ship()
+    requires status == @Paid {
+    status' = @Shipped
+  }
+
+  action cancel()
+    requires status == @Pending {
+    status' = @Cancelled
+  }
+}
+
+system Commerce(orders: Store<Order>) {
+
+  command pay(order_id: identity)
+
+  step pay(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Pending {
+    choose o: Order where o.id == order_id {
+      o.submit()
+    }
+    Billing::open_intent(order_id: order_id, amount: o.total)
+  }
+
+  command confirm_payment(order_id: identity)
+
+  step confirm_payment(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @AwaitingPayment {
+    choose o: Order where o.id == order_id {
+      o.mark_paid()
+    }
+  }
+
+  command ship_order(order_id: identity)
+
+  step ship_order(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Paid {
+    choose o: Order where o.id == order_id {
+      o.ship()
+    }
+  }
+
+  command cancel_all_pending()
+
+  step cancel_all_pending() {
+    for o: Order {
+      o.cancel()
+    }
+  }
+}
+
+pred non_negative_order_total(o: Order) = o.total >= 0
+
+prop commerce_safe for Commerce = always all o: Order | non_negative_order_total(o)
+
+// Bounded model checking — automated, scope-bounded
+verify commerce_smoke {
+  assume {
+    store orders: Order[0..5]
+    let commerce = Commerce { orders: orders }
+  }
+  assert commerce_safe
+  assert eventually exists o: Order | o.status == @Paid
+}
+
+verify billing_safety {
+  assume {
+    let billing = Billing {  }
+  }
+  assert always all p: PaymentIntent | p.status == @Captured implies p.amount > 0
+}
+
+// Uses PS alias (imported as Billing::PaymentStatus as PS)
+pred payment_opened(p: PaymentIntent) = p.status == @Opened
+
+// Unbounded proof — human-guided, emits obligations to Agda
+theorem order_total_non_negative for Commerce
+  invariant all o: Order | o.total >= 0 {
+  show always all o: Order | non_negative_order_total(o)
+}
+
+lemma order_total_preserved {
+  non_negative_order_total(o) implies non_negative_order_total(o)
+}
+
+scene happy_path {
+  given {
+    store orders: Order[0..2]
+    store paymentIntents: PaymentIntent[0..2]
+    let commerce = Commerce { orders: orders }
+    let billing = Billing { paymentIntents: paymentIntents }
+    let o = one Order in orders where o.total == 100
+  }
+  when {
+    let commerce_pay = commerce.pay(o.id)
+    let billing_capture_payment = billing.capture_payment(o.id)
+    assume commerce_pay -> billing_capture_payment
+  }
+  then {
+    assert o.status == @Paid
+  }
+}

@@ -1,0 +1,21 @@
+// Shipping module — used by logistics.ab for multi-module alias testing
+
+module Shipping
+
+enum ShipStatus = Pending | InTransit | Delivered
+
+entity Package {
+  id: identity
+  status: ShipStatus = @Pending
+  weight: int
+
+  action ship()
+    requires status == @Pending {
+    status' = @InTransit
+  }
+
+  action deliver()
+    requires status == @InTransit {
+    status' = @Delivered
+  }
+}

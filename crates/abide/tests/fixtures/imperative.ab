@@ -1,0 +1,125 @@
+module Imperative
+
+// Imperative fn body examples
+// Demonstrates: var, while, if/else, assert, assume,
+// invariant, decreases, blocks, nested control flow
+
+// --- var declarations ---
+
+fn sum_to(n: int): int
+  requires n >= 0
+  ensures result >= 0
+{
+  var total = 0
+  var i = 0
+  while i <= n
+    invariant total >= 0
+    invariant i >= 0
+    decreases n - i
+  {
+    total = total + i
+    i = i + 1
+  }
+  total
+}
+
+// --- if/else as expression ---
+
+fn abs(x: int): int
+  ensures result >= 0
+{
+  if x < 0 {
+    0 - x
+  } else {
+    x
+  }
+}
+
+fn max_val(a: int, b: int): int
+  ensures result >= a
+  ensures result >= b
+{
+  if a >= b { a } else { b }
+}
+
+fn sign(x: int): int {
+  if x > 0 {
+    1
+  } else {
+    if x < 0 {
+      0 - 1
+    } else {
+      0
+    }
+  }
+}
+
+// --- while with contracts ---
+
+fn gcd_imperative(a: int, b: int): int
+  requires a > 0
+  requires b >= 0
+  ensures result > 0
+{
+  var x = a
+  var y = b
+  while y != 0
+    invariant x > 0
+    invariant y >= 0
+    decreases y
+  {
+    var temp = y
+    y = x % y
+    x = temp
+  }
+  x
+}
+
+// --- assert and assume ---
+
+fn checked_divide(a: int, b: int): int
+  requires b != 0
+{
+  assert b != 0
+  a / b
+}
+
+fn with_assertion(x: int): int
+  requires x > 0
+{
+  assert x > 0
+  x + 1
+}
+
+// --- typed var declarations ---
+
+fn fibonacci(n: int): int
+  requires n >= 0
+{
+  var a: int = 0
+  var b: int = 1
+  var i: int = 0
+  while i < n
+    decreases n - i
+  {
+    var temp: int = b
+    b = a + b
+    a = temp
+    i = i + 1
+  }
+  a
+}
+
+// --- simple block ---
+
+fn compute(x: int): int {
+  var doubled = x + x
+  var incremented = doubled + 1
+  incremented
+}
+
+// --- no contracts (pure = form still works) ---
+
+fn double(x: int): int = x + x
+
+fn is_positive(n: int): bool = n > 0
