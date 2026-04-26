@@ -11,7 +11,7 @@ fn abs(x: int): int
   }
 }
 
-fn max(a: int, b: int): int
+fn larger_of(a: int, b: int): int
   ensures result >= a
   ensures result >= b
 {

@@ -1,54 +1,42 @@
 # Modeling Guide
 
-How to think about, structure, and work with Abide specifications.
+This guide is about how to structure Abide models with the syntax and verification model the compiler accepts today.
 
-This guide covers the principles and patterns that emerge from using Abide. It's not a syntax reference (see [syntax-at-a-glance](syntax-at-a-glance.md)) or a tutorial (see [getting-started](getting-started.md)) — it's about how to approach the work.
+## Start with types and entities
 
----
-
-## The two activities
-
-When you write a spec, you're doing two distinct things:
-
-1. **Exploring** — "What are the right concepts? How do they relate?" You're discovering your model. You sketch types and entities, run the checker, see what's possible, refine.
-
-2. **Verifying** — "Does this model satisfy my requirements?" You've committed to a design and you're checking it holds under all conditions.
-
-These feel different. Exploring is loose and creative. Verifying is precise and exhaustive. Abide supports both — you start by exploring structure, then add behavior and verification as the model matures.
-
-You don't need to get it right the first time. Define some types. Run it. See what happens. Add a constraint. Run again. This back-and-forth is the normal workflow.
-
----
-
-## Entities are data, systems are services
-
-The most important structural decision: what's an entity vs what's a system.
-
-**Entities** are the things in your domain — they have identity, fields, and state machines. Think database rows, domain objects, things you'd see in an ER diagram:
+Types define vocabulary. Entities define persistent state and transitions.
 
 ```abide
+enum OrderStatus = Pending | Confirmed | Shipped
+
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action confirm() requires status == @Pending {
+  action confirm()
+    requires status == @Pending
+    requires total > 0 {
     status' = @Confirmed
   }
 }
 ```
 
-**Systems** are the services that operate on entities — they're singletons with events. Think microservices, controllers, domain boundaries:
+Use:
+- `enum` for finite state vocabularies
+- `struct` for plain product data
+- `type` for aliases and refinements
+- `entity` for stateful things with identity
+
+## Systems are store-backed boundaries
+
+Current Abide systems take explicit store pools:
 
 ```abide
-system Commerce {
-  use Order
+system Commerce(orders: Store<Order>) {
+  command confirm_order(order_id: identity)
 
-  event place_order(total: real) {
-    create Order { total = total }
-  }
-
-  event confirm_order(order_id: identity) {
+  step confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.confirm()
     }
@@ -56,377 +44,170 @@ system Commerce {
 }
 ```
 
-The split: entities hold state, systems hold behavior. An entity answers "what is this thing and what states can it be in?" A system answers "what operations are available and how do they coordinate?"
+Model systems over explicit `Store<T>` pools and route behavior through commands and steps.
 
-If you're wondering "should this be an entity or a system?" — ask yourself: "are there multiple instances of this, or just one?" Multiple → entity. One → system.
+## Commands, steps, queries, predicates
 
-| Code concept | Abide construct |
-|-------------|----------------|
-| Database model, domain object | Entity (pooled, created/destroyed by events) |
-| Service, controller, manager | System (singleton, orchestrates entities) |
-| Business rule, computation | `fn` with contracts |
-| Configuration, constants | `const` or `struct` |
-| Data shape without identity | `enum` (sum type) or `struct` (product type) |
+Use the system surface deliberately:
 
-> **Side note:** You might think you need a "class" for something like a ProcessManager or CacheService. You don't — that's a system. Systems are singletons that orchestrate entities. If your "class" has internal state, model the state as an entity and the behavior as a system. The split feels unfamiliar if you come from OOP, but it's how spec languages work — and it makes verification much cleaner because state and behavior are separated.
-
----
-
-## Types are your vocabulary
-
-Before writing entities or systems, define the vocabulary of your domain. Enums, structs, and type aliases are cheap — make lots of them:
+- `command` — public callable operation
+- `step` — executable clause implementing a command
+- `query` — public pure observation
+- `pred` — internal pure helper
 
 ```abide
-enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
-enum Priority = Low | Medium | High | Critical
-type Money = int  // cents, not dollars — avoid floating point in specs
-struct Address { street: string, city: string, zip: string }
-```
+system Billing(orders: Store<Order>) {
+  command charge(order: Order)
 
-Enums define finite state spaces. Structs group related data. Type aliases (`type Money = int`) give meaningful names to built-in types. Together they describe the conceptual landscape before any behavior is added.
+  query payable(order: Order) =
+    order.status == @Pending and order.total > 0
 
-A well-typed spec catches mistakes at the structural level: if `Priority` and `OrderStatus` are different types, you can't accidentally compare them.
-
----
-
-## Actions are state machines
-
-Entity actions aren't methods — they're **guarded transitions**. Each action says: "IF these conditions hold, THEN these fields change."
-
-```abide
-action ship() requires status == @Confirmed {
-  status' = @Shipped
-}
-```
-
-The `requires` clause is a guard — the action can only fire when the guard is true. The body describes what changes. Fields not mentioned don't change (the frame condition is automatic).
-
-This means an entity IS a state machine. The actions define the transitions, the `requires` clauses define the guards, and the field assignments define the effects. You can read the entity definition and immediately see every possible state transition.
-
-> **Side note on primed notation:** `status'` (with a prime mark) means "the next-state value of status." This is TLA+ notation. It's declarative — you're saying what the next state looks like, not imperatively assigning a value. The distinction matters for verification: the checker can reason about both `status` (current) and `status'` (next) simultaneously.
-
----
-
-## Events are the external interface
-
-Events are what the outside world can trigger. They're defined in systems, and they invoke entity actions:
-
-```abide
-event freeze_account(account_id: identity)
-  requires exists a: Account | a.id == account_id and a.status == @Active {
-  choose a: Account where a.id == account_id {
-    a.freeze()
-  }
-  // Revoke all sessions for this account
-  for s: Session {
-    s.revoke()
+  step charge(order: Order)
+    requires payable(order) {
+    order.mark_paid()
   }
 }
 ```
 
-Three primitives in event bodies:
+## Use identity params when selection matters
 
-- **`choose`** — select one entity matching a condition and operate on it
-- **`for`** — operate on all entities of a type
-- **`create`** — bring a new entity instance into existence
-
-Events can call other systems' events for cross-service coordination: `Billing::charge(order.id)`.
-
-> **In development — syntax subject to change:** `for` will be generalized to iterate over collection values (`for item in order.items { ... }`) and bounded ranges (`for i in 0..count { ... }`), not just entity pools.
-
----
-
-## The verification ladder
-
-Abide offers four levels of confidence, each stronger than the last:
-
-### Scenes — "does this path work?"
-
-Manual test cases. You set up a specific scenario and check the outcome:
+For public APIs, identity-based command params are usually clearer than exposing unrestricted entity picks:
 
 ```abide
-scene deposit_success for Banking {
-  given let a = one Account where a.status == @Active and a.balance == 1000
-  when action dep = Banking::deposit(a, 500){one}
-  then assert a.balance == 1500
-}
-```
-
-Scenes are documentation that the checker validates. They answer: "here's an example of how the system should work."
-
-### Verify — "does it hold for all behaviors?"
-
-Bounded model checking. The checker explores ALL possible event orderings within a scope:
-
-```abide
-verify account_safety for Banking[0..500] {
-  assert always (all a: Account | a.balance >= 0)
-}
-```
-
-This says: "with up to 500 entities, try every possible event ordering. Does the balance ever go negative?" If yes, the checker gives you the exact event sequence that caused it.
-
-> **Side note on scope:** The scope pre-allocates entity slots — like reserving seats. `Banking[0..500]` means "at most 500 entity instances can exist." The `create` keyword activates a slot. When all slots are active, no more can be created. This is how Alloy works under the hood — the scope IS the universe.
-
-### Run and simulate
-
-Per-entity-type scope gives finer control over the verification universe:
-
-```abide
-run safety_check ->
-  Account[0..10], Session[0..20]
-  for 50 {
-  assert always (all a: Account | a.balance >= 0)
-}
-```
-
-Hierarchical scope with `<-` expresses structural containment, eliminating unrealistic configurations:
-
-```abide
-run workflow_test ->
-  Workflow[3] <- Node[1..4] <- Edge[derive],
-  WorkflowRun[5] <- StepExecution[2..10]
-  for 500 {
-  assert always (all r: WorkflowRun | r.status == @Completed implies
-    no s: StepExecution | s.run_id == r.id and s.status == @Active)
-}
-```
-
-Simulation mode explores one seeded forward trace for larger systems where you want execution feedback without invoking the solver:
-
-```sh
-$ abide simulate commerce.ab --steps 200 --seed 42 --slots 8
-$ abide simulate banking.ab --system TransferSystem --steps 100 --seed 7 --scope Account=12 --scope Transfer=6
-```
-
-This runs the current executable system semantics against a concrete in-memory state and prints the resulting operational trace.
-
-Use simulation when you want:
-- a concrete seeded execution
-- quick feedback on event flow and state updates
-- to exercise imperative helper logic without asking the solver for a proof
-
-Do not use simulation as a substitute for `verify` or `scene`:
-- `simulate` is not exhaustive bounded search
-- it does not prove properties
-- it does not execute proof-oriented temporal expressions
-
-### Theorem — "does it hold for all sizes?"
-
-Unbounded proof. No scope limitation — the property holds for any number of entities:
-
-```abide
-theorem no_overdraft for Banking {
-  show always (all a: Account | a.balance >= 0)
-}
-```
-
-The solver attempts an inductive proof. If it succeeds, the property is guaranteed for all time and all entity counts. If it can't, you're told what's missing and can add lemmas to help.
-
-> **Side note on theorem vs proof:** In Abide, `theorem` is the CLAIM — what you want to prove. `proof` (future) is the ARGUMENT — how you prove it. This follows mathematical convention: a theorem states the result, a proof demonstrates it. For now, the solver attempts the proof automatically. Later, `proof { }` blocks will let you guide the solver with intermediate steps.
-
----
-
-## Start abstract, add detail
-
-You don't need to write everything at once. Start with types and entities — just the structure:
-
-```abide
-enum OrderStatus = Pending | Confirmed | Shipped
-
-entity Order {
-  id: identity
-  status: OrderStatus
-}
-```
-
-Run the checker. See what instances exist. Does the state space look right? Are you missing a status? Then add actions:
-
-```abide
-entity Order {
-  id: identity
-  status: OrderStatus = @Pending
-
-  action confirm() requires status == @Pending { status' = @Confirmed }
-  action ship() requires status == @Confirmed { status' = @Shipped }
-}
-```
-
-Then add a system. Then add verification. Each step adds detail without invalidating the previous work. This is the layered approach:
-
-1. **Enums, structs, and entities** — "what exists?" (explore)
-2. **Actions and events** — "what can happen?" (model behavior)
-3. **Verify and scenes** — "is it correct?" (check properties)
-4. **Theorems** — "is it provably correct?" (prove guarantees)
-
-Most specs stop at layer 3. That's fine. Each layer is useful on its own.
-
----
-
-## Predicates and properties are documentation
-
-Name your constraints:
-
-```abide
-pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: real) = a.balance >= amount
-
-prop no_overdraft for Banking = always (all a: Account | a.balance >= 0)
-```
-
-Predicates (`pred`) are reusable boolean expressions — they give names to concepts. Properties (`prop`) are named assertions about the system — they're checked automatically by the checker.
-
-Use predicates liberally. They make your verification readable:
-
-```abide
-// Hard to read
-assert always (all a: Account | a.status != @Deleted implies a.balance >= 0)
-
-// Easy to read
-assert always (all a: Account | is_active(a) implies has_funds(a, 0))
-```
-
----
-
-## Use functions for computation
-
-Pure functions (`fn`) compute values without side effects:
-
-```abide
-fn calculate_total(subtotal: real, tax_rate: real): real =
-  subtotal + (subtotal * tax_rate)
-
-fn is_eligible(age: int): bool = age >= 18
-```
-
-Functions are great for business rules, derived values, and computations that multiple events share.
-
-Functions cannot modify entity state — that's what actions are for. This separation is intentional: functions are pure (easy to verify), actions are stateful (need more care).
-
-> **In development — syntax subject to change:** Functions will gain `requires`/`ensures` contracts, imperative block bodies with `var` and `while`, and termination measures via `decreases`. This enables Dafny-style algorithm verification within Abide.
-
----
-
-## Collections model relationships
-
-Use `Set`, `Seq`, and `Map` for entity relationships and structured data:
-
-```abide
-entity Workflow {
-  id: identity
-  name: string
-  node_ids: Set<identity>
-  variables: Map<string, string>
-}
-```
-
-Update maps with the `[k := v]` syntax:
-
-```abide
-action set_variable(key: string, value: string) {
-  variables' = variables[key := value]
-}
-```
-
-Read with index syntax: `variables[key]`.
-
-Build sets with comprehensions:
-
-```abide
-// All active accounts with positive balance
-{ a: Account where a.status == @Active and a.balance > 0 }
-
-// Just the balances
-{ a.balance | a: Account where a.status == @Active }
-```
-
----
-
-## File organization
-
-Abide doesn't enforce file structure, but convention helps:
-
-| File pattern | Contents | Purpose |
-|-------------|----------|---------|
-| `*.ab` | Types, entities, systems, functions | Definitions — what the system IS |
-| `*.spec.ab` | Verify blocks, scenes, predicates, properties | Verification — does it work? |
-| `*.proof.ab` | Theorems, lemmas, axioms | Proofs — why does it work? |
-
-Every file declares its module: `module Commerce` at the top. Multiple files can share a module. Use `use Commerce::*` to bring names into scope across modules.
-
-For larger projects, separate structure from behavior from verification. For small specs, put everything in one file. The compiler doesn't care — it processes all constructs regardless of file extension.
-
----
-
-## Common patterns
-
-### The guard-and-dispatch pattern
-
-When different behavior depends on data, use separate events with discriminating `requires` clauses:
-
-```abide
-event process_standard(order_id: identity)
-  requires exists o: Order | o.id == order_id and o.priority == @Standard { ... }
-
-event process_express(order_id: identity)
-  requires exists o: Order | o.id == order_id and o.priority == @Express { ... }
-```
-
-The checker explores which event fires based on the entity state. You don't need if/else — the `requires` clauses handle dispatch.
-
-### The coordinator pattern
-
-Cross-system coordination through event calls:
-
-```abide
-system OrderFulfillment {
-  use Order
-
-  event fulfill(order_id: identity) {
-    choose o: Order where o.id == order_id {
-      o.ship()
-    }
-    Billing::finalize_payment(order_id: order_id)
-    Notifications::send_shipped_email(order_id: order_id)
+command ship_order(order_id: identity)
+
+step ship_order(order_id: identity) {
+  choose o: Order where o.id == order_id {
+    o.ship()
   }
 }
 ```
 
-One event triggers actions across multiple systems. The spec captures the coordination — if Billing and Notifications need to happen atomically with shipping, this event expresses that.
+This makes witness traces and cross-system routing easier to read.
 
-### The lifecycle pattern
+## Verification uses explicit assumptions
 
-Model entity creation, state transitions, and (optionally) destruction as a complete lifecycle:
+Current verify blocks do not use `for System[0..N]`. They use an `assume` block with stores and instantiated systems:
 
 ```abide
-system SessionManager {
-  use Session
-
-  event login(user_id: identity) {
-    create Session {
-      user_id = user_id
-      status = @Active
-    }
+verify shipped_orders_have_value {
+  assume {
+    store orders: Order[0..6]
+    let commerce = Commerce { orders: orders }
   }
+  assert always all o: Order | o.status == @Shipped implies o.total > 0
+}
+```
 
-  event logout(session_id: identity) {
-    choose s: Session where s.id == session_id {
-      s.expire()
-    }
+That assumption block is also where fairness and stutter settings live:
+
+```abide
+verify fair_progress {
+  assume {
+    store orders: Order[0..6]
+    let commerce = Commerce { orders: orders }
+    fair Commerce::confirm_order
+    strong fair Commerce::ship_order
+  }
+  assert all o: Order | o.status == @Confirmed implies eventually o.status == @Shipped
+}
+```
+
+## Scenes are existential witnesses
+
+Use scenes to demonstrate reachability or successful workflows:
+
+```abide
+scene paid_order_can_ship {
+  given {
+    store orders: Order[1..1]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.status == @Confirmed
+  }
+  when {
+    commerce.ship_order(o.id)
+  }
+  then {
+    assert o.status == @Shipped
   }
 }
 ```
 
-The full lifecycle: create → transitions → terminal state. Scoped verification checks that the lifecycle is well-behaved.
+## Workflow orchestration
 
----
+```abide
+proc release(editorial: Editorial) {
+  submit = editorial.submit_pending()
+  approve = editorial.approve_pending()
+  publish = editorial.publish_pending()
 
-## When you're stuck
+  approve needs submit.ok
+  publish needs approve.ok
+}
 
-If you can't figure out how to model something:
+program Publishing(documents: Store<Document>) {
+  let editorial = Editorial { documents: documents }
+  use release(editorial)
+}
+```
 
-1. **Start with enums and structs.** What are the concepts? Name them. Don't worry about behavior yet.
-2. **Ask "what changes?"** The things that change are entities. The things that cause change are events.
-3. **Draw the state machine.** Entity actions ARE the state machine. If you can draw it, you can write it.
-4. **Write a scene first.** A concrete example ("user signs up, creates an order, pays") often clarifies the abstract model.
-5. **Check the FAQ.** Common modeling questions are answered in [faq.md](faq.md).
+Use `proc` when you want dependency-structured command execution, branching on outcomes, or reusable orchestration logic.
+
+## Cross-system coordination
+
+System steps can call other systems directly:
+
+```abide
+step process_payment(intent_id: identity) {
+  choose p: PaymentIntent where p.id == intent_id {
+    p.capture()
+    Commerce::confirm_payment(p.order_id)
+  }
+}
+```
+
+This is the right place to model service-to-service orchestration.
+
+## Functions are for local computation
+
+Keep business computations in `fn` declarations with contracts:
+
+```abide
+fn clamp(x: int, lo: int, hi: int): int
+  requires lo <= hi
+  ensures result >= lo
+  ensures result <= hi
+{
+  if x < lo { lo } else { if x > hi { hi } else { x } }
+}
+```
+
+Use imperative function bodies when they make the logic clearer:
+
+```abide
+fn sum_to(n: int): int
+  requires n >= 0
+{
+  var total = 0
+  var i = 0
+  while i <= n
+    invariant total >= 0
+    decreases n - i
+  {
+    total = total + i
+    i = i + 1
+  }
+  total
+}
+```
+
+## Recommended modeling order
+
+1. Define enums, structs, and refinement aliases.
+2. Define entities and actions.
+3. Define systems over explicit `Store<T>` pools.
+4. Add `command`, `step`, `query`, and `pred`.
+5. Add `verify` and `scene` blocks.
+6. Add `proc` / `program` only when orchestration structure matters.
+
+This keeps the model readable and makes verification failures easier to diagnose.

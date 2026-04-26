@@ -1,7 +1,6 @@
 module Commerce
 
-// Commerce — multi-system coordination
-// Demonstrates two systems sharing entities with cross-system event calls.
+// Commerce — multiple systems, cross-system command calls, and store-backed verification.
 
 enum OrderStatus = Pending | AwaitingPayment | Paid | Shipped
 enum PaymentStatus = Open | Captured | Failed
@@ -9,17 +8,21 @@ enum PaymentStatus = Open | Captured | Failed
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action submit() requires status == @Pending requires total > 0 {
+  action submit()
+    requires status == @Pending
+    requires total > 0 {
     status' = @AwaitingPayment
   }
 
-  action mark_paid() requires status == @AwaitingPayment {
+  action mark_paid()
+    requires status == @AwaitingPayment {
     status' = @Paid
   }
 
-  action ship() requires status == @Paid {
+  action ship()
+    requires status == @Paid {
     status' = @Shipped
   }
 }
@@ -27,58 +30,101 @@ entity Order {
 entity PaymentIntent {
   id: identity
   order_id: identity
-  amount: real
+  amount: real = 0
   status: PaymentStatus = @Open
 
-  action capture() requires status == @Open requires amount > 0 {
+  action capture()
+    requires status == @Open
+    requires amount > 0 {
     status' = @Captured
   }
+}
 
-  action fail() requires status == @Open {
-    status' = @Failed
+system Commerce(orders: Store<Order>) {
+
+  command create_order(total: real)
+
+  step create_order(total: real)
+    requires total > 0 {
+    create Order {
+      total = total
+    }
+  }
+
+  command submit_order(order_id: identity)
+
+  step submit_order(order_id: identity) {
+    choose o: Order where o.id == order_id {
+      o.submit()
+    }
+  }
+
+  command confirm_payment(order_id: identity)
+
+  step confirm_payment(order_id: identity) {
+    choose o: Order where o.id == order_id {
+      o.mark_paid()
+    }
+  }
+
+  command ship_order(order_id: identity)
+
+  step ship_order(order_id: identity) {
+    choose o: Order where o.id == order_id {
+      o.ship()
+    }
+  }
+
+  query payable(order: Order) =
+    order.status == @AwaitingPayment and order.total > 0
+}
+
+system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
+
+  command open_intent(order_id: identity, amount: real)
+
+  step open_intent(order_id: identity, amount: real)
+    requires amount > 0 {
+    create PaymentIntent {
+      order_id = order_id
+      amount = amount
+    }
+  }
+
+  command process_payment(intent_id: identity)
+
+  step process_payment(intent_id: identity) {
+    choose p: PaymentIntent where p.id == intent_id {
+      p.capture()
+      Commerce::confirm_payment(p.order_id)
+    }
   }
 }
 
-system Commerce {
-  use Order
-
-  event submit_order(o: Order) requires o.status == @Pending {
-    o.submit()
+verify payment_integrity {
+  assume {
+    store orders: Order[0..6]
+    store intents: PaymentIntent[0..6]
+    let commerce = Commerce { orders: orders }
+    let billing = Billing { orders: orders, intents: intents }
   }
-
-  event confirm_payment(o: Order) requires o.status == @AwaitingPayment {
-    o.mark_paid()
-  }
-
-  event ship_order(o: Order) requires o.status == @Paid {
-    o.ship()
-  }
+  assert always all o: Order | o.status == @Paid implies o.total > 0
 }
 
-system Billing {
-  use PaymentIntent
-  use Order
-
-  event process_payment(p: PaymentIntent, o: Order)
-    requires p.status == @Open
-    requires p.order_id == o.id {
-    p.capture()
-    Commerce::confirm_payment(o)
+scene payment_then_shipping {
+  given {
+    store orders: Order[1..1]
+    store intents: PaymentIntent[1..1]
+    let commerce = Commerce { orders: orders }
+    let billing = Billing { orders: orders, intents: intents }
+    let o = one Order in orders where o.total == 99 and o.status == @AwaitingPayment
+    let p = one PaymentIntent in intents where p.order_id == o.id and p.amount == 99
   }
-}
-
-pred is_paid(o: Order) = o.status == @Paid or o.status == @Shipped
-
-verify payment_integrity for Commerce[0..100], Billing[0..100] {
-  assert always (all o: Order |
-    o.status == @Paid implies o.total > 0)
-}
-
-scene order_to_shipment for Commerce {
-  given let o = one Order where o.status == @Pending and o.total == 99
-  when action s = Commerce::submit_order(o) { one }
-  when action p = Commerce::confirm_payment(o) { one }
-  when action sh = Commerce::ship_order(o) { one }
-  when assume s -> p -> sh
-  then assert o.status == @Shipped
+  when {
+    billing.process_payment(p.id)
+    commerce.ship_order(o.id)
+  }
+  then {
+    assert o.status == @Shipped
+  }
 }

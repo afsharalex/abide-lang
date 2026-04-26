@@ -11,7 +11,7 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Types (enums, records, ADTs, type aliases) | Implemented |
 | Entities (fields, defaults, state atoms) | Implemented |
 | Actions (requires/ensures, primed notation) | Implemented |
-| Systems and events | Implemented |
+| Systems, commands, and steps | Implemented |
 | Entity reference parameters (`[ref: Entity]`) | Implemented |
 | Predicates (`pred`) and properties (`prop`) | Implemented |
 | Pure functions (`fn ... = expr`) | Implemented |
@@ -77,8 +77,8 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Feature | Description |
 |---------|-------------|
 | Proof backends | Export proof obligations to Agda, Lean 4, or Rocq |
-| Explicit-state model checker | TLC-style exact finite-state exploration |
-| Relational/SAT backend | Alloy-like bounded relational solving as a first-class backend |
+| Explicit-state model checker | Implemented on a bounded finite-state fragment; broader coverage is still widening |
+| Relational/SAT backend | Implemented on a bounded routed fragment; broader coverage is still widening |
 | Visual analyzer | Graphical state machine visualization and interactive simulation |
 | Editor integration | LSP server, Tree-sitter grammar, VS Code/Neovim/Emacs plugins |
 
@@ -94,7 +94,7 @@ Today Abide is strongest on a finite or finitely scoped vertical slice:
 
 The main things still outside the “trustworthy and routine” slice are:
 
-- explicit-state exploration
-- relational/SAT-specialized solving
+- broader explicit-state exploration coverage
+- broader relational/SAT-specialized solving coverage
 - external proof backends and proof routing
 - complete backend-validation coverage across all supported encodings

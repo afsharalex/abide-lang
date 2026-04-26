@@ -1,370 +1,148 @@
 # Core Concepts
 
-Abide organizes specification into five layers. Each builds on the previous. You work top-down: define structure, add behavior, assert temporal properties, verify algorithms, then prove deep guarantees.
+Abide models stateful systems, their public command surfaces, and the properties they must satisfy.
 
-Most projects only need the first three layers. Layers 4 and 5 are for when you need stronger guarantees than bounded checking provides.
+## Entities
 
----
-
-## Layer 1: Structural Modeling
-
-Define the vocabulary of your domain.
-
-**Types** name the concepts:
-
-```abide
-enum OrderStatus = Pending | Confirmed | Shipped | Delivered | Cancelled
-enum Currency = USD | EUR | GBP
-struct Address { street: string, city: string, zip: string }
-```
-
-Enums (`enum`) define finite state spaces. Structs (`struct`) group related data. Algebraic data types combine both:
-
-```abide
-enum DosageForm =
-  Tablet { mg: int }
-  | Liquid { ml: int }
-  | Injection { dose_mg: int, route: string }
-```
-
-**Entities** are the stateful objects in your domain — things with identity that change over time:
+Entities are stateful domain objects with identity, fields, and actions.
 
 ```abide
 entity Account {
   id: identity
-  balance: real
-  status: AccountStatus = @Active
-  currency: Currency = @USD
-}
-```
-
-Fields have types, optional defaults, and state atom initializers (`@Active`). The `@` prefix marks state values — these are the vocabulary of your state space.
-
-At this layer, you're answering: *"What things exist in my system, and what states can they be in?"*
-
----
-
-## Layer 2: Behavioral Modeling
-
-Define how things change.
-
-**Actions** are guarded state transitions on entities:
-
-```abide
-entity Account {
-  // ...fields...
+  balance: real = 0
 
   action deposit(amount: real)
-    requires status == @Active
-    requires amount > 0
-    ensures balance' == balance + amount {
+    requires amount > 0 {
     balance' = balance + amount
   }
-
-  action freeze()
-    requires status == @Active {
-    status' = @Frozen
-  }
 }
 ```
 
-The key notation:
-- `requires` = precondition. The action can only execute when this is true.
-- `ensures` = postcondition. This must be true after execution.
-- `balance'` = the **next-state** value of `balance`. Unprimed `balance` is the **current** value.
-- Fields not mentioned in the body don't change (inertia — the frame problem is handled automatically).
+- Fields describe persistent state.
+- `action` bodies describe guarded transitions.
+- Primed fields such as `balance'` refer to post-state values.
 
-**Systems** compose entities and define events:
+## Systems
+
+Systems operate over explicit entity pools:
 
 ```abide
-system Banking {
-  use Account
+system Banking(accounts: Store<Account>) {
+  command deposit(account: Account, amount: real)
 
-  event deposit(a: Account, amount: real)
+  step deposit(account: Account, amount: real)
     requires amount > 0 {
-    a.deposit(amount)
-  }
-
-  event freeze_account(a: Account) {
-    a.freeze()
+    account.deposit(amount)
   }
 }
 ```
 
-Events are the external interface — what the outside world can trigger. They invoke entity actions. Systems can reference multiple entities and coordinate between them.
+Key points:
+- `Store<T>` constructor parameters define the entity pools the system can operate over.
+- `command` declares public operations.
+- `step` provides executable implementation clauses for those operations.
+- `query` exposes pure read-only observations.
+- `pred` stays internal to the system.
 
-**Predicates and properties** name reusable constraints:
+## Verification blocks
 
-```abide
-pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: real) = a.balance >= amount
-
-prop no_overdraft = all a: Account | a.balance >= 0
-```
-
-Predicates are boolean expressions. Properties are assertions about the system — they can be used in verification and as documentation of invariants.
-
-At this layer, you're answering: *"What can happen, under what conditions, and what must always be true?"*
-
----
-
-## Layer 3: Temporal Modeling
-
-Check properties across time.
-
-**Verify blocks** use bounded model checking — the solver systematically explores event sequences up to a given depth:
+`verify` checks universal properties:
 
 ```abide
-verify account_safety for Banking[0..500] {
-  assert always (all a: Account |
-    a.status == @Frozen implies a.balance' == a.balance)
-
-  assert always (all a: Account |
-    a.status == @Closed implies a.balance == 0)
-}
-```
-
-`always` means "on every reachable state." The solver tries every possible interleaving of events up to 500 steps. If any interleaving violates an assertion, it reports a counterexample trace showing exactly which events led to the violation.
-
-**Scene blocks** are existential witnesses — they show that a specific behavior is possible:
-
-```abide
-scene successful_deposit for Banking {
-  given let a = one Account where a.status == @Active and a.balance == 1000
-  when action dep = Banking::deposit(a, 500) { one }
-  then assert a.balance == 1500
-}
-
-scene cannot_withdraw_from_frozen for Banking {
-  given let a = one Account where a.status == @Frozen and a.balance == 1000
-  when action wd = Banking::withdraw(a, 100) { no }
-  then assert a.balance == 1000
-}
-```
-
-Scenes have three parts:
-- `given` — set up initial conditions
-- `when` — fire specific events (with cardinality: `one` = exactly once, `no` = must not be possible)
-- `then` — assert outcomes
-
-**Temporal operators** express properties over time:
-
-```abide
-always (P)               // P holds on every reachable state (safety)
-eventually (P)           // P holds on some future state (liveness)
-P implies Q              // if P then Q (logical implication)
-P -> Q                   // P is followed by Q (temporal sequence)
-```
-
-**Composition operators** express how events relate to each other:
-
-```abide
-submit -> pay -> ship        // temporal sequence — ordered steps
-deposit & update_log         // same-step — both happen simultaneously
-route_a | route_b            // unordered — either order is valid
-route_a || route_b           // concurrent — happen in parallel
-approve ^| reject            // exclusive — exactly one happens, not both
-```
-
-These let you express complex event relationships: "submit must happen before pay, which must happen before ship" (`->`), "deposit and logging happen atomically" (`&`), "the system either approves or rejects, never both" (`^|`).
-
-Precedence (tightest to loosest): `->` > `&` > `||` > `|`, `^|`. So `a -> b & c | d` parses as `((a -> b) & c) | d`. Use parentheses to override default precedence.
-
-**Bounded vs. unbounded checking:**
-
-`verify` blocks with bounds (`[0..500]`) use bounded model checking — the solver explores finite depth. For many common safety properties, the solver also attempts to **discharge them as unbounded proofs automatically** via induction and IC3/PDR when the property is inductive or the state space is finite. When automatic unbounded checking fails, `theorem` and `lemma` blocks (Layer 5) provide the escape hatch to external proof backends.
-
-**Interactive exploration** — the [REPL](repl.md) and [QA language](qa-language.md) let you explore specifications interactively:
-
-```
-$ abide repl commerce/
-abide> /qa
-qa> ask reachable Order.status -> @Shipped
-true
-qa> explain path Order.status @Pending -> @Shipped
-@Pending -> submit -> @Confirmed -> ship -> @Shipped
-qa> assert not cycles Order.status
-PASS
-```
-
-The QA language answers structural questions about your spec instantly — reachability, terminal states, transition paths, cycles — using graph analysis on the precomputed FlowModel, no solver needed. The REPL lets you experiment with definitions against a live universe without modifying source files.
-
-A planned **visual analyzer** will provide graphical state machine visualization, interactive transition exploration, and simulation playback.
-
-At this layer, you're answering: *"Does my system behave correctly across all possible execution paths?"*
-
----
-
-## Layer 4: Algorithm Verification
-
-Verify function and algorithm correctness.
-
-Beyond system-level properties, some specifications need to verify that a specific algorithm is correct — that a sorting function actually sorts, that a routing algorithm finds the shortest path, that a cryptographic operation preserves certain invariants.
-
-**Function contracts** attach `requires`, `ensures`, and `decreases` clauses to `fn` declarations. **Imperative bodies** provide `var` for mutable locals, `while` loops with `invariant` and `decreases`, and `if`/`else` expressions. Functions with contracts or imperative logic use the `{ body }` form:
-
-```abide
-fn gcd(a: int, b: int): int
-  requires a > 0
-  requires b >= 0
-  ensures result > 0
-{
-  var x = a
-  var y = b
-  while y != 0
-    invariant x > 0
-    decreases y
-  {
-    var temp = y
-    y = x % y
-    x = temp
+verify no_negative_balances {
+  assume {
+    store accounts: Account[0..8]
+    let banking = Banking { accounts: accounts }
   }
-  x
+  assert always all a: Account | a.balance >= 0
 }
 ```
 
-- `requires` = precondition (must be bool)
-- `ensures` = postcondition (must be bool, `result` refers to the return value)
-- `decreases` = termination measure for recursive functions (must be int, comma-separated for lexicographic tuples, `*` to skip checking)
-- `var` = mutable local variable (vs `let` for immutable)
-- `while` = loop with optional `invariant` (must be bool) and `decreases`
-- `if`/`else` = conditional expression (both branches must have the same type)
-- Block evaluates to its last expression — no explicit `return` keyword
+The `assume` block establishes:
+- finite store bounds
+- instantiated systems
+- fairness, stutter, and related execution assumptions when needed
 
-**Refinement types** constrain values at the type level with predicates. Two forms are supported: type aliases and inline parameter refinements.
+## Theorems and lemmas
 
-```abide
-// Refinement type aliases
-type Positive = int { $ > 0 }
-type Byte = int { $ >= 0 and $ <= 255 }
-
-// Inline refinement on parameters
-fn gcd(a: int{$ > 0}, b: int{$ > 0}): int
-  ensures result > 0
-
-// Left-to-right parameter references — each parameter can reference parameters to its left
-fn clamp(lo: int, hi: int{$ > lo}, x: int): int
-  ensures result >= lo and result <= hi
-
-// Parameter names can be used directly instead of $
-fn bounded(x: int{x > 0}, y: int{y > x}): int
-```
-
-The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts: `fn f(x: int{$ > 0})` is equivalent to `fn f(x: int) requires x > 0`. Both inline refinements and refinement type aliases (like `type Positive = int { $ > 0 }`) are enforced at call sites.
-
-> **Note:** Refinement types are not allowed on return types — use `ensures` for return value constraints. This keeps the grammar unambiguous with imperative function bodies.
-
-**Imperative verification statements** — `assert` and `assume` can appear in function bodies:
+`theorem` and `lemma` express unbounded proof obligations and reusable facts:
 
 ```abide
-fn checked_divide(a: int, b: int): int
-  requires b != 0
-{
-  assert b != 0     // VC: proved from requires, then available as fact
-  assume a >= 0     // user-asserted without proof (reported as ADMITTED)
-  a / b
+theorem shipped_orders_have_value =
+  always all o: Order | o.status == @Shipped implies o.total > 0
+
+lemma positive_amounts {
+  all o: Order | o.total >= 0
 }
 ```
 
-- `assert P` generates a verification condition — the verifier proves `P` holds at that point, then `P` is available as a fact for subsequent code. If the assertion cannot be proved, the function reports a verification failure.
-- `assume P` adds `P` as an assumption without proof. Functions containing `assume` are reported as `ADMITTED` instead of `PROVED`.
-- `sorry` admits the entire proof obligation — the function reports `ADMITTED` and skips all verification (postcondition, termination, everything).
+## Scenes
 
-**Quantifiers, collections, and data types** are supported in function contracts:
+`scene` checks existential witnesses:
 
 ```abide
-// Quantifiers in ensures/requires (Z3 native encoding)
-fn identity(x: int): int
-  ensures all y: int | result >= y implies x >= y
-{ x }
-
-// Set operations: cardinality and set comprehension
-fn count(): int
-  ensures result == 3
-{ #Set(1, 2, 3) }
-
-// Constructor field destructuring (Z3 algebraic datatypes)
-enum Shape = Circle { radius: int } | Rect { w: int, h: int }
-
-fn perimeter(s: Shape): int
-{
-  match s {
-    Circle { radius: r } => 2 * r
-    Rect { w: w, h: h } => 2 * (w + h)
+scene successful_payment {
+  given {
+    store orders: Order[1..1]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.total == 25
+  }
+  when {
+    commerce.pay(o)
+  }
+  then {
+    assert o.status == @Paid
   }
 }
-
-// Lambda expressions (uninterpreted functions + axioms)
-fn apply(): int
-  ensures result == 2
-{ (fn(y: int): int => y + 1)(1) }
 ```
 
-**Verification model** — function contracts are verified automatically by `abide verify`:
+Use scenes when you want to show that some behavior is possible, not that it is universally required.
 
-- **Postcondition verification:** For each fn with `ensures`, the verifier proves that the body satisfies the postcondition given the precondition. While loops are verified via Hoare logic (invariant init, preservation, and termination).
-- **Call-site precondition checking:** At every call site, the verifier proves that the arguments satisfy the callee's `requires`. This includes refinement-type predicates, which desugar to `requires`.
-- **Termination verification:** For recursive functions with `decreases`, the verifier proves that each recursive call strictly decreases the measure and satisfies the callee's precondition.
-- **Modular verification:** Recursive calls trust the function's own `ensures` (proved by induction over the decreasing measure). Each function is verified in isolation — the verifier does not inline recursive bodies.
-- **Assert/assume:** `assert` generates a VC at each occurrence. `assume` strengthens the proof context without proof. Functions with `assume` or `sorry` report `ADMITTED`.
+## Temporal logic
 
-At this layer, you're answering: *"Is this specific algorithm correct?"*
+Abide’s temporal surface includes:
+- `always`
+- `eventually`
+- `until`
+- past-time operators such as `historically`, `once`, `previously`, `since`
+- `saw` for observation-style event reasoning
 
----
-
-## Layer 5: Proof Escape Hatch *(Planned)*
-
-Prove properties beyond what automated checking can handle.
-
-> This layer is designed but not yet fully implemented. The theorem/lemma syntax exists; backend integration is under evaluation.
-
-The solver will attempt to discharge unbounded properties automatically where possible — many safety properties over finite state spaces or with inductive structure can be proved without human intervention. When the solver can't find a proof automatically, Abide provides an escape hatch to dependent type theory backends (**Agda**, **Lean 4**, or **Rocq** — under evaluation) where you write the proof yourself.
-
-**Lemmas** are reusable proof building blocks:
+Fairness is declared at the verification site, not on commands:
 
 ```abide
-lemma frozen_blocks_transactions {
-  all a: Account | all t: Transfer |
-    a.status == @Frozen and t.from_account == a.id implies
-      t.status != @Executed
+verify fair_toggle {
+  assume {
+    store signals: Signal[0..3]
+    let traffic = Traffic { signals: signals }
+    fair Traffic::toggle
+    strong fair Traffic::reset
+  }
+  assert all s: Signal | s.color == @Red implies eventually s.color == @Green
 }
 ```
 
-**Theorem blocks** declare unbounded invariants with proof steps:
+## Programs and procs
+
+For workflow-style orchestration, Abide provides `proc` and `program`:
 
 ```abide
-theorem frozen_account_safety for Compliance, Banking
-  invariant frozen_accounts_stable {
-  show always (all a: Account |
-    a.status == @Frozen implies a.balance' == a.balance)
+proc release(editorial: Editorial) {
+  submit = editorial.submit_pending()
+  approve = editorial.approve_pending()
+  publish = editorial.publish_pending()
+
+  approve needs submit.ok
+  publish needs approve.ok
+}
+
+program Publishing(documents: Store<Document>) {
+  let editorial = Editorial { documents: documents }
+  use release(editorial)
 }
 ```
 
-For proofs that exceed what Abide can express directly, the planned approach is to export proof obligations to an external backend — **Agda**, **Lean 4**, or **Rocq** (under evaluation). The external prover produces a certificate that Abide trusts.
+## Terminology
 
-```abide
-// Planned syntax — not yet implemented
-
-proof module TransferSafety {
-  theorem balance_preserved :
-    forall (a b : Account) (amount : real).
-      a.balance + b.balance == a.balance' + b.balance'
-  // proof in "proofs/balance.agda"
-}
-```
-
-At this layer, you're answering: *"Can I get a mathematical guarantee, not just bounded confidence?"*
-
----
-
-## How the Layers Compose
-
-A typical project uses layers incrementally:
-
-1. **Start with structure.** Define your entities, enums, and structs. Get the vocabulary right.
-2. **Add behavior.** Write actions with guards. Define system events. This is where most of the work happens.
-3. **Assert properties.** Write verify blocks to check invariants. Write scenes to validate scenarios. The solver finds bugs you didn't think of.
-4. **Verify critical algorithms** *(when needed)*. If a function needs correctness guarantees beyond "the types check," add contracts and loop invariants.
-5. **Prove deep properties** *(when needed)*. If bounded checking isn't enough, export to a proof backend.
-
-Most specifications never need layers 4 and 5. The first three layers cover system-level correctness — the kind of bugs that cause outages, data corruption, and compliance violations.
+- `command` is the public system operation surface.
+- `step` is an executable implementation clause.
+- `program` and `proc` describe orchestration structure.

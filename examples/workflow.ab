@@ -1,110 +1,74 @@
 module Workflow
 
-// Workflow — state machine with role-based guards
-// Demonstrates multi-step lifecycles, role separation, and temporal properties.
+// Workflow — proc/program orchestration over command execution.
 
-enum DocStatus = Draft | Submitted | UnderReview | Approved | Rejected | Published | Archived
+enum DocumentStatus = Draft | Submitted | Approved | Published
 
 entity Document {
   id: identity
-  status: DocStatus = @Draft
-  author_id: identity
-  reviewer_id: identity
-  revision_count: int = 0
+  status: DocumentStatus = @Draft
 
-  action submit() requires status == @Draft {
+  action submit()
+    requires status == @Draft {
     status' = @Submitted
   }
 
-  action begin_review(reviewer: identity)
-    requires status == @Submitted
-    requires reviewer != author_id {
-    status' = @UnderReview
-    reviewer_id' = reviewer
-  }
-
-  action approve() requires status == @UnderReview {
+  action approve()
+    requires status == @Submitted {
     status' = @Approved
   }
 
-  action reject() requires status == @UnderReview {
-    status' = @Rejected
-  }
-
-  action revise() requires status == @Rejected {
-    status' = @Draft
-    revision_count' = revision_count + 1
-  }
-
-  action publish() requires status == @Approved {
+  action publish()
+    requires status == @Approved {
     status' = @Published
   }
+}
 
-  action archive() requires status == @Published {
-    status' = @Archived
+system Editorial(documents: Store<Document>) {
+
+  command submit_pending()
+
+  step submit_pending() {
+    choose d: Document where d.status == @Draft {
+      d.submit()
+    }
+  }
+
+  command approve_pending()
+
+  step approve_pending() {
+    choose d: Document where d.status == @Submitted {
+      d.approve()
+    }
+  }
+
+  command publish_pending()
+
+  step publish_pending() {
+    choose d: Document where d.status == @Approved {
+      d.publish()
+    }
   }
 }
 
-pred is_reviewable(d: Document) = d.status == @Submitted
-pred is_published(d: Document) = d.status == @Published
+proc release(editorial: Editorial) {
+  submit = editorial.submit_pending()
+  approve = editorial.approve_pending()
+  publish = editorial.publish_pending()
 
-prop reviewer_not_author = all d: Document |
-  d.status == @UnderReview implies d.reviewer_id != d.author_id
-
-system Publishing {
-  use Document
-
-  event submit_doc(d: Document) requires d.status == @Draft {
-    d.submit()
-  }
-
-  event review(d: Document, reviewer: identity)
-    requires d.status == @Submitted
-    requires reviewer != d.author_id {
-    d.begin_review(reviewer)
-  }
-
-  event review_approve(d: Document) requires d.status == @UnderReview {
-    d.approve()
-  }
-
-  event review_reject(d: Document) requires d.status == @UnderReview {
-    d.reject()
-  }
-
-  event revise_doc(d: Document) requires d.status == @Rejected {
-    d.revise()
-  }
-
-  event publish_doc(d: Document) requires d.status == @Approved {
-    d.publish()
-  }
+  approve needs submit.ok
+  publish needs approve.ok
 }
 
-verify review_integrity for Publishing[0..200] {
-  assert always (all d: Document |
-    d.status == @UnderReview implies d.reviewer_id != d.author_id)
-
-  assert all d: Document |
-    d.status == @Submitted implies
-      eventually (d.status == @Approved or d.status == @Rejected)
+program Publishing(documents: Store<Document>) {
+  let editorial = Editorial { documents: documents }
+  use release(editorial)
 }
 
-scene full_review_cycle for Publishing {
-  given let d = one Document where d.status == @Draft
-  when action s = Publishing::submit_doc(d) { one }
-  when action r = Publishing::review(d, d.reviewer_id) { one }
-  when action a = Publishing::review_approve(d) { one }
-  when assume s -> r -> a
-  then assert d.status == @Approved
-}
-
-scene rejection_and_revision for Publishing {
-  given let d = one Document where d.status == @Draft and d.revision_count == 0
-  when action s = Publishing::submit_doc(d) { one }
-  when action r = Publishing::review(d, d.reviewer_id) { one }
-  when action rej = Publishing::review_reject(d) { one }
-  when action rev = Publishing::revise_doc(d) { one }
-  when assume s -> r -> rej -> rev
-  then assert d.status == @Draft and d.revision_count == 1
+verify published_documents_leave_draft {
+  assume {
+    store documents: Document[0..4]
+    let editorial = Editorial { documents: documents }
+  }
+  assert always all d: Document | d.status == @Published implies not (d.status == @Draft)
 }

@@ -1,224 +1,161 @@
 # Syntax at a Glance
 
-Quick reference for all Abide constructs. Each section shows a minimal example, a brief explanation, and a stability tag.
+This is a current quick reference for the syntax accepted by the compiler on `master`.
 
-**Stability tags:** `Stable` = unlikely to change. `Evolving` = may change in syntax or semantics. `Planned` = designed but not yet implemented.
-
----
-
-### Enums
+## Modules
 
 ```abide
-enum OrderStatus = Pending | Paid | Shipped | Cancelled
+module Commerce
+include "billing.ab"
+use Commerce::Order
+use Commerce::* as C
 ```
 
-Sum types. Enums define the vocabulary of state with named constructors.
-
-`Stable`
-
----
-
-### Structs
+## Types
 
 ```abide
-struct Address { street: string, city: string }
-```
+enum OrderStatus = Pending | Paid | Shipped
 
-Product types with named fields. Structs group related data.
+struct Address {
+  street: string
+  city: string
+}
 
-`Stable`
-
----
-
-### Type Aliases
-
-```abide
-type Price = int
-```
-
-Type aliases give a new name to an existing type.
-
-`Stable`
-
----
-
-### Refinement Types
-
-```abide
-// Refinement type aliases — constrain values with predicates
 type Positive = int { $ > 0 }
-type Byte = int { $ >= 0 and $ <= 255 }
-
-// Inline refinement on parameters
-fn gcd(a: int{$ > 0}, b: int{$ > 0}): int
-
-// Parameter names can reference earlier parameters (left-to-right)
-fn clamp(lo: int, hi: int{$ > lo}, x: int): int
-
-// Parameter names can be used instead of $
-fn bounded(x: int{x > 0}, y: int{y > x}): int
 ```
 
-The `$` placeholder references the value being constrained. Refinement predicates desugar to `requires` contracts.
-
-Refinement types are not allowed on return types — use `ensures` for return constraints.
-
-`Implemented`
-
----
-
-### Algebraic Data Types
-
-```abide
-enum Shape =
-  Circle { radius: real }
-  | Rectangle { width: real, height: real }
-  | Point
-```
-
-Sum types with record variants. Each variant can carry different fields.
-
-`Stable`
-
----
-
-### Entities
+## Entities and actions
 
 ```abide
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action pay() requires status == @Pending requires total > 0 {
+  action mark_paid()
+    requires status == @Pending
+    requires total > 0 {
     status' = @Paid
   }
 }
 ```
 
-Stateful domain objects with identity. Fields have types and optional defaults. Actions define guarded state transitions. `status' = @Paid` means "the next value of status is Paid."
-
-`Stable`
-
----
-
-### State Atoms
+## Systems
 
 ```abide
-@Pending                   // simple atom
-@OrderStatus::Paid         // qualified atom
-```
+system Commerce(orders: Store<Order>) {
+  command pay(order: Order)
 
-The `@` prefix marks state and constructor values. `::` is scope resolution for qualified references.
+  step pay(order: Order)
+    requires order.status == @Pending {
+    order.mark_paid()
+  }
 
-`Stable`
+  query payable(order: Order) =
+    order.status == @Pending and order.total > 0
 
----
-
-### Primed Notation
-
-```abide
-action withdraw(amount: real) requires balance >= amount {
-  balance' = balance - amount
+  pred non_negative(order: Order) =
+    order.total >= 0
 }
 ```
 
-`balance` is the current (pre-state) value. `balance'` is the next (post-state) value. Fields not mentioned in the action body are unchanged (inertia).
+Notes:
+- `Store<T>` constructor params are the current entity-pool surface.
+- `command` declares the public API.
+- `step` gives executable command clauses.
+- `query` is public and pure.
+- `pred` is internal and pure.
 
-`Stable`
-
----
-
-### Contracts
+## Verification
 
 ```abide
-action deposit(amount: real)
-  requires amount > 0
-  requires status == @Active
-  ensures balance' == balance + amount {
-  balance' = balance + amount
+verify order_safety {
+  assume {
+    store orders: Order[0..8]
+    let commerce = Commerce { orders: orders }
+    fair Commerce::pay
+  }
+  assert always all o: Order | o.total >= 0
 }
 ```
 
-`requires` = precondition (must be true to execute). `ensures` = postcondition (must be true after execution). `decreases` = termination measure (for recursive functions). Contracts attach to actions, events, and functions.
-
-`Stable`
-
----
-
-### Systems and Events
+## Theorems, lemmas, axioms
 
 ```abide
-system Banking {
-  use Account
+lemma positive_totals {
+  all o: Order | o.total >= 0
+}
 
-  event deposit(a: Account, amount: real)
-    requires amount > 0 {
-    a.deposit(amount)
+theorem shipped_orders_have_value =
+  always all o: Order | o.status == @Shipped implies o.total > 0
+
+axiom external_fact = true by "proofs/external.agda"
+```
+
+## Scenes
+
+```abide
+scene successful_payment {
+  given {
+    store orders: Order[1..1]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.total == 25
+  }
+  when {
+    commerce.pay(o)
+  }
+  then {
+    assert o.status == @Paid
   }
 }
 ```
 
-Systems compose entities and define events. Events are externally triggered operations that invoke entity actions. `use` declares which entities the system operates on.
-
-`Stable`
-
----
-
-### Entity Reference Parameters
+## Programs and procs
 
 ```abide
-action transfer_out[to: Account](amount: real) requires balance >= amount {
-  balance' = balance - amount
+proc release(editorial: Editorial) {
+  submit = editorial.submit_pending()
+  approve = editorial.approve_pending()
+  publish = editorial.publish_pending()
+
+  approve needs submit.ok
+  publish needs approve.ok
+}
+
+program Publishing(documents: Store<Document>) {
+  let editorial = Editorial { documents: documents }
+  use release(editorial)
 }
 ```
 
-Square brackets `[to: Account]` declare entity reference parameters — references to other entity instances that the action can read or modify.
-
-`Stable`
-
----
-
-### Predicates
+## Temporal operators
 
 ```abide
-pred is_active(a: Account) = a.status == @Active
-pred has_funds(a: Account, amount: real) = a.balance >= amount
+always p
+eventually p
+p until q
+historically p
+once p
+previously p
+p since q
+saw Commerce::pay(_)
 ```
 
-Named boolean expressions. Reusable in guards, properties, and verification blocks.
-
-`Stable`
-
----
-
-### Properties
+## Quantifiers and aggregates
 
 ```abide
-prop no_negative_balances = all a: Account | a.balance >= 0
-prop frozen_stable for Account = always (status == @Frozen implies status' == @Frozen)
+all o: Order | o.total >= 0
+exists o: Order | o.total > 0
+some o: Order | o.total > 0
+no o: Order | o.status == @Cancelled
+lone o: Order | o.status == @Draft
+
+count o: Order in orders | o.total > 0
+sum o: Order in orders | o.total
+max o: Order in orders | o.total
 ```
 
-Named assertions about the system. Global (`prop name = ...`) or scoped to an entity (`prop name for Entity = ...`).
-
-`Stable`
-
----
-
-### Pure Functions
-
-```abide
-fn max(a: int, b: int): int = if a > b then a else b
-fn risk_score(t: Transfer): real = sorry
-```
-
-Named pure functions. `= expr` form for simple definitions. `sorry` stubs a function body that will be filled in later.
-
-`Stable`
-
----
-
-### Function Contracts
+## Imperative functions
 
 ```abide
 fn gcd(a: int, b: int): int
@@ -227,226 +164,22 @@ fn gcd(a: int, b: int): int
   ensures result > 0
   decreases b
 {
-  match b {
-    _ if b == 0 => a
-    _ => gcd(b, a % b)
-  }
-}
-```
-
-Functions with contracts use the `{ body }` form. `requires` = precondition. `ensures` = postcondition (`result` refers to the return value). `decreases` = termination measure for recursive functions (comma-separated for lexicographic, `*` to skip checking).
-
-`Stable`
-
----
-
-### Imperative Functions
-
-```abide
-fn sum_to(n: int): int
-  requires n >= 0
-{
-  var total = 0
-  var i = 0
-  while i <= n
-    invariant total >= 0
-    decreases n - i
+  var x = a
+  var y = b
+  while y != 0
+    invariant x > 0
+    decreases y
   {
-    total = total + i
-    i = i + 1
+    var tmp = y
+    y = x % y
+    x = tmp
   }
-  total
+  x
 }
 ```
 
-`var` = mutable local. `while` = loop with optional `invariant` and `decreases`. `if/else` is an expression. Block evaluates to its last expression — no `return` keyword.
+## Structural patterns
 
-`Stable`
-
----
-
-### Constants
-
-```abide
-const MAX_WITHDRAWAL = 10000
-const OVERDRAFT_LIMIT = 500
-```
-
-Named compile-time values. Used in guards, assertions, and expressions.
-
-`Stable`
-
----
-
-### Verify Blocks
-
-```abide
-verify no_overdraft for Banking[0..500] {
-  assert always (all a: Account | a.balance >= 0)
-  assert always (all a: Account |
-    a.status == @Closed implies a.balance == 0)
-}
-```
-
-Bounded model checking. The solver explores up to 500 steps of the Banking system and checks all assertions on every reachable state.
-
-`Evolving`
-
----
-
-### Scenes
-
-```abide
-scene successful_deposit for Banking {
-  given let a = one Account where a.status == @Active and a.balance == 1000
-  when action dep = Banking::deposit(a, 500) { one }
-  then assert a.balance == 1500
-}
-```
-
-Existential witnesses. Given initial conditions, when specific events fire, then specific outcomes hold. Scenes demonstrate that a behavior is possible.
-
-`Evolving`
-
----
-
-### Theorems, Lemmas, and Axioms
-
-```abide
-lemma frozen_blocks_transactions {
-  all a: Account | all t: Transfer |
-    a.status == @Frozen and t.from_account == a.id implies
-      t.status != @Executed
-}
-
-theorem frozen_account_safety for Compliance, Banking
-  invariant frozen_accounts_stable {
-  show always (all a: Account |
-    a.status == @Frozen implies a.balance' == a.balance)
-}
-
-axiom transfer_preserves_total {
-  all a: Account | all b: Account |
-    a.balance + b.balance == a.balance' + b.balance'
-}
-```
-
-`lemma` = reusable proof building block. `theorem` = unbounded verification with invariants and `show` steps. `axiom` = assumed truth without proof (trusted assertion). Proof backends are under evaluation.
-
-`Evolving`
-
----
-
-### Match Expressions
-
-```abide
-fn describe(s: Shape): string =
-  match s {
-    Circle { radius: r } if r > 100 => "large circle"
-    Circle { .. } => "circle"
-    Rectangle { width: w, height: h } if w == h => "square"
-    Shipped | Cancelled => "done"
-    _ => "unknown"
-  }
-```
-
-Pattern matching with destructuring, guards (`if`), or-patterns (`|`), rest patterns (`..`), and wildcards (`_`).
-
-`Stable`
-
----
-
-### Temporal Operators
-
-```abide
-always (all a: Account | a.balance >= 0)         // safety — holds on every state
-eventually (exists o: Order | o.status == @Shipped)  // liveness — holds on some future state
-a.status == @Frozen implies a.balance' == a.balance  // implication
-```
-
-`always` = on every reachable state (LTL box). `eventually` = on some future state (LTL diamond). `implies` = logical implication.
-
-`Stable`
-
----
-
-### Composition and Sequencing
-
-```abide
-submit -> pay -> ship             // temporal sequence (ordered steps)
-deposit & update_log              // same-step (both happen simultaneously)
-route_a | route_b                 // unordered composition (either order)
-route_a || route_b                // concurrent composition
-approve ^| reject                 // exclusive composition (exactly one)
-x |> validate |> process          // pipe operator
-```
-
-Precedence (tightest to loosest): `->` > `&` > `||` > `|`, `^|`. So `a -> b & c | d` parses as `((a -> b) & c) | d`. Use parentheses to override.
-
-`Implemented`
-
----
-
-### Quantifiers
-
-```abide
-all a: Account | a.balance >= 0             // universal
-exists o: Order | o.status == @Paid          // existential
-some a: Account | is_active(a)              // at least one
-no a: Account | a.balance < 0               // none
-one o: Order | o.status == @Pending          // exactly one
-lone t: Transfer | t.status == @Pending      // at most one
-```
-
-Set quantifiers with formal semantics. `all`/`exists` are standard logical quantifiers. `some`/`no`/`one`/`lone` are cardinality quantifiers from Alloy.
-
-`Stable`
-
----
-
-### Sorry, Todo, Assert, Assume
-
-```abide
-fn calculate_risk(o: Order): real = sorry   // ADMITTED — skips all verification
-fn validate_address(a: Address): bool = todo // verification error — implementation missing
-
-fn checked_divide(a: int, b: int): int
-  requires b != 0
-{
-  assert b != 0    // VC: proved from requires, then available as fact
-  assume a >= 0    // trusted assumption (function reports ADMITTED)
-  a / b
-}
-```
-
-`sorry` = admits the entire proof obligation (postcondition + termination). Reports `ADMITTED`. `todo` = placeholder that causes a verification error. `assert` = verifier-checked assertion (generates a VC). `assume` = trusted assumption (no VC, function reports `ADMITTED`).
-
-`Stable`
-
----
-
-### QA Language (`.qa` files)
-
-```qa
-load "commerce/"
-
-ask entities
-ask reachable Order.status -> @Shipped
-assert not cycles Order.status
-explain path Order.status @Pending -> @Shipped
-
-abide {
-  module Commerce
-  entity Order {
-    action refund() requires status == @Confirmed { status' = @Refunded }
-  }
-}
-
-assert reachable Order.status -> @Refunded
-```
-
-QA queries run against a FlowModel (state graphs extracted from IR). No SMT — instant responses. `abide { }` blocks extend entities with hypothetical actions for "what if" testing.
-
-Run with `abide qa script.qa` or interactively via `abide repl` with `/qa` mode.
-
-`Implemented`
+- Systems are declared over explicit `Store<T>` pools.
+- Public operations are described with `command` plus executable `step` clauses.
+- Orchestration is described with `proc` and `program`.

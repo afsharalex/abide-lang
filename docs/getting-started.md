@@ -1,110 +1,132 @@
 # Getting Started
 
-> Abide is under heavy development. The syntax and semantics will change frequently. We will announce when an alpha release with solver backend support is available.
+Abide is a specification language for stateful systems, workflows, and verification.
 
-## Prerequisites
-
-- Rust toolchain (stable) — install via [rustup.rs](https://rustup.rs)
+This guide uses the syntax that the current compiler accepts on `master`:
+- store-backed systems: `system Commerce(orders: Store<Order>)`
+- public command surface plus executable `step` clauses
+- verification blocks with explicit `assume { store ...; let ... }`
 
 ## Build
 
 ```sh
 git clone https://github.com/afsharalex/abide-lang.git
 cd abide-lang
-cargo build --release
+cargo build
 ```
 
-The binary is at `target/release/abide`.
+The binary will be at `target/debug/abide`.
 
-## Write Your First Spec
+## First spec
 
-Create a file called `order.ab`:
+Create `order.ab`:
 
 ```abide
+module OrderDemo
+
 enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action pay() requires status == @Pending requires total > 0 {
+  action mark_paid()
+    requires status == @Pending
+    requires total > 0 {
     status' = @Paid
   }
 
-  action ship() requires status == @Paid {
+  action ship()
+    requires status == @Paid {
     status' = @Shipped
   }
 }
 
-system Commerce {
-  use Order
+system Commerce(orders: Store<Order>) {
 
-  event place_order(o: Order) requires o.status == @Pending {
-    o.pay()
+  command create_order(total: real)
+
+  step create_order(total: real)
+    requires total > 0 {
+    create Order {
+      total = total
+    }
+  }
+
+  command pay(order: Order)
+
+  step pay(order: Order)
+    requires order.status == @Pending {
+    order.mark_paid()
+  }
+
+  command ship(order: Order)
+
+  step ship(order: Order)
+    requires order.status == @Paid {
+    order.ship()
   }
 }
 ```
 
-## Check It
+## Parse it
 
 ```sh
 abide parse order.ab
 ```
 
-If the spec parses correctly, the compiler prints the AST. If there's a syntax error, it points to the offending line.
+If parsing succeeds, Abide prints the AST. If it fails, the diagnostic points at the rejected syntax.
 
-To verify the spec (induction, IC3/PDR, and bounded model checking):
+## Verify it
+
+Append:
+
+```abide
+verify shipped_orders_have_value {
+  assume {
+    store orders: Order[0..4]
+    let commerce = Commerce { orders: orders }
+  }
+  assert always all o: Order | o.status == @Shipped implies o.total > 0
+}
+
+scene payment_then_shipping {
+  given {
+    store orders: Order[1..1]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.total == 25
+  }
+  when {
+    commerce.pay(o)
+    commerce.ship(o)
+  }
+  then {
+    assert o.status == @Shipped
+  }
+}
+```
+
+Then run:
 
 ```sh
 abide verify order.ab
 ```
 
-## What Just Happened
+## What the pieces mean
 
-You defined:
+- `entity` declares stateful domain objects with fields and actions.
+- `system ... (orders: Store<Order>)` declares a system over a bounded pool of entities.
+- `command` declares the public API surface of the system.
+- `step` gives an executable implementation clause for a command.
+- `verify` checks universal properties.
+- `scene` checks existential witness scenarios.
 
-- An **enum** (`OrderStatus`) — a sum type with three states
-- An **entity** (`Order`) — a stateful domain object with fields and defaults
-- Two **actions** (`pay`, `ship`) — guarded state transitions using primed notation (`status' = @Paid` means "the next value of status is Paid")
-- A **system** (`Commerce`) — a boundary that composes entities and defines events
-- An **event** (`place_order`) — an externally triggered action with a precondition
+Systems are defined over explicit store pools, and verification assumptions instantiate those pools directly.
 
-The `@` prefix marks state atoms (`@Pending`, `@Paid`). The prime notation (`'`) distinguishes current state from next state — this is how Abide expresses state transitions without mutation.
+## Modules
 
-## Add Verification
-
-Append this to your file:
-
-```abide
-verify order_lifecycle for Commerce[0..50] {
-  assert always (all o: Order |
-    o.status == @Shipped implies o.total > 0)
-}
-
-scene successful_payment for Commerce {
-  given let o = one Order where o.status == @Pending and o.total == 100
-  when action p = Commerce::place_order(o) { one }
-  then assert o.status == @Paid
-}
-```
-
-The `verify` block asks the checker to explore up to 50 steps of the Commerce system. It tries induction and IC3/PDR first (unbounded proof), then falls back to bounded model checking. Run `abide verify <file>` to execute it.
-
-The `scene` block constructs a concrete scenario: given an order in a specific state, when a specific event fires, then a specific outcome holds. Scenes are existential witnesses — they demonstrate that a behavior is possible.
-
-Abide also supports collection-typed fields (`Map<K,V>`, `Set<T>`, `Seq<T>`) with map update (`m[k := v]`), index access (`m[k]`), set comprehension (`{ x: T where P(x) }`), and cardinality (`#S`). These are verified using Z3's array theory.
-
-Properties declared with `prop` are automatically verified — declaring a property IS asserting it must hold:
-
-```abide
-prop order_safety for Commerce =
-  always all o: Order | o.total >= 0
-```
-
-## Organize with Modules
-
-As specs grow, split them into multiple files using the module system:
+Split larger specs into multiple files:
 
 ```abide
 // types.ab
@@ -115,11 +137,7 @@ enum OrderStatus = Pending | Paid | Shipped
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
-
-  action pay() requires status == @Pending {
-    status' = @Paid
-  }
+  total: real = 0
 }
 ```
 
@@ -130,144 +148,56 @@ module Commerce
 use Commerce::Order
 use Commerce::OrderStatus
 
-system Commerce {
-  use Order
-
-  event place_order(o: Order) requires o.status == @Pending {
-    o.pay()
-  }
+system Commerce(orders: Store<Order>) {
+  command create_order(total: real)
+  step create_order(total: real) { create Order { total = total } }
 }
 ```
 
 ```abide
-// spec.ab
-module Spec
+// checks.ab
+module CommerceChecks
 
 use Commerce::*
 
-verify order_safety for Commerce[0..50] {
-  assert always (all o: Order | o.status == @Shipped implies o.total > 0)
+verify positive_totals {
+  assume {
+    store orders: Order[0..4]
+    let commerce = Commerce { orders: orders }
+  }
+  assert always all o: Order | o.total >= 0
 }
 ```
 
-Verify all files together:
+Run them together:
 
 ```sh
-abide verify types.ab system.ab spec.ab
+abide verify types.ab system.ab checks.ab
 ```
 
-Key module system concepts:
-- `module Name` at the top of each file declares which module it belongs to
-- `use Module::Name` imports a specific declaration; `use Module::*` imports all names declared in that module
-- `use Module::Name as Alias` provides a local alias
-- `include "file.ab"` includes a file's contents into the current module
-- Entity fields stay local to the entity; modules are organized with `module`, `use`, and `include`
+## Interactive tools
 
-## Explore with the REPL
-
-The REPL lets you interactively explore your specs:
+REPL:
 
 ```sh
-$ abide repl commerce/
-Loaded 2 entities, 1 system
-
-abide> /qa
-qa> ask reachable Order.status -> @Shipped
-true
-qa> ask terminal Order.status
-@Shipped, @Cancelled
-qa> /quit
+abide repl .
 ```
 
-Switch between Abide mode (write definitions) and QA mode (query the spec) with `/qa` and `/abide`. See the [REPL guide](repl.md) for details.
-
-## Run QA Scripts
-
-Automate structural checks with `.qa` scripts:
+QA scripts:
 
 ```sh
-$ abide qa checks.qa
-  PASS: assert reachable Order.status -> @Shipped
-  PASS: assert not cycles Order.status
-
-=== QA: 2 passed, 0 failed (2 executed) ===
+abide qa checks.qa -f .
 ```
 
-See the [QA Language](qa-language.md) guide.
+Simulation:
 
-## Verify Algorithms
-
-Beyond system-level properties, Abide verifies function contracts. Attach `requires`, `ensures`, and `decreases` to functions with imperative bodies:
-
-```abide
-fn gcd(a: int, b: int): int
-  requires a > 0
-  requires b >= 0
-  ensures result > 0
-  decreases b
-{
-  var x = a
-  var y = b
-  while y != 0
-    invariant x > 0
-    invariant y >= 0
-    decreases y
-  {
-    var temp = y
-    y = x % y
-    x = temp
-  }
-  x
-}
+```sh
+abide simulate order.ab --steps 10
 ```
 
-`abide verify` automatically proves that the body satisfies the postcondition, that while-loop invariants are maintained, and that recursive calls decrease the termination measure. Preconditions are checked at every call site.
+## Next guides
 
-Refinement types provide a shorthand — `fn f(x: int { $ > 0 })` is equivalent to `fn f(x: int) requires x > 0`, and type aliases like `type Positive = int { $ > 0 }` work the same way.
-
-Use `assert` and `assume` inside function bodies for intermediate verification:
-
-```abide
-fn checked_divide(a: int, b: int): int
-  requires b != 0
-{
-  assert b != 0    // verified from requires, then available as fact
-  a / b
-}
-```
-
-Use `sorry` to admit a function's proof obligation while you work on it:
-
-```abide
-fn complex_algorithm(x: int): int
-  ensures result > 0
-{
-  sorry    // reports ADMITTED — skips verification
-}
-```
-
-Quantifiers, constructor patterns, and lambdas work in function contracts:
-
-```abide
-enum Option = None | Some { value: int }
-
-fn get_or(o: Option, d: int): int
-  ensures match o {
-    Some { value: v } => result == v
-    None => result == d
-  }
-{
-  match o {
-    Some { value: v } => v
-    None => d
-  }
-}
-```
-
-## Next Steps
-
-- [Syntax at a Glance](syntax-at-a-glance.md) — quick reference for all constructs
-- [Core Concepts](core-concepts.md) — the five specification layers
-- [REPL](repl.md) — interactive specification exploration
-- [QA Language](qa-language.md) — structural analysis queries
-- [Examples](examples.md) — more specs to learn from
+- [Syntax at a Glance](syntax-at-a-glance.md)
+- [Core Concepts](core-concepts.md)
+- [CLI Reference](cli.md)
+- [QA Language](qa-language.md)

@@ -1,32 +1,59 @@
-module Order
+module Orders
 
-// Order — minimal Abide example
-// Demonstrates types, entities, actions, and primed notation.
+// Order lifecycle — a compact single-system example using the current command/step surface.
 
-enum OrderStatus = Pending | Paid | Shipped
+enum OrderStatus = Pending | Confirmed | Shipped
 
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action pay() requires status == @Pending requires total > 0 {
-    status' = @Paid
+  action confirm()
+    requires status == @Pending
+    requires total > 0 {
+    status' = @Confirmed
   }
 
-  action ship() requires status == @Paid {
+  action ship()
+    requires status == @Confirmed {
     status' = @Shipped
   }
 }
 
-system Commerce {
-  use Order
+system Orders(orders: Store<Order>) {
 
-  event place_order(o: Order) requires o.status == @Pending {
-    o.pay()
+  command create_order(total: real)
+
+  step create_order(total: real)
+    requires total > 0 {
+    create Order {
+      total = total
+    }
   }
 
-  event ship_order(o: Order) requires o.status == @Paid {
-    o.ship()
+  command confirm_order(order: Order)
+
+  query payable(order: Order) =
+    order.status == @Pending and order.total > 0
+
+  step confirm_order(order: Order)
+    requires payable(order) {
+    order.confirm()
   }
+
+  command ship_order(order: Order)
+
+  step ship_order(order: Order)
+    requires order.status == @Confirmed {
+    order.ship()
+  }
+}
+
+verify shipped_orders_have_positive_totals {
+  assume {
+    store orders: Order[0..4]
+    let orders_sys = Orders { orders: orders }
+  }
+  assert always all o: Order | o.status == @Shipped implies o.total > 0
 }

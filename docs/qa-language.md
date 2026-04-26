@@ -55,7 +55,7 @@ ask match-coverage Order.status              // match arm completeness
 ### Cross-System Queries
 
 ```
-ask cross-calls from Commerce                // outgoing cross-system event calls
+ask cross-calls from Commerce                // outgoing cross-system command calls
 ask updates on Order.status @Pending -> @Paid  // what causes this transition
 ```
 

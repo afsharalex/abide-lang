@@ -9,7 +9,7 @@ No. Abide is a **specification language** — you describe what your system shou
 Abide occupies the intersection:
 
 - **Like Alloy:** Lightweight structural modeling with bounded exploration. Entities and types define relational structure. The solver finds counterexamples within bounds.
-- **Like TLA+:** System-level temporal reasoning. Actions, events, and temporal operators (`always`, `eventually`) express system behavior over time.
+- **Like TLA+:** System-level temporal reasoning. Actions, commands, and temporal operators (`always`, `eventually`) express system behavior over time.
 - **Like Dafny:** Function and algorithm-level contracts with automated verification. `requires`/`ensures` attach to functions, with loop invariants and termination measures.
 - **Beyond all three:** A proof escape hatch to dependent type theory backends (Agda, Lean 4, or Rocq — under evaluation) for properties that need unbounded guarantees.
 
@@ -17,9 +17,9 @@ The goal is one language that scales from quick structural sketches to deep algo
 
 ### Can I use it today?
 
-Yes, with caveats.
+Yes.
 
-The language is still under active development and surface details will continue to move, but the current compiler does much more than parse and type-check. Today you can:
+The current compiler does much more than parse and type-check. Today you can:
 
 - elaborate and lower multi-file specs
 - run `verify` with Z3-backed bounded checking and the current auto-unbounded fragment
@@ -31,8 +31,8 @@ The language is still under active development and surface details will continue
 What is still incomplete is the broader backend architecture and proof-backend story:
 
 - proof-manager / external proof backend integration
-- explicit-state model checking
-- first-class relational/SAT backend
+- explicit-state coverage is real on a documented fragment, but broader model-checking coverage is still widening
+- first-class relational/SAT coverage is real on a bounded routed fragment, but not yet the whole verifier surface
 - complete native artifact coverage for all result kinds
 
 ### What does the prime notation (`'`) mean?
@@ -77,14 +77,15 @@ No.
 
 `abide simulate` is a seeded forward executor over the current operational
 fragment. It is useful for debugging, exploration, and artifact inspection, but
-it does not exhaustively search the state space. Explicit-state exploration is a
-separate future backend.
+it does not exhaustively search the state space. Abide also has a real
+explicit-state backend on a bounded finite-state fragment, but `simulate` is
+not that backend.
 
 ### Is the language stable?
 
 No. Abide is in active design. Syntax and semantics may change. We'll add version-tagged stability markers when the language reaches that point.
 
-The constructs most likely to remain stable: enums, structs, type aliases, entities, actions, primed notation, `requires`/`ensures`, systems, events, `verify`/`scene` block structure, temporal operators, quantifiers.
+The constructs most likely to remain stable: enums, structs, type aliases, entities, actions, primed notation, `requires`/`ensures`, systems, `command`/`step`, `verify`/`scene` block structure, temporal operators, quantifiers.
 
 The constructs most likely to evolve: theorem block internals, module system, trait system, algorithm verification syntax.
 
@@ -107,12 +108,14 @@ fn risk_score(o: Order): real
 Use `always` with `no` or negation in a `verify` block:
 
 ```abide
-verify safety for Banking[0..500] {
-  // No account is ever both frozen and closed
+verify safety {
+  assume {
+    store accounts: Account[0..8]
+    let banking = Banking { accounts: accounts }
+  }
   assert always (no a: Account |
     a.status == @Frozen and a.status == @Closed)
 
-  // Frozen accounts never change balance
   assert always (all a: Account |
     a.status == @Frozen implies a.balance' == a.balance)
 }
@@ -124,16 +127,28 @@ Use `eventually` in a `verify` block or construct a `scene`:
 
 ```abide
 // Property: every pending order eventually gets paid or cancelled
-verify liveness for Commerce[0..100] {
+verify liveness {
+  assume {
+    store orders: Order[0..8]
+    let commerce = Commerce { orders: orders }
+  }
   assert all o: Order |
     o.status == @Pending implies
       eventually (o.status == @Paid or o.status == @Cancelled)
 }
 
 // Witness: show a specific path to payment
-scene order_gets_paid for Commerce {
-  given let o = one Order where o.status == @Pending and o.total == 50
-  when action p = Commerce::place_order(o) { one }
-  then assert o.status == @Paid
+scene order_gets_paid {
+  given {
+    store orders: Order[1..1]
+    let commerce = Commerce { orders: orders }
+    let o = one Order in orders where o.status == @Pending and o.total == 50
+  }
+  when {
+    commerce.pay(o)
+  }
+  then {
+    assert o.status == @Paid
+  }
 }
 ```
