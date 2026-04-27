@@ -16,6 +16,8 @@ pub mod defenv;
 mod explicit;
 pub mod harness;
 pub mod ic3;
+#[cfg_attr(not(test), allow(dead_code))]
+mod ltl;
 pub mod smt;
 mod sygus;
 mod temporal;
@@ -3733,32 +3735,11 @@ fn encode_lasso_violation_inner(
     bound: usize,
     ctx: &PropertyCtx,
 ) -> Result<Bool, String> {
+    if contains_past_time(expr) {
+        return Err("past-time temporal operators are not supported by lasso BMC".to_owned());
+    }
+
     match expr {
-        // `eventually P` — violation: P never holds on the loop
-        IRExpr::Eventually { body, .. } => {
-            let mut loop_violations = Vec::new();
-            for (l, loop_ind) in loop_indicators.iter().enumerate() {
-                let mut p_never = Vec::new();
-                for step in l..=bound {
-                    let p = encode_prop_expr(pool, vctx, defs, ctx, body, step)?;
-                    p_never.push(smt::bool_not(&p));
-                }
-                let p_never_refs: Vec<&Bool> = p_never.iter().collect();
-                let violation_at_l = smt::bool_and(&[loop_ind, &smt::bool_and(&p_never_refs)]);
-                loop_violations.push(violation_at_l);
-            }
-            if loop_violations.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            let refs: Vec<&Bool> = loop_violations.iter().collect();
-            Ok(smt::bool_or(&refs))
-        }
-
-        // `always body` — strip always, examine body for liveness patterns
-        IRExpr::Always { body, .. } => {
-            encode_lasso_violation_inner(pool, vctx, defs, body, loop_indicators, bound, ctx)
-        }
-
         // Entity quantifier: `all o: Entity | body` — expand over active slots
         // and check each for liveness violations (disjunction: ANY slot violated).
         // The active guard per step is handled inside the inner encoding
@@ -3788,7 +3769,51 @@ fn encode_lasso_violation_inner(
                 return Ok(smt::bool_const(false));
             }
             let refs: Vec<&Bool> = slot_violations.iter().collect();
+            return Ok(smt::bool_or(&refs));
+        }
+        _ => {}
+    }
+
+    if contains_liveness(expr) {
+        let violation_expr = negate_temporal_expr(expr);
+        let compiled = CompiledTemporalFormula::from_expanded(violation_expr);
+        if let Some(buchi) = compiled.buchi() {
+            return encode_buchi_lasso_violation(
+                pool,
+                vctx,
+                defs,
+                buchi,
+                loop_indicators,
+                bound,
+                ctx,
+            );
+        }
+    }
+
+    match expr {
+        // `eventually P` — violation: P never holds on the loop
+        IRExpr::Eventually { body, .. } => {
+            let mut loop_violations = Vec::new();
+            for (l, loop_ind) in loop_indicators.iter().enumerate() {
+                let mut p_never = Vec::new();
+                for step in l..=bound {
+                    let p = encode_prop_expr(pool, vctx, defs, ctx, body, step)?;
+                    p_never.push(smt::bool_not(&p));
+                }
+                let p_never_refs: Vec<&Bool> = p_never.iter().collect();
+                let violation_at_l = smt::bool_and(&[loop_ind, &smt::bool_and(&p_never_refs)]);
+                loop_violations.push(violation_at_l);
+            }
+            if loop_violations.is_empty() {
+                return Ok(smt::bool_const(false));
+            }
+            let refs: Vec<&Bool> = loop_violations.iter().collect();
             Ok(smt::bool_or(&refs))
+        }
+
+        // `always body` — strip always, examine body for liveness patterns
+        IRExpr::Always { body, .. } => {
+            encode_lasso_violation_inner(pool, vctx, defs, body, loop_indicators, bound, ctx)
         }
 
         // `P implies eventually Q` — response pattern
@@ -3897,6 +3922,147 @@ fn encode_lasso_violation_inner(
         // Safety properties or other patterns — no lasso violation
         _ => Ok(smt::bool_const(false)),
     }
+}
+
+fn negate_temporal_expr(expr: &IRExpr) -> IRExpr {
+    IRExpr::UnOp {
+        op: "OpNot".to_owned(),
+        operand: Box::new(expr.clone()),
+        ty: crate::ir::types::IRType::Bool,
+        span: expr_span(expr),
+    }
+}
+
+fn encode_buchi_lasso_violation(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    buchi: &CompiledBuchiFormula,
+    loop_indicators: &[Bool],
+    bound: usize,
+    ctx: &PropertyCtx,
+) -> Result<Bool, String> {
+    let automaton = buchi.automaton();
+    if automaton.state_count() == 0 {
+        return Ok(smt::bool_const(false));
+    }
+
+    let var_prefix = buchi_state_var_prefix(ctx);
+    let state_vars = (0..=bound)
+        .map(|step| {
+            (0..automaton.state_count())
+                .map(|state| smt::bool_named(&format!("{var_prefix}_s{state}_t{step}")))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut constraints = Vec::new();
+
+    for step_vars in &state_vars {
+        constraints.push(exactly_one_bool(step_vars));
+    }
+
+    let initial_refs = automaton
+        .initial_states()
+        .iter()
+        .map(|state| &state_vars[0][*state])
+        .collect::<Vec<_>>();
+    constraints.push(smt::bool_or(&initial_refs));
+
+    for (step, vars_at_step) in state_vars.iter().enumerate() {
+        for (state_id, state_var) in vars_at_step.iter().enumerate() {
+            let state_atoms = automaton.state_atoms(state_id);
+            for atom in 0..buchi.atoms() {
+                let Some(atom_expr) = buchi.atom_expr(atom) else {
+                    return Err(format!(
+                        "Büchi atom p{atom} is missing its source expression"
+                    ));
+                };
+                let atom_value = encode_prop_expr(pool, vctx, defs, ctx, atom_expr, step)?;
+                let required = if state_atoms.contains(&atom) {
+                    atom_value
+                } else {
+                    smt::bool_not(&atom_value)
+                };
+                constraints.push(smt::bool_implies(state_var, &required));
+            }
+        }
+    }
+
+    for step in 0..bound {
+        for (source, targets) in automaton.transitions().iter().enumerate() {
+            let target_refs = targets
+                .iter()
+                .map(|target| &state_vars[step + 1][*target])
+                .collect::<Vec<_>>();
+            let target_disjunction = smt::bool_or(&target_refs);
+            constraints.push(smt::bool_implies(
+                &state_vars[step][source],
+                &target_disjunction,
+            ));
+        }
+    }
+
+    for (loop_start, loop_ind) in loop_indicators.iter().enumerate() {
+        for (source, targets) in automaton.transitions().iter().enumerate() {
+            let target_refs = targets
+                .iter()
+                .map(|target| &state_vars[loop_start][*target])
+                .collect::<Vec<_>>();
+            let target_disjunction = smt::bool_or(&target_refs);
+            let source_on_loop = smt::bool_and(&[loop_ind, &state_vars[bound][source]]);
+            constraints.push(smt::bool_implies(&source_on_loop, &target_disjunction));
+        }
+
+        for acceptance_id in 0..automaton.acceptance_set_count() {
+            let mut accepting_hits = Vec::new();
+            for step_vars in state_vars.iter().take(bound + 1).skip(loop_start) {
+                for (state, state_var) in step_vars.iter().enumerate() {
+                    if automaton.state_satisfies_acceptance(state, acceptance_id) {
+                        accepting_hits.push(state_var);
+                    }
+                }
+            }
+            let acceptance_seen = smt::bool_or(&accepting_hits);
+            constraints.push(smt::bool_implies(loop_ind, &acceptance_seen));
+        }
+    }
+
+    let refs = constraints.iter().collect::<Vec<_>>();
+    Ok(smt::bool_and(&refs))
+}
+
+fn buchi_state_var_prefix(ctx: &PropertyCtx) -> String {
+    let mut bindings = ctx
+        .bindings
+        .iter()
+        .map(|(var, (entity, slot))| format!("{var}_{entity}_{slot}"))
+        .collect::<Vec<_>>();
+    bindings.sort();
+    if bindings.is_empty() {
+        "ltl_buchi".to_owned()
+    } else {
+        format!("ltl_buchi_{}", bindings.join("_"))
+    }
+}
+
+fn exactly_one_bool(vars: &[Bool]) -> Bool {
+    if vars.is_empty() {
+        return smt::bool_const(false);
+    }
+
+    let mut constraints = Vec::new();
+    let at_least_one = smt::bool_or(&vars.iter().collect::<Vec<_>>());
+    constraints.push(at_least_one);
+
+    for i in 0..vars.len() {
+        for j in i + 1..vars.len() {
+            constraints.push(smt::bool_not(&smt::bool_and(&[&vars[i], &vars[j]])));
+        }
+    }
+
+    let refs = constraints.iter().collect::<Vec<_>>();
+    smt::bool_and(&refs)
 }
 
 // ── Property encoding for BMC ───────────────────────────────────────

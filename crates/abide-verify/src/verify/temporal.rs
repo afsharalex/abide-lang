@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::ir::types::{IRExpr, IRVerify};
 
 use super::defenv;
+use super::ltl::{Formula as LtlFormula, GeneralizedBuchi};
 
 #[derive(Clone)]
 pub enum LivenessPattern {
@@ -83,6 +84,7 @@ pub struct CompiledTemporalFormula {
     contains_past_time: bool,
     extraction: Option<PatternExtraction>,
     spot: Option<CompiledSpotFormula>,
+    buchi: Option<CompiledBuchiFormula>,
 }
 
 impl CompiledTemporalFormula {
@@ -98,6 +100,7 @@ impl CompiledTemporalFormula {
         let contains_past_time = contains_past_time(&expanded);
         let extraction = extract_liveness_pattern_inner(&normalized);
         let spot = compile_spot_formula(&normalized, contains_past_time);
+        let buchi = compile_buchi_formula(&expanded, contains_past_time);
         Self {
             expanded,
             normalized,
@@ -106,6 +109,7 @@ impl CompiledTemporalFormula {
             contains_past_time,
             extraction,
             spot,
+            buchi,
         }
     }
 
@@ -136,6 +140,10 @@ impl CompiledTemporalFormula {
     pub fn spot(&self) -> Option<&CompiledSpotFormula> {
         self.spot.as_ref()
     }
+
+    pub fn buchi(&self) -> Option<&CompiledBuchiFormula> {
+        self.buchi.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,8 +164,19 @@ pub struct CompiledSpotFormula {
 }
 
 #[derive(Clone)]
+pub struct CompiledBuchiFormula {
+    automaton: GeneralizedBuchi,
+    atoms: Vec<BuchiAtomBinding>,
+}
+
+#[derive(Clone)]
 struct SpotAtomBinding {
     label: String,
+    expr: IRExpr,
+}
+
+#[derive(Clone)]
+struct BuchiAtomBinding {
     expr: IRExpr,
 }
 
@@ -211,6 +230,28 @@ impl CompiledSpotFormula {
     }
 }
 
+impl CompiledBuchiFormula {
+    pub fn atoms(&self) -> usize {
+        self.atoms.len()
+    }
+
+    pub fn state_count(&self) -> usize {
+        self.automaton.state_count()
+    }
+
+    pub fn acceptance_set_count(&self) -> usize {
+        self.automaton.acceptance_set_count()
+    }
+
+    pub(super) fn automaton(&self) -> &GeneralizedBuchi {
+        &self.automaton
+    }
+
+    pub(super) fn atom_expr(&self, atom: usize) -> Option<&IRExpr> {
+        self.atoms.get(atom).map(|binding| &binding.expr)
+    }
+}
+
 pub fn export_verify_temporal_formulas(
     verify_block: &IRVerify,
     defs: &defenv::DefEnv,
@@ -243,6 +284,69 @@ fn compile_spot_formula(
     let mut next_atom = 0usize;
     let root = lower_to_temporal_formula(normalized, &mut atoms, &mut next_atom)?;
     Some(CompiledSpotFormula { root, atoms })
+}
+
+fn compile_buchi_formula(
+    expanded: &IRExpr,
+    contains_past_time: bool,
+) -> Option<CompiledBuchiFormula> {
+    if contains_past_time {
+        return None;
+    }
+
+    let mut atoms = Vec::new();
+    let mut next_atom = 0usize;
+    let root = lower_to_buchi_formula(expanded, &mut atoms, &mut next_atom)?;
+    let automaton = GeneralizedBuchi::from_formula(&root, atoms.len());
+    Some(CompiledBuchiFormula { automaton, atoms })
+}
+
+fn lower_to_buchi_formula(
+    expr: &IRExpr,
+    atoms: &mut Vec<BuchiAtomBinding>,
+    next_atom: &mut usize,
+) -> Option<LtlFormula> {
+    if !contains_temporal(expr) {
+        let atom = *next_atom;
+        *next_atom += 1;
+        atoms.push(BuchiAtomBinding { expr: expr.clone() });
+        return Some(LtlFormula::atom(atom));
+    }
+
+    match expr {
+        IRExpr::Always { body, .. } => Some(LtlFormula::always(lower_to_buchi_formula(
+            body, atoms, next_atom,
+        )?)),
+        IRExpr::Eventually { body, .. } => Some(LtlFormula::eventually(lower_to_buchi_formula(
+            body, atoms, next_atom,
+        )?)),
+        IRExpr::Until { left, right, .. } => Some(LtlFormula::until(
+            lower_to_buchi_formula(left, atoms, next_atom)?,
+            lower_to_buchi_formula(right, atoms, next_atom)?,
+        )),
+        IRExpr::UnOp { op, operand, .. } if op == "OpNot" => Some(LtlFormula::not(
+            lower_to_buchi_formula(operand, atoms, next_atom)?,
+        )),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" => Some(LtlFormula::and(
+            lower_to_buchi_formula(left, atoms, next_atom)?,
+            lower_to_buchi_formula(right, atoms, next_atom)?,
+        )),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpOr" => Some(LtlFormula::or(
+            lower_to_buchi_formula(left, atoms, next_atom)?,
+            lower_to_buchi_formula(right, atoms, next_atom)?,
+        )),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if is_implies_op(op) => Some(LtlFormula::implies(
+            lower_to_buchi_formula(left, atoms, next_atom)?,
+            lower_to_buchi_formula(right, atoms, next_atom)?,
+        )),
+        _ => None,
+    }
 }
 
 fn lower_to_temporal_formula(
@@ -982,6 +1086,46 @@ mod tests {
             IRExpr::BinOp { op, .. } => assert_eq!(op, "OpAnd"),
             other => panic!("expected desugared conjunction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compiled_temporal_formula_builds_buchi_for_full_future_ltl() {
+        let expr = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpImplies".to_owned(),
+                left: Box::new(bool_var("p")),
+                right: Box::new(IRExpr::Until {
+                    left: Box::new(bool_var("q")),
+                    right: Box::new(IRExpr::Eventually {
+                        body: Box::new(bool_var("r")),
+                        span: None,
+                    }),
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+
+        let compiled = CompiledTemporalFormula::from_expanded(expr);
+        let buchi = compiled.buchi().expect("future LTL compiles to Buchi");
+
+        assert_eq!(buchi.atoms(), 3);
+        assert!(buchi.state_count() > 0);
+        assert!(buchi.acceptance_set_count() > 0);
+    }
+
+    #[test]
+    fn compiled_temporal_formula_rejects_past_time_buchi() {
+        let compiled = CompiledTemporalFormula::from_expanded(IRExpr::Since {
+            left: Box::new(bool_var("p")),
+            right: Box::new(bool_var("q")),
+            span: None,
+        });
+
+        assert!(compiled.contains_past_time());
+        assert!(compiled.buchi().is_none());
     }
 
     #[test]
