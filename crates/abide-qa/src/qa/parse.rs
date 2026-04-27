@@ -421,7 +421,11 @@ fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
     }
 }
 
-fn parse_temporal_query(op: TemporalOp, tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_temporal_query(
+    op: TemporalOp,
+    tokens: &[&str],
+    line: usize,
+) -> Result<Query, QAParseError> {
     if tokens.is_empty() {
         return Err(QAParseError {
             message: format!(
@@ -468,9 +472,10 @@ fn parse_temporal_query(op: TemporalOp, tokens: &[&str], line: usize) -> Result<
                     message: format!("invalid temporal scope '{value}', expected Entity=N"),
                     line,
                 })?;
-                bounds
-                    .scopes
-                    .push((entity.to_owned(), parse_usize(slots, "scope slot count", line)?));
+                bounds.scopes.push((
+                    entity.to_owned(),
+                    parse_usize(slots, "scope slot count", line)?,
+                ));
                 index += 2;
             }
             _ => break,
@@ -490,7 +495,10 @@ fn parse_temporal_query(op: TemporalOp, tokens: &[&str], line: usize) -> Result<
                 line,
             });
         }
-        (Some(parse_temporal_target(tokens[index + 1], line)?), &tokens[index + 2..])
+        (
+            Some(parse_temporal_target(tokens[index + 1], line)?),
+            &tokens[index + 2..],
+        )
     } else {
         (None, &tokens[index..])
     };

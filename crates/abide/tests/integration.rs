@@ -4386,7 +4386,7 @@ fn verify_deadlock_when_no_events_enabled() {
 }
 
 /// opting into stutter via `assume { stutter }` recovers the
-/// pre-Phase-4 behavior — the same fixture above no longer reports
+/// earlier behavior — the same fixture above no longer reports
 /// DEADLOCK because the BMC can extend the trace via stutter steps.
 #[test]
 fn verify_no_deadlock_when_stutter_opted_in() {

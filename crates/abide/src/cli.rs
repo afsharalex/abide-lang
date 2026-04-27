@@ -231,10 +231,10 @@ enum Command {
     },
 }
 
-/// Default timeout for verifier phases, in seconds.
+/// Default timeout for verifier passes, in seconds.
 ///
 /// The default user-facing verify path should terminate on its own even when
-/// backends hit hard cases. Individual phases remain overrideable with the
+/// backends hit hard cases. Individual passes remain overrideable with the
 /// existing per-flag controls.
 const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 20 * 60;
 

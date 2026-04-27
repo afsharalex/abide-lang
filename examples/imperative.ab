@@ -1,6 +1,6 @@
 module Imperative
 
-// Imperative fn body examples (DDR-019)
+// Imperative function body examples
 // Demonstrates: var, while, if/else, assert, assume,
 // invariant, decreases, blocks, nested control flow
 

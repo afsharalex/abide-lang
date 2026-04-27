@@ -1,6 +1,6 @@
 module Orders
 
-// Order lifecycle — a compact single-system example using the current command/step surface.
+// Order lifecycle — a compact single-system example using the current command/query surface.
 
 enum OrderStatus = Pending | Confirmed | Shipped
 
@@ -22,29 +22,22 @@ entity Order {
 }
 
 system Orders(orders: Store<Order>) {
-
   command create_order(total: real)
-
-  step create_order(total: real)
     requires total > 0 {
     create Order {
       total = total
     }
   }
 
-  command confirm_order(order: Order)
-
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
-  step confirm_order(order: Order)
+  command confirm_order(order: Order)
     requires payable(order) {
     order.confirm()
   }
 
   command ship_order(order: Order)
-
-  step ship_order(order: Order)
     requires order.status == @Confirmed {
     order.ship()
   }

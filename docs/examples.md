@@ -8,18 +8,16 @@ See: [`examples/order.ab`](../examples/order.ab)
 
 Highlights:
 - store-backed system constructor: `system Orders(orders: Store<Order>)`
-- `command` plus `step`
+- inline `command` bodies
 - `query`
 - `verify` with `assume { store ...; let ... }`
 
 ```abide
 system Orders(orders: Store<Order>) {
-  command confirm_order(order: Order)
-
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
-  step confirm_order(order: Order)
+  command confirm_order(order: Order)
     requires payable(order) {
     order.confirm()
   }
@@ -39,8 +37,6 @@ Highlights:
 ```abide
 system Banking(accounts: Store<Account>) {
   command deposit(account_id: identity, amount: real)
-
-  step deposit(account_id: identity, amount: real)
     requires amount > 0 {
     choose a: Account where a.id == account_id {
       a.deposit(amount)
@@ -60,9 +56,7 @@ Highlights:
 
 ```abide
 system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
-  command process_payment(intent_id: identity)
-
-  step process_payment(intent_id: identity) {
+  command process_payment(intent_id: identity) {
     choose p: PaymentIntent where p.id == intent_id {
       p.capture()
       Commerce::confirm_payment(p.order_id)

@@ -45,8 +45,6 @@ entity Order {
 ```abide
 system Commerce(orders: Store<Order>) {
   command pay(order: Order)
-
-  step pay(order: Order)
     requires order.status == @Pending {
     order.mark_paid()
   }
@@ -61,8 +59,7 @@ system Commerce(orders: Store<Order>) {
 
 Notes:
 - `Store<T>` constructor params are the current entity-pool surface.
-- `command` declares the public API.
-- `step` gives executable command clauses.
+- `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
 - `pred` is internal and pure.
 
@@ -181,5 +178,5 @@ fn gcd(a: int, b: int): int
 ## Structural patterns
 
 - Systems are declared over explicit `Store<T>` pools.
-- Public operations are described with `command` plus executable `step` clauses.
+- Public operations are described with `command` and `query`.
 - Orchestration is described with `proc` and `program`.

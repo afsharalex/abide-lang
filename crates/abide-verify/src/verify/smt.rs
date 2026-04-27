@@ -1384,3 +1384,61 @@ pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
         _ => Err(format!("unsupported unop: {op}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_neutral_ast_extension_traits_dispatch_to_active_backend() {
+        let t = <Bool as BoolAstExt>::from_bool(true);
+        let f = <Bool as BoolAstExt>::from_bool(false);
+        let b = <Bool as BoolAstExt>::new_const("smt_ext_b");
+        let not_b = <Bool as BoolAstExt>::not(&b);
+        let excluded_middle = <Bool as BoolAstExt>::or(&[&b, &not_b]);
+        let conjunction = <Bool as BoolAstExt>::and(&[&t, &excluded_middle]);
+        let xor_tf = <Bool as BoolAstExt>::xor(&t, &f);
+        let implication = <Bool as BoolAstExt>::implies(&conjunction, &xor_tf);
+        let bool_eq_self = <Bool as BoolAstExt>::eq(&b, b.clone());
+
+        let one = <Int as IntAstExt>::from_i64(1);
+        let two = <Int as IntAstExt>::new_const("smt_ext_i");
+        let int_constraints = [
+            <Int as IntAstExt>::lt(&one, two.clone()),
+            <Int as IntAstExt>::le(&one, two.clone()),
+            <Int as IntAstExt>::gt(&two, one.clone()),
+            <Int as IntAstExt>::ge(&two, one.clone()),
+            <Int as IntAstExt>::eq(&one, one.clone()),
+        ];
+
+        let SmtValue::Real(real_one) = real_val(1, 1) else {
+            panic!("expected real");
+        };
+        let SmtValue::Real(real_two) = real_val(2, 1) else {
+            panic!("expected real");
+        };
+        let real_constraints = [
+            <Real as RealAstExt>::lt(&real_one, real_two.clone()),
+            <Real as RealAstExt>::le(&real_one, real_two.clone()),
+            <Real as RealAstExt>::gt(&real_two, real_one.clone()),
+            <Real as RealAstExt>::ge(&real_two, real_one.clone()),
+            <Real as RealAstExt>::eq(&real_one, real_one.clone()),
+        ];
+
+        let _ = <Sort as SortExt>::int();
+        let _ = <Sort as SortExt>::bool();
+        let _ = <Sort as SortExt>::real();
+
+        let solver = AbideSolver::new();
+        solver.assert(&implication);
+        solver.assert(&bool_eq_self);
+        solver.assert(&int_eq(&two, &int_lit(2)));
+        for constraint in &int_constraints {
+            solver.assert(constraint);
+        }
+        for constraint in &real_constraints {
+            solver.assert(constraint);
+        }
+        assert_eq!(solver.check(), SatResult::Sat);
+    }
+}

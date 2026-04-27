@@ -41,35 +41,26 @@ entity PaymentIntent {
 }
 
 system Commerce(orders: Store<Order>) {
-
   command create_order(total: real)
-
-  step create_order(total: real)
     requires total > 0 {
     create Order {
       total = total
     }
   }
 
-  command submit_order(order_id: identity)
-
-  step submit_order(order_id: identity) {
+  command submit_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.submit()
     }
   }
 
-  command confirm_payment(order_id: identity)
-
-  step confirm_payment(order_id: identity) {
+  command confirm_payment(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.mark_paid()
     }
   }
 
-  command ship_order(order_id: identity)
-
-  step ship_order(order_id: identity) {
+  command ship_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.ship()
     }
@@ -80,10 +71,7 @@ system Commerce(orders: Store<Order>) {
 }
 
 system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
-
   command open_intent(order_id: identity, amount: real)
-
-  step open_intent(order_id: identity, amount: real)
     requires amount > 0 {
     create PaymentIntent {
       order_id = order_id
@@ -91,9 +79,7 @@ system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
     }
   }
 
-  command process_payment(intent_id: identity)
-
-  step process_payment(intent_id: identity) {
+  command process_payment(intent_id: identity) {
     choose p: PaymentIntent where p.id == intent_id {
       p.capture()
       Commerce::confirm_payment(p.order_id)

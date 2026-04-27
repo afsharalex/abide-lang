@@ -150,7 +150,9 @@ impl ReplArtifact {
             ArtifactPayload::Simulation(simulation) => {
                 render_behavior_state(&simulation.behavior, index)
             }
-            ArtifactPayload::StateSpace(state_space) => render_state_space_state(state_space, index),
+            ArtifactPayload::StateSpace(state_space) => {
+                render_state_space_state(state_space, index)
+            }
         }
     }
 

@@ -34,9 +34,7 @@ Current Abide systems take explicit store pools:
 
 ```abide
 system Commerce(orders: Store<Order>) {
-  command confirm_order(order_id: identity)
-
-  step confirm_order(order_id: identity) {
+  command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.confirm()
     }
@@ -44,25 +42,23 @@ system Commerce(orders: Store<Order>) {
 }
 ```
 
-Model systems over explicit `Store<T>` pools and route behavior through commands and steps.
+Model systems over explicit `Store<T>` pools and route behavior through commands and queries.
 
 ## Commands, steps, queries, predicates
 
 Use the system surface deliberately:
 
-- `command` — public callable operation
-- `step` — executable clause implementing a command
+- `command` — public callable operation, with its body inline when needed
+- `step` — private executable clause for internal reusable behavior
 - `query` — public pure observation
 - `pred` — internal pure helper
 
 ```abide
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
-  step charge(order: Order)
+  command charge(order: Order)
     requires payable(order) {
     order.mark_paid()
   }
@@ -74,11 +70,9 @@ system Billing(orders: Store<Order>) {
 For public APIs, identity-based command params are usually clearer than exposing unrestricted entity picks:
 
 ```abide
-command ship_order(order_id: identity)
-
-step ship_order(order_id: identity) {
-  choose o: Order where o.id == order_id {
-    o.ship()
+command ship_order(order_id: identity) {
+  choose order: Order where order.id == order_id {
+    order.ship()
   }
 }
 ```
@@ -155,10 +149,10 @@ Use `proc` when you want dependency-structured command execution, branching on o
 
 ## Cross-system coordination
 
-System steps can call other systems directly:
+System commands can call other systems directly:
 
 ```abide
-step process_payment(intent_id: identity) {
+command process_payment(intent_id: identity) {
   choose p: PaymentIntent where p.id == intent_id {
     p.capture()
     Commerce::confirm_payment(p.order_id)
@@ -206,7 +200,7 @@ fn sum_to(n: int): int
 1. Define enums, structs, and refinement aliases.
 2. Define entities and actions.
 3. Define systems over explicit `Store<T>` pools.
-4. Add `command`, `step`, `query`, and `pred`.
+4. Add `command`, `query`, and `pred`.
 5. Add `verify` and `scene` blocks.
 6. Add `proc` / `program` only when orchestration structure matters.
 

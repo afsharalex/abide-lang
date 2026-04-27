@@ -158,15 +158,16 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
 /// **IC3/PDR** is tried first — it automatically discovers strengthening
 /// invariants, proving properties that aren't directly 1-inductive.
 ///
-/// If IC3 fails or is skipped (`--no-ic3`), falls back to **4-phase
-/// 1-induction** with user-provided invariants:
+/// If IC3 fails or is skipped (`--no-ic3`), falls back to staged
+/// 1-induction with user-provided invariants:
 ///
 /// 0. Invariant base: I holds at step 0
 /// 1. Invariant step: I(k) ∧ transition → I(k+1)
 /// 2. Property base: P holds at step 0
 /// 3. Property step: I(k) ∧ P(k) ∧ transition → P(k+1)
 ///
-/// All phases pass → PROVED. Any fails → UNPROVABLE with hint.
+/// If every pass succeeds, return `PROVED`. Otherwise return `UNPROVABLE`
+/// with a hint.
 #[allow(clippy::too_many_lines)]
 pub(super) fn check_theorem_block(
     ir: &IRProgram,
@@ -222,7 +223,7 @@ pub(super) fn check_theorem_block(
     }
 
     // ── Build scope via the shared theorem helper ( ).
-    // The induction phases encode both shows AND invariants, so the
+    // The induction passes encode both shows AND invariants, so the
     // scope needs to accommodate both in its quantifier-depth analysis.
     let quantifier_exprs: Vec<&IRExpr> = theorem
         .shows
@@ -261,7 +262,7 @@ pub(super) fn check_theorem_block(
 
     // collect entity and system invariants in
     // scope and merge them into the theorem's invariants list. The
-    // existing 4-phase induction machinery treats `theorem.invariants`
+    // existing staged induction machinery treats `theorem.invariants`
     // as both proof obligation (preserved by every event) AND
     // assumption (available when proving the show), which matches the
     // semantics required for entity/system invariants. Per  // entity invariants travel; system invariants stay scoped.
@@ -529,7 +530,7 @@ pub(super) fn check_theorem_block(
 
     // ── Try IC3/PDR (more powerful than 1-induction) ───────────────
     // IC3 discovers strengthening invariants automatically. If it proves
-    // the property, we're done. If not, fall through to 4-phase induction
+    // the property, we're done. If not, fall through to staged induction
     // which can leverage user-provided invariants.
     if let Some(result) = try_ic3_on_theorem(ir, vctx, defs, theorem, config, _deadline) {
         return result;
@@ -538,7 +539,7 @@ pub(super) fn check_theorem_block(
     // ── Lemma injection: encode referenced lemma conclusions ────────
     // Lemma conclusions are state-independent (pure, no temporal — checked
     // by check_lemma_block). They hold at every state and are asserted as
-    // global facts in each induction phase.
+    // global facts in each induction pass.
     let mut lemma_bools: Vec<Bool> = Vec::new();
     for lemma_name in &theorem.by_lemmas {
         // Try bare name first, then qualified — DefEnv stores lemmas under
@@ -1048,7 +1049,7 @@ pub(super) fn check_theorem_block(
 /// Try to prove a theorem's show expressions using IC3/PDR.
 ///
 /// IC3 discovers strengthening invariants automatically, so user-provided
-/// invariants are not needed. This is tried before 4-phase induction (since
+/// invariants are not needed. This is tried before staged induction (since
 /// IC3 is strictly more powerful for properties that need invariant discovery).
 fn try_ic3_on_theorem(
     ir: &IRProgram,
@@ -1335,5 +1336,598 @@ pub(super) fn check_lemma_block(
             span: lemma.span,
             file: lemma.file.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ir::types::{
+        IRAggKind, IRAssumptionSet, IRAxiom, IREntity, IRExpr, IRLemma, IRMatchArm, IRPattern,
+        IRProgram, IRScene, IRSystem, IRTheorem, IRType, IRVerify, LetBinding, LitVal,
+    };
+
+    use super::{
+        check_lemma_block, check_theorem_block, encode_pure_property_expr, needs_property_encoder,
+    };
+    use crate::verify::context::VerifyContext;
+    use crate::verify::defenv::DefEnv;
+    use crate::verify::{VerificationResult, VerifyConfig};
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn var(name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn empty_ir() -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: Vec::<IRVerify>::new(),
+            theorems: Vec::<IRTheorem>::new(),
+            axioms: Vec::<IRAxiom>::new(),
+            lemmas: Vec::<IRLemma>::new(),
+            scenes: Vec::<IRScene>::new(),
+        }
+    }
+
+    fn ir_with_system_entity() -> IRProgram {
+        IRProgram {
+            entities: vec![IREntity {
+                name: "Task".to_owned(),
+                fields: vec![],
+                transitions: vec![],
+                derived_fields: vec![],
+                invariants: vec![],
+                fsm_decls: vec![],
+            }],
+            systems: vec![IRSystem {
+                name: "Workflow".to_owned(),
+                store_params: vec![],
+                fields: vec![],
+                entities: vec!["Task".to_owned()],
+                commands: vec![],
+                steps: vec![],
+                fsm_decls: vec![],
+                derived_fields: vec![],
+                invariants: vec![],
+                queries: vec![],
+                preds: vec![],
+                let_bindings: vec![],
+                procs: vec![],
+            }],
+            ..empty_ir()
+        }
+    }
+
+    fn lemma(name: &str, body: Vec<IRExpr>) -> IRLemma {
+        IRLemma {
+            name: name.to_owned(),
+            assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+            body,
+            span: None,
+            file: None,
+        }
+    }
+
+    fn theorem(name: &str, shows: Vec<IRExpr>, by_file: Option<&str>) -> IRTheorem {
+        IRTheorem {
+            name: name.to_owned(),
+            systems: vec![],
+            assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+            invariants: vec![],
+            shows,
+            by_file: by_file.map(str::to_owned),
+            by_lemmas: vec![],
+            span: None,
+            file: None,
+        }
+    }
+
+    fn scoped_theorem(name: &str, shows: Vec<IRExpr>) -> IRTheorem {
+        IRTheorem {
+            systems: vec!["Workflow".to_owned()],
+            ..theorem(name, shows, None)
+        }
+    }
+
+    fn assert_needs(expr: IRExpr) {
+        assert!(needs_property_encoder(&expr), "expected property encoder");
+    }
+
+    fn assert_pure(expr: IRExpr) {
+        assert!(
+            !needs_property_encoder(&expr),
+            "expected pure expression encoder"
+        );
+    }
+
+    #[test]
+    fn needs_property_encoder_distinguishes_direct_property_only_forms() {
+        assert_pure(bool_lit(true));
+        assert_pure(var("x", IRType::Bool));
+        assert_pure(IRExpr::Sorry { span: None });
+        assert_pure(IRExpr::Todo { span: None });
+        assert_pure(IRExpr::Prime {
+            expr: Box::new(var("x", IRType::Bool)),
+            span: None,
+        });
+
+        assert_needs(IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: Some(Box::new(bool_lit(true))),
+            ty: IRType::Int,
+            span: None,
+        });
+        assert_needs(IRExpr::Assert {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        });
+        assert_needs(IRExpr::Assume {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        });
+    }
+
+    #[test]
+    fn needs_property_encoder_walks_recursive_expression_shapes() {
+        let choose = IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: None,
+            ty: IRType::Int,
+            span: None,
+        };
+
+        assert_needs(IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Always {
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Eventually {
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Historically {
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Once {
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Previously {
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Card {
+            expr: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::UnOp {
+            op: "!".to_owned(),
+            operand: Box::new(choose.clone()),
+            ty: IRType::Bool,
+            span: None,
+        });
+        assert_needs(IRExpr::Let {
+            bindings: vec![LetBinding {
+                name: "w".to_owned(),
+                ty: IRType::Int,
+                expr: choose.clone(),
+            }],
+            body: Box::new(bool_lit(true)),
+            span: None,
+        });
+        assert_needs(IRExpr::VarDecl {
+            name: "w".to_owned(),
+            ty: IRType::Int,
+            init: Box::new(int_lit(0)),
+            rest: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::IfElse {
+            cond: Box::new(bool_lit(true)),
+            then_body: Box::new(bool_lit(true)),
+            else_body: Some(Box::new(choose.clone())),
+            span: None,
+        });
+        assert_needs(IRExpr::BinOp {
+            op: "&&".to_owned(),
+            left: Box::new(bool_lit(true)),
+            right: Box::new(choose.clone()),
+            ty: IRType::Bool,
+            span: None,
+        });
+        assert_needs(IRExpr::Until {
+            left: Box::new(bool_lit(true)),
+            right: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Since {
+            left: Box::new(bool_lit(true)),
+            right: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::App {
+            func: Box::new(var("f", IRType::Bool)),
+            arg: Box::new(choose.clone()),
+            ty: IRType::Bool,
+            span: None,
+        });
+    }
+
+    #[test]
+    fn needs_property_encoder_walks_collection_match_and_imperative_shapes() {
+        let choose = IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: None,
+            ty: IRType::Int,
+            span: None,
+        };
+
+        assert_needs(IRExpr::Forall {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Exists {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::One {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Lone {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            body: Box::new(choose.clone()),
+            span: None,
+        });
+        assert_needs(IRExpr::Aggregate {
+            kind: IRAggKind::Sum,
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            body: Box::new(int_lit(1)),
+            in_filter: Some(Box::new(choose.clone())),
+            span: None,
+        });
+        assert_needs(IRExpr::Field {
+            expr: Box::new(choose.clone()),
+            field: "status".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        });
+        assert_needs(IRExpr::SetLit {
+            elements: vec![choose.clone()],
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        });
+        assert_needs(IRExpr::SeqLit {
+            elements: vec![choose.clone()],
+            ty: IRType::Seq {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        });
+        assert_needs(IRExpr::MapLit {
+            entries: vec![(int_lit(0), choose.clone())],
+            ty: IRType::Map {
+                key: Box::new(IRType::Int),
+                value: Box::new(IRType::Int),
+            },
+            span: None,
+        });
+        assert_needs(IRExpr::MapUpdate {
+            map: Box::new(var(
+                "m",
+                IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Int),
+                },
+            )),
+            key: Box::new(int_lit(0)),
+            value: Box::new(choose.clone()),
+            ty: IRType::Map {
+                key: Box::new(IRType::Int),
+                value: Box::new(IRType::Int),
+            },
+            span: None,
+        });
+        assert_needs(IRExpr::Index {
+            map: Box::new(var(
+                "m",
+                IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Int),
+                },
+            )),
+            key: Box::new(choose.clone()),
+            ty: IRType::Int,
+            span: None,
+        });
+        assert_needs(IRExpr::Match {
+            scrutinee: Box::new(var("flag", IRType::Bool)),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PWild,
+                guard: Some(choose.clone()),
+                body: bool_lit(true),
+            }],
+            span: None,
+        });
+        assert_needs(IRExpr::Block {
+            exprs: vec![bool_lit(true), choose.clone()],
+            span: None,
+        });
+        assert_needs(IRExpr::While {
+            cond: Box::new(bool_lit(true)),
+            invariants: vec![choose.clone()],
+            decreases: None,
+            body: Box::new(bool_lit(true)),
+            span: None,
+        });
+    }
+
+    #[test]
+    fn needs_property_encoder_walks_constructor_saw_and_comprehension_shapes() {
+        let choose = IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: None,
+            ty: IRType::Int,
+            span: None,
+        };
+
+        assert_needs(IRExpr::Ctor {
+            enum_name: "Result".to_owned(),
+            ctor: "Ok".to_owned(),
+            args: vec![("value".to_owned(), choose.clone())],
+            span: None,
+        });
+        assert_needs(IRExpr::Saw {
+            system_name: "Orders".to_owned(),
+            event_name: "submit".to_owned(),
+            args: vec![None, Some(Box::new(choose.clone()))],
+            span: None,
+        });
+        assert_needs(IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            filter: Box::new(bool_lit(true)),
+            projection: Some(Box::new(choose)),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        });
+    }
+
+    #[test]
+    fn encode_pure_property_expr_uses_pure_and_property_encoder_paths() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+
+        let pure = encode_pure_property_expr(&vctx, &defs, &bool_lit(true))
+            .expect("pure bool should encode");
+        assert_eq!(pure.as_bool(), Some(true));
+
+        encode_pure_property_expr(
+            &vctx,
+            &defs,
+            &IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(var("x", IRType::Bool)),
+                span: None,
+            },
+        )
+        .expect("finite property quantifier should encode");
+    }
+
+    #[test]
+    fn check_lemma_block_covers_empty_true_false_and_encoding_error_results() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let empty = check_lemma_block(&vctx, &defs, &lemma("empty", vec![]), &config);
+        assert!(
+            matches!(empty, VerificationResult::Proved { method, .. } if method == "lemma (empty body)")
+        );
+
+        let tautology =
+            check_lemma_block(&vctx, &defs, &lemma("truth", vec![bool_lit(true)]), &config);
+        assert!(
+            matches!(tautology, VerificationResult::Proved { method, .. } if method == "lemma")
+        );
+
+        let counterexample = check_lemma_block(
+            &vctx,
+            &defs,
+            &lemma("falsehood", vec![bool_lit(false)]),
+            &config,
+        );
+        assert!(matches!(
+            counterexample,
+            VerificationResult::Counterexample { name, .. } if name == "falsehood"
+        ));
+
+        let encoding_error = check_lemma_block(
+            &vctx,
+            &defs,
+            &lemma("unbound", vec![var("missing", IRType::Bool)]),
+            &config,
+        );
+        assert!(matches!(
+            encoding_error,
+            VerificationResult::Unprovable { name, .. } if name == "unbound"
+        ));
+    }
+
+    #[test]
+    fn check_lemma_block_rejects_temporal_body_with_specific_hint() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let result = check_lemma_block(
+            &vctx,
+            &defs,
+            &lemma(
+                "temporal",
+                vec![IRExpr::Always {
+                    body: Box::new(bool_lit(true)),
+                    span: None,
+                }],
+            ),
+            &config,
+        );
+        assert!(matches!(
+            result,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains(crate::messages::LEMMA_TEMPORAL_UNSUPPORTED)
+        ));
+    }
+
+    #[test]
+    fn check_theorem_block_covers_by_file_admission_and_empty_scope_failure() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let admitted = check_theorem_block(
+            &ir,
+            &vctx,
+            &defs,
+            &theorem(
+                "external",
+                vec![bool_lit(true)],
+                Some("proofs/external.agda"),
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            admitted,
+            VerificationResult::Admitted { name, reason, evidence: Some(_), .. }
+                if name == "external" && reason.contains("external proof artifact reference")
+        ));
+
+        let empty_scope = check_theorem_block(
+            &ir,
+            &vctx,
+            &defs,
+            &theorem("empty_scope", vec![bool_lit(true)], None),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            empty_scope,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "empty_scope" && hint == crate::messages::VERIFY_EMPTY_SCOPE
+        ));
+    }
+
+    #[test]
+    fn check_theorem_block_covers_nonempty_scope_diagnostics_before_solver_paths() {
+        let ir = ir_with_system_entity();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let past_time = check_theorem_block(
+            &ir,
+            &vctx,
+            &defs,
+            &scoped_theorem(
+                "past_time",
+                vec![IRExpr::Previously {
+                    body: Box::new(bool_lit(true)),
+                    span: None,
+                }],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            past_time,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains(crate::messages::THEOREM_PAST_TIME_UNSUPPORTED)
+        ));
+
+        let unsupported = check_theorem_block(
+            &ir,
+            &vctx,
+            &defs,
+            &scoped_theorem(
+                "unsupported",
+                vec![IRExpr::Block {
+                    exprs: vec![bool_lit(true)],
+                    span: None,
+                }],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            unsupported,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("unsupported expression kind in theorem show: Block")
+        ));
+
+        let mut bounded_only_config = VerifyConfig::default();
+        bounded_only_config.bounded_only = true;
+        let bounded_only = check_theorem_block(
+            &ir,
+            &vctx,
+            &defs,
+            &scoped_theorem("bounded_only", vec![bool_lit(true)]),
+            &bounded_only_config,
+            None,
+        );
+        assert!(matches!(
+            bounded_only,
+            VerificationResult::Unprovable { hint, .. } if hint.contains("--bounded-only")
+        ));
     }
 }

@@ -85,7 +85,7 @@ not that backend.
 
 No. Abide is in active design. Syntax and semantics may change. We'll add version-tagged stability markers when the language reaches that point.
 
-The constructs most likely to remain stable: enums, structs, type aliases, entities, actions, primed notation, `requires`/`ensures`, systems, `command`/`step`, `verify`/`scene` block structure, temporal operators, quantifiers.
+The constructs most likely to remain stable: enums, structs, type aliases, entities, actions, primed notation, `requires`/`ensures`, systems, commands, queries, `verify`/`scene` block structure, temporal operators, quantifiers.
 
 The constructs most likely to evolve: theorem block internals, module system, trait system, algorithm verification syntax.
 

@@ -145,7 +145,7 @@ Common parse errors include:
 
 - **Unexpected token:** The parser expected a specific syntax element but found something else.
 - **Unexpected end of input:** The file ended before a declaration was complete (e.g., missing closing `}`).
-- **Invalid keyword:** A keyword was used in the wrong context (e.g., `assert` inside a command/step body instead of a verify block).
+- **Invalid keyword:** A keyword was used in the wrong context (e.g., `assert` inside a command body instead of a verify block).
 
 ## Verification Results
 

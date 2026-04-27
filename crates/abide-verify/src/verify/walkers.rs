@@ -2023,6 +2023,10 @@ pub(super) fn behavior_to_trace_steps(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::ir::types::{
+        IRActionMatchArm, IRActionMatchScrutinee, IRAggKind, IRField, IRMatchArm, IRPattern,
+        IRTransition, IRUpdate, IRVariant, LetBinding, LitVal,
+    };
 
     fn atomic_step(id: &str, system: &str, command: &str) -> op::AtomicStep {
         op::AtomicStep::builder(
@@ -2032,6 +2036,873 @@ mod tests {
         )
         .build()
         .expect("test atomic step")
+    }
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn var(name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn field(expr: IRExpr, name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Field {
+            expr: Box::new(expr),
+            field: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn bin(op: &str, left: IRExpr, right: IRExpr, ty: IRType) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty,
+            span: None,
+        }
+    }
+
+    fn test_entity() -> IREntity {
+        IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "OrderStatus".to_owned(),
+                    variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Confirmed")],
+                },
+                default: None,
+                initial_constraint: None,
+            }],
+            transitions: vec![IRTransition {
+                name: "confirm".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: bool_lit(true),
+                updates: vec![IRUpdate {
+                    field: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "OrderStatus".to_owned(),
+                        ctor: "Confirmed".to_owned(),
+                        args: vec![],
+                        span: None,
+                    },
+                }],
+                postcondition: None,
+            }],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        }
+    }
+
+    fn test_system(name: &str, steps: Vec<crate::ir::types::IRStep>) -> IRSystem {
+        IRSystem {
+            name: name.to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec!["Order".to_owned()],
+            commands: vec![],
+            steps,
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        }
+    }
+
+    fn test_step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRStep {
+        crate::ir::types::IRStep {
+            name: name.to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body,
+            return_expr: None,
+        }
+    }
+
+    #[test]
+    fn witness_value_renderers_cover_composite_shapes() {
+        let slot = op::EntitySlotRef::new("Order", 2);
+        let tuple = op::WitnessValue::Tuple(vec![
+            op::WitnessValue::Unknown,
+            op::WitnessValue::Bool(true),
+            op::WitnessValue::Int(3),
+            op::WitnessValue::Real("1/2".to_owned()),
+            op::WitnessValue::Float("1.5".to_owned()),
+            op::WitnessValue::String("txt".to_owned()),
+            op::WitnessValue::Identity("id-1".to_owned()),
+            op::WitnessValue::EnumVariant {
+                enum_name: "OrderStatus".to_owned(),
+                variant: "Pending".to_owned(),
+            },
+            op::WitnessValue::SlotRef(slot.clone()),
+            op::WitnessValue::Set(vec![op::WitnessValue::Int(1), op::WitnessValue::Int(2)]),
+            op::WitnessValue::Seq(vec![op::WitnessValue::Bool(false)]),
+            op::WitnessValue::Map(vec![(
+                op::WitnessValue::String("k".to_owned()),
+                op::WitnessValue::String("v".to_owned()),
+            )]),
+            op::WitnessValue::Record(std::collections::BTreeMap::from([(
+                "field".to_owned(),
+                op::WitnessValue::Opaque {
+                    display: "opaque".to_owned(),
+                    ty: Some("Opaque".to_owned()),
+                },
+            )])),
+        ]);
+
+        let rendered = render_witness_value(&tuple);
+        assert!(rendered.contains("?"));
+        assert!(rendered.contains("true"));
+        assert!(rendered.contains("@OrderStatus::Pending"));
+        assert!(rendered.contains("Order[2]"));
+        assert!(rendered.contains("{1, 2}"));
+        assert!(rendered.contains("[false]"));
+        assert!(rendered.contains("k -> v"));
+        assert!(rendered.contains("field: opaque"));
+
+        let observation_rendered = render_observation_witness_value(&tuple);
+        assert_eq!(observation_rendered, rendered);
+    }
+
+    #[test]
+    fn render_ir_type_covers_all_shapes() {
+        let refinement = IRType::Refinement {
+            base: Box::new(IRType::Int),
+            predicate: Box::new(bool_lit(true)),
+        };
+        let types = vec![
+            (IRType::Int, "Int"),
+            (IRType::Bool, "Bool"),
+            (IRType::String, "String"),
+            (IRType::Identity, "Identity"),
+            (IRType::Real, "Real"),
+            (IRType::Float, "Float"),
+            (
+                IRType::Enum {
+                    name: "OrderStatus".to_owned(),
+                    variants: vec![IRVariant::simple("Pending")],
+                },
+                "OrderStatus",
+            ),
+            (
+                IRType::Record {
+                    name: "Payload".to_owned(),
+                    fields: vec![],
+                },
+                "Payload",
+            ),
+            (
+                IRType::Fn {
+                    param: Box::new(IRType::Int),
+                    result: Box::new(IRType::Bool),
+                },
+                "Fn",
+            ),
+            (
+                IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                "Entity<Order>",
+            ),
+            (
+                IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                "Set<Bool>",
+            ),
+            (
+                IRType::Seq {
+                    element: Box::new(IRType::Real),
+                },
+                "Seq<Real>",
+            ),
+            (
+                IRType::Map {
+                    key: Box::new(IRType::String),
+                    value: Box::new(IRType::Float),
+                },
+                "Map<String, Float>",
+            ),
+            (
+                IRType::Tuple {
+                    elements: vec![IRType::Int, IRType::Bool],
+                },
+                "(Int, Bool)",
+            ),
+            (refinement, "Int"),
+        ];
+
+        for (ty, expected) in types {
+            assert_eq!(render_ir_type(&ty), expected);
+        }
+    }
+
+    #[test]
+    fn expression_predicates_walk_nested_forms() {
+        let assert_expr = IRExpr::Assert {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        };
+        let assume_expr = IRExpr::Assume {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        };
+        let sorry_expr = IRExpr::Sorry { span: None };
+        let nested = IRExpr::Block {
+            exprs: vec![
+                IRExpr::While {
+                    cond: Box::new(bool_lit(true)),
+                    invariants: vec![assert_expr.clone()],
+                    decreases: None,
+                    body: Box::new(IRExpr::IfElse {
+                        cond: Box::new(bool_lit(true)),
+                        then_body: Box::new(assume_expr.clone()),
+                        else_body: Some(Box::new(IRExpr::Let {
+                            bindings: vec![LetBinding {
+                                name: "x".to_owned(),
+                                ty: IRType::Int,
+                                expr: int_lit(1),
+                            }],
+                            body: Box::new(sorry_expr.clone()),
+                            span: None,
+                        })),
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Aggregate {
+                    kind: IRAggKind::Count,
+                    var: "o".to_owned(),
+                    domain: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    body: Box::new(bool_lit(true)),
+                    in_filter: Some(Box::new(IRExpr::Saw {
+                        system_name: "Commerce".to_owned(),
+                        event_name: "confirm".to_owned(),
+                        args: vec![Some(Box::new(assert_expr.clone()))],
+                        span: None,
+                    })),
+                    span: None,
+                },
+            ],
+            span: None,
+        };
+
+        assert!(contains_imperative(&nested));
+        assert!(body_contains_assert(&nested));
+        assert!(body_contains_assume(&nested));
+        assert!(body_contains_sorry(&nested));
+        assert!(contains_imperative(&bin(
+            "OpEq",
+            var("x", IRType::Int),
+            int_lit(1),
+            IRType::Bool,
+        )));
+        assert!(body_contains_assert(&IRExpr::Saw {
+            system_name: "Commerce".to_owned(),
+            event_name: "confirm".to_owned(),
+            args: vec![Some(Box::new(assert_expr.clone())), None],
+            span: None,
+        }));
+        assert!(body_contains_assert(&IRExpr::Aggregate {
+            kind: IRAggKind::Count,
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(bool_lit(true)),
+            in_filter: Some(Box::new(assert_expr.clone())),
+            span: None,
+        }));
+        assert!(body_contains_sorry(&IRExpr::MapUpdate {
+            map: Box::new(var(
+                "m",
+                IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Bool),
+                }
+            )),
+            key: Box::new(int_lit(1)),
+            value: Box::new(sorry_expr.clone()),
+            ty: IRType::Map {
+                key: Box::new(IRType::Int),
+                value: Box::new(IRType::Bool),
+            },
+            span: None,
+        }));
+        assert!(body_contains_sorry(&IRExpr::MapLit {
+            entries: vec![(int_lit(1), sorry_expr.clone())],
+            ty: IRType::Map {
+                key: Box::new(IRType::Int),
+                value: Box::new(IRType::Bool),
+            },
+            span: None,
+        }));
+        assert!(body_contains_sorry(&IRExpr::Saw {
+            system_name: "Commerce".to_owned(),
+            event_name: "confirm".to_owned(),
+            args: vec![Some(Box::new(sorry_expr.clone()))],
+            span: None,
+        }));
+        assert!(body_contains_sorry(&IRExpr::Aggregate {
+            kind: IRAggKind::Count,
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(bool_lit(true)),
+            in_filter: Some(Box::new(sorry_expr)),
+            span: None,
+        }));
+        assert!(!contains_imperative(&IRExpr::Always {
+            body: Box::new(bool_lit(true)),
+            span: None,
+        }));
+    }
+
+    #[test]
+    fn expression_helpers_cover_remaining_recursive_branches() {
+        let assert_expr = IRExpr::Assert {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        };
+        let assume_expr = IRExpr::Assume {
+            expr: Box::new(bool_lit(true)),
+            span: None,
+        };
+        let sorry_expr = IRExpr::Sorry { span: None };
+        let map_ty = IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Bool),
+        };
+
+        assert!(body_contains_assert(&IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: Some(Box::new(assert_expr.clone())),
+            ty: IRType::Int,
+            span: None,
+        }));
+        assert!(body_contains_assert(&IRExpr::MapUpdate {
+            map: Box::new(var("m", map_ty.clone())),
+            key: Box::new(int_lit(1)),
+            value: Box::new(assert_expr.clone()),
+            ty: map_ty.clone(),
+            span: None,
+        }));
+        assert!(body_contains_assert(&IRExpr::MapLit {
+            entries: vec![(int_lit(1), assert_expr.clone())],
+            ty: map_ty.clone(),
+            span: None,
+        }));
+        assert!(body_contains_assert(&IRExpr::Since {
+            left: Box::new(bool_lit(true)),
+            right: Box::new(assert_expr.clone()),
+            span: None,
+        }));
+
+        for wrapper in [
+            IRExpr::Always {
+                body: Box::new(sorry_expr.clone()),
+                span: None,
+            },
+            IRExpr::Eventually {
+                body: Box::new(sorry_expr.clone()),
+                span: None,
+            },
+            IRExpr::Historically {
+                body: Box::new(sorry_expr.clone()),
+                span: None,
+            },
+            IRExpr::Once {
+                body: Box::new(sorry_expr.clone()),
+                span: None,
+            },
+            IRExpr::Previously {
+                body: Box::new(sorry_expr.clone()),
+                span: None,
+            },
+        ] {
+            assert!(body_contains_sorry(&wrapper));
+        }
+        assert!(body_contains_sorry(&IRExpr::Choose {
+            var: "x".to_owned(),
+            domain: IRType::Int,
+            predicate: Some(Box::new(sorry_expr.clone())),
+            ty: IRType::Int,
+            span: None,
+        }));
+        assert!(body_contains_sorry(&IRExpr::Since {
+            left: Box::new(bool_lit(true)),
+            right: Box::new(sorry_expr.clone()),
+            span: None,
+        }));
+
+        let match_with_assume = IRExpr::Match {
+            scrutinee: Box::new(bool_lit(false)),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PWild,
+                guard: Some(bool_lit(true)),
+                body: assume_expr,
+            }],
+            span: None,
+        };
+        assert!(body_contains_assume(&match_with_assume));
+    }
+
+    #[test]
+    fn collect_def_refs_respects_binders_and_pattern_shadowing() {
+        let expr = IRExpr::Let {
+            bindings: vec![LetBinding {
+                name: "local".to_owned(),
+                ty: IRType::Int,
+                expr: var("free_rhs", IRType::Int),
+            }],
+            body: Box::new(IRExpr::Match {
+                scrutinee: Box::new(var("scrutinee", IRType::Int)),
+                arms: vec![IRMatchArm {
+                    pattern: IRPattern::POr {
+                        left: Box::new(IRPattern::PVar {
+                            name: "matched".to_owned(),
+                        }),
+                        right: Box::new(IRPattern::PVar {
+                            name: "matched".to_owned(),
+                        }),
+                    },
+                    guard: Some(bin(
+                        "OpGt",
+                        var("matched", IRType::Int),
+                        var("free_guard", IRType::Int),
+                        IRType::Bool,
+                    )),
+                    body: IRExpr::SetComp {
+                        var: "item".to_owned(),
+                        domain: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        filter: Box::new(bin(
+                            "OpEq",
+                            var(
+                                "item",
+                                IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            ),
+                            var(
+                                "free_filter",
+                                IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            ),
+                            IRType::Bool,
+                        )),
+                        projection: Some(Box::new(var("free_projection", IRType::Int))),
+                        ty: IRType::Set {
+                            element: Box::new(IRType::Int),
+                        },
+                        span: None,
+                    },
+                }],
+                span: None,
+            }),
+            span: None,
+        };
+
+        let mut refs = HashSet::new();
+        collect_def_refs_in_exprs(&[expr], &mut refs);
+
+        assert!(refs.contains("free_rhs"));
+        assert!(refs.contains("scrutinee"));
+        assert!(refs.contains("free_guard"));
+        assert!(refs.contains("free_filter"));
+        assert!(refs.contains("free_projection"));
+        assert!(!refs.contains("local"));
+        assert!(!refs.contains("matched"));
+        assert!(!refs.contains("item"));
+
+        let mut more_refs = HashSet::new();
+        collect_def_refs_in_exprs(
+            &[
+                IRExpr::Lam {
+                    param: "bound".to_owned(),
+                    param_type: IRType::Int,
+                    body: Box::new(var("free_lam", IRType::Int)),
+                    span: None,
+                },
+                IRExpr::Prime {
+                    expr: Box::new(var("prime_ref", IRType::Int)),
+                    span: None,
+                },
+                IRExpr::Historically {
+                    body: Box::new(var("history_ref", IRType::Bool)),
+                    span: None,
+                },
+                IRExpr::Once {
+                    body: Box::new(var("once_ref", IRType::Bool)),
+                    span: None,
+                },
+                IRExpr::Previously {
+                    body: Box::new(var("prev_ref", IRType::Bool)),
+                    span: None,
+                },
+                IRExpr::MapUpdate {
+                    map: Box::new(var(
+                        "map_ref",
+                        IRType::Map {
+                            key: Box::new(IRType::Int),
+                            value: Box::new(IRType::Bool),
+                        },
+                    )),
+                    key: Box::new(var("key_ref", IRType::Int)),
+                    value: Box::new(var("value_ref", IRType::Bool)),
+                    ty: IRType::Map {
+                        key: Box::new(IRType::Int),
+                        value: Box::new(IRType::Bool),
+                    },
+                    span: None,
+                },
+            ],
+            &mut more_refs,
+        );
+        assert!(more_refs.contains("free_lam"));
+        assert!(!more_refs.contains("bound"));
+        assert!(more_refs.contains("prime_ref"));
+        assert!(more_refs.contains("history_ref"));
+        assert!(more_refs.contains("once_ref"));
+        assert!(more_refs.contains("prev_ref"));
+        assert!(more_refs.contains("map_ref"));
+        assert!(more_refs.contains("key_ref"));
+        assert!(more_refs.contains("value_ref"));
+    }
+
+    #[test]
+    fn scene_precheck_reports_supported_and_unsupported_shapes() {
+        let entity_card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                filter: Box::new(bool_lit(true)),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Entity {
+                        name: "Order".to_owned(),
+                    }),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+        assert_eq!(find_unsupported_scene_expr(&entity_card), None);
+
+        let unsupported_card = IRExpr::Card {
+            expr: Box::new(field(
+                var(
+                    "o",
+                    IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                ),
+                "status",
+                IRType::Int,
+            )),
+            span: None,
+        };
+        assert_eq!(
+            find_unsupported_scene_expr(&unsupported_card),
+            Some("cardinality (#) of non-literal, non-comprehension expression")
+        );
+
+        let unresolved_app = IRExpr::App {
+            func: Box::new(var(
+                "unknown_fn",
+                IRType::Fn {
+                    param: Box::new(IRType::Int),
+                    result: Box::new(IRType::Bool),
+                },
+            )),
+            arg: Box::new(int_lit(1)),
+            ty: IRType::Bool,
+            span: None,
+        };
+        assert_eq!(
+            find_unsupported_scene_expr(&unresolved_app),
+            Some(crate::messages::PRECHECK_UNRESOLVED_FN)
+        );
+
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::SetComp {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                filter: Box::new(bool_lit(true)),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            }),
+            Some("SetComp with non-entity domain")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Sorry { span: None }),
+            Some("Sorry")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Todo { span: None }),
+            Some("Todo")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Block {
+                exprs: vec![bool_lit(true)],
+                span: None,
+            }),
+            Some("Block")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::VarDecl {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                init: Box::new(int_lit(0)),
+                rest: Box::new(bool_lit(true)),
+                span: None,
+            }),
+            Some("VarDecl")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::While {
+                cond: Box::new(bool_lit(true)),
+                invariants: vec![],
+                decreases: None,
+                body: Box::new(bool_lit(true)),
+                span: None,
+            }),
+            Some("While")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Aggregate {
+                kind: IRAggKind::Sum,
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                body: Box::new(IRExpr::Sorry { span: None }),
+                in_filter: None,
+                span: None,
+            }),
+            Some("Sorry")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::IfElse {
+                cond: Box::new(bool_lit(true)),
+                then_body: Box::new(bool_lit(true)),
+                else_body: Some(Box::new(IRExpr::Todo { span: None })),
+                span: None,
+            }),
+            Some("Todo")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Saw {
+                system_name: "Commerce".to_owned(),
+                event_name: "confirm".to_owned(),
+                args: vec![Some(Box::new(IRExpr::Sorry { span: None }))],
+                span: None,
+            }),
+            Some("Sorry")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Choose {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                predicate: Some(Box::new(IRExpr::Todo { span: None })),
+                ty: IRType::Int,
+                span: None,
+            }),
+            Some("Todo")
+        );
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Assume {
+                expr: Box::new(IRExpr::Sorry { span: None }),
+                span: None,
+            }),
+            Some("Sorry")
+        );
+    }
+
+    #[test]
+    fn action_collectors_follow_nested_crosscalls_and_matches() {
+        let create_order = IRAction::Create {
+            entity: "Order".to_owned(),
+            fields: vec![],
+        };
+        let apply_confirm = IRAction::Apply {
+            target: "Order".to_owned(),
+            transition: "confirm".to_owned(),
+            refs: vec![],
+            args: vec![],
+        };
+        let callee = test_system(
+            "Callee",
+            vec![test_step("make", vec![create_order.clone()])],
+        );
+        let caller = test_system(
+            "Caller",
+            vec![test_step(
+                "run",
+                vec![
+                    IRAction::Choose {
+                        var: "o".to_owned(),
+                        entity: "Order".to_owned(),
+                        filter: Box::new(bool_lit(true)),
+                        ops: vec![apply_confirm.clone()],
+                    },
+                    IRAction::CrossCall {
+                        system: "Callee".to_owned(),
+                        command: "make".to_owned(),
+                        args: vec![],
+                    },
+                    IRAction::Match {
+                        scrutinee: IRActionMatchScrutinee::Var {
+                            name: "result".to_owned(),
+                        },
+                        arms: vec![IRActionMatchArm {
+                            pattern: IRPattern::PWild,
+                            guard: None,
+                            body: vec![IRAction::ForAll {
+                                var: "each".to_owned(),
+                                entity: "Order".to_owned(),
+                                ops: vec![apply_confirm.clone()],
+                            }],
+                        }],
+                    },
+                ],
+            )],
+        );
+        let systems = vec![caller.clone(), callee];
+        let step_body = &caller.steps[0].body;
+
+        assert_eq!(scan_event_creates(step_body, &systems), vec!["Order"]);
+        assert_eq!(
+            scan_event_creates(
+                &[
+                    create_order.clone(),
+                    IRAction::ForAll {
+                        var: "o".to_owned(),
+                        entity: "Order".to_owned(),
+                        ops: vec![create_order.clone()],
+                    },
+                ],
+                &systems,
+            ),
+            vec!["Order"]
+        );
+
+        let mut entities = HashSet::new();
+        let mut visited = HashSet::new();
+        collect_event_body_entities(step_body, &systems, &mut entities, &mut visited);
+        assert!(entities.contains("Order"));
+        assert!(visited.contains(&("Callee".to_owned(), "make".to_owned())));
+        collect_event_body_entities(
+            &[
+                IRAction::LetCrossCall {
+                    name: "made".to_owned(),
+                    system: "Callee".to_owned(),
+                    command: "make".to_owned(),
+                    args: vec![],
+                },
+                IRAction::ExprStmt {
+                    expr: bool_lit(true),
+                },
+            ],
+            &systems,
+            &mut entities,
+            &mut visited,
+        );
+
+        let modified = collect_event_modified_fields(step_body, &[test_entity()]);
+        assert!(modified.contains(&("Order".to_owned(), "status".to_owned())));
+        assert_eq!(
+            collect_event_created_entities(step_body),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn field_and_quantifier_helpers_cover_recursive_paths() {
+        let expr = IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::Exists {
+                var: "other".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::Until {
+                    left: Box::new(field(
+                        var(
+                            "o",
+                            IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                        ),
+                        "status",
+                        IRType::Enum {
+                            name: "OrderStatus".to_owned(),
+                            variants: vec![IRVariant::simple("Pending")],
+                        },
+                    )),
+                    right: Box::new(IRExpr::Eventually {
+                        body: Box::new(field(
+                            var(
+                                "other",
+                                IRType::Entity {
+                                    name: "Order".to_owned(),
+                                },
+                            ),
+                            "status",
+                            IRType::Enum {
+                                name: "OrderStatus".to_owned(),
+                                variants: vec![IRVariant::simple("Confirmed")],
+                            },
+                        )),
+                        span: None,
+                    }),
+                    span: None,
+                }),
+                span: None,
+            }),
+            span: None,
+        };
+
+        let mut fields = HashSet::new();
+        collect_field_refs_in_expr(&expr, "o", &mut fields);
+        assert_eq!(fields, HashSet::from(["status".to_owned()]));
+        assert!(has_multi_entity_quantifier(&[&expr]));
     }
 
     #[test]

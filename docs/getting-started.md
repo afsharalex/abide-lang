@@ -4,7 +4,7 @@ Abide is a specification language for stateful systems, workflows, and verificat
 
 This guide uses the syntax that the current compiler accepts on `master`:
 - store-backed systems: `system Commerce(orders: Store<Order>)`
-- public command surface plus executable `step` clauses
+- public commands and queries, with inline command bodies where needed
 - verification blocks with explicit `assume { store ...; let ... }`
 
 ## Build
@@ -44,10 +44,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-
   command create_order(total: real)
-
-  step create_order(total: real)
     requires total > 0 {
     create Order {
       total = total
@@ -55,15 +52,11 @@ system Commerce(orders: Store<Order>) {
   }
 
   command pay(order: Order)
-
-  step pay(order: Order)
     requires order.status == @Pending {
     order.mark_paid()
   }
 
   command ship(order: Order)
-
-  step ship(order: Order)
     requires order.status == @Paid {
     order.ship()
   }
@@ -117,8 +110,7 @@ abide verify order.ab
 
 - `entity` declares stateful domain objects with fields and actions.
 - `system ... (orders: Store<Order>)` declares a system over a bounded pool of entities.
-- `command` declares the public API surface of the system.
-- `step` gives an executable implementation clause for a command.
+- `command` declares a public system operation and may include its body inline.
 - `verify` checks universal properties.
 - `scene` checks existential witness scenarios.
 
@@ -149,8 +141,7 @@ use Commerce::Order
 use Commerce::OrderStatus
 
 system Commerce(orders: Store<Order>) {
-  command create_order(total: real)
-  step create_order(total: real) { create Order { total = total } }
+  command create_order(total: real) { create Order { total = total } }
 }
 ```
 

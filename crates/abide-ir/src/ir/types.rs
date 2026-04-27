@@ -722,7 +722,7 @@ pub enum IRProcDepCond {
 
 /// command declaration metadata in IR.
 /// Carries the command name, parameter types, and optional return type
-/// so downstream phases (proc outcome port resolution) can validate
+/// so downstream proc outcome port resolution can validate
 /// outcome ports and payload shapes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRCommand {

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::ir;
 use crate::loader;
-use abide_ir::ir::types::{IRAssumptionSet, IRExpr, IRStoreDecl, IRType, IRVerify, IRVerifySystem, LitVal};
+use abide_ir::ir::types::{
+    IRAssumptionSet, IRExpr, IRStoreDecl, IRType, IRVerify, IRVerifySystem, LitVal,
+};
 use abide_verify::verify::{
     explore_verify_state_space, verify_all, ExplicitStateSpace, VerifyConfig,
 };
@@ -238,8 +240,7 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
                 Ok(ir_program) => match hooks.explore_state_space(&ir_program, request) {
                     Ok(state_space) => {
                         let name = state_space_artifact_name(&state_space, request);
-                        let stored =
-                            artifacts.record_state_space_result(name, state_space.clone());
+                        let stored = artifacts.record_state_space_result(name, state_space.clone());
                         output.push(render_state_space_summary(&state_space));
                         output.push(format!("stored {stored} artifact(s)"));
                     }
@@ -321,7 +322,9 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
                 }
             }
             if stored_temporal > 0 {
-                output.push(format!("  OK: stored {stored_temporal} temporal artifact(s)"));
+                output.push(format!(
+                    "  OK: stored {stored_temporal} temporal artifact(s)"
+                ));
             }
         } else {
             output.push(fmt::format_result(verb, &result));
@@ -414,30 +417,22 @@ show artifact deadlock:qa_temporal_always_on_commerce_true
 
         let result = run_qa_script(&script_path, None, false);
         assert_eq!(result.failed, 0);
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("false [semantic:counterexample[slots=4]]"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("stored 1 artifact(s)"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("#1 deadlock qa_temporal_always_on_commerce_true"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("witness kind: deadlock"))
-        );
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("false [semantic:counterexample[slots=4]]")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("stored 1 artifact(s)")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("#1 deadlock qa_temporal_always_on_commerce_true")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("witness kind: deadlock")));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -486,36 +481,23 @@ draw artifact state-space:state_space_commerce
 
         let result = run_qa_script(&script_path, None, false);
         assert_eq!(result.failed, 0);
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("State space"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("stored 1 artifact(s)"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("#1 state-space state_space_commerce"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("bounded state-space exploration"))
-        );
-        assert!(
-            result
-                .output
-                .iter()
-                .any(|line| line.contains("[state 0]"))
-        );
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("State space")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("stored 1 artifact(s)")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("#1 state-space state_space_commerce")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("bounded state-space exploration")));
+        assert!(result.output.iter().any(|line| line.contains("[state 0]")));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -4,38 +4,58 @@
 
 Abide lets you model system behavior formally — then simulate it, check it against properties, and prove guarantees. Specifications are readable enough to guide engineering decisions and precise enough for automated verification.
 
-**Status:** Active design and implementation phase. Syntax and semantics are evolving. Early feedback is welcome.
+**Status:** Active design and implementation. Syntax and semantics are evolving. Early feedback is welcome.
 
 ## A Taste of Abide
 
 ```abide
-type OrderStatus = Pending | Paid | Shipped
+module Commerce
+
+enum OrderStatus = Pending | Paid | Shipped
 
 entity Order {
   id: identity
   status: OrderStatus = @Pending
-  total: real
+  total: real = 0
 
-  action pay() requires status == @Pending requires total > 0 {
+  action pay()
+    requires status == @Pending
+    requires total > 0 {
     status' = @Paid
   }
 
-  action ship() requires status == @Paid {
+  action ship()
+    requires status == @Paid {
     status' = @Shipped
   }
 }
 
-system Commerce {
-  use Order
+system Commerce(orders: Store<Order>) {
+  command create_order(total: real)
+    requires total > 0 {
+    create Order {
+      total = total
+    }
+  }
 
-  event place_order(o: Order) requires o.status == @Pending {
-    o.pay()
+  command pay_order(order: Order)
+    requires order.status == @Pending
+    requires order.total > 0 {
+    order.pay()
+  }
+
+  command ship_order(order: Order)
+    requires order.status == @Paid {
+    order.ship()
   }
 }
 
-verify paid_orders_can_ship for Commerce[0..50] {
-  assert all o: Order |
-    o.status == @Paid implies eventually (o.status == @Shipped)
+verify paid_orders_can_ship {
+  assume {
+    store orders: Order[0..4]
+    let commerce = Commerce { orders: orders }
+  }
+  assert always all o: Order | o.status == @Paid implies eventually (o.status == @Shipped)
 }
 ```
 
@@ -45,9 +65,9 @@ Abide spans five specification layers under one language:
 
 1. **Structural modeling** — Define domain vocabulary with types, records, and algebraic data types. Model stateful objects as entities with fields and defaults.
 
-2. **Behavioral modeling** — Specify state transitions with guarded actions (`requires`/`ensures`). Compose entities into systems with events. Express constraints as named predicates and properties.
+2. **Behavioral modeling** — Specify state transitions with guarded actions. Compose entities into systems with public commands, queries, predicates, and reusable orchestration.
 
-3. **Temporal modeling** — Assert safety (`always`) and liveness (`eventually`) properties. Explore system behavior with bounded model checking. Construct scenario witnesses with `scene` blocks. Query specifications interactively with the [REPL](docs/repl.md) and [QA language](docs/qa-language.md) *(planned)*.
+3. **Temporal modeling** — Assert safety (`always`) and liveness (`eventually`) properties. Explore system behavior with bounded model checking. Construct scenario witnesses with `scene` blocks. Query specifications interactively with the [REPL](docs/repl.md) and [QA language](docs/qa-language.md).
 
 4. **Algorithm verification** *(planned)* — Verify function correctness with loop invariants, termination measures, and refinement types. Prove algorithms correct against their contracts.
 

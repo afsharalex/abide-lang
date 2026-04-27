@@ -479,11 +479,9 @@ impl<'a> ExplicitModel<'a> {
             if !self.system_is_scheduled(&step.system) {
                 continue;
             }
-            for bindings in enumerate_param_bindings_for_state(
-                &step.step.params,
-                state,
-                &self.entity_specs,
-            )? {
+            for bindings in
+                enumerate_param_bindings_for_state(&step.step.params, state, &self.entity_specs)?
+            {
                 for (next, choices) in self.execute_step_with_bindings(state, step, &bindings)? {
                     out.push((
                         next,
@@ -1328,7 +1326,10 @@ pub fn explore_verify_state_space(
                 slots: store.hi.max(1) as usize,
             })
             .collect(),
-        states: nodes.iter().map(|state| model.witness_state(state)).collect(),
+        states: nodes
+            .iter()
+            .map(|state| model.witness_state(state))
+            .collect(),
         initial_state: 0,
         transitions,
     }))
@@ -1593,7 +1594,7 @@ fn build_entity_spec<'a>(
         field_indices.insert(field.name.clone(), index);
     }
     let mut transitions = HashMap::new();
-        for transition in &entity.transitions {
+    for transition in &entity.transitions {
         if transition.postcondition.is_some() {
             return Err(format!(
                 "unsupported explicit-state transition `{}::{}`",
@@ -1672,14 +1673,13 @@ fn validate_action(
                 value_locals,
                 slot_locals,
             ) || !supports_state_expr(
-                    right,
-                    Some(current_system),
-                    system_fields,
-                    entity_specs,
-                    value_locals,
-                    slot_locals,
-                )
-            {
+                right,
+                Some(current_system),
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            ) {
                 return Err("unsupported assignment in explicit-state fragment".to_owned());
             }
             Ok(value_locals.clone())
@@ -2661,7 +2661,9 @@ fn assignment_target(
                 field_index,
             })
         }
-        _ => Err("explicit-state assignment target must be a primed system or entity field".to_owned()),
+        _ => Err(
+            "explicit-state assignment target must be a primed system or entity field".to_owned(),
+        ),
     }
 }
 
@@ -2713,14 +2715,16 @@ fn supports_state_expr(
                 || value_locals.contains(name)
         }
         IRExpr::Field { expr, field, .. } => match expr.as_ref() {
-            IRExpr::Var { name, .. } => slot_locals
-                .get(name)
-                .and_then(|entity_index| entity_specs.get(*entity_index))
-                .is_some_and(|spec| spec.field_indices.contains_key(field))
-                || (value_locals.contains(name)
-                    && entity_specs
-                        .iter()
-                        .any(|spec| spec.field_indices.contains_key(field))),
+            IRExpr::Var { name, .. } => {
+                slot_locals
+                    .get(name)
+                    .and_then(|entity_index| entity_specs.get(*entity_index))
+                    .is_some_and(|spec| spec.field_indices.contains_key(field))
+                    || (value_locals.contains(name)
+                        && entity_specs
+                            .iter()
+                            .any(|spec| spec.field_indices.contains_key(field)))
+            }
             _ => false,
         },
         IRExpr::BinOp {
@@ -3081,7 +3085,10 @@ fn ensure_supported_explicit_param_type(ty: &IRType) -> Result<(), String> {
     if supports_explicit_param_type(ty) {
         Ok(())
     } else {
-        Err("explicit-state only supports Bool, fieldless-enum, and entity step parameters".to_owned())
+        Err(
+            "explicit-state only supports Bool, fieldless-enum, and entity step parameters"
+                .to_owned(),
+        )
     }
 }
 
@@ -3097,7 +3104,9 @@ fn finite_values_for_param(
                 .enumerate()
                 .find(|(_, spec)| spec.name == *name)
             else {
-                return Err(format!("unknown explicit-state entity parameter domain `{name}`"));
+                return Err(format!(
+                    "unknown explicit-state entity parameter domain `{name}`"
+                ));
             };
             Ok((0..spec.slot_count)
                 .filter(|slot| state.entity_slots[entity_index][*slot].active)
@@ -3273,5 +3282,543 @@ fn render_explicit_edge_label(edge: &ExplicitEdge) -> String {
             }
         }
         ExplicitEdge::Stutter => "stutter".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{IRFieldPat, IRPattern, IRVariant};
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn bool_field(name: &str, default: Option<bool>) -> IRField {
+        IRField {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            default: default.map(bool_lit),
+            initial_constraint: None,
+        }
+    }
+
+    fn enum_type() -> IRType {
+        IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        }
+    }
+
+    fn enum_ctor(variant: &str) -> IRExpr {
+        IRExpr::Ctor {
+            enum_name: "Status".to_owned(),
+            ctor: variant.to_owned(),
+            args: vec![],
+            span: None,
+        }
+    }
+
+    fn var(name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn prime(expr: IRExpr) -> IRExpr {
+        IRExpr::Prime {
+            expr: Box::new(expr),
+            span: None,
+        }
+    }
+
+    fn bin(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn entity_spec() -> ExplicitEntitySpec<'static> {
+        let fields = vec![bool_field("active", Some(false))];
+        let field_indices = HashMap::from([("active".to_owned(), 0)]);
+        ExplicitEntitySpec {
+            name: "Task".to_owned(),
+            slot_count: 2,
+            fields,
+            field_indices,
+            transitions: HashMap::new(),
+        }
+    }
+
+    fn sample_state() -> ExplicitState {
+        ExplicitState {
+            system_values: vec![ExplicitValue::Bool(false)],
+            entity_slots: vec![vec![
+                ExplicitEntitySlotState {
+                    active: true,
+                    values: vec![ExplicitValue::Bool(true)],
+                },
+                ExplicitEntitySlotState {
+                    active: false,
+                    values: vec![ExplicitValue::Bool(false)],
+                },
+            ]],
+        }
+    }
+
+    fn empty_state() -> ExplicitState {
+        ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![],
+        }
+    }
+
+    fn leaked_step(name: &str, params: Vec<IRTransParam>) -> &'static IRStep {
+        Box::leak(Box::new(IRStep {
+            name: name.to_owned(),
+            params,
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: None,
+        }))
+    }
+
+    fn simple_model<'a>(step: &'a IRStep) -> ExplicitModel<'a> {
+        ExplicitModel {
+            roots: vec!["Sys".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs: vec![],
+            entity_indices: HashMap::new(),
+            steps: vec![ExplicitStepRef {
+                system: "Sys".to_owned(),
+                store_param_count: 0,
+                step,
+            }],
+            step_indices: HashMap::from([(("Sys".to_owned(), step.name.clone()), 0usize)]),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        }
+    }
+
+    #[test]
+    fn explicit_finite_defaults_and_param_domains_cover_supported_and_error_paths() {
+        assert_eq!(
+            finite_default_value(&bool_field("flag", None)).unwrap(),
+            ExplicitValue::Bool(false)
+        );
+        assert_eq!(
+            finite_default_value(&bool_field("flag", Some(true))).unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        let enum_field = IRField {
+            name: "status".to_owned(),
+            ty: enum_type(),
+            default: Some(enum_ctor("Closed")),
+            initial_constraint: None,
+        };
+        assert_eq!(
+            finite_default_value(&enum_field).unwrap(),
+            ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned()
+            }
+        );
+        let identity_field = IRField {
+            name: "id".to_owned(),
+            ty: IRType::Identity,
+            default: None,
+            initial_constraint: None,
+        };
+        assert_eq!(
+            entity_field_default_value(&identity_field, "Task", 3).unwrap(),
+            ExplicitValue::Identity("Task#3".to_owned())
+        );
+        assert!(finite_values_for_type(&IRType::Int).is_err());
+        assert!(ensure_supported_explicit_param_type(&IRType::Bool).is_ok());
+        assert!(ensure_supported_explicit_param_type(&IRType::Real).is_err());
+
+        let params = vec![
+            IRTransParam {
+                name: "flag".to_owned(),
+                ty: IRType::Bool,
+            },
+            IRTransParam {
+                name: "status".to_owned(),
+                ty: enum_type(),
+            },
+        ];
+        let bindings = enumerate_param_bindings(&params).unwrap();
+        assert_eq!(bindings.len(), 4);
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_fields_quantifiers_and_errors() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::from([
+            ("Orders::flag".to_owned(), 0usize),
+            ("flag".to_owned(), 0usize),
+        ]);
+        let value_locals = HashMap::from([("local".to_owned(), ExplicitValue::Bool(true))]);
+        let slot_locals = HashMap::from([(
+            "task".to_owned(),
+            ExplicitSlotBinding {
+                entity_index: 0,
+                slot: 0,
+            },
+        )]);
+        let value_names = HashSet::from(["local".to_owned()]);
+        let slot_names = HashMap::from([("task".to_owned(), 0usize)]);
+
+        assert!(supports_state_expr(
+            &var("flag", IRType::Bool),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert!(supports_state_expr(
+            &IRExpr::Field {
+                expr: Box::new(var(
+                    "task",
+                    IRType::Entity {
+                        name: "Task".to_owned()
+                    }
+                )),
+                field: "active".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            },
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert!(!supports_state_expr(
+            &IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            },
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+
+        let field_value = eval_expr(
+            &state,
+            &IRExpr::Field {
+                expr: Box::new(var(
+                    "task",
+                    IRType::Entity {
+                        name: "Task".to_owned(),
+                    },
+                )),
+                field: "active".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            },
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_locals,
+            &slot_locals,
+        )
+        .unwrap();
+        assert_eq!(field_value, ExplicitValue::Bool(true));
+
+        let forall_active = IRExpr::Forall {
+            var: "t".to_owned(),
+            domain: IRType::Entity {
+                name: "Task".to_owned(),
+            },
+            body: Box::new(IRExpr::Field {
+                expr: Box::new(var(
+                    "t",
+                    IRType::Entity {
+                        name: "Task".to_owned(),
+                    },
+                )),
+                field: "active".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+        assert_eq!(
+            eval_expr(
+                &state,
+                &forall_active,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &HashMap::new(),
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert!(eval_expr(
+            &state,
+            &var("missing", IRType::Bool),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_locals,
+            &slot_locals,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_assignment_targets_and_application_update_state() {
+        let mut state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::from([
+            ("Orders::flag".to_owned(), 0usize),
+            ("flag".to_owned(), 0usize),
+        ]);
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::from([(
+            "task".to_owned(),
+            ExplicitSlotBinding {
+                entity_index: 0,
+                slot: 0,
+            },
+        )]);
+
+        apply_assignment(
+            &mut state,
+            &bin("OpEq", prime(var("flag", IRType::Bool)), bool_lit(true)),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_locals,
+            &slot_locals,
+        )
+        .unwrap();
+        assert_eq!(state.system_values[0], ExplicitValue::Bool(true));
+
+        apply_assignment(
+            &mut state,
+            &bin(
+                "OpEq",
+                prime(IRExpr::Field {
+                    expr: Box::new(var(
+                        "task",
+                        IRType::Entity {
+                            name: "Task".to_owned(),
+                        },
+                    )),
+                    field: "active".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                bool_lit(false),
+            ),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_locals,
+            &slot_locals,
+        )
+        .unwrap();
+        assert_eq!(
+            state.entity_slots[0][0].values[0],
+            ExplicitValue::Bool(false)
+        );
+
+        assert!(apply_assignment(
+            &mut state,
+            &bool_lit(true),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_locals,
+            &slot_locals,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_patterns_rendering_and_scc_helpers_cover_branchy_paths() {
+        let ctor = IRPattern::PCtor {
+            name: "Open".to_owned(),
+            fields: vec![],
+        };
+        let unsupported_ctor = IRPattern::PCtor {
+            name: "Open".to_owned(),
+            fields: vec![IRFieldPat {
+                name: "value".to_owned(),
+                pattern: IRPattern::PWild,
+            }],
+        };
+        assert!(pattern_supported(&IRPattern::POr {
+            left: Box::new(IRPattern::PWild),
+            right: Box::new(ctor.clone()),
+        }));
+        assert!(!pattern_supported(&unsupported_ctor));
+        assert!(pattern_matches(
+            &ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Open".to_owned()
+            },
+            &ctor
+        ));
+        assert!(!pattern_matches(
+            &ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned()
+            },
+            &ctor
+        ));
+
+        let tuple = HashMap::from([
+            ("b".to_owned(), ExplicitValue::Bool(false)),
+            ("a".to_owned(), ExplicitValue::Identity("id".to_owned())),
+        ]);
+        assert_eq!(render_tuple_suffix(&tuple), "(a=id, b=false)");
+        assert_eq!(render_choice_suffix(&[]), "");
+        assert_eq!(
+            render_choice_suffix(&[ExplicitChoiceBinding {
+                binder: "x".to_owned(),
+                selected: op::EntitySlotRef::new("Task", 1)
+            }]),
+            "[x=Task[1]]"
+        );
+
+        let adjacency = vec![
+            vec![(1, ExplicitEdge::Stutter)],
+            vec![(0, ExplicitEdge::Stutter), (2, ExplicitEdge::Stutter)],
+            vec![],
+        ];
+        let subset = HashSet::from([0usize, 1usize, 2usize]);
+        let components = strongly_connected_components(&adjacency, &subset);
+        assert!(components
+            .iter()
+            .any(|component| component == &HashSet::from([0, 1])));
+        assert!(components
+            .iter()
+            .any(|component| component == &HashSet::from([2])));
+    }
+
+    #[test]
+    fn explicit_edge_labels_include_params_choices_and_stutter() {
+        let label = render_explicit_edge_label(&ExplicitEdge::Step {
+            system: "Orders".to_owned(),
+            step_name: "advance".to_owned(),
+            params: vec![ExplicitParamBinding {
+                name: "flag".to_owned(),
+                value: ExplicitValue::Bool(true),
+            }],
+            choices: vec![
+                op::Choice::Choose {
+                    binder: "task".to_owned(),
+                    selected: op::EntitySlotRef::new("Task", 0),
+                },
+                op::Choice::ForAll {
+                    binder: "each".to_owned(),
+                    iterated: vec![op::EntitySlotRef::new("Task", 1)],
+                },
+                op::Choice::Create {
+                    created: op::EntitySlotRef::new("Task", 2),
+                },
+            ],
+        });
+        assert!(label.contains("Orders::advance"));
+        assert!(label.contains("params(flag=true)"));
+        assert!(label.contains("task=Task#0"));
+        assert!(label.contains("each=[Task#1]"));
+        assert!(label.contains("create=Task#2"));
+        assert_eq!(
+            render_explicit_edge_label(&ExplicitEdge::Stutter),
+            "stutter"
+        );
+    }
+
+    #[test]
+    fn explicit_model_fairness_helpers_cover_key_tuple_and_choice_paths() {
+        let step = leaked_step(
+            "go",
+            vec![IRTransParam {
+                name: "flag".to_owned(),
+                ty: IRType::Bool,
+            }],
+        );
+        let mut model = simple_model(step);
+        let state = empty_state();
+
+        assert!(model.system_is_scheduled("Sys"));
+        assert!(!model.system_is_scheduled("Other"));
+        assert!(model.step_enabled_by_key(&state, "Sys", "go").unwrap());
+        assert!(!model.step_enabled_by_key(&state, "Other", "go").unwrap());
+
+        model.per_tuple_fair = vec![("Sys".to_owned(), "go".to_owned())];
+        let tuples = model.fair_param_tuples("Sys", "go").unwrap().unwrap();
+        assert_eq!(tuples.len(), 2);
+        assert!(model.fair_param_tuples("Sys", "missing").unwrap().is_none());
+        model.per_tuple_fair.clear();
+
+        let fired_edge = ExplicitEdge::Step {
+            system: "Sys".to_owned(),
+            step_name: "go".to_owned(),
+            params: vec![ExplicitParamBinding {
+                name: "flag".to_owned(),
+                value: ExplicitValue::Bool(true),
+            }],
+            choices: vec![op::Choice::Choose {
+                binder: "picked".to_owned(),
+                selected: op::EntitySlotRef::new("Task", 0),
+            }],
+        };
+        let tuple = HashMap::from([("flag".to_owned(), ExplicitValue::Bool(true))]);
+        assert!(model.edge_fired_tuple(&fired_edge, "Sys", "go", &tuple));
+        assert!(!model.edge_fired_tuple(&ExplicitEdge::Stutter, "Sys", "go", &tuple));
+
+        let choice_tuple = model
+            .edge_choice_tuple(&fired_edge, "Sys", "go")
+            .expect("choose edge should expose a choice tuple");
+        assert!(model.edge_fired_choice_tuple(&fired_edge, "Sys", "go", &choice_tuple));
+        assert_eq!(
+            model
+                .fair_choice_tuples_in_cycle(&[vec![(0, fired_edge.clone())]], &[0], "Sys", "go")
+                .len(),
+            1
+        );
+
+        model.weak_fair = vec![("Sys".to_owned(), "go".to_owned())];
+        model.strong_fair = vec![("Sys".to_owned(), "go".to_owned())];
+        let nodes = vec![ExplicitProductState {
+            state,
+            monitors: vec![],
+        }];
+        let adjacency = vec![vec![(0, fired_edge.clone())]];
+        let fairness = model
+            .evaluate_fair_cycle(&nodes, &adjacency, &[0], &[fired_edge])
+            .unwrap()
+            .expect("fired self-loop satisfies weak and strong fairness");
+        assert_eq!(fairness.len(), 2);
+        assert!(fairness
+            .iter()
+            .all(|analysis| analysis.status == FairnessStatus::EnabledAndFired));
     }
 }

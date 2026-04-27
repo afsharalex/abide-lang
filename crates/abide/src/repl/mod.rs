@@ -17,8 +17,8 @@ use crate::elab;
 use crate::elab::env::Env;
 use crate::ir;
 use crate::loader;
-use crate::qa::model::FlowModel;
 use crate::qa::ast::StateSpaceRequest;
+use crate::qa::model::FlowModel;
 use crate::qa::{exec, extract, fmt, parse as qa_parse};
 use crate::simulate::SimulateConfig;
 use crate::verify::VerifyConfig;
@@ -238,10 +238,9 @@ impl ReplState {
         &mut self,
         request: &StateSpaceRequest,
     ) -> Result<(crate::qa::artifacts::StateSpaceArtifact, usize), String> {
-        let ir_program = self
-            .ir_program
-            .as_ref()
-            .ok_or_else(|| "no elaborated program available for state-space exploration".to_owned())?;
+        let ir_program = self.ir_program.as_ref().ok_or_else(|| {
+            "no elaborated program available for state-space exploration".to_owned()
+        })?;
         let result = crate::qa::runner::explore_state_space(ir_program, request)?;
         let name = if let Some(system) = &request.system {
             format!("state_space_{}", system.to_ascii_lowercase())
@@ -258,7 +257,9 @@ impl ReplState {
                     .join("_")
             )
         };
-        let stored = self.artifacts.record_state_space_result(name, result.clone());
+        let stored = self
+            .artifacts
+            .record_state_space_result(name, result.clone());
         Ok((result, stored))
     }
 }
@@ -508,7 +509,11 @@ pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
 
                 // Execute based on mode
                 match mode {
-                    Mode::QA => handle_qa_input(&full_input, state.model.as_ref(), Some(&state.merged_env())),
+                    Mode::QA => handle_qa_input(
+                        &full_input,
+                        state.model.as_ref(),
+                        Some(&state.merged_env()),
+                    ),
                     Mode::Abide => handle_abide_input(&full_input, &mut state),
                 }
             }

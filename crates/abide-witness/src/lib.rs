@@ -5,8 +5,7 @@
 //! - `abide-witness` describes concrete witness payloads produced by
 //!   verification and checking backends
 //!
-//! Phase 44a established the operational witness foundation. Phase 44d adds
-//! the relational witness namespace alongside the shared result envelope.
+//! Operational and relational witnesses share one stable result envelope.
 //!
 //! Construction policy:
 //! - normal in-process construction should go through checked constructors and

@@ -11061,8 +11061,7 @@ fn theorem_invariant_preservation_does_not_vacuously_prove_under_no_stutter() {
         span: None,
     };
 
-    // Trivially true `show` so the test focuses on the invariant
-    // preservation phase.
+    // Trivially true `show` so the test focuses on invariant preservation.
     let trivial_show = IRExpr::Always {
         body: Box::new(IRExpr::Lit {
             ty: IRType::Bool,
@@ -11624,7 +11623,7 @@ fn ic3_proves_property_induction_cannot() {
         "expected PROVED (method: IC3/PDR) for verify block, got: {verify_result}"
     );
 
-    // Theorem: IC3 proves (tried before 4-phase induction)
+    // Theorem: IC3 proves before staged induction is needed.
     assert_eq!(results.len(), 2, "expected 2 results (verify + theorem)");
     let thm_result = &results[1];
     assert!(
@@ -16159,7 +16158,7 @@ fn multi_apply_scene_checks_final_state() {
 fn multi_apply_ic3_proves_property() {
     // IC3 rejects same-entity multi-apply (CHC per-Apply rules model
     // multi-step, not atomic intra-event composition). Falls through to
-    // 4-phase induction which uses BMC-style intermediate variable chaining.
+    // staged induction which uses BMC-style intermediate variable chaining.
     // Property: status >= 0 (1-inductive: default 0, transitions set 1 or 2).
     let entity = IREntity {
         name: "F".to_owned(),
@@ -16379,7 +16378,7 @@ fn multi_apply_ic3_proves_property() {
 
     let results = verify_all(&ir, &VerifyConfig::default());
     assert_eq!(results.len(), 1);
-    // IC3 rejects multi-apply (Unknown), falls to 4-phase induction.
+    // IC3 rejects multi-apply (Unknown), then falls to staged induction.
     // status >= 0 is 1-inductive (default 0, transitions set 1 or 2).
     assert!(
         matches!(

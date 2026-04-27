@@ -1,6 +1,6 @@
 module Workflow
 
-// Workflow — proc/program orchestration over command execution.
+// Workflow — proc/program orchestration over public commands.
 
 enum DocumentStatus = Draft | Submitted | Approved | Published
 
@@ -25,26 +25,19 @@ entity Document {
 }
 
 system Editorial(documents: Store<Document>) {
-
-  command submit_pending()
-
-  step submit_pending() {
+  command submit_pending() {
     choose d: Document where d.status == @Draft {
       d.submit()
     }
   }
 
-  command approve_pending()
-
-  step approve_pending() {
+  command approve_pending() {
     choose d: Document where d.status == @Submitted {
       d.approve()
     }
   }
 
-  command publish_pending()
-
-  step publish_pending() {
+  command publish_pending() {
     choose d: Document where d.status == @Approved {
       d.publish()
     }

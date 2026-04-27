@@ -162,7 +162,9 @@ impl Artifact {
             ArtifactPayload::Simulation(simulation) => {
                 render_behavior_state(&simulation.behavior, index)
             }
-            ArtifactPayload::StateSpace(state_space) => render_state_space_state(state_space, index),
+            ArtifactPayload::StateSpace(state_space) => {
+                render_state_space_state(state_space, index)
+            }
         }
     }
 
@@ -287,7 +289,11 @@ impl ArtifactStore {
         1
     }
 
-    pub fn record_state_space_result(&mut self, name: String, state_space: StateSpaceArtifact) -> usize {
+    pub fn record_state_space_result(
+        &mut self,
+        name: String,
+        state_space: StateSpaceArtifact,
+    ) -> usize {
         self.next_id += 1;
         self.artifacts.push(Artifact {
             id: self.next_id,
@@ -396,7 +402,10 @@ fn render_state_space_graph(state_space: &StateSpaceArtifact) -> String {
     let mut outgoing: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
     let mut edges_by_state: BTreeMap<usize, Vec<(String, usize)>> = BTreeMap::new();
     for transition in &state_space.transitions {
-        outgoing.entry(transition.from).or_default().push(&transition.label);
+        outgoing
+            .entry(transition.from)
+            .or_default()
+            .push(&transition.label);
         edges_by_state
             .entry(transition.from)
             .or_default()

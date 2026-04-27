@@ -1843,6 +1843,507 @@ mod tests {
     use super::*;
     use crate::ir::types::*;
 
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn var(name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn bin(op: &str, left: IRExpr, right: IRExpr, ty: IRType) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty,
+            span: None,
+        }
+    }
+
+    fn order_ty() -> IRType {
+        IRType::Entity {
+            name: "Order".to_owned(),
+        }
+    }
+
+    fn int_map_ty() -> IRType {
+        IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Bool),
+        }
+    }
+
+    #[test]
+    fn rewrite_self_field_refs_covers_recursive_expression_shapes() {
+        let receiver = var("self", order_ty());
+        let field_names = HashSet::from(["status".to_owned(), "count".to_owned()]);
+        let status_ref = var("status", IRType::Bool);
+        let count_ref = var("count", IRType::Int);
+        let map_ref = var("m", int_map_ty());
+
+        let exprs = vec![
+            status_ref.clone(),
+            IRExpr::Field {
+                expr: Box::new(status_ref.clone()),
+                field: "inner".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            },
+            bin("OpAnd", status_ref.clone(), bool_lit(true), IRType::Bool),
+            IRExpr::UnOp {
+                op: "OpNot".to_owned(),
+                operand: Box::new(status_ref.clone()),
+                ty: IRType::Bool,
+                span: None,
+            },
+            IRExpr::App {
+                func: Box::new(var("pred", IRType::Bool)),
+                arg: Box::new(status_ref.clone()),
+                ty: IRType::Bool,
+                span: None,
+            },
+            IRExpr::Lam {
+                param: "status".to_owned(),
+                param_type: IRType::Bool,
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: "status".to_owned(),
+                    ty: IRType::Bool,
+                    expr: bool_lit(false),
+                }],
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Forall {
+                var: "status".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Exists {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                body: Box::new(count_ref.clone()),
+                span: None,
+            },
+            IRExpr::One {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                body: Box::new(count_ref.clone()),
+                span: None,
+            },
+            IRExpr::Lone {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                body: Box::new(count_ref.clone()),
+                span: None,
+            },
+            IRExpr::Always {
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Eventually {
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Until {
+                left: Box::new(status_ref.clone()),
+                right: Box::new(bool_lit(true)),
+                span: None,
+            },
+            IRExpr::Historically {
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Once {
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Previously {
+                body: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Since {
+                left: Box::new(status_ref.clone()),
+                right: Box::new(bool_lit(true)),
+                span: None,
+            },
+            IRExpr::Prime {
+                expr: Box::new(count_ref.clone()),
+                span: None,
+            },
+            IRExpr::Match {
+                scrutinee: Box::new(status_ref.clone()),
+                arms: vec![IRMatchArm {
+                    pattern: IRPattern::POr {
+                        left: Box::new(IRPattern::PVar {
+                            name: "status".to_owned(),
+                        }),
+                        right: Box::new(IRPattern::PVar {
+                            name: "status".to_owned(),
+                        }),
+                    },
+                    guard: Some(status_ref.clone()),
+                    body: count_ref.clone(),
+                }],
+                span: None,
+            },
+            IRExpr::MapUpdate {
+                map: Box::new(map_ref.clone()),
+                key: Box::new(count_ref.clone()),
+                value: Box::new(status_ref.clone()),
+                ty: int_map_ty(),
+                span: None,
+            },
+            IRExpr::Index {
+                map: Box::new(map_ref.clone()),
+                key: Box::new(count_ref.clone()),
+                ty: IRType::Bool,
+                span: None,
+            },
+            IRExpr::SetComp {
+                var: "x".to_owned(),
+                domain: IRType::Int,
+                filter: Box::new(status_ref.clone()),
+                projection: Some(Box::new(count_ref.clone())),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            },
+            IRExpr::SetLit {
+                elements: vec![count_ref.clone()],
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            },
+            IRExpr::SeqLit {
+                elements: vec![count_ref.clone()],
+                ty: IRType::Seq {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            },
+            IRExpr::MapLit {
+                entries: vec![(count_ref.clone(), status_ref.clone())],
+                ty: int_map_ty(),
+                span: None,
+            },
+            IRExpr::Card {
+                expr: Box::new(IRExpr::SetLit {
+                    elements: vec![count_ref.clone()],
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                }),
+                span: None,
+            },
+            IRExpr::Assert {
+                expr: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::Assume {
+                expr: Box::new(status_ref.clone()),
+                span: None,
+            },
+            IRExpr::IfElse {
+                cond: Box::new(status_ref.clone()),
+                then_body: Box::new(count_ref.clone()),
+                else_body: Some(Box::new(int_lit(0))),
+                span: None,
+            },
+        ];
+
+        let mut free = HashSet::new();
+        for expr in exprs {
+            free.extend(free_vars(&rewrite_self_field_refs(
+                expr,
+                &receiver,
+                &field_names,
+            )));
+        }
+        assert!(free.contains("self"));
+    }
+
+    #[test]
+    fn substitute_var_covers_capture_avoidance_and_recursive_shapes() {
+        let replacement = var("y", IRType::Int);
+        let target = var("x", IRType::Int);
+        let expr = IRExpr::Block {
+            exprs: vec![
+                target.clone(),
+                IRExpr::Field {
+                    expr: Box::new(target.clone()),
+                    field: "value".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                bin("OpEq", target.clone(), int_lit(1), IRType::Bool),
+                IRExpr::UnOp {
+                    op: "OpNeg".to_owned(),
+                    operand: Box::new(target.clone()),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                IRExpr::App {
+                    func: Box::new(var("f", IRType::Bool)),
+                    arg: Box::new(target.clone()),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                IRExpr::Lam {
+                    param: "y".to_owned(),
+                    param_type: IRType::Int,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Choose {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    predicate: Some(Box::new(bin(
+                        "OpEq",
+                        target.clone(),
+                        var("y", IRType::Int),
+                        IRType::Bool,
+                    ))),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                IRExpr::Let {
+                    bindings: vec![LetBinding {
+                        name: "y".to_owned(),
+                        ty: IRType::Int,
+                        expr: target.clone(),
+                    }],
+                    body: Box::new(bin(
+                        "OpEq",
+                        target.clone(),
+                        var("y", IRType::Int),
+                        IRType::Bool,
+                    )),
+                    span: None,
+                },
+                IRExpr::Forall {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Exists {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::One {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Lone {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Always {
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Eventually {
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Until {
+                    left: Box::new(target.clone()),
+                    right: Box::new(int_lit(2)),
+                    span: None,
+                },
+                IRExpr::Historically {
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Once {
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Previously {
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Since {
+                    left: Box::new(target.clone()),
+                    right: Box::new(int_lit(2)),
+                    span: None,
+                },
+                IRExpr::Prime {
+                    expr: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::Assert {
+                    expr: Box::new(bin("OpEq", target.clone(), int_lit(1), IRType::Bool)),
+                    span: None,
+                },
+                IRExpr::Assume {
+                    expr: Box::new(bin("OpEq", target.clone(), int_lit(1), IRType::Bool)),
+                    span: None,
+                },
+                IRExpr::Match {
+                    scrutinee: Box::new(target.clone()),
+                    arms: vec![IRMatchArm {
+                        pattern: IRPattern::PCtor {
+                            name: "Some".to_owned(),
+                            fields: vec![IRFieldPat {
+                                name: "value".to_owned(),
+                                pattern: IRPattern::PVar {
+                                    name: "y".to_owned(),
+                                },
+                            }],
+                        },
+                        guard: Some(bin(
+                            "OpEq",
+                            var("y", IRType::Int),
+                            target.clone(),
+                            IRType::Bool,
+                        )),
+                        body: bin("OpEq", target.clone(), var("y", IRType::Int), IRType::Bool),
+                    }],
+                    span: None,
+                },
+                IRExpr::MapUpdate {
+                    map: Box::new(var("m", int_map_ty())),
+                    key: Box::new(target.clone()),
+                    value: Box::new(bool_lit(true)),
+                    ty: int_map_ty(),
+                    span: None,
+                },
+                IRExpr::Index {
+                    map: Box::new(var("m", int_map_ty())),
+                    key: Box::new(target.clone()),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                IRExpr::SetComp {
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    filter: Box::new(bin(
+                        "OpEq",
+                        target.clone(),
+                        var("y", IRType::Int),
+                        IRType::Bool,
+                    )),
+                    projection: Some(Box::new(target.clone())),
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                },
+                IRExpr::SetLit {
+                    elements: vec![target.clone()],
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                },
+                IRExpr::SeqLit {
+                    elements: vec![target.clone()],
+                    ty: IRType::Seq {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                },
+                IRExpr::MapLit {
+                    entries: vec![(target.clone(), bool_lit(true))],
+                    ty: int_map_ty(),
+                    span: None,
+                },
+                IRExpr::Card {
+                    expr: Box::new(IRExpr::SetLit {
+                        elements: vec![target.clone()],
+                        ty: IRType::Set {
+                            element: Box::new(IRType::Int),
+                        },
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::VarDecl {
+                    name: "y".to_owned(),
+                    ty: IRType::Int,
+                    init: Box::new(target.clone()),
+                    rest: Box::new(bin(
+                        "OpEq",
+                        target.clone(),
+                        var("y", IRType::Int),
+                        IRType::Bool,
+                    )),
+                    span: None,
+                },
+                IRExpr::While {
+                    cond: Box::new(bool_lit(true)),
+                    invariants: vec![bin("OpEq", target.clone(), int_lit(1), IRType::Bool)],
+                    decreases: None,
+                    body: Box::new(target.clone()),
+                    span: None,
+                },
+                IRExpr::IfElse {
+                    cond: Box::new(bool_lit(true)),
+                    then_body: Box::new(target.clone()),
+                    else_body: Some(Box::new(int_lit(0))),
+                    span: None,
+                },
+                IRExpr::Aggregate {
+                    kind: IRAggKind::Sum,
+                    var: "y".to_owned(),
+                    domain: IRType::Int,
+                    body: Box::new(target.clone()),
+                    in_filter: Some(Box::new(bin(
+                        "OpEq",
+                        target.clone(),
+                        var("y", IRType::Int),
+                        IRType::Bool,
+                    ))),
+                    span: None,
+                },
+                IRExpr::Saw {
+                    system_name: "Audit".to_owned(),
+                    event_name: "seen".to_owned(),
+                    args: vec![Some(Box::new(target.clone())), None],
+                    span: None,
+                },
+            ],
+            span: None,
+        };
+
+        let substituted = substitute_var(expr, "x", &replacement);
+        let free = free_vars(&substituted);
+        assert!(free.contains("y"));
+        assert!(!free.contains("x"));
+    }
+
     #[test]
     fn uncurry_nullary() {
         let body = IRExpr::Lit {

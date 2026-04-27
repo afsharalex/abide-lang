@@ -1663,3 +1663,415 @@ pub(super) fn check_scene_block(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_ir() -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    fn empty_scene() -> IRScene {
+        IRScene {
+            name: "empty_scene".to_owned(),
+            systems: vec![],
+            stores: vec![],
+            givens: vec![],
+            events: vec![],
+            ordering: vec![],
+            assertions: vec![],
+            given_constraints: vec![],
+            activations: vec![],
+            span: None,
+            file: None,
+        }
+    }
+
+    fn scene_with_unsupported_given() -> IRScene {
+        IRScene {
+            name: "unsupported_given".to_owned(),
+            systems: vec![],
+            stores: vec![],
+            givens: vec![crate::ir::types::IRSceneGiven {
+                var: "task".to_owned(),
+                entity: "Task".to_owned(),
+                store_name: None,
+                constraint: IRExpr::Sorry { span: None },
+            }],
+            events: vec![],
+            ordering: vec![],
+            assertions: vec![],
+            given_constraints: vec![],
+            activations: vec![],
+            span: None,
+            file: None,
+        }
+    }
+
+    fn store_decl(name: &str, entity_type: &str, hi: i64) -> crate::ir::types::IRStoreDecl {
+        crate::ir::types::IRStoreDecl {
+            name: name.to_owned(),
+            entity_type: entity_type.to_owned(),
+            lo: hi,
+            hi,
+        }
+    }
+
+    fn given(var: &str, entity: &str, store_name: Option<&str>) -> crate::ir::types::IRSceneGiven {
+        crate::ir::types::IRSceneGiven {
+            var: var.to_owned(),
+            entity: entity.to_owned(),
+            store_name: store_name.map(str::to_owned),
+            constraint: bool_lit(true),
+        }
+    }
+
+    fn store_scene(
+        name: &str,
+        stores: Vec<crate::ir::types::IRStoreDecl>,
+        givens: Vec<crate::ir::types::IRSceneGiven>,
+        given_constraints: Vec<IRExpr>,
+        assertions: Vec<IRExpr>,
+        activations: Vec<crate::ir::types::IRActivation>,
+    ) -> IRScene {
+        IRScene {
+            name: name.to_owned(),
+            systems: vec![],
+            stores,
+            givens,
+            events: vec![],
+            ordering: vec![],
+            assertions,
+            given_constraints,
+            activations,
+            span: None,
+            file: None,
+        }
+    }
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: crate::ir::types::IRType::Bool,
+            value: crate::ir::types::LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: crate::ir::types::IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn bin(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty: crate::ir::types::IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn firing(event_idx: usize, inst_idx: usize, fires_var: Option<Bool>) -> FiringInst {
+        FiringInst {
+            event_idx,
+            inst_idx,
+            step_var: smt::int_const(&format!("s_{event_idx}_{inst_idx}")),
+            fires_var,
+        }
+    }
+
+    #[test]
+    fn scene_ordering_collectors_walk_nested_sequence_same_step_and_xor() {
+        let expr = bin(
+            "OpSeq",
+            bin("OpSameStep", var("a"), var("b")),
+            bin("OpXor", var("c"), var("d")),
+        );
+        assert_eq!(collect_ordering_leaf_vars(&expr), vec!["a", "b", "c", "d"]);
+
+        let var_to_idx =
+            HashMap::from([("a", 0usize), ("b", 1usize), ("c", 2usize), ("d", 3usize)]);
+        assert_eq!(first_ordering_var(&expr, &var_to_idx), Some(0));
+        assert_eq!(last_ordering_var(&expr, &var_to_idx), Some(3));
+
+        let mut pairs = Vec::new();
+        collect_same_step_event_pairs(&[expr.clone()], &var_to_idx, &mut pairs);
+        assert_eq!(pairs, vec![(0, 1)]);
+
+        let mut xor_events = HashSet::new();
+        collect_xor_event_indices(&expr, &var_to_idx, &mut xor_events);
+        assert_eq!(xor_events, HashSet::from([2, 3]));
+        assert_eq!(event_var_names_from_idx(2, &var_to_idx), "c");
+        assert_eq!(event_var_names_from_idx(99, &var_to_idx), "event_99");
+    }
+
+    #[test]
+    fn scene_ordering_encoder_rejects_unknown_empty_and_untracked_xor_shapes() {
+        let solver = AbideSolver::new();
+        let var_to_idx = HashMap::from([("a", 0usize), ("b", 1usize)]);
+        let instances = vec![
+            firing(0, 0, Some(smt::bool_named("a_fires"))),
+            firing(1, 0, Some(smt::bool_named("b_fires"))),
+        ];
+
+        let unknown = encode_scene_ordering_v2(
+            &bin("OpSeq", var("a"), bool_lit(true)),
+            &var_to_idx,
+            &[0..1, 1..2],
+            &instances,
+            &solver,
+            "ordering_errors",
+        );
+        assert!(matches!(unknown, Err(reason) if reason.contains("unknown event variable")));
+
+        let empty_xor = encode_scene_ordering_v2(
+            &bin("OpXor", var("a"), var("b")),
+            &var_to_idx,
+            &[0..0, 1..2],
+            &instances,
+            &solver,
+            "ordering_errors",
+        );
+        assert!(matches!(empty_xor, Err(reason) if reason.contains("ordering_errors")));
+
+        let no_fire_instances = vec![
+            firing(0, 0, None),
+            firing(1, 0, Some(smt::bool_named("b_fires_2"))),
+        ];
+        let no_fire = encode_scene_ordering_v2(
+            &bin("OpXor", var("a"), var("b")),
+            &var_to_idx,
+            &[0..1, 1..2],
+            &no_fire_instances,
+            &solver,
+            "ordering_errors",
+        );
+        assert!(matches!(no_fire, Err(reason) if reason.contains("ordering_errors")));
+    }
+
+    #[test]
+    fn scene_ordering_encoder_accepts_basic_sequence_same_step_concurrency_and_xor() {
+        let solver = AbideSolver::new();
+        let var_to_idx = HashMap::from([("a", 0usize), ("b", 1usize), ("c", 2usize)]);
+        let instances = vec![
+            firing(0, 0, Some(smt::bool_named("a_fires_ok"))),
+            firing(1, 0, Some(smt::bool_named("b_fires_ok"))),
+            firing(2, 0, Some(smt::bool_named("c_fires_ok"))),
+        ];
+        let expr = bin(
+            "OpConc",
+            bin("OpSeq", var("a"), var("b")),
+            bin("OpXor", var("b"), var("c")),
+        );
+        encode_scene_ordering_v2(
+            &expr,
+            &var_to_idx,
+            &[0..1, 1..2, 2..3],
+            &instances,
+            &solver,
+            "ordering_ok",
+        )
+        .expect("supported ordering should encode");
+    }
+
+    #[test]
+    fn check_scene_block_reports_empty_scope_without_solver_work() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let result = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &empty_scene(),
+            &VerifyConfig::default(),
+            None,
+        );
+        assert!(matches!(
+            result,
+            VerificationResult::SceneFail { name, reason, .. }
+                if name == "empty_scene" && reason == crate::messages::SCENE_EMPTY_SCOPE
+        ));
+    }
+
+    #[test]
+    fn check_scene_block_reports_unsupported_given_before_slot_allocation() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let result = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &scene_with_unsupported_given(),
+            &VerifyConfig::default(),
+            None,
+        );
+        assert!(matches!(
+            result,
+            VerificationResult::SceneFail { name, reason, .. }
+                if name == "unsupported_given"
+                    && reason.contains("unsupported expression kind in scene given")
+        ));
+    }
+
+    #[test]
+    fn check_scene_block_reports_store_binding_validation_errors() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let mismatch = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "mismatch",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![given("order", "Order", Some("tasks"))],
+                vec![],
+                vec![],
+                vec![],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            mismatch,
+            VerificationResult::SceneFail { reason, .. } if reason.contains("entity type mismatch")
+        ));
+
+        let unknown_store = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "unknown_store",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![given("task", "Task", Some("missing"))],
+                vec![],
+                vec![],
+                vec![],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            unknown_store,
+            VerificationResult::SceneFail { reason, .. } if reason.contains("unknown store 'missing'")
+        ));
+
+        let full_store = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "full_store",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![
+                    given("first", "Task", Some("tasks")),
+                    given("second", "Task", Some("tasks")),
+                ],
+                vec![],
+                vec![],
+                vec![],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            full_store,
+            VerificationResult::SceneFail { reason, .. } if reason.contains("store 'tasks' is full")
+        ));
+    }
+
+    #[test]
+    fn check_scene_block_reports_activation_and_expression_validation_errors() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        let unknown_activation_store = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "unknown_activation_store",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![],
+                vec![],
+                vec![],
+                vec![crate::ir::types::IRActivation {
+                    instances: vec!["task".to_owned()],
+                    store_name: "missing".to_owned(),
+                }],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            unknown_activation_store,
+            VerificationResult::SceneFail { reason, .. } if reason.contains("unknown store 'missing'")
+        ));
+
+        let unsupported_given_constraint = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "unsupported_given_constraint",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![],
+                vec![IRExpr::Todo { span: None }],
+                vec![],
+                vec![],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            unsupported_given_constraint,
+            VerificationResult::SceneFail { reason, .. }
+                if reason.contains("unsupported expression kind in scene given constraint")
+        ));
+
+        let unsupported_assertion = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "unsupported_assertion",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![],
+                vec![],
+                vec![IRExpr::Sorry { span: None }],
+                vec![],
+            ),
+            &config,
+            None,
+        );
+        assert!(matches!(
+            unsupported_assertion,
+            VerificationResult::SceneFail { reason, .. }
+                if reason.contains("unsupported expression kind in scene then assertion")
+        ));
+    }
+}

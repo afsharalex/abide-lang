@@ -840,3 +840,379 @@ pub(super) fn collect_saw_systems_expr(expr: &IRExpr, targets: &mut Vec<String>)
         IRExpr::Var { .. } | IRExpr::Lit { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{
+        IRActionMatchArm, IRAssumptionSet, IRField, IRInvariant, IRLetBinding, IRMatchArm,
+        IRPattern, IRStoreDecl, IRTransParam, LetBinding, LitVal,
+    };
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn bool_var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn entity(name: &str) -> IREntity {
+        IREntity {
+            name: name.to_owned(),
+            fields: vec![IRField {
+                name: "ok".to_owned(),
+                ty: IRType::Bool,
+                default: Some(bool_lit(true)),
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        }
+    }
+
+    fn step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRStep {
+        crate::ir::types::IRStep {
+            name: name.to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body,
+            return_expr: None,
+        }
+    }
+
+    fn system(name: &str, entities: Vec<&str>, steps: Vec<crate::ir::types::IRStep>) -> IRSystem {
+        IRSystem {
+            name: name.to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: entities.into_iter().map(str::to_owned).collect(),
+            commands: vec![],
+            steps,
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        }
+    }
+
+    fn program(entities: Vec<IREntity>, systems: Vec<IRSystem>) -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities,
+            systems,
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    #[test]
+    fn compute_verify_scope_tracks_store_ranges_depth_and_reachable_systems() {
+        let callee = system("Audit", vec!["Log"], vec![]);
+        let mut caller = system(
+            "Orders",
+            vec!["Order"],
+            vec![step(
+                "submit",
+                vec![IRAction::CrossCall {
+                    system: "Audit".to_owned(),
+                    command: "record".to_owned(),
+                    args: vec![],
+                }],
+            )],
+        );
+        caller.let_bindings.push(IRLetBinding {
+            name: "audit".to_owned(),
+            system_type: "Audit".to_owned(),
+            store_bindings: vec![],
+        });
+        let ir = program(vec![entity("Order"), entity("Log")], vec![caller, callee]);
+        let verify = IRVerify {
+            name: "safety".to_owned(),
+            depth: Some(5),
+            systems: vec![crate::ir::types::IRVerifySystem {
+                name: "Orders".to_owned(),
+                lo: 0,
+                hi: 2,
+            }],
+            stores: vec![
+                IRStoreDecl {
+                    name: "pending".to_owned(),
+                    entity_type: "Order".to_owned(),
+                    lo: 0,
+                    hi: 2,
+                },
+                IRStoreDecl {
+                    name: "archived".to_owned(),
+                    entity_type: "Order".to_owned(),
+                    lo: 0,
+                    hi: 3,
+                },
+            ],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            asserts: vec![IRExpr::Saw {
+                system_name: "Audit".to_owned(),
+                event_name: "record".to_owned(),
+                args: vec![],
+                span: None,
+            }],
+            span: None,
+            file: None,
+        };
+
+        let (scope, systems, bound, ranges) = compute_verify_scope(&ir, &verify);
+
+        assert_eq!(scope.get("Order"), Some(&5));
+        assert_eq!(scope.get("Log"), Some(&5));
+        assert_eq!(bound, 5);
+        assert!(systems.contains(&"Orders".to_owned()));
+        assert!(systems.contains(&"Audit".to_owned()));
+        assert_eq!(ranges["pending"].start_slot, 0);
+        assert_eq!(ranges["archived"].start_slot, 2);
+    }
+
+    #[test]
+    fn collect_in_scope_invariants_wraps_entity_and_target_system_invariants() {
+        let mut ent = entity("Order");
+        ent.invariants.push(IRInvariant {
+            name: "ok".to_owned(),
+            body: bool_var("ok"),
+        });
+        let mut target = system("Orders", vec!["Order"], vec![]);
+        target.invariants.push(IRInvariant {
+            name: "sys_ok".to_owned(),
+            body: bool_lit(true),
+        });
+        let defs = defenv::DefEnv::from_ir(&program(vec![ent.clone()], vec![target.clone()]));
+
+        let invariants = collect_in_scope_invariants(&defs, &[ent], &[target]);
+
+        assert_eq!(invariants.len(), 2);
+        assert!(matches!(invariants[0], IRExpr::Always { .. }));
+        assert!(matches!(invariants[1], IRExpr::Always { .. }));
+    }
+
+    #[test]
+    fn validate_symmetry_rejects_nested_actions_crosscalls_and_property_quantifiers() {
+        let nested = system(
+            "Orders",
+            vec!["Order"],
+            vec![step(
+                "touch",
+                vec![IRAction::Choose {
+                    var: "a".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(bool_lit(true)),
+                    ops: vec![IRAction::ForAll {
+                        var: "b".to_owned(),
+                        entity: "Order".to_owned(),
+                        ops: vec![],
+                    }],
+                }],
+            )],
+        );
+        let pattern = LivenessPattern::QuantifiedRecurrence {
+            var: "o".to_owned(),
+            entity: "Order".to_owned(),
+            response: bool_var("ok"),
+        };
+        assert!(!validate_symmetry(
+            "Order",
+            std::slice::from_ref(&nested),
+            std::slice::from_ref(&nested),
+            &pattern
+        ));
+
+        let caller = system(
+            "Caller",
+            vec!["Order"],
+            vec![step(
+                "call",
+                vec![IRAction::Match {
+                    scrutinee: crate::ir::types::IRActionMatchScrutinee::CrossCall {
+                        system: "Callee".to_owned(),
+                        command: "touch".to_owned(),
+                        args: vec![],
+                    },
+                    arms: vec![IRActionMatchArm {
+                        pattern: IRPattern::PWild,
+                        guard: None,
+                        body: vec![],
+                    }],
+                }],
+            )],
+        );
+        let callee = system(
+            "Callee",
+            vec!["Order"],
+            vec![step(
+                "touch",
+                vec![IRAction::Choose {
+                    var: "o".to_owned(),
+                    entity: "Order".to_owned(),
+                    filter: Box::new(bool_lit(true)),
+                    ops: vec![],
+                }],
+            )],
+        );
+        assert!(validate_symmetry(
+            "Order",
+            std::slice::from_ref(&caller),
+            &[caller.clone(), callee],
+            &pattern
+        ));
+
+        let quantified_pattern = LivenessPattern::QuantifiedResponse {
+            var: "o".to_owned(),
+            entity: "Order".to_owned(),
+            trigger: IRExpr::Exists {
+                var: "other".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(bool_lit(true)),
+                span: None,
+            },
+            response: bool_lit(true),
+        };
+        assert!(!validate_symmetry(
+            "Order",
+            std::slice::from_ref(&caller),
+            std::slice::from_ref(&caller),
+            &quantified_pattern
+        ));
+    }
+
+    #[test]
+    fn validate_crosscall_arities_reports_missing_targets_and_nested_mismatch() {
+        let target = crate::ir::types::IRStep {
+            name: "record".to_owned(),
+            params: vec![IRTransParam {
+                name: "id".to_owned(),
+                ty: IRType::Int,
+            }],
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: None,
+        };
+        let audit = system("Audit", vec![], vec![target]);
+        let err = validate_crosscall_arities(
+            &[IRAction::CrossCall {
+                system: "Audit".to_owned(),
+                command: "record".to_owned(),
+                args: vec![],
+            }],
+            std::slice::from_ref(&audit),
+            0,
+        )
+        .expect_err("arity mismatch");
+        assert!(err.contains("expects 1 params"));
+
+        let missing = validate_crosscall_arities(
+            &[IRAction::LetCrossCall {
+                name: "x".to_owned(),
+                system: "Missing".to_owned(),
+                command: "record".to_owned(),
+                args: vec![],
+            }],
+            &[audit],
+            0,
+        )
+        .expect_err("missing target system");
+        assert!(missing.contains("target system not found"));
+    }
+
+    #[test]
+    fn collect_saw_systems_expr_walks_recursive_expression_shapes() {
+        let saw = IRExpr::Saw {
+            system_name: "Audit".to_owned(),
+            event_name: "record".to_owned(),
+            args: vec![Some(Box::new(IRExpr::Saw {
+                system_name: "Nested".to_owned(),
+                event_name: "seen".to_owned(),
+                args: vec![],
+                span: None,
+            }))],
+            span: None,
+        };
+        let expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: "x".to_owned(),
+                    ty: IRType::Bool,
+                    expr: saw,
+                }],
+                body: Box::new(bool_var("x")),
+                span: None,
+            }),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PWild,
+                guard: Some(IRExpr::MapUpdate {
+                    map: Box::new(IRExpr::MapLit {
+                        entries: vec![],
+                        ty: IRType::Map {
+                            key: Box::new(IRType::Int),
+                            value: Box::new(IRType::Bool),
+                        },
+                        span: None,
+                    }),
+                    key: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 0 },
+                        span: None,
+                    }),
+                    value: Box::new(IRExpr::Saw {
+                        system_name: "Guard".to_owned(),
+                        event_name: "hit".to_owned(),
+                        args: vec![],
+                        span: None,
+                    }),
+                    ty: IRType::Map {
+                        key: Box::new(IRType::Int),
+                        value: Box::new(IRType::Bool),
+                    },
+                    span: None,
+                }),
+                body: IRExpr::SetComp {
+                    var: "v".to_owned(),
+                    domain: IRType::Bool,
+                    filter: Box::new(IRExpr::Saw {
+                        system_name: "Body".to_owned(),
+                        event_name: "hit".to_owned(),
+                        args: vec![],
+                        span: None,
+                    }),
+                    projection: None,
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Bool),
+                    },
+                    span: None,
+                },
+            }],
+            span: None,
+        };
+        let mut targets = Vec::new();
+
+        collect_saw_systems_expr(&expr, &mut targets);
+
+        assert_eq!(targets, vec!["Audit", "Nested", "Guard", "Body"]);
+    }
+}

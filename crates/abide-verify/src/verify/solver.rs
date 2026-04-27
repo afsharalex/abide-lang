@@ -3405,11 +3405,203 @@ pub type Params = <ActiveBackend as SolverBackend>::Params;
 mod tests {
     use super::*;
 
+    fn exercise_backend_surface<B: SolverBackend>() {
+        let ctx = B::context_new();
+        let solver = AbideSolver::<B>::new();
+        solver.set_timeout(1_000);
+
+        let t = B::bool_const(&ctx, true);
+        let f = B::bool_const(&ctx, false);
+        let b = B::bool_var(&ctx, "backend_surface_b");
+        let not_b = B::bool_not(&ctx, &b);
+        let bool_ite = B::bool_ite(&ctx, &b, &t, &f);
+        let bool_formula = B::bool_and(
+            &ctx,
+            &[
+                &B::bool_or(&ctx, &[&b, &not_b]),
+                &B::bool_implies(&ctx, &bool_ite, &b),
+                &B::bool_xor(&ctx, &t, &f),
+                &B::bool_eq(&ctx, &t, &t),
+            ],
+        );
+
+        let one = B::int_lit(&ctx, 1);
+        let two = B::int_lit(&ctx, 2);
+        let three = B::int_lit(&ctx, 3);
+        let x = B::int_var(&ctx, "backend_surface_x");
+        let int_expr = B::int_sub(
+            &ctx,
+            &[
+                &B::int_add(&ctx, &[&one, &two, &three]),
+                &B::int_lit(&ctx, 1),
+            ],
+        );
+        let int_expr = B::int_mul(&ctx, &[&int_expr, &B::int_lit(&ctx, 1)]);
+        let int_expr = B::int_div(&ctx, &int_expr, &B::int_lit(&ctx, 1));
+        let int_expr = B::int_sub(
+            &ctx,
+            &[&int_expr, &B::int_modulo(&ctx, &B::int_lit(&ctx, 5), &two)],
+        );
+        let int_expr = B::int_add(&ctx, &[&int_expr, &B::int_neg(&ctx, &B::int_lit(&ctx, -1))]);
+        let int_ite = B::int_ite(&ctx, &t, &int_expr, &one);
+        let int_formula = B::bool_and(
+            &ctx,
+            &[
+                &B::int_eq(&ctx, &x, &B::int_lit(&ctx, 6)),
+                &B::int_lt(&ctx, &one, &two),
+                &B::int_le(&ctx, &two, &two),
+                &B::int_gt(&ctx, &three, &two),
+                &B::int_ge(&ctx, &three, &three),
+                &B::int_eq(&ctx, &int_ite, &B::int_lit(&ctx, 6)),
+            ],
+        );
+
+        let r1 = B::real_val(&ctx, 1, 2);
+        let r2 = B::real_val(&ctx, 3, 2);
+        let r3 = B::real_var(&ctx, "backend_surface_r");
+        let real_expr = B::real_div(
+            &ctx,
+            &B::real_mul(
+                &ctx,
+                &[&B::real_add(&ctx, &[&r1, &r2]), &B::real_val(&ctx, 2, 1)],
+            ),
+            &B::real_val(&ctx, 2, 1),
+        );
+        let real_expr = B::real_sub(&ctx, &[&real_expr, &B::real_val(&ctx, 1, 1)]);
+        let real_ite = B::real_ite(&ctx, &t, &real_expr, &r1);
+        let real_formula = B::bool_and(
+            &ctx,
+            &[
+                &B::real_eq(&ctx, &r3, &B::real_val(&ctx, 1, 1)),
+                &B::real_lt(&ctx, &r1, &r2),
+                &B::real_le(&ctx, &r1, &r1),
+                &B::real_gt(&ctx, &r2, &r1),
+                &B::real_ge(&ctx, &r2, &r2),
+                &B::real_eq(&ctx, &real_ite, &B::real_val(&ctx, 1, 1)),
+            ],
+        );
+
+        let int_sort = B::int_sort(&ctx);
+        let bool_sort = B::bool_sort(&ctx);
+        let real_sort = B::real_sort(&ctx);
+        let array_sort = B::array_sort(&ctx, &int_sort, &bool_sort);
+        assert_eq!(B::sort_array_domain(&ctx, &array_sort).is_some(), true);
+        assert_eq!(B::sort_array_range(&ctx, &array_sort).is_some(), true);
+        assert!(!B::sort_to_string(&ctx, &real_sort).is_empty());
+
+        let dx = B::dynamic_from_int(&ctx, &x);
+        let db = B::dynamic_from_bool(&ctx, &b);
+        let dr = B::dynamic_from_real(&ctx, &r3);
+        let fresh = B::dynamic_fresh(&ctx, "backend_surface_fresh", &int_sort);
+        let named = B::dynamic_const(&ctx, "backend_surface_named", &int_sort);
+        assert!(B::dynamic_as_int(&ctx, &dx).is_some());
+        assert!(B::dynamic_as_bool(&ctx, &db).is_some());
+        assert!(B::dynamic_as_real(&ctx, &dr).is_some());
+        let _ = B::dynamic_get_sort(&ctx, &fresh);
+        let dyn_ite = B::dynamic_ite(&ctx, &t, &dx, &named);
+        let dyn_formula = B::dynamic_eq(&ctx, &dyn_ite, &dx);
+
+        let array = B::array_new_const(&ctx, "backend_surface_array", &int_sort, &bool_sort);
+        let default_array = B::array_const_array(&ctx, &int_sort, &B::dynamic_from_bool(&ctx, &f));
+        let stored = B::array_store(
+            &ctx,
+            &default_array,
+            &B::dynamic_from_int(&ctx, &one),
+            &B::dynamic_from_bool(&ctx, &t),
+        );
+        let selected = B::array_select(&ctx, &stored, &B::dynamic_from_int(&ctx, &one));
+        let arr_dyn = B::dynamic_from_array(&ctx, &array);
+        assert!(B::dynamic_as_array(&ctx, &arr_dyn).is_some());
+        let _ = B::array_get_sort(&ctx, &stored);
+        let array_formula = B::bool_and(
+            &ctx,
+            &[
+                &B::dynamic_eq(&ctx, &selected, &B::dynamic_from_bool(&ctx, &t)),
+                &B::array_eq(
+                    &ctx,
+                    &B::array_ite(&ctx, &t, &stored, &default_array),
+                    stored.clone(),
+                ),
+            ],
+        );
+
+        let quantifier_formula = if B::family() == SolverFamily::Z3 {
+            let q_var = B::dynamic_const(&ctx, "backend_surface_q", &int_sort);
+            let q_int = B::dynamic_as_int(&ctx, &q_var).expect("int dynamic");
+            let q_body = B::int_eq(&ctx, &q_int, &q_int);
+            let forall = B::forall(&ctx, &[&q_var], &q_body);
+            let exists = B::exists(&ctx, &[&q_var], &q_body);
+            let lambda = B::lambda(&ctx, &[&q_var], &B::dynamic_from_int(&ctx, &q_int));
+            let _ = B::array_get_sort(&ctx, &lambda);
+            B::bool_and(&ctx, &[&forall, &exists])
+        } else {
+            B::bool_const(&ctx, true)
+        };
+
+        let func = B::func_decl_new(&ctx, "backend_surface_func", &[&int_sort], &bool_sort);
+        let applied = B::func_decl_apply(&ctx, &func, &[&B::dynamic_from_int(&ctx, &one)]);
+        assert_eq!(B::func_decl_name(&ctx, &func), "backend_surface_func");
+        let _ = B::dynamic_as_bool(&ctx, &applied);
+
+        let dt = B::datatype_builder_finish(
+            &ctx,
+            B::datatype_builder_variant(
+                &ctx,
+                B::datatype_builder_new(&ctx, "BackendSurfaceOption"),
+                "None",
+                vec![],
+            ),
+        );
+        let _ = format!("{dt:?}");
+
+        let mut params = B::params_new();
+        B::params_set_bool(&mut params, "model", true);
+        B::params_set_u32(&mut params, "timeout", 10);
+        B::params_set_symbol(&mut params, "engine", "default");
+        let _ = format!("{params:?}");
+
+        let _ = (
+            bool_formula,
+            int_formula,
+            real_formula,
+            dyn_formula,
+            array_formula,
+            quantifier_formula,
+        );
+
+        solver.assert(B::bool_and(
+            &ctx,
+            &[
+                &B::bool_eq(&ctx, &b, &t),
+                &B::int_eq(&ctx, &x, &B::int_lit(&ctx, 6)),
+            ],
+        ));
+        assert_eq!(solver.check(), SatResult::Sat);
+        let model = solver.get_model().expect("sat model");
+        assert_eq!(B::model_eval_bool(&model, &b), Some(true));
+        assert_eq!(B::model_eval_int(&model, &x), Some(6));
+        assert!(B::model_eval_dynamic(&model, &dx).is_some());
+    }
+
     #[test]
     fn sat_result_eq() {
         assert_eq!(SatResult::Sat, SatResult::Sat);
         assert_eq!(SatResult::Unsat, SatResult::Unsat);
         assert_ne!(SatResult::Sat, SatResult::Unsat);
+    }
+
+    #[test]
+    fn backend_surface_exercises_z3_and_cvc5_paths() {
+        assert_eq!(Z3Backend::family(), SolverFamily::Z3);
+        assert_eq!(Cvc5Backend::family(), SolverFamily::Cvc5);
+        assert!(Cvc5Backend::capabilities().native_sequences);
+        assert!(format!("{:?}", Z3Backend::solver_new(&())).contains("Z3Backend"));
+        let cvc5_ctx = Cvc5Backend::context_new();
+        assert!(format!("{cvc5_ctx:?}").contains("Cvc5Context"));
+        assert!(format!("{:?}", Cvc5Backend::solver_new(&cvc5_ctx)).contains("Cvc5Backend"));
+
+        exercise_backend_surface::<Z3Backend>();
+        exercise_backend_surface::<Cvc5Backend>();
     }
 
     #[test]

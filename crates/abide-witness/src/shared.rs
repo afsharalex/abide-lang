@@ -51,7 +51,7 @@ impl WitnessPayload {
 /// Shared result-envelope witness wrapper.
 ///
 /// The envelope allows higher layers to depend on one stable field even as
-/// additional witness families arrive in later phases.
+/// additional witness families arrive in later revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessEnvelope {
     payload: WitnessPayload,

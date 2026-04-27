@@ -220,7 +220,7 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                     if candidates.len() == 1 {
                         candidates[0].clone()
                     } else {
-                        // Zero or multiple matches — leave unresolved, check phase handles it
+                        // Zero or multiple matches — leave unresolved so later validation handles it
                         ty.clone()
                     }
                 }

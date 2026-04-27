@@ -957,7 +957,7 @@ pub(super) fn contains_past_time(expr: &IRExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::IRType;
+    use crate::ir::types::{IRAssumptionSet, IRProgram, IRType, IRVerify};
 
     fn bool_var(name: &str) -> IRExpr {
         IRExpr::Var {
@@ -1043,5 +1043,135 @@ mod tests {
             }
             _ => panic!("expected response pattern"),
         }
+    }
+
+    #[test]
+    fn compiled_temporal_formula_extracts_all_liveness_pattern_shapes() {
+        let recurrence = CompiledTemporalFormula::from_expanded(IRExpr::Always {
+            body: Box::new(IRExpr::Eventually {
+                body: Box::new(bool_var("p")),
+                span: None,
+            }),
+            span: None,
+        });
+        assert!(matches!(
+            recurrence.extraction().map(|e| &e.pattern),
+            Some(LivenessPattern::Recurrence { .. })
+        ));
+
+        let eventuality = CompiledTemporalFormula::from_expanded(IRExpr::Eventually {
+            body: Box::new(bool_var("p")),
+            span: None,
+        });
+        assert!(matches!(
+            eventuality.extraction().map(|e| &e.pattern),
+            Some(LivenessPattern::Eventuality { .. })
+        ));
+        assert!(eventuality
+            .extraction()
+            .expect("eventuality")
+            .pattern
+            .is_oneshot());
+
+        let persistence = CompiledTemporalFormula::from_expanded(IRExpr::Eventually {
+            body: Box::new(IRExpr::Always {
+                body: Box::new(bool_var("stable")),
+                span: None,
+            }),
+            span: None,
+        });
+        assert!(matches!(
+            persistence.extraction().map(|e| &e.pattern),
+            Some(LivenessPattern::Persistence { .. })
+        ));
+
+        let quantified = CompiledTemporalFormula::from_expanded(IRExpr::Always {
+            body: Box::new(IRExpr::Forall {
+                var: "o".to_owned(),
+                domain: IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+                body: Box::new(IRExpr::Eventually {
+                    body: Box::new(bool_var("done")),
+                    span: None,
+                }),
+                span: None,
+            }),
+            span: None,
+        });
+        let pattern = &quantified.extraction().expect("quantified").pattern;
+        assert!(matches!(
+            pattern,
+            LivenessPattern::QuantifiedRecurrence { .. }
+        ));
+        assert_eq!(pattern.quantified_binding(), (Some("o"), Some("Order")));
+    }
+
+    #[test]
+    fn compiled_temporal_formula_preserves_safety_conjunct_and_spot_export() {
+        let expr = IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(bool_var("safe")),
+                right: Box::new(IRExpr::Eventually {
+                    body: Box::new(bool_var("done")),
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+
+        let compiled = CompiledTemporalFormula::from_expanded(expr);
+        let extraction = compiled.extraction().expect("extraction");
+
+        assert_eq!(extraction.safety_conjuncts.len(), 1);
+        assert!(matches!(
+            extraction.safety_conjuncts[0],
+            IRExpr::Always { .. }
+        ));
+        let spot = compiled.spot().expect("spot formula");
+        assert_eq!(spot.atoms(), 2);
+        assert_eq!(spot.to_spot_input(), "G((p0 & F(p1)))");
+        assert_eq!(spot.export().spot_formula, "G((p0 & F(p1)))");
+    }
+
+    #[test]
+    fn temporal_export_marks_past_time_without_spot_formula() {
+        let verify = IRVerify {
+            name: "history".to_owned(),
+            depth: None,
+            systems: vec![],
+            stores: vec![],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            asserts: vec![IRExpr::Since {
+                left: Box::new(bool_var("p")),
+                right: Box::new(bool_var("q")),
+                span: None,
+            }],
+            span: None,
+            file: None,
+        };
+        let defs = defenv::DefEnv::from_ir(&IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        });
+
+        let exports = export_verify_temporal_formulas(&verify, &defs);
+
+        assert_eq!(exports.len(), 1);
+        assert!(exports[0].contains_temporal);
+        assert!(exports[0].contains_liveness);
+        assert!(exports[0].contains_past_time);
+        assert!(exports[0].spot.is_none());
     }
 }

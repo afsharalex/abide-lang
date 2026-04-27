@@ -2943,6 +2943,68 @@ mod tests {
             ite_value(&cond, &smt::real_val(1, 1), &smt::real_val(2, 1)),
             SmtValue::Real(_)
         ));
+
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let bool_var = IRExpr::Var {
+            name: "b".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let bool_count = encode_aggregate_bool(
+            &pool,
+            &vctx,
+            &defs,
+            &ctx,
+            crate::ir::types::IRAggKind::Count,
+            "b",
+            &bool_var,
+            None,
+            0,
+        )
+        .expect("bool count");
+        let solver = AbideSolver::new();
+        solver.assert(&smt::bool_not(&smt::int_eq(
+            bool_count.as_int().expect("count int"),
+            &smt::int_lit(1),
+        )));
+        assert_eq!(solver.check(), SatResult::Unsat);
+
+        let bool_max_body = IRExpr::IfElse {
+            cond: Box::new(bool_var),
+            then_body: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 2 },
+                span: None,
+            }),
+            else_body: Some(Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            })),
+            span: None,
+        };
+        let bool_max = encode_aggregate_bool(
+            &pool,
+            &vctx,
+            &defs,
+            &ctx,
+            crate::ir::types::IRAggKind::Max,
+            "b",
+            &bool_max_body,
+            None,
+            0,
+        )
+        .expect("bool max");
+        let solver = AbideSolver::new();
+        solver.assert(&smt::bool_not(&smt::int_eq(
+            bool_max.as_int().expect("max int"),
+            &smt::int_lit(2),
+        )));
+        assert_eq!(solver.check(), SatResult::Unsat);
     }
 
     #[test]
@@ -3650,5 +3712,46 @@ mod tests {
         let solver = AbideSolver::new();
         solver.assert(&smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn path_guard_stack_and_expr_type_cover_local_helper_branches() {
+        clear_path_guard_stack();
+        push_path_guard(smt::bool_const(true));
+        push_path_guard(smt::bool_const(false));
+        let guard = current_path_guard();
+        let solver = AbideSolver::new();
+        solver.assert(&guard);
+        assert_eq!(solver.check(), SatResult::Unsat);
+        pop_path_guard();
+        pop_path_guard();
+
+        let prime = IRExpr::Prime {
+            expr: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: crate::ir::types::LitVal::Int { value: 1 },
+                span: None,
+            }),
+            span: None,
+        };
+        assert_eq!(expr_type(&prime), Some(&IRType::Int));
+
+        let let_expr = IRExpr::Let {
+            bindings: vec![],
+            body: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: crate::ir::types::LitVal::Bool { value: true },
+                span: None,
+            }),
+            span: None,
+        };
+        assert_eq!(expr_type(&let_expr), Some(&IRType::Bool));
+        assert!(expr_type(&IRExpr::Ctor {
+            enum_name: "Status".to_owned(),
+            ctor: "Open".to_owned(),
+            args: vec![],
+            span: None,
+        })
+        .is_none());
     }
 }

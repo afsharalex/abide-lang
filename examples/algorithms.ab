@@ -1,11 +1,11 @@
 module Algorithms
 
-// Algorithm verification examples: fn contracts (DDR-020)
+// Algorithm verification examples: function contracts
 // Demonstrates: requires, ensures, decreases, result keyword,
 // lexicographic tuples, decreases * escape hatch
 //
 // Pure fns without contracts use = expr.
-// Fns with contracts use { expr } bodies, matching the current action/step style.
+// Fns with contracts use { expr } bodies, matching the current command/action style.
 
 // --- Simple recursion with decreases ---
 

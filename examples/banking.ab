@@ -32,10 +32,7 @@ pred can_withdraw(a: Account, amount: real) =
   a.status == @Active and a.balance >= amount and amount > 0
 
 system Banking(accounts: Store<Account>) {
-
   command open_account(initial_balance: real)
-
-  step open_account(initial_balance: real)
     requires initial_balance >= 0 {
     create Account {
       balance = initial_balance
@@ -43,8 +40,6 @@ system Banking(accounts: Store<Account>) {
   }
 
   command deposit(account_id: identity, amount: real)
-
-  step deposit(account_id: identity, amount: real)
     requires amount > 0 {
     choose a: Account where a.id == account_id {
       a.deposit(amount)
@@ -52,17 +47,13 @@ system Banking(accounts: Store<Account>) {
   }
 
   command withdraw(account_id: identity, amount: real)
-
-  step withdraw(account_id: identity, amount: real)
     requires exists a: Account in accounts | can_withdraw(a, amount) and a.id == account_id {
     choose a: Account where a.id == account_id {
       a.withdraw(amount)
     }
   }
 
-  command freeze_account(account_id: identity)
-
-  step freeze_account(account_id: identity) {
+  command freeze_account(account_id: identity) {
     choose a: Account where a.id == account_id {
       a.freeze()
     }

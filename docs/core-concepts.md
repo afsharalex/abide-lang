@@ -29,8 +29,6 @@ Systems operate over explicit entity pools:
 ```abide
 system Banking(accounts: Store<Account>) {
   command deposit(account: Account, amount: real)
-
-  step deposit(account: Account, amount: real)
     requires amount > 0 {
     account.deposit(amount)
   }
@@ -39,8 +37,7 @@ system Banking(accounts: Store<Account>) {
 
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
-- `command` declares public operations.
-- `step` provides executable implementation clauses for those operations.
+- `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
 - `pred` stays internal to the system.
 
@@ -144,5 +141,5 @@ program Publishing(documents: Store<Document>) {
 ## Terminology
 
 - `command` is the public system operation surface.
-- `step` is an executable implementation clause.
+- `step` is a private executable clause when you want an implementation that is not part of the public command surface.
 - `program` and `proc` describe orchestration structure.

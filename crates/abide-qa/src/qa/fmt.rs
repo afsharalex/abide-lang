@@ -280,7 +280,6 @@ mod tests {
         assert!(json.contains("\"value\":true"));
     }
 
-
     #[test]
     fn fmt_json_error() {
         let json = format_result_json(Verb::Ask, &QueryResult::Error("not found".into()));

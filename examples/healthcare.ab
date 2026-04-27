@@ -45,25 +45,18 @@ entity Prescription {
 pred is_admitted(p: Patient) = p.status == @Admitted
 
 system Registration(patients: Store<Patient>) {
-
-  command register_patient()
-
-  step register_patient() {
+  command register_patient() {
     create Patient {}
   }
 
   command admit_patient(patient_id: identity, room: int)
-
-  step admit_patient(patient_id: identity, room: int)
     requires room > 0 {
     choose p: Patient where p.id == patient_id {
       p.admit(room)
     }
   }
 
-  command discharge_patient(patient_id: identity)
-
-  step discharge_patient(patient_id: identity) {
+  command discharge_patient(patient_id: identity) {
     choose p: Patient where p.id == patient_id {
       p.discharge()
     }
@@ -71,27 +64,20 @@ system Registration(patients: Store<Patient>) {
 }
 
 system Pharmacy(patients: Store<Patient>, prescriptions: Store<Prescription>) {
-
   command issue_prescription(patient_id: identity)
-
-  step issue_prescription(patient_id: identity)
     requires exists p: Patient in patients | is_admitted(p) and p.id == patient_id {
     create Prescription {
       patient_id = patient_id
     }
   }
 
-  command prescribe(rx_id: identity)
-
-  step prescribe(rx_id: identity) {
+  command prescribe(rx_id: identity) {
     choose rx: Prescription where rx.id == rx_id {
       rx.prescribe()
     }
   }
 
-  command dispense(rx_id: identity)
-
-  step dispense(rx_id: identity) {
+  command dispense(rx_id: identity) {
     choose rx: Prescription where rx.id == rx_id {
       rx.dispense()
     }
