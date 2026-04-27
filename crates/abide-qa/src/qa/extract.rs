@@ -1,35 +1,45 @@
 //! Extract a `FlowModel` from IR.
 //!
-//! Walks the `IRProgram` to build state graphs for each enum-typed entity field,
+//! Walks the `IRProgram` to build state graphs for each finite graph-backed
+//! entity or system field,
 //! extracts system/event structure for cross-system queries, and lifts declared
 //! fsm metadata from both entities and systems.
 
 use std::collections::HashMap;
 
-use crate::ir::types::{IRAction, IREntity, IRExpr, IRProgram, IRSystem, IRType};
+use crate::ir::types::{
+    IRAction, IREntity, IRExpr, IRField, IRProgram, IRSystem, IRType, IRVariant,
+};
 
 use super::model::{
-    ActionContract, ApplyInfo, CrossCall, EventInfo, FlowModel, FsmInfo, StateGraph, SystemInfo,
-    TransitionEdge,
+    ActionContract, ApplyInfo, CrossCall, EventInfo, FieldGraphMeta, FlowModel, FsmInfo, OwnerKind,
+    StateGraph, SystemInfo, TransitionEdge,
 };
 
 /// Extract a `FlowModel` from an `IRProgram`.
 pub fn extract(ir: &IRProgram) -> FlowModel {
     let mut state_graphs = HashMap::new();
+    let mut field_graph_meta = HashMap::new();
 
     for entity in &ir.entities {
-        let graphs = extract_entity_graphs(entity, ir);
+        record_entity_field_meta(entity, &mut field_graph_meta);
+        let graphs = extract_entity_graphs(entity);
         for sg in graphs {
-            state_graphs.insert((sg.entity.clone(), sg.field.clone()), sg);
+            state_graphs.insert((sg.owner.clone(), sg.field.clone()), sg);
         }
     }
 
     let mut systems = HashMap::new();
     for system in &ir.systems {
+        record_system_field_meta(system, &mut field_graph_meta);
+        for sg in extract_system_graphs(system) {
+            state_graphs.insert((sg.owner.clone(), sg.field.clone()), sg);
+        }
         systems.insert(system.name.clone(), extract_system_info(system));
     }
 
     let entity_names = ir.entities.iter().map(|e| e.name.clone()).collect();
+    let system_names = ir.systems.iter().map(|s| s.name.clone()).collect();
     let type_names = ir.types.iter().map(|t| t.name.clone()).collect();
 
     let mut action_contracts = HashMap::new();
@@ -138,38 +148,75 @@ pub fn extract(ir: &IRProgram) -> FlowModel {
 
     FlowModel {
         state_graphs,
+        field_graph_meta,
         systems,
         entity_names,
+        system_names,
         type_names,
         action_contracts,
         fsm_decls,
     }
 }
 
-/// Extract state graphs for all enum-typed fields of an entity.
-fn extract_entity_graphs(entity: &IREntity, _ir: &IRProgram) -> Vec<StateGraph> {
+fn record_entity_field_meta(
+    entity: &IREntity,
+    field_graph_meta: &mut HashMap<(String, String), FieldGraphMeta>,
+) {
+    for field in &entity.fields {
+        field_graph_meta.insert(
+            (entity.name.clone(), field.name.clone()),
+            FieldGraphMeta {
+                owner: entity.name.clone(),
+                field: field.name.clone(),
+                owner_kind: OwnerKind::Entity,
+                graphable: is_graphable_field_type(&field.ty),
+                type_name: display_ir_type(&field.ty),
+            },
+        );
+    }
+}
+
+fn record_system_field_meta(
+    system: &IRSystem,
+    field_graph_meta: &mut HashMap<(String, String), FieldGraphMeta>,
+) {
+    for field in &system.fields {
+        field_graph_meta.insert(
+            (system.name.clone(), field.name.clone()),
+            FieldGraphMeta {
+                owner: system.name.clone(),
+                field: field.name.clone(),
+                owner_kind: OwnerKind::System,
+                graphable: is_graphable_field_type(&field.ty),
+                type_name: display_ir_type(&field.ty),
+            },
+        );
+    }
+}
+
+/// Extract state graphs for all finite scalar fields of an entity.
+fn extract_entity_graphs(entity: &IREntity) -> Vec<StateGraph> {
     let mut graphs = Vec::new();
 
     for field in &entity.fields {
-        // Only build state graphs for enum-typed fields
-        let variants = match &field.ty {
-            IRType::Enum { variants: vs, .. } => {
-                vs.iter().map(|v| v.name.clone()).collect::<Vec<_>>()
-            }
-            _ => continue,
+        let Some(states) = finite_field_states(&field.ty) else {
+            continue;
         };
 
-        let initial = field.default.as_ref().and_then(extract_ctor_name);
+        let initial = field
+            .default
+            .as_ref()
+            .and_then(|expr| extract_finite_state_name(expr, &field.ty));
 
         let mut transitions = Vec::new();
         for transition in &entity.transitions {
             // Check if this transition updates this field
             for update in &transition.updates {
                 if update.field == field.name {
-                    let Some(to) = extract_ctor_name(&update.value) else {
+                    let Some(to) = extract_finite_state_name(&update.value, &field.ty) else {
                         continue;
                     };
-                    let from = extract_guard_state(&transition.guard, &field.name);
+                    let from = extract_guard_state(&transition.guard, &field.name, &field.ty);
                     transitions.push(TransitionEdge {
                         action: transition.name.clone(),
                         from,
@@ -180,9 +227,10 @@ fn extract_entity_graphs(entity: &IREntity, _ir: &IRProgram) -> Vec<StateGraph> 
         }
 
         graphs.push(StateGraph {
-            entity: entity.name.clone(),
+            owner: entity.name.clone(),
+            owner_kind: OwnerKind::Entity,
             field: field.name.clone(),
-            states: variants,
+            states,
             initial,
             transitions,
         });
@@ -191,36 +239,232 @@ fn extract_entity_graphs(entity: &IREntity, _ir: &IRProgram) -> Vec<StateGraph> 
     graphs
 }
 
-/// Extract a constructor name from an IR expression (Ctor node).
-fn extract_ctor_name(expr: &IRExpr) -> Option<String> {
+/// Extract state graphs for all finite scalar fields of a system.
+fn extract_system_graphs(system: &IRSystem) -> Vec<StateGraph> {
+    let mut graphs = Vec::new();
+
+    for field in &system.fields {
+        let Some(states) = finite_field_states(&field.ty) else {
+            continue;
+        };
+
+        let initial = field
+            .default
+            .as_ref()
+            .and_then(|expr| extract_finite_state_name(expr, &field.ty));
+
+        let mut transitions = Vec::new();
+        for step in &system.steps {
+            collect_system_field_transitions(
+                &step.body,
+                &step.guard,
+                field,
+                &step.name,
+                &mut transitions,
+            );
+        }
+
+        graphs.push(StateGraph {
+            owner: system.name.clone(),
+            owner_kind: OwnerKind::System,
+            field: field.name.clone(),
+            states,
+            initial,
+            transitions,
+        });
+    }
+
+    graphs
+}
+
+fn collect_system_field_transitions(
+    body: &[IRAction],
+    guard: &IRExpr,
+    field: &IRField,
+    action_name: &str,
+    out: &mut Vec<TransitionEdge>,
+) {
+    for action in body {
+        match action {
+            IRAction::ExprStmt { expr } => {
+                if let Some(to) = extract_system_field_update(expr, &field.name, &field.ty) {
+                    out.push(TransitionEdge {
+                        action: action_name.to_owned(),
+                        from: extract_guard_state(guard, &field.name, &field.ty),
+                        to,
+                    });
+                }
+            }
+            IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                collect_system_field_transitions(ops, guard, field, action_name, out);
+            }
+            IRAction::Match { arms, .. } => {
+                for arm in arms {
+                    collect_system_field_transitions(&arm.body, guard, field, action_name, out);
+                }
+            }
+            IRAction::Create { .. }
+            | IRAction::LetCrossCall { .. }
+            | IRAction::Apply { .. }
+            | IRAction::CrossCall { .. } => {}
+        }
+    }
+}
+
+fn extract_system_field_update(
+    expr: &IRExpr,
+    field_name: &str,
+    field_ty: &IRType,
+) -> Option<String> {
     match expr {
-        IRExpr::Ctor { ctor, .. } => Some(ctor.clone()),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpEq" => match left.as_ref() {
+            IRExpr::Prime { expr, .. } => match expr.as_ref() {
+                IRExpr::Var { name, .. } if name == field_name => {
+                    extract_finite_state_name(right, field_ty)
+                }
+                _ => None,
+            },
+            _ => None,
+        },
         _ => None,
     }
 }
 
 /// Try to extract the source state from a guard expression.
-/// Looks for patterns like `status == @Pending` in the guard.
-fn extract_guard_state(guard: &IRExpr, field_name: &str) -> Option<String> {
+/// Looks for patterns like `status == @Pending` or `ready == true`.
+fn extract_guard_state(guard: &IRExpr, field_name: &str, field_ty: &IRType) -> Option<String> {
     match guard {
-        // Direct: field == @State
+        // Direct: field == State
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpEq" => {
             if is_field_ref(left, field_name) {
-                return extract_ctor_name(right);
+                return extract_finite_state_name(right, field_ty);
             }
             if is_field_ref(right, field_name) {
-                return extract_ctor_name(left);
+                return extract_finite_state_name(left, field_ty);
             }
             None
         }
         // Conjunction:... and field == @State
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpAnd" => {
-            extract_guard_state(left, field_name).or_else(|| extract_guard_state(right, field_name))
+        } if op == "OpAnd" => extract_guard_state(left, field_name, field_ty)
+            .or_else(|| extract_guard_state(right, field_name, field_ty)),
+        _ => None,
+    }
+}
+
+fn finite_field_states(ty: &IRType) -> Option<Vec<String>> {
+    finite_field_states_inner(ty, &mut Vec::new())
+}
+
+fn finite_field_states_inner(ty: &IRType, visiting_enums: &mut Vec<String>) -> Option<Vec<String>> {
+    match ty {
+        IRType::Bool => Some(vec!["false".to_owned(), "true".to_owned()]),
+        IRType::Enum { name, variants } => {
+            if visiting_enums.iter().any(|seen| seen == name) {
+                return None;
+            }
+            visiting_enums.push(name.clone());
+            let mut states = Vec::new();
+            for variant in variants {
+                states.extend(finite_variant_states(variant, visiting_enums)?);
+            }
+            visiting_enums.pop();
+            Some(states)
         }
+        _ => None,
+    }
+}
+
+fn finite_variant_states(
+    variant: &IRVariant,
+    visiting_enums: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    if variant.fields.is_empty() {
+        return Some(vec![variant.name.clone()]);
+    }
+
+    let mut field_domains = Vec::with_capacity(variant.fields.len());
+    for field in &variant.fields {
+        field_domains.push((
+            field.name.clone(),
+            finite_field_states_inner(&field.ty, visiting_enums)?,
+        ));
+    }
+
+    let mut labels = Vec::new();
+    enumerate_variant_states(variant, &field_domains, 0, &mut Vec::new(), &mut labels);
+    Some(labels)
+}
+
+fn enumerate_variant_states(
+    variant: &IRVariant,
+    field_domains: &[(String, Vec<String>)],
+    index: usize,
+    current: &mut Vec<(String, String)>,
+    labels: &mut Vec<String>,
+) {
+    if index == field_domains.len() {
+        labels.push(render_variant_state(&variant.name, current));
+        return;
+    }
+
+    let (field_name, states) = &field_domains[index];
+    for state in states {
+        current.push((field_name.clone(), state.clone()));
+        enumerate_variant_states(variant, field_domains, index + 1, current, labels);
+        current.pop();
+    }
+}
+
+fn render_variant_state(variant_name: &str, fields: &[(String, String)]) -> String {
+    if fields.is_empty() {
+        return variant_name.to_owned();
+    }
+
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    format!("{variant_name}{{{}}}", parts.join(","))
+}
+
+fn is_graphable_field_type(ty: &IRType) -> bool {
+    finite_field_states(ty).is_some()
+}
+
+fn extract_finite_state_name(expr: &IRExpr, field_ty: &IRType) -> Option<String> {
+    match (field_ty, expr) {
+        (IRType::Enum { variants, .. }, IRExpr::Ctor { ctor, args, .. }) => {
+            let variant = variants.iter().find(|variant| variant.name == *ctor)?;
+            if variant.fields.is_empty() {
+                return args.is_empty().then(|| ctor.clone());
+            }
+            if args.len() != variant.fields.len() {
+                return None;
+            }
+
+            let mut rendered_fields = Vec::with_capacity(variant.fields.len());
+            for field in &variant.fields {
+                let (_, value) = args.iter().find(|(name, _)| name == &field.name)?;
+                rendered_fields.push((
+                    field.name.clone(),
+                    extract_finite_state_name(value, &field.ty)?,
+                ));
+            }
+            Some(render_variant_state(ctor, &rendered_fields))
+        }
+        (
+            IRType::Bool,
+            IRExpr::Lit {
+                value: crate::ir::types::LitVal::Bool { value },
+                ..
+            },
+        ) => Some(value.to_string()),
         _ => None,
     }
 }
@@ -584,6 +828,54 @@ mod tests {
         }
     }
 
+    fn make_bool_field(name: &str, default: bool) -> IRField {
+        IRField {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            default: Some(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: default },
+                span: None,
+            }),
+            initial_constraint: None,
+        }
+    }
+
+    fn make_payload_enum_field(name: &str, default_ready: bool) -> IRField {
+        IRField {
+            name: name.to_owned(),
+            ty: IRType::Enum {
+                name: "WorkflowMode".to_owned(),
+                variants: vec![
+                    crate::ir::types::IRVariant::simple("Idle"),
+                    crate::ir::types::IRVariant {
+                        name: "Ready".to_owned(),
+                        fields: vec![crate::ir::types::IRVariantField {
+                            name: "armed".to_owned(),
+                            ty: IRType::Bool,
+                        }],
+                    },
+                ],
+            },
+            default: Some(IRExpr::Ctor {
+                enum_name: "WorkflowMode".to_owned(),
+                ctor: "Ready".to_owned(),
+                args: vec![(
+                    "armed".to_owned(),
+                    IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool {
+                            value: default_ready,
+                        },
+                        span: None,
+                    },
+                )],
+                span: None,
+            }),
+            initial_constraint: None,
+        }
+    }
+
     fn make_transition(
         name: &str,
         field: &str,
@@ -666,6 +958,8 @@ mod tests {
             .get(&("Order".to_owned(), "status".to_owned()))
             .expect("state graph for Order.status");
         assert_eq!(sg.states.len(), 3);
+        assert_eq!(sg.owner, "Order");
+        assert_eq!(sg.owner_kind, OwnerKind::Entity);
         assert_eq!(sg.initial, Some("Pending".to_owned()));
         assert_eq!(sg.transitions.len(), 2);
         assert_eq!(sg.transitions[0].action, "submit");
@@ -717,6 +1011,12 @@ mod tests {
         assert!(!model
             .state_graphs
             .contains_key(&("Ticket".to_owned(), "title".to_owned())));
+        let title_meta = model
+            .field_graph_meta
+            .get(&("Ticket".to_owned(), "title".to_owned()))
+            .expect("title field metadata");
+        assert!(!title_meta.graphable);
+        assert_eq!(title_meta.type_name, "string");
     }
 
     #[test]
@@ -767,5 +1067,239 @@ mod tests {
         assert_eq!(info.events[0].name, "submit_order");
         assert_eq!(info.events[0].applies.len(), 1);
         assert_eq!(info.events[0].applies[0].action, "submit");
+    }
+
+    #[test]
+    fn extract_bool_graphs_for_entity_and_system_fields() {
+        let entity = IREntity {
+            name: "Ticket".to_owned(),
+            fields: vec![make_bool_field("ready", false)],
+            transitions: vec![IRTransition {
+                name: "activate".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "ready".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: false },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                updates: vec![IRUpdate {
+                    field: "ready".to_owned(),
+                    value: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                        span: None,
+                    },
+                }],
+                postcondition: None,
+            }],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let system = IRSystem {
+            name: "Workflow".to_owned(),
+            fields: vec![make_bool_field("running", false)],
+            store_params: vec![],
+            entities: vec![],
+            commands: vec![IRCommand {
+                name: "start".to_owned(),
+                params: vec![],
+                return_type: None,
+            }],
+            steps: vec![IRStep {
+                name: "start".to_owned(),
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "running".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: false },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                body: vec![IRAction::ExprStmt {
+                    expr: IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Prime {
+                            expr: Box::new(IRExpr::Var {
+                                name: "running".to_owned(),
+                                ty: IRType::Bool,
+                                span: None,
+                            }),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                            span: None,
+                        }),
+                        ty: IRType::Bool,
+                        span: None,
+                    },
+                }],
+                return_expr: None,
+            }],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        };
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+
+        let model = extract(&ir);
+        let entity_graph = model
+            .state_graphs
+            .get(&("Ticket".to_owned(), "ready".to_owned()))
+            .expect("entity bool graph");
+        assert_eq!(
+            entity_graph.states,
+            vec!["false".to_owned(), "true".to_owned()]
+        );
+        assert_eq!(entity_graph.initial, Some("false".to_owned()));
+        assert_eq!(entity_graph.transitions[0].to, "true");
+
+        let system_graph = model
+            .state_graphs
+            .get(&("Workflow".to_owned(), "running".to_owned()))
+            .expect("system bool graph");
+        assert_eq!(system_graph.owner_kind, OwnerKind::System);
+        assert_eq!(system_graph.initial, Some("false".to_owned()));
+        assert_eq!(system_graph.transitions[0].action, "start");
+        assert_eq!(system_graph.transitions[0].from, Some("false".to_owned()));
+        assert_eq!(system_graph.transitions[0].to, "true");
+    }
+
+    #[test]
+    fn extract_payload_enum_graphs_for_entity_fields() {
+        let mode_ty = IRType::Enum {
+            name: "WorkflowMode".to_owned(),
+            variants: vec![
+                crate::ir::types::IRVariant::simple("Idle"),
+                crate::ir::types::IRVariant {
+                    name: "Ready".to_owned(),
+                    fields: vec![crate::ir::types::IRVariantField {
+                        name: "armed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+            ],
+        };
+        let entity = IREntity {
+            name: "Workflow".to_owned(),
+            fields: vec![make_payload_enum_field("mode", false)],
+            transitions: vec![IRTransition {
+                name: "arm".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "mode".to_owned(),
+                        ty: mode_ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "WorkflowMode".to_owned(),
+                        ctor: "Ready".to_owned(),
+                        args: vec![(
+                            "armed".to_owned(),
+                            IRExpr::Lit {
+                                ty: IRType::Bool,
+                                value: LitVal::Bool { value: false },
+                                span: None,
+                            },
+                        )],
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                updates: vec![IRUpdate {
+                    field: "mode".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "WorkflowMode".to_owned(),
+                        ctor: "Ready".to_owned(),
+                        args: vec![(
+                            "armed".to_owned(),
+                            IRExpr::Lit {
+                                ty: IRType::Bool,
+                                value: LitVal::Bool { value: true },
+                                span: None,
+                            },
+                        )],
+                        span: None,
+                    },
+                }],
+                postcondition: None,
+            }],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+
+        let model = extract(&ir);
+        let graph = model
+            .state_graphs
+            .get(&("Workflow".to_owned(), "mode".to_owned()))
+            .expect("state graph for Workflow.mode");
+        assert_eq!(
+            graph.states,
+            vec![
+                "Idle".to_owned(),
+                "Ready{armed=false}".to_owned(),
+                "Ready{armed=true}".to_owned(),
+            ]
+        );
+        assert_eq!(graph.initial, Some("Ready{armed=false}".to_owned()));
+        assert_eq!(graph.transitions.len(), 1);
+        assert_eq!(
+            graph.transitions[0].from,
+            Some("Ready{armed=false}".to_owned())
+        );
+        assert_eq!(graph.transitions[0].to, "Ready{armed=true}");
     }
 }

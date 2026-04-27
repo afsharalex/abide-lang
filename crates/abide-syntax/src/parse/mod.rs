@@ -221,6 +221,29 @@ pub fn parse_string(input: &str) -> Result<crate::ast::Program, ParseError> {
     Ok(output.program)
 }
 
+/// Parse a string into a single expression.
+pub fn parse_expr_string(input: &str) -> Result<crate::ast::Expr, ParseError> {
+    let tokens = crate::lex::lex(input).map_err(|errs| ParseError::General {
+        msg: errs
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; "),
+        span: (0..0).into(),
+        help: None,
+    })?;
+    let mut parser = Parser::new(tokens);
+    let expr = parser.expr()?;
+    if let Some((token, span)) = parser.tokens.get(parser.pos) {
+        return Err(ParseError::General {
+            msg: format!("unexpected token after expression: {token:?}"),
+            span: (*span).into(),
+            help: None,
+        });
+    }
+    Ok(expr)
+}
+
 /// Parse a string into a partial `Program`, retaining parse diagnostics.
 pub fn parse_string_recovering(
     input: &str,

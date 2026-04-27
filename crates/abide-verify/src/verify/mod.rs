@@ -23,6 +23,10 @@ pub mod transition;
 #[allow(clippy::wildcard_imports)]
 use temporal::*;
 pub use temporal::{export_verify_temporal_formulas, TemporalFormulaExport, VerifyTemporalExport};
+pub use explicit::{
+    explore_verify_state_space, ExplicitStateSpace, ExplicitStateSpaceStoreBound,
+    ExplicitStateSpaceTransition,
+};
 mod walkers;
 #[allow(clippy::wildcard_imports)]
 use walkers::*;

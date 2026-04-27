@@ -427,7 +427,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                         let arg_ty = arg.ty();
                                         if !matches!(&arg_ty, Ty::Error)
                                             && !matches!(declared_ty, Ty::Error)
-                                            && !super::types_compatible(&arg_ty, declared_ty)
+                                            && !super::expr_compatible_with_ty(arg, declared_ty)
                                         {
                                             errors.push(ElabError::with_span(
                                                 ErrorKind::TypeMismatch,
@@ -487,7 +487,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                         let arg_ty = arg.ty();
                                         if !matches!(&arg_ty, Ty::Error)
                                             && !matches!(declared_ty, Ty::Error)
-                                            && !super::types_compatible(&arg_ty, declared_ty)
+                                            && !super::expr_compatible_with_ty(arg, declared_ty)
                                         {
                                             errors.push(ElabError::with_span(
                                                 ErrorKind::TypeMismatch,
@@ -626,7 +626,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                 let arg_ty = arg.ty();
                                 if !matches!(&arg_ty, Ty::Error)
                                     && !matches!(param_ty, Ty::Error)
-                                    && !super::types_compatible(&arg_ty, param_ty)
+                                    && !super::expr_compatible_with_ty(arg, param_ty)
                                 {
                                     errors.push(ElabError::with_span(
                                         ErrorKind::TypeMismatch,

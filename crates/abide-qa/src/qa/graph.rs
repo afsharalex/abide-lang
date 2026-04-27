@@ -241,11 +241,12 @@ fn dfs_find_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qa::model::{StateGraph, TransitionEdge};
+    use crate::qa::model::{OwnerKind, StateGraph, TransitionEdge};
 
     fn order_graph() -> StateGraph {
         StateGraph {
-            entity: "Order".to_owned(),
+            owner: "Order".to_owned(),
+            owner_kind: OwnerKind::Entity,
             field: "status".to_owned(),
             states: vec![
                 "Pending".to_owned(),

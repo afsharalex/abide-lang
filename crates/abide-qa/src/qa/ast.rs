@@ -17,6 +17,8 @@ pub enum QAStatement {
     Verify,
     /// `simulate [options]` — run one seeded forward simulation and store it as an artifact
     Simulate(SimulationRequest),
+    /// `explore [options]` — build a bounded composite state-space artifact
+    Explore(StateSpaceRequest),
     /// `artifacts` — list stored artifacts from earlier `verify` statements
     Artifacts,
     /// `show artifact <selector>` — show artifact summary
@@ -44,11 +46,40 @@ pub struct SimulationRequest {
     pub system: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateSpaceRequest {
+    pub slots: usize,
+    pub scopes: Vec<(String, usize)>,
+    pub system: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TemporalBounds {
+    pub slots: Option<usize>,
+    pub scopes: Vec<(String, usize)>,
+}
+
+impl TemporalBounds {
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_none() && self.scopes.is_empty()
+    }
+}
+
 impl Default for SimulationRequest {
     fn default() -> Self {
         Self {
             steps: 25,
             seed: 0,
+            slots: 4,
+            scopes: Vec::new(),
+            system: None,
+        }
+    }
+}
+
+impl Default for StateSpaceRequest {
+    fn default() -> Self {
+        Self {
             slots: 4,
             scopes: Vec::new(),
             system: None,
@@ -128,11 +159,14 @@ pub enum Query {
     // ── Modifiers ───────────────────────────────────────────────
     /// `not <query>` — negation
     Not(Box<Query>),
-    /// `always (expr)` / `eventually (expr)` — temporal assertions
-    /// Delegates to Abide expression parsing
-    AlwaysExpr(String),
-    /// `eventually (expr)`
-    EventuallyExpr(String),
+    /// `always [on Target] (expr)` / `eventually [on Target] (expr)` —
+    /// temporal assertions over an explicit or inferred scope target.
+    Temporal {
+        op: TemporalOp,
+        bounds: TemporalBounds,
+        target: Option<TemporalTarget>,
+        expr: String,
+    },
 
     // ── Block-form queries ──────────────────────────────────────
     /// `{ for e, f, s where pred(e, f, s) [not pred(...)] select e, f, s }`
@@ -141,6 +175,18 @@ pub enum Query {
         predicates: Vec<BlockPredicate>,
         select: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalOp {
+    Always,
+    Eventually,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalTarget {
+    pub owner: String,
+    pub field: Option<String>,
 }
 
 /// A relational predicate in a block-form query.
@@ -174,6 +220,7 @@ impl std::fmt::Display for QAStatement {
             Self::AbideBlock(_) => write!(f, "abide {{ ... }}"),
             Self::Verify => write!(f, "verify"),
             Self::Simulate(request) => write!(f, "{request}"),
+            Self::Explore(request) => write!(f, "{request}"),
             Self::Artifacts => write!(f, "artifacts"),
             Self::ShowArtifact(selector) => write!(f, "show artifact {selector}"),
             Self::DrawArtifact(selector) => write!(f, "draw artifact {selector}"),
@@ -197,6 +244,19 @@ impl std::fmt::Display for SimulationRequest {
             "simulate --steps {} --seed {} --slots {}",
             self.steps, self.seed, self.slots
         )?;
+        for (entity, slots) in &self.scopes {
+            write!(f, " --scope {entity}={slots}")?;
+        }
+        if let Some(system) = &self.system {
+            write!(f, " --system {system}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for StateSpaceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "explore --slots {}", self.slots)?;
         for (entity, slots) in &self.scopes {
             write!(f, " --scope {entity}={slots}")?;
         }
@@ -260,9 +320,46 @@ impl std::fmt::Display for Query {
             Self::CrossCalls { system } => write!(f, "cross-calls from {system}"),
             Self::Deadlock { system } => write!(f, "deadlock {system}"),
             Self::Not(inner) => write!(f, "not {inner}"),
-            Self::AlwaysExpr(expr) => write!(f, "always {expr}"),
-            Self::EventuallyExpr(expr) => write!(f, "eventually {expr}"),
+            Self::Temporal {
+                op,
+                bounds,
+                target,
+                expr,
+            } => {
+                let op = match op {
+                    TemporalOp::Always => "always",
+                    TemporalOp::Eventually => "eventually",
+                };
+                if !bounds.is_empty() {
+                    write!(f, "{op}")?;
+                    if let Some(slots) = bounds.slots {
+                        write!(f, " --slots {slots}")?;
+                    }
+                    for (entity, slots) in &bounds.scopes {
+                        write!(f, " --scope {entity}={slots}")?;
+                    }
+                    if let Some(target) = target {
+                        write!(f, " on {target} {expr}")
+                    } else {
+                        write!(f, " {expr}")
+                    }
+                } else if let Some(target) = target {
+                    write!(f, "{op} on {target} {expr}")
+                } else {
+                    write!(f, "{op} {expr}")
+                }
+            }
             Self::Block { .. } => write!(f, "block query"),
+        }
+    }
+}
+
+impl std::fmt::Display for TemporalTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(field) = &self.field {
+            write!(f, "{}.{field}", self.owner)
+        } else {
+            write!(f, "{}", self.owner)
         }
     }
 }

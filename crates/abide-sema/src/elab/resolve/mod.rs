@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    EContract, EEventAction, EExpr, EMatchArm, EMatchScrutinee, EProc, EProcDepCond, EProcEdge,
-    EProcNode, EProcUse, ESceneWhen, GenericTypeDef, Ty, VariantFieldsMap,
+    BuiltinTy, EContract, EEventAction, EExpr, EMatchArm, EMatchScrutinee, EProc, EProcDepCond,
+    EProcEdge, EProcNode, EProcUse, ESceneWhen, GenericTypeDef, Literal, Ty, VariantFieldsMap,
 };
 use crate::ast::UseDecl;
 
@@ -77,6 +77,27 @@ impl Ctx {
     /// Resolve an alias to its canonical name, or return the name as-is.
     fn canonical_name<'a>(&'a self, name: &'a str) -> &'a str {
         self.aliases.get(name).map_or(name, String::as_str)
+    }
+}
+
+fn expected_real_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::Builtin(BuiltinTy::Real) => true,
+        Ty::Alias(_, inner) | Ty::Refinement(inner, _) => expected_real_ty(inner),
+        _ => false,
+    }
+}
+
+fn coerce_int_literal_to_real_if_expected(expr: &mut EExpr, expected: &Ty) {
+    if !expected_real_ty(expected) {
+        return;
+    }
+    if let EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(value), span) = expr {
+        *expr = EExpr::Lit(
+            Ty::Builtin(BuiltinTy::Real),
+            Literal::Real(*value as f64),
+            *span,
+        );
     }
 }
 
@@ -1408,10 +1429,12 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
                 Some(crate::elab::types::EFieldDefault::Value(ref mut e)) => {
                     *e = resolve_expr(ctx, &HashMap::new(), e);
                     resolve_ctor_type_from_context(e, &field.ty);
+                    coerce_int_literal_to_real_if_expected(e, &field.ty);
                 }
                 Some(crate::elab::types::EFieldDefault::In(ref mut es)) => {
                     for e in es.iter_mut() {
                         *e = resolve_expr(ctx, &HashMap::new(), e);
+                        coerce_int_literal_to_real_if_expected(e, &field.ty);
                     }
                 }
                 Some(crate::elab::types::EFieldDefault::Where(ref mut e)) => {
@@ -1458,10 +1481,12 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
                 Some(crate::elab::types::EFieldDefault::Value(ref mut e)) => {
                     *e = resolve_expr(ctx, &HashMap::new(), e);
                     resolve_ctor_type_from_context(e, &field.ty);
+                    coerce_int_literal_to_real_if_expected(e, &field.ty);
                 }
                 Some(crate::elab::types::EFieldDefault::In(ref mut es)) => {
                     for e in es.iter_mut() {
                         *e = resolve_expr(ctx, &HashMap::new(), e);
+                        coerce_int_literal_to_real_if_expected(e, &field.ty);
                     }
                 }
                 Some(crate::elab::types::EFieldDefault::Where(ref mut e)) => {
@@ -1922,7 +1947,7 @@ mod tests {
     use super::*;
     use crate::ast::Visibility;
     use crate::elab::collect;
-    use crate::elab::types::EExpr;
+    use crate::elab::types::{EExpr, EFieldDefault};
     use crate::lex;
     use crate::parse::Parser;
 
@@ -1935,6 +1960,18 @@ mod tests {
         env.build_working_namespace();
         resolve(&mut env);
         env
+    }
+
+    fn elaborate_all(
+        src: &str,
+    ) -> (
+        crate::elab::types::ElabResult,
+        Vec<crate::elab::error::ElabError>,
+    ) {
+        let tokens = lex::lex(src).expect("lex error");
+        let mut parser = Parser::new(tokens);
+        let prog = parser.parse_program().expect("parse error");
+        crate::elab::elaborate(&prog)
     }
 
     #[test]
@@ -2005,6 +2042,58 @@ mod tests {
             matches!(user.fields[0].ty, Ty::Error),
             "unknown named types should be rewritten to poison, got: {:?}",
             user.fields[0].ty
+        );
+    }
+
+    #[test]
+    fn int_literal_field_default_is_coerced_to_real() {
+        let (result, errors) = elaborate_all("entity Order { total: real = 0 }");
+        assert!(
+            errors.is_empty(),
+            "real field defaults should accept int literals, got: {:?}",
+            errors
+        );
+
+        let order = result
+            .entities
+            .iter()
+            .find(|entity| entity.name == "Order")
+            .expect("entity collected");
+        let field = order
+            .fields
+            .iter()
+            .find(|field| field.name == "total")
+            .expect("total field present");
+        match field.default.as_ref() {
+            Some(EFieldDefault::Value(EExpr::Lit(
+                Ty::Builtin(BuiltinTy::Real),
+                Literal::Real(value),
+                _,
+            ))) => {
+                assert_eq!(*value, 0.0);
+            }
+            other => panic!("expected real literal default after coercion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn int_variable_field_default_still_errors_for_real() {
+        let (_result, errors) = elaborate_all(
+            "enum Outcome = Ok { value: real }\n\
+             system Bank {\n\
+               command open_account(initial_balance: int) -> Outcome\n\
+               step open_account(initial_balance: int) {\n\
+                 return @Ok { value: initial_balance }\n\
+               }\n\
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("field `value` of type `int`")
+                    && e.message.contains("expects `real`")),
+            "int variables should not be coerced to real return payloads, got: {:?}",
+            errors
         );
     }
 

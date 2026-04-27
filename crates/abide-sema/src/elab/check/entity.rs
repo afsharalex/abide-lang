@@ -266,12 +266,8 @@ pub(super) fn check_field(entity_name: &str, field: &EField) -> Vec<ElabError> {
                     }
                 }
                 // For non-enum fields: check type compatibility
-                if let Ty::Builtin(expected_bt) = &field.ty {
-                    let ok = match e.ty() {
-                        Ty::Builtin(actual_bt) => actual_bt == *expected_bt,
-                        Ty::Error => true,
-                        _ => false,
-                    };
+                if let Ty::Builtin(_) = &field.ty {
+                    let ok = super::expr_compatible_with_ty(e, &field.ty);
                     if !ok {
                         errors.push(ElabError::new(
                             ErrorKind::InvalidDefault,
@@ -337,12 +333,8 @@ pub(super) fn check_field(entity_name: &str, field: &EField) -> Vec<ElabError> {
             )]
         }
         // Builtin type mismatch (e.g., Int literal for Bool field)
-        (Ty::Builtin(expected_bt), _) => {
-            let ok = match def_expr.ty() {
-                Ty::Builtin(actual_bt) => actual_bt == *expected_bt,
-                Ty::Error => true,
-                _ => false,
-            };
+        (Ty::Builtin(_), _) => {
+            let ok = super::expr_compatible_with_ty(def_expr, &field.ty);
             if ok {
                 Vec::new()
             } else {

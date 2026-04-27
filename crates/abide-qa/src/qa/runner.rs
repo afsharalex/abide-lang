@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 
 use crate::ir;
 use crate::loader;
-use abide_verify::verify::{verify_all, VerifyConfig};
+use abide_ir::ir::types::{IRAssumptionSet, IRExpr, IRStoreDecl, IRType, IRVerify, IRVerifySystem, LitVal};
+use abide_verify::verify::{
+    explore_verify_state_space, verify_all, ExplicitStateSpace, VerifyConfig,
+};
 
-use super::artifacts::{ArtifactStore, SimulationArtifact};
-use super::ast::{QAStatement, SimulationRequest};
+use super::artifacts::{ArtifactStore, SimulationArtifact, StateSpaceArtifact};
+use super::ast::{QAStatement, Query, SimulationRequest, StateSpaceRequest};
 use super::exec::{self, QueryResult, Verb};
 use super::extract;
 use super::fmt;
@@ -33,6 +36,14 @@ pub trait RunnerHooks {
         _request: &SimulationRequest,
     ) -> Result<SimulationArtifact, String> {
         Err("simulation is not available in this QA runner".to_owned())
+    }
+
+    fn explore_state_space(
+        &mut self,
+        ir_program: &ir::types::IRProgram,
+        request: &StateSpaceRequest,
+    ) -> Result<StateSpaceArtifact, String> {
+        explore_state_space(ir_program, request)
     }
 }
 
@@ -221,6 +232,31 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
             }
             continue;
         }
+        if let QAStatement::Explore(request) = stmt {
+            executed += 1;
+            match rebuild_ir_program(&base_env) {
+                Ok(ir_program) => match hooks.explore_state_space(&ir_program, request) {
+                    Ok(state_space) => {
+                        let name = state_space_artifact_name(&state_space, request);
+                        let stored =
+                            artifacts.record_state_space_result(name, state_space.clone());
+                        output.push(render_state_space_summary(&state_space));
+                        output.push(format!("stored {stored} artifact(s)"));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        output.push(format!("error: {err}"));
+                    }
+                },
+                Err(errors) => {
+                    failed += 1;
+                    for e in errors {
+                        output.push(format!("  ERROR: {e}"));
+                    }
+                }
+            }
+            continue;
+        }
         if matches!(stmt, QAStatement::Artifacts) {
             executed += 1;
             if artifacts.is_empty() {
@@ -244,12 +280,26 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
             continue;
         }
         executed += 1;
-        let (verb, result) = exec::execute_statement(&model, stmt);
+        let outcome = exec::execute_statement_detailed_with_env(&model, Some(&base_env), stmt);
+        let verb = outcome.verb;
+        let result = outcome.result;
+        let stored_temporal = if let Some(verification_result) = &outcome.semantic_artifact {
+            temporal_artifact_name(stmt)
+                .map(|name| artifacts.record_named_verification_result(name, verification_result))
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         if json_mode {
             output.push(fmt::format_result_json(verb, &result));
             if verb == Verb::Assert {
-                if matches!(&result, QueryResult::Bool(false) | QueryResult::Error(_)) {
+                if matches!(
+                    &result,
+                    QueryResult::Bool(false)
+                        | QueryResult::BoolWithMode { value: false, .. }
+                        | QueryResult::Error(_)
+                ) {
                     failed += 1;
                 } else {
                     passed += 1;
@@ -257,7 +307,7 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
             }
         } else if verb == Verb::Assert {
             match &result {
-                QueryResult::Bool(false) => {
+                QueryResult::Bool(false) | QueryResult::BoolWithMode { value: false, .. } => {
                     failed += 1;
                     output.push(format!("  FAIL: {stmt}"));
                 }
@@ -270,8 +320,14 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
                     output.push(format!("  PASS: {stmt}"));
                 }
             }
+            if stored_temporal > 0 {
+                output.push(format!("  OK: stored {stored_temporal} temporal artifact(s)"));
+            }
         } else {
             output.push(fmt::format_result(verb, &result));
+            if stored_temporal > 0 {
+                output.push(format!("stored {stored_temporal} artifact(s)"));
+            }
         }
     }
 
@@ -280,6 +336,188 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
         failed,
         executed,
         output,
+    }
+}
+
+fn temporal_artifact_name(stmt: &QAStatement) -> Option<String> {
+    let query = match stmt {
+        QAStatement::Ask(query) | QAStatement::Explain(query) | QAStatement::Assert(query) => query,
+        _ => return None,
+    };
+    let Query::Temporal { .. } = query else {
+        return None;
+    };
+    let mut out = String::from("qa_temporal_");
+    let rendered = query.to_string();
+    let mut last_was_sep = false;
+    for ch in rendered.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn semantic_temporal_failures_are_stored_as_artifacts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-runner-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let spec_path = dir.join("spec.ab");
+        let script_path = dir.join("script.qa");
+        fs::write(
+            &spec_path,
+            r#"
+enum OrderStatus = Pending | Shipped
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+}
+
+system Commerce(orders: Store<Order>) {
+  command ship(order: Order)
+  step ship(order: Order) requires order.status == @Pending {
+    order.status' = @Shipped
+  }
+}
+"#,
+        )
+        .expect("write spec");
+        fs::write(
+            &script_path,
+            r#"
+load "spec.ab"
+ask always on Commerce true
+artifacts
+show artifact deadlock:qa_temporal_always_on_commerce_true
+"#,
+        )
+        .expect("write script");
+
+        let result = run_qa_script(&script_path, None, false);
+        assert_eq!(result.failed, 0);
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("false [semantic:counterexample[slots=4]]"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("stored 1 artifact(s)"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("#1 deadlock qa_temporal_always_on_commerce_true"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("witness kind: deadlock"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explore_statements_store_state_space_artifacts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-explore-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let spec_path = dir.join("spec.ab");
+        let script_path = dir.join("script.qa");
+        fs::write(
+            &spec_path,
+            r#"
+enum OrderStatus = Pending | Confirmed
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+}
+
+system Commerce(orders: Store<Order>) {
+  command submit(order: Order)
+  step submit(order: Order) requires order.status == @Pending {
+    order.status' = @Confirmed
+  }
+}
+"#,
+        )
+        .expect("write spec");
+        fs::write(
+            &script_path,
+            r#"
+load "spec.ab"
+explore --system Commerce --slots 1
+artifacts
+show artifact state-space:state_space_commerce
+draw artifact state-space:state_space_commerce
+"#,
+        )
+        .expect("write script");
+
+        let result = run_qa_script(&script_path, None, false);
+        assert_eq!(result.failed, 0);
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("State space"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("stored 1 artifact(s)"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("#1 state-space state_space_commerce"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("bounded state-space exploration"))
+        );
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line.contains("[state 0]"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -304,6 +542,156 @@ fn render_simulation_summary(simulation: &SimulationArtifact) -> String {
         }
     }
     out.trim_end().to_owned()
+}
+
+pub fn explore_state_space(
+    ir_program: &ir::types::IRProgram,
+    request: &StateSpaceRequest,
+) -> Result<StateSpaceArtifact, String> {
+    let selected_systems = select_exploration_systems(ir_program, request.system.as_deref())?;
+    let verify_block = build_state_space_verify(ir_program, &selected_systems, request);
+    explore_verify_state_space(ir_program, &verify_block, &VerifyConfig::default())?
+        .ok_or_else(|| {
+            "state-space exploration is not supported for this program fragment by the explicit-state backend"
+                .to_owned()
+        })
+}
+
+fn select_exploration_systems<'a>(
+    ir_program: &'a ir::types::IRProgram,
+    system: Option<&str>,
+) -> Result<Vec<&'a ir::types::IRSystem>, String> {
+    if let Some(system_name) = system {
+        let system = ir_program
+            .systems
+            .iter()
+            .find(|candidate| candidate.name == system_name)
+            .ok_or_else(|| format!("no system named `{system_name}`"))?;
+        return Ok(vec![system]);
+    }
+    if ir_program.systems.is_empty() {
+        return Err("program contains no systems to explore".to_owned());
+    }
+    Ok(ir_program.systems.iter().collect())
+}
+
+fn build_state_space_verify(
+    ir_program: &ir::types::IRProgram,
+    systems: &[&ir::types::IRSystem],
+    request: &StateSpaceRequest,
+) -> IRVerify {
+    let systems_bound = systems
+        .iter()
+        .map(|system| IRVerifySystem {
+            name: system.name.clone(),
+            lo: request.slots as i64,
+            hi: request.slots as i64,
+        })
+        .collect();
+    let stores = systems
+        .iter()
+        .flat_map(|system| {
+            system.store_params.iter().map(|store| IRStoreDecl {
+                name: format!("__qa_explore_store_{}_{}", system.name, store.name),
+                entity_type: store.entity_type.clone(),
+                lo: slots_for_entity(request, &store.entity_type) as i64,
+                hi: slots_for_entity(request, &store.entity_type) as i64,
+            })
+        })
+        .collect();
+
+    let _ = ir_program;
+    IRVerify {
+        name: "__qa_state_space".to_owned(),
+        depth: None,
+        systems: systems_bound,
+        stores,
+        assumption_set: IRAssumptionSet::default_for_verify(),
+        asserts: vec![IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        }],
+        span: None,
+        file: None,
+    }
+}
+
+fn slots_for_entity(request: &StateSpaceRequest, entity_type: &str) -> usize {
+    request
+        .scopes
+        .iter()
+        .rev()
+        .find_map(|(entity, slots)| (entity == entity_type).then_some(*slots))
+        .unwrap_or(request.slots)
+}
+
+fn state_space_artifact_name(
+    state_space: &ExplicitStateSpace,
+    request: &StateSpaceRequest,
+) -> String {
+    if let Some(system) = &request.system {
+        return format!("state_space_{}", sanitize_artifact_name(system));
+    }
+    if state_space.systems.is_empty() {
+        return "state_space".to_owned();
+    }
+    format!(
+        "state_space_{}",
+        state_space
+            .systems
+            .iter()
+            .map(|name| sanitize_artifact_name(name))
+            .collect::<Vec<_>>()
+            .join("_")
+    )
+}
+
+fn sanitize_artifact_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_sep = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "state_space".to_owned()
+    } else {
+        out
+    }
+}
+
+pub fn render_state_space_summary(state_space: &StateSpaceArtifact) -> String {
+    let mut out = String::new();
+    out.push_str("State space\n");
+    out.push_str(&format!("  systems: {}\n", state_space.systems.join(", ")));
+    out.push_str(&format!("  stutter: {}\n", state_space.stutter));
+    if state_space.store_bounds.is_empty() {
+        out.push_str("  store bounds: (none)\n");
+    } else {
+        out.push_str("  store bounds:\n");
+        for store in &state_space.store_bounds {
+            out.push_str(&format!(
+                "    - {}: Store<{}>[{}]\n",
+                store.name, store.entity_type, store.slots
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  states: {}  transitions: {}  initial: {}\n",
+        state_space.states.len(),
+        state_space.transitions.len(),
+        state_space.initial_state
+    ));
+    out
 }
 
 fn handle_artifact_statement(

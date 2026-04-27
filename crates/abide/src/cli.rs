@@ -39,6 +39,14 @@ impl crate::qa::runner::RunnerHooks for QaRunnerHooks {
             behavior: result.behavior,
         })
     }
+
+    fn explore_state_space(
+        &mut self,
+        ir_program: &crate::ir::types::IRProgram,
+        request: &crate::qa::ast::StateSpaceRequest,
+    ) -> Result<crate::qa::artifacts::StateSpaceArtifact, String> {
+        crate::qa::runner::explore_state_space(ir_program, request)
+    }
 }
 
 #[derive(ClapParser)]
@@ -212,6 +220,10 @@ enum Command {
     Repl {
         /// Path to load specs from (file or directory)
         path: Option<PathBuf>,
+
+        /// Start with no specs loaded, even if the current directory contains Abide files
+        #[arg(long)]
+        scratch: bool,
 
         /// Use Vi keybindings instead of Emacs
         #[arg(long)]
@@ -563,8 +575,8 @@ pub fn run() -> miette::Result<()> {
                 );
             }
         }
-        Command::Repl { path, vi } => {
-            crate::repl::run_repl(path.as_deref(), vi);
+        Command::Repl { path, scratch, vi } => {
+            crate::repl::run_repl(path.as_deref(), scratch, vi);
         }
     }
 

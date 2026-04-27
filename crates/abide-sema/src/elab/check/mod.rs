@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BuiltinTy, EContract, EExpr, EFn, EPattern, ESceneWhen, EType, EVariant, ElabResult, Ty,
-    VariantFieldsMap,
+    BuiltinTy, EContract, EExpr, EFn, EPattern, ESceneWhen, EType, EVariant, ElabResult, Literal,
+    Ty, VariantFieldsMap,
 };
 use crate::messages;
 
@@ -478,7 +478,7 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
 }
 
 /// Check if two types are compatible (same kind, ignoring poison).
-fn types_compatible(a: &Ty, b: &Ty) -> bool {
+pub(super) fn types_compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Error, _) | (_, Ty::Error) => true,
         (Ty::Builtin(a), Ty::Builtin(b)) => a == b,
@@ -490,6 +490,28 @@ fn types_compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::Alias(a, _), Ty::Alias(b, _)) => a == b,
         _ => false,
     }
+}
+
+fn unwrap_real_target(ty: &Ty) -> Option<BuiltinTy> {
+    match ty {
+        Ty::Builtin(bt) => Some(*bt),
+        Ty::Alias(_, inner) | Ty::Refinement(inner, _) => unwrap_real_target(inner),
+        _ => None,
+    }
+}
+
+pub(super) fn expr_compatible_with_ty(expr: &EExpr, expected: &Ty) -> bool {
+    if types_compatible(&expr.ty(), expected) {
+        return true;
+    }
+
+    matches!(
+        (expr, unwrap_real_target(expected)),
+        (
+            EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(_), _),
+            Some(BuiltinTy::Real)
+        )
+    )
 }
 
 fn check_unresolved_constructors(

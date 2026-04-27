@@ -16,6 +16,17 @@ pub fn format_result(verb: Verb, result: &QueryResult) -> String {
                 b.to_string()
             }
         }
+        QueryResult::BoolWithMode { value, mode } => {
+            if verb == Verb::Assert {
+                if *value {
+                    format!("PASS [{mode}]")
+                } else {
+                    format!("FAIL [{mode}]")
+                }
+            } else {
+                format!("{value} [{mode}]")
+            }
+        }
         QueryResult::StateSet(states) => {
             if states.is_empty() {
                 "(none)".to_owned()
@@ -49,7 +60,6 @@ pub fn format_result(verb: Verb, result: &QueryResult) -> String {
             }
         }
         QueryResult::Table { columns, rows } => format_table(columns, rows),
-        QueryResult::ExprStr(expr) => format!("[expr] {expr}"),
         QueryResult::Error(msg) => format!("error: {msg}"),
     }
 }
@@ -145,6 +155,20 @@ pub fn format_result_json(verb: Verb, result: &QueryResult) -> String {
                 "ok"
             };
             format!("{{\"verb\":\"{verb_str}\",\"status\":\"{status}\",\"value\":{b}}}")
+        }
+        QueryResult::BoolWithMode { value, mode } => {
+            let status = if verb == Verb::Assert {
+                if *value {
+                    "pass"
+                } else {
+                    "fail"
+                }
+            } else {
+                "ok"
+            };
+            format!(
+                "{{\"verb\":\"{verb_str}\",\"status\":\"{status}\",\"value\":{value},\"mode\":\"{mode}\"}}"
+            )
         }
         QueryResult::StateSet(states) => {
             let arr: Vec<String> = states.iter().map(|s| format!("\"{s}\"")).collect();
@@ -255,6 +279,7 @@ mod tests {
         assert!(json.contains("\"status\":\"pass\""));
         assert!(json.contains("\"value\":true"));
     }
+
 
     #[test]
     fn fmt_json_error() {

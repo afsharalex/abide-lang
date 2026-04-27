@@ -18,6 +18,7 @@ use crate::elab::env::Env;
 use crate::ir;
 use crate::loader;
 use crate::qa::model::FlowModel;
+use crate::qa::ast::StateSpaceRequest;
 use crate::qa::{exec, extract, fmt, parse as qa_parse};
 use crate::simulate::SimulateConfig;
 use crate::verify::VerifyConfig;
@@ -35,6 +36,8 @@ pub enum Mode {
 
 /// Live REPL state: base env from disk + overlay from REPL input.
 struct ReplState {
+    /// Base file/directory targets currently loaded from disk.
+    loaded_targets: Vec<PathBuf>,
     /// Base environment loaded from disk (restored on /reload).
     base_env: Option<Env>,
     /// Overlay definitions entered in the REPL.
@@ -50,8 +53,9 @@ struct ReplState {
 }
 
 impl ReplState {
-    fn new(base_env: Option<Env>) -> Self {
+    fn new(loaded_targets: Vec<PathBuf>, base_env: Option<Env>) -> Self {
         let mut state = Self {
+            loaded_targets,
             base_env,
             overlay_env: Env::new(),
             model: None,
@@ -63,16 +67,33 @@ impl ReplState {
         state
     }
 
+    fn loaded_target_display(&self) -> String {
+        if self.loaded_targets.is_empty() {
+            "(none)".to_owned()
+        } else {
+            self.loaded_targets
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
     /// Merge base + overlay, elaborate, lower, and rebuild the flow model.
-    fn rebuild(&mut self) {
-        let env = match &self.base_env {
+    fn merged_env(&self) -> Env {
+        match &self.base_env {
             Some(base) => {
                 let mut merged = base.clone();
                 merge_overlay(&mut merged, &self.overlay_env);
                 merged
             }
             None => self.overlay_env.clone(),
-        };
+        }
+    }
+
+    /// Merge base + overlay, elaborate, lower, and rebuild the flow model.
+    fn rebuild(&mut self) {
+        let env = self.merged_env();
 
         let (result, elab_errors) = elab::elaborate_env(env);
 
@@ -118,6 +139,69 @@ impl ReplState {
         self.artifacts.invalidate()
     }
 
+    fn current_loaded_files(&self) -> Vec<PathBuf> {
+        collect_files_for_targets(&self.loaded_targets)
+    }
+
+    fn add_loaded_target(&mut self, target: PathBuf) -> Result<LoadTargetOutcome, Vec<String>> {
+        let candidate_files = collect_files_for_target(&target)?;
+        let current_files = self.current_loaded_files();
+        let already_loaded = !candidate_files.is_empty()
+            && candidate_files
+                .iter()
+                .all(|candidate| current_files.iter().any(|existing| existing == candidate));
+        if already_loaded {
+            return Ok(LoadTargetOutcome::AlreadyLoaded(target));
+        }
+
+        let mut next_targets = self.loaded_targets.clone();
+        next_targets.push(target.clone());
+        let base_env = load_base_envs(&next_targets)?;
+        let entity_count = base_env.entities.len();
+        let system_count = base_env.systems.len();
+        self.loaded_targets = next_targets;
+        self.base_env = Some(base_env);
+        let cleared_artifacts = self.invalidate_artifacts();
+        self.rebuild();
+        Ok(LoadTargetOutcome::Loaded {
+            target,
+            entity_count,
+            system_count,
+            cleared_artifacts,
+        })
+    }
+
+    fn reload_targets(&mut self, target: Option<&Path>) -> Result<ReloadOutcome, Vec<String>> {
+        if self.loaded_targets.is_empty() {
+            return Ok(ReloadOutcome::NothingLoaded);
+        }
+
+        if let Some(target) = target {
+            let normalized = normalize_target(target).map_err(|err| vec![err])?;
+            let candidate_files = collect_files_for_target(&normalized)?;
+            let current_files = self.current_loaded_files();
+            let covered = !candidate_files.is_empty()
+                && candidate_files
+                    .iter()
+                    .all(|candidate| current_files.iter().any(|existing| existing == candidate));
+            if !covered {
+                return Ok(ReloadOutcome::TargetNotLoaded(normalized));
+            }
+        }
+
+        let base_env = load_base_envs(&self.loaded_targets)?;
+        let entity_count = base_env.entities.len();
+        let system_count = base_env.systems.len();
+        self.base_env = Some(base_env);
+        let cleared_artifacts = self.invalidate_artifacts();
+        self.reset_overlay();
+        Ok(ReloadOutcome::Reloaded {
+            entity_count,
+            system_count,
+            cleared_artifacts,
+        })
+    }
+
     fn verify_current(
         &mut self,
     ) -> Result<(Vec<crate::verify::VerificationResult>, usize), String> {
@@ -149,6 +233,54 @@ impl ReplState {
             .record_simulation_result(name, result.clone());
         Ok((result, stored))
     }
+
+    fn explore_current(
+        &mut self,
+        request: &StateSpaceRequest,
+    ) -> Result<(crate::qa::artifacts::StateSpaceArtifact, usize), String> {
+        let ir_program = self
+            .ir_program
+            .as_ref()
+            .ok_or_else(|| "no elaborated program available for state-space exploration".to_owned())?;
+        let result = crate::qa::runner::explore_state_space(ir_program, request)?;
+        let name = if let Some(system) = &request.system {
+            format!("state_space_{}", system.to_ascii_lowercase())
+        } else if result.systems.is_empty() {
+            "state_space".to_owned()
+        } else {
+            format!(
+                "state_space_{}",
+                result
+                    .systems
+                    .iter()
+                    .map(|system| system.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            )
+        };
+        let stored = self.artifacts.record_state_space_result(name, result.clone());
+        Ok((result, stored))
+    }
+}
+
+enum LoadTargetOutcome {
+    Loaded {
+        target: PathBuf,
+        entity_count: usize,
+        system_count: usize,
+        cleared_artifacts: usize,
+    },
+    AlreadyLoaded(PathBuf),
+}
+
+enum ReloadOutcome {
+    Reloaded {
+        entity_count: usize,
+        system_count: usize,
+        cleared_artifacts: usize,
+    },
+    NothingLoaded,
+    TargetNotLoaded(PathBuf),
 }
 
 /// Merge declarations from `src` into `dst`, printing warnings for redefinitions.
@@ -255,29 +387,30 @@ fn merge_overlay(dst: &mut Env, src: &Env) {
 
 /// Run the interactive REPL.
 #[allow(clippy::too_many_lines)]
-pub fn run_repl(load_path: Option<&Path>, vi_mode: bool) {
-    // Load specs if a path was provided
-    let base_env = if let Some(path) = load_path {
-        match load_base_env(path) {
+pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
+    let startup_targets = determine_startup_targets(load_path, scratch);
+    let (loaded_targets, base_env) = match startup_targets {
+        Some(targets) => match load_base_envs(&targets) {
             Ok(env) => {
                 let entity_count = env.entities.len();
                 let system_count = env.systems.len();
                 println!("Loaded {entity_count} entities, {system_count} systems");
-                Some(env)
+                (targets, Some(env))
             }
             Err(errors) => {
                 for e in &errors {
                     eprintln!("{e}");
                 }
-                None
+                (Vec::new(), None)
             }
+        },
+        None => {
+            println!("No specs loaded. Use /load <path> to load specifications.");
+            (Vec::new(), None)
         }
-    } else {
-        println!("No specs loaded. Use /load <path> to load specifications.");
-        None
     };
 
-    let mut state = ReplState::new(base_env);
+    let mut state = ReplState::new(loaded_targets, base_env);
     let mut mode = Mode::Abide;
 
     // Set up completer
@@ -344,7 +477,7 @@ pub fn run_repl(load_path: Option<&Path>, vi_mode: bool) {
 
                 // Handle tool commands (only on fresh prompt)
                 if input_buffer.is_empty() && trimmed.starts_with('/') {
-                    match handle_tool_command(trimmed, &mut mode, &mut state, load_path) {
+                    match handle_tool_command(trimmed, &mut mode, &mut state) {
                         ToolResult::Continue => continue,
                         ToolResult::Quit => break,
                         ToolResult::UpdateCompleter => {
@@ -375,7 +508,7 @@ pub fn run_repl(load_path: Option<&Path>, vi_mode: bool) {
 
                 // Execute based on mode
                 match mode {
-                    Mode::QA => handle_qa_input(&full_input, state.model.as_ref()),
+                    Mode::QA => handle_qa_input(&full_input, state.model.as_ref(), Some(&state.merged_env())),
                     Mode::Abide => handle_abide_input(&full_input, &mut state),
                 }
             }
@@ -401,13 +534,9 @@ enum ToolResult {
     UpdateCompleter,
 }
 
-fn handle_tool_command(
-    cmd: &str,
-    mode: &mut Mode,
-    state: &mut ReplState,
-    load_path: Option<&Path>,
-) -> ToolResult {
-    match cmd {
+fn handle_tool_command(cmd: &str, mode: &mut Mode, state: &mut ReplState) -> ToolResult {
+    let trimmed = cmd.trim();
+    match trimmed {
         "/quit" | "/q" => ToolResult::Quit,
         "/help" | "/h" => {
             print_help(*mode);
@@ -423,28 +552,78 @@ fn handle_tool_command(
             println!("Switched to Abide mode.");
             ToolResult::UpdateCompleter
         }
-        "/reload" => {
-            if let Some(path) = load_path {
-                match load_base_env(path) {
-                    Ok(env) => {
-                        let entity_count = env.entities.len();
-                        let system_count = env.systems.len();
-                        state.base_env = Some(env);
-                        let cleared = state.invalidate_artifacts();
-                        state.reset_overlay();
-                        println!("Reloaded: {entity_count} entities, {system_count} systems (in-memory changes discarded)");
-                        if cleared > 0 {
-                            println!("Invalidated {cleared} stored artifacts.");
+        _ if trimmed.starts_with("/load") => {
+            match parse_target_command(trimmed, "/load") {
+                Ok(target) => match state.add_loaded_target(target) {
+                    Ok(LoadTargetOutcome::Loaded {
+                        target,
+                        entity_count,
+                        system_count,
+                        cleared_artifacts,
+                    }) => {
+                        println!(
+                            "Loaded {}. Current base set: {} ({entity_count} entities, {system_count} systems)",
+                            target.display(),
+                            state.loaded_target_display()
+                        );
+                        if cleared_artifacts > 0 {
+                            println!("Invalidated {cleared_artifacts} stored artifacts.");
                         }
+                    }
+                    Ok(LoadTargetOutcome::AlreadyLoaded(target)) => {
+                        println!(
+                            "Target `{}` is already loaded. Use `/reload` or `/reload {}`.",
+                            target.display(),
+                            target.display()
+                        );
                     }
                     Err(errors) => {
                         for e in &errors {
                             eprintln!("{e}");
                         }
                     }
+                },
+                Err(err) => println!("{err}"),
+            }
+            ToolResult::UpdateCompleter
+        }
+        _ if trimmed.starts_with("/reload") => {
+            let target = match parse_optional_target_command(trimmed, "/reload") {
+                Ok(target) => target,
+                Err(err) => {
+                    println!("{err}");
+                    return ToolResult::Continue;
                 }
-            } else {
-                println!("Nothing to reload — no specs were loaded at startup.");
+            };
+            match state.reload_targets(target.as_deref()) {
+                Ok(ReloadOutcome::Reloaded {
+                    entity_count,
+                    system_count,
+                    cleared_artifacts,
+                }) => {
+                    println!(
+                        "Reloaded: {} ({entity_count} entities, {system_count} systems; in-memory changes discarded)",
+                        state.loaded_target_display()
+                    );
+                    if cleared_artifacts > 0 {
+                        println!("Invalidated {cleared_artifacts} stored artifacts.");
+                    }
+                }
+                Ok(ReloadOutcome::NothingLoaded) => {
+                    println!("Nothing to reload — no specs are currently loaded.");
+                }
+                Ok(ReloadOutcome::TargetNotLoaded(target)) => {
+                    println!(
+                        "Target `{}` is not currently loaded. Use `/load {}` first.",
+                        target.display(),
+                        target.display()
+                    );
+                }
+                Err(errors) => {
+                    for e in &errors {
+                        eprintln!("{e}");
+                    }
+                }
             }
             ToolResult::UpdateCompleter
         }
@@ -466,8 +645,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/simulate") => {
-            match parse_simulate_command(cmd) {
+        _ if trimmed.starts_with("/simulate") => {
+            match parse_simulate_command(trimmed) {
                 Ok(config) => match state.simulate_current(&config) {
                     Ok((result, stored)) => {
                         print!("{}", result.render_text());
@@ -475,6 +654,21 @@ fn handle_tool_command(
                     }
                     Err(err) => {
                         println!("Cannot simulate current REPL environment: {err}");
+                    }
+                },
+                Err(err) => println!("{err}"),
+            }
+            ToolResult::Continue
+        }
+        _ if trimmed.starts_with("/explore") => {
+            match parse_explore_command(trimmed) {
+                Ok(request) => match state.explore_current(&request) {
+                    Ok((result, stored)) => {
+                        print!("{}", crate::qa::runner::render_state_space_summary(&result));
+                        println!("Stored {stored} state-space artifact(s).");
+                    }
+                    Err(err) => {
+                        println!("Cannot explore current REPL environment: {err}");
                     }
                 },
                 Err(err) => println!("{err}"),
@@ -511,8 +705,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/show artifact ") => {
-            match parse_artifact_selector(cmd, "/show artifact ") {
+        _ if trimmed.starts_with("/show artifact ") => {
+            match parse_artifact_selector(trimmed, "/show artifact ") {
                 Ok(selector) => match state.artifacts.resolve(&selector) {
                     Some(artifact) => print!("{}", artifact.render_show()),
                     None => println!("Unknown artifact selector `{selector}`."),
@@ -521,8 +715,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/draw artifact ") => {
-            match parse_artifact_selector(cmd, "/draw artifact ") {
+        _ if trimmed.starts_with("/draw artifact ") => {
+            match parse_artifact_selector(trimmed, "/draw artifact ") {
                 Ok(selector) => match state.artifacts.resolve(&selector) {
                     Some(artifact) => match artifact.render_draw() {
                         Ok(rendered) => print!("{rendered}"),
@@ -534,8 +728,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/state artifact ") => {
-            match parse_artifact_state_args(cmd, "/state artifact ") {
+        _ if trimmed.starts_with("/state artifact ") => {
+            match parse_artifact_state_args(trimmed, "/state artifact ") {
                 Ok((selector, index)) => match state.artifacts.resolve(&selector) {
                     Some(artifact) => match artifact.render_state(index) {
                         Ok(rendered) => print!("{rendered}"),
@@ -547,8 +741,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/diff artifact ") => {
-            match parse_artifact_diff_args(cmd, "/diff artifact ") {
+        _ if trimmed.starts_with("/diff artifact ") => {
+            match parse_artifact_diff_args(trimmed, "/diff artifact ") {
                 Ok((selector, from, to)) => match state.artifacts.resolve(&selector) {
                     Some(artifact) => match artifact.render_diff(from, to) {
                         Ok(rendered) => print!("{rendered}"),
@@ -560,8 +754,8 @@ fn handle_tool_command(
             }
             ToolResult::Continue
         }
-        _ if cmd.starts_with("/export artifact ") => {
-            match parse_artifact_export_args(cmd, "/export artifact ") {
+        _ if trimmed.starts_with("/export artifact ") => {
+            match parse_artifact_export_args(trimmed, "/export artifact ") {
                 Ok((selector, format)) => match state.artifacts.resolve(&selector) {
                     Some(artifact) => {
                         if format == "json" {
@@ -586,14 +780,14 @@ fn handle_tool_command(
     }
 }
 
-fn handle_qa_input(input: &str, model: Option<&FlowModel>) {
+fn handle_qa_input(input: &str, model: Option<&FlowModel>, env: Option<&Env>) {
     let Some(model) = model else {
         println!("No specs loaded. Use /load <path> or restart with a path argument.");
         return;
     };
     match qa_parse::parse_statement(input, 1) {
         Ok(stmt) => {
-            let (verb, result) = exec::execute_statement(model, &stmt);
+            let (verb, result) = exec::execute_statement_with_env(model, env, &stmt);
             println!("{}", fmt::format_result(verb, &result));
         }
         Err(e) => eprintln!("  {e}"),
@@ -686,9 +880,12 @@ fn print_help(mode: Mode) {
     println!("  /quit, /q     Exit the REPL");
     println!("  /qa           Switch to QA mode");
     println!("  /abide        Switch to Abide mode");
+    println!("  /load <path>  Load a file or directory into the current base set");
     println!("  /reload       Reload specs from disk");
+    println!("  /reload <path>  Reload a specific loaded target");
     println!("  /verify       Run verification on the current in-memory environment");
     println!("  /simulate [options]  Run one seeded forward simulation");
+    println!("  /explore [options]   Build a bounded composite state-space artifact");
     println!("  /artifacts    List stored native evidence and simulation artifacts");
     println!("  /show artifact <selector>        Show artifact metadata and summary");
     println!("  /draw artifact <selector>        Draw artifact timeline when available");
@@ -796,18 +993,65 @@ fn parse_simulate_command(cmd: &str) -> Result<SimulateConfig, String> {
     Ok(config)
 }
 
-/// Load `.ab` files into a raw `Env` (pre-elaboration).
-/// The `Env` is used as the base layer for the REPL state.
-fn load_base_env(path: &Path) -> Result<Env, Vec<String>> {
-    let mut paths = Vec::new();
-    if path.is_file() {
-        paths.push(path.to_owned());
-    } else if path.is_dir() {
-        collect_abide_files(path, &mut paths);
-    } else {
-        return Err(vec![format!("path not found: {}", path.display())]);
+fn parse_explore_command(cmd: &str) -> Result<StateSpaceRequest, String> {
+    let rest = cmd
+        .strip_prefix("/explore")
+        .ok_or_else(|| "internal explore command parse error".to_owned())?
+        .trim();
+    let mut request = StateSpaceRequest::default();
+    if rest.is_empty() {
+        return Ok(request);
     }
 
+    let usage = "Usage: /explore [--slots N] [--scope Entity=N]... [--system NAME]";
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index] {
+            "--slots" => {
+                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                request.slots = value.parse::<usize>().map_err(|_| {
+                    format!("invalid `/explore --slots {value}`; expected a non-negative integer")
+                })?;
+                index += 2;
+            }
+            "--scope" => {
+                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let (entity, slots_text) = value.split_once('=').ok_or_else(|| {
+                    format!("invalid `/explore --scope {value}`; expected `Entity=N`")
+                })?;
+                if entity.trim().is_empty() {
+                    return Err(format!(
+                        "invalid `/explore --scope {value}`; entity name must not be empty"
+                    ));
+                }
+                let slots = slots_text.parse::<usize>().map_err(|_| {
+                    format!(
+                        "invalid `/explore --scope {value}`; slot count must be a non-negative integer"
+                    )
+                })?;
+                request.scopes.push((entity.to_owned(), slots));
+                index += 2;
+            }
+            "--system" => {
+                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                request.system = Some((*value).to_owned());
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown `/explore` option `{other}`; expected --slots, --scope, or --system"
+                ));
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn load_base_envs(targets: &[PathBuf]) -> Result<Env, Vec<String>> {
+    let mut paths = collect_files_for_targets(targets);
+    paths.sort();
+    paths.dedup();
     if paths.is_empty() {
         return Err(vec!["no .ab files found".to_owned()]);
     }
@@ -837,6 +1081,28 @@ fn load_base_env(path: &Path) -> Result<Env, Vec<String>> {
     Ok(env)
 }
 
+fn collect_files_for_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for target in targets {
+        if let Ok(mut target_paths) = collect_files_for_target(target) {
+            paths.append(&mut target_paths);
+        }
+    }
+    paths
+}
+
+fn collect_files_for_target(path: &Path) -> Result<Vec<PathBuf>, Vec<String>> {
+    let mut paths = Vec::new();
+    if path.is_file() {
+        paths.push(path.to_owned());
+    } else if path.is_dir() {
+        collect_abide_files(path, &mut paths);
+    } else {
+        return Err(vec![format!("path not found: {}", path.display())]);
+    }
+    Ok(paths)
+}
+
 fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
@@ -852,6 +1118,55 @@ fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
         } else if path.is_dir() {
             collect_abide_files(&path, paths);
         }
+    }
+}
+
+fn normalize_target(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|_| format!("path not found: {}", path.display()))
+}
+
+fn determine_startup_targets(load_path: Option<&Path>, scratch: bool) -> Option<Vec<PathBuf>> {
+    if scratch {
+        return None;
+    }
+    if let Some(path) = load_path {
+        return normalize_target(path).ok().map(|path| vec![path]);
+    }
+
+    let cwd = std::env::current_dir().ok()?;
+    determine_startup_targets_in_dir(&cwd)
+}
+
+fn determine_startup_targets_in_dir(dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_abide_files(dir, &mut paths);
+    if paths.is_empty() {
+        None
+    } else {
+        Some(vec![dir.to_path_buf()])
+    }
+}
+
+fn parse_target_command(cmd: &str, prefix: &str) -> Result<PathBuf, String> {
+    let rest = cmd
+        .strip_prefix(prefix)
+        .ok_or_else(|| "internal command parse error".to_owned())?
+        .trim();
+    if rest.is_empty() {
+        return Err(format!("Usage: {prefix} <path>"));
+    }
+    normalize_target(Path::new(rest))
+}
+
+fn parse_optional_target_command(cmd: &str, prefix: &str) -> Result<Option<PathBuf>, String> {
+    let rest = cmd
+        .strip_prefix(prefix)
+        .ok_or_else(|| "internal command parse error".to_owned())?
+        .trim();
+    if rest.is_empty() {
+        Ok(None)
+    } else {
+        normalize_target(Path::new(rest)).map(Some)
     }
 }
 
@@ -937,4 +1252,93 @@ fn parse_artifact_export_args(cmd: &str, prefix: &str) -> Result<(String, String
         return Err("Usage: /export artifact <selector> <format>".to_owned());
     }
     Ok((selector.to_owned(), format.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write test file");
+    }
+
+    fn simple_spec() -> &'static str {
+        "module Test\n\nenum Status = Pending | Done\n\nentity Order {\n  id: identity\n  status: Status = @Pending\n}\n"
+    }
+
+    #[test]
+    fn startup_targets_respect_scratch() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file(&dir.path().join("spec.ab"), simple_spec());
+        let targets = determine_startup_targets(Some(dir.path()), true);
+        assert!(targets.is_none());
+    }
+
+    #[test]
+    fn startup_targets_use_current_directory_when_abide_files_exist() {
+        let dir = TempDir::new().expect("tempdir");
+        write_file(&dir.path().join("spec.ab"), simple_spec());
+        let targets = determine_startup_targets_in_dir(dir.path()).expect("startup targets");
+        assert_eq!(targets, vec![dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn parse_target_command_requires_path() {
+        let err = parse_target_command("/load", "/load").expect_err("missing path");
+        assert!(err.contains("Usage: /load <path>"));
+    }
+
+    #[test]
+    fn add_loaded_target_is_noop_when_target_files_are_already_loaded() {
+        let dir = TempDir::new().expect("tempdir");
+        let subdir = dir.path().join("specs");
+        fs::create_dir_all(&subdir).expect("create specs dir");
+        let spec = subdir.join("spec.ab");
+        write_file(&spec, simple_spec());
+
+        let initial_target = normalize_target(&subdir).expect("normalize dir");
+        let env = load_base_envs(std::slice::from_ref(&initial_target)).expect("load base env");
+        let mut state = ReplState::new(vec![initial_target], Some(env));
+
+        let file_target = normalize_target(&spec).expect("normalize file");
+        match state
+            .add_loaded_target(file_target.clone())
+            .expect("load target outcome")
+        {
+            LoadTargetOutcome::AlreadyLoaded(path) => assert_eq!(path, file_target),
+            LoadTargetOutcome::Loaded { .. } => panic!("expected already loaded outcome"),
+        }
+    }
+
+    #[test]
+    fn reload_specific_target_requires_it_to_be_loaded() {
+        let dir = TempDir::new().expect("tempdir");
+        let spec = dir.path().join("spec.ab");
+        write_file(&spec, simple_spec());
+        let normalized_spec = normalize_target(&spec).expect("normalize spec");
+        let env = load_base_envs(std::slice::from_ref(&normalized_spec)).expect("load base env");
+        let mut state = ReplState::new(vec![normalized_spec], Some(env));
+
+        let other = dir.path().join("other.ab");
+        write_file(&other, simple_spec());
+        match state.reload_targets(Some(&other)).expect("reload outcome") {
+            ReloadOutcome::TargetNotLoaded(path) => {
+                assert_eq!(path, normalize_target(&other).expect("normalize other"));
+            }
+            ReloadOutcome::Reloaded { .. } | ReloadOutcome::NothingLoaded => {
+                panic!("expected target-not-loaded outcome")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_explore_command_supports_bounds() {
+        let request = parse_explore_command("/explore --slots 2 --scope Order=3 --system Commerce")
+            .expect("parse explore");
+        assert_eq!(request.slots, 2);
+        assert_eq!(request.scopes, vec![("Order".to_owned(), 3)]);
+        assert_eq!(request.system.as_deref(), Some("Commerce"));
+    }
 }

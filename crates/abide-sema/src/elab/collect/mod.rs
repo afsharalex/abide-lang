@@ -30,6 +30,16 @@ pub fn collect(program: &ast::Program) -> Env {
     env
 }
 
+/// Collect a standalone expression into its elaboration-level form.
+///
+/// This is a narrow helper for tools that need to synthesize verifier-facing
+/// declarations from ad hoc expressions while still reusing the normal
+/// resolve/check/lower pipeline over an existing `Env`.
+#[must_use]
+pub fn collect_query_expr(expr: &ast::Expr) -> EExpr {
+    collect_expr(expr)
+}
+
 /// Collect declarations from a parsed program into an existing `Env`.
 ///
 /// Used by the multi-file loader to merge declarations from multiple files

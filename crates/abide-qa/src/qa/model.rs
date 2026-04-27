@@ -6,13 +6,18 @@ use std::collections::HashMap;
 /// Built from IR, queried by QA commands.
 #[derive(Debug, Clone)]
 pub struct FlowModel {
-    /// State graphs per entity, per field.
-    /// Key: `(entity_name, field_name)`
+    /// State graphs per owner, per field.
+    /// Key: `(owner_name, field_name)`, where owner is an entity or system.
     pub state_graphs: HashMap<(String, String), StateGraph>,
+    /// Field graph metadata for every entity/system field QA can see, including
+    /// unsupported graph targets. Used for precise diagnostics.
+    pub field_graph_meta: HashMap<(String, String), FieldGraphMeta>,
     /// System information.
     pub systems: HashMap<String, SystemInfo>,
     /// Entity names.
     pub entity_names: Vec<String>,
+    /// System names.
+    pub system_names: Vec<String>,
     /// Type names.
     pub type_names: Vec<String>,
     /// Action contracts per entity.
@@ -24,6 +29,23 @@ pub struct FlowModel {
     /// graph) so QA queries can distinguish "what the user declared"
     /// from "what actions actually drive."
     pub fsm_decls: HashMap<(String, String), FsmInfo>,
+}
+
+/// What kind of declaration owns a graph-addressable field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerKind {
+    Entity,
+    System,
+}
+
+/// The graph-extraction status of one owner field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldGraphMeta {
+    pub owner: String,
+    pub field: String,
+    pub owner_kind: OwnerKind,
+    pub graphable: bool,
+    pub type_name: String,
 }
 
 /// structural info for one fsm declaration. The
@@ -40,12 +62,13 @@ pub struct FsmInfo {
     pub terminal_states: Vec<String>,
 }
 
-/// A state machine graph for a single enum-typed field of an entity.
+/// A state machine graph for a single finite owner field.
 #[derive(Debug, Clone)]
 pub struct StateGraph {
-    pub entity: String,
+    pub owner: String,
+    pub owner_kind: OwnerKind,
     pub field: String,
-    /// All states (enum variant names).
+    /// All states in the field's finite domain.
     pub states: Vec<String>,
     /// Initial state (from field default), if known.
     pub initial: Option<String>,
@@ -120,7 +143,8 @@ mod tests {
     #[test]
     fn flow_model_construction() {
         let mut sg = StateGraph {
-            entity: "Order".to_owned(),
+            owner: "Order".to_owned(),
+            owner_kind: OwnerKind::Entity,
             field: "status".to_owned(),
             states: vec!["Pending".to_owned(), "Confirmed".to_owned()],
             initial: Some("Pending".to_owned()),

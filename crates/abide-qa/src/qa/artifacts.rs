@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use abide_verify::verify::VerificationResult;
+use abide_verify::verify::{ExplicitStateSpace, VerificationResult};
 use abide_witness::{
     op, rel, Countermodel, EntitySlotRef, EvidenceEnvelope, EvidencePayload, ProofArtifactRef,
     WitnessEnvelope, WitnessValue,
@@ -23,10 +23,13 @@ pub struct SimulationArtifact {
     pub behavior: op::Behavior,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type StateSpaceArtifact = ExplicitStateSpace;
+
+#[derive(Debug, Clone)]
 pub enum ArtifactPayload {
     Evidence(EvidenceEnvelope),
     Simulation(SimulationArtifact),
+    StateSpace(StateSpaceArtifact),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +102,28 @@ impl Artifact {
                     simulation.behavior.transitions().len()
                 ));
             }
+            ArtifactPayload::StateSpace(state_space) => {
+                out.push_str("  bounded state-space exploration\n");
+                out.push_str(&format!("  systems: {}\n", state_space.systems.join(", ")));
+                out.push_str(&format!("  stutter: {}\n", state_space.stutter));
+                if state_space.store_bounds.is_empty() {
+                    out.push_str("  store bounds: (none)\n");
+                } else {
+                    out.push_str("  store bounds:\n");
+                    for store in &state_space.store_bounds {
+                        out.push_str(&format!(
+                            "    - {}: Store<{}>[{}]\n",
+                            store.name, store.entity_type, store.slots
+                        ));
+                    }
+                }
+                out.push_str(&format!(
+                    "  states: {}  transitions: {}  initial: {}\n",
+                    state_space.states.len(),
+                    state_space.transitions.len(),
+                    state_space.initial_state
+                ));
+            }
         }
         out
     }
@@ -118,6 +143,7 @@ impl Artifact {
             ArtifactPayload::Simulation(simulation) => {
                 Ok(render_behavior_timeline(&simulation.behavior, None))
             }
+            ArtifactPayload::StateSpace(state_space) => Ok(render_state_space_graph(state_space)),
         }
     }
 
@@ -136,6 +162,7 @@ impl Artifact {
             ArtifactPayload::Simulation(simulation) => {
                 render_behavior_state(&simulation.behavior, index)
             }
+            ArtifactPayload::StateSpace(state_space) => render_state_space_state(state_space, index),
         }
     }
 
@@ -154,6 +181,9 @@ impl Artifact {
             ArtifactPayload::Simulation(simulation) => {
                 render_behavior_diff(&simulation.behavior, from, to)
             }
+            ArtifactPayload::StateSpace(state_space) => {
+                render_state_space_diff(state_space, from, to)
+            }
         }
     }
 
@@ -163,6 +193,8 @@ impl Artifact {
                 .map_err(|err| format!("failed to serialize evidence: {err}")),
             ArtifactPayload::Simulation(simulation) => serde_json::to_string_pretty(simulation)
                 .map_err(|err| format!("failed to serialize simulation: {err}")),
+            ArtifactPayload::StateSpace(state_space) => serde_json::to_string_pretty(state_space)
+                .map_err(|err| format!("failed to serialize state space: {err}")),
         }
     }
 
@@ -201,7 +233,7 @@ impl ArtifactStore {
         let mut stored = 0;
         for result in results {
             let Some((name, result_kind, payload, extraction_error)) =
-                artifact_parts_from_result(result)
+                artifact_parts_from_result_with_name(result, None)
             else {
                 continue;
             };
@@ -218,6 +250,27 @@ impl ArtifactStore {
         stored
     }
 
+    pub fn record_named_verification_result(
+        &mut self,
+        name: String,
+        result: &VerificationResult,
+    ) -> usize {
+        let Some((name, result_kind, payload, extraction_error)) =
+            artifact_parts_from_result_with_name(result, Some(name))
+        else {
+            return 0;
+        };
+        self.next_id += 1;
+        self.artifacts.push(Artifact {
+            id: self.next_id,
+            name,
+            result_kind,
+            payload,
+            evidence_extraction_error: extraction_error,
+        });
+        1
+    }
+
     pub fn record_simulation_result(
         &mut self,
         name: String,
@@ -229,6 +282,18 @@ impl ArtifactStore {
             name,
             result_kind: "simulation",
             payload: ArtifactPayload::Simulation(simulation),
+            evidence_extraction_error: None,
+        });
+        1
+    }
+
+    pub fn record_state_space_result(&mut self, name: String, state_space: StateSpaceArtifact) -> usize {
+        self.next_id += 1;
+        self.artifacts.push(Artifact {
+            id: self.next_id,
+            name,
+            result_kind: "state-space",
+            payload: ArtifactPayload::StateSpace(state_space),
             evidence_extraction_error: None,
         });
         1
@@ -261,12 +326,14 @@ impl ArtifactStore {
     }
 }
 
-fn artifact_parts_from_result(
+fn artifact_parts_from_result_with_name(
     result: &VerificationResult,
+    name_override: Option<String>,
 ) -> Option<(String, &'static str, ArtifactPayload, Option<String>)> {
+    let name_or = |default: &String| name_override.clone().unwrap_or_else(|| default.clone());
     match result {
         VerificationResult::Admitted { name, evidence, .. } => Some((
-            name.clone(),
+            name_or(name),
             "admitted",
             ArtifactPayload::Evidence(evidence.clone()?),
             None,
@@ -277,7 +344,7 @@ fn artifact_parts_from_result(
             evidence_extraction_error,
             ..
         } => Some((
-            name.clone(),
+            name_or(name),
             "counterexample",
             ArtifactPayload::Evidence(evidence.clone()?),
             evidence_extraction_error.clone(),
@@ -288,7 +355,7 @@ fn artifact_parts_from_result(
             evidence_extraction_error,
             ..
         } => Some((
-            name.clone(),
+            name_or(name),
             "liveness-violation",
             ArtifactPayload::Evidence(evidence.clone()?),
             evidence_extraction_error.clone(),
@@ -299,7 +366,7 @@ fn artifact_parts_from_result(
             evidence_extraction_error,
             ..
         } => Some((
-            name.clone(),
+            name_or(name),
             "deadlock",
             ArtifactPayload::Evidence(evidence.clone()?),
             evidence_extraction_error.clone(),
@@ -321,7 +388,68 @@ fn payload_kind_label(payload: &ArtifactPayload) -> &'static str {
             _ => "evidence",
         },
         ArtifactPayload::Simulation(_) => "simulation",
+        ArtifactPayload::StateSpace(_) => "state-space",
     }
+}
+
+fn render_state_space_graph(state_space: &StateSpaceArtifact) -> String {
+    let mut outgoing: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+    let mut edges_by_state: BTreeMap<usize, Vec<(String, usize)>> = BTreeMap::new();
+    for transition in &state_space.transitions {
+        outgoing.entry(transition.from).or_default().push(&transition.label);
+        edges_by_state
+            .entry(transition.from)
+            .or_default()
+            .push((transition.label.clone(), transition.to));
+    }
+
+    let mut out = String::new();
+    for state_index in 0..state_space.states.len() {
+        let initial_marker = if state_space.initial_state == state_index {
+            "  <initial>"
+        } else {
+            ""
+        };
+        out.push_str(&format!("[state {state_index}]{initial_marker}\n"));
+        if let Some(edges) = edges_by_state.get(&state_index) {
+            for (label, to) in edges {
+                out.push_str(&format!("  -- {label} --> [state {to}]\n"));
+            }
+        }
+    }
+    out
+}
+
+fn render_state_space_state(
+    state_space: &StateSpaceArtifact,
+    index: usize,
+) -> Result<String, String> {
+    let state = state_space
+        .states
+        .get(index)
+        .ok_or_else(|| format!("state index {index} is out of bounds"))?;
+    Ok(render_operational_state(state, index))
+}
+
+fn render_state_space_diff(
+    state_space: &StateSpaceArtifact,
+    from: usize,
+    to: usize,
+) -> Result<String, String> {
+    let before = state_space_state_lines(state_space, from)?;
+    let after = state_space_state_lines(state_space, to)?;
+    render_state_diff(before, after, from, to)
+}
+
+fn state_space_state_lines(
+    state_space: &StateSpaceArtifact,
+    index: usize,
+) -> Result<Vec<String>, String> {
+    let state = state_space
+        .states
+        .get(index)
+        .ok_or_else(|| format!("state index {index} is out of bounds"))?;
+    Ok(operational_state_lines(state))
 }
 
 fn render_witness_summary(out: &mut String, witness: &WitnessEnvelope) {

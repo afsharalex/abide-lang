@@ -4,7 +4,10 @@
 //! Disambiguation: `ask reachable...` is a QA command; `ask(x)` would be
 //! a user function call (handled by the Abide parser, not here).
 
-use super::ast::{BlockArg, BlockPredicate, QAStatement, Query, SimulationRequest};
+use super::ast::{
+    BlockArg, BlockPredicate, QAStatement, Query, SimulationRequest, StateSpaceRequest,
+    TemporalBounds, TemporalOp, TemporalTarget,
+};
 
 /// Parse error for QA input.
 #[derive(Debug, Clone)]
@@ -110,6 +113,7 @@ pub fn parse_statement(input: &str, line: usize) -> Result<QAStatement, QAParseE
         "load" => parse_load(input, line),
         "verify" => Ok(QAStatement::Verify),
         "simulate" => parse_simulate(&tokens[1..], line),
+        "explore" => parse_explore(&tokens[1..], line),
         "artifacts" => Ok(QAStatement::Artifacts),
         "show" => parse_show_artifact(&tokens[1..], line),
         "draw" => parse_draw_artifact(&tokens[1..], line),
@@ -127,7 +131,7 @@ pub fn parse_statement(input: &str, line: usize) -> Result<QAStatement, QAParseE
         "assert" => Ok(QAStatement::Assert(parse_query(&tokens[1..], line)?)),
         _ => Err(QAParseError {
             message: format!(
-                "expected 'ask', 'explain', 'assert', 'load', 'verify', 'simulate', 'artifacts', 'show', 'draw', 'state', 'diff', or 'export', got '{}'",
+                "expected 'ask', 'explain', 'assert', 'load', 'verify', 'simulate', 'explore', 'artifacts', 'show', 'draw', 'state', 'diff', or 'export', got '{}'",
                 tokens[0]
             ),
             line,
@@ -199,6 +203,53 @@ fn parse_simulate(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseEr
         }
     }
     Ok(QAStatement::Simulate(request))
+}
+
+fn parse_explore(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
+    let mut request = StateSpaceRequest::default();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index] {
+            "--slots" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: "explore --slots requires a value".to_owned(),
+                    line,
+                })?;
+                request.slots = parse_usize(value, "slot count", line)?;
+                index += 2;
+            }
+            "--scope" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: "explore --scope requires Entity=N".to_owned(),
+                    line,
+                })?;
+                let (entity, slots) = value.split_once('=').ok_or_else(|| QAParseError {
+                    message: format!("invalid explore scope '{value}', expected Entity=N"),
+                    line,
+                })?;
+                request.scopes.push((
+                    entity.to_owned(),
+                    parse_usize(slots, "scope slot count", line)?,
+                ));
+                index += 2;
+            }
+            "--system" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: "explore --system requires a system name".to_owned(),
+                    line,
+                })?;
+                request.system = Some((*value).to_owned());
+                index += 2;
+            }
+            other => {
+                return Err(QAParseError {
+                    message: format!("unknown explore option '{other}'"),
+                    line,
+                });
+            }
+        }
+    }
+    Ok(QAStatement::Explore(request))
 }
 
 fn parse_show_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
@@ -356,14 +407,8 @@ fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
         }
 
         // Temporal assertions (delegate to Abide expression)
-        "always" => {
-            let expr_str = tokens[1..].join(" ");
-            Ok(Query::AlwaysExpr(expr_str))
-        }
-        "eventually" => {
-            let expr_str = tokens[1..].join(" ");
-            Ok(Query::EventuallyExpr(expr_str))
-        }
+        "always" => parse_temporal_query(TemporalOp::Always, &tokens[1..], line),
+        "eventually" => parse_temporal_query(TemporalOp::Eventually, &tokens[1..], line),
 
         other => Err(QAParseError {
             message: format!(
@@ -374,6 +419,123 @@ fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
             line,
         }),
     }
+}
+
+fn parse_temporal_query(op: TemporalOp, tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+    if tokens.is_empty() {
+        return Err(QAParseError {
+            message: format!(
+                "{} requires an expression",
+                match op {
+                    TemporalOp::Always => "always",
+                    TemporalOp::Eventually => "eventually",
+                }
+            ),
+            line,
+        });
+    }
+
+    let mut bounds = TemporalBounds::default();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index] {
+            "--slots" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: format!(
+                        "{} --slots requires a value",
+                        match op {
+                            TemporalOp::Always => "always",
+                            TemporalOp::Eventually => "eventually",
+                        }
+                    ),
+                    line,
+                })?;
+                bounds.slots = Some(parse_usize(value, "slot count", line)?);
+                index += 2;
+            }
+            "--scope" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: format!(
+                        "{} --scope requires Entity=N",
+                        match op {
+                            TemporalOp::Always => "always",
+                            TemporalOp::Eventually => "eventually",
+                        }
+                    ),
+                    line,
+                })?;
+                let (entity, slots) = value.split_once('=').ok_or_else(|| QAParseError {
+                    message: format!("invalid temporal scope '{value}', expected Entity=N"),
+                    line,
+                })?;
+                bounds
+                    .scopes
+                    .push((entity.to_owned(), parse_usize(slots, "scope slot count", line)?));
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+
+    let (target, expr_tokens) = if tokens.get(index).copied() == Some("on") {
+        if tokens.len() < index + 3 {
+            return Err(QAParseError {
+                message: format!(
+                    "expected: {} on Owner[.field] <expr>",
+                    match op {
+                        TemporalOp::Always => "always",
+                        TemporalOp::Eventually => "eventually",
+                    }
+                ),
+                line,
+            });
+        }
+        (Some(parse_temporal_target(tokens[index + 1], line)?), &tokens[index + 2..])
+    } else {
+        (None, &tokens[index..])
+    };
+
+    let expr = expr_tokens.join(" ");
+    if expr.trim().is_empty() {
+        return Err(QAParseError {
+            message: format!(
+                "{} requires an expression",
+                match op {
+                    TemporalOp::Always => "always",
+                    TemporalOp::Eventually => "eventually",
+                }
+            ),
+            line,
+        });
+    }
+
+    Ok(Query::Temporal {
+        op,
+        bounds,
+        target,
+        expr,
+    })
+}
+
+fn parse_temporal_target(token: &str, line: usize) -> Result<TemporalTarget, QAParseError> {
+    if let Some((owner, field)) = token.split_once('.') {
+        return Ok(TemporalTarget {
+            owner: owner.to_owned(),
+            field: Some(field.to_owned()),
+        });
+    }
+
+    if token.is_empty() {
+        return Err(QAParseError {
+            message: "expected Owner or Owner.field after `on`".to_owned(),
+            line,
+        });
+    }
+
+    Ok(TemporalTarget {
+        owner: token.to_owned(),
+        field: None,
+    })
 }
 
 /// Parse `E.field` from tokens. Returns `(entity, field)`.
@@ -1027,11 +1189,72 @@ mod tests {
     fn parse_assert_always() {
         let stmts = parse_qa("assert always (all o: Order | o.balance >= 0)").unwrap();
         match &stmts[0] {
-            QAStatement::Assert(Query::AlwaysExpr(expr)) => {
+            QAStatement::Assert(Query::Temporal {
+                op: TemporalOp::Always,
+                bounds,
+                target: None,
+                expr,
+            }) => {
+                assert!(bounds.is_empty());
                 assert!(expr.contains("all o: Order"));
             }
-            other => panic!("expected Assert(AlwaysExpr), got {other:?}"),
+            other => panic!("expected Assert(Temporal Always), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_assert_always_with_explicit_target() {
+        let stmts = parse_qa("assert always on Order.status (o.status == @Paid)").unwrap();
+        match &stmts[0] {
+            QAStatement::Assert(Query::Temporal {
+                op: TemporalOp::Always,
+                bounds,
+                target: Some(target),
+                expr,
+            }) => {
+                assert!(bounds.is_empty());
+                assert_eq!(target.owner, "Order");
+                assert_eq!(target.field.as_deref(), Some("status"));
+                assert!(expr.contains("o.status"));
+            }
+            other => panic!("expected Assert(Temporal Always on target), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_assert_always_with_temporal_bounds() {
+        let stmts = parse_qa(
+            "assert always --slots 6 --scope Order=2 on Commerce (all o: Order | o.total >= 0.0)",
+        )
+        .unwrap();
+        match &stmts[0] {
+            QAStatement::Assert(Query::Temporal {
+                op: TemporalOp::Always,
+                bounds,
+                target: Some(target),
+                expr,
+            }) => {
+                assert_eq!(bounds.slots, Some(6));
+                assert_eq!(bounds.scopes, vec![("Order".to_owned(), 2)]);
+                assert_eq!(target.owner, "Commerce");
+                assert_eq!(target.field, None);
+                assert!(expr.contains("all o: Order"));
+            }
+            other => panic!("expected Assert(Temporal Always with bounds), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_explore_with_bounds() {
+        let stmts = parse_qa("explore --slots 2 --scope Order=3 --system Commerce").unwrap();
+        assert_eq!(
+            stmts[0],
+            QAStatement::Explore(StateSpaceRequest {
+                slots: 2,
+                scopes: vec![("Order".to_owned(), 3)],
+                system: Some("Commerce".to_owned()),
+            })
+        );
     }
 
     #[test]
