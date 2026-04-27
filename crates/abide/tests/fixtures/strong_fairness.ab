@@ -74,6 +74,7 @@ theorem weak_liveness for Sys {
 // ── Test 3: Safety property unaffected ──────────────────────────────
 verify safety_check {
   assume {
+    stutter
     store es: E[0..3]
     let sys = Sys { es: es }
   }

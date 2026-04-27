@@ -2,6 +2,8 @@
 
 CARGO := cargo
 LLVM_COV := cargo llvm-cov
+RUN_WITH_TIMEOUT := python3 tools/run_with_timeout.py
+CARGO_TIMEOUT_SECS ?= 3600
 
 help:
 	@printf "Available targets:\n"
@@ -19,10 +21,10 @@ help:
 	@printf "  make clean             Remove build artifacts\n"
 
 build:
-	$(CARGO) build --workspace
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "workspace build" -- $(CARGO) build --workspace
 
 run:
-	$(CARGO) run -p abide -- $(ARGS)
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide run" -- $(CARGO) run -p abide -- $(ARGS)
 
 fmt:
 	$(CARGO) fmt
@@ -31,22 +33,22 @@ fmt-check:
 	$(CARGO) fmt --check
 
 clippy:
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "workspace clippy" -- $(CARGO) clippy --workspace --all-targets -- -D warnings
 
 test:
-	$(CARGO) test --workspace
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "workspace tests" -- $(CARGO) test --workspace
 
 test-lib:
-	$(CARGO) test -p abide --lib
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide lib tests" -- $(CARGO) test -p abide --lib
 
 test-integration:
-	$(CARGO) test -p abide --test integration
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide integration tests" -- $(CARGO) test -p abide --test integration
 
 coverage:
-	$(LLVM_COV) -p abide --lib --tests
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide coverage" -- $(LLVM_COV) -p abide --lib --tests
 
 coverage-html:
-	$(LLVM_COV) -p abide --lib --tests --html
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide html coverage" -- $(LLVM_COV) -p abide --lib --tests --html
 
 check: fmt-check clippy test
 

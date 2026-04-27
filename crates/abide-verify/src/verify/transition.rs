@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::ir::types::{
-    IRAssumptionSet, IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify,
+    IRAssumptionSet, IRCommandRef, IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify,
 };
 
 use super::context::VerifyContext;
@@ -29,10 +29,10 @@ use super::walkers::count_entity_quantifiers;
 
 #[derive(Debug, Clone)]
 pub struct TransitionAssumptions {
-    pub stutter: bool,
-    pub weak_fair_event_keys: Vec<(String, String)>,
-    pub strong_fair_event_keys: Vec<(String, String)>,
-    pub per_tuple_fair_event_keys: Vec<(String, String)>,
+    stutter: bool,
+    weak_fair_event_keys: Vec<(String, String)>,
+    strong_fair_event_keys: Vec<(String, String)>,
+    per_tuple_fair_event_keys: Vec<(String, String)>,
 }
 
 impl TransitionAssumptions {
@@ -55,6 +55,52 @@ impl TransitionAssumptions {
                 .map(|event| (event.system.clone(), event.command.clone()))
                 .collect(),
         }
+    }
+
+    pub fn as_ir_assumption_set(&self) -> IRAssumptionSet {
+        IRAssumptionSet {
+            stutter: self.stutter,
+            weak_fair: self
+                .weak_fair_event_keys
+                .iter()
+                .map(|(system, command)| IRCommandRef {
+                    system: system.clone(),
+                    command: command.clone(),
+                })
+                .collect(),
+            strong_fair: self
+                .strong_fair_event_keys
+                .iter()
+                .map(|(system, command)| IRCommandRef {
+                    system: system.clone(),
+                    command: command.clone(),
+                })
+                .collect(),
+            per_tuple: self
+                .per_tuple_fair_event_keys
+                .iter()
+                .map(|(system, command)| IRCommandRef {
+                    system: system.clone(),
+                    command: command.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn stutter(&self) -> bool {
+        self.stutter
+    }
+
+    pub fn weak_fair_event_keys(&self) -> &[(String, String)] {
+        &self.weak_fair_event_keys
+    }
+
+    pub fn strong_fair_event_keys(&self) -> &[(String, String)] {
+        &self.strong_fair_event_keys
+    }
+
+    pub fn per_tuple_fair_event_keys(&self) -> &[(String, String)] {
+        &self.per_tuple_fair_event_keys
     }
 
     pub fn all_fair_event_keys(&self) -> Vec<(String, String)> {
@@ -336,6 +382,14 @@ impl<'a> TransitionSafetySpec<'a> {
             span: None,
         }))
     }
+
+    pub fn obligation(&self, property_index: usize, timeout_ms: u64) -> TransitionObligation<'a> {
+        TransitionObligation::SystemSafety {
+            safety: self.clone(),
+            property_index,
+            timeout_ms,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -455,6 +509,22 @@ impl<'a> TransitionVerifyObligation<'a> {
     pub fn has_supported_liveness(&self) -> bool {
         self.liveness.is_some()
     }
+
+    pub fn deadlock_plan(&self) -> TransitionExecutionPlan<'a> {
+        TransitionExecutionPlan::for_deadlock_probe(self.system().clone())
+    }
+
+    pub fn prefix_plan(&self, steps: usize) -> TransitionExecutionPlan<'a> {
+        TransitionExecutionPlan::for_prefix_probe(self.system().clone(), steps)
+    }
+
+    pub fn bmc_plan(&self) -> TransitionExecutionPlan<'a> {
+        TransitionExecutionPlan::for_bmc(self.system().clone(), self.system().bound())
+    }
+
+    pub fn lasso_plan(&self) -> TransitionExecutionPlan<'a> {
+        TransitionExecutionPlan::for_lasso(self.system().clone(), self.system().bound())
+    }
 }
 
 pub struct TransitionSmtEncoding<'a> {
@@ -511,6 +581,10 @@ impl<'a> TransitionExecutionPlan<'a> {
         Self::new(system, steps, true, true, true)
     }
 
+    pub fn for_inductive_step(system: TransitionSystemSpec<'a>) -> Self {
+        Self::new(system, 1, false, false, false)
+    }
+
     pub fn system(&self) -> &TransitionSystemSpec<'a> {
         &self.system
     }
@@ -536,6 +610,7 @@ impl<'a> TransitionSmtEncoding<'a> {
     pub fn from_plan(plan: TransitionExecutionPlan<'a>) -> Result<Self, String> {
         let system = plan.system;
         let steps = plan.steps;
+        let assumption_set = system.assumptions().as_ir_assumption_set();
         let pool = create_slot_pool_with_systems(
             system.relevant_entities(),
             system.slots_per_entity(),
@@ -568,36 +643,7 @@ impl<'a> TransitionSmtEncoding<'a> {
             system.relevant_entities(),
             system.relevant_systems(),
             steps,
-            &IRAssumptionSet {
-                stutter: system.assumptions().stutter,
-                weak_fair: system
-                    .assumptions()
-                    .weak_fair_event_keys
-                    .iter()
-                    .map(|(system, command)| crate::ir::types::IRCommandRef {
-                        system: system.clone(),
-                        command: command.clone(),
-                    })
-                    .collect(),
-                strong_fair: system
-                    .assumptions()
-                    .strong_fair_event_keys
-                    .iter()
-                    .map(|(system, command)| crate::ir::types::IRCommandRef {
-                        system: system.clone(),
-                        command: command.clone(),
-                    })
-                    .collect(),
-                per_tuple: system
-                    .assumptions()
-                    .per_tuple_fair_event_keys
-                    .iter()
-                    .map(|(system, command)| crate::ir::types::IRCommandRef {
-                        system: system.clone(),
-                        command: command.clone(),
-                    })
-                    .collect(),
-            },
+            &assumption_set,
         )?;
         let (lasso, fairness_constraints) = if plan.include_lasso_and_fairness {
             let lasso =
@@ -609,36 +655,7 @@ impl<'a> TransitionSmtEncoding<'a> {
                 system.relevant_systems(),
                 &fire_tracking,
                 &lasso,
-                &IRAssumptionSet {
-                    stutter: system.assumptions().stutter,
-                    weak_fair: system
-                        .assumptions()
-                        .weak_fair_event_keys
-                        .iter()
-                        .map(|(system, command)| crate::ir::types::IRCommandRef {
-                            system: system.clone(),
-                            command: command.clone(),
-                        })
-                        .collect(),
-                    strong_fair: system
-                        .assumptions()
-                        .strong_fair_event_keys
-                        .iter()
-                        .map(|(system, command)| crate::ir::types::IRCommandRef {
-                            system: system.clone(),
-                            command: command.clone(),
-                        })
-                        .collect(),
-                    per_tuple: system
-                        .assumptions()
-                        .per_tuple_fair_event_keys
-                        .iter()
-                        .map(|(system, command)| crate::ir::types::IRCommandRef {
-                            system: system.clone(),
-                            command: command.clone(),
-                        })
-                        .collect(),
-                },
+                &assumption_set,
             )?;
             (Some(lasso), fairness_constraints)
         } else {
@@ -913,6 +930,20 @@ impl<'a> TransitionLivenessSpec<'a> {
     pub fn pattern_slot_count(&self, pattern_index: usize) -> Option<usize> {
         Some(self.recipe(pattern_index)?.slot_count())
     }
+
+    pub fn obligation(
+        &self,
+        recipe_index: usize,
+        target_slot: Option<usize>,
+        timeout_ms: u64,
+    ) -> TransitionObligation<'a> {
+        TransitionObligation::SystemLiveness {
+            liveness: self.clone(),
+            recipe_index,
+            target_slot,
+            timeout_ms,
+        }
+    }
 }
 
 pub use super::ic3::{Ic3Result as TransitionResult, Ic3TraceStep as TransitionTraceStep};
@@ -1140,7 +1171,7 @@ mod tests {
             }],
         });
 
-        assert!(!assumptions.stutter);
+        assert!(!assumptions.stutter());
         assert_eq!(
             assumptions.all_fair_event_keys(),
             vec![
@@ -1149,9 +1180,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            assumptions.per_tuple_fair_event_keys,
-            vec![("Sys".to_owned(), "other".to_owned())]
+            assumptions.per_tuple_fair_event_keys(),
+            &[("Sys".to_owned(), "other".to_owned())]
         );
+        let roundtrip = assumptions.as_ir_assumption_set();
+        assert!(!roundtrip.stutter);
+        assert_eq!(roundtrip.weak_fair.len(), 2);
+        assert_eq!(roundtrip.strong_fair.len(), 1);
+        assert_eq!(roundtrip.per_tuple.len(), 1);
     }
 
     #[test]
@@ -1435,6 +1471,15 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            liveness.obligation(0, Some(1), 123),
+            TransitionObligation::SystemLiveness {
+                recipe_index: 0,
+                target_slot: Some(1),
+                timeout_ms: 123,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1481,7 +1526,8 @@ mod tests {
         .expect("expected selected system");
 
         let bmc = TransitionExecutionPlan::for_bmc(system.clone(), 3);
-        let lasso = TransitionExecutionPlan::for_lasso(system, 3);
+        let lasso = TransitionExecutionPlan::for_lasso(system.clone(), 3);
+        let inductive = TransitionExecutionPlan::for_inductive_step(system);
 
         assert_eq!(bmc.steps(), 3);
         assert!(bmc.include_system_initial_constraints());
@@ -1492,5 +1538,10 @@ mod tests {
         assert!(lasso.include_system_initial_constraints());
         assert!(lasso.include_symmetry_constraints());
         assert!(lasso.include_lasso_and_fairness());
+
+        assert_eq!(inductive.steps(), 1);
+        assert!(!inductive.include_system_initial_constraints());
+        assert!(!inductive.include_symmetry_constraints());
+        assert!(!inductive.include_lasso_and_fairness());
     }
 }

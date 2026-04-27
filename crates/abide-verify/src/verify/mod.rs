@@ -67,8 +67,7 @@ use crate::ir::types::{IRAction, IRExpr, IRProgram, IRSystem, IRType, IRVerify};
 pub use self::chc::ChcSelection;
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints,
-    try_transition_constraints_with_fire, SlotPool,
+    create_slot_pool_with_systems, domain_constraints, initial_state_constraints, SlotPool,
 };
 use self::smt::SmtValue;
 use self::solver::{
@@ -1665,7 +1664,9 @@ fn check_for_deadlock(
     witness_semantics: WitnessSemantics,
 ) -> Option<VerificationResult> {
     let system = transition::TransitionSystemSpec::for_verify_shallow(ir, vctx, verify_block)?;
-    let encoding = match transition::TransitionSmtEncoding::for_deadlock_probe(system) {
+    let encoding = match transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_deadlock_probe(system),
+    ) {
         Ok(encoding) => encoding,
         Err(_) => return None,
     };
@@ -1820,7 +1821,10 @@ fn find_deadlock_step(
             HashMap::new(),
             &verify_block.assumption_set,
         )?;
-        let encoding = transition::TransitionSmtEncoding::for_prefix_probe(system, k).ok()?;
+        let encoding = transition::TransitionSmtEncoding::from_plan(
+            transition::TransitionExecutionPlan::for_prefix_probe(system, k),
+        )
+        .ok()?;
         let probe_solver = AbideSolver::new();
         if config.bmc_timeout_ms > 0 {
             probe_solver.set_timeout(config.bmc_timeout_ms);
@@ -1875,8 +1879,10 @@ fn find_deadlock_step(
                 HashMap::new(),
                 &verify_block.assumption_set,
             )?;
-            let sat_encoding =
-                transition::TransitionSmtEncoding::for_prefix_probe(sat_system, sat_steps).ok()?;
+            let sat_encoding = transition::TransitionSmtEncoding::from_plan(
+                transition::TransitionExecutionPlan::for_prefix_probe(sat_system, sat_steps),
+            )
+            .ok()?;
             let sat_pool = sat_encoding.pool();
             let sat_fire_tracking = sat_encoding.fire_tracking();
             let evidence = match witness_semantics {
@@ -1925,8 +1931,10 @@ fn find_deadlock_step(
                 HashMap::new(),
                 &verify_block.assumption_set,
             )?;
-            let sat_encoding =
-                transition::TransitionSmtEncoding::for_prefix_probe(sat_system, sat_steps).ok()?;
+            let sat_encoding = transition::TransitionSmtEncoding::from_plan(
+                transition::TransitionExecutionPlan::for_prefix_probe(sat_system, sat_steps),
+            )
+            .ok()?;
             let sat_pool = sat_encoding.pool();
             extract_deadlock_diagnostics(
                 sat_solver,
@@ -2375,17 +2383,19 @@ fn try_induction_on_verify(
 
     // ── Step case: P(k) ∧ transition(k→k+1) → P(k+1) ─────────────
     {
-        let pool = create_slot_pool_with_systems(
-            system.relevant_entities(),
-            system.slots_per_entity(),
-            1,
-            system.relevant_systems(),
-        );
+        let encoding = match transition::TransitionSmtEncoding::from_plan(
+            transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
+        ) {
+            Ok(encoding) => encoding,
+            Err(_) => return None,
+        };
+        let pool = encoding.pool();
+        let fire_tracking = encoding.fire_tracking();
         let solver = AbideSolver::new();
         solver.set_timeout(config.induction_timeout_ms);
 
-        for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
-            solver.assert(&c);
+        for c in encoding.domain_constraints() {
+            solver.assert(c);
         }
 
         // Assume P at step 0
@@ -2407,17 +2417,6 @@ fn try_induction_on_verify(
         // One transition with command fire tracking. Bounded witness paths use
         // the command-level fire indicators as native provenance instead of
         // reconstructing events heuristically from state deltas.
-        let fire_tracking = match try_transition_constraints_with_fire(
-            &pool,
-            vctx,
-            system.relevant_entities(),
-            system.relevant_systems(),
-            1,
-            &verify_block.assumption_set,
-        ) {
-            Ok(fire_tracking) => fire_tracking,
-            Err(_) => return None,
-        };
         for c in &fire_tracking.constraints {
             solver.assert(c);
         }
@@ -2428,7 +2427,7 @@ fn try_induction_on_verify(
         // induction would prove the property "vacuously" — `P ∧ false
         // → P'` is trivially true — and silently mask the deadlock.
         // Bail out to BMC, which has explicit deadlock detection.
-        if !verify_block.assumption_set.stutter {
+        if !system.assumptions().stutter() {
             match solver.check() {
                 SatResult::Unsat => return None,
                 SatResult::Sat | SatResult::Unknown(_) => {}
@@ -2620,33 +2619,20 @@ pub(super) fn try_liveness_reduction(
     // ── Inductive step (the core of the proof) ──────────────────────
     // For each liveness assert, build a monitor and check
     // `not accepting(k+1)` given `not accepting(k)` and one transition.
-    let pool = create_slot_pool_with_systems(
-        system.relevant_entities(),
-        system.slots_per_entity(),
-        1,
-        system.relevant_systems(),
-    );
+    let encoding = match transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
+    ) {
+        Ok(encoding) => encoding,
+        Err(_) => return None,
+    };
+    let pool = encoding.pool();
+    let fire_tracking = encoding.fire_tracking();
     let solver = AbideSolver::new();
     solver.set_timeout(config.induction_timeout_ms);
 
-    for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
-        solver.assert(&c);
+    for c in encoding.domain_constraints() {
+        solver.assert(c);
     }
-
-    // Fire tracking for the single transition step (0→1).
-    // stutter is conditional on the verification site's
-    // `assume { stutter }`.
-    let fire_tracking = match try_transition_constraints_with_fire(
-        &pool,
-        vctx,
-        system.relevant_entities(),
-        system.relevant_systems(),
-        1,
-        &verify_block.assumption_set,
-    ) {
-        Ok(fire_tracking) => fire_tracking,
-        Err(_) => return None,
-    };
     for c in &fire_tracking.constraints {
         solver.assert(c);
     }
@@ -2953,14 +2939,11 @@ pub(super) fn try_liveness_reduction(
                 None // non-quantified: no per-slot restriction
             };
 
-            let ic3_result = transition::solve_transition_obligation(
-                transition::TransitionObligation::SystemLiveness {
-                    liveness: liveness.clone(),
-                    recipe_index,
-                    target_slot,
-                    timeout_ms: config.ic3_timeout_ms / 2,
-                },
-            );
+            let ic3_result = transition::solve_transition_obligation(liveness.obligation(
+                recipe_index,
+                target_slot,
+                config.ic3_timeout_ms / 2,
+            ));
 
             if let transition::TransitionResult::Proved = ic3_result {
                 // This slot proved — continue to check remaining slots
@@ -3075,11 +3058,7 @@ fn try_ic3_on_verify(
     // per-slot independence can produce spurious intermediate states).
     for (property_index, _) in safety.step_properties().iter().enumerate() {
         let result = transition::solve_transition_obligation(
-            transition::TransitionObligation::SystemSafety {
-                safety: safety.clone(),
-                property_index,
-                timeout_ms: config.ic3_timeout_ms,
-            },
+            safety.obligation(property_index, config.ic3_timeout_ms),
         );
         match result {
             transition::TransitionResult::Proved => {} // this assert proved, continue
@@ -3223,7 +3202,9 @@ fn check_verify_block(
     }
 
     // ── 3. Create compiled bounded transition encoding ────────────
-    let encoding = match transition::TransitionSmtEncoding::for_bmc(system.clone(), bound) {
+    let encoding = match transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_bmc(system.clone(), bound),
+    ) {
         Ok(encoding) => encoding,
         Err(msg) => {
             return VerificationResult::Unprovable {
@@ -3501,7 +3482,8 @@ fn check_verify_block_lasso(
 ) -> VerificationResult {
     let start = Instant::now();
 
-    let Some(system) = transition::TransitionSystemSpec::for_verify_shallow(ir, vctx, verify_block)
+    let Some(obligation) =
+        transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)
     else {
         return VerificationResult::Unprovable {
             name: verify_block.name.clone(),
@@ -3510,6 +3492,7 @@ fn check_verify_block_lasso(
             file: verify_block.file.clone(),
         };
     };
+    let system = obligation.system();
 
     if system.slots_per_entity().is_empty() {
         // No entities — lasso BMC requires entity state for loop-back.
@@ -3519,7 +3502,7 @@ fn check_verify_block_lasso(
     let bound = system.bound();
 
     // ── 2. Create pool and solver ───────────────────────────────────
-    let encoding = match transition::TransitionSmtEncoding::for_lasso(system.clone(), bound) {
+    let encoding = match transition::TransitionSmtEncoding::from_plan(obligation.lasso_plan()) {
         Ok(encoding) => encoding,
         Err(msg) => {
             return VerificationResult::Unprovable {

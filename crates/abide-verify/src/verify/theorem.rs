@@ -1132,22 +1132,19 @@ fn try_ic3_on_theorem(
 
     // Try IC3 on each show expression
     for (property_index, _) in safety.step_properties().iter().enumerate() {
+        let timeout_ms = match clamp_timeout_to_deadline(config.ic3_timeout_ms, deadline) {
+            Some(timeout_ms) => timeout_ms,
+            None => {
+                return Some(VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: verification_timeout_hint(config),
+                    span: theorem.span,
+                    file: theorem.file.clone(),
+                })
+            }
+        };
         let result = super::transition::solve_transition_obligation(
-            super::transition::TransitionObligation::SystemSafety {
-                safety: safety.clone(),
-                property_index,
-                timeout_ms: match clamp_timeout_to_deadline(config.ic3_timeout_ms, deadline) {
-                    Some(timeout_ms) => timeout_ms,
-                    None => {
-                        return Some(VerificationResult::Unprovable {
-                            name: theorem.name.clone(),
-                            hint: verification_timeout_hint(config),
-                            span: theorem.span,
-                            file: theorem.file.clone(),
-                        })
-                    }
-                },
-            },
+            safety.obligation(property_index, timeout_ms),
         );
         match result {
             super::transition::TransitionResult::Proved => {}
