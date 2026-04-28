@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::ir::types::{IRExpr, IRVerify};
+use crate::ir::types::{IRExpr, IRVerify, LitVal};
 
 use super::defenv;
 use super::ltl::{Formula as LtlFormula, GeneralizedBuchi};
@@ -100,7 +100,7 @@ impl CompiledTemporalFormula {
         let contains_past_time = contains_past_time(&expanded);
         let extraction = extract_liveness_pattern_inner(&normalized);
         let spot = compile_spot_formula(&normalized, contains_past_time);
-        let buchi = compile_buchi_formula(&expanded, contains_past_time);
+        let buchi = compile_buchi_formula(&normalized, contains_past_time);
         Self {
             expanded,
             normalized,
@@ -148,6 +148,8 @@ impl CompiledTemporalFormula {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TemporalFormula {
+    True,
+    False,
     Atom(String),
     Not(Box<TemporalFormula>),
     And(Vec<TemporalFormula>),
@@ -187,6 +189,18 @@ pub struct TemporalFormulaExport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BuchiAutomatonExport {
+    pub format: &'static str,
+    pub version: &'static str,
+    pub automaton_kind: &'static str,
+    pub acceptance: &'static str,
+    pub hoa: String,
+    pub state_count: usize,
+    pub acceptance_set_count: usize,
+    pub atoms: Vec<TemporalAtomExport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TemporalAtomExport {
     pub label: String,
     pub expr_debug: String,
@@ -200,6 +214,8 @@ pub struct VerifyTemporalExport {
     pub contains_past_time: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spot: Option<TemporalFormulaExport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buchi: Option<BuchiAutomatonExport>,
 }
 
 impl CompiledSpotFormula {
@@ -250,6 +266,30 @@ impl CompiledBuchiFormula {
     pub(super) fn atom_expr(&self, atom: usize) -> Option<&IRExpr> {
         self.atoms.get(atom).map(|binding| &binding.expr)
     }
+
+    pub fn export(&self) -> BuchiAutomatonExport {
+        let atom_labels = (0..self.atoms.len())
+            .map(|atom| format!("p{atom}"))
+            .collect::<Vec<_>>();
+        BuchiAutomatonExport {
+            format: "hoa",
+            version: "v1",
+            automaton_kind: "generalized-buchi",
+            acceptance: "state",
+            hoa: self.automaton.to_hoa(&atom_labels),
+            state_count: self.automaton.state_count(),
+            acceptance_set_count: self.automaton.acceptance_set_count(),
+            atoms: self
+                .atoms
+                .iter()
+                .enumerate()
+                .map(|(atom, binding)| TemporalAtomExport {
+                    label: format!("p{atom}"),
+                    expr_debug: format!("{:?}", binding.expr),
+                })
+                .collect(),
+        }
+    }
 }
 
 pub fn export_verify_temporal_formulas(
@@ -268,6 +308,7 @@ pub fn export_verify_temporal_formulas(
                 contains_liveness: compiled.contains_liveness(),
                 contains_past_time: compiled.contains_past_time(),
                 spot: compiled.spot().map(CompiledSpotFormula::export),
+                buchi: compiled.buchi().map(CompiledBuchiFormula::export),
             }
         })
         .collect()
@@ -288,12 +329,8 @@ fn compile_spot_formula(
 
 fn compile_buchi_formula(
     expanded: &IRExpr,
-    contains_past_time: bool,
+    _contains_past_time: bool,
 ) -> Option<CompiledBuchiFormula> {
-    if contains_past_time {
-        return None;
-    }
-
     let mut atoms = Vec::new();
     let mut next_atom = 0usize;
     let root = lower_to_buchi_formula(expanded, &mut atoms, &mut next_atom)?;
@@ -306,21 +343,39 @@ fn lower_to_buchi_formula(
     atoms: &mut Vec<BuchiAtomBinding>,
     next_atom: &mut usize,
 ) -> Option<LtlFormula> {
-    if !contains_temporal(expr) {
-        let atom = *next_atom;
-        *next_atom += 1;
-        atoms.push(BuchiAtomBinding { expr: expr.clone() });
-        return Some(LtlFormula::atom(atom));
+    if let IRExpr::Lit {
+        value: LitVal::Bool { value },
+        ..
+    } = expr
+    {
+        return Some(if *value {
+            LtlFormula::True
+        } else {
+            LtlFormula::False
+        });
     }
 
-    match expr {
+    let lowered = match expr {
         IRExpr::Always { body, .. } => Some(LtlFormula::always(lower_to_buchi_formula(
             body, atoms, next_atom,
         )?)),
         IRExpr::Eventually { body, .. } => Some(LtlFormula::eventually(lower_to_buchi_formula(
             body, atoms, next_atom,
         )?)),
+        IRExpr::Historically { body, .. } => Some(LtlFormula::historically(
+            lower_to_buchi_formula(body, atoms, next_atom)?,
+        )),
+        IRExpr::Once { body, .. } => Some(LtlFormula::once(lower_to_buchi_formula(
+            body, atoms, next_atom,
+        )?)),
+        IRExpr::Previously { body, .. } => Some(LtlFormula::previously(lower_to_buchi_formula(
+            body, atoms, next_atom,
+        )?)),
         IRExpr::Until { left, right, .. } => Some(LtlFormula::until(
+            lower_to_buchi_formula(left, atoms, next_atom)?,
+            lower_to_buchi_formula(right, atoms, next_atom)?,
+        )),
+        IRExpr::Since { left, right, .. } => Some(LtlFormula::since(
             lower_to_buchi_formula(left, atoms, next_atom)?,
             lower_to_buchi_formula(right, atoms, next_atom)?,
         )),
@@ -346,7 +401,16 @@ fn lower_to_buchi_formula(
             lower_to_buchi_formula(right, atoms, next_atom)?,
         )),
         _ => None,
+    };
+    if lowered.is_some() {
+        return lowered;
     }
+
+    if !contains_temporal(expr) {
+        return Some(LtlFormula::atom(buchi_atom_for(expr, atoms, next_atom)));
+    }
+
+    None
 }
 
 fn lower_to_temporal_formula(
@@ -354,17 +418,19 @@ fn lower_to_temporal_formula(
     atoms: &mut Vec<SpotAtomBinding>,
     next_atom: &mut usize,
 ) -> Option<TemporalFormula> {
-    if !contains_temporal(expr) {
-        let label = format!("p{}", *next_atom);
-        *next_atom += 1;
-        atoms.push(SpotAtomBinding {
-            label: label.clone(),
-            expr: expr.clone(),
+    if let IRExpr::Lit {
+        value: LitVal::Bool { value },
+        ..
+    } = expr
+    {
+        return Some(if *value {
+            TemporalFormula::True
+        } else {
+            TemporalFormula::False
         });
-        return Some(TemporalFormula::Atom(label));
     }
 
-    match expr {
+    let lowered = match expr {
         IRExpr::Always { body, .. } => Some(TemporalFormula::Always(Box::new(
             lower_to_temporal_formula(body, atoms, next_atom)?,
         ))),
@@ -393,11 +459,51 @@ fn lower_to_temporal_formula(
             Box::new(lower_to_temporal_formula(right, atoms, next_atom)?),
         )),
         _ => None,
+    };
+    if lowered.is_some() {
+        return lowered;
     }
+
+    if !contains_temporal(expr) {
+        return Some(TemporalFormula::Atom(spot_atom_for(expr, atoms, next_atom)));
+    }
+
+    None
+}
+
+fn buchi_atom_for(
+    expr: &IRExpr,
+    atoms: &mut Vec<BuchiAtomBinding>,
+    next_atom: &mut usize,
+) -> usize {
+    if let Some(atom) = atoms.iter().position(|binding| binding.expr == *expr) {
+        return atom;
+    }
+
+    let atom = *next_atom;
+    *next_atom += 1;
+    atoms.push(BuchiAtomBinding { expr: expr.clone() });
+    atom
+}
+
+fn spot_atom_for(expr: &IRExpr, atoms: &mut Vec<SpotAtomBinding>, next_atom: &mut usize) -> String {
+    if let Some(binding) = atoms.iter().find(|binding| binding.expr == *expr) {
+        return binding.label.clone();
+    }
+
+    let label = format!("p{}", *next_atom);
+    *next_atom += 1;
+    atoms.push(SpotAtomBinding {
+        label: label.clone(),
+        expr: expr.clone(),
+    });
+    label
 }
 
 fn render_spot_formula(formula: &TemporalFormula) -> String {
     match formula {
+        TemporalFormula::True => "1".to_owned(),
+        TemporalFormula::False => "0".to_owned(),
         TemporalFormula::Atom(label) => label.clone(),
         TemporalFormula::Not(inner) => format!("!({})", render_spot_formula(inner)),
         TemporalFormula::And(parts) => format!(
@@ -1117,15 +1223,47 @@ mod tests {
     }
 
     #[test]
-    fn compiled_temporal_formula_rejects_past_time_buchi() {
-        let compiled = CompiledTemporalFormula::from_expanded(IRExpr::Since {
-            left: Box::new(bool_var("p")),
-            right: Box::new(bool_var("q")),
+    fn compiled_temporal_formula_builds_buchi_for_past_time_ltl() {
+        let compiled = CompiledTemporalFormula::from_expanded(IRExpr::Always {
+            body: Box::new(IRExpr::BinOp {
+                op: "OpImplies".to_owned(),
+                left: Box::new(IRExpr::Previously {
+                    body: Box::new(bool_var("p")),
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpAnd".to_owned(),
+                    left: Box::new(IRExpr::Once {
+                        body: Box::new(bool_var("q")),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpAnd".to_owned(),
+                        left: Box::new(IRExpr::Historically {
+                            body: Box::new(bool_var("r")),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Since {
+                            left: Box::new(bool_var("s")),
+                            right: Box::new(bool_var("t")),
+                            span: None,
+                        }),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
             span: None,
         });
 
         assert!(compiled.contains_past_time());
-        assert!(compiled.buchi().is_none());
+        let buchi = compiled.buchi().expect("past-time LTL compiles to Buchi");
+        assert_eq!(buchi.atoms(), 5);
+        assert!(buchi.state_count() > 0);
     }
 
     #[test]
@@ -1279,6 +1417,15 @@ mod tests {
         assert_eq!(spot.atoms(), 2);
         assert_eq!(spot.to_spot_input(), "G((p0 & F(p1)))");
         assert_eq!(spot.export().spot_formula, "G((p0 & F(p1)))");
+        let buchi = compiled.buchi().expect("buchi formula");
+        let exported = buchi.export();
+        assert_eq!(exported.format, "hoa");
+        assert_eq!(exported.version, "v1");
+        assert_eq!(exported.automaton_kind, "generalized-buchi");
+        assert_eq!(exported.acceptance, "state");
+        assert_eq!(exported.atoms.len(), 2);
+        assert!(exported.hoa.starts_with("HOA: v1\n"));
+        assert!(exported.hoa.contains("AP: 2 \"p0\" \"p1\"\n"));
     }
 
     #[test]
@@ -1317,5 +1464,6 @@ mod tests {
         assert!(exports[0].contains_liveness);
         assert!(exports[0].contains_past_time);
         assert!(exports[0].spot.is_none());
+        assert!(exports[0].buchi.is_some());
     }
 }

@@ -21,6 +21,8 @@ mod ltl;
 pub mod smt;
 mod sygus;
 mod temporal;
+#[cfg_attr(not(test), allow(dead_code))]
+mod temporal_relational;
 pub mod transition;
 pub use explicit::{
     explore_verify_state_space, ExplicitStateSpace, ExplicitStateSpaceStoreBound,
@@ -3735,10 +3737,6 @@ fn encode_lasso_violation_inner(
     bound: usize,
     ctx: &PropertyCtx,
 ) -> Result<Bool, String> {
-    if contains_past_time(expr) {
-        return Err("past-time temporal operators are not supported by lasso BMC".to_owned());
-    }
-
     match expr {
         // Entity quantifier: `all o: Entity | body` — expand over active slots
         // and check each for liveness violations (disjunction: ANY slot violated).
