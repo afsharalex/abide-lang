@@ -21990,6 +21990,19 @@ fn relational_scene_fragment_supports_non_singleton_stateful_updates() {
              assert c.status == @Confirmed\n\
            }\n\
          }\n\n\
+         scene exact_three_updates {\n\
+           given {\n\
+             store counters: Counter[0..1]\n\
+             let counterOps = CounterOps { counters: counters }\n\
+             let c = one Counter in counters where c.status == @Pending\n\
+           }\n\
+           when {\n\
+             counterOps.confirm_one(c.id){3}\n\
+           }\n\
+           then {\n\
+             assert c.status == @Confirmed\n\
+           }\n\
+         }\n\n\
          scene some_updates {\n\
            given {\n\
              store counters: Counter[0..1]\n\

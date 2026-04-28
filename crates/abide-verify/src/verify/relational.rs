@@ -1,6 +1,6 @@
 //! Narrow RustSAT-backed bounded relational backend.
 //!
-//! This owns the first `abide-h2j` product slices:
+//! This owns the first bounded relational product slices:
 //! - create-only scene fragments
 //! - narrow stateful scenes with given-bound entity selections
 //! - bounded relational verify fragments over one pooled entity type with
@@ -23,6 +23,9 @@ use crate::ir::types::{
 
 use super::scene::collect_ordering_leaf_vars;
 use super::{VerificationResult, WitnessSemantics};
+
+const STATEFUL_SCENE_SOME_EVENT_BUDGET: usize = 3;
+const STATEFUL_SCENE_MAX_TOTAL_EVENT_INSTANCES: usize = 6;
 
 #[derive(Debug, Clone)]
 struct CreateInstance {
@@ -956,7 +959,6 @@ fn relational_stateful_scene_spec(
         .map(|given| (given.var.as_str(), given.entity.as_str()))
         .collect();
     let mut step_schedules = Vec::with_capacity(event_stage_schedules.len());
-    let some_budget = 2;
     for event_stages in event_stage_schedules {
         let mut steps = Vec::with_capacity(event_stages.len());
         for stage in event_stages {
@@ -967,7 +969,10 @@ fn relational_stateful_scene_spec(
                     return Ok(None);
                 };
                 if event.system != *system_name
-                    || !scene_event_has_small_stateful_cardinality(event, some_budget)
+                    || !scene_event_has_small_stateful_cardinality(
+                        event,
+                        STATEFUL_SCENE_SOME_EVENT_BUDGET,
+                    )
                 {
                     return Ok(None);
                 }
@@ -1090,15 +1095,12 @@ fn add_cardinality_constraint(
 }
 
 fn scene_event_stage_schedules(scene: &IRScene) -> Option<Vec<Vec<Vec<&str>>>> {
-    let some_budget = 2;
-    let max_total_instances = 5;
     if scene.ordering.is_empty() {
         if scene.events.is_empty()
             || scene.events.len() > 5
-            || !scene
-                .events
-                .iter()
-                .all(|event| scene_event_has_small_stateful_cardinality(event, some_budget))
+            || !scene.events.iter().all(|event| {
+                scene_event_has_small_stateful_cardinality(event, STATEFUL_SCENE_SOME_EVENT_BUDGET)
+            })
         {
             return None;
         }
@@ -1117,8 +1119,8 @@ fn scene_event_stage_schedules(scene: &IRScene) -> Option<Vec<Vec<Vec<&str>>>> {
         enumerate_scene_count_variants(
             &vars,
             &events_by_var,
-            some_budget,
-            max_total_instances,
+            STATEFUL_SCENE_SOME_EVENT_BUDGET,
+            STATEFUL_SCENE_MAX_TOTAL_EVENT_INSTANCES,
             0,
             &mut current,
             &mut expanded,
@@ -1169,7 +1171,12 @@ fn scene_event_stage_schedules(scene: &IRScene) -> Option<Vec<Vec<Vec<&str>>>> {
         .iter()
         .map(|event| (event.var.as_str(), event))
         .collect();
-    expand_stage_count_options(&stages, &events_by_var, some_budget, max_total_instances)
+    expand_stage_count_options(
+        &stages,
+        &events_by_var,
+        STATEFUL_SCENE_SOME_EVENT_BUDGET,
+        STATEFUL_SCENE_MAX_TOTAL_EVENT_INSTANCES,
+    )
 }
 
 fn permute_scene_event_vars<'a>(
@@ -1212,7 +1219,7 @@ fn scene_event_count_options(
         Cardinality::Named(name) if name == "some" => Some((1..=some_budget).collect()),
         Cardinality::Exact { exactly } => usize::try_from(*exactly)
             .ok()
-            .filter(|count| *count <= 2)
+            .filter(|count| *count <= some_budget)
             .map(|count| vec![count]),
         _ => None,
     }
