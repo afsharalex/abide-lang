@@ -236,8 +236,7 @@ pub struct ESystem {
     /// flat state fields declared directly on the system.
     pub fields: Vec<EField>,
     /// store params from `system S(x: Store<E>)`.
-    /// Each entry is `(param_name, entity_type)`.
-    pub store_params: Vec<(String, String)>,
+    pub store_params: Vec<EStoreParam>,
     pub scopes: Vec<EScope>,
     pub commands: Vec<ECommand>,
     pub actions: Vec<ESystemAction>,
@@ -268,6 +267,15 @@ pub struct ESystem {
     /// during elaboration. Non-program systems keep this empty.
     pub proc_uses: Vec<EProcUse>,
     pub span: Option<crate::span::Span>,
+}
+
+/// elaborated store constructor parameter.
+#[derive(Debug, Clone)]
+pub struct EStoreParam {
+    pub name: String,
+    pub entity_type: String,
+    pub lo: Option<i64>,
+    pub hi: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

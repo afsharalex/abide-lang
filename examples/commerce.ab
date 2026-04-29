@@ -40,7 +40,7 @@ entity PaymentIntent {
   }
 }
 
-system Commerce(orders: Store<Order>) {
+system Commerce(orders: Store<Order>[..6]) {
   command create_order(total: real)
     requires total > 0 {
     create Order {
@@ -70,7 +70,7 @@ system Commerce(orders: Store<Order>) {
     order.status == @AwaitingPayment and order.total > 0
 }
 
-system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
+system Billing(orders: Store<Order>[..6], intents: Store<PaymentIntent>[..6]) {
   command open_intent(order_id: identity, amount: real)
     requires amount > 0 {
     create PaymentIntent {
@@ -99,8 +99,8 @@ verify payment_integrity {
 
 scene payment_then_shipping {
   given {
-    store orders: Order[1..1]
-    store intents: PaymentIntent[1..1]
+    store orders: Order[1]
+    store intents: PaymentIntent[1]
     let commerce = Commerce { orders: orders }
     let billing = Billing { orders: orders, intents: intents }
     let o = one Order in orders where o.total == 99 and o.status == @AwaitingPayment

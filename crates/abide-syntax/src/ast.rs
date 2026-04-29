@@ -369,6 +369,7 @@ pub enum Contract {
 pub struct StoreParam {
     pub name: String,
     pub entity_type: String,
+    pub bounds: Option<StoreBounds>,
     pub span: Span,
 }
 
@@ -381,6 +382,12 @@ pub struct StoreDecl {
     pub lo: i64,
     pub hi: i64,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBounds {
+    pub lo: i64,
+    pub hi: i64,
 }
 
 /// a proc pool bound declaration in a verify assume block.

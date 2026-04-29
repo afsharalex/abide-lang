@@ -21,7 +21,7 @@ entity Order {
   }
 }
 
-system Orders(orders: Store<Order>) {
+system Orders(orders: Store<Order>[..4]) {
   command create_order(total: real)
     requires total > 0 {
     create Order {

@@ -14,7 +14,7 @@ use crate::elab::error::{ElabError, ErrorKind};
 use crate::elab::types::{
     ECommand, EEventAction, EExpr, EExtern, EExternAssume, EInterface, ELetBinding, EMatchArm,
     EMatchScrutinee, EMay, EPred, EProc, EProcDepCond, EProcEdge, EProcNode, EProcUse, EQuery,
-    EQuerySig, ESystem, ESystemAction, Ty,
+    EQuerySig, EStoreParam, ESystem, ESystemAction, Ty,
 };
 
 // ── Program declarations ────────────────────────────────────────────
@@ -25,11 +25,7 @@ use crate::elab::types::{
 /// invariants travel with the system.
 pub(super) fn collect_program(env: &mut Env, pd: &ast::ProgramDecl) {
     let name = &pd.name;
-    let store_params: Vec<(String, String)> = pd
-        .params
-        .iter()
-        .map(|p| (p.name.clone(), p.entity_type.clone()))
-        .collect();
+    let store_params: Vec<EStoreParam> = pd.params.iter().map(elaborate_store_param).collect();
     let mut invariants = Vec::new();
     let mut let_bindings = Vec::new();
     let mut procs = Vec::new();
@@ -195,11 +191,7 @@ pub(super) fn collect_extern(env: &mut Env, ed: &ast::ExternDecl) {
 pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     let name = &sd.name;
     // collect store params from system constructor.
-    let store_params: Vec<(String, String)> = sd
-        .params
-        .iter()
-        .map(|p| (p.name.clone(), p.entity_type.clone()))
-        .collect();
+    let store_params: Vec<EStoreParam> = sd.params.iter().map(elaborate_store_param).collect();
     let mut fields = Vec::new();
     let mut deps = Vec::new();
     let mut commands = Vec::new();
@@ -365,6 +357,15 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     );
     env.add_decl(name, info);
     env.insert_system(name, es);
+}
+
+fn elaborate_store_param(param: &ast::StoreParam) -> EStoreParam {
+    EStoreParam {
+        name: param.name.clone(),
+        entity_type: param.entity_type.clone(),
+        lo: param.bounds.map(|bounds| bounds.lo),
+        hi: param.bounds.map(|bounds| bounds.hi),
+    }
 }
 
 fn check_system_action_fsm_violations(

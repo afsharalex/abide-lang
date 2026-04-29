@@ -24,7 +24,7 @@ entity Document {
   }
 }
 
-system Editorial(documents: Store<Document>) {
+system Editorial(documents: Store<Document>[..4]) {
   command submit_pending() {
     choose d: Document where d.status == @Draft {
       d.submit()
@@ -49,11 +49,11 @@ proc release(editorial: Editorial) {
   approve = editorial.approve_pending()
   publish = editorial.publish_pending()
 
-  approve needs submit.ok
-  publish needs approve.ok
+  approve needs submit
+  publish needs approve
 }
 
-program Publishing(documents: Store<Document>) {
+program Publishing(documents: Store<Document>[..4]) {
   let editorial = Editorial { documents: documents }
   use release(editorial)
 }

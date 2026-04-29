@@ -511,7 +511,8 @@ impl Parser {
         Ok((path, qualifier))
     }
 
-    /// Parse a single `name: Store<EntityType>` parameter.
+    /// Parse a single `name: Store<EntityType>` parameter, optionally bounded
+    /// as `name: Store<EntityType>[N]`, `[lo..hi]`, or `[..hi]`.
     /// The type is `Store<Entity>` where `Store` matches the keyword token
     /// or `Name("Store")`.
     pub(super) fn store_param(&mut self) -> Result<StoreParam, ParseError> {
@@ -529,10 +530,17 @@ impl Parser {
         }
         self.expect(&Token::Lt)?;
         let (entity_type, _) = self.expect_name()?;
-        let end = self.expect(&Token::Gt)?;
+        let gt_span = self.expect(&Token::Gt)?;
+        let (bounds, end) = if matches!(self.peek(), Some(Token::LBracket)) {
+            let (bounds, end) = self.store_bounds()?;
+            (Some(bounds), end)
+        } else {
+            (None, gt_span)
+        };
         Ok(StoreParam {
             name,
             entity_type,
+            bounds,
             span: start.merge(end),
         })
     }

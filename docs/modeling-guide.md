@@ -33,7 +33,7 @@ Use:
 Current Abide systems take explicit store pools:
 
 ```abide
-system Commerce(orders: Store<Order>) {
+system Commerce(orders: Store<Order>[..6]) {
   command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.confirm()
@@ -42,7 +42,7 @@ system Commerce(orders: Store<Order>) {
 }
 ```
 
-Model systems over explicit `Store<T>` pools and route behavior through commands and queries.
+Model systems over explicit finite `Store<T>` pools and route behavior through commands and queries.
 
 ## Commands, actions, queries, predicates
 
@@ -54,7 +54,7 @@ Use the system surface deliberately:
 - `pred` — internal pure helper
 
 ```abide
-system Billing(orders: Store<Order>) {
+system Billing(orders: Store<Order>[..6]) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
@@ -114,7 +114,7 @@ Use scenes to demonstrate reachability or successful workflows:
 ```abide
 scene paid_order_can_ship {
   given {
-    store orders: Order[1..1]
+    store orders: Order[1]
     let commerce = Commerce { orders: orders }
     let o = one Order in orders where o.status == @Confirmed
   }
@@ -135,11 +135,11 @@ proc release(editorial: Editorial) {
   approve = editorial.approve_pending()
   publish = editorial.publish_pending()
 
-  approve needs submit.ok
-  publish needs approve.ok
+  approve needs submit
+  publish needs approve
 }
 
-program Publishing(documents: Store<Document>) {
+program Publishing(documents: Store<Document>[..4]) {
   let editorial = Editorial { documents: documents }
   use release(editorial)
 }

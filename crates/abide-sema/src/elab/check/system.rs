@@ -17,26 +17,49 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     // from the working namespace key when imported via alias).
     let canonical_names: std::collections::HashSet<String> =
         env.entities.values().map(|e| e.name.clone()).collect();
-    for (_, entity_name) in &system.store_params {
-        if env.lookup_entity(entity_name).is_none() && !canonical_names.contains(entity_name) {
+    for store in &system.store_params {
+        if env.lookup_entity(&store.entity_type).is_none()
+            && !canonical_names.contains(&store.entity_type)
+        {
             let mut err = if let Some(span) = system.span {
                 ElabError::with_span(
                     ErrorKind::UndefinedRef,
-                    format!("system {} uses unknown entity '{entity_name}'", system.name),
+                    format!(
+                        "system {} uses unknown entity '{}'",
+                        system.name, store.entity_type
+                    ),
                     &sys_ctx,
                     span,
                 )
             } else {
                 ElabError::new(
                     ErrorKind::UndefinedRef,
-                    format!("system {} uses unknown entity '{entity_name}'", system.name),
+                    format!(
+                        "system {} uses unknown entity '{}'",
+                        system.name, store.entity_type
+                    ),
                     &sys_ctx,
                 )
             };
-            if let Some(closest) = super::find_closest_name(entity_name, &entity_names) {
+            if let Some(closest) = super::find_closest_name(&store.entity_type, &entity_names) {
                 err = err.with_help(format!("did you mean '{closest}'?"));
             }
             errors.push(err);
+        }
+        if let (Some(lo), Some(hi)) = (store.lo, store.hi) {
+            if lo < 0 || hi < 0 || lo > hi {
+                errors.push(ElabError::with_span(
+                    ErrorKind::TypeMismatch,
+                    format!(
+                        "system `{}` store parameter `{}` has invalid bounds [{lo}..{hi}]",
+                        system.name, store.name
+                    ),
+                    &sys_ctx,
+                    system
+                        .span
+                        .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                ));
+            }
         }
     }
 

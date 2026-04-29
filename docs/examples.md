@@ -7,13 +7,13 @@ Curated examples live in [`abide-lang/examples/`](../examples/). Every example l
 See: [`examples/order.ab`](../examples/order.ab)
 
 Highlights:
-- store-backed system constructor: `system Orders(orders: Store<Order>)`
+- store-backed system constructor: `system Orders(orders: Store<Order>[..4])`
 - inline `command` bodies
 - `query`
 - `verify` with `assume { store ...; let ... }`
 
 ```abide
-system Orders(orders: Store<Order>) {
+system Orders(orders: Store<Order>[..4]) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
@@ -35,7 +35,7 @@ Highlights:
 - existential witness scenes
 
 ```abide
-system Banking(accounts: Store<Account>) {
+system Banking(accounts: Store<Account>[..8]) {
   command deposit(account_id: identity, amount: real)
     requires amount > 0 {
     choose a: Account where a.id == account_id {
@@ -55,7 +55,7 @@ Highlights:
 - public `query` surface
 
 ```abide
-system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
+system Billing(orders: Store<Order>[..6], intents: Store<PaymentIntent>[..6]) {
   command process_payment(intent_id: identity) {
     choose p: PaymentIntent where p.id == intent_id {
       p.capture()
@@ -89,11 +89,11 @@ proc release(editorial: Editorial) {
   approve = editorial.approve_pending()
   publish = editorial.publish_pending()
 
-  approve needs submit.ok
-  publish needs approve.ok
+  approve needs submit
+  publish needs approve
 }
 
-program Publishing(documents: Store<Document>) {
+program Publishing(documents: Store<Document>[..4]) {
   let editorial = Editorial { documents: documents }
   use release(editorial)
 }

@@ -1065,7 +1065,7 @@ fn semantic_entity_scaffold(
             let matching: Vec<_> = system
                 .store_params
                 .iter()
-                .filter(|(_, entity_type)| entity_type == owner)
+                .filter(|store| store.entity_type == owner)
                 .collect();
             if matching.is_empty() {
                 None
@@ -1108,16 +1108,16 @@ fn build_scaffold_for_system(
 ) -> (Vec<EStoreDecl>, ELetBinding) {
     let mut stores = Vec::new();
     let mut store_bindings = Vec::new();
-    for (param_name, entity_type) in &system.store_params {
-        let store_name = format!("__qa_store_{}_{}", system.name, param_name);
-        let slots = semantic_slots_for_entity(bounds, entity_type);
+    for store in &system.store_params {
+        let store_name = format!("__qa_store_{}_{}", system.name, store.name);
+        let slots = semantic_slots_for_entity(bounds, &store.entity_type);
         stores.push(EStoreDecl {
             name: store_name.clone(),
-            entity_type: entity_type.clone(),
+            entity_type: store.entity_type.clone(),
             lo: slots,
             hi: slots,
         });
-        store_bindings.push((param_name.clone(), store_name));
+        store_bindings.push((store.name.clone(), store_name));
     }
     let let_binding = ELetBinding {
         name: format!("__qa_system_{}", system.name),

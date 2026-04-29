@@ -3,7 +3,7 @@
 Abide is a specification language for stateful systems, workflows, and verification.
 
 This guide uses the syntax that the current compiler accepts on `master`:
-- store-backed systems: `system Commerce(orders: Store<Order>)`
+- store-backed systems: `system Commerce(orders: Store<Order>[..4])`
 - public commands and queries, with inline command bodies where needed
 - verification blocks with explicit `assume { store ...; let ... }`
 
@@ -43,7 +43,7 @@ entity Order {
   }
 }
 
-system Commerce(orders: Store<Order>) {
+system Commerce(orders: Store<Order>[..4]) {
   command create_order(total: real)
     requires total > 0 {
     create Order {
@@ -86,7 +86,7 @@ verify shipped_orders_have_value {
 
 scene payment_then_shipping {
   given {
-    store orders: Order[1..1]
+    store orders: Order[1]
     let commerce = Commerce { orders: orders }
     let o = one Order in orders where o.total == 25
   }
@@ -109,7 +109,8 @@ abide verify order.ab
 ## What the pieces mean
 
 - `entity` declares stateful domain objects with fields and actions.
-- `system ... (orders: Store<Order>)` declares a system over a bounded pool of entities.
+- `system ... (orders: Store<Order>[..4])` declares a system over a finite pool of entities.
+- Store bounds can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
 - `command` declares a public system operation and may include its body inline.
 - `verify` checks universal properties.
 - `scene` checks existential witness scenarios.
@@ -140,7 +141,7 @@ module Commerce
 use Commerce::Order
 use Commerce::OrderStatus
 
-system Commerce(orders: Store<Order>) {
+system Commerce(orders: Store<Order>[..4]) {
   command create_order(total: real) { create Order { total = total } }
 }
 ```

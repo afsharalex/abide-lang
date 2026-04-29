@@ -43,7 +43,7 @@ entity Order {
 ## Systems
 
 ```abide
-system Commerce(orders: Store<Order>) {
+system Commerce(orders: Store<Order>[..8]) {
   command pay(order: Order)
     requires order.status == @Pending {
     order.mark_paid()
@@ -59,6 +59,7 @@ system Commerce(orders: Store<Order>) {
 
 Notes:
 - `Store<T>` constructor params are the current entity-pool surface.
+- Store constructor params may carry finite bounds: `Store<Order>[N]`, `Store<Order>[lo..hi]`, or `Store<Order>[..hi]`.
 - `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
 - `pred` is internal and pure.
@@ -94,7 +95,7 @@ axiom external_fact = true by "proofs/external.agda"
 ```abide
 scene successful_payment {
   given {
-    store orders: Order[1..1]
+    store orders: Order[1]
     let commerce = Commerce { orders: orders }
     let o = one Order in orders where o.total == 25
   }
@@ -115,11 +116,11 @@ proc release(editorial: Editorial) {
   approve = editorial.approve_pending()
   publish = editorial.publish_pending()
 
-  approve needs submit.ok
-  publish needs approve.ok
+  approve needs submit
+  publish needs approve
 }
 
-program Publishing(documents: Store<Document>) {
+program Publishing(documents: Store<Document>[..4]) {
   let editorial = Editorial { documents: documents }
   use release(editorial)
 }

@@ -7,8 +7,8 @@ use crate::ast::{
     EntityAction, EntityDecl, EntityItem, EventPath, Expr, ExprKind, FieldDecl, FieldDefault,
     FnDecl, FsmDecl, FsmRow, GivenItem, IncludeDecl, InvariantDecl, InvocArg, LemmaDecl,
     LetBindingDecl, ModuleDecl, Param, PredDecl, Program, PropDecl, SceneDecl, SceneItem,
-    StoreDecl, ThenItem, TheoremDecl, TopDecl, TypedParam, UnderBlock, UseDecl, UseItem,
-    VerifyDecl, Visibility, WhenItem,
+    StoreBounds, StoreDecl, ThenItem, TheoremDecl, TopDecl, TypedParam, UnderBlock, UseDecl,
+    UseItem, VerifyDecl, Visibility, WhenItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -1319,24 +1319,58 @@ impl Parser {
         Ok(items)
     }
 
-    /// parse `store name: Type[lo..hi]`.
+    /// parse `store name: Type[lo..hi]`, `store name: Type[N]`, or
+    /// `store name: Type[..hi]`.
     fn store_decl(&mut self) -> Result<StoreDecl, ParseError> {
         let start = self.expect(&Token::Store)?;
         let (name, _) = self.expect_name()?;
         self.expect(&Token::Colon)?;
         let (entity_type, _) = self.expect_name()?;
-        self.expect(&Token::LBracket)?;
-        let (lo, _) = self.expect_int()?;
-        self.expect(&Token::DotDot)?;
-        let (hi, _) = self.expect_int()?;
-        let end = self.expect(&Token::RBracket)?;
+        let (bounds, end) = self.store_bounds()?;
         Ok(StoreDecl {
             name,
             entity_type,
-            lo,
-            hi,
+            lo: bounds.lo,
+            hi: bounds.hi,
             span: start.merge(end),
         })
+    }
+
+    pub(super) fn store_bounds(&mut self) -> Result<(StoreBounds, Span), ParseError> {
+        self.expect(&Token::LBracket)?;
+        let bounds = match self.peek() {
+            Some(Token::DotDot) => {
+                self.expect(&Token::DotDot)?;
+                let (hi, _) = self.expect_int()?;
+                StoreBounds { lo: 0, hi }
+            }
+            Some(Token::IntLit(_)) => {
+                let (lo, _) = self.expect_int()?;
+                if self.eat(&Token::DotDot).is_some() {
+                    if matches!(self.peek(), Some(Token::RBracket)) {
+                        return Err(ParseError::expected(
+                            "finite upper store bound",
+                            "`]`",
+                            self.cur_span(),
+                        ));
+                    }
+                    let (hi, _) = self.expect_int()?;
+                    StoreBounds { lo, hi }
+                } else {
+                    StoreBounds { lo, hi: lo }
+                }
+            }
+            Some(tok) => {
+                return Err(ParseError::expected(
+                    "store bound (`N`, `lo..hi`, or `..hi`)",
+                    &format!("`{tok}`"),
+                    self.cur_span(),
+                ));
+            }
+            None => return Err(ParseError::eof(self.cur_span())),
+        };
+        let end = self.expect(&Token::RBracket)?;
+        Ok((bounds, end))
     }
 
     /// parse `proc path[lo..hi]`.

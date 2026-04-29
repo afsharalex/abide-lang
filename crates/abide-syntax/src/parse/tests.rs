@@ -1296,6 +1296,62 @@ strong fair Commerce::ship_order
     assert_eq!(v.asserts.len(), 1);
 }
 
+#[test]
+fn store_decls_accept_exact_and_at_most_bounds() {
+    let src = r"verify bounded_stores {
+  assume {
+    store exact_orders: Order[3]
+    store at_most_orders: Order[..5]
+    store ranged_orders: Order[1..4]
+  }
+  assert true
+}";
+    let prog = parse_program(src);
+    let TopDecl::Verify(v) = &prog.decls[0] else {
+        panic!("expected Verify");
+    };
+    let ab = v.assume_block.as_ref().expect("assume block");
+    let stores = ab
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            AssumeItem::Store(store) => Some(store),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!((stores[0].lo, stores[0].hi), (3, 3));
+    assert_eq!((stores[1].lo, stores[1].hi), (0, 5));
+    assert_eq!((stores[2].lo, stores[2].hi), (1, 4));
+}
+
+#[test]
+fn store_params_accept_finite_bounds() {
+    let src = r"system Shop(
+  exact: Store<Order>[1],
+  bounded: Store<Order>[1..4],
+  optional: Store<Order>[..5]
+) {
+}";
+    let prog = parse_program(src);
+    let TopDecl::System(system) = &prog.decls[0] else {
+        panic!("expected System");
+    };
+
+    assert_eq!(
+        system.params[0].bounds.expect("exact bounds"),
+        crate::ast::StoreBounds { lo: 1, hi: 1 }
+    );
+    assert_eq!(
+        system.params[1].bounds.expect("range bounds"),
+        crate::ast::StoreBounds { lo: 1, hi: 4 }
+    );
+    assert_eq!(
+        system.params[2].bounds.expect("at-most bounds"),
+        crate::ast::StoreBounds { lo: 0, hi: 5 }
+    );
+}
+
 /// `assume { stutter }` parses as a `Stutter` item.
 #[test]
 fn verify_assume_stutter_item() {

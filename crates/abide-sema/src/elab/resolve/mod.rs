@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
-    BuiltinTy, EContract, EEventAction, EExpr, EMatchArm, EMatchScrutinee, EProc, EProcDepCond,
-    EProcEdge, EProcNode, EProcUse, ESceneWhen, GenericTypeDef, Literal, Ty, VariantFieldsMap,
+    BuiltinTy, EContract, EEventAction, EExpr, ELetBinding, EMatchArm, EMatchScrutinee, EProc,
+    EProcDepCond, EProcEdge, EProcNode, EProcUse, ESceneWhen, EStoreDecl, GenericTypeDef, Literal,
+    Ty, VariantFieldsMap,
 };
 use crate::ast::UseDecl;
 
@@ -145,7 +146,109 @@ pub fn resolve(env: &mut Env) {
     // positions (let bindings, lambda params, etc.) that the pre-pass missed.
     validate_remaining_type_params(env);
 
+    validate_store_bounds(env);
+
     validate_unresolved_types(env);
+}
+
+fn validate_store_bounds(env: &mut Env) {
+    let mut errors = Vec::new();
+
+    for verify in &env.verifies {
+        validate_store_decl_bounds("verify", &verify.name, &verify.stores, &mut errors);
+        validate_store_binding_bounds(
+            "verify",
+            &verify.name,
+            &verify.stores,
+            &verify.let_bindings,
+            env,
+            &mut errors,
+        );
+    }
+    for scene in &env.scenes {
+        validate_store_decl_bounds("scene", &scene.name, &scene.stores, &mut errors);
+        validate_store_binding_bounds(
+            "scene",
+            &scene.name,
+            &scene.stores,
+            &scene.let_bindings,
+            env,
+            &mut errors,
+        );
+    }
+
+    env.errors.extend(errors);
+}
+
+fn validate_store_decl_bounds(
+    owner_kind: &str,
+    owner_name: &str,
+    stores: &[EStoreDecl],
+    errors: &mut Vec<ElabError>,
+) {
+    for store in stores {
+        if store.lo < 0 || store.hi < 0 || store.lo > store.hi {
+            errors.push(ElabError::new(
+                ErrorKind::TypeMismatch,
+                format!(
+                    "{owner_kind} `{owner_name}` store `{}` has invalid finite bounds [{}..{}]",
+                    store.name, store.lo, store.hi
+                ),
+                owner_kind,
+            ));
+        }
+    }
+}
+
+fn validate_store_binding_bounds(
+    owner_kind: &str,
+    owner_name: &str,
+    stores: &[EStoreDecl],
+    let_bindings: &[ELetBinding],
+    env: &Env,
+    errors: &mut Vec<ElabError>,
+) {
+    for binding in let_bindings {
+        let Some(system) = env.systems.get(&binding.system_type) else {
+            continue;
+        };
+        for (param_name, store_name) in &binding.store_bindings {
+            let Some(param) = system
+                .store_params
+                .iter()
+                .find(|param| param.name == *param_name)
+            else {
+                continue;
+            };
+            let Some(store) = stores.iter().find(|store| store.name == *store_name) else {
+                continue;
+            };
+            if let Some(min) = param.lo {
+                if store.hi < min {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "{owner_kind} `{owner_name}` binds store `{store_name}` with upper bound {} to `{}::{param_name}`, which requires at least {min} slot(s)",
+                            store.hi, system.name
+                        ),
+                        owner_kind,
+                    ));
+                }
+            }
+            if let Some(max) = param.hi {
+                if store.hi > max {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "{owner_kind} `{owner_name}` binds store `{store_name}` with upper bound {} to `{}::{param_name}`, which allows at most {max} slot(s)",
+                            store.hi, system.name
+                        ),
+                        owner_kind,
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn expand_proc_uses(env: &mut Env) {
@@ -1972,6 +2075,45 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let prog = parser.parse_program().expect("parse error");
         crate::elab::elaborate(&prog)
+    }
+
+    #[test]
+    fn store_param_bounds_validate_bound_store_scopes() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[1..2]) {}\n\
+             verify too_many_orders {\n\
+               assume {\n\
+                 store orders: Order[3]\n\
+                 let shop = Shop { orders: orders }\n\
+               }\n\
+               assert true\n\
+             }",
+        );
+
+        assert!(
+            errors.iter().any(|err| err.message.contains(
+                "binds store `orders` with upper bound 3 to `Shop::orders`, which allows at most 2"
+            )),
+            "expected store parameter bound error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn store_param_exact_bounds_accept_matching_store_scope() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[2]) {}\n\
+             verify exact_orders {\n\
+               assume {\n\
+                 store orders: Order[2]\n\
+                 let shop = Shop { orders: orders }\n\
+               }\n\
+               assert true\n\
+             }",
+        );
+
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }
 
     #[test]

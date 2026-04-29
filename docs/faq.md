@@ -140,7 +140,7 @@ verify liveness {
 // Witness: show a specific path to payment
 scene order_gets_paid {
   given {
-    store orders: Order[1..1]
+    store orders: Order[1]
     let commerce = Commerce { orders: orders }
     let o = one Order in orders where o.status == @Pending and o.total == 50
   }

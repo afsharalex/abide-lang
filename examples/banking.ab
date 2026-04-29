@@ -31,7 +31,7 @@ entity Account {
 pred can_withdraw(a: Account, amount: real) =
   a.status == @Active and a.balance >= amount and amount > 0
 
-system Banking(accounts: Store<Account>) {
+system Banking(accounts: Store<Account>[..8]) {
   command open_account(initial_balance: real)
     requires initial_balance >= 0 {
     create Account {
@@ -70,7 +70,7 @@ verify account_safety {
 
 scene successful_deposit {
   given {
-    store accounts: Account[1..1]
+    store accounts: Account[1]
     let banking = Banking { accounts: accounts }
     let a = one Account in accounts where a.balance == 100 and a.status == @Active
   }

@@ -27,7 +27,7 @@ entity Account {
 Systems operate over explicit entity pools:
 
 ```abide
-system Banking(accounts: Store<Account>) {
+system Banking(accounts: Store<Account>[..8]) {
   command deposit(account: Account, amount: real)
     requires amount > 0 {
     account.deposit(amount)
@@ -37,6 +37,7 @@ system Banking(accounts: Store<Account>) {
 
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
+- Store bounds are finite: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.
 - `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
 - `pred` stays internal to the system.
@@ -80,7 +81,7 @@ lemma positive_amounts {
 ```abide
 scene successful_payment {
   given {
-    store orders: Order[1..1]
+    store orders: Order[1]
     let commerce = Commerce { orders: orders }
     let o = one Order in orders where o.total == 25
   }
@@ -128,11 +129,11 @@ proc release(editorial: Editorial) {
   approve = editorial.approve_pending()
   publish = editorial.publish_pending()
 
-  approve needs submit.ok
-  publish needs approve.ok
+  approve needs submit
+  publish needs approve
 }
 
-program Publishing(documents: Store<Document>) {
+program Publishing(documents: Store<Document>[..4]) {
   let editorial = Editorial { documents: documents }
   use release(editorial)
 }

@@ -44,7 +44,7 @@ entity Prescription {
 
 pred is_admitted(p: Patient) = p.status == @Admitted
 
-system Registration(patients: Store<Patient>) {
+system Registration(patients: Store<Patient>[..5]) {
   command register_patient() {
     create Patient {}
   }
@@ -63,7 +63,7 @@ system Registration(patients: Store<Patient>) {
   }
 }
 
-system Pharmacy(patients: Store<Patient>, prescriptions: Store<Prescription>) {
+system Pharmacy(patients: Store<Patient>[..5], prescriptions: Store<Prescription>[..5]) {
   command issue_prescription(patient_id: identity)
     requires exists p: Patient in patients | is_admitted(p) and p.id == patient_id {
     create Prescription {

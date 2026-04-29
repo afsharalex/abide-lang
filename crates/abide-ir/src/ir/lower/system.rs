@@ -25,15 +25,15 @@ pub(super) fn lower_system(
     let mut entities: Vec<String> = es
         .store_params
         .iter()
-        .map(|(_, entity_type)| canonical(aliases, entity_type).to_owned())
+        .map(|store| canonical(aliases, &store.entity_type).to_owned())
         .collect();
     // For programs with let bindings, include composed systems' entities
     // so the verifier can see all pooled entity types.
     for lb in &es.let_bindings {
         let sys_name = canonical(aliases, &lb.system_type);
         if let Some(composed) = all_systems.iter().find(|s| s.name == sys_name) {
-            for (_, entity_type) in &composed.store_params {
-                let canonical_ent = canonical(aliases, entity_type).to_owned();
+            for store in &composed.store_params {
+                let canonical_ent = canonical(aliases, &store.entity_type).to_owned();
                 if !entities.contains(&canonical_ent) {
                     entities.push(canonical_ent);
                 }
@@ -62,9 +62,9 @@ pub(super) fn lower_system(
         store_params: es
             .store_params
             .iter()
-            .map(|(name, entity_type)| IRStoreParam {
-                name: name.clone(),
-                entity_type: canonical(aliases, entity_type).to_owned(),
+            .map(|store| IRStoreParam {
+                name: store.name.clone(),
+                entity_type: canonical(aliases, &store.entity_type).to_owned(),
             })
             .collect(),
         fields: flatten_system_fields(&es.fields, ctx),
