@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -85,6 +85,14 @@ pub(crate) struct RenderedAssignment {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct RenderedTraceChange {
+    pub(crate) entity: String,
+    pub(crate) field: String,
+    pub(crate) before: Option<String>,
+    pub(crate) after: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct RenderedTraceObservation {
     pub(crate) name: String,
     pub(crate) value: String,
@@ -95,6 +103,7 @@ pub(crate) struct RenderedTraceStep {
     pub(crate) step: usize,
     pub(crate) event: Option<String>,
     pub(crate) assignments: Vec<RenderedAssignment>,
+    pub(crate) changes: Vec<RenderedTraceChange>,
     pub(crate) observations: Vec<RenderedTraceObservation>,
 }
 
@@ -205,43 +214,15 @@ fn render_trace_steps_from_behavior(behavior: &op::Behavior) -> Vec<RenderedTrac
         .iter()
         .enumerate()
         .map(|(step, state)| {
-            let mut entity_slot_counts: BTreeMap<&str, usize> = BTreeMap::new();
-            for slot_ref in state.entity_slots().keys() {
-                *entity_slot_counts.entry(slot_ref.entity()).or_default() += 1;
-            }
-
-            let mut assignments = Vec::new();
-            for (slot_ref, entity_state) in state.entity_slots() {
-                if !entity_state.active() {
-                    continue;
-                }
-                let entity_label = if entity_slot_counts
-                    .get(slot_ref.entity())
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-                {
-                    format!("{}[{}]", slot_ref.entity(), slot_ref.slot())
-                } else {
-                    slot_ref.entity().to_owned()
-                };
-                for (field, value) in entity_state.fields() {
-                    assignments.push(RenderedAssignment {
-                        entity: entity_label.clone(),
-                        field: field.clone(),
-                        value: render_witness_value(value),
-                    });
-                }
-            }
-            for (system, fields) in state.system_fields() {
-                for (field, value) in fields {
-                    assignments.push(RenderedAssignment {
-                        entity: format!("System::{system}"),
-                        field: field.clone(),
-                        value: render_witness_value(value),
-                    });
-                }
-            }
+            let assignments = rendered_assignments_for_state(state);
+            let changes = behavior
+                .transition_after_state(step)
+                .and_then(|_| {
+                    behavior
+                        .state(step + 1)
+                        .map(|next| rendered_changes_between_states(state, next))
+                })
+                .unwrap_or_default();
 
             let observations = behavior
                 .transition_after_state(step)
@@ -263,8 +244,70 @@ fn render_trace_steps_from_behavior(behavior: &op::Behavior) -> Vec<RenderedTrac
                     .transition_after_state(step)
                     .and_then(|transition| render_transition_event_label(transition, system_count)),
                 assignments,
+                changes,
                 observations,
             }
+        })
+        .collect()
+}
+
+fn rendered_assignments_for_state(state: &op::State) -> Vec<RenderedAssignment> {
+    rendered_assignment_map_for_state(state)
+        .into_iter()
+        .map(|((entity, field), value)| RenderedAssignment {
+            entity,
+            field,
+            value,
+        })
+        .collect()
+}
+
+fn rendered_assignment_map_for_state(state: &op::State) -> BTreeMap<(String, String), String> {
+    let mut assignments = BTreeMap::new();
+    for (slot_ref, entity_state) in state.entity_slots() {
+        if !entity_state.active() {
+            continue;
+        }
+        let entity_label = format!("{}[{}]", slot_ref.entity(), slot_ref.slot());
+        for (field, value) in entity_state.fields() {
+            assignments.insert(
+                (entity_label.clone(), field.clone()),
+                render_witness_value(value),
+            );
+        }
+    }
+    for (system, fields) in state.system_fields() {
+        for (field, value) in fields {
+            assignments.insert(
+                (format!("System::{system}"), field.clone()),
+                render_witness_value(value),
+            );
+        }
+    }
+    assignments
+}
+
+fn rendered_changes_between_states(
+    before: &op::State,
+    after: &op::State,
+) -> Vec<RenderedTraceChange> {
+    let before = rendered_assignment_map_for_state(before);
+    let after = rendered_assignment_map_for_state(after);
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    keys.into_iter()
+        .filter_map(|(entity, field)| {
+            let before_value = before.get(&(entity.clone(), field.clone())).cloned();
+            let after_value = after.get(&(entity.clone(), field.clone())).cloned();
+            (before_value != after_value).then_some(RenderedTraceChange {
+                entity,
+                field,
+                before: before_value,
+                after: after_value,
+            })
         })
         .collect()
 }
@@ -438,12 +481,19 @@ pub(crate) fn report_verification_result(
                     let diag = miette::miette!(
                         labels = vec![miette::LabeledSpan::at(span.start..span.end, &label)],
                         "{}",
-                        result
+                        render_terminal_summary(result)
                     )
                     .with_source_code(named);
                     eprintln!("{diag:?}");
-                    if !verbose {
+                    if verbose {
+                        report_result_verbose_details(result, true);
+                    } else {
                         eprintln!("{}", render_terminal_summary(result));
+                        if let Some(human_text) =
+                            render_result_human_text(result, terminal_text_art())
+                        {
+                            eprintln!("{human_text}");
+                        }
                     }
                     if debug_evidence {
                         report_result_debug_evidence(result, true);
@@ -488,6 +538,7 @@ pub(crate) fn write_verification_report(
     no_fn_verify: bool,
     progress: bool,
     witness_semantics_name: &str,
+    target: Option<&str>,
     diagnostics: &[Diagnostic],
     results: &[verify::VerificationResult],
 ) -> miette::Result<PathBuf> {
@@ -505,6 +556,7 @@ pub(crate) fn write_verification_report(
         no_fn_verify,
         progress,
         witness_semantics_name,
+        target,
         diagnostics,
         results,
     );
@@ -566,6 +618,7 @@ fn build_verification_report_json(
     no_fn_verify: bool,
     progress: bool,
     witness_semantics_name: &str,
+    target: Option<&str>,
     diagnostics: &[Diagnostic],
     results: &[verify::VerificationResult],
 ) -> serde_json::Value {
@@ -592,6 +645,7 @@ fn build_verification_report_json(
             "no_fn_verify": no_fn_verify,
             "progress": progress,
             "witness_semantics": witness_semantics_name,
+            "target": target,
         },
         "diagnostics": diagnostics,
         "results": results,
@@ -1840,7 +1894,7 @@ fn render_trace_section_lines(
             step.step,
             render_trace_step_label(step)
         ));
-        if step.assignments.is_empty() && step.observations.is_empty() {
+        if step.assignments.is_empty() && step.changes.is_empty() && step.observations.is_empty() {
             continue;
         }
         let child_indent = format!(
@@ -1848,7 +1902,21 @@ fn render_trace_section_lines(
             indent_spaces(indent),
             if is_last_step { " " } else { art.vertical() }
         );
-        if !step.assignments.is_empty() {
+        if !step.changes.is_empty() {
+            for (change_idx, change) in step.changes.iter().enumerate() {
+                let change_branch =
+                    if change_idx + 1 == step.changes.len() && step.observations.is_empty() {
+                        art.elbow()
+                    } else {
+                        art.branch()
+                    };
+                lines.push(format!(
+                    "{child_indent}{change_branch} {}",
+                    render_trace_change_text(change)
+                ));
+            }
+        }
+        if step.changes.is_empty() && !step.assignments.is_empty() {
             for (assignment_idx, assignment) in step.assignments.iter().enumerate() {
                 let assign_branch = if assignment_idx + 1 == step.assignments.len()
                     && step.observations.is_empty()
@@ -1878,6 +1946,16 @@ fn render_trace_section_lines(
         }
     }
     lines
+}
+
+fn render_trace_change_text(change: &RenderedTraceChange) -> String {
+    let target = format!("{}.{}", change.entity, change.field);
+    match (&change.before, &change.after) {
+        (Some(before), Some(after)) => format!("{target}: {before} -> {after}"),
+        (None, Some(after)) => format!("{target}: <absent> -> {after}"),
+        (Some(before), None) => format!("{target}: {before} -> <absent>"),
+        (None, None) => format!("{target}: <absent> -> <absent>"),
+    }
 }
 
 fn render_trace_observation_text(observation: &RenderedTraceObservation) -> String {
@@ -2666,9 +2744,9 @@ fn render_trace_step_button(
         out.push_str("</span>");
     }
     out.push_str("<span class=\"trace-step-subtitle\">");
-    out.push_str(&step.assignments.len().to_string());
+    out.push_str(&step.changes.len().to_string());
     out.push_str(" change");
-    if step.assignments.len() != 1 {
+    if step.changes.len() != 1 {
         out.push('s');
     }
     out.push_str("</span>");
@@ -2712,12 +2790,21 @@ fn render_trace_panel_html(
         out.push_str("<div class=\"trace-event\">Stutter step</div>");
     }
     out.push_str("<div class=\"trace-meta\"><span class=\"chip chip-muted\">");
-    out.push_str(&step.assignments.len().to_string());
-    out.push_str(" recorded fact");
-    if step.assignments.len() != 1 {
+    out.push_str(&step.changes.len().to_string());
+    out.push_str(" change");
+    if step.changes.len() != 1 {
         out.push('s');
     }
     out.push_str("</span>");
+    if !step.assignments.is_empty() {
+        out.push_str("<span class=\"chip chip-muted\">");
+        out.push_str(&step.assignments.len().to_string());
+        out.push_str(" recorded fact");
+        if step.assignments.len() != 1 {
+            out.push('s');
+        }
+        out.push_str("</span>");
+    }
     if !step.observations.is_empty() {
         out.push_str("<span class=\"chip chip-muted\">");
         out.push_str(&step.observations.len().to_string());
@@ -2728,9 +2815,27 @@ fn render_trace_panel_html(
         out.push_str("</span>");
     }
     out.push_str("</div>");
-    if step.assignments.is_empty() {
-        out.push_str("<p class=\"trace-note muted\">No assignments recorded for this step.</p>");
+    if step.changes.is_empty() {
+        out.push_str(
+            "<p class=\"trace-note muted\">No state changes recorded for this transition.</p>",
+        );
     } else {
+        out.push_str("<div class=\"assignment-section-title\">State changes</div>");
+        out.push_str("<ul class=\"assignment-list\">");
+        for change in &step.changes {
+            out.push_str("<li><code>");
+            out.push_str(&escape_html(&change.entity));
+            out.push('.');
+            out.push_str(&escape_html(&change.field));
+            out.push_str("</code>: <code>");
+            out.push_str(&escape_html(change.before.as_deref().unwrap_or("<absent>")));
+            out.push_str("</code> → <code>");
+            out.push_str(&escape_html(change.after.as_deref().unwrap_or("<absent>")));
+            out.push_str("</code></li>");
+        }
+        out.push_str("</ul>");
+    }
+    if !step.assignments.is_empty() {
         out.push_str("<div class=\"assignment-section-title\">State facts</div>");
         out.push_str("<ul class=\"assignment-list\">");
         for assignment in &step.assignments {

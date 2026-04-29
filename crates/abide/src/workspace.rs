@@ -26,7 +26,7 @@ struct CachedQuery<T> {
     value: Arc<T>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_excessive_bools)]
 struct VerifyConfigKey {
     bounded_only: bool,
@@ -43,6 +43,8 @@ struct VerifyConfigKey {
     relational_symmetry_breaking: bool,
     solver_selection: u8,
     chc_selection: u8,
+    target_kind: Option<u8>,
+    target_name: Option<String>,
 }
 
 impl From<&VerifyConfig> for VerifyConfigKey {
@@ -62,11 +64,16 @@ impl From<&VerifyConfig> for VerifyConfigKey {
             relational_symmetry_breaking: config.relational_symmetry_breaking,
             solver_selection: config.solver_selection as u8,
             chc_selection: config.chc_selection as u8,
+            target_kind: config
+                .target
+                .as_ref()
+                .and_then(|target| target.kind.map(|kind| kind as u8)),
+            target_name: config.target.as_ref().map(|target| target.name.clone()),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct VerifyCacheKey {
     root: FileId,
     config: VerifyConfigKey,

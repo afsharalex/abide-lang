@@ -1,4 +1,4 @@
-use clap::{Parser as ClapParser, Subcommand, ValueEnum};
+use clap::{Args, Parser as ClapParser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, WrapErr};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -166,6 +166,10 @@ enum Command {
         #[arg(long)]
         no_relational_symmetry_breaking: bool,
 
+        /// Run a single target, optionally typed as verify:NAME, scene:NAME, theorem:NAME, lemma:NAME, prop:NAME, or fn:NAME
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+
         /// Print expanded human-readable verification details, including native evidence
         #[arg(long)]
         verbose: bool,
@@ -177,33 +181,20 @@ enum Command {
         /// Write a verification report as `<format> [output_dir]`; defaults to `reports/`
         #[arg(long, value_names = ["FORMAT", "OUTPUT_DIR"], num_args = 1..=2)]
         report: Option<Vec<String>>,
+
+        /// Write structured trace/evidence artifacts as JSON
+        #[arg(long = "trace-artifact", value_name = "PATH")]
+        trace_artifact: Option<PathBuf>,
     },
+
+    /// Run one seeded model execution without the solver
+    Run(SimulateArgs),
 
     /// Forward-simulate event sequences without the solver
-    Simulate {
-        #[arg(required = true)]
-        files: Vec<PathBuf>,
+    Simulate(SimulateArgs),
 
-        /// Number of atomic steps to execute before stopping
-        #[arg(long, default_value_t = 25)]
-        steps: usize,
-
-        /// Seed for deterministic pseudo-random step selection
-        #[arg(long, default_value_t = 0)]
-        seed: u64,
-
-        /// Preallocated slot count per entity type
-        #[arg(long, default_value_t = 4)]
-        slots: usize,
-
-        /// Override a specific entity pool size as `Entity=N`
-        #[arg(long = "scope", value_name = "ENTITY=SLOTS")]
-        scope: Vec<String>,
-
-        /// Restrict simulation to a single system name
-        #[arg(long)]
-        system: Option<String>,
-    },
+    /// Inspect structured trace artifacts emitted by verify/run
+    Trace(TraceArgs),
 
     /// Run QA structural analysis scripts
     #[command(name = "qa")]
@@ -233,6 +224,67 @@ enum Command {
         #[arg(long)]
         vi: bool,
     },
+}
+
+#[derive(Args)]
+struct SimulateArgs {
+    #[arg(required = true)]
+    files: Vec<PathBuf>,
+
+    /// Number of atomic steps to execute before stopping
+    #[arg(long, default_value_t = 25)]
+    steps: usize,
+
+    /// Seed for deterministic pseudo-random step selection
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+
+    /// Preallocated slot count per entity type
+    #[arg(long, default_value_t = 4)]
+    slots: usize,
+
+    /// Override a specific entity pool size as `Entity=N`
+    #[arg(long = "scope", value_name = "ENTITY=SLOTS")]
+    scope: Vec<String>,
+
+    /// Restrict simulation to a single system name
+    #[arg(long)]
+    system: Option<String>,
+
+    /// Write structured simulation trace artifact as JSON
+    #[arg(long = "trace-artifact", value_name = "PATH")]
+    trace_artifact: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct TraceArgs {
+    /// Trace artifact JSON file produced by --trace-artifact
+    file: PathBuf,
+
+    /// Artifact id to inspect
+    #[arg(long, default_value_t = 1)]
+    artifact: usize,
+
+    #[command(subcommand)]
+    command: Option<TraceCommand>,
+}
+
+#[derive(Subcommand)]
+enum TraceCommand {
+    /// List artifacts in the bundle
+    List,
+
+    /// Render the selected artifact as a frame-by-frame trace
+    Draw,
+
+    /// Show one frame from the selected artifact
+    State { index: usize },
+
+    /// Show state changes between two frames
+    Diff { from: usize, to: usize },
+
+    /// Print the selected artifact as JSON
+    Json,
 }
 
 /// Default timeout for verifier passes, in seconds.
@@ -346,9 +398,11 @@ pub fn run() -> miette::Result<()> {
             progress,
             witness_semantics,
             no_relational_symmetry_breaking,
+            target,
             verbose,
             debug_evidence,
             report,
+            trace_artifact,
         } => {
             let solver_selection = match solver {
                 VerifySolver::Z3 => crate::verify::SolverSelection::Z3,
@@ -399,6 +453,11 @@ pub fn run() -> miette::Result<()> {
             let chc_solver_name = format!("{chc_solver:?}").to_lowercase();
             let witness_semantics_name = format!("{witness_semantics:?}").to_lowercase();
             let report_request = render::parse_verify_report_request(report)?;
+            let target_selector = target
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|err| miette::miette!("{err}"))?;
 
             let config = crate::verify::VerifyConfig {
                 solver_selection,
@@ -416,6 +475,7 @@ pub fn run() -> miette::Result<()> {
                 progress,
                 witness_semantics,
                 relational_symmetry_breaking: !no_relational_symmetry_breaking,
+                target: target_selector,
             };
 
             let verified = match driver::verify_files(&files, &config) {
@@ -438,6 +498,7 @@ pub fn run() -> miette::Result<()> {
                                 no_fn_verify,
                                 progress,
                                 &witness_semantics_name,
+                                target.as_deref(),
                                 &diagnostics,
                                 &[],
                             )?;
@@ -466,6 +527,7 @@ pub fn run() -> miette::Result<()> {
                         no_fn_verify,
                         progress,
                         &witness_semantics_name,
+                        target.as_deref(),
                         &diagnostics,
                         &[],
                     )?;
@@ -489,10 +551,45 @@ pub fn run() -> miette::Result<()> {
                     no_fn_verify,
                     progress,
                     &witness_semantics_name,
+                    target.as_deref(),
                     &diagnostics,
                     &results,
                 )?;
                 println!("Report written to {}", report_path.display());
+            }
+            if let Some(path) = trace_artifact.as_ref() {
+                let artifact_config = crate::artifact::VerifyArtifactConfig {
+                    solver: &solver_name,
+                    chc_solver: &chc_solver_name,
+                    bounded_only,
+                    unbounded_only,
+                    induction_timeout_ms: induction_timeout.saturating_mul(1000),
+                    bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
+                    ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
+                    no_ic3,
+                    no_prop_verify,
+                    no_fn_verify,
+                    witness_semantics: &witness_semantics_name,
+                    target: target.as_deref(),
+                };
+                let artifacts =
+                    crate::artifact::verification_trace_artifacts(&results, &artifact_config);
+                let bundle = crate::artifact::TraceArtifactBundle::new(
+                    &files,
+                    crate::artifact::ReplayInfo::from_current_process(),
+                    artifacts,
+                );
+                crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
+                println!(
+                    "Trace artifact written to {} ({} artifact{})",
+                    path.display(),
+                    bundle.artifacts().len(),
+                    if bundle.artifacts().len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
             }
             if results.is_empty() {
                 println!("No verification targets found.");
@@ -514,14 +611,16 @@ pub fn run() -> miette::Result<()> {
                 }
             }
         }
-        Command::Simulate {
-            files,
-            steps,
-            seed,
-            slots,
-            scope,
-            system,
-        } => {
+        Command::Run(args) | Command::Simulate(args) => {
+            let SimulateArgs {
+                files,
+                steps,
+                seed,
+                slots,
+                scope,
+                system,
+                trace_artifact,
+            } = args;
             let entity_slot_overrides = parse_simulation_scope_overrides(&scope)?;
             let config = crate::simulate::SimulateConfig {
                 steps,
@@ -541,12 +640,77 @@ pub fn run() -> miette::Result<()> {
             if has_error_diagnostics(&simulated.lowered.diagnostics) {
                 std::process::exit(1);
             }
+            if let Some(path) = trace_artifact.as_ref() {
+                let artifact = crate::artifact::simulation_trace_artifact(
+                    simulated.result.clone(),
+                    &crate::artifact::SimulationArtifactConfig {
+                        slots_per_entity: slots,
+                        system: config.system.clone(),
+                    },
+                );
+                let bundle = crate::artifact::TraceArtifactBundle::new(
+                    &files,
+                    crate::artifact::ReplayInfo::from_current_process(),
+                    vec![artifact],
+                );
+                crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
+                println!("Trace artifact written to {}", path.display());
+            }
             print!("{}", simulated.result.render_text());
             if matches!(
                 simulated.result.termination,
                 crate::simulate::SimulationTermination::Deadlock { .. }
             ) {
                 std::process::exit(1);
+            }
+        }
+        Command::Trace(args) => {
+            let TraceArgs {
+                file,
+                artifact,
+                command,
+            } = args;
+            let bundle = crate::artifact::read_trace_artifact_bundle(&file)?;
+            match command.unwrap_or(TraceCommand::List) {
+                TraceCommand::List => {
+                    print!("{}", crate::artifact::render_trace_artifact_list(&bundle));
+                }
+                TraceCommand::Draw => {
+                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
+                        .map_err(|err| miette::miette!("{err}"))?;
+                    print!(
+                        "{}",
+                        crate::artifact::render_trace_artifact_draw(selected)
+                            .map_err(|err| miette::miette!("{err}"))?
+                    );
+                }
+                TraceCommand::State { index } => {
+                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
+                        .map_err(|err| miette::miette!("{err}"))?;
+                    print!(
+                        "{}",
+                        crate::artifact::render_trace_artifact_state(selected, index)
+                            .map_err(|err| miette::miette!("{err}"))?
+                    );
+                }
+                TraceCommand::Diff { from, to } => {
+                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
+                        .map_err(|err| miette::miette!("{err}"))?;
+                    print!(
+                        "{}",
+                        crate::artifact::render_trace_artifact_diff(selected, from, to)
+                            .map_err(|err| miette::miette!("{err}"))?
+                    );
+                }
+                TraceCommand::Json => {
+                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
+                        .map_err(|err| miette::miette!("{err}"))?;
+                    println!(
+                        "{}",
+                        crate::artifact::render_trace_artifact_json(selected)
+                            .map_err(|err| miette::miette!("{err}"))?
+                    );
+                }
             }
         }
         Command::Qa {

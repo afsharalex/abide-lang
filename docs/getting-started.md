@@ -183,7 +183,7 @@ abide qa checks.qa -f .
 Simulation:
 
 ```sh
-abide simulate order.ab --steps 10
+abide run order.ab --steps 10
 ```
 
 ## Next guides

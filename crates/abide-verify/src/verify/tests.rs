@@ -27,6 +27,14 @@ fn skip_unbounded_proof_test() {
     eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
 }
 
+fn bool_lit(value: bool) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value },
+        span: None,
+    }
+}
+
 macro_rules! require_unbounded_proof_tests {
     () => {
         if !should_run_unbounded_proof_tests() {
@@ -239,6 +247,120 @@ fn verification_panic_boundary_preserves_success_result() {
     assert!(matches!(
         result,
         VerificationResult::Checked { ref name, depth, .. } if name == "ok_case" && depth == 1
+    ));
+}
+
+fn target_selector_test_ir() -> IRProgram {
+    IRProgram {
+        types: vec![],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![],
+        systems: vec![],
+        verifies: vec![IRVerify {
+            name: "same".to_owned(),
+            depth: Some(1),
+            systems: vec![],
+            stores: vec![],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            asserts: vec![bool_lit(true)],
+            span: None,
+            file: None,
+        }],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![
+            IRLemma {
+                name: "same".to_owned(),
+                assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+                body: vec![bool_lit(true)],
+                span: None,
+                file: None,
+            },
+            IRLemma {
+                name: "kept".to_owned(),
+                assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+                body: vec![bool_lit(true)],
+                span: None,
+                file: None,
+            },
+        ],
+        scenes: vec![],
+    }
+}
+
+#[test]
+fn verify_target_selector_parses_typed_and_untyped_forms() {
+    let typed: VerifyTargetSelector = "verify:safety".parse().expect("typed target");
+    assert_eq!(typed.kind, Some(VerifyTargetKind::Verify));
+    assert_eq!(typed.name, "safety");
+    assert_eq!(typed.to_string(), "verify:safety");
+
+    let untyped: VerifyTargetSelector = "safety".parse().expect("untyped target");
+    assert_eq!(untyped.kind, None);
+    assert_eq!(untyped.name, "safety");
+    assert_eq!(untyped.to_string(), "safety");
+
+    assert!("unknown:safety".parse::<VerifyTargetSelector>().is_err());
+}
+
+#[test]
+fn verify_all_target_runs_only_selected_lemma_result() {
+    let ir = target_selector_test_ir();
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            target: Some("lemma:kept".parse().expect("target")),
+            ..VerifyConfig::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        &results[0],
+        VerificationResult::Proved { name, .. } if name == "kept"
+    ));
+}
+
+#[test]
+fn verify_all_target_rejects_ambiguous_untyped_name() {
+    let ir = target_selector_test_ir();
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            target: Some("same".parse().expect("target")),
+            ..VerifyConfig::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        &results[0],
+        VerificationResult::Unprovable { hint, .. }
+            if hint.contains("ambiguous")
+                && hint.contains("lemma:same")
+                && hint.contains("verify:same")
+    ));
+}
+
+#[test]
+fn verify_all_target_rejects_unknown_name_with_available_targets() {
+    let ir = target_selector_test_ir();
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            target: Some("missing".parse().expect("target")),
+            ..VerifyConfig::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        &results[0],
+        VerificationResult::Unprovable { hint, .. }
+            if hint.contains("unknown verification target")
+                && hint.contains("lemma:kept")
+                && hint.contains("verify:same")
     ));
 }
 

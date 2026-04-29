@@ -58,8 +58,10 @@ mod relational;
 pub mod solver;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -834,6 +836,96 @@ pub enum WitnessSemantics {
     Relational,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerifyTargetKind {
+    Verify,
+    Scene,
+    Theorem,
+    Lemma,
+    Prop,
+    Fn,
+}
+
+impl VerifyTargetKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Scene => "scene",
+            Self::Theorem => "theorem",
+            Self::Lemma => "lemma",
+            Self::Prop => "prop",
+            Self::Fn => "fn",
+        }
+    }
+
+    fn parse(input: &str) -> Option<Self> {
+        match input {
+            "verify" => Some(Self::Verify),
+            "scene" => Some(Self::Scene),
+            "theorem" => Some(Self::Theorem),
+            "lemma" => Some(Self::Lemma),
+            "prop" => Some(Self::Prop),
+            "fn" => Some(Self::Fn),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VerifyTargetSelector {
+    pub kind: Option<VerifyTargetKind>,
+    pub name: String,
+}
+
+impl VerifyTargetSelector {
+    #[must_use]
+    pub fn matches(&self, kind: VerifyTargetKind, name: &str) -> bool {
+        self.name == name && self.kind.is_none_or(|selected| selected == kind)
+    }
+}
+
+impl fmt::Display for VerifyTargetSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(kind) = self.kind {
+            write!(f, "{}:{}", kind.as_str(), self.name)
+        } else {
+            f.write_str(&self.name)
+        }
+    }
+}
+
+impl FromStr for VerifyTargetSelector {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("verification target must not be empty".to_owned());
+        }
+        if let Some((kind, name)) = input.split_once(':') {
+            let kind = VerifyTargetKind::parse(kind).ok_or_else(|| {
+                format!(
+                    "unknown verification target kind `{kind}`; expected one of verify, scene, theorem, lemma, prop, fn"
+                )
+            })?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!("{} target must include a name", kind.as_str()));
+            }
+            Ok(Self {
+                kind: Some(kind),
+                name: name.to_owned(),
+            })
+        } else {
+            Ok(Self {
+                kind: None,
+                name: input.to_owned(),
+            })
+        }
+    }
+}
+
 /// Configuration for the verification pipeline.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
@@ -868,6 +960,8 @@ pub struct VerifyConfig {
     pub witness_semantics: WitnessSemantics,
     /// Add semantics-preserving symmetry breaking to relational SAT encodings.
     pub relational_symmetry_breaking: bool,
+    /// Optional target selector. Untyped selectors must resolve unambiguously.
+    pub target: Option<VerifyTargetSelector>,
 }
 
 impl Default for VerifyConfig {
@@ -888,6 +982,7 @@ impl Default for VerifyConfig {
             progress: false,
             witness_semantics: WitnessSemantics::Operational,
             relational_symmetry_breaking: true,
+            target: None,
         }
     }
 }
@@ -952,6 +1047,144 @@ pub(super) fn verification_timeout_hint(config: &VerifyConfig) -> String {
         "verification timed out after {} — increase --timeout or simplify the target",
         timeout_display_ms(config.overall_timeout_ms)
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyTargetEntry {
+    pub kind: VerifyTargetKind,
+    pub name: String,
+}
+
+impl fmt::Display for VerifyTargetEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.kind.as_str(), self.name)
+    }
+}
+
+#[must_use]
+pub fn available_verify_targets(ir: &IRProgram) -> Vec<VerifyTargetEntry> {
+    let mut targets = Vec::new();
+    targets.extend(ir.verifies.iter().map(|block| VerifyTargetEntry {
+        kind: VerifyTargetKind::Verify,
+        name: block.name.clone(),
+    }));
+    targets.extend(ir.scenes.iter().map(|block| VerifyTargetEntry {
+        kind: VerifyTargetKind::Scene,
+        name: block.name.clone(),
+    }));
+    targets.extend(ir.theorems.iter().map(|block| VerifyTargetEntry {
+        kind: VerifyTargetKind::Theorem,
+        name: block.name.clone(),
+    }));
+    targets.extend(ir.lemmas.iter().map(|block| VerifyTargetEntry {
+        kind: VerifyTargetKind::Lemma,
+        name: block.name.clone(),
+    }));
+    targets.extend(ir.functions.iter().filter_map(|func| {
+        func.prop_target.as_ref().map(|_| VerifyTargetEntry {
+            kind: VerifyTargetKind::Prop,
+            name: func.name.clone(),
+        })
+    }));
+    targets.extend(ir.functions.iter().filter_map(|func| {
+        if func.prop_target.is_none()
+            && (!func.ensures.is_empty()
+                || func.decreases.is_some()
+                || body_contains_assert(&func.body)
+                || body_contains_sorry(&func.body))
+        {
+            Some(VerifyTargetEntry {
+                kind: VerifyTargetKind::Fn,
+                name: func.name.clone(),
+            })
+        } else {
+            None
+        }
+    }));
+    targets.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+    });
+    targets
+}
+
+fn selected_target_error(ir: &IRProgram, config: &VerifyConfig) -> Option<VerificationResult> {
+    let selector = config.target.as_ref()?;
+    let available = available_verify_targets(ir);
+    let matches: Vec<_> = available
+        .iter()
+        .filter(|entry| selector.matches(entry.kind, &entry.name))
+        .collect();
+    match matches.as_slice() {
+        [entry] if entry.kind == VerifyTargetKind::Prop && config.no_prop_verify => {
+            Some(VerificationResult::Unprovable {
+                name: selector.to_string(),
+                hint: "selected target is disabled by --no-prop-verify".to_owned(),
+                span: None,
+                file: None,
+            })
+        }
+        [entry] if entry.kind == VerifyTargetKind::Fn && config.no_fn_verify => {
+            Some(VerificationResult::Unprovable {
+                name: selector.to_string(),
+                hint: "selected target is disabled by --no-fn-verify".to_owned(),
+                span: None,
+                file: None,
+            })
+        }
+        [_] => None,
+        [] => Some(VerificationResult::Unprovable {
+            name: selector.to_string(),
+            hint: format!(
+                "unknown verification target `{selector}`; available targets: {}",
+                format_available_targets(&available)
+            ),
+            span: None,
+            file: None,
+        }),
+        _ if selector.kind.is_none() => Some(VerificationResult::Unprovable {
+            name: selector.to_string(),
+            hint: format!(
+                "verification target `{}` is ambiguous; use one of: {}",
+                selector.name,
+                matches
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            span: None,
+            file: None,
+        }),
+        _ => None,
+    }
+}
+
+fn format_available_targets(targets: &[VerifyTargetEntry]) -> String {
+    if targets.is_empty() {
+        "none".to_owned()
+    } else {
+        targets
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+pub(super) fn should_run_target(config: &VerifyConfig, kind: VerifyTargetKind, name: &str) -> bool {
+    config
+        .target
+        .as_ref()
+        .is_none_or(|selector| selector.matches(kind, name))
+}
+
+fn should_prepare_lemma_dependency(config: &VerifyConfig) -> bool {
+    config
+        .target
+        .as_ref()
+        .is_some_and(|selector| selector.kind != Some(VerifyTargetKind::Lemma))
 }
 
 fn solver_label(family: SolverFamily) -> &'static str {
@@ -1103,6 +1336,10 @@ where
 /// Returns one result per target, each carrying source location for diagnostic rendering.
 #[allow(clippy::too_many_lines)]
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
+    if let Some(result) = selected_target_error(ir, config) {
+        return vec![result];
+    }
+
     let resolved_chc_family = match chc::resolve_chc_family(config.chc_selection) {
         Ok(family) => family,
         Err(hint) => {
@@ -1268,26 +1505,34 @@ fn verify_all_single_impl(
     // must be a tautology. Processed first so proved lemmas are
     // available to verify blocks, scenes, and theorems via DefEnv.
     for lemma_block in &ir.lemmas {
+        let selected = should_run_target(config, VerifyTargetKind::Lemma, &lemma_block.name);
+        if !selected && !should_prepare_lemma_dependency(config) {
+            continue;
+        }
         let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-            results.push(
-                VerificationResult::Unprovable {
-                    name: lemma_block.name.clone(),
-                    hint: verification_timeout_hint(config),
-                    span: lemma_block.span,
-                    file: lemma_block.file.clone(),
-                }
-                .with_source(lemma_block.span, lemma_block.file.clone()),
-            );
+            if selected {
+                results.push(
+                    VerificationResult::Unprovable {
+                        name: lemma_block.name.clone(),
+                        hint: verification_timeout_hint(config),
+                        span: lemma_block.span,
+                        file: lemma_block.file.clone(),
+                    }
+                    .with_source(lemma_block.span, lemma_block.file.clone()),
+                );
+            }
             continue;
         };
         if let Err(hint) = set_active_solver_family(solver_family) {
-            results.push(
-                unavailable_solver_result(&lemma_block.name, hint)
-                    .with_source(lemma_block.span, lemma_block.file.clone()),
-            );
+            if selected {
+                results.push(
+                    unavailable_solver_result(&lemma_block.name, hint)
+                        .with_source(lemma_block.span, lemma_block.file.clone()),
+                );
+            }
             continue;
         }
-        if config.progress {
+        if config.progress && selected {
             eprint!("Proving lemma {}...", lemma_block.name);
         }
         let result = catch_verification_panic(
@@ -1300,7 +1545,7 @@ fn verify_all_single_impl(
                     .with_source(lemma_block.span, lemma_block.file.clone())
             },
         );
-        if config.progress {
+        if config.progress && selected {
             eprintln!(" done");
         }
         // If the lemma proved, add its body to DefEnv under its declared
@@ -1308,10 +1553,15 @@ fn verify_all_single_impl(
         if matches!(&result, VerificationResult::Proved { .. }) {
             defs.add_lemma_fact(&lemma_block.name, &lemma_block.body);
         }
-        results.push(result);
+        if selected {
+            results.push(result);
+        }
     }
 
     for verify_block in &ir.verifies {
+        if !should_run_target(config, VerifyTargetKind::Verify, &verify_block.name) {
+            continue;
+        }
         let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
             results.push(VerificationResult::Unprovable {
                 name: verify_block.name.clone(),
@@ -1366,6 +1616,9 @@ fn verify_all_single_impl(
     }
 
     for scene_block in &ir.scenes {
+        if !should_run_target(config, VerifyTargetKind::Scene, &scene_block.name) {
+            continue;
+        }
         let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
             results.push(VerificationResult::Unprovable {
                 name: scene_block.name.clone(),
@@ -1404,6 +1657,9 @@ fn verify_all_single_impl(
     }
 
     for theorem_block in &ir.theorems {
+        if !should_run_target(config, VerifyTargetKind::Theorem, &theorem_block.name) {
+            continue;
+        }
         let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
             results.push(VerificationResult::Unprovable {
                 name: theorem_block.name.clone(),
@@ -1453,7 +1709,13 @@ fn verify_all_single_impl(
     // ── Verify function contracts ───────────────────────────────────
     // For each fn with ensures, prove that the body satisfies the
     // postcondition given the precondition.
-    if !config.no_fn_verify {
+    if !config.no_fn_verify
+        && config.target.as_ref().is_none_or(|selector| {
+            selector
+                .kind
+                .is_none_or(|kind| kind == VerifyTargetKind::Fn)
+        })
+    {
         if let Err(hint) = set_active_solver_family(solver_family) {
             results.push(unavailable_solver_result("fn_verification", hint));
         } else {
@@ -1464,7 +1726,13 @@ fn verify_all_single_impl(
     // ── Auto-verify props ───────────────────────────────────────────
     // Props with a target system are implicit theorems: declaring a prop
     // means asserting it must hold (Dafny model).
-    if !config.no_prop_verify {
+    if !config.no_prop_verify
+        && config.target.as_ref().is_none_or(|selector| {
+            selector
+                .kind
+                .is_none_or(|kind| kind == VerifyTargetKind::Prop)
+        })
+    {
         // Collect prop names already covered by explicit theorems/verify blocks.
         // Collect from both unexpanded (direct name refs like `Var("prop_name")`)
         // AND expanded forms (transitive refs: if p2's body references p1,
@@ -1494,6 +1762,9 @@ fn verify_all_single_impl(
         }
 
         for func in &ir.functions {
+            if !should_run_target(config, VerifyTargetKind::Prop, &func.name) {
+                continue;
+            }
             let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
                 results.push(
                     VerificationResult::Unprovable {
@@ -1532,7 +1803,7 @@ fn verify_all_single_impl(
                 );
                 continue;
             }
-            if covered.contains(&func.name) {
+            if config.target.is_none() && covered.contains(&func.name) {
                 continue; // already checked via an explicit theorem/verify
             }
 

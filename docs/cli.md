@@ -8,7 +8,9 @@ The `abide` binary exposes these subcommands:
 - `emit-ir`
 - `export-temporal`
 - `verify`
+- `run`
 - `simulate`
+- `trace`
 - `qa`
 - `repl`
 
@@ -82,15 +84,18 @@ Selected flags:
 - `--verbose`
 - `--debug-evidence`
 - `--report <format> [output_dir]`
+- `--target <target>`
+- `--trace-artifact <path>`
 
-## `abide simulate`
+## `abide run`
 
-Forward-simulate a model without the solver.
+Run one seeded model execution without the solver.
 
 ```sh
-abide simulate spec.ab --steps 25
-abide simulate spec.ab --seed 7 --slots 8
-abide simulate spec.ab --scope Order=12 --system Commerce
+abide run spec.ab --steps 25
+abide run spec.ab --seed 7 --slots 8
+abide run spec.ab --scope Order=12 --system Commerce
+abide run spec.ab --trace-artifact traces/run.json
 ```
 
 Selected flags:
@@ -100,6 +105,37 @@ Selected flags:
 - `--slots <n>`
 - `--scope Entity=SLOTS`
 - `--system <name>`
+- `--trace-artifact <path>`
+
+## `abide simulate`
+
+`simulate` has the same behavior and flags as `run`.
+
+## `abide trace`
+
+Inspect structured artifacts emitted by `verify --trace-artifact` or `run --trace-artifact`.
+
+```sh
+abide trace traces/run.json
+abide trace traces/run.json draw
+abide trace traces/run.json state 1
+abide trace traces/run.json diff 0 1
+abide trace traces/run.json --artifact 2 json
+```
+
+Subcommands:
+
+- `list`
+- `draw`
+- `state <index>`
+- `diff <from> <to>`
+- `json`
+
+`draw` prints selected transitions, nondeterministic choices, observations, and state changes. Liveness artifacts are lasso-shaped when native liveness evidence is available; `list`, `draw`, and `state` show the loop-start frame.
+
+Flags:
+
+- `--artifact <id>`
 
 ## `abide qa`
 

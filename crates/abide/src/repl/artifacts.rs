@@ -1021,6 +1021,7 @@ mod tests {
             steps_requested: 5,
             steps_executed: 1,
             termination: crate::simulate::SimulationTermination::StepLimit,
+            violations: vec![],
             behavior,
         };
 

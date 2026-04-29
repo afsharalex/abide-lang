@@ -96,6 +96,7 @@ impl AbideCompleter {
                 "/abide".into(),
                 "/reload".into(),
                 "/verify".into(),
+                "/run".into(),
                 "/simulate".into(),
                 "/artifacts".into(),
                 "/show".into(),

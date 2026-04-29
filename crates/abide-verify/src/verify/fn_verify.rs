@@ -104,6 +104,9 @@ pub(super) fn verify_fn_contracts(
     results: &mut Vec<VerificationResult>,
 ) {
     for func in &ir.functions {
+        if !super::should_run_target(config, super::VerifyTargetKind::Fn, &func.name) {
+            continue;
+        }
         if matches!(remaining_budget_ms(deadline), Some(0)) {
             results.push(VerificationResult::Unprovable {
                 name: format!("fn_{}", func.name),

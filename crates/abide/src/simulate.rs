@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ir::types::{
     IRAction, IRActionMatchScrutinee, IRCreateField, IREntity, IRExpr, IRField, IRFunction,
@@ -33,20 +33,30 @@ impl Default for SimulateConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimulationTermination {
     StepLimit,
     Deadlock { reasons: Vec<String> },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub systems: Vec<String>,
     pub seed: u64,
     pub steps_requested: usize,
     pub steps_executed: usize,
     pub termination: SimulationTermination,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub violations: Vec<SimulationViolation>,
     pub behavior: Behavior,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationViolation {
+    pub verify: String,
+    pub assert_index: usize,
+    pub step: usize,
+    pub message: String,
 }
 
 impl SimulationResult {
@@ -66,6 +76,20 @@ impl SimulationResult {
                 for reason in reasons {
                     out.push_str(&format!("  - {reason}\n"));
                 }
+            }
+        }
+        if self.violations.is_empty() {
+            out.push_str("sampled assertions: no violations found (simulation is not proof)\n");
+        } else {
+            out.push_str("sampled assertions: violation found\n");
+            for violation in &self.violations {
+                out.push_str(&format!(
+                    "  - {} assert #{} failed at state {}: {}\n",
+                    violation.verify,
+                    violation.assert_index + 1,
+                    violation.step,
+                    violation.message
+                ));
             }
         }
 
@@ -146,11 +170,65 @@ impl SimulationResult {
                         render_value(observation.value())
                     ));
                 }
+                if let Some(next_state) = self.behavior.state(index + 1) {
+                    let changes = render_state_changes(state, next_state);
+                    if changes.is_empty() {
+                        out.push_str("    changes: none\n");
+                    } else {
+                        out.push_str("    changes\n");
+                        for change in changes {
+                            out.push_str(&format!("      {change}\n"));
+                        }
+                    }
+                }
             }
         }
 
         out
     }
+}
+
+fn render_state_changes(before: &op::State, after: &op::State) -> Vec<String> {
+    let before = rendered_state_fields(before);
+    let after = rendered_state_fields(after);
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|key| {
+            let before_value = before.get(&key);
+            let after_value = after.get(&key);
+            (before_value != after_value).then(|| match (before_value, after_value) {
+                (Some(before), Some(after)) => format!("{key}: {before} -> {after}"),
+                (None, Some(after)) => format!("{key}: <absent> -> {after}"),
+                (Some(before), None) => format!("{key}: {before} -> <absent>"),
+                (None, None) => format!("{key}: <absent> -> <absent>"),
+            })
+        })
+        .collect()
+}
+
+fn rendered_state_fields(state: &op::State) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    for (slot_ref, entity_state) in state.entity_slots() {
+        if !entity_state.active() {
+            continue;
+        }
+        for (field, value) in entity_state.fields() {
+            fields.insert(
+                format!("{}[{}].{field}", slot_ref.entity(), slot_ref.slot()),
+                render_value(value),
+            );
+        }
+    }
+    for (system, system_fields) in state.system_fields() {
+        for (field, value) in system_fields {
+            fields.insert(format!("System::{system}.{field}"), render_value(value));
+        }
+    }
+    fields
 }
 
 pub fn simulate_program(
@@ -161,6 +239,7 @@ pub fn simulate_program(
     let mut runtime = Runtime::new(program, config.clone(), &selected_systems)?;
 
     let mut states = vec![runtime.snapshot()];
+    let mut violations = runtime.sample_assertion_violations(0)?;
     let mut transitions = Vec::new();
     let mut executed = 0usize;
     let termination = loop {
@@ -180,6 +259,7 @@ pub fn simulate_program(
         transitions.push(transition);
         states.push(runtime.snapshot());
         executed += 1;
+        violations.extend(runtime.sample_assertion_violations(executed)?);
     };
 
     let behavior = op::Behavior::from_parts(states, transitions)
@@ -193,6 +273,7 @@ pub fn simulate_program(
         steps_requested: config.steps,
         steps_executed: executed,
         termination,
+        violations,
         behavior,
     })
 }
@@ -213,6 +294,20 @@ fn select_systems<'a>(
         return Ok(vec![system]);
     }
     Ok(program.systems.iter().collect())
+}
+
+fn simulation_state_assertion(assertion: &IRExpr) -> Option<&IRExpr> {
+    match assertion {
+        IRExpr::Always { body, .. } => Some(body),
+        IRExpr::Eventually { .. }
+        | IRExpr::Until { .. }
+        | IRExpr::Historically { .. }
+        | IRExpr::Once { .. }
+        | IRExpr::Previously { .. }
+        | IRExpr::Since { .. }
+        | IRExpr::Saw { .. } => None,
+        other => Some(other),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -446,6 +541,57 @@ impl<'a> Runtime<'a> {
             }
         }
         Ok(out)
+    }
+
+    fn sample_assertion_violations(&self, step: usize) -> Result<Vec<SimulationViolation>, String> {
+        let mut violations = Vec::new();
+        for verify in &self.program.verifies {
+            if !self.verify_applies_to_selected_systems(verify) {
+                continue;
+            }
+            let current_system = verify
+                .systems
+                .first()
+                .map_or_else(|| self.default_eval_system(), |system| system.name.clone());
+            for (assert_index, assertion) in verify.asserts.iter().enumerate() {
+                let Some(state_expr) = simulation_state_assertion(assertion) else {
+                    continue;
+                };
+                let env = EvalEnv {
+                    current_system: &current_system,
+                    current_slot: None,
+                    locals: BTreeMap::new(),
+                };
+                if !self.eval_bool(state_expr, &env)? {
+                    violations.push(SimulationViolation {
+                        verify: verify.name.clone(),
+                        assert_index,
+                        step,
+                        message: format!(
+                            "sampled state does not satisfy `{}`",
+                            expr_kind(state_expr)
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(violations)
+    }
+
+    fn verify_applies_to_selected_systems(&self, verify: &crate::ir::types::IRVerify) -> bool {
+        verify.systems.is_empty()
+            || verify
+                .systems
+                .iter()
+                .any(|system| self.entry_systems.contains(&system.name))
+    }
+
+    fn default_eval_system(&self) -> String {
+        self.entry_systems
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn enumerate_param_bindings(
@@ -2496,6 +2642,58 @@ mod tests {
             result.steps_executed > 0,
             "expected at least one simulated step"
         );
+    }
+
+    #[test]
+    fn simulate_records_sampled_assertion_violations() {
+        let lowered = lower_source(
+            r"module T
+
+enum AccountStatus = Open
+
+entity Account {
+  status: AccountStatus = @Open
+  balance: int = 0
+
+  action overdraw() { balance' = 0 - 1 }
+}
+
+system Bank(accounts: Store<Account>) {
+  command open_account() { create Account {} }
+
+  command overdraw_account() {
+    choose a: Account where a.balance == 0 { a.overdraw() }
+  }
+}
+
+verify no_negative_balances {
+  assume {
+    store accounts: Account[0..1]
+    let bank = Bank { accounts: accounts }
+  }
+  assert always all a: Account | a.balance >= 0
+}
+",
+        );
+
+        let result = simulate_program(
+            &lowered.ir_program,
+            &SimulateConfig {
+                steps: 2,
+                seed: 0,
+                slots_per_entity: 1,
+                entity_slot_overrides: BTreeMap::new(),
+                system: Some("Bank".to_owned()),
+            },
+        )
+        .expect("simulate");
+
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.violations[0].verify, "no_negative_balances");
+        assert_eq!(result.violations[0].step, 2);
+        assert!(result
+            .render_text()
+            .contains("sampled assertions: violation found"));
     }
 
     #[test]

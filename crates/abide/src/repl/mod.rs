@@ -204,12 +204,19 @@ impl ReplState {
 
     fn verify_current(
         &mut self,
+        target: Option<crate::verify::VerifyTargetSelector>,
     ) -> Result<(Vec<crate::verify::VerificationResult>, usize), String> {
         let ir_program = self
             .ir_program
             .as_ref()
             .ok_or_else(|| "no elaborated program available for verification".to_owned())?;
-        let results = crate::verify::verify_all(ir_program, &VerifyConfig::default());
+        let results = crate::verify::verify_all(
+            ir_program,
+            &VerifyConfig {
+                target,
+                ..VerifyConfig::default()
+            },
+        );
         let stored = self.artifacts.record_verify_results(&results);
         Ok((results, stored))
     }
@@ -632,26 +639,35 @@ fn handle_tool_command(cmd: &str, mode: &mut Mode, state: &mut ReplState) -> Too
             }
             ToolResult::UpdateCompleter
         }
-        "/verify" => {
-            match state.verify_current() {
-                Ok((results, stored)) => {
-                    for result in &results {
-                        println!("{result}");
+        _ if is_tool_command(trimmed, "/verify") => {
+            let target_text = trimmed.strip_prefix("/verify").unwrap_or_default().trim();
+            let target = if target_text.is_empty() {
+                Ok(None)
+            } else {
+                target_text.parse().map(Some)
+            };
+            match target {
+                Ok(target) => match state.verify_current(target) {
+                    Ok((results, stored)) => {
+                        for result in &results {
+                            println!("{result}");
+                        }
+                        if stored == 0 {
+                            println!("No native evidence artifacts were produced.");
+                        } else {
+                            println!("Stored {stored} native evidence artifact(s).");
+                        }
                     }
-                    if stored == 0 {
-                        println!("No native evidence artifacts were produced.");
-                    } else {
-                        println!("Stored {stored} native evidence artifact(s).");
+                    Err(err) => {
+                        println!("Cannot verify current REPL environment: {err}");
                     }
-                }
-                Err(err) => {
-                    println!("Cannot verify current REPL environment: {err}");
-                }
+                },
+                Err(err) => println!("Invalid verification target: {err}"),
             }
             ToolResult::Continue
         }
-        _ if trimmed.starts_with("/simulate") => {
-            match parse_simulate_command(trimmed) {
+        _ if is_tool_command(trimmed, "/run") || is_tool_command(trimmed, "/simulate") => {
+            match parse_run_command(trimmed) {
                 Ok(config) => match state.simulate_current(&config) {
                     Ok((result, stored)) => {
                         print!("{}", result.render_text());
@@ -879,6 +895,13 @@ fn make_continuation_prompt() -> DefaultPrompt {
     )
 }
 
+fn is_tool_command(input: &str, command: &str) -> bool {
+    input == command
+        || input
+            .strip_prefix(command)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+}
+
 fn print_help(mode: Mode) {
     println!("Tool commands:");
     println!("  /help, /h     Show this help");
@@ -889,7 +912,8 @@ fn print_help(mode: Mode) {
     println!("  /reload       Reload specs from disk");
     println!("  /reload <path>  Reload a specific loaded target");
     println!("  /verify       Run verification on the current in-memory environment");
-    println!("  /simulate [options]  Run one seeded forward simulation");
+    println!("  /run [options]       Run one seeded forward simulation");
+    println!("  /simulate [options]  Alias for /run");
     println!("  /explore [options]   Build a bounded composite state-space artifact");
     println!("  /artifacts    List stored native evidence, simulation, and state-space artifacts");
     println!("  /show artifact <selector>        Show artifact metadata and summary");
@@ -926,18 +950,22 @@ fn make_prompt(mode: Mode) -> DefaultPrompt {
     DefaultPrompt::new(segment, DefaultPromptSegment::Empty)
 }
 
-fn parse_simulate_command(cmd: &str) -> Result<SimulateConfig, String> {
-    let rest = cmd
-        .strip_prefix("/simulate")
-        .ok_or_else(|| "internal simulate command parse error".to_owned())?
-        .trim();
+fn parse_run_command(cmd: &str) -> Result<SimulateConfig, String> {
+    let (command, rest) = if let Some(rest) = cmd.strip_prefix("/run") {
+        ("/run", rest.trim())
+    } else if let Some(rest) = cmd.strip_prefix("/simulate") {
+        ("/simulate", rest.trim())
+    } else {
+        return Err("internal run command parse error".to_owned());
+    };
     let mut config = SimulateConfig::default();
     if rest.is_empty() {
         return Ok(config);
     }
 
-    let usage =
-        "Usage: /simulate [--steps N] [--seed N] [--slots N] [--scope Entity=N]... [--system NAME]";
+    let usage = format!(
+        "Usage: {command} [--steps N] [--seed N] [--slots N] [--scope Entity=N]... [--system NAME]"
+    );
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let mut index = 0usize;
     while index < tokens.len() {
@@ -945,37 +973,37 @@ fn parse_simulate_command(cmd: &str) -> Result<SimulateConfig, String> {
             "--steps" => {
                 let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
                 config.steps = value.parse::<usize>().map_err(|_| {
-                    format!("invalid `/simulate --steps {value}`; expected a non-negative integer")
+                    format!("invalid `{command} --steps {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--seed" => {
                 let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
                 config.seed = value.parse::<u64>().map_err(|_| {
-                    format!("invalid `/simulate --seed {value}`; expected a non-negative integer")
+                    format!("invalid `{command} --seed {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--slots" => {
                 let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
                 config.slots_per_entity = value.parse::<usize>().map_err(|_| {
-                    format!("invalid `/simulate --slots {value}`; expected a non-negative integer")
+                    format!("invalid `{command} --slots {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--scope" => {
                 let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
                 let (entity, slots_text) = value.split_once('=').ok_or_else(|| {
-                    format!("invalid `/simulate --scope {value}`; expected `Entity=N`")
+                    format!("invalid `{command} --scope {value}`; expected `Entity=N`")
                 })?;
                 if entity.trim().is_empty() {
                     return Err(format!(
-                        "invalid `/simulate --scope {value}`; entity name must not be empty"
+                        "invalid `{command} --scope {value}`; entity name must not be empty"
                     ));
                 }
                 let slots = slots_text.parse::<usize>().map_err(|_| {
                     format!(
-                        "invalid `/simulate --scope {value}`; slot count must be a non-negative integer"
+                        "invalid `{command} --scope {value}`; slot count must be a non-negative integer"
                     )
                 })?;
                 config
@@ -990,7 +1018,7 @@ fn parse_simulate_command(cmd: &str) -> Result<SimulateConfig, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `/simulate` option `{other}`; expected --steps, --seed, --slots, --scope, or --system"
+                    "unknown `{command}` option `{other}`; expected --steps, --seed, --slots, --scope, or --system"
                 ));
             }
         }
@@ -1300,6 +1328,29 @@ mod tests {
     fn parse_target_command_requires_path() {
         let err = parse_target_command("/load", "/load").expect_err("missing path");
         assert!(err.contains("Usage: /load <path>"));
+    }
+
+    #[test]
+    fn parse_run_command_supports_run_and_simulate_aliases() {
+        let run = parse_run_command(
+            "/run --steps 5 --seed 7 --slots 2 --scope Order=3 --system Commerce",
+        )
+        .expect("parse run");
+        assert_eq!(run.steps, 5);
+        assert_eq!(run.seed, 7);
+        assert_eq!(run.slots_per_entity, 2);
+        assert_eq!(run.entity_slot_overrides.get("Order"), Some(&3));
+        assert_eq!(run.system.as_deref(), Some("Commerce"));
+
+        let simulate = parse_run_command("/simulate --steps 8").expect("parse simulate");
+        assert_eq!(simulate.steps, 8);
+    }
+
+    #[test]
+    fn tool_command_matching_requires_exact_command_boundary() {
+        assert!(is_tool_command("/run", "/run"));
+        assert!(is_tool_command("/run --steps 1", "/run"));
+        assert!(!is_tool_command("/runner", "/run"));
     }
 
     #[test]

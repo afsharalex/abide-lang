@@ -51,6 +51,7 @@ pub use abide_syntax::{ast, lex, parse};
 pub use abide_verify::verify;
 pub use abide_witness as witness;
 
+pub mod artifact;
 pub mod cli;
 pub mod driver;
 pub mod ide;
