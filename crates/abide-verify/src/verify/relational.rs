@@ -93,6 +93,19 @@ enum RelScopedPred {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum RelQuantifier {
+    Exists,
+    Forall,
+}
+
+#[derive(Debug, Clone)]
+struct RelQuantBinding {
+    quantifier: RelQuantifier,
+    var: String,
+    entity: String,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum RelCmpOp {
     Lt,
     Le,
@@ -103,8 +116,18 @@ enum RelCmpOp {
 #[derive(Debug, Clone)]
 enum RelSnapshotExpr {
     Bool(bool),
-    Exists { entity: String, pred: RelPred },
-    Forall { entity: String, pred: RelPred },
+    Exists {
+        entity: String,
+        pred: RelPred,
+    },
+    Forall {
+        entity: String,
+        pred: RelPred,
+    },
+    ScopedQuantified {
+        bindings: Vec<RelQuantBinding>,
+        pred: RelScopedPred,
+    },
     And(Box<RelSnapshotExpr>, Box<RelSnapshotExpr>),
     Or(Box<RelSnapshotExpr>, Box<RelSnapshotExpr>),
     Not(Box<RelSnapshotExpr>),
@@ -558,6 +581,7 @@ impl<'a> RelationalVerifyObligation<'a> {
         ir: &'a IRProgram,
         verify: &'a IRVerify,
         bound: usize,
+        symmetry_breaking: bool,
     ) -> Result<Option<Self>, String> {
         let Some(spec) = relational_verify_spec(ir, verify)? else {
             return Ok(None);
@@ -601,6 +625,10 @@ impl<'a> RelationalVerifyObligation<'a> {
                     field_encodings,
                 },
             );
+        }
+
+        if symmetry_breaking {
+            add_active_prefix_symmetry_breaking(&mut sat, &entity_states);
         }
 
         for step_idx in 0..bound {
@@ -773,8 +801,10 @@ pub(super) fn try_check_verify_block_relational(
     verify: &IRVerify,
     bound: usize,
     witness_semantics: WitnessSemantics,
+    symmetry_breaking: bool,
 ) -> Option<RelationalVerifyOutcome> {
-    let obligation = RelationalVerifyObligation::build(ir, verify, bound).ok()??;
+    let obligation =
+        RelationalVerifyObligation::build(ir, verify, bound, symmetry_breaking).ok()??;
     Some(obligation.solve(witness_semantics))
 }
 
@@ -1674,7 +1704,7 @@ fn simple_value_with_params(
 
 fn supports_assertion_expr(expr: &IRExpr) -> bool {
     match expr {
-        IRExpr::Exists { body, .. } => supports_slot_predicate(body),
+        IRExpr::Exists { body, .. } | IRExpr::Forall { body, .. } => supports_slot_predicate(body),
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" => {
@@ -1770,6 +1800,29 @@ fn encode_assertion_into(
                 sat.add_clause(clause.as_slice().into());
             }
             Ok(out)
+        }
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => {
+            let entity_name = match domain {
+                IRType::Entity { name } => name.clone(),
+                _ => return Err("unsupported universal domain in relational scene".to_owned()),
+            };
+            let entity_name_ref = entity_name.as_str();
+            let mut clauses = Vec::new();
+            for inst in instances {
+                if inst.entity != entity_name_ref {
+                    continue;
+                }
+                for assign in inst.assigns.iter().copied() {
+                    clauses.push(if slot_predicate_matches(body, var, &inst.field_values) {
+                        const_lit(sat, true)
+                    } else {
+                        !assign
+                    });
+                }
+            }
+            and_lit(sat, &clauses)
         }
         _ => Err("unsupported relational scene assertion".to_owned()),
     }
@@ -2819,46 +2872,85 @@ fn parse_snapshot_expr(
             };
             Ok(Some(RelSnapshotExpr::Not(Box::new(inner))))
         }
-        IRExpr::Exists {
-            var, domain, body, ..
-        } => {
-            let IRType::Entity { name: entity_name } = domain else {
-                return Ok(None);
-            };
-            if !entity_names.contains(entity_name) {
-                return Ok(None);
-            }
-            let Some(pred) =
-                parse_slot_predicate_expr(body, Some(var.as_str()), None, &HashMap::new())?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(RelSnapshotExpr::Exists {
-                entity: entity_name.clone(),
-                pred,
-            }))
-        }
-        IRExpr::Forall {
-            var, domain, body, ..
-        } => {
-            let IRType::Entity { name: entity_name } = domain else {
-                return Ok(None);
-            };
-            if !entity_names.contains(entity_name) {
-                return Ok(None);
-            }
-            let Some(pred) =
-                parse_slot_predicate_expr(body, Some(var.as_str()), None, &HashMap::new())?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(RelSnapshotExpr::Forall {
-                entity: entity_name.clone(),
-                pred,
-            }))
-        }
+        IRExpr::Exists { .. } => parse_snapshot_quantifier_chain(expr, entity_names),
+        IRExpr::Forall { .. } => parse_snapshot_quantifier_chain(expr, entity_names),
         _ => Ok(None),
     }
+}
+
+fn parse_snapshot_quantifier_chain(
+    expr: &IRExpr,
+    entity_names: &[String],
+) -> Result<Option<RelSnapshotExpr>, String> {
+    let mut bindings = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            IRExpr::Exists {
+                var, domain, body, ..
+            } => {
+                let IRType::Entity { name: entity_name } = domain else {
+                    return Ok(None);
+                };
+                if !entity_names.contains(entity_name) {
+                    return Ok(None);
+                }
+                bindings.push(RelQuantBinding {
+                    quantifier: RelQuantifier::Exists,
+                    var: var.clone(),
+                    entity: entity_name.clone(),
+                });
+                current = body;
+            }
+            IRExpr::Forall {
+                var, domain, body, ..
+            } => {
+                let IRType::Entity { name: entity_name } = domain else {
+                    return Ok(None);
+                };
+                if !entity_names.contains(entity_name) {
+                    return Ok(None);
+                }
+                bindings.push(RelQuantBinding {
+                    quantifier: RelQuantifier::Forall,
+                    var: var.clone(),
+                    entity: entity_name.clone(),
+                });
+                current = body;
+            }
+            _ => break,
+        }
+    }
+
+    if bindings.len() == 1 {
+        let binding = &bindings[0];
+        let Some(pred) =
+            parse_slot_predicate_expr(current, Some(binding.var.as_str()), None, &HashMap::new())?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(match binding.quantifier {
+            RelQuantifier::Exists => RelSnapshotExpr::Exists {
+                entity: binding.entity.clone(),
+                pred,
+            },
+            RelQuantifier::Forall => RelSnapshotExpr::Forall {
+                entity: binding.entity.clone(),
+                pred,
+            },
+        }));
+    }
+
+    let allowed_bindings = bindings
+        .iter()
+        .map(|binding| binding.var.as_str())
+        .collect::<Vec<_>>();
+    let Some(pred) =
+        parse_scoped_predicate_expr(current, None, None, &HashMap::new(), &allowed_bindings)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RelSnapshotExpr::ScopedQuantified { bindings, pred }))
 }
 
 fn parse_slot_predicate_expr(
@@ -3136,6 +3228,13 @@ fn collect_snapshot_values(
             if entity == entity_name {
                 collect_pred_values(pred, domains);
             }
+        }
+        RelSnapshotExpr::ScopedQuantified { bindings, pred } => {
+            let binding_entities = bindings
+                .iter()
+                .map(|binding| (binding.var.as_str(), binding.entity.as_str()))
+                .collect::<HashMap<_, _>>();
+            collect_scoped_pred_values_for_entity(pred, &binding_entities, domains, entity_name);
         }
         RelSnapshotExpr::And(left, right) | RelSnapshotExpr::Or(left, right) => {
             collect_snapshot_values(left, domains, entity_name);
@@ -3458,6 +3557,18 @@ fn encode_verify_snapshot_into(
             }
             and_lit(sat, &clauses)
         }
+        RelSnapshotExpr::ScopedQuantified { bindings, pred } => {
+            let mut assignment = HashMap::new();
+            encode_scoped_quantified_snapshot(
+                bindings,
+                pred,
+                entity_states,
+                sat,
+                state_idx,
+                0,
+                &mut assignment,
+            )
+        }
         RelSnapshotExpr::And(left, right) => {
             let left_lit = encode_verify_snapshot_into(left, entity_states, sat, state_idx)?;
             let right_lit = encode_verify_snapshot_into(right, entity_states, sat, state_idx)?;
@@ -3474,6 +3585,99 @@ fn encode_verify_snapshot_into(
             sat,
             state_idx,
         )?),
+    }
+}
+
+fn add_active_prefix_symmetry_breaking(
+    sat: &mut SatInstance,
+    entity_states: &HashMap<String, EntityStateEncoding>,
+) -> usize {
+    let mut added = 0;
+    for state in entity_states.values() {
+        if state.slot_count < 2 {
+            continue;
+        }
+        for active_slots in &state.active_by_state {
+            for slot in 0..(state.slot_count - 1) {
+                sat.add_binary(!active_slots[slot + 1], active_slots[slot]);
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
+fn encode_scoped_quantified_snapshot(
+    bindings: &[RelQuantBinding],
+    pred: &RelScopedPred,
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    index: usize,
+    assignment: &mut HashMap<String, (String, usize)>,
+) -> Result<rustsat::types::Lit, String> {
+    if index == bindings.len() {
+        let mut binding_slots = HashMap::new();
+        for (var, (entity, slot)) in assignment.iter() {
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let slots = (0..state.slot_count)
+                .map(|candidate| const_lit(sat, candidate == *slot))
+                .collect::<Vec<_>>();
+            binding_slots.insert(var.clone(), (entity.clone(), slots));
+        }
+        let current_fields: HashMap<String, HashMap<String, Vec<Vec<rustsat::types::Lit>>>> =
+            entity_states
+                .iter()
+                .map(|(entity_name, state)| {
+                    (
+                        entity_name.clone(),
+                        state
+                            .field_encodings
+                            .iter()
+                            .map(|(field_name, encoding)| {
+                                (field_name.clone(), encoding.state_lits[state_idx].clone())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+        return encode_scoped_pred_with_bindings(
+            sat,
+            pred,
+            &binding_slots,
+            &current_fields,
+            entity_states,
+        );
+    }
+
+    let binding = &bindings[index];
+    let state = entity_states
+        .get(&binding.entity)
+        .ok_or_else(|| format!("missing relational entity state for `{}`", binding.entity))?;
+    let mut cases = Vec::with_capacity(state.slot_count);
+    for slot in 0..state.slot_count {
+        let active = state.active_by_state[state_idx][slot];
+        assignment.insert(binding.var.clone(), (binding.entity.clone(), slot));
+        let body = encode_scoped_quantified_snapshot(
+            bindings,
+            pred,
+            entity_states,
+            sat,
+            state_idx,
+            index + 1,
+            assignment,
+        )?;
+        assignment.remove(&binding.var);
+        cases.push(match binding.quantifier {
+            RelQuantifier::Exists => and_lit(sat, &[active, body])?,
+            RelQuantifier::Forall => or_lit(sat, &[!active, body])?,
+        });
+    }
+    match binding.quantifier {
+        RelQuantifier::Exists => or_lit(sat, &cases),
+        RelQuantifier::Forall => and_lit(sat, &cases),
     }
 }
 
@@ -3985,5 +4189,44 @@ fn slot_predicate_matches(
             field_values.get(field) == Some(&expected)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solve_instance(sat: SatInstance) -> SolverResult {
+        let (cnf, _) = sat.into_cnf();
+        let mut solver = BasicSolver::default();
+        solver.add_cnf(cnf).expect("test CNF should load");
+        solver.solve().expect("test solve should complete")
+    }
+
+    #[test]
+    fn active_prefix_symmetry_breaking_prunes_non_prefix_slot_assignments() {
+        let mut unsymmetrized = SatInstance::new();
+        let inactive_first = unsymmetrized.new_lit();
+        let active_second = unsymmetrized.new_lit();
+        unsymmetrized.add_unit(!inactive_first);
+        unsymmetrized.add_unit(active_second);
+        assert!(matches!(solve_instance(unsymmetrized), SolverResult::Sat));
+
+        let mut symmetrized = SatInstance::new();
+        let inactive_first = symmetrized.new_lit();
+        let active_second = symmetrized.new_lit();
+        let entity_states = HashMap::from([(
+            "Order".to_owned(),
+            EntityStateEncoding {
+                slot_count: 2,
+                active_by_state: vec![vec![inactive_first, active_second]],
+                field_encodings: HashMap::new(),
+            },
+        )]);
+        let added = add_active_prefix_symmetry_breaking(&mut symmetrized, &entity_states);
+        assert_eq!(added, 1);
+        symmetrized.add_unit(!inactive_first);
+        symmetrized.add_unit(active_second);
+        assert!(matches!(solve_instance(symmetrized), SolverResult::Unsat));
     }
 }

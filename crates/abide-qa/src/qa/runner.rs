@@ -284,16 +284,32 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
         let outcome = exec::execute_statement_detailed_with_env(&model, Some(&base_env), stmt);
         let verb = outcome.verb;
         let result = outcome.result;
-        let stored_temporal = if let Some(verification_result) = &outcome.semantic_artifact {
-            temporal_artifact_name(stmt)
-                .map(|name| artifacts.record_named_verification_result(name, verification_result))
-                .unwrap_or(0)
+        let stored_temporal_artifact = if let Some(verification_result) = &outcome.semantic_artifact
+        {
+            temporal_artifact_name(stmt).and_then(|name| {
+                artifacts.record_named_verification_result_id(name, verification_result)
+            })
         } else {
-            0
+            None
         };
-
+        let stored_temporal = usize::from(stored_temporal_artifact.is_some());
         if json_mode {
             output.push(fmt::format_result_json(verb, &result));
+            if let Some(artifact_id) = stored_temporal_artifact {
+                if let Some(artifact) = artifacts.artifact(artifact_id) {
+                    output.push(
+                        serde_json::json!({
+                            "verb": "artifact",
+                            "status": "stored",
+                            "id": artifact.id,
+                            "name": artifact.name,
+                            "kind": artifact.result_kind,
+                            "selector": artifact.kind_name_selector(),
+                        })
+                        .to_string(),
+                    );
+                }
+            }
             if verb == Verb::Assert {
                 if matches!(
                     &result,
@@ -438,6 +454,68 @@ show artifact deadlock:qa_temporal_always_on_commerce_true
     }
 
     #[test]
+    fn semantic_temporal_json_reports_stored_artifact_reference() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-runner-json-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let spec_path = dir.join("spec.ab");
+        let script_path = dir.join("script.qa");
+        fs::write(
+            &spec_path,
+            r#"
+enum OrderStatus = Pending | Shipped
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+}
+
+system Commerce(orders: Store<Order>) {
+  command ship(order: Order)
+  step ship(order: Order) requires order.status == @Pending {
+    order.status' = @Shipped
+  }
+}
+"#,
+        )
+        .expect("write spec");
+        fs::write(
+            &script_path,
+            r#"
+load "spec.ab"
+ask always on Commerce true
+"#,
+        )
+        .expect("write script");
+
+        let result = run_qa_script(&script_path, None, true);
+        assert_eq!(result.failed, 0);
+        let json_lines = result
+            .output
+            .iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert!(json_lines.iter().any(|value| {
+            value["verb"] == "ask"
+                && value["value"] == false
+                && value["mode"] == "semantic:counterexample[slots=4]"
+        }));
+        assert!(json_lines.iter().any(|value| {
+            value["verb"] == "artifact"
+                && value["status"] == "stored"
+                && value["id"] == 1
+                && value["kind"] == "deadlock"
+                && value["selector"] == "deadlock:qa_temporal_always_on_commerce_true"
+        }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn explore_statements_store_state_space_artifacts() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -471,7 +549,7 @@ system Commerce(orders: Store<Order>) {
             &script_path,
             r#"
 load "spec.ab"
-explore --system Commerce --slots 1
+explore --system Commerce --depth 1 --slots 1
 artifacts
 show artifact state-space:state_space_commerce
 draw artifact state-space:state_space_commerce
@@ -485,6 +563,7 @@ draw artifact state-space:state_space_commerce
             .output
             .iter()
             .any(|line| line.contains("State space")));
+        assert!(result.output.iter().any(|line| line.contains("depth: 1")));
         assert!(result
             .output
             .iter()
@@ -498,6 +577,50 @@ draw artifact state-space:state_space_commerce
             .iter()
             .any(|line| line.contains("bounded state-space exploration")));
         assert!(result.output.iter().any(|line| line.contains("[state 0]")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explore_rejects_unknown_scope_override() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-explore-scope-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let spec_path = dir.join("spec.ab");
+        let script_path = dir.join("script.qa");
+        fs::write(
+            &spec_path,
+            r#"
+entity Order {
+  id: identity
+}
+
+system Commerce(orders: Store<Order>) {
+  command tick()
+  step tick() {}
+}
+"#,
+        )
+        .expect("write spec");
+        fs::write(
+            &script_path,
+            r#"
+load "spec.ab"
+explore --system Commerce --scope Missing=1
+"#,
+        )
+        .expect("write script");
+
+        let result = run_qa_script(&script_path, None, false);
+        assert_eq!(result.failed, 1);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| { line.contains("unknown or unused entity `Missing`") }));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -531,12 +654,32 @@ pub fn explore_state_space(
     request: &StateSpaceRequest,
 ) -> Result<StateSpaceArtifact, String> {
     let selected_systems = select_exploration_systems(ir_program, request.system.as_deref())?;
+    validate_state_space_scopes(&selected_systems, request)?;
     let verify_block = build_state_space_verify(ir_program, &selected_systems, request);
     explore_verify_state_space(ir_program, &verify_block, &VerifyConfig::default())?
         .ok_or_else(|| {
             "state-space exploration is not supported for this program fragment by the explicit-state backend"
                 .to_owned()
         })
+}
+
+fn validate_state_space_scopes(
+    systems: &[&ir::types::IRSystem],
+    request: &StateSpaceRequest,
+) -> Result<(), String> {
+    let scoped_entities = systems
+        .iter()
+        .flat_map(|system| system.store_params.iter())
+        .map(|store| store.entity_type.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (entity, _) in &request.scopes {
+        if !scoped_entities.contains(entity.as_str()) {
+            return Err(format!(
+                "explore scope override names unknown or unused entity `{entity}` for this state-space query"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn select_exploration_systems<'a>(
@@ -585,7 +728,7 @@ fn build_state_space_verify(
     let _ = ir_program;
     IRVerify {
         name: "__qa_state_space".to_owned(),
-        depth: None,
+        depth: request.depth,
         systems: systems_bound,
         stores,
         assumption_set: IRAssumptionSet::default_for_verify(),
@@ -656,6 +799,10 @@ pub fn render_state_space_summary(state_space: &StateSpaceArtifact) -> String {
     out.push_str("State space\n");
     out.push_str(&format!("  systems: {}\n", state_space.systems.join(", ")));
     out.push_str(&format!("  stutter: {}\n", state_space.stutter));
+    match state_space.depth_bound {
+        Some(depth) => out.push_str(&format!("  depth: {depth}\n")),
+        None => out.push_str("  depth: exhaustive\n"),
+    }
     if state_space.store_bounds.is_empty() {
         out.push_str("  store bounds: (none)\n");
     } else {

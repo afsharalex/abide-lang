@@ -464,7 +464,7 @@ pub struct EProp {
     pub file: Option<String>,
 }
 
-// ── Assumption sets () ─────────────────────────────────────
+// ── Assumption sets ────────────────────────────────────────
 //
 // Every verify/theorem/lemma site carries an `AssumptionSet` summarizing
 // the fairness and stutter assumptions in its `assume {... }` block,
@@ -475,7 +475,7 @@ pub struct EProp {
 // * theorem → stutter = true (refinement-friendly, TLA+-style)
 // * lemma → stutter = true
 //
-// Normalization ():
+// Normalization:
 // * sets are sorted alphabetically and deduplicated (BTreeSet)
 // * if an event is in `strong_fair`, it is removed from `weak_fair`
 // (strong fairness implies weak fairness)
@@ -520,12 +520,11 @@ pub struct AssumptionSet {
     pub weak_fair: std::collections::BTreeSet<EventRef>,
     /// Events with strong fairness.
     pub strong_fair: std::collections::BTreeSet<EventRef>,
-    /// Subset of `weak_fair ∪ strong_fair` whose events are parameterized
-    /// (i.e., the event signature has at least one parameter). Per Item
-    /// 20.5, parameterized fair events default to **per-tuple** fairness:
-    /// the fairness obligation is asserted for each `(event, args)` tuple
-    /// over the reachable state space, not for the event as a whole.
-    /// will use this to choose the correct lasso-BMC encoding.
+    /// Subset of `weak_fair ∪ strong_fair` whose events are parameterized.
+    /// Parameterized fair events default to per-tuple fairness: the fairness
+    /// obligation is asserted for each `(event, args)` tuple over the reachable
+    /// state space, not for the event as a whole. The verifier uses this to
+    /// choose the correct lasso-BMC encoding.
     pub per_tuple: std::collections::BTreeSet<EventRef>,
 }
 
@@ -567,7 +566,7 @@ impl AssumptionSet {
     }
 
     /// `lemma_usable(L, T)`: returns true iff lemma `L` can be used inside
-    /// theorem `T`'s proof environment, per. Required:
+    /// theorem `T`'s proof environment. Required:
     /// * every weak-fair event in `L` is weak-fair *or* strong-fair in `T`
     /// * every strong-fair event in `L` is strong-fair in `T`
     /// * if `T.stutter` and `!L.stutter`, reject — `T` admits stuttering
@@ -577,9 +576,8 @@ impl AssumptionSet {
     ///   on the smaller one.
     #[must_use]
     pub fn lemma_usable(lemma: &Self, theorem: &Self) -> bool {
-        // Stutter rule (): T allows stuttering, L was proven
-        // without it ⇒ reject. T's traces include stutter steps L never
-        // saw, so L's claim is too narrow.
+        // T allows stuttering but L was proven without it, so T's traces
+        // include stutter steps L never saw and L's claim is too narrow.
         if theorem.stutter && !lemma.stutter {
             return false;
         }
@@ -630,7 +628,7 @@ pub struct ELetBinding {
 pub struct EVerify {
     pub name: String,
     /// optional BMC depth override from `verify name [depth: N]`.
-    pub depth: Option<i64>,
+    pub depth: Option<usize>,
     /// store declarations from assume block.
     pub stores: Vec<EStoreDecl>,
     /// proc pool bounds from assume block.
@@ -750,9 +748,9 @@ pub struct ETheorem {
     /// index into the env's / `ElabResult`'s
     /// `under_blocks` vec, if this theorem was declared inside an
     /// `under` block. The resolve pass uses the indexed `EUnderBlock`'s
-    /// `resolved_set` as the floor of this theorem's assumption set
-    /// () and runs the add-only check on the inner `assume_block`
-    /// against that resolved floor.
+    /// `resolved_set` as the floor of this theorem's assumption set and runs
+    /// the add-only check on the inner `assume_block` against that resolved
+    /// floor.
     pub enclosing_under_idx: Option<usize>,
     /// Normalized assumption set populated by the resolve pass.
     pub assumption_set: AssumptionSet,

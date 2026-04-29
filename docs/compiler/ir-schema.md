@@ -12,6 +12,9 @@ The compiler currently exposes two JSON surfaces:
 Both are intended to be stable enough for tooling inside the Abide workspace.
 When these shapes change incompatibly, bump the schema version in this file.
 
+Fairness and stuttering defaults are recorded in
+[`fairness-stuttering.md`](fairness-stuttering.md).
+
 ## 1. IR JSON
 
 Command:

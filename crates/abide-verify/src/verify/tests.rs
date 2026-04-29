@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Helper: build a minimal IR program with an Order entity, `OrderStatus` enum,
 /// Commerce system, and a verify block.
-fn make_order_ir(assert_expr: IRExpr, bound: i64) -> IRProgram {
+fn make_order_ir(assert_expr: IRExpr, bound: usize) -> IRProgram {
     let order_status = IRTypeEntry {
         name: "OrderStatus".to_owned(),
         ty: IRType::Enum {
@@ -149,7 +149,7 @@ fn make_order_ir(assert_expr: IRExpr, bound: i64) -> IRProgram {
         systems: vec![IRVerifySystem {
             name: "Commerce".to_owned(),
             lo: 0,
-            hi: bound,
+            hi: bound as i64,
         }],
         stores: vec![],
         assumption_set: crate::ir::types::IRAssumptionSet {
@@ -21544,6 +21544,87 @@ fn relational_scene_fragment_passes_exact_two_creates() {
 }
 
 #[test]
+fn relational_scene_fragment_supports_create_only_forall_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_forall_pass.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_pending()\n\
+           step create_pending() { create Order {} }\n\
+         }\n\n\
+         scene all_created_pending {\n\
+           given {\n\
+             store orders: Order[0..2]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_pending(){2}\n\
+           }\n\
+           then {\n\
+             assert all o: Order | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "create-only forall scene should be routed to relational backend"
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "all_created_pending")),
+        "all_created_pending should pass through the relational backend: {results:?}"
+    );
+}
+
+#[test]
+fn relational_scene_fragment_fails_create_only_forall_assertion() {
+    let ir = lower_source_file(
+        "rel_scene_forall_fail.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_pending()\n\
+           step create_pending() { create Order {} }\n\
+           command create_confirmed()\n\
+           step create_confirmed() { create Order { status = @Confirmed } }\n\
+         }\n\n\
+         scene not_all_created_pending {\n\
+           given {\n\
+             store orders: Order[0..2]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_pending()\n\
+             commerce.create_confirmed()\n\
+           }\n\
+           then {\n\
+             assert all o: Order | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "failing create-only forall scene should stay inside relational backend"
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::SceneFail { name, .. } if name == "not_all_created_pending")
+        ),
+        "not_all_created_pending should fail through the relational backend: {results:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_fails_when_store_capacity_is_too_small() {
     let ir = lower_source_file(
         "rel_scene_fail.ab",
@@ -23247,6 +23328,96 @@ fn relational_verify_fragment_finds_two_entity_counterexample_with_relational_wi
     assert!(
         result.relational_witness().is_some(),
         "two-entity bounded counterexample should carry relational witness evidence: {result:?}"
+    );
+}
+
+#[test]
+fn relational_verify_fragment_checks_nested_cross_entity_quantifiers() {
+    let ir = lower_source_file(
+        "rel_verify_nested_quantifiers.ab",
+        "module RelVerify\n\n\
+         entity Order {\n  paid: bool = false\n}\n\n\
+         entity Payment {\n  captured: bool = false\n}\n\n\
+         system Commerce(orders: Store<Order>, payments: Store<Payment>) {\n\
+           command seed()\n\
+           step seed() {\n\
+             create Order { paid = true }\n\
+             create Payment { captured = true }\n\
+           }\n\
+         }\n\n\
+         verify matching_states {\n\
+           assume {\n\
+             stutter\n\
+             store orders: Order[0..2]\n\
+             store payments: Payment[0..2]\n\
+             let commerce = Commerce { orders: orders, payments: payments }\n\
+           }\n\
+           assert always (all o: Order | all p: Payment | o.paid == p.captured)\n\
+         }\n",
+    );
+    let verify = &ir.verifies[0];
+    assert!(
+        relational::supports_verify_fragment(&ir, verify)
+            .expect("support detection should succeed"),
+        "nested cross-entity quantifiers should stay inside the relational fragment"
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "matching_states"
+        )),
+        "nested cross-entity quantifiers should check through the relational backend: {results:?}"
+    );
+}
+
+#[test]
+fn relational_verify_fragment_finds_nested_cross_entity_quantifier_counterexample() {
+    let ir = lower_source_file(
+        "rel_verify_nested_quantifiers_fail.ab",
+        "module RelVerify\n\n\
+         entity Order {\n  paid: bool = false\n}\n\n\
+         entity Payment {\n  captured: bool = false\n}\n\n\
+         system Commerce(orders: Store<Order>, payments: Store<Payment>) {\n\
+           command seed()\n\
+           step seed() {\n\
+             create Order { paid = true }\n\
+             create Payment { captured = false }\n\
+           }\n\
+         }\n\n\
+         verify matching_states {\n\
+           assume {\n\
+             stutter\n\
+             store orders: Order[0..2]\n\
+             store payments: Payment[0..2]\n\
+             let commerce = Commerce { orders: orders, payments: payments }\n\
+           }\n\
+           assert always (all o: Order | all p: Payment | o.paid == p.captured)\n\
+         }\n",
+    );
+    let verify = &ir.verifies[0];
+    assert!(
+        relational::supports_verify_fragment(&ir, verify)
+            .expect("support detection should succeed"),
+        "nested cross-entity quantifier counterexamples should stay inside the relational fragment"
+    );
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            witness_semantics: WitnessSemantics::Relational,
+            ..VerifyConfig::default()
+        },
+    );
+    let result = results
+        .iter()
+        .find(
+            |r| matches!(r, VerificationResult::Counterexample { name, .. } if name == "matching_states"),
+        )
+        .unwrap_or_else(|| panic!("expected relational counterexample, got {results:?}"));
+    assert!(
+        result.relational_witness().is_some(),
+        "nested cross-entity quantifier counterexample should carry relational witness evidence: {result:?}"
     );
 }
 

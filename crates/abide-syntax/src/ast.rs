@@ -791,7 +791,7 @@ pub struct EventPath {
 pub struct VerifyDecl {
     pub name: String,
     /// Optional BMC depth override: `verify name [depth: N] {... }`
-    pub depth: Option<i64>,
+    pub depth: Option<usize>,
     /// `assume { store...; let...; fair X; stutter;... }` block.
     pub assume_block: Option<AssumeBlock>,
     pub asserts: Vec<Expr>,

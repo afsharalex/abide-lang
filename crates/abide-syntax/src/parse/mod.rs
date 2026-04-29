@@ -1441,14 +1441,16 @@ impl Parser {
             self.expect(&Token::Colon)?;
             let val = match self.peek() {
                 Some(Token::IntLit(_)) => {
-                    let (Token::IntLit(n), _) = self.advance() else {
+                    let (Token::IntLit(n), span) = self.advance() else {
                         unreachable!()
                     };
-                    n
+                    usize::try_from(n).map_err(|_| {
+                        ParseError::expected("non-negative integer", &format!("`{n}`"), span)
+                    })?
                 }
                 Some(tok) => {
                     return Err(ParseError::expected(
-                        "integer",
+                        "non-negative integer",
                         &format!("`{tok}`"),
                         self.cur_span(),
                     ));

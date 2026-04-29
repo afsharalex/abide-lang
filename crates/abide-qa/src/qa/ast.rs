@@ -48,6 +48,7 @@ pub struct SimulationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateSpaceRequest {
+    pub depth: Option<usize>,
     pub slots: usize,
     pub scopes: Vec<(String, usize)>,
     pub system: Option<String>,
@@ -80,6 +81,7 @@ impl Default for SimulationRequest {
 impl Default for StateSpaceRequest {
     fn default() -> Self {
         Self {
+            depth: None,
             slots: 4,
             scopes: Vec::new(),
             system: None,
@@ -256,7 +258,11 @@ impl std::fmt::Display for SimulationRequest {
 
 impl std::fmt::Display for StateSpaceRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "explore --slots {}", self.slots)?;
+        write!(f, "explore")?;
+        if let Some(depth) = self.depth {
+            write!(f, " --depth {depth}")?;
+        }
+        write!(f, " --slots {}", self.slots)?;
         for (entity, slots) in &self.scopes {
             write!(f, " --scope {entity}={slots}")?;
         }

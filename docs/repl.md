@@ -87,7 +87,8 @@ abide repl order.ab       # load a file (+ dependencies)
 | `/reload` | Reload all files from disk, discard in-memory changes |
 | `/verify` | Run verification against the current in-memory environment |
 | `/simulate [options]` | Run one seeded forward simulation against the current in-memory environment |
-| `/artifacts` | List stored native evidence and simulation artifacts |
+| `/explore [options]` | Build a bounded operational state-space artifact |
+| `/artifacts` | List stored native evidence, simulation, and state-space artifacts |
 | `/show artifact <selector>` | Show artifact metadata and evidence summary |
 | `/draw artifact <selector>` | Render a timeline view for temporal/operational artifacts |
 | `/state artifact <selector> <n>` | Inspect a specific witness state |
@@ -106,6 +107,14 @@ Artifact selectors can be a numeric session ID (`1`), a source name (`order_safe
 ```
 
 Simulation artifacts use the `simulation:<name>` selector form, where `<name>` is the explicit `--system` target when present or the first simulated system name otherwise.
+
+`/explore` accepts:
+
+```text
+/explore [--depth N] [--slots N] [--scope Entity=N]... [--system NAME]
+```
+
+If `--depth` is omitted, the REPL enumerates the finite operational fragment exhaustively. State-space artifacts use the `state-space:<name>` selector form.
 
 Artifacts are session-local. `/reload` and in-memory definition changes invalidate stored artifacts so you do not inspect evidence for an older program state by mistake.
 
@@ -163,5 +172,6 @@ Abide mode definitions modify the in-memory IR and rebuild the FlowModel. They d
 Today, the REPL stores:
 - evidence-bearing verification results that already emit native evidence objects: counterexamples, liveness violations, deadlocks, and admitted proof-artifact references
 - native simulation runs produced by `/simulate`
+- bounded operational state spaces produced by `/explore`
 
 Scene results are still printed by `/verify`, but they do not yet produce native artifacts.

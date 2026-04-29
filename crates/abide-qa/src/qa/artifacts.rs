@@ -106,6 +106,10 @@ impl Artifact {
                 out.push_str("  bounded state-space exploration\n");
                 out.push_str(&format!("  systems: {}\n", state_space.systems.join(", ")));
                 out.push_str(&format!("  stutter: {}\n", state_space.stutter));
+                match state_space.depth_bound {
+                    Some(depth) => out.push_str(&format!("  depth: {depth}\n")),
+                    None => out.push_str("  depth: exhaustive\n"),
+                }
                 if state_space.store_bounds.is_empty() {
                     out.push_str("  store bounds: (none)\n");
                 } else {
@@ -257,20 +261,30 @@ impl ArtifactStore {
         name: String,
         result: &VerificationResult,
     ) -> usize {
+        self.record_named_verification_result_id(name, result)
+            .map_or(0, |_| 1)
+    }
+
+    pub fn record_named_verification_result_id(
+        &mut self,
+        name: String,
+        result: &VerificationResult,
+    ) -> Option<usize> {
         let Some((name, result_kind, payload, extraction_error)) =
             artifact_parts_from_result_with_name(result, Some(name))
         else {
-            return 0;
+            return None;
         };
         self.next_id += 1;
+        let id = self.next_id;
         self.artifacts.push(Artifact {
-            id: self.next_id,
+            id,
             name,
             result_kind,
             payload,
             evidence_extraction_error: extraction_error,
         });
-        1
+        Some(id)
     }
 
     pub fn record_simulation_result(

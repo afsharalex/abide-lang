@@ -94,6 +94,10 @@ impl ReplArtifact {
                 out.push_str("  bounded state-space exploration\n");
                 out.push_str(&format!("  systems: {}\n", state_space.systems.join(", ")));
                 out.push_str(&format!("  stutter: {}\n", state_space.stutter));
+                match state_space.depth_bound {
+                    Some(depth) => out.push_str(&format!("  depth: {depth}\n")),
+                    None => out.push_str("  depth: exhaustive\n"),
+                }
                 if state_space.store_bounds.is_empty() {
                     out.push_str("  store bounds: (none)\n");
                 } else {

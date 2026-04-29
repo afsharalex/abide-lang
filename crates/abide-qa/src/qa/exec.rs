@@ -949,9 +949,28 @@ fn semantic_slots_for_entity(bounds: &TemporalBounds, entity_type: &str) -> i64 
     bounds
         .scopes
         .iter()
+        .rev()
         .find_map(|(entity, slots)| (entity == entity_type).then_some(*slots as i64))
         .or_else(|| bounds.slots.map(|slots| slots as i64))
         .unwrap_or(QA_SEMANTIC_DEFAULT_STORE_SLOTS)
+}
+
+fn validate_semantic_scope_bounds(
+    bounds: &TemporalBounds,
+    stores: &[EStoreDecl],
+) -> Result<(), String> {
+    let scoped_entities = stores
+        .iter()
+        .map(|store| store.entity_type.as_str())
+        .collect::<BTreeSet<_>>();
+    for (entity, _) in &bounds.scopes {
+        if !scoped_entities.contains(entity.as_str()) {
+            return Err(format!(
+                "temporal scope override names unknown or unused entity `{entity}` for this query"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_owner_kind(
@@ -1015,6 +1034,7 @@ fn build_semantic_verify(
         OwnerKind::Entity => semantic_entity_scaffold(env, owner, bounds)?,
         OwnerKind::System => semantic_system_scaffold(env, owner, bounds)?,
     };
+    validate_semantic_scope_bounds(bounds, &stores)?;
     let mode_suffix = semantic_mode_suffix(&stores);
     Ok((
         EVerify {
@@ -1056,7 +1076,7 @@ fn semantic_entity_scaffold(
         .collect();
     if candidates.is_empty() {
         return Err(format!(
-            "unsupported semantic QA query on `{owner}`: no system instantiates a Store<{owner}>; whole-store/global owner semantics remain in abide-vl6"
+            "unsupported semantic QA query on `{owner}`: no system instantiates a Store<{owner}>; whole-store/global owner semantics are not supported yet"
         ));
     }
     let mut stores = Vec::new();
@@ -4072,6 +4092,45 @@ system Commerce(orders: Store<Order>, payments: Store<Payment>) {
                 assert!(mode.contains("[scopes=Order=2,Payment=6]"));
             }
             other => panic!("expected semantic success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_temporal_semantic_rejects_unknown_scope_override() {
+        let (env, model) = semantic_env_and_model(
+            r#"
+entity Order {
+  id: identity
+}
+
+system Commerce(orders: Store<Order>) {
+  command tick()
+  step tick() {}
+}
+"#,
+            "semantic_unknown_scope_bounds",
+        );
+
+        match execute_query_with_env(
+            &model,
+            Some(&env),
+            &Query::Temporal {
+                op: TemporalOp::Always,
+                bounds: TemporalBounds {
+                    slots: Some(1),
+                    scopes: vec![("Missing".to_owned(), 2)],
+                },
+                target: Some(TemporalTarget {
+                    owner: "Commerce".to_owned(),
+                    field: None,
+                }),
+                expr: "true".to_owned(),
+            },
+        ) {
+            QueryResult::Error(message) => {
+                assert!(message.contains("unknown or unused entity `Missing`"));
+            }
+            other => panic!("expected clear unknown scope error, got {other:?}"),
         }
     }
 

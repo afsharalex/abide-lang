@@ -891,7 +891,7 @@ fn print_help(mode: Mode) {
     println!("  /verify       Run verification on the current in-memory environment");
     println!("  /simulate [options]  Run one seeded forward simulation");
     println!("  /explore [options]   Build a bounded composite state-space artifact");
-    println!("  /artifacts    List stored native evidence and simulation artifacts");
+    println!("  /artifacts    List stored native evidence, simulation, and state-space artifacts");
     println!("  /show artifact <selector>        Show artifact metadata and summary");
     println!("  /draw artifact <selector>        Draw artifact timeline when available");
     println!("  /state artifact <selector> <n>   Show a specific artifact state");
@@ -1008,11 +1008,18 @@ fn parse_explore_command(cmd: &str) -> Result<StateSpaceRequest, String> {
         return Ok(request);
     }
 
-    let usage = "Usage: /explore [--slots N] [--scope Entity=N]... [--system NAME]";
+    let usage = "Usage: /explore [--depth N] [--slots N] [--scope Entity=N]... [--system NAME]";
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let mut index = 0usize;
     while index < tokens.len() {
         match tokens[index] {
+            "--depth" => {
+                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                request.depth = Some(value.parse::<usize>().map_err(|_| {
+                    format!("invalid `/explore --depth {value}`; expected a non-negative integer")
+                })?);
+                index += 2;
+            }
             "--slots" => {
                 let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
                 request.slots = value.parse::<usize>().map_err(|_| {
@@ -1045,7 +1052,7 @@ fn parse_explore_command(cmd: &str) -> Result<StateSpaceRequest, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown `/explore` option `{other}`; expected --slots, --scope, or --system"
+                    "unknown `/explore` option `{other}`; expected --depth, --slots, --scope, or --system"
                 ));
             }
         }
@@ -1340,8 +1347,10 @@ mod tests {
 
     #[test]
     fn parse_explore_command_supports_bounds() {
-        let request = parse_explore_command("/explore --slots 2 --scope Order=3 --system Commerce")
-            .expect("parse explore");
+        let request =
+            parse_explore_command("/explore --depth 5 --slots 2 --scope Order=3 --system Commerce")
+                .expect("parse explore");
+        assert_eq!(request.depth, Some(5));
         assert_eq!(request.slots, 2);
         assert_eq!(request.scopes, vec![("Order".to_owned(), 3)]);
         assert_eq!(request.system.as_deref(), Some("Commerce"));

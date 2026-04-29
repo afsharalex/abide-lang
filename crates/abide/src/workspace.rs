@@ -40,6 +40,7 @@ struct VerifyConfigKey {
     no_prop_verify: bool,
     no_fn_verify: bool,
     progress: bool,
+    relational_symmetry_breaking: bool,
     solver_selection: u8,
     chc_selection: u8,
 }
@@ -58,6 +59,7 @@ impl From<&VerifyConfig> for VerifyConfigKey {
             no_prop_verify: config.no_prop_verify,
             no_fn_verify: config.no_fn_verify,
             progress: config.progress,
+            relational_symmetry_breaking: config.relational_symmetry_breaking,
             solver_selection: config.solver_selection as u8,
             chc_selection: config.chc_selection as u8,
         }

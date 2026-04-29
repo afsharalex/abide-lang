@@ -162,6 +162,10 @@ enum Command {
         #[arg(long = "witness-semantics", value_enum, default_value_t = VerifyWitnessSemantics::Operational)]
         witness_semantics: VerifyWitnessSemantics,
 
+        /// Disable relational SAT active-slot symmetry breaking
+        #[arg(long)]
+        no_relational_symmetry_breaking: bool,
+
         /// Print expanded human-readable verification details, including native evidence
         #[arg(long)]
         verbose: bool,
@@ -341,6 +345,7 @@ pub fn run() -> miette::Result<()> {
             no_fn_verify,
             progress,
             witness_semantics,
+            no_relational_symmetry_breaking,
             verbose,
             debug_evidence,
             report,
@@ -410,6 +415,7 @@ pub fn run() -> miette::Result<()> {
                 no_fn_verify,
                 progress,
                 witness_semantics,
+                relational_symmetry_breaking: !no_relational_symmetry_breaking,
             };
 
             let verified = match driver::verify_files(&files, &config) {

@@ -1142,6 +1142,23 @@ let commerce = Commerce { orders: orders }
     }
 }
 
+#[test]
+fn verify_decl_depth_is_non_negative() {
+    let prog = parse_program("verify bounded [depth: 7] { assert true }");
+    if let TopDecl::Verify(v) = &prog.decls[0] {
+        assert_eq!(v.depth, Some(7));
+    } else {
+        panic!("expected Verify");
+    }
+
+    let err = parse_program_err("verify bounded [depth: -1] { assert true }");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("non-negative integer"),
+        "expected non-negative depth diagnostic, got: {err:?}"
+    );
+}
+
 /// `for System[0..N]` on verify is rejected.
 #[test]
 fn verify_for_system_rejected() {

@@ -540,9 +540,8 @@ pub struct IRDerivedField {
 }
 
 /// a named invariant on an entity or system.
-/// `name` is mandatory (). `body` is the lowered Boolean
-/// expression that must be preserved by every event boundary in
-/// the verification scope.
+/// `name` is mandatory. `body` is the lowered Boolean expression that must be
+/// preserved by every event boundary in the verification scope.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRInvariant {
     pub name: std::string::String,
@@ -744,7 +743,7 @@ pub struct IRStep {
     pub body: Vec<IRAction>,
     /// optional return expression (outcome variant).
     /// The verifier does not encode return values — they are used by
-    /// proc outcome port resolution ().
+    /// proc outcome port resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_expr: Option<IRExpr>,
 }
@@ -827,16 +826,15 @@ pub struct IRVerify {
     pub name: std::string::String,
     /// optional BMC depth override from `verify name [depth: N]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub depth: Option<i64>,
+    pub depth: Option<usize>,
     pub systems: Vec<IRVerifySystem>,
     /// Per-store bounds: each store declaration carries its own entity type
     /// and pool size. `compute_verify_scope` sizes entities from these
     /// instead of collapsing all stores into a single max(hi) per system.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<IRStoreDecl>,
-    /// Normalized assumption set (). Populated in.
-    /// will read fairness/stutter from this field instead of
-    /// the hardcoded `false` literals in the verifier.
+    /// Normalized assumption set populated during elaboration.
+    /// Verifier backends read fairness and stutter semantics from this field.
     pub assumption_set: IRAssumptionSet,
     pub asserts: Vec<IRExpr>,
     /// Source span of the verify block (not serialized — diagnostic use only).
@@ -877,7 +875,7 @@ pub struct IRVerifySystem {
 // * theorem → stutter = true
 // * lemma → stutter = true
 //
-// Normalization ():
+// Assumption-set normalization:
 // * sets are deduplicated and sorted alphabetically by (system, event)
 // * if an event is in `strong_fair`, it is removed from `weak_fair`
 //
@@ -885,7 +883,7 @@ pub struct IRVerifySystem {
 // `IRVerify::assumption_set` at three sites — `fairness_constraints`
 // in `verify/harness.rs`, `check_verify_block_tiered` and
 // `try_liveness_reduction` in `verify/mod.rs`. Per-tuple lasso
-// encoding () is wired through `assumption_set.per_tuple`.
+// encoding is wired through `assumption_set.per_tuple`.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IRCommandRef {
@@ -950,7 +948,7 @@ impl IRAssumptionSet {
     }
 
     /// Whether this assumption set carries any fairness items.
-    /// Used by the verifier () to short-circuit dispatch.
+    /// Used by the verifier to short-circuit dispatch.
     #[must_use]
     pub fn has_fair_events(&self) -> bool {
         !self.weak_fair.is_empty() || !self.strong_fair.is_empty()

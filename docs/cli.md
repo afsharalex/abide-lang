@@ -76,6 +76,7 @@ Selected flags:
 - `--no-ic3`
 - `--no-prop-verify`
 - `--no-fn-verify`
+- `--no-relational-symmetry-breaking`
 - `--progress`
 - `--witness-semantics {operational,relational}`
 - `--verbose`

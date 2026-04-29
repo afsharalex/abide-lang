@@ -87,11 +87,7 @@ fn transition_system_from_verify(
             reason: format!("unknown temporal relational verify system `{system_name}`"),
         });
     };
-    if !system.fields.is_empty()
-        || !system.let_bindings.is_empty()
-        || !system.store_params.is_empty()
-        || !system.commands.is_empty()
-    {
+    if !system.fields.is_empty() || !system.let_bindings.is_empty() {
         return Ok(None);
     }
 
@@ -108,21 +104,63 @@ fn transition_system_from_verify(
 
     let mut transitions = Vec::new();
     for step in &system.steps {
-        if !step.params.is_empty() || !is_true_expr(&step.guard) || step.body.len() != 1 {
+        if !step.params.is_empty() || !is_true_expr(&step.guard) || step.body.is_empty() {
             return Ok(None);
         }
-        let Some(step_transitions) =
-            temporal_transitions_for_action(&step.name, &step.body[0], &entities, &stores, model)?
-        else {
-            return Ok(None);
-        };
-        transitions.extend(step_transitions);
+        let mut alternatives_by_action = Vec::new();
+        for action in &step.body {
+            let Some(action_transitions) =
+                temporal_transitions_for_action(&step.name, action, &entities, &stores, model)?
+            else {
+                return Ok(None);
+            };
+            alternatives_by_action.push(action_transitions);
+        }
+        transitions.extend(combine_same_step_transitions(
+            &step.name,
+            &alternatives_by_action,
+        ));
     }
 
     Ok(Some(RelTemporalTransitionSystem {
         transitions,
         allow_stutter: verify.assumption_set.stutter,
     }))
+}
+
+fn combine_same_step_transitions(
+    step_name: &str,
+    alternatives_by_action: &[Vec<RelTemporalTransition>],
+) -> Vec<RelTemporalTransition> {
+    if let [alternatives] = alternatives_by_action {
+        return alternatives.clone();
+    }
+    let mut combined = vec![RelTemporalTransition {
+        name: step_name.to_owned(),
+        guard: RelTemporalFormula::True,
+        updates: Vec::new(),
+    }];
+    for alternatives in alternatives_by_action {
+        let mut next = Vec::new();
+        for prefix in &combined {
+            for alternative in alternatives {
+                let guard = match (&prefix.guard, &alternative.guard) {
+                    (RelTemporalFormula::True, guard) => guard.clone(),
+                    (guard, RelTemporalFormula::True) => guard.clone(),
+                    (left, right) => RelTemporalFormula::And(vec![left.clone(), right.clone()]),
+                };
+                let mut updates = prefix.updates.clone();
+                updates.extend(alternative.updates.clone());
+                next.push(RelTemporalTransition {
+                    name: format!("{}+{}", prefix.name, alternative.name),
+                    guard,
+                    updates,
+                });
+            }
+        }
+        combined = next;
+    }
+    combined
 }
 
 fn temporal_transitions_for_action(
@@ -1389,11 +1427,15 @@ mod tests {
     }
 
     fn program_with_system(entity: IREntity, system: IRSystem) -> IRProgram {
+        program_with_entities_system(vec![entity], system)
+    }
+
+    fn program_with_entities_system(entities: Vec<IREntity>, system: IRSystem) -> IRProgram {
         IRProgram {
             types: Vec::new(),
             constants: Vec::new(),
             functions: Vec::new(),
-            entities: vec![entity],
+            entities,
             systems: vec![system],
             verifies: Vec::new(),
             theorems: Vec::new(),
@@ -1403,7 +1445,7 @@ mod tests {
         }
     }
 
-    fn verify(depth: i64) -> IRVerify {
+    fn verify(depth: usize) -> IRVerify {
         IRVerify {
             name: "temporal_relational".to_owned(),
             depth: Some(depth),
@@ -1421,7 +1463,7 @@ mod tests {
         }
     }
 
-    fn verify_for_system(depth: i64) -> IRVerify {
+    fn verify_for_system(depth: usize) -> IRVerify {
         IRVerify {
             systems: vec![IRVerifySystem {
                 name: "Commerce".to_owned(),
@@ -1502,7 +1544,7 @@ mod tests {
         }
     }
 
-    fn model_with_loop(depth: i64, loop_start: usize) -> TemporalRelationalModel {
+    fn model_with_loop(depth: usize, loop_start: usize) -> TemporalRelationalModel {
         let ir = program(entity_with_fields(vec![
             bool_field("paid"),
             enum_field("status"),
@@ -1841,6 +1883,126 @@ mod tests {
         )
         .expect("solve");
 
+        assert!(witness.is_some());
+    }
+
+    #[test]
+    fn temporal_transition_system_combines_multi_scope_same_step_updates() {
+        let order = payable_entity();
+        let payment = IREntity {
+            name: "Payment".to_owned(),
+            fields: vec![bool_field("captured")],
+            transitions: vec![IRTransition {
+                name: "capture".to_owned(),
+                refs: Vec::new(),
+                params: Vec::new(),
+                guard: bool_expr(true),
+                updates: vec![IRUpdate {
+                    field: "captured".to_owned(),
+                    value: bool_expr(true),
+                }],
+                postcondition: None,
+            }],
+            derived_fields: Vec::new(),
+            invariants: Vec::new(),
+            fsm_decls: Vec::new(),
+        };
+        let system = IRSystem {
+            name: "Commerce".to_owned(),
+            store_params: vec![
+                crate::ir::types::IRStoreParam {
+                    name: "orders".to_owned(),
+                    entity_type: "Order".to_owned(),
+                },
+                crate::ir::types::IRStoreParam {
+                    name: "payments".to_owned(),
+                    entity_type: "Payment".to_owned(),
+                },
+            ],
+            fields: Vec::new(),
+            entities: vec!["Order".to_owned(), "Payment".to_owned()],
+            commands: Vec::new(),
+            steps: vec![IRStep {
+                name: "settle".to_owned(),
+                params: Vec::new(),
+                guard: bool_expr(true),
+                body: vec![
+                    IRAction::Choose {
+                        var: "o".to_owned(),
+                        entity: "Order".to_owned(),
+                        filter: Box::new(bool_expr(true)),
+                        ops: vec![IRAction::Apply {
+                            target: "o".to_owned(),
+                            transition: "pay".to_owned(),
+                            refs: Vec::new(),
+                            args: Vec::new(),
+                        }],
+                    },
+                    IRAction::Choose {
+                        var: "p".to_owned(),
+                        entity: "Payment".to_owned(),
+                        filter: Box::new(bool_expr(true)),
+                        ops: vec![IRAction::Apply {
+                            target: "p".to_owned(),
+                            transition: "capture".to_owned(),
+                            refs: Vec::new(),
+                            args: Vec::new(),
+                        }],
+                    },
+                ],
+                return_expr: None,
+            }],
+            fsm_decls: Vec::new(),
+            derived_fields: Vec::new(),
+            invariants: Vec::new(),
+            queries: Vec::new(),
+            preds: Vec::new(),
+            let_bindings: Vec::new(),
+            procs: Vec::new(),
+        };
+        let ir = program_with_entities_system(vec![order, payment], system);
+        let verify = IRVerify {
+            stores: vec![
+                IRStoreDecl {
+                    name: "orders".to_owned(),
+                    entity_type: "Order".to_owned(),
+                    lo: 0,
+                    hi: 1,
+                },
+                IRStoreDecl {
+                    name: "payments".to_owned(),
+                    entity_type: "Payment".to_owned(),
+                    lo: 0,
+                    hi: 1,
+                },
+            ],
+            ..verify_for_system(1)
+        };
+        let model = TemporalRelationalModel::from_verify(&ir, &verify).expect("model");
+        let transition_system = transition_system_from_verify(&ir, &verify, &model)
+            .expect("transition system")
+            .expect("supported");
+
+        assert_eq!(transition_system.transitions.len(), 1);
+        let transition = &transition_system.transitions[0];
+        assert!(transition.name.contains("pay"));
+        assert!(transition.name.contains("capture"));
+        assert!(transition
+            .updates
+            .iter()
+            .any(|update| update.relation == "orders.paid" && update.value));
+        assert!(transition
+            .updates
+            .iter()
+            .any(|update| update.relation == "payments.captured" && update.value));
+
+        let formula = RelTemporalFormula::eventually(RelTemporalFormula::And(vec![
+            atom(&model, "orders.paid", 1),
+            atom(&model, "payments.captured", 1),
+        ]));
+        let witness =
+            solve_temporal_formula_with_transitions(&model, &formula, Some(&transition_system))
+                .expect("solve");
         assert!(witness.is_some());
     }
 

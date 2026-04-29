@@ -46,6 +46,8 @@ use fn_verify::*;
 mod property;
 #[allow(clippy::wildcard_imports)]
 use property::*;
+#[cfg_attr(not(test), allow(dead_code))]
+mod relation_sat;
 mod theorem;
 #[allow(clippy::wildcard_imports)]
 use theorem::*;
@@ -79,7 +81,7 @@ use self::solver::{
 };
 // ── Verification results ────────────────────────────────────────────
 
-/// Per-event fairness analysis for lasso counterexamples ().
+/// Per-event fairness analysis for lasso counterexamples.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FairnessStatus {
@@ -108,7 +110,7 @@ pub struct FairnessEventAnalysis {
     pub status: FairnessStatus,
 }
 
-/// Per-event diagnostic for a deadlocked state ().
+/// Per-event diagnostic for a deadlocked state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlockEventDiag {
     pub system: String,
@@ -864,6 +866,8 @@ pub struct VerifyConfig {
     pub progress: bool,
     /// Native witness family to prefer when multiple extraction paths exist.
     pub witness_semantics: WitnessSemantics,
+    /// Add semantics-preserving symmetry breaking to relational SAT encodings.
+    pub relational_symmetry_breaking: bool,
 }
 
 impl Default for VerifyConfig {
@@ -883,6 +887,7 @@ impl Default for VerifyConfig {
             no_fn_verify: false,
             progress: false,
             witness_semantics: WitnessSemantics::Operational,
+            relational_symmetry_breaking: true,
         }
     }
 }
@@ -2054,6 +2059,7 @@ fn check_verify_block_tiered(
             effective_block,
             bound,
             relational_config.witness_semantics,
+            relational_config.relational_symmetry_breaking,
         ) {
             return materialize_relational_verify_outcome(ir, effective_block, bound, result);
         }
@@ -2562,10 +2568,9 @@ pub(super) fn try_liveness_reduction(
 ) -> Option<VerificationResult> {
     let start = Instant::now();
 
-    // read fairness from the verification site's normalized
-    // assumption set (populated by ). Liveness reduction can
-    // only prove eventualities under fairness — without any fair events
-    // declared, there's nothing to discharge against and we bail out.
+    // Read fairness from the verification site's normalized assumption set.
+    // Liveness reduction can only prove eventualities under fairness; without
+    // any fair events declared, there is nothing to discharge against.
     if !verify_block.assumption_set.has_fair_events() {
         return None; // can't prove liveness without fairness
     }
@@ -2574,10 +2579,9 @@ pub(super) fn try_liveness_reduction(
     // semantics. The unbounded reduction path here builds one justice
     // bit per (system, event), not per (event, args) tuple, so it
     // cannot discharge per-tuple obligations as the user wrote them.
-    // Per and, sound unbounded per-tuple liveness
-    // requires k-liveness (). Until then, fall through to
-    // bounded lasso BMC and report CHECKED — never PROVED — when any
-    // fair event in scope is parameterized.
+    // Sound unbounded per-tuple liveness needs a stronger proof engine. Until
+    // then, fall through to bounded lasso BMC and report CHECKED, never PROVED,
+    // when any fair event in scope is parameterized.
     if !verify_block.assumption_set.per_tuple.is_empty() {
         return None;
     }
@@ -3130,6 +3134,7 @@ fn check_verify_block(
         verify_block,
         bound,
         config.witness_semantics,
+        config.relational_symmetry_breaking,
     ) {
         return materialize_relational_verify_outcome(ir, verify_block, bound, result);
     }

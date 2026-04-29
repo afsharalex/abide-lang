@@ -138,6 +138,7 @@ pub struct ExplicitStateSpaceTransition {
 pub struct ExplicitStateSpace {
     pub systems: Vec<String>,
     pub stutter: bool,
+    pub depth_bound: Option<usize>,
     pub store_bounds: Vec<ExplicitStateSpaceStoreBound>,
     pub states: Vec<op::State>,
     pub initial_state: usize,
@@ -1276,7 +1277,9 @@ pub fn explore_verify_state_space(
     };
 
     let deadline = super::verification_deadline(config);
+    let depth_bound = verify_block.depth;
     let mut nodes = vec![initial_state.clone()];
+    let mut depths = vec![0usize];
     let mut seen: HashMap<ExplicitState, usize> = HashMap::from([(initial_state, 0)]);
     let mut queue = VecDeque::from([0usize]);
     let mut transitions = Vec::new();
@@ -1284,6 +1287,10 @@ pub fn explore_verify_state_space(
     while let Some(index) = queue.pop_front() {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(super::verification_timeout_hint(config));
+        }
+
+        if depth_bound.is_some_and(|bound| depths[index] >= bound) {
+            continue;
         }
 
         let state = nodes[index].clone();
@@ -1303,6 +1310,7 @@ pub fn explore_verify_state_space(
                 let next_index = nodes.len();
                 seen.insert(next_state.clone(), next_index);
                 nodes.push(next_state);
+                depths.push(depths[index] + 1);
                 queue.push_back(next_index);
                 next_index
             };
@@ -1317,6 +1325,7 @@ pub fn explore_verify_state_space(
     Ok(Some(ExplicitStateSpace {
         systems: model.roots.clone(),
         stutter: model.stutter,
+        depth_bound,
         store_bounds: verify_block
             .stores
             .iter()

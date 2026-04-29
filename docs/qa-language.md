@@ -1,7 +1,5 @@
 # The QA Language
 
-> Implemented in v0.
-
 QA (Query Abide) is a small, purpose-built language for querying specifications structurally. It answers questions about your spec without running the solver — what states are reachable, where are the cycles, what transitions exist, what events touch a field.
 
 QA runs in two contexts:
@@ -18,7 +16,7 @@ QA runs in two contexts:
 | `load "path"` | Load specs from file or directory | N/A (scripts only) |
 | `verify` | Run verification on the current in-memory spec and store evidence-bearing results as artifacts | Verification results + stored artifacts |
 | `simulate [options]` | Run one seeded forward simulation and store the run as an artifact | Simulation summary + stored artifact |
-| `artifacts` | List stored artifacts from earlier `verify` or `simulate` statements | Artifact summaries |
+| `artifacts` | List stored artifacts from earlier `verify`, `simulate`, or `explore` statements | Artifact summaries |
 | `show artifact <selector>` | Show artifact metadata and evidence summary | Artifact details |
 | `draw artifact <selector>` | Draw a timeline view when the artifact is temporal | Timeline |
 | `state artifact <selector> <n>` | Inspect a specific artifact state | State dump |
@@ -59,6 +57,18 @@ ask cross-calls from Commerce                // outgoing cross-system command ca
 ask updates on Order.status @Pending -> @Paid  // what causes this transition
 ```
 
+### Temporal Assertions
+
+`always` and `eventually` assertions can run against a finite field graph or, when a bound is supplied, through bounded semantic verification:
+
+```text
+assert always on Order.status (status == @Pending or status == @Shipped)
+assert always --slots 4 --scope Order=2 on Commerce (true)
+assert eventually --slots 3 on Order (status == @Shipped)
+```
+
+`--slots` sets the default finite store scope. `--scope Entity=N` overrides one entity type. Scope overrides must name an entity used by the query; unknown or unused overrides fail instead of being ignored. Results that use semantic verification include the effective bound in their mode, such as `semantic:proved[slots=3]` or `semantic:counterexample[scopes=Order=2,Payment=4]`.
+
 ### Diagnostic Queries (`explain`)
 
 `explain` gives the reasoning behind a result — not just the answer, but why:
@@ -89,7 +99,7 @@ Assertions return non-zero exit code on failure, making them suitable for CI/CD 
 
 ## QA Scripts
 
-QA scripts are `.qa` files containing `load`, `ask`, `explain`, `assert`, `verify`, `simulate`, and artifact inspection statements. `verify` and `simulate` store native artifacts in the current script session; the artifact commands inspect those stored objects rather than scraping terminal output.
+QA scripts are `.qa` files containing `load`, `ask`, `explain`, `assert`, `verify`, `simulate`, `explore`, and artifact inspection statements. `verify`, `simulate`, and `explore` store native artifacts in the current script session; the artifact commands inspect those stored objects rather than scraping terminal output.
 
 ```
 // commerce.qa
@@ -128,7 +138,7 @@ explain not reachable Order.status -> @Refunded:
 
 ## Artifacts In QA Scripts
 
-`verify` runs the normal verification pipeline against the current in-memory spec and stores any evidence-bearing results as session-local artifacts. `simulate` runs one seeded forward execution and stores the resulting timeline as a native simulation artifact.
+`verify` runs the normal verification pipeline against the current in-memory spec and stores any evidence-bearing results as session-local artifacts. `simulate` runs one seeded forward execution and stores the resulting timeline as a native simulation artifact. Semantic temporal queries also store an artifact when the verifier produces evidence for a failed temporal query.
 
 ```qa
 load "src/commerce/"
@@ -154,9 +164,26 @@ Artifacts are invalidated when the script changes the in-memory spec with an `ab
 
 Today, QA stores:
 - evidence-bearing verification results that already emit native evidence objects: counterexamples, liveness violations, deadlocks, and admitted proof-artifact references
+- evidence-bearing semantic temporal query failures
 - native simulation runs produced by `simulate`
+- bounded operational state spaces produced by `explore`
 
 Scene results are still printed by `verify`, but they do not yet produce native artifacts.
+
+`explore` builds a bounded operational state-space artifact from the loaded systems:
+
+```text
+explore [--depth N] [--slots N] [--scope Entity=N]... [--system NAME]
+```
+
+`--slots` sets the default store/system scope, `--scope` overrides the store slot count for a specific entity type, and `--system` restricts exploration to one loaded system. If `--depth` is supplied, exploration includes states reachable within that many transitions. If it is omitted, QA enumerates the finite operational fragment exhaustively.
+
+With `--format json`, a semantic temporal query that stores evidence emits a
+second JSON line describing the stored artifact:
+
+```json
+{"verb":"artifact","status":"stored","id":1,"name":"qa_temporal_always_on_commerce_true","kind":"deadlock","selector":"deadlock:qa_temporal_always_on_commerce_true"}
+```
 
 ## Hypothetical Scenarios
 
@@ -199,11 +226,11 @@ ask(42)                                    // user function call (ask + parenthe
 
 If a user-defined name shadows a QA subcommand keyword, the module qualifier resolves the ambiguity: `Commerce::reachable(x)`.
 
-## Key Design Decisions
+## Execution Model
 
-**QA is its own language.** Not embedded Abide, not a library. Query statements (`ask`/`explain`/`assert`), load/overlay statements (`load`, `abide { }`), and verification-artifact statements (`verify`, `artifacts`, `show`, `draw`, `state`, `diff`, `export`). Simple grammar, easy to learn, easy to parse.
+QA is its own small language. Query statements (`ask`/`explain`/`assert`), load/overlay statements (`load`, `abide { }`), and verification-artifact statements (`verify`, `simulate`, `explore`, `artifacts`, `show`, `draw`, `state`, `diff`, `export`) are parsed directly by the QA runner.
 
-**Graph-based, not solver-based.** QA queries execute against a FlowModel — a precomputed graph of state transitions extracted from the IR. No SMT solver invocation. Responses are instant (microseconds). Solver-backed analysis belongs to `abide verify`.
+Structural QA queries execute against a FlowModel — a precomputed graph of state transitions extracted from the IR. Bounded temporal assertions with explicit scopes use semantic verification and disclose the effective finite bounds in their result mode.
 
 **`explain` over `why_not`.** One keyword for both positive and negative diagnostics. `explain reachable ...` tells you why something is reachable. `explain not reachable ...` tells you why not.
 

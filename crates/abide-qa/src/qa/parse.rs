@@ -180,8 +180,16 @@ fn parse_simulate(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseEr
                     message: format!("invalid simulation scope '{value}', expected Entity=N"),
                     line,
                 })?;
+                if entity.trim().is_empty() {
+                    return Err(QAParseError {
+                        message: format!(
+                            "invalid simulation scope '{value}'; entity name must not be empty"
+                        ),
+                        line,
+                    });
+                }
                 request.scopes.push((
-                    entity.to_owned(),
+                    entity.trim().to_owned(),
                     parse_usize(slots, "scope slot count", line)?,
                 ));
                 index += 2;
@@ -210,6 +218,14 @@ fn parse_explore(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseErr
     let mut index = 0usize;
     while index < tokens.len() {
         match tokens[index] {
+            "--depth" => {
+                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
+                    message: "explore --depth requires a value".to_owned(),
+                    line,
+                })?;
+                request.depth = Some(parse_usize(value, "exploration depth", line)?);
+                index += 2;
+            }
             "--slots" => {
                 let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
                     message: "explore --slots requires a value".to_owned(),
@@ -227,8 +243,16 @@ fn parse_explore(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseErr
                     message: format!("invalid explore scope '{value}', expected Entity=N"),
                     line,
                 })?;
+                if entity.trim().is_empty() {
+                    return Err(QAParseError {
+                        message: format!(
+                            "invalid explore scope '{value}'; entity name must not be empty"
+                        ),
+                        line,
+                    });
+                }
                 request.scopes.push((
-                    entity.to_owned(),
+                    entity.trim().to_owned(),
                     parse_usize(slots, "scope slot count", line)?,
                 ));
                 index += 2;
@@ -472,8 +496,16 @@ fn parse_temporal_query(
                     message: format!("invalid temporal scope '{value}', expected Entity=N"),
                     line,
                 })?;
+                if entity.trim().is_empty() {
+                    return Err(QAParseError {
+                        message: format!(
+                            "invalid temporal scope '{value}'; entity name must not be empty"
+                        ),
+                        line,
+                    });
+                }
                 bounds.scopes.push((
-                    entity.to_owned(),
+                    entity.trim().to_owned(),
                     parse_usize(slots, "scope slot count", line)?,
                 ));
                 index += 2;
@@ -1254,10 +1286,12 @@ mod tests {
 
     #[test]
     fn parse_explore_with_bounds() {
-        let stmts = parse_qa("explore --slots 2 --scope Order=3 --system Commerce").unwrap();
+        let stmts =
+            parse_qa("explore --depth 5 --slots 2 --scope Order=3 --system Commerce").unwrap();
         assert_eq!(
             stmts[0],
             QAStatement::Explore(StateSpaceRequest {
+                depth: Some(5),
                 slots: 2,
                 scopes: vec![("Order".to_owned(), 3)],
                 system: Some("Commerce".to_owned()),

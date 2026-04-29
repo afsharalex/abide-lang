@@ -1,6 +1,7 @@
 //! Core IR: lowering from elaborated AST and JSON emission.
 
 pub mod lower;
+pub mod relation;
 pub mod types;
 
 use crate::elab::types::ElabResult;
