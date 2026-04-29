@@ -1,11 +1,11 @@
-//! System lowering — systems, steps, queries, procs.
+//! System lowering — systems, actions, queries, procs.
 
 use std::collections::{HashMap, HashSet};
 
 use super::super::types::{
     IRAction, IRActionMatchArm, IRActionMatchScrutinee, IRCommand, IRCreateField, IREntity, IRExpr,
-    IRField, IRFunction, IRPattern, IRStep, IRStoreParam, IRSystem, IRTransParam, IRTransRef,
-    IRTransition, IRType, IRUpdate, LitVal,
+    IRField, IRFunction, IRPattern, IRStoreParam, IRSystem, IRSystemAction, IRTransParam,
+    IRTransRef, IRTransition, IRType, IRUpdate, LitVal,
 };
 use super::expr::lower_pattern;
 use super::qualify::{qualify_action_query_vars, qualify_query_vars_scoped};
@@ -91,7 +91,7 @@ pub(super) fn lower_system(
                 return_type: c.return_type.as_ref().map(|t| lower_ty(t, ctx)),
             })
             .collect(),
-        steps: {
+        actions: {
             // Build bare→qualified name map for queries AND system-local preds.
             // All system-scoped names (queries + preds) need rewriting so
             // DefEnv resolves them under qualified names at verification time.
@@ -105,10 +105,10 @@ pub(super) fn lower_system(
                         .map(|p| (p.name.clone(), format!("{}::{}", es.name, p.name))),
                 )
                 .collect();
-            es.steps
+            es.actions
                 .iter()
-                .map(|step| {
-                    let mut s = lower_step(step, aliases, ctx);
+                .map(|action| {
+                    let mut s = lower_system_action(action, aliases, ctx);
                     if !scoped_renames.is_empty() {
                         let param_bound: std::collections::HashSet<String> =
                             s.params.iter().map(|p| p.name.clone()).collect();
@@ -275,7 +275,7 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
         })
         .collect();
 
-    let mut steps = Vec::new();
+    let mut actions = Vec::new();
     for may in &ext.mays {
         let command = ext.commands.iter().find(|c| c.name == may.command);
         let params: Vec<IRTransParam> = command
@@ -291,7 +291,7 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
             .unwrap_or_default();
 
         for ret in &may.returns {
-            steps.push(IRStep {
+            actions.push(IRSystemAction {
                 name: may.command.clone(),
                 params: params.clone(),
                 guard: crate::ir::types::IRExpr::Lit {
@@ -336,7 +336,7 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
         fields: Vec::new(),
         entities: Vec::new(),
         commands,
-        steps,
+        actions,
         fsm_decls: Vec::new(),
         derived_fields: Vec::new(),
         invariants: Vec::new(),
@@ -534,7 +534,7 @@ fn synthesize_proc_workflow(
         params: proc_params.clone(),
         return_type: None,
     });
-    ir_system.steps.push(IRStep {
+    ir_system.actions.push(IRSystemAction {
         name: proc.name.clone(),
         params: proc_params.clone(),
         guard: proc_start_guard(proc, ctx),
@@ -563,13 +563,13 @@ fn synthesize_proc_workflow(
     });
 
     for node in &proc.nodes {
-        let step_name = proc_node_step_name(proc, &node.name);
+        let step_name = proc_node_action_name(proc, &node.name);
         ir_system.commands.push(IRCommand {
             name: step_name.clone(),
             params: proc_params.clone(),
             return_type: None,
         });
-        ir_system.steps.push(IRStep {
+        ir_system.actions.push(IRSystemAction {
             name: step_name,
             params: proc_params.clone(),
             guard: bool_lit_expr(true, proc.span),
@@ -734,7 +734,7 @@ fn node_outcome_field_name(node: &E::EProcNode, port: &str) -> String {
     format!("outcome__{}__{port}", node.name)
 }
 
-fn proc_node_step_name(proc: &E::EProc, node: &str) -> String {
+fn proc_node_action_name(proc: &E::EProc, node: &str) -> String {
     format!("__abide_proc_{}__node__{node}", proc.name)
 }
 
@@ -964,19 +964,19 @@ pub(super) fn lower_query(q: &E::EQuery, ctx: &LowerCtx<'_>) -> super::super::ty
     }
 }
 
-/// Lower an EStep into an IRStep.
-pub(super) fn lower_step(
-    step: &E::EStep,
+/// Lower an ESystemAction into an IRSystemAction.
+pub(super) fn lower_system_action(
+    action: &E::ESystemAction,
     aliases: &HashMap<String, String>,
     ctx: &LowerCtx<'_>,
-) -> IRStep {
+) -> IRSystemAction {
     // Extract refinement predicates from params and add to guard
-    let refinement_reqs = extract_param_refinements(&step.params);
+    let refinement_reqs = extract_param_refinements(&action.params);
     let mut all_requires: Vec<&E::EExpr> = refinement_reqs.iter().collect();
-    all_requires.extend(step.requires.iter());
-    IRStep {
-        name: step.name.clone(),
-        params: step
+    all_requires.extend(action.requires.iter());
+    IRSystemAction {
+        name: action.name.clone(),
+        params: action
             .params
             .iter()
             .map(|(pn, pt)| {
@@ -991,12 +991,12 @@ pub(super) fn lower_step(
             })
             .collect(),
         guard: lower_guard_refs(&all_requires, ctx),
-        body: step
+        body: action
             .body
             .iter()
             .map(|a| lower_event_action(a, aliases, ctx))
             .collect(),
-        return_expr: step.return_expr.as_ref().map(|e| lower_expr(e, ctx)),
+        return_expr: action.return_expr.as_ref().map(|e| lower_expr(e, ctx)),
     }
 }
 

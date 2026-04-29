@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::ir::types::{
     IRAction, IRActionMatchScrutinee, IRCreateField, IREntity, IRExpr, IRField, IRFunction,
-    IRMatchArm, IRPattern, IRProgram, IRStep, IRSystem, IRTransition, IRType, IRVariant, LitVal,
+    IRMatchArm, IRPattern, IRProgram, IRSystem, IRSystemAction, IRTransition, IRType, IRVariant,
+    LitVal,
 };
 use crate::witness::op::{
     self, AtomicStepId, Behavior, Binding, Choice, EntitySlotRef, EntityState,
@@ -306,7 +307,7 @@ impl<'a> Runtime<'a> {
         }
 
         for system in selected_systems {
-            for step in &system.steps {
+            for step in &system.actions {
                 collect_crosscall_systems(program, step, &mut systems)?;
             }
         }
@@ -405,7 +406,7 @@ impl<'a> Runtime<'a> {
             .iter()
             .filter_map(|name| self.systems.get(name))
             .flat_map(|system| {
-                system.steps.iter().map(|step| {
+                system.actions.iter().map(|step| {
                     format!(
                         "{}::{} has no synthesized parameter instance with a true guard",
                         system.name, step.name
@@ -422,7 +423,7 @@ impl<'a> Runtime<'a> {
             .iter()
             .filter_map(|name| self.systems.get(name))
         {
-            for step in &system.steps {
+            for step in &system.actions {
                 let bindings = self.enumerate_param_bindings(system, step)?;
                 for params in bindings {
                     let env = EvalEnv {
@@ -450,7 +451,7 @@ impl<'a> Runtime<'a> {
     fn enumerate_param_bindings(
         &self,
         system: &IRSystem,
-        step: &IRStep,
+        step: &IRSystemAction,
     ) -> Result<Vec<BTreeMap<String, WitnessValue>>, String> {
         if step.params.is_empty() {
             return Ok(vec![BTreeMap::new()]);
@@ -604,7 +605,7 @@ impl<'a> Runtime<'a> {
             .copied()
             .ok_or_else(|| format!("unknown system `{}`", candidate.system))?;
         let step = system
-            .steps
+            .actions
             .iter()
             .find(|step| step.name == candidate.step)
             .ok_or_else(|| {
@@ -627,7 +628,7 @@ impl<'a> Runtime<'a> {
     fn execute_step(
         &mut self,
         system: &IRSystem,
-        step: &IRStep,
+        step: &IRSystemAction,
         params: &BTreeMap<String, WitnessValue>,
         top_level: bool,
     ) -> Result<AtomicCapture, String> {
@@ -924,7 +925,7 @@ impl<'a> Runtime<'a> {
             .copied()
             .ok_or_else(|| format!("unknown cross-call system `{target_system}`"))?;
         let step = target
-            .steps
+            .actions
             .iter()
             .find(|step| step.name == command)
             .ok_or_else(|| format!("unknown cross-call command `{target_system}::{command}`"))?;
@@ -1165,7 +1166,7 @@ impl<'a> Runtime<'a> {
             .copied()
             .ok_or_else(|| format!("unknown system `{system_name}`"))?;
         let step = target
-            .steps
+            .actions
             .iter()
             .find(|step| step.name == command_name)
             .ok_or_else(|| format!("unknown command `{system_name}::{command_name}`"))?;
@@ -2051,7 +2052,7 @@ fn record_value_for_variant(
 
 fn collect_crosscall_systems<'a>(
     program: &'a IRProgram,
-    step: &IRStep,
+    step: &IRSystemAction,
     out: &mut BTreeMap<String, &'a IRSystem>,
 ) -> Result<(), String> {
     for action in &step.body {
@@ -2078,7 +2079,7 @@ fn collect_action_crosscalls<'a>(
                 .find(|candidate| candidate.name == *system)
                 .ok_or_else(|| format!("unknown cross-call system `{system}`"))?;
             out.entry(system.clone()).or_insert(target);
-            for step in &target.steps {
+            for step in &target.actions {
                 collect_crosscall_systems(program, step, out)?;
             }
         }
@@ -2099,7 +2100,7 @@ fn collect_action_crosscalls<'a>(
                     .find(|candidate| candidate.name == *system)
                     .ok_or_else(|| format!("unknown cross-call system `{system}`"))?;
                 out.entry(system.clone()).or_insert(target);
-                for step in &target.steps {
+                for step in &target.actions {
                     collect_crosscall_systems(program, step, out)?;
                 }
             }
@@ -2557,8 +2558,7 @@ mod tests {
 enum Outcome = ok { value: int } | err
 
 system Provider {
-  command charge(x: int) -> Outcome
-  step charge(x: int) {
+  command charge(x: int) -> Outcome {
     return @ok { value: x }
   }
 }
@@ -2566,8 +2566,7 @@ system Provider {
 system Billing {
   charged: bool = false
 
-  command submit()
-  step submit() {
+  command submit() {
     let result = Provider::charge(1)
     match result {
       ok { value: id } => { charged' = id == 1 }
@@ -2613,15 +2612,13 @@ system Billing {
 enum Outcome = ok | err
 
 system Provider {
-  command charge() -> Outcome
-  step charge() { return @ok }
+  command charge() -> Outcome { return @ok }
 }
 
 system Billing {
   charged: bool = false
 
-  command submit()
-  step submit() {
+  command submit() {
     match Provider::charge() {
       ok {} => { charged' = true }
       err {} => { charged' = false }
@@ -2666,8 +2663,7 @@ system Billing {
 system Counter {
   picked: int = 0
 
-  command choose_number()
-  step choose_number() {
+  command choose_number() {
     picked' = choose n: int where n > 0 and n < 3
   }
 }
@@ -2722,8 +2718,7 @@ entity Account {
 }
 
 system Bank(accounts: Store<Account>) {
-  command seed_accounts()
-  step seed_accounts() {
+  command seed_accounts() {
     create Account {
       key = 1
       balance = 10
@@ -2734,8 +2729,7 @@ system Bank(accounts: Store<Account>) {
     }
   }
 
-  command settle()
-  step settle() {
+  command settle() {
     choose from: Account where from.key == 1 {
       choose to: Account where to.key == 2 {
         from.transfer_out[to](3)
@@ -2804,8 +2798,7 @@ entity Account {
 }
 
 system Bank(accounts: Store<Account>) {
-  command settle()
-  step settle() {
+  command settle() {
     create Account {
       key = 1
       balance = 10
@@ -2879,8 +2872,7 @@ fn sum_to(n: int): int {
 system Counter {
   total: int = 0
 
-  command run()
-  step run() {
+  command run() {
     total' = sum_to(3)
   }
 }

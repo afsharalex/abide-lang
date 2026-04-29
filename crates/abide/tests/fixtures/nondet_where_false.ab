@@ -12,9 +12,7 @@ entity Impossible {
 }
 
 system S(impossibles: Store<Impossible>) {
-  command mk()
-
-  step mk() { create Impossible {} }
+  command mk() { create Impossible {} }
 }
 
 // Vacuously true: no Impossible entity can ever be created.

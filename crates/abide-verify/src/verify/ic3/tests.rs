@@ -2,6 +2,25 @@ use super::*;
 use crate::ir::types::*;
 use crate::verify::context::VerifyContext;
 
+const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
+
+fn should_run_unbounded_proof_tests() -> bool {
+    std::env::var_os(UNBOUNDED_PROOF_TEST_ENV).is_some()
+}
+
+fn skip_unbounded_proof_test() {
+    eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
+}
+
+macro_rules! require_unbounded_proof_tests {
+    () => {
+        if !should_run_unbounded_proof_tests() {
+            skip_unbounded_proof_test();
+            return;
+        }
+    };
+}
+
 /// Test CHC solving through the routed CHC backend with declare-var style
 /// variables. Validates the reference CHC API works with a simple
 /// unreachable error.
@@ -319,6 +338,8 @@ fn ic3_status_ctor(name: &str) -> IRExpr {
 
 #[test]
 fn ic3_proves_valid_safety_property() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -352,6 +373,8 @@ fn ic3_proves_valid_safety_property() {
 
 #[test]
 fn ic3_proves_field_access_property() {
+    require_unbounded_proof_tests!();
+
     // Property: always all o: Order | o.total >= 0
     // total defaults to 0 and no transition modifies it.
     let (entity, types) = make_simple_entity();
@@ -406,6 +429,8 @@ fn ic3_proves_field_access_property() {
 
 #[test]
 fn ic3_detects_violation() {
+    require_unbounded_proof_tests!();
+
     // Property: status == Pending always (false — confirm changes it)
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
@@ -439,6 +464,8 @@ fn ic3_detects_violation() {
 
 #[test]
 fn ic3_violation_extracts_trace() {
+    require_unbounded_proof_tests!();
+
     // Property: status == Pending always (false — confirm changes it)
     // IC3 should find the violation AND extract a trace showing the state change.
     let (entity, types) = make_simple_entity();
@@ -644,6 +671,8 @@ fn sexpr_parser_handles_derivation_tree() {
 
 #[test]
 fn ic3_supports_pure_let_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -688,6 +717,8 @@ fn ic3_supports_pure_let_expression() {
 
 #[test]
 fn ic3_supports_int_choose_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -738,6 +769,8 @@ fn ic3_supports_int_choose_expression() {
 
 #[test]
 fn ic3_supports_int_choose_with_equality_conjunct() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -818,6 +851,8 @@ fn ic3_supports_int_choose_with_equality_conjunct() {
 
 #[test]
 fn ic3_supports_int_choose_with_lower_bound_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -878,6 +913,8 @@ fn ic3_supports_int_choose_with_lower_bound_predicate() {
 
 #[test]
 fn ic3_supports_int_choose_with_multiple_upper_bounds() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -991,6 +1028,8 @@ fn ic3_supports_int_choose_with_multiple_upper_bounds() {
 
 #[test]
 fn ic3_supports_int_choose_with_disjunctive_bounds() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1071,6 +1110,8 @@ fn ic3_supports_int_choose_with_disjunctive_bounds() {
 
 #[test]
 fn ic3_supports_int_choose_with_conditional_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1164,6 +1205,8 @@ fn ic3_supports_int_choose_with_conditional_predicate() {
 
 #[test]
 fn ic3_supports_int_choose_with_let_in_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1236,6 +1279,8 @@ fn ic3_supports_int_choose_with_let_in_predicate() {
 
 #[test]
 fn ic3_supports_payload_enum_choose_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1328,6 +1373,8 @@ fn ic3_supports_payload_enum_choose_expression() {
 
 #[test]
 fn ic3_supports_int_choose_with_match_scoped_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1430,6 +1477,8 @@ fn ic3_supports_int_choose_with_match_scoped_predicate() {
 
 #[test]
 fn ic3_returns_unknown_for_nonlinear_nonconstructive_int_choose() {
+    require_unbounded_proof_tests!();
+
     let entity = IREntity {
         name: "Counter".to_owned(),
         fields: vec![IRField {
@@ -1569,6 +1618,8 @@ fn ic3_returns_unknown_for_nonlinear_nonconstructive_int_choose() {
 
 #[test]
 fn ic3_supports_payload_enum_choose_with_shape_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1692,6 +1743,8 @@ fn ic3_supports_payload_enum_choose_with_shape_predicate() {
 
 #[test]
 fn ic3_supports_real_choose_with_lower_bound_predicate() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1752,6 +1805,8 @@ fn ic3_supports_real_choose_with_lower_bound_predicate() {
 
 #[test]
 fn ic3_supports_bool_choose_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1792,6 +1847,8 @@ fn ic3_supports_bool_choose_expression() {
 
 #[test]
 fn ic3_supports_fieldless_enum_choose_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1853,6 +1910,8 @@ fn ic3_supports_fieldless_enum_choose_expression() {
 
 #[test]
 fn ic3_supports_bool_exists_quantifier_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1880,6 +1939,8 @@ fn ic3_supports_bool_exists_quantifier_expression() {
 
 #[test]
 fn ic3_supports_enum_forall_quantifier_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1918,6 +1979,8 @@ fn ic3_supports_enum_forall_quantifier_expression() {
 
 #[test]
 fn ic3_supports_one_and_lone_quantifier_expressions() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -1963,6 +2026,8 @@ fn ic3_supports_one_and_lone_quantifier_expressions() {
 
 #[test]
 fn ic3_multi_slot_supports_entity_choose_with_field_access() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2039,6 +2104,8 @@ fn ic3_multi_slot_supports_entity_choose_with_field_access() {
 
 #[test]
 fn ic3_multi_slot_supports_entity_choose_in_inter_entity_property() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2120,6 +2187,8 @@ fn ic3_multi_slot_supports_entity_choose_in_inter_entity_property() {
 
 #[test]
 fn ic3_supports_if_without_else_guard_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2172,6 +2241,8 @@ fn ic3_supports_if_without_else_guard_expression() {
 
 #[test]
 fn ic3_supports_match_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2230,6 +2301,8 @@ fn ic3_supports_match_expression() {
 
 #[test]
 fn ic3_supports_match_destructuring_for_constructor_fields() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2294,6 +2367,8 @@ fn ic3_supports_match_destructuring_for_constructor_fields() {
 
 #[test]
 fn ic3_supports_or_pattern_bindings_when_names_align() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_dual_payload_variants();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2369,6 +2444,8 @@ fn ic3_supports_or_pattern_bindings_when_names_align() {
 
 #[test]
 fn ic3_rejects_or_pattern_bindings_with_mismatched_names() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_result_entity_with_dual_payload_variants();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2434,6 +2511,8 @@ fn ic3_rejects_or_pattern_bindings_with_mismatched_names() {
 
 #[test]
 fn ic3_rejects_non_exhaustive_match_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2473,6 +2552,8 @@ fn ic3_rejects_non_exhaustive_match_expression() {
 
 #[test]
 fn ic3_multi_slot_proves_per_entity_property() {
+    require_unbounded_proof_tests!();
+
     // Per-entity property with 2 slots — should still prove
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
@@ -2526,6 +2607,8 @@ fn ic3_multi_slot_proves_per_entity_property() {
 
 #[test]
 fn ic3_multi_slot_detects_violation() {
+    require_unbounded_proof_tests!();
+
     // Property: all orders always Pending — should fail with 2 slots
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
@@ -2579,6 +2662,8 @@ fn ic3_multi_slot_detects_violation() {
 
 #[test]
 fn ic3_multi_slot_delegates_to_single_for_one_slot() {
+    require_unbounded_proof_tests!();
+
     // With n_slots=1, should delegate to single-entity encoding
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
@@ -2612,6 +2697,8 @@ fn ic3_multi_slot_delegates_to_single_for_one_slot() {
 
 #[test]
 fn ic3_multi_slot_inter_entity_property() {
+    require_unbounded_proof_tests!();
+
     // Inter-entity property: all a: Order | all b: Order | a.total >= 0 and b.total >= 0
     // This is trivially true (total defaults to 0, no transition modifies it).
     // Tests the nested quantifier expansion path with 3 slots.
@@ -2707,6 +2794,8 @@ fn ic3_multi_slot_inter_entity_property() {
 
 #[test]
 fn ic3_multi_slot_supports_inter_entity_let_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2810,6 +2899,8 @@ fn ic3_multi_slot_supports_inter_entity_let_expression() {
 
 #[test]
 fn ic3_multi_slot_supports_inter_entity_if_expression() {
+    require_unbounded_proof_tests!();
+
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
     let vctx = VerifyContext::from_ir(&ir);
@@ -2893,6 +2984,8 @@ fn ic3_multi_slot_supports_inter_entity_if_expression() {
 
 #[test]
 fn ic3_rejects_bare_entity_var_in_inter_entity() {
+    require_unbounded_proof_tests!();
+
     // Property: all a | all b | a == b — bare entity vars, should error
     let (entity, types) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, types);
@@ -2952,6 +3045,8 @@ fn ic3_rejects_bare_entity_var_in_inter_entity() {
 
 #[test]
 fn ic3_system_proves_multi_entity_safety() {
+    require_unbounded_proof_tests!();
+
     // Two entity types: Order (status) and Item (quantity).
     // Property: all o: Order | o.total >= 0
     // No transitions modify total — should prove.
@@ -3129,6 +3224,8 @@ fn ic3_system_proves_multi_entity_safety() {
 
 #[test]
 fn ic3_system_supports_let_bound_property() {
+    require_unbounded_proof_tests!();
+
     let (ir, _) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
 
@@ -3196,6 +3293,8 @@ fn ic3_system_supports_let_bound_property() {
 
 #[test]
 fn ic3_system_supports_if_value_property() {
+    require_unbounded_proof_tests!();
+
     let (ir, _) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
 
@@ -3282,6 +3381,8 @@ fn ic3_system_supports_if_value_property() {
 
 #[test]
 fn ic3_system_supports_match_property() {
+    require_unbounded_proof_tests!();
+
     let (ir, _) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
 
@@ -3370,6 +3471,8 @@ fn ic3_system_supports_match_property() {
 
 #[test]
 fn ic3_system_supports_match_destructuring_for_constructor_fields() {
+    require_unbounded_proof_tests!();
+
     let result_ty = IRTypeEntry {
         name: "Result".to_owned(),
         ty: IRType::Enum {
@@ -3419,7 +3522,7 @@ fn ic3_system_supports_match_destructuring_for_constructor_fields() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![],
+        actions: vec![],
         fsm_decls: vec![],
         derived_fields: vec![],
         invariants: vec![],
@@ -3526,6 +3629,8 @@ fn ic3_system_supports_match_destructuring_for_constructor_fields() {
 
 #[test]
 fn ic3_system_supports_cross_entity_let_property() {
+    require_unbounded_proof_tests!();
+
     let order_status = IRTypeEntry {
         name: "OrderStatus".to_owned(),
         ty: IRType::Enum {
@@ -3717,6 +3822,8 @@ fn ic3_system_supports_cross_entity_let_property() {
 
 #[test]
 fn ic3_system_supports_entity_choose_with_field_access() {
+    require_unbounded_proof_tests!();
+
     let (ir, _) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
 
@@ -3813,6 +3920,8 @@ fn ic3_system_supports_entity_choose_with_field_access() {
 
 #[test]
 fn ic3_system_supports_cross_entity_choose_property() {
+    require_unbounded_proof_tests!();
+
     let (ir, _) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
 
@@ -4049,7 +4158,7 @@ fn make_system_program() -> (IRProgram, IRExpr) {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "process_order".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4155,6 +4264,8 @@ fn make_system_program() -> (IRProgram, IRExpr) {
 
 #[test]
 fn ic3_system_with_events_proves_safety() {
+    require_unbounded_proof_tests!();
+
     // Test system-level IC3 with actual system events (not empty systems vec).
     // Commerce system has Choose+Apply(confirm) for Orders.
     // Property: total >= 0 (no transition modifies total).
@@ -4180,6 +4291,8 @@ fn ic3_system_with_events_proves_safety() {
 
 #[test]
 fn ic3_system_missing_transition_returns_unknown() {
+    require_unbounded_proof_tests!();
+
     // System event references a non-existent transition — should return Unknown.
     let status_type = IRTypeEntry {
         name: "Status".to_owned(),
@@ -4217,7 +4330,7 @@ fn ic3_system_missing_transition_returns_unknown() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "do_thing".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4286,6 +4399,8 @@ fn ic3_system_missing_transition_returns_unknown() {
 
 #[test]
 fn ic3_system_missing_crosscall_target_returns_unknown() {
+    require_unbounded_proof_tests!();
+
     // System event has CrossCall to non-existent system — should return Unknown.
     let order = IREntity {
         name: "Order".to_owned(),
@@ -4312,7 +4427,7 @@ fn ic3_system_missing_crosscall_target_returns_unknown() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "trigger".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4370,6 +4485,8 @@ fn ic3_system_missing_crosscall_target_returns_unknown() {
 
 #[test]
 fn ic3_system_crosscall_create_via_recursion() {
+    require_unbounded_proof_tests!();
+
     // System A has CrossCall to System B which Creates an entity.
     // Tests recursive CrossCall encoding (not just Create scanning).
     let item = IREntity {
@@ -4398,7 +4515,7 @@ fn ic3_system_crosscall_create_via_recursion() {
         fields: vec![],
         entities: vec!["Item".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "add_item".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4437,7 +4554,7 @@ fn ic3_system_crosscall_create_via_recursion() {
         fields: vec![],
         entities: vec![],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "place_order".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4535,6 +4652,8 @@ fn ic3_system_crosscall_create_via_recursion() {
 
 #[test]
 fn ic3_system_forall_with_apply() {
+    require_unbounded_proof_tests!();
+
     // ForAll iterates all active orders and applies confirm.
     // With event-level encoding (no entity-level rules), transitions
     // are only accessible through system events.
@@ -4547,7 +4666,7 @@ fn ic3_system_forall_with_apply() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "confirm_all".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4602,6 +4721,8 @@ fn ic3_system_forall_with_apply() {
 
 #[test]
 fn ic3_system_forall_with_create() {
+    require_unbounded_proof_tests!();
+
     // ForAll iterates active orders and creates an Item for each.
     // Tests ForAll handling of Create ops (not just Apply).
     let order = IREntity {
@@ -4648,7 +4769,7 @@ fn ic3_system_forall_with_create() {
         fields: vec![],
         entities: vec!["Order".to_owned(), "Item".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "create_items".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4751,6 +4872,8 @@ fn ic3_system_forall_with_create() {
 
 #[test]
 fn ic3_system_event_guard_propagation() {
+    require_unbounded_proof_tests!();
+
     // Event guard is false → no transitions can fire → property trivially holds.
     // Verifies that event guard is properly AND'd into generated rules.
     let (ir, _) = make_system_program();
@@ -4762,7 +4885,7 @@ fn ic3_system_event_guard_propagation() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "never_fires".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -4864,6 +4987,8 @@ fn ic3_system_event_guard_propagation() {
 
 #[test]
 fn ic3_system_no_entity_rules_when_systems_present() {
+    require_unbounded_proof_tests!();
+
     // With systems present, entity-level transition rules are NOT emitted.
     // This means transitions can only fire through system events.
     // Test: property that would fail with entity-level rules but succeeds
@@ -4933,6 +5058,8 @@ fn ic3_system_no_entity_rules_when_systems_present() {
 
 #[test]
 fn ic3_system_unknown_system_name_returns_unknown() {
+    require_unbounded_proof_tests!();
+
     let (ir, property) = make_system_program();
     let vctx = VerifyContext::from_ir(&ir);
     let mut slots = HashMap::new();
@@ -4955,6 +5082,8 @@ fn ic3_system_unknown_system_name_returns_unknown() {
 
 #[test]
 fn ic3_system_cyclic_crosscall_returns_unknown() {
+    require_unbounded_proof_tests!();
+
     // System A calls B, system B calls A — cyclic CrossCall.
     let order = IREntity {
         name: "Order".to_owned(),
@@ -4981,7 +5110,7 @@ fn ic3_system_cyclic_crosscall_returns_unknown() {
         fields: vec![],
         entities: vec![],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "go".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -5012,7 +5141,7 @@ fn ic3_system_cyclic_crosscall_returns_unknown() {
         fields: vec![],
         entities: vec![],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "bounce".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -5070,6 +5199,8 @@ fn ic3_system_cyclic_crosscall_returns_unknown() {
 
 #[test]
 fn ic3_system_apply_target_mismatch_returns_unknown() {
+    require_unbounded_proof_tests!();
+
     // Apply.target doesn't match Choose variable — malformed IR.
     let (ir, _) = make_system_program();
 
@@ -5079,7 +5210,7 @@ fn ic3_system_apply_target_mismatch_returns_unknown() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "bad_event".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -5265,6 +5396,8 @@ fn build_liveness_chc_emits_monitor_columns_and_accepting_rule() {
 
 #[test]
 fn try_ic3_liveness_reports_missing_quantified_entity() {
+    require_unbounded_proof_tests!();
+
     let ir = IRProgram {
         types: vec![],
         constants: vec![],
@@ -5484,7 +5617,7 @@ fn build_system_chc_supports_entity_choose_scoped_properties() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![],
+        actions: vec![],
         fsm_decls: vec![],
         derived_fields: vec![],
         invariants: vec![],
@@ -5603,7 +5736,7 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
         fields: vec![],
         entities: vec![],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "decide".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -5628,7 +5761,7 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "tick".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {

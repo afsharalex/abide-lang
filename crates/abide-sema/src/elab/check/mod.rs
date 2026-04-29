@@ -105,10 +105,10 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     for prop in env.props.values() {
         check_ctor_records_in_expr(&prop.body, &env.variant_fields, &mut errors);
     }
-    // walk system step guards/bodies and query bodies for
+    // walk system action guards/bodies and query bodies for
     // StructCtor (and CtorRecord) well-formedness.
     for system in env.systems.values() {
-        for step in &system.steps {
+        for step in &system.actions {
             for req in &step.requires {
                 check_ctor_records_in_expr(req, &env.variant_fields, &mut errors);
             }

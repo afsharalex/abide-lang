@@ -116,7 +116,7 @@ pub struct VerifyContext {
     pub adt_sorts: HashMap<String, DatatypeSort>,
     /// command parameter metadata for `saw` encoding.
     /// Maps `(system_name, command_name)` → parameter list.
-    /// Populated from executable command clauses (`IRStep` after
+    /// Populated from executable command clauses (`IRSystemAction` after
     /// elaboration/lowering). Deduplicated by command name within each
     /// system because repeated guarded clauses share the same command
     /// signature.
@@ -209,7 +209,7 @@ impl VerifyContext {
         let mut seen = std::collections::HashSet::new();
         for system in &ir.systems {
             seen.clear();
-            for step in &system.steps {
+            for step in &system.actions {
                 if seen.insert(step.name.clone()) {
                     command_params.insert(
                         (system.name.clone(), step.name.clone()),

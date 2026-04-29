@@ -254,7 +254,7 @@ fn extract_system_graphs(system: &IRSystem) -> Vec<StateGraph> {
             .and_then(|expr| extract_finite_state_name(expr, &field.ty));
 
         let mut transitions = Vec::new();
-        for step in &system.steps {
+        for step in &system.actions {
             collect_system_field_transitions(
                 &step.body,
                 &step.guard,
@@ -480,7 +480,7 @@ fn is_field_ref(expr: &IRExpr, field_name: &str) -> bool {
 /// Extract system information from an `IRSystem`.
 fn extract_system_info(system: &IRSystem) -> SystemInfo {
     let events = system
-        .steps
+        .actions
         .iter()
         .map(|ev| {
             let mut cross_calls = Vec::new();
@@ -1027,7 +1027,7 @@ mod tests {
             store_params: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "submit_order".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -1117,7 +1117,7 @@ mod tests {
                 params: vec![],
                 return_type: None,
             }],
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "start".to_owned(),
                 params: vec![],
                 guard: IRExpr::BinOp {

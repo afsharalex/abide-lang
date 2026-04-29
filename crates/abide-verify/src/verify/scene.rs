@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use super::smt::{self, AbideSolver, Bool, Int, SatResult};
 
-use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRStep};
+use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSystemAction};
 
 use super::context::VerifyContext;
 use super::defenv;
@@ -315,7 +315,7 @@ pub(super) struct FiringInst {
 /// every clause.
 pub(super) struct ResolvedSceneEvent<'a> {
     scene_event: &'a IRSceneEvent,
-    steps: Vec<&'a IRStep>,
+    steps: Vec<&'a IRSystemAction>,
 }
 
 /// Build `override_params` for a scene event at a given step.
@@ -485,7 +485,7 @@ pub(super) fn check_scene_block(
             if !system_names.contains(&sys.name) {
                 system_names.push(sys.name.clone());
             }
-            for event in &sys.steps {
+            for event in &sys.actions {
                 collect_crosscall_systems(&event.body, &mut systems_to_scan);
             }
             // Follow let bindings (program composition): a program's
@@ -890,7 +890,7 @@ pub(super) fn check_scene_block(
             };
         };
         let matching_steps: Vec<_> = sys
-            .steps
+            .actions
             .iter()
             .filter(|s| s.name == scene_event.event)
             .collect();

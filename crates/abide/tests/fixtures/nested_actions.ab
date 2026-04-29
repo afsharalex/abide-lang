@@ -20,9 +20,7 @@ entity AuditLog {
 
 system CreateInChoose(tasks: Store<Task>, auditLogs: Store<AuditLog>) {
 
-  command start_with_log()
-
-  step start_with_log() {
+  command start_with_log() {
     choose t: Task where t.status == @Open {
       t.start()
       create AuditLog {}
@@ -55,9 +53,7 @@ verify create_in_choose {
 system CreateInForAll(tasks: Store<Task>, auditLogs: Store<AuditLog>) {
 
   // For each active task, start it and create an audit log
-  command start_all_with_logs()
-
-  step start_all_with_logs() {
+  command start_all_with_logs() {
     for t: Task {
       t.start()
       create AuditLog {}
@@ -83,9 +79,7 @@ verify create_in_forall {
 
 system Logger(auditLogs: Store<AuditLog>) {
 
-  command log_complete()
-
-  step log_complete() {
+  command log_complete() {
     choose l: AuditLog where l.kind == @Started {
       l.set_completed()
     }
@@ -95,9 +89,7 @@ system Logger(auditLogs: Store<AuditLog>) {
 system CrossCallInChoose(tasks: Store<Task>) {
 
   // CrossCall is nested inside the Choose block
-  command complete_and_log()
-
-  step complete_and_log() {
+  command complete_and_log() {
     choose t: Task where t.status == @InProgress {
       t.complete()
       Logger::log_complete()
@@ -135,9 +127,7 @@ entity Worker {
 system ForAllInChoose(tasks: Store<Task>, workers: Store<Worker>) {
 
   // ForAll is nested inside the Choose block
-  command start_and_deactivate()
-
-  step start_and_deactivate() {
+  command start_and_deactivate() {
     choose t: Task where t.status == @Open {
       t.start()
       for w: Worker {
@@ -170,21 +160,15 @@ verify forall_in_choose {
 
 system CrossEntityApply(tasks: Store<Task>, workers: Store<Worker>) {
 
-  command make_task()
+  command make_task() { create Task {} }
 
-  step make_task() { create Task {} }
-
-  command make_worker()
-
-  step make_worker() { create Worker {} }
+  command make_worker() { create Worker {} }
 
   // t.start() targets the outer Choose variable, NOT the inner Worker.
   // The inner Worker slot has NO Apply — it must be framed (unchanged).
   // Worker.start() exists and goes to @Done, so without framing, the
   // solver could mutate the Worker to @Done.
-  command start_task_via_inner_choose()
-
-  step start_task_via_inner_choose() {
+  command start_task_via_inner_choose() {
     choose t: Task where t.status == @Open {
       choose w: Worker where w.status == @Open {
         t.start()
@@ -198,6 +182,7 @@ system CrossEntityApply(tasks: Store<Task>, workers: Store<Worker>) {
 // Worker slot must be framed to prevent the solver from mutating it.
 verify cross_entity_target {
   assume {
+    stutter
     store tasks: Task[0..5]
     store workers: Worker[0..5]
     let crossEntityApply = CrossEntityApply { tasks: tasks, workers: workers }

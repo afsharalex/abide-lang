@@ -142,7 +142,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                     .find(|s| s.name == *target_sys)
                     .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
                 let evt = sys
-                    .steps
+                    .actions
                     .iter()
                     .find(|e| e.name == *target_evt)
                     .ok_or_else(|| {
@@ -301,7 +301,7 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                     .find(|s| s.name == *target_sys)
                     .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
                 let evt = sys
-                    .steps
+                    .actions
                     .iter()
                     .find(|e| e.name == *target_evt)
                     .ok_or_else(|| {

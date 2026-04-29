@@ -23,19 +23,13 @@ entity Signal {
 // ── Symmetric system: standard single-entity Choose ─────────────────
 system SymmetricTraffic(signals: Store<Signal>) {
 
-  command create_signal()
+  command create_signal() { create Signal {} }
 
-  step create_signal() { create Signal {} }
-
-  command toggle()
-
-  step toggle() {
+  command toggle() {
     choose s: Signal where s.color == @Red { s.go_green() }
   }
 
-  command reset()
-
-  step reset() {
+  command reset() {
     choose s: Signal where s.color == @Green { s.go_red() }
   }
 }
@@ -45,19 +39,13 @@ system SymmetricTraffic(signals: Store<Signal>) {
 // This breaks entity symmetry (slots interact).
 system AsymmetricTraffic(signals: Store<Signal>) {
 
-  command create_signal()
+  command create_signal() { create Signal {} }
 
-  step create_signal() { create Signal {} }
-
-  command toggle()
-
-  step toggle() {
+  command toggle() {
     choose s: Signal where s.color == @Red { s.go_green() }
   }
 
-  command swap()
-
-  step swap() {
+  command swap() {
     choose s1: Signal where s1.color == @Red {
       choose s2: Signal where s2.color == @Green {
         s1.go_green()

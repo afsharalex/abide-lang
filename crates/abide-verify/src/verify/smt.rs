@@ -34,7 +34,7 @@ pub use super::solver::ChcResult;
 pub use super::solver::Ast;
 
 // Solver-independent result type and solver wrapper
-pub use super::solver::SatResult;
+pub use super::solver::{SatResult, SolverLimits};
 
 /// Concrete solver wrapper (always uses the active backend from solver.rs).
 pub type AbideSolver = solver::AbideSolver<ActiveBackend>;

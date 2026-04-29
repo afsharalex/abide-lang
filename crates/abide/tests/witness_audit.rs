@@ -147,8 +147,7 @@ system Ui {
   screen: Screen = @home
   mode: Mode = @normal
 
-  command handle()
-  step handle() requires screen == @home {
+  command handle() requires screen == @home {
     screen' = @compose
   }
 }
@@ -220,8 +219,7 @@ system Ui {
   screen: Screen = @home
   mode: Mode = @normal
 
-  command handle()
-  step handle() requires screen == @home {
+  command handle() requires screen == @home {
     screen' = @compose
   }
 }

@@ -23,9 +23,7 @@ entity PaymentIntent {
 
 system Billing(paymentIntents: Store<PaymentIntent>) {
 
-  command open_intent(order_id: identity, amount: int)
-
-  step open_intent(order_id: identity, amount: int) {
+  command open_intent(order_id: identity, amount: int) {
     create PaymentIntent {
       order_id = order_id
       amount = amount
@@ -34,8 +32,6 @@ system Billing(paymentIntents: Store<PaymentIntent>) {
   }
 
   command capture_payment(order_id: identity)
-
-  step capture_payment(order_id: identity)
     requires exists p: PaymentIntent | p.order_id == order_id and p.status == @Opened {
     choose p: PaymentIntent where p.order_id == order_id {
       p.capture()

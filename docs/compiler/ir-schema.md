@@ -77,7 +77,7 @@ Example assumption set:
 - `IREntity`
   - fields, transitions, derived fields, invariants
 - `IRSystem`
-  - system-level fields, commands, executable command clauses (`steps` in IR), queries, preds, let bindings, procs
+  - system-level fields, commands, executable actions, queries, preds, let bindings, procs
 - `IRVerify`
   - bounded verification target, including store declarations and assumption set
 - `IRTheorem`

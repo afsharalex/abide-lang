@@ -1,4 +1,5 @@
 use super::*;
+use crate::verify::walkers;
 
 #[allow(clippy::too_many_lines)]
 pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
@@ -47,8 +48,53 @@ pub fn try_encode_slot_expr(
         }
 
         IRExpr::Ctor {
-            enum_name, ctor, ..
+            enum_name,
+            ctor,
+            args,
+            ..
         } => {
+            if let Some(dt) = ctx.vctx.adt_sorts.get(enum_name) {
+                for variant in &dt.variants {
+                    if smt::func_decl_name(&variant.constructor) == *ctor {
+                        let arity = variant.accessors.len();
+                        if arity > 0 && args.is_empty() {
+                            return Err(format!(
+                                "constructor '{ctor}' of '{enum_name}' requires {arity} field argument(s)"
+                            ));
+                        }
+                        if args.is_empty() {
+                            let result = smt::func_decl_apply(&variant.constructor, &[]);
+                            return Ok(walkers::dynamic_to_smt_value(result));
+                        }
+
+                        let declared_names: Vec<String> =
+                            variant.accessors.iter().map(smt::func_decl_name).collect();
+                        for (field_name, _) in args {
+                            if !declared_names.iter().any(|name| name == field_name) {
+                                return Err(format!(
+                                    "unknown field '{field_name}' in constructor '{ctor}' of '{enum_name}'"
+                                ));
+                            }
+                        }
+                        let args_map: HashMap<&str, &IRExpr> = args
+                            .iter()
+                            .map(|(name, expr)| (name.as_str(), expr))
+                            .collect();
+                        let mut z3_args: Vec<smt::Dynamic> = Vec::new();
+                        for name in &declared_names {
+                            let Some(field_expr) = args_map.get(name.as_str()) else {
+                                return Err(format!(
+                                    "constructor '{ctor}' of '{enum_name}' is missing field '{name}'"
+                                ));
+                            };
+                            z3_args.push(try_encode_slot_expr(ctx, field_expr, step)?.to_dynamic());
+                        }
+                        let refs: Vec<&smt::Dynamic> = z3_args.iter().collect();
+                        let result = smt::func_decl_apply(&variant.constructor, &refs);
+                        return Ok(walkers::dynamic_to_smt_value(result));
+                    }
+                }
+            }
             let id = ctx.vctx.variants.try_id_of(enum_name, ctor)?;
             Ok(smt::int_val(id))
         }

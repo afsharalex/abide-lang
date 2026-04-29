@@ -15,38 +15,26 @@ entity Signal {
 
 system FairTraffic(signals: Store<Signal>) {
 
-  command create_signal()
+  command create_signal() { create Signal {} }
 
-  step create_signal() { create Signal {} }
-
-  command toggle()
-
-  step toggle() {
+  command toggle() {
     choose s: Signal where s.color == @Red { s.go_green() }
   }
 
-  command reset()
-
-  step reset() {
+  command reset() {
     choose s: Signal where s.color == @Green { s.go_red() }
   }
 }
 
 system UnfairTraffic(signals: Store<Signal>) {
 
-  command create_signal()
+  command create_signal() { create Signal {} }
 
-  step create_signal() { create Signal {} }
-
-  command toggle()
-
-  step toggle() {
+  command toggle() {
     choose s: Signal where s.color == @Red { s.go_green() }
   }
 
-  command reset()
-
-  step reset() {
+  command reset() {
     choose s: Signal where s.color == @Green { s.go_red() }
   }
 }

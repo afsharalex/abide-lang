@@ -68,7 +68,7 @@ fn depth(x: int): int
   }
 }
 
-// ── Multi-step let chain before recursive call ──────────────────────
+// ── Multi-action let chain before recursive call ──────────────────────
 
 fn chain_let(n: int): int
   requires n >= 0

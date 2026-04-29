@@ -566,7 +566,7 @@ pub enum SystemItem {
     Field(FieldDecl),
     Dep(DepDecl),
     Command(CommandDecl),
-    Step(StepDecl),
+    Action(SystemActionDecl),
     Query(QueryDecl),
     /// System-internal predicate (). Not cross-system callable.
     Pred(PredDecl),
@@ -608,11 +608,11 @@ pub struct CommandBodyDecl {
     pub span: Span,
 }
 
-/// Internal guarded transition clause that realizes a command.
-/// Multiple steps with different `requires` guards can implement
-/// the same command (multi-clause dispatch).
+/// Private executable system behavior. System actions are part of the
+/// system transition relation, but are not part of the public command/query
+/// surface and are not cross-system callable.
 #[derive(Debug, Clone)]
-pub struct StepDecl {
+pub struct SystemActionDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub contracts: Vec<Contract>,

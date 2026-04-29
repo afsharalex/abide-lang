@@ -40,7 +40,7 @@ pub fn try_ic3_liveness(
             if !all_system_names.contains(&sys.name) {
                 all_system_names.push(sys.name.clone());
             }
-            for event in &sys.steps {
+            for event in &sys.actions {
                 collect_crosscall_targets(&event.body, &mut to_scan);
             }
         }
@@ -502,7 +502,7 @@ pub(super) fn build_liveness_chc(
 
     // System event rules — encode using existing CHC event encoder.
     for system in systems {
-        for event in &system.steps {
+        for event in &system.actions {
             let mut visited = HashSet::new();
             visited.insert((system.name.clone(), event.name.clone()));
 
@@ -820,7 +820,7 @@ fn encode_liveness_event_chc(
                     .find(|s| s.name == *target_sys)
                     .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
                 let evt = sys
-                    .steps
+                    .actions
                     .iter()
                     .find(|e| e.name == *target_evt)
                     .ok_or_else(|| {

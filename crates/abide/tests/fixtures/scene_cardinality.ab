@@ -14,25 +14,17 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
 
-  command create_order()
+  command create_order() { create Order {} }
 
-  step create_order() { create Order {} }
-
-  command confirm_order(order_id: identity)
-
-  step confirm_order(order_id: identity) {
+  command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
   }
 
-  command ship_order(order_id: identity)
-
-  step ship_order(order_id: identity) {
+  command ship_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Confirmed { o.ship() }
   }
 
-  command cancel_order(order_id: identity)
-
-  step cancel_order(order_id: identity) {
+  command cancel_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Pending { o.cancel() }
   }
 }
@@ -132,15 +124,11 @@ entity AuditLog {
 
 system Audited(orders: Store<Order>, auditLogs: Store<AuditLog>) {
 
-  command confirm_order(order_id: identity)
-
-  step confirm_order(order_id: identity) {
+  command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
   }
 
-  command cancel_order(order_id: identity)
-
-  step cancel_order(order_id: identity) {
+  command cancel_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Pending { o.cancel() }
   }
 }
@@ -167,15 +155,11 @@ scene xor_confirm_or_cancel {
 // even if warn skips — AuditLog stays @Info.
 system AuditActions(orders: Store<Order>, auditLogs: Store<AuditLog>) {
 
-  command confirm_order(order_id: identity)
-
-  step confirm_order(order_id: identity) {
+  command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }
   }
 
-  command warn_log()
-
-  step warn_log() {
+  command warn_log() {
     choose l: AuditLog where l.kind == @Info { l.mark_warning() }
   }
 }

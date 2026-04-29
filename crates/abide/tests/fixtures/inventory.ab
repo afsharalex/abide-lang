@@ -96,8 +96,6 @@ entity Fulfillment {
 system Warehouse(products: Store<Product>, reservations: Store<Reservation>) {
 
   command reserve_product(product_id: identity, qty: int)
-
-  step reserve_product(product_id: identity, qty: int)
     requires exists p: Product |
       p.id == product_id and
       p.status == @Available and
@@ -114,8 +112,6 @@ system Warehouse(products: Store<Product>, reservations: Store<Reservation>) {
   }
 
   command release_reservation(reservation_id: identity)
-
-  step release_reservation(reservation_id: identity)
     requires exists r: Reservation |
       r.id == reservation_id and r.status == @Held {
     choose r: Reservation where r.id == reservation_id {
@@ -128,8 +124,6 @@ system Warehouse(products: Store<Product>, reservations: Store<Reservation>) {
   }
 
   command confirm_reservation(reservation_id: identity)
-
-  step confirm_reservation(reservation_id: identity)
     requires exists r: Reservation |
       r.id == reservation_id and r.status == @Held {
     choose r: Reservation where r.id == reservation_id {
@@ -139,8 +133,6 @@ system Warehouse(products: Store<Product>, reservations: Store<Reservation>) {
   }
 
   command restock_product(product_id: identity, amount: int)
-
-  step restock_product(product_id: identity, amount: int)
     requires exists p: Product | p.id == product_id
     requires amount > 0 {
     choose p: Product where p.id == product_id {
@@ -151,9 +143,7 @@ system Warehouse(products: Store<Product>, reservations: Store<Reservation>) {
 
 system Shipping(fulfillments: Store<Fulfillment>) {
 
-  command begin_fulfillment(reservation_id: identity)
-
-  step begin_fulfillment(reservation_id: identity) {
+  command begin_fulfillment(reservation_id: identity) {
     create Fulfillment {
       reservation_id = reservation_id
       status = @Pending
@@ -161,8 +151,6 @@ system Shipping(fulfillments: Store<Fulfillment>) {
   }
 
   command pick(fulfillment_id: identity)
-
-  step pick(fulfillment_id: identity)
     requires exists f: Fulfillment |
       f.id == fulfillment_id and f.status == @Pending {
     choose f: Fulfillment where f.id == fulfillment_id {
@@ -173,8 +161,6 @@ system Shipping(fulfillments: Store<Fulfillment>) {
   // Sequential composition: pack then ship in one atomic step.
   // Uses intermediate variable chaining — ship's guard sees pack's result.
   command pack_and_ship(fulfillment_id: identity)
-
-  step pack_and_ship(fulfillment_id: identity)
     requires exists f: Fulfillment |
       f.id == fulfillment_id and f.status == @Picking {
     choose f: Fulfillment where f.id == fulfillment_id {
@@ -184,8 +170,6 @@ system Shipping(fulfillments: Store<Fulfillment>) {
   }
 
   command mark_delivered(fulfillment_id: identity)
-
-  step mark_delivered(fulfillment_id: identity)
     requires exists f: Fulfillment |
       f.id == fulfillment_id and f.status == @Shipped {
     choose f: Fulfillment where f.id == fulfillment_id {

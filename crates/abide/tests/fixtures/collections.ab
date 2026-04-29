@@ -49,34 +49,26 @@ prop tasks_start_open for TaskMgmt =
 
 system TaskMgmt(tasks: Store<Task>) {
 
-  command create_task()
-
-  step create_task() {
+  command create_task() {
     create Task {
       status = @Open
       priority = @Medium
     }
   }
 
-  command start_task(task_id: identity)
-
-  step start_task(task_id: identity) {
+  command start_task(task_id: identity) {
     choose t: Task where t.id == task_id {
       t.start()
     }
   }
 
-  command finish_task(task_id: identity)
-
-  step finish_task(task_id: identity) {
+  command finish_task(task_id: identity) {
     choose t: Task where t.id == task_id {
       t.finish()
     }
   }
 
-  command tag_task(task_id: identity, tag: identity)
-
-  step tag_task(task_id: identity, tag: identity) {
+  command tag_task(task_id: identity, tag: identity) {
     choose t: Task where t.id == task_id {
       t.add_tag(tag)
     }

@@ -240,7 +240,7 @@ pub struct ESystem {
     pub store_params: Vec<(String, String)>,
     pub scopes: Vec<EScope>,
     pub commands: Vec<ECommand>,
-    pub steps: Vec<EStep>,
+    pub actions: Vec<ESystemAction>,
     pub queries: Vec<EQuery>,
     /// fsm declarations on direct system fields.
     /// This remains a narrow lifecycle table over enum-typed flat
@@ -367,7 +367,7 @@ pub struct EScope {
 }
 
 /// public API declaration on a system. Commands declare the
-/// externally callable surface; steps implement them with guarded bodies.
+/// externally callable surface; actions are private executable behavior with guarded bodies.
 #[derive(Debug, Clone)]
 pub struct ECommand {
     pub name: String,
@@ -377,11 +377,10 @@ pub struct ECommand {
     pub span: Option<crate::span::Span>,
 }
 
-/// internal guarded transition clause that realizes a command.
-/// Multiple steps with the same name but different `requires` guards can
-/// implement multi-clause dispatch for a single command.
+/// Private executable system behavior. Command bodies lower to actions with
+/// the command name; explicit `action` declarations remain private.
 #[derive(Debug, Clone)]
-pub struct EStep {
+pub struct ESystemAction {
     pub name: String,
     pub params: Vec<(String, Ty)>,
     pub requires: Vec<EExpr>,

@@ -471,7 +471,7 @@ pub(super) fn qualify_query_vars_scoped(
 }
 
 /// Rewrite bare query Var names inside IRAction trees.
-/// Scope-aware: `bound` tracks locally bound variables from step params,
+/// Scope-aware: `bound` tracks locally bound variables from action params,
 /// Choose/ForAll binders, etc.
 pub(super) fn qualify_action_query_vars(
     action: &IRAction,

@@ -211,7 +211,7 @@ pub(super) fn build_system_chc(
     // Choose/ForAll/Apply/Create/CrossCall are all handled with full context
     // guard propagation. CrossCall targets are recursively encoded (not just Creates).
     for system in systems {
-        for event in &system.steps {
+        for event in &system.actions {
             // Fresh visited set per event tree — cycles within one event's
             // CrossCall graph are detected, but the same event can appear
             // in different top-level event trees.

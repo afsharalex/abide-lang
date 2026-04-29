@@ -26,7 +26,7 @@ pub fn encode_step(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
 ) -> Bool {
     try_encode_step(pool, vctx, entities, all_systems, event, step)
@@ -39,7 +39,7 @@ pub fn try_encode_step(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
 ) -> Result<Bool, String> {
     let (formula, touched) =
@@ -57,7 +57,7 @@ pub fn encode_step_with_params(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     params: HashMap<String, SmtValue>,
 ) -> Bool {
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn step_scope_metadata_and_branch_param_merging_resolve_expected_bindings() {
-        let event = IRStep {
+        let event = IRSystemAction {
             name: "tick".to_owned(),
             params: vec![
                 IRTransParam {
@@ -239,7 +239,7 @@ mod tests {
             fields: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps: vec![event.clone()],
+            actions: vec![event.clone()],
             fsm_decls: vec![],
             derived_fields: vec![],
             invariants: vec![],
@@ -250,7 +250,7 @@ mod tests {
         };
 
         let (system_name, entity_params, store_params) =
-            step_scope_metadata(std::slice::from_ref(&system), &system.steps[0]);
+            step_scope_metadata(std::slice::from_ref(&system), &system.actions[0]);
         assert_eq!(system_name, "Shop");
         assert_eq!(entity_params.get("order"), Some(&"Order".to_owned()));
         assert_eq!(store_params.get("orders"), Some(&"Order".to_owned()));
@@ -692,7 +692,7 @@ mod tests {
             fields: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "set_from_relay".to_owned(),
                 params: vec![IRTransParam {
                     name: "amount".to_owned(),
@@ -789,7 +789,7 @@ mod tests {
             fields: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "needs_arg".to_owned(),
                 params: vec![IRTransParam {
                     name: "amount".to_owned(),
@@ -867,7 +867,7 @@ mod tests {
             fields: vec![],
             entities: vec![],
             commands: vec![],
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "decide".to_owned(),
                 params: vec![],
                 guard: IRExpr::Lit {
@@ -888,14 +888,14 @@ mod tests {
         }
     }
 
-    fn make_shop_system(step: IRStep) -> IRSystem {
+    fn make_shop_system(step: IRSystemAction) -> IRSystem {
         IRSystem {
             name: "Shop".to_owned(),
             store_params: vec![],
             fields: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps: vec![step],
+            actions: vec![step],
             fsm_decls: vec![],
             derived_fields: vec![],
             invariants: vec![],
@@ -924,7 +924,7 @@ mod tests {
             args: vec![],
             span: None,
         }));
-        let relay = make_shop_system(IRStep {
+        let relay = make_shop_system(IRSystemAction {
             name: "relay".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -983,7 +983,7 @@ mod tests {
             &vctx,
             std::slice::from_ref(&entity),
             &systems,
-            &relay.steps[0],
+            &relay.actions[0],
             0,
             0,
             None,
@@ -1015,7 +1015,7 @@ mod tests {
             args: vec![],
             span: None,
         }));
-        let relay = make_shop_system(IRStep {
+        let relay = make_shop_system(IRSystemAction {
             name: "relay_choose".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -1071,7 +1071,7 @@ mod tests {
             &vctx,
             std::slice::from_ref(&entity),
             &systems,
-            &relay.steps[0],
+            &relay.actions[0],
             0,
             0,
             None,
@@ -1090,7 +1090,7 @@ mod tests {
             args: vec![],
             span: None,
         }));
-        let relay = make_shop_system(IRStep {
+        let relay = make_shop_system(IRSystemAction {
             name: "relay_match".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -1143,7 +1143,7 @@ mod tests {
             &vctx,
             std::slice::from_ref(&entity),
             &systems,
-            &relay.steps[0],
+            &relay.actions[0],
             0,
             0,
             None,
@@ -1169,7 +1169,7 @@ mod tests {
         let entity = make_step_test_entity();
         let vctx = make_step_test_vctx();
         let decision = decision_system(None);
-        let relay = make_shop_system(IRStep {
+        let relay = make_shop_system(IRSystemAction {
             name: "relay_err".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -1196,7 +1196,7 @@ mod tests {
             &vctx,
             std::slice::from_ref(&entity),
             &systems,
-            &relay.steps[0],
+            &relay.actions[0],
             0,
             0,
             None,

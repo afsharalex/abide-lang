@@ -21,15 +21,11 @@ entity Ticket {
 
 system TicketSystem(tickets: Store<Ticket>) {
 
-  command start_ticket(t: Ticket)
-
-  step start_ticket(t: Ticket) {
+  command start_ticket(t: Ticket) {
     t.start()
   }
 
-  command close_ticket(t: Ticket)
-
-  step close_ticket(t: Ticket) {
+  command close_ticket(t: Ticket) {
     t.close()
   }
 }

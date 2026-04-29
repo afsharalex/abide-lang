@@ -702,47 +702,16 @@ pub fn saw_arity_mismatch(sys: &str, evt: &str, expected: usize, got: usize) -> 
     format!("`saw {sys}::{evt}` expects {expected} arguments but got {got}")
 }
 
-// ── command / step / query ─────────────────────────────────
+// ── command / action / query ───────────────────────────────
 
 /// `event` keyword is no longer valid in system bodies.
 pub const EVENT_KEYWORD_REMOVED: &str = "`event` has been replaced by `command` — \
-     declare a `command` directly, optionally with a guarded body; \
-     legacy `step` declarations remain available for compatibility";
+     declare a `command` directly, optionally with a guarded body";
 
-/// `ensures` is not valid on step declarations.
-pub const STEP_ENSURES_NOT_ALLOWED: &str = "`ensures` is not valid on `step` declarations — \
-     the step body is the postcondition; use `requires` for guards";
-
-/// A legacy `step` name does not match any declared `command` in the same system.
-pub fn step_no_matching_command(step_name: &str, system_name: &str) -> String {
-    format!(
-        "legacy `step {step_name}` does not match any `command` declared in system `{system_name}`"
-    )
-}
-
-/// Label for a legacy step that has no matching command.
-pub fn label_step_no_matching_command(step_name: &str) -> String {
-    format!("no `command {step_name}` found in this system")
-}
-
-/// A legacy `step` clause and its matching `command` have different parameter counts.
-pub fn step_command_param_mismatch(step_name: &str, cmd_arity: usize, step_arity: usize) -> String {
-    format!(
-        "legacy `step {step_name}` has {step_arity} parameters but `command {step_name}` declares {cmd_arity}"
-    )
-}
-
-/// A legacy `step` parameter type does not match the corresponding `command` parameter type.
-pub fn step_command_type_mismatch(
-    step_name: &str,
-    param_pos: usize,
-    cmd_ty: &str,
-    step_ty: &str,
-) -> String {
-    format!(
-        "legacy `step {step_name}` parameter {param_pos} has type `{step_ty}` but `command {step_name}` declares `{cmd_ty}`"
-    )
-}
+/// `ensures` is not valid on executable command/action declarations.
+pub const ACTION_ENSURES_NOT_ALLOWED: &str = "`ensures` is not valid on executable \
+     command or action declarations — the body is the postcondition; use `requires` \
+     for guards";
 
 // ── Generic enum diagnostics ──────────────────────────────
 

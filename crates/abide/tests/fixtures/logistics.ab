@@ -16,8 +16,6 @@ use Warehouse::Warehouse as WH
 system Logistics(packages: Store<Package>, wSlots: Store<WSlot>) {
 
   command ship_package(pkg_id: identity)
-
-  step ship_package(pkg_id: identity)
     requires exists p: Package | p.id == pkg_id and p.status == @Pending {
     choose p: Package where p.id == pkg_id {
       p.ship()
@@ -25,8 +23,6 @@ system Logistics(packages: Store<Package>, wSlots: Store<WSlot>) {
   }
 
   command reserve_slot(slot_id: identity)
-
-  step reserve_slot(slot_id: identity)
     requires exists s: WSlot | s.id == slot_id and s.status == @Empty {
     choose s: WSlot where s.id == slot_id {
       s.reserve()
@@ -34,8 +30,6 @@ system Logistics(packages: Store<Package>, wSlots: Store<WSlot>) {
   }
 
   command fill_slot(slot_id: identity)
-
-  step fill_slot(slot_id: identity)
     requires exists s: WSlot | s.id == slot_id and s.status == @Reserved {
     choose s: WSlot where s.id == slot_id {
       s.fill()
@@ -43,16 +37,12 @@ system Logistics(packages: Store<Package>, wSlots: Store<WSlot>) {
   }
 
   // Cross-call using aliased system name (WH → Warehouse)
-  command provision_slot(cap: int)
-
-  step provision_slot(cap: int) {
+  command provision_slot(cap: int) {
     WH::add_slot(cap: cap)
   }
 
   // Create using aliased entity name (WSlot → Slot)
-  command create_slot(cap: int)
-
-  step create_slot(cap: int) {
+  command create_slot(cap: int) {
     create WSlot {
       id = cap
       status = @Empty

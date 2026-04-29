@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use super::smt::Bool;
 
 use crate::ir::types::{
-    IRAction, IRAssumptionSet, IREntity, IRExpr, IRStep, IRSystem, IRTransParam, IRTransition,
-    IRType, LitVal,
+    IRAction, IRAssumptionSet, IREntity, IRExpr, IRSystem, IRSystemAction, IRTransParam,
+    IRTransition, IRType, LitVal,
 };
 
 use super::context::VerifyContext;

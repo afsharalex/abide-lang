@@ -9,9 +9,7 @@ entity Order {
 }
 
 system S(orders: Store<Order>) {
-  command make()
-
-  step make() { create Order {} }
+  command make() { create Order {} }
 }
 
 // match o.status misses Shipped — should produce NonExhaustiveMatch error

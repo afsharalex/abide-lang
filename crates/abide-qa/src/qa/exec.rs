@@ -3611,14 +3611,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3658,14 +3656,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3708,8 +3704,7 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
@@ -3753,14 +3748,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3803,14 +3796,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3853,14 +3844,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3903,14 +3892,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -3953,14 +3940,12 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
   revenue: real = 0
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
     order.total' = order.total
     revenue' = revenue
   }
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -4002,19 +3987,15 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
   }
-  step tick() {}
+  command tick() {}
 }
 
 system Audit(orders: Store<Order>) {
-  command inspect(order: Order)
-  command tick()
-  step inspect(order: Order) requires order.status == @Pending {}
-  step tick() {}
+  command inspect(order: Order) requires order.status == @Pending {}
+  command tick() {}
 }
 "#,
             "multi_system_entity_scope",
@@ -4062,8 +4043,7 @@ entity Payment {
 
 system Commerce(orders: Store<Order>, payments: Store<Payment>) {
   revenue: real = 0
-  command tick()
-  step tick() {
+  command tick() {
     revenue' = revenue
   }
 }
@@ -4104,8 +4084,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command tick()
-  step tick() {}
+  command tick() {}
 }
 "#,
             "semantic_unknown_scope_bounds",
@@ -4146,12 +4125,10 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command ship(order: Order)
-  command tick()
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
   }
-  step tick() {}
+  command tick() {}
 }
 "#,
             "semantic_bounds_force_graph_target",

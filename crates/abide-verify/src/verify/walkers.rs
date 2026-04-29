@@ -758,7 +758,7 @@ pub(super) fn identify_event_from_field_changes(
     // Collect fields that each event's actions modify
     let mut matches = Vec::new();
     for system in systems {
-        for event in &system.steps {
+        for event in &system.actions {
             let modified = collect_event_modified_fields(&event.body, entities);
             let creates = collect_event_created_entities(&event.body);
 
@@ -980,7 +980,7 @@ fn scan_event_creates_inner(
                 system, command, ..
             } => {
                 if let Some(sys) = all_systems.iter().find(|s| s.name == *system) {
-                    for step in sys.steps.iter().filter(|s| s.name == *command) {
+                    for step in sys.actions.iter().filter(|s| s.name == *command) {
                         scan_event_creates_inner(&step.body, all_systems, creates, depth + 1);
                     }
                 }
@@ -1014,7 +1014,7 @@ pub(super) fn collect_event_body_entities(
                 let key = (system.clone(), command.clone());
                 if visited.insert(key) {
                     if let Some(sys) = systems.iter().find(|s| s.name == *system) {
-                        for step in sys.steps.iter().filter(|s| s.name == *command) {
+                        for step in sys.actions.iter().filter(|s| s.name == *command) {
                             collect_event_body_entities(&step.body, systems, entities, visited);
                         }
                     }
@@ -1026,7 +1026,7 @@ pub(super) fn collect_event_body_entities(
                 let key = (system.clone(), command.clone());
                 if visited.insert(key) {
                     if let Some(sys) = systems.iter().find(|s| s.name == *system) {
-                        for step in sys.steps.iter().filter(|s| s.name == *command) {
+                        for step in sys.actions.iter().filter(|s| s.name == *command) {
                             collect_event_body_entities(&step.body, systems, entities, visited);
                         }
                     }
@@ -1615,7 +1615,7 @@ fn extract_transition_from_fire(
 
     for system in systems {
         let mut command_ordinals: HashMap<&str, usize> = HashMap::new();
-        for (clause_idx, step_decl) in system.steps.iter().enumerate() {
+        for (clause_idx, step_decl) in system.actions.iter().enumerate() {
             let command_name = step_decl.name.as_str();
             let key = (system.name.clone(), command_name.to_owned(), clause_idx);
             let fire_bool = fire_tracking
@@ -2115,14 +2115,14 @@ mod tests {
         }
     }
 
-    fn test_system(name: &str, steps: Vec<crate::ir::types::IRStep>) -> IRSystem {
+    fn test_system(name: &str, actions: Vec<crate::ir::types::IRSystemAction>) -> IRSystem {
         IRSystem {
             name: name.to_owned(),
             store_params: vec![],
             fields: vec![],
             entities: vec!["Order".to_owned()],
             commands: vec![],
-            steps,
+            actions,
             fsm_decls: vec![],
             derived_fields: vec![],
             invariants: vec![],
@@ -2133,8 +2133,8 @@ mod tests {
         }
     }
 
-    fn test_step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRStep {
-        crate::ir::types::IRStep {
+    fn test_step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRSystemAction {
+        crate::ir::types::IRSystemAction {
             name: name.to_owned(),
             params: vec![],
             guard: bool_lit(true),
@@ -2802,7 +2802,7 @@ mod tests {
             )],
         );
         let systems = vec![caller.clone(), callee];
-        let step_body = &caller.steps[0].body;
+        let step_body = &caller.actions[0].body;
 
         assert_eq!(scan_event_creates(step_body, &systems), vec!["Order"]);
         assert_eq!(
@@ -3117,8 +3117,8 @@ fn analyze_event_fairness(
     // Check enabledness at each loop step. A command may have multiple
     // step clauses — the command is enabled if ANY clause is enabled.
     let target_sys = systems.iter().find(|s| s.name == sys_name);
-    let matching_steps: Vec<&crate::ir::types::IRStep> = target_sys
-        .map(|s| s.steps.iter().filter(|st| st.name == evt_name).collect())
+    let matching_steps: Vec<&crate::ir::types::IRSystemAction> = target_sys
+        .map(|s| s.actions.iter().filter(|st| st.name == evt_name).collect())
         .unwrap_or_default();
 
     let mut enabled_at_every_step = !matching_steps.is_empty();
@@ -3193,13 +3193,13 @@ pub(super) fn extract_deadlock_diagnostics(
         // Group step clauses by command name. A command is enabled if
         // ANY of its clauses is enabled (multi-clause dispatch).
         let mut seen_commands: HashSet<String> = HashSet::new();
-        for event in &system.steps {
+        for event in &system.actions {
             if !seen_commands.insert(event.name.clone()) {
                 continue; // already diagnosed this command
             }
             // Check all clauses for this command name
-            let clauses: Vec<&crate::ir::types::IRStep> = system
-                .steps
+            let clauses: Vec<&crate::ir::types::IRSystemAction> = system
+                .actions
                 .iter()
                 .filter(|s| s.name == event.name)
                 .collect();
@@ -3278,7 +3278,7 @@ fn diagnose_disabled_event(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &crate::ir::types::IRStep,
+    event: &crate::ir::types::IRSystemAction,
     step: usize,
 ) -> String {
     use crate::ir::types::{IRAction, IRType, LitVal};
@@ -3296,7 +3296,7 @@ fn diagnose_disabled_event(
         let store_param_types: std::collections::HashMap<String, String> = systems
             .iter()
             .find(|s| {
-                s.steps
+                s.actions
                     .iter()
                     .any(|st| std::ptr::eq(st, event) || st.name == event.name)
             })
@@ -3460,7 +3460,7 @@ fn diagnose_disabled_event(
                         .iter()
                         .find(|s| s.name == *sys_name)
                         .is_some_and(|s| {
-                            s.steps
+                            s.actions
                                 .iter()
                                 .filter(|st| st.name == *cmd_name)
                                 .any(|target_step| {

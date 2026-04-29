@@ -83,7 +83,7 @@ fn partial_app(): int
      in inc(2)
 }
 
-// --- Multi-step partial application ---
+// --- Multi-action partial application ---
 
 fn multi_partial(): int
   ensures result == 6

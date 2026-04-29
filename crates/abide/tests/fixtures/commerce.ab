@@ -43,8 +43,6 @@ entity Order {
 system Commerce(orders: Store<Order>) {
 
   command pay(order_id: identity)
-
-  step pay(order_id: identity)
     requires exists o: Order | o.id == order_id and o.status == @Pending {
     choose o: Order where o.id == order_id {
       o.submit()
@@ -53,8 +51,6 @@ system Commerce(orders: Store<Order>) {
   }
 
   command confirm_payment(order_id: identity)
-
-  step confirm_payment(order_id: identity)
     requires exists o: Order | o.id == order_id and o.status == @AwaitingPayment {
     choose o: Order where o.id == order_id {
       o.mark_paid()
@@ -62,17 +58,13 @@ system Commerce(orders: Store<Order>) {
   }
 
   command ship_order(order_id: identity)
-
-  step ship_order(order_id: identity)
     requires exists o: Order | o.id == order_id and o.status == @Paid {
     choose o: Order where o.id == order_id {
       o.ship()
     }
   }
 
-  command cancel_all_pending()
-
-  step cancel_all_pending() {
+  command cancel_all_pending() {
     for o: Order {
       o.cancel()
     }

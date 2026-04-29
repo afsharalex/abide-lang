@@ -543,8 +543,7 @@ fn completion_item_for_symbol(symbol: &IdeSymbol) -> CompletionItem {
             | IdeSymbolKind::Scene
             | IdeSymbolKind::Axiom
             | IdeSymbolKind::Const
-            | IdeSymbolKind::Function
-            | IdeSymbolKind::Step => CompletionItemKind::FUNCTION,
+            | IdeSymbolKind::Function => CompletionItemKind::FUNCTION,
             IdeSymbolKind::Module | IdeSymbolKind::System | IdeSymbolKind::Program => {
                 CompletionItemKind::MODULE
             }

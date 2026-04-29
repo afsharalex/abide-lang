@@ -27,9 +27,7 @@ entity Slot {
 
 system Warehouse(slots: Store<Slot>) {
 
-  command add_slot(cap: int)
-
-  step add_slot(cap: int) {
+  command add_slot(cap: int) {
     create Slot {
       id = cap
       status = @Empty

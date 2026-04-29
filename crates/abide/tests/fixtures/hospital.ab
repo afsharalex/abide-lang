@@ -76,9 +76,7 @@ prop beds_valid_status for HospitalOps =
 
 system HospitalOps(patients: Store<Patient>, beds: Store<Bed>) {
 
-  command admit_patient(bed_id: identity)
-
-  step admit_patient(bed_id: identity) {
+  command admit_patient(bed_id: identity) {
     choose b: Bed where b.id == bed_id {
       b.occupy()
     }
@@ -89,41 +87,31 @@ system HospitalOps(patients: Store<Patient>, beds: Store<Bed>) {
     }
   }
 
-  command begin_treatment(patient_id: identity)
-
-  step begin_treatment(patient_id: identity) {
+  command begin_treatment(patient_id: identity) {
     choose p: Patient where p.id == patient_id {
       p.begin_treatment()
     }
   }
 
-  command discharge_patient(patient_id: identity)
-
-  step discharge_patient(patient_id: identity) {
+  command discharge_patient(patient_id: identity) {
     choose p: Patient where p.id == patient_id {
       p.discharge()
     }
   }
 
-  command transfer_patient(patient_id: identity)
-
-  step transfer_patient(patient_id: identity) {
+  command transfer_patient(patient_id: identity) {
     choose p: Patient where p.id == patient_id {
       p.transfer()
     }
   }
 
-  command release_bed(bed_id: identity)
-
-  step release_bed(bed_id: identity) {
+  command release_bed(bed_id: identity) {
     choose b: Bed where b.id == bed_id {
       b.release()
     }
   }
 
-  command maintenance_bed(bed_id: identity)
-
-  step maintenance_bed(bed_id: identity) {
+  command maintenance_bed(bed_id: identity) {
     choose b: Bed where b.id == bed_id {
       b.mark_maintenance()
     }

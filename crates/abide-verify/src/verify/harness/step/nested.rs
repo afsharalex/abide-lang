@@ -103,7 +103,7 @@ pub(in crate::verify::harness::step) fn try_encode_nested_op(
         } => {
             if let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) {
                 let matching_steps: Vec<_> = target_sys
-                    .steps
+                    .actions
                     .iter()
                     .filter(|s| s.name == *command_name)
                     .collect();

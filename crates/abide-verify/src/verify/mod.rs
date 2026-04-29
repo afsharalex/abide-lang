@@ -249,7 +249,7 @@ fn collect_extern_assumptions(
             }
         }
 
-        for step in &system.steps {
+        for step in &system.actions {
             collect_crosscall_systems(&step.body, &mut to_scan);
         }
         for lb in &system.let_bindings {
@@ -1962,6 +1962,31 @@ fn find_deadlock_step(
 
 // ── Tiered dispatch for verify blocks ───────────────────────────────
 
+fn record_verify_assert_precondition_obligations(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+) {
+    let (scope, system_names, bound, store_ranges) = compute_verify_scope(ir, verify_block);
+    let (relevant_entities, relevant_systems) = select_verify_relevant(ir, &scope, &system_names);
+    let pool_bound = bound.max(1);
+    let pool =
+        create_slot_pool_with_systems(&relevant_entities, &scope, pool_bound, &relevant_systems);
+
+    for assert_expr in &verify_block.asserts {
+        let _ = encode_property_at_step(
+            &pool,
+            vctx,
+            defs,
+            assert_expr,
+            0,
+            &store_ranges,
+            &relevant_systems,
+        );
+    }
+}
+
 /// Check a verify block using tiered dispatch ():
 ///
 /// 1. If asserts contain `eventually`, skip Tier 1 (liveness can't be proved by induction)
@@ -2037,11 +2062,7 @@ fn check_verify_block_tiered(
         .as_ref()
         .is_some_and(transition::TransitionVerifyObligation::has_liveness);
 
-    if let Some(result) =
-        explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
-    {
-        return result;
-    }
+    record_verify_assert_precondition_obligations(ir, vctx, defs, effective_block);
 
     if !has_liveness && !config.unbounded_only {
         let Some(relational_config) = clamp_config_to_deadline(config, deadline) else {
@@ -2065,6 +2086,12 @@ fn check_verify_block_tiered(
         }
     }
 
+    if let Some(result) =
+        explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
+    {
+        return result;
+    }
+
     // / revised: when stutter is opted out, check for
     // a global deadlock BEFORE running any proof technique. Without
     // this gate, both 1-induction and IC3 can vacuously prove `always
@@ -2086,24 +2113,8 @@ fn check_verify_block_tiered(
         }
     }
 
-    if !config.bounded_only && !has_liveness {
-        let Some(sygus_config) = clamp_config_to_deadline(config, deadline) else {
-            return VerificationResult::Unprovable {
-                name: effective_block.name.clone(),
-                hint: verification_timeout_hint(config),
-                span: effective_block.span,
-                file: effective_block.file.clone(),
-            };
-        };
-        if let Some(result) =
-            try_cvc5_sygus_on_verify(ir, vctx, defs, effective_block, &sygus_config)
-        {
-            return result;
-        }
-    }
-
     // Tier 1a: Try induction (unless bounded-only or liveness)
-    if !config.bounded_only && !has_liveness {
+    if !config.bounded_only && !has_liveness && active_solver_family() == SolverFamily::Z3 {
         let Some(induction_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {
                 name: effective_block.name.clone(),
@@ -2134,6 +2145,22 @@ fn check_verify_block_tiered(
             return result;
         }
         // IC3 failed — fall through to Tier 2
+    }
+
+    if !config.bounded_only && !has_liveness && config.chc_selection != ChcSelection::Cvc5 {
+        let Some(sygus_config) = clamp_config_to_deadline(config, deadline) else {
+            return VerificationResult::Unprovable {
+                name: effective_block.name.clone(),
+                hint: verification_timeout_hint(config),
+                span: effective_block.span,
+                file: effective_block.file.clone(),
+            };
+        };
+        if let Some(result) =
+            try_cvc5_sygus_on_verify(ir, vctx, defs, effective_block, &sygus_config)
+        {
+            return result;
+        }
     }
 
     // Tier 2: Bounded model checking (unless unbounded-only)
@@ -2337,7 +2364,7 @@ fn try_induction_on_verify(
         }
     }
     for sys in system.relevant_systems() {
-        for event in &sys.steps {
+        for event in &sys.actions {
             if find_unsupported_scene_expr(&event.guard).is_some() {
                 return None;
             }
@@ -2614,7 +2641,7 @@ pub(super) fn try_liveness_reduction(
         }
     }
     for sys in system.relevant_systems() {
-        for event in &sys.steps {
+        for event in &sys.actions {
             if find_unsupported_scene_expr(&event.guard).is_some() {
                 return None;
             }
@@ -3184,7 +3211,7 @@ fn check_verify_block(
     }
     // Scan event guards and action bodies
     for sys in system.relevant_systems() {
-        for event in &sys.steps {
+        for event in &sys.actions {
             if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
                 return VerificationResult::Unprovable {
                     name: verify_block.name.clone(),

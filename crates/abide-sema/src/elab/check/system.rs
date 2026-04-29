@@ -273,7 +273,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
         }
     }
 
-    for step in &system.steps {
+    for step in &system.actions {
         validate_crosscalls_in_actions(
             env,
             &system.name,
@@ -381,7 +381,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
         .iter()
         .map(|c| (c.name.as_str(), c.return_type.as_ref()))
         .collect();
-    for step in &system.steps {
+    for step in &system.actions {
         let cmd_rt = cmd_return_types.get(step.name.as_str()).copied().flatten();
         let step_span = step
             .span
@@ -393,7 +393,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                 errors.push(ElabError::with_span(
                     ErrorKind::TypeMismatch,
                     format!(
-                        "step `{}` has a `return` expression but command `{}` \
+                        "action `{}` has a `return` expression but command `{}` \
                          does not declare a return type",
                         step.name, step.name
                     ),
@@ -432,7 +432,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                             errors.push(ElabError::with_span(
                                                 ErrorKind::TypeMismatch,
                                                 format!(
-                                                    "step `{}` returns `@{name}` with argument {} \
+                                                    "action `{}` returns `@{name}` with argument {} \
                                                      (field `{fname}`) of type `{}` but variant \
                                                      `{enum_name}::@{name}` expects `{}`",
                                                     step.name,
@@ -449,7 +449,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                     errors.push(ElabError::with_span(
                                         ErrorKind::ParamMismatch,
                                         format!(
-                                            "step `{}` returns `@{name}` with {} \
+                                            "action `{}` returns `@{name}` with {} \
                                              argument(s) but variant `{enum_name}::@{name}` \
                                              expects {}",
                                             step.name,
@@ -471,7 +471,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                     errors.push(ElabError::with_span(
                                         ErrorKind::ParamMismatch,
                                         format!(
-                                            "step `{}` returns `@{name}` with {} \
+                                            "action `{}` returns `@{name}` with {} \
                                              field(s) but variant `{enum_name}::@{name}` \
                                              expects {}",
                                             step.name,
@@ -492,7 +492,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                             errors.push(ElabError::with_span(
                                                 ErrorKind::TypeMismatch,
                                                 format!(
-                                                    "step `{}` returns `@{name}` with field \
+                                                    "action `{}` returns `@{name}` with field \
                                                      `{fname}` of type `{}` but variant \
                                                      `{enum_name}::@{name}` expects `{}`",
                                                     step.name,
@@ -507,7 +507,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                         errors.push(ElabError::with_span(
                                             ErrorKind::UndefinedRef,
                                             format!(
-                                                "step `{}` returns `@{name}` with unknown \
+                                                "action `{}` returns `@{name}` with unknown \
                                                  field `{fname}` (variant `{enum_name}::@{name}` \
                                                  has fields: {})",
                                                 step.name,
@@ -528,7 +528,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                         errors.push(ElabError::with_span(
                             ErrorKind::TypeMismatch,
                             format!(
-                                "step `{}` returns `@{name}` which is not a variant of \
+                                "action `{}` returns `@{name}` which is not a variant of \
                                  `{enum_name}`; expected one of: {}",
                                 step.name,
                                 variants
@@ -547,7 +547,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                     errors.push(ElabError::with_span(
                         ErrorKind::TypeMismatch,
                         format!(
-                            "step `{}` returns a non-constructor expression but \
+                            "action `{}` returns a non-constructor expression but \
                              command `{}` expects return type `{enum_name}` \
                              (an enum); use `return @variant` or `return @variant(...)`",
                             step.name, step.name
@@ -1055,33 +1055,26 @@ fn validate_crosscall_target(
         }
     } else if is_system {
         if let Some(target_sys) = env.systems.get(target) {
-            let matching_steps: Vec<_> = target_sys
-                .steps
-                .iter()
-                .filter(|step| step.name == *command)
-                .collect();
-            if matching_steps.is_empty() {
+            if let Some(cmd) = target_sys.commands.iter().find(|cmd| cmd.name == *command) {
+                if cmd.params.len() != args.len() {
+                    errors.push(ElabError::with_span(
+                        ErrorKind::ParamMismatch,
+                        format!(
+                            "cross-call `{target}::{command}` expects {} args but got {}",
+                            cmd.params.len(),
+                            args.len()
+                        ),
+                        sys_ctx,
+                        span,
+                    ));
+                }
+            } else {
                 errors.push(ElabError::with_span(
                     ErrorKind::UndefinedRef,
                     format!("system `{target}` has no command `{command}`"),
                     sys_ctx,
                     span,
                 ));
-            } else {
-                for step in matching_steps {
-                    if step.params.len() != args.len() {
-                        errors.push(ElabError::with_span(
-                            ErrorKind::ParamMismatch,
-                            format!(
-                                "cross-call `{target}::{command}` expects {} args but got {}",
-                                step.params.len(),
-                                args.len()
-                            ),
-                            sys_ctx,
-                            span,
-                        ));
-                    }
-                }
             }
         }
     } else {

@@ -21,23 +21,15 @@ entity Ticket {
 }
 
 system TaskManager(tasks: Store<Task>, tickets: Store<Ticket>) {
-  command create_task()
+  command create_task() { create Task {} }
 
-  step create_task() { create Task {} }
+  command create_ticket() { create Ticket {} }
 
-  command create_ticket()
-
-  step create_ticket() { create Ticket {} }
-
-  command finish()
-
-  step finish() {
+  command finish() {
     choose t: Task where t.done == false { t.complete() }
   }
 
-  command close_ticket()
-
-  step close_ticket() {
+  command close_ticket() {
     choose t: Ticket where t.status == @Open { t.close() }
   }
 }

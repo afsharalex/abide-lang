@@ -24,19 +24,13 @@ entity Ball {
 
 system Painter(balls: Store<Ball>) {
 
-  command spawn_ball()
+  command spawn_ball() { create Ball {} }
 
-  step spawn_ball() { create Ball {} }
-
-  command green_paint()
-
-  step green_paint() {
+  command green_paint() {
     choose b: Ball where b.color == @Red { b.paint_green() }
   }
 
-  command blue_paint()
-
-  step blue_paint() {
+  command blue_paint() {
     choose b: Ball where b.color == @Red { b.paint_blue() }
   }
 }

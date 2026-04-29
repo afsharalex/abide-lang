@@ -45,33 +45,23 @@ entity Order {
 
 system Commerce(orders: Store<Order>) {
 
-  command submit_order(o: Order)
-
-  step submit_order(o: Order) {
+  command submit_order(o: Order) {
     o.submit()
   }
 
-  command pay_order(o: Order)
-
-  step pay_order(o: Order) {
+  command pay_order(o: Order) {
     o.pay()
   }
 
-  command ship_order(o: Order)
-
-  step ship_order(o: Order) {
+  command ship_order(o: Order) {
     o.ship()
   }
 
-  command deliver_order(o: Order)
-
-  step deliver_order(o: Order) {
+  command deliver_order(o: Order) {
     o.deliver()
   }
 
-  command cancel_order(o: Order)
-
-  step cancel_order(o: Order) {
+  command cancel_order(o: Order) {
     o.cancel()
   }
 }

@@ -508,7 +508,7 @@ pub(super) fn validate_remaining_type_params(env: &mut Env) {
 
     // ── Systems ─────────────────────────────────────────────────────
     for system in env.systems.values() {
-        for step in &system.steps {
+        for step in &system.actions {
             for req in &step.requires {
                 collect_ty_params_in_expr(req, &mut bad_params);
             }
@@ -863,7 +863,7 @@ pub(super) fn validate_unresolved_types(env: &mut Env) {
         for field in &system.fields {
             collect_named_in_ty(&field.ty, &mut unresolved);
         }
-        for step in &system.steps {
+        for step in &system.actions {
             for (_, t) in &step.params {
                 collect_named_in_ty(t, &mut unresolved);
             }
@@ -1042,7 +1042,7 @@ fn rewrite_named_types_to_error(env: &mut Env) {
         for field in &mut system.fields {
             rewrite_named_ty(&mut field.ty);
         }
-        for step in &mut system.steps {
+        for step in &mut system.actions {
             for (_, ty) in &mut step.params {
                 rewrite_named_ty(ty);
             }

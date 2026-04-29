@@ -67,8 +67,6 @@ entity Session {
 system Auth(users: Store<User>, sessions: Store<Session>) {
 
   command login(user_id: identity)
-
-  step login(user_id: identity)
     requires exists u: User | u.id == user_id and u.status == @Active {
     choose u: User where u.id == user_id {
       u.reset_failures()
@@ -80,8 +78,6 @@ system Auth(users: Store<User>, sessions: Store<Session>) {
   }
 
   command login_failed(user_id: identity)
-
-  step login_failed(user_id: identity)
     requires exists u: User | u.id == user_id and u.status == @Active {
     choose u: User where u.id == user_id {
       u.record_failure()
@@ -89,8 +85,6 @@ system Auth(users: Store<User>, sessions: Store<Session>) {
   }
 
   command auto_lock(user_id: identity)
-
-  step auto_lock(user_id: identity)
     requires exists u: User |
       u.id == user_id and
       u.status == @Active and
@@ -105,8 +99,6 @@ system Auth(users: Store<User>, sessions: Store<Session>) {
   }
 
   command logout(session_id: identity)
-
-  step logout(session_id: identity)
     requires exists s: Session | s.id == session_id and s.status == @Valid {
     choose s: Session where s.id == session_id {
       s.expire()
@@ -114,8 +106,6 @@ system Auth(users: Store<User>, sessions: Store<Session>) {
   }
 
   command suspend_user(user_id: identity)
-
-  step suspend_user(user_id: identity)
     requires exists u: User | u.id == user_id and u.status == @Active {
     choose u: User where u.id == user_id {
       u.suspend()

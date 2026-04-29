@@ -36,6 +36,9 @@ pub(super) fn try_cvc5_sygus_multi_pooled_system_safety(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    if !cvc5_sygus_enabled() {
+        return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
+    }
     match try_cvc5_sygus_multi_pooled_system_safety_inner(
         system,
         entities,
@@ -56,6 +59,9 @@ pub fn try_cvc5_sygus_multi_system_pooled_safety(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    if !cvc5_sygus_enabled() {
+        return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
+    }
     match try_cvc5_sygus_multi_system_pooled_safety_inner(
         root_system,
         systems,
@@ -385,7 +391,7 @@ fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     let pre_body = mk_and(&tm, &pre_conjuncts);
 
     let trans_clauses = root_system
-        .steps
+        .actions
         .iter()
         .map(|step| {
             encode_pooled_system_step(
@@ -1573,7 +1579,7 @@ fn encode_pooled_system_action(
 #[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step(
     tm: &Cvc5Tm,
-    step: &IRStep,
+    step: &IRSystemAction,
     system: &IRSystem,
     systems_by_name: &HashMap<String, &IRSystem>,
     entities_by_name: &HashMap<String, &IREntity>,
@@ -1610,7 +1616,7 @@ fn encode_pooled_system_step(
 #[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step_with_bound_params(
     tm: &Cvc5Tm,
-    step: &IRStep,
+    step: &IRSystemAction,
     system: &IRSystem,
     systems_by_name: &HashMap<String, &IRSystem>,
     entities_by_name: &HashMap<String, &IREntity>,
@@ -1647,7 +1653,7 @@ fn encode_pooled_system_step_with_bound_params(
 #[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step_with_param_envs(
     tm: &Cvc5Tm,
-    step: &IRStep,
+    step: &IRSystemAction,
     system: &IRSystem,
     systems_by_name: &HashMap<String, &IRSystem>,
     entities_by_name: &HashMap<String, &IREntity>,
@@ -2389,7 +2395,7 @@ fn encode_pooled_crosscall_capture(
         )
     })?;
     let target_step = target_system
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == *command)
         .ok_or_else(|| {

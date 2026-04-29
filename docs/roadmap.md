@@ -11,7 +11,7 @@ Syntax and semantics are evolving. Early feedback is welcome.
 | Types (enums, records, ADTs, type aliases) | Implemented |
 | Entities (fields, defaults, state atoms) | Implemented |
 | Actions (requires/ensures, primed notation) | Implemented |
-| Systems, commands, and steps | Implemented |
+| Systems, commands, actions, and queries | Implemented |
 | Entity reference parameters (`[ref: Entity]`) | Implemented |
 | Predicates (`pred`) and properties (`prop`) | Implemented |
 | Pure functions (`fn ... = expr`) | Implemented |

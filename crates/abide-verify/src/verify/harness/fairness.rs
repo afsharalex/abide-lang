@@ -45,7 +45,7 @@ pub fn try_fairness_constraints(
         .collect();
 
     for system in systems {
-        for event in &system.steps {
+        for event in &system.actions {
             let pair = (system.name.as_str(), event.name.as_str());
             let is_strong = strong_set.contains(&pair);
             let is_fair = is_strong || weak_set.contains(&pair);
@@ -179,7 +179,7 @@ pub fn try_fairness_constraints(
 ///
 /// Each returned `HashMap` maps a param name to its slot-index Z3 value.
 pub(super) fn enumerate_entity_param_tuples(
-    event: &IRStep,
+    event: &IRSystemAction,
     pool: &SlotPool,
 ) -> Option<Vec<HashMap<String, SmtValue>>> {
     // Collect (param_name, entity_name) for each entity-typed param.

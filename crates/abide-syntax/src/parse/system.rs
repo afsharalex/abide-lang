@@ -6,7 +6,7 @@ use crate::ast::{
     EventItem, EventLetCall, EventMatchArm, EventMatchBlock, EventMatchScrutinee, Expr,
     ExternAssumeBlock, ExternAssumeItem, ExternDecl, ExternItem, ForBlock, InterfaceDecl,
     InterfaceItem, MayDecl, Pattern, ProcDecl, ProcItem, ProcUseDecl, ProgramDecl, ProgramItem,
-    QueryDecl, QuerySigDecl, StepDecl, StoreParam, SystemDecl, SystemItem,
+    QueryDecl, QuerySigDecl, StoreParam, SystemActionDecl, SystemDecl, SystemItem,
 };
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
@@ -540,39 +540,45 @@ impl Parser {
     pub(super) fn system_item(&mut self) -> Result<SystemItem, ParseError> {
         match self.peek() {
             Some(Token::Use) => Err(ParseError::expected_with_help(
-                "system item (`command`, legacy `step`, `query`, `next`, `derived`, `invariant`)",
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
                 "`use`",
                 self.cur_span(),
                 crate::messages::USE_ENTITY_REMOVED,
             )),
             Some(Token::Fair) => Err(ParseError::expected_with_help(
-                "system item (`command`, legacy `step`, `query`, `next`, `derived`, `invariant`)",
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
                 "`fair`",
                 self.cur_span(),
                 crate::messages::HINT_LEGACY_FAIR_EVENT,
             )),
             Some(Token::Strong) => Err(ParseError::expected_with_help(
-                "system item (`command`, legacy `step`, `query`, `next`, `derived`, `invariant`)",
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
                 "`strong`",
                 self.cur_span(),
                 crate::messages::HINT_LEGACY_FAIR_EVENT,
             )),
             Some(Token::Event) => Err(ParseError::expected_with_help(
-                "system item (`command`, legacy `step`, or `query`)",
+                "system item (`command`, `action`, or `query`)",
                 "`event`",
                 self.cur_span(),
                 crate::messages::EVENT_KEYWORD_REMOVED,
             )),
             Some(Token::Dep) => Ok(SystemItem::Dep(self.dep_decl()?)),
             Some(Token::Command) => Ok(SystemItem::Command(self.system_command_decl()?)),
-            Some(Token::Step) => Ok(SystemItem::Step(self.step_decl()?)),
+            Some(Token::Action) => Ok(SystemItem::Action(self.system_action_decl()?)),
+            Some(Token::Step) => Err(ParseError::expected_with_help(
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "`step`",
+                self.cur_span(),
+                "`step` is not source syntax. Use `action` for private executable system behavior or put the body directly on a public `command`.",
+            )),
             Some(Token::Query) => Ok(SystemItem::Query(self.query_decl()?)),
             Some(Token::Pred) => Ok(SystemItem::Pred(self.pred_decl()?)),
             Some(Token::Fsm) => Ok(SystemItem::Fsm(self.fsm_decl()?)),
             Some(Token::Derived) => Ok(SystemItem::Derived(self.derived_decl()?)),
             Some(Token::Invariant) => Ok(SystemItem::Invariant(self.invariant_decl()?)),
             Some(Token::Name(ref name)) if name == "uses" => Err(ParseError::expected_with_help(
-                "system item (`command`, legacy `step`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
                 "`uses`",
                 self.cur_span(),
                 crate::messages::USE_ENTITY_REMOVED,
@@ -582,7 +588,7 @@ impl Parser {
                 Ok(SystemItem::Field(self.field_decl()?))
             }
             Some(tok) => Err(ParseError::expected(
-                "system item (`command`, legacy `step`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -662,7 +668,7 @@ impl Parser {
         let rparen = self.expect(&Token::RParen)?;
         // Optional return type: `-> TypeName`
         let (return_type, end) = if self.eat(&Token::Arrow).is_some() {
-            let ty = self.type_ref()?;
+            let ty = self.type_ref_no_refine()?;
             let s = ty.span;
             (Some(ty), s)
         } else {
@@ -679,7 +685,7 @@ impl Parser {
                     "`requires` or `{`",
                     "`ensures`",
                     *span,
-                    crate::messages::STEP_ENSURES_NOT_ALLOWED,
+                    crate::messages::ACTION_ENSURES_NOT_ALLOWED,
                 ));
             }
         }
@@ -751,8 +757,8 @@ impl Parser {
         Ok((system, command, args, start.merge(end)))
     }
 
-    fn step_decl(&mut self) -> Result<StepDecl, ParseError> {
-        let start = self.expect(&Token::Step)?;
+    fn system_action_decl(&mut self) -> Result<SystemActionDecl, ParseError> {
+        let start = self.expect(&Token::Action)?;
         let (name, _) = self.expect_name()?;
         self.expect(&Token::LParen)?;
         let params = self.comma_sep(&Token::RParen, Parser::param)?;
@@ -767,7 +773,7 @@ impl Parser {
                 self.cur_span(),
             )
         })?;
-        Ok(StepDecl {
+        Ok(SystemActionDecl {
             name,
             params,
             contracts: body.contracts,

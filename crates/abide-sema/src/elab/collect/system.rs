@@ -1,4 +1,4 @@
-//! System and program collection — systems, commands, steps, queries, procs.
+//! System and program collection — systems, commands, actions, queries, procs.
 
 use std::collections::HashSet;
 
@@ -14,13 +14,13 @@ use crate::elab::error::{ElabError, ErrorKind};
 use crate::elab::types::{
     ECommand, EEventAction, EExpr, EExtern, EExternAssume, EInterface, ELetBinding, EMatchArm,
     EMatchScrutinee, EMay, EPred, EProc, EProcDepCond, EProcEdge, EProcNode, EProcUse, EQuery,
-    EQuerySig, EStep, ESystem, Ty,
+    EQuerySig, ESystem, ESystemAction, Ty,
 };
 
 // ── Program declarations ────────────────────────────────────────────
 
 /// R4: `program` is the composition root. For verification purposes,
-/// a program is lowered into an `ESystem` with no commands/steps/queries.
+/// a program is lowered into an `ESystem` with no commands/actions/queries.
 /// The program's let bindings become system store params, and its
 /// invariants travel with the system.
 pub(super) fn collect_program(env: &mut Env, pd: &ast::ProgramDecl) {
@@ -68,7 +68,7 @@ pub(super) fn collect_program(env: &mut Env, pd: &ast::ProgramDecl) {
         store_params,
         scopes: Vec::new(),
         commands: Vec::new(),
-        steps: Vec::new(),
+        actions: Vec::new(),
         queries: Vec::new(),
         fsm_decls: Vec::new(),
         derived_fields: Vec::new(),
@@ -203,12 +203,13 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     let mut fields = Vec::new();
     let mut deps = Vec::new();
     let mut commands = Vec::new();
-    let mut steps = Vec::new();
+    let mut actions = Vec::new();
     let mut queries = Vec::new();
     let mut sys_preds = Vec::new();
     let mut raw_fsms = Vec::new();
     let mut derived_fields = Vec::new();
     let mut invariants = Vec::new();
+    let mut explicit_action_names = Vec::new();
 
     for item in &sd.items {
         match item {
@@ -218,10 +219,13 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
                 let cmd = collect_command(c);
                 push_system_command(env, &mut commands, &cmd, name, c.span);
                 if c.body.is_some() {
-                    steps.push(collect_step_from_command(c));
+                    actions.push(collect_action_from_command(c));
                 }
             }
-            ast::SystemItem::Step(s) => steps.push(collect_step(s)),
+            ast::SystemItem::Action(s) => {
+                explicit_action_names.push((s.name.clone(), s.span));
+                actions.push(collect_system_action(s));
+            }
             ast::SystemItem::Query(q) => queries.push(collect_query(q)),
             ast::SystemItem::Pred(p) => sys_preds.push(collect_system_pred(p)),
             ast::SystemItem::Fsm(fsm) => raw_fsms.push(fsm),
@@ -241,63 +245,26 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         check_fsm_reachability(env, name, fsm);
     }
 
-    // Validate that every legacy `step` name matches a declared
-    // command. Inline command clauses already create both the command
-    // declaration and the executable step form together; this check only
-    // guards the compatibility surface.
     let command_names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-    for step in &steps {
-        if !command_names.contains(step.name.as_str()) {
+    let mut seen_explicit_actions = HashSet::new();
+    for (action_name, span) in &explicit_action_names {
+        if command_names.contains(action_name.as_str()) {
             env.errors.push(ElabError::with_span(
-                ErrorKind::UndefinedRef,
-                crate::messages::step_no_matching_command(&step.name, name),
-                crate::messages::label_step_no_matching_command(&step.name),
-                step.span.unwrap_or(sd.span),
+                ErrorKind::DuplicateDecl,
+                format!(
+                    "system `{name}` action `{action_name}` conflicts with public command `{action_name}`"
+                ),
+                "put the executable body directly on the `command`, or choose a distinct private action name".to_owned(),
+                *span,
             ));
         }
-    }
-
-    // Validate that legacy `step` declarations still agree with their
-    // command signature. Inline command clauses derive their executable
-    // form from the command itself, so this only checks compatibility
-    // syntax.
-    for step in &steps {
-        if let Some(cmd) = commands.iter().find(|c| c.name == step.name) {
-            if cmd.params.len() == step.params.len() {
-                // Check parameter types match
-                for (i, (cmd_param, step_param)) in
-                    cmd.params.iter().zip(step.params.iter()).enumerate()
-                {
-                    if format!("{:?}", cmd_param.1) != format!("{:?}", step_param.1) {
-                        env.errors.push(ElabError::with_span(
-                            ErrorKind::TypeMismatch,
-                            crate::messages::step_command_type_mismatch(
-                                &step.name,
-                                i + 1,
-                                &format!("{:?}", cmd_param.1),
-                                &format!("{:?}", step_param.1),
-                            ),
-                            format!("parameter type mismatch at position {}", i + 1),
-                            step.span.unwrap_or(sd.span),
-                        ));
-                    }
-                }
-            } else {
-                env.errors.push(ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    crate::messages::step_command_param_mismatch(
-                        &step.name,
-                        cmd.params.len(),
-                        step.params.len(),
-                    ),
-                    format!(
-                        "`command {}` has {} parameters",
-                        step.name,
-                        cmd.params.len()
-                    ),
-                    step.span.unwrap_or(sd.span),
-                ));
-            }
+        if !seen_explicit_actions.insert(action_name.as_str()) {
+            env.errors.push(ElabError::with_span(
+                ErrorKind::DuplicateDecl,
+                format!("duplicate action `{action_name}` in system `{name}`"),
+                String::new(),
+                *span,
+            ));
         }
     }
 
@@ -305,9 +272,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     // name uniqueness across commands, queries, derived fields, AND
     // invariants for system-level scope per /.
     // (Pool/use entity names live in their own namespace and are
-    // intentionally allowed to reuse names.) Note: step names are
-    // expected to match command names — they are not checked for
-    // uniqueness against commands.
+    // intentionally allowed to reuse names.
     let mut seen: HashSet<String> = HashSet::new();
     for c in &commands {
         seen.insert(c.name.clone());
@@ -369,7 +334,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         ));
     }
 
-    check_system_step_fsm_violations(env, name, &steps, &fsm_decls);
+    check_system_action_fsm_violations(env, name, &actions, &fsm_decls);
 
     let es = ESystem {
         name: name.clone(),
@@ -379,7 +344,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         store_params,
         scopes: Vec::new(),
         commands,
-        steps,
+        actions,
         queries,
         fsm_decls,
         derived_fields,
@@ -402,10 +367,10 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     env.insert_system(name, es);
 }
 
-fn check_system_step_fsm_violations(
+fn check_system_action_fsm_violations(
     env: &mut Env,
     system_name: &str,
-    steps: &[EStep],
+    actions: &[ESystemAction],
     fsm_decls: &[crate::elab::types::EFsm],
 ) {
     for fsm in fsm_decls {
@@ -418,11 +383,11 @@ fn check_system_step_fsm_violations(
             })
             .collect();
 
-        for step in steps {
-            let assignments = collect_system_prime_assignments(&step.body, &fsm.field);
+        for action in actions {
+            let assignments = collect_system_prime_assignments(&action.body, &fsm.field);
             for (target_atom, span) in assignments {
                 let sources =
-                    super::entity::literal_sources_from_requires(&step.requires, &fsm.field);
+                    super::entity::literal_sources_from_requires(&action.requires, &fsm.field);
                 if sources.is_empty() {
                     continue;
                 }
@@ -439,13 +404,13 @@ fn check_system_step_fsm_violations(
                             crate::messages::fsm_action_violation(
                                 system_name,
                                 &fsm.field,
-                                &step.name,
+                                &action.name,
                                 &source,
                                 &target_atom,
                                 &valid,
                             ),
                             String::new(),
-                            span.or(step.span)
+                            span.or(action.span)
                                 .unwrap_or(crate::span::Span { start: 0, end: 0 }),
                         ));
                     }
@@ -539,7 +504,7 @@ fn push_system_command(
     commands.push(cmd.clone());
 }
 
-pub(super) fn collect_step(s: &ast::StepDecl) -> EStep {
+pub(super) fn collect_system_action(s: &ast::SystemActionDecl) -> ESystemAction {
     let params = s
         .params
         .iter()
@@ -554,7 +519,7 @@ pub(super) fn collect_step(s: &ast::StepDecl) -> EStep {
         })
         .collect();
     let body = collect_event_items(&s.items);
-    EStep {
+    ESystemAction {
         name: s.name.clone(),
         params,
         requires,
@@ -564,11 +529,11 @@ pub(super) fn collect_step(s: &ast::StepDecl) -> EStep {
     }
 }
 
-pub(super) fn collect_step_from_command(c: &ast::CommandDecl) -> EStep {
+pub(super) fn collect_action_from_command(c: &ast::CommandDecl) -> ESystemAction {
     let body = c
         .body
         .as_ref()
-        .expect("collect_step_from_command requires a command body");
+        .expect("collect_action_from_command requires a command body");
     let params = c
         .params
         .iter()
@@ -583,7 +548,7 @@ pub(super) fn collect_step_from_command(c: &ast::CommandDecl) -> EStep {
         })
         .collect();
     let body_items = collect_event_items(&body.items);
-    EStep {
+    ESystemAction {
         name: c.name.clone(),
         params,
         requires,

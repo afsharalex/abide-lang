@@ -154,8 +154,8 @@ fn is_system_item_starter(tok: &Token, next: Option<&Token>) -> bool {
     matches!(
         tok,
         Token::Dep
+            | Token::Action
             | Token::Command
-            | Token::Step
             | Token::Query
             | Token::Pred
             | Token::Derived

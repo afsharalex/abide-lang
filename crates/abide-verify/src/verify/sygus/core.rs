@@ -34,6 +34,9 @@ pub fn try_cvc5_sygus_single_entity(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    if !cvc5_sygus_enabled() {
+        return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
+    }
     match try_cvc5_sygus_single_entity_inner(entity, property, timeout_ms) {
         Ok(()) => Ic3Result::Proved,
         Err(err) => Ic3Result::Unknown(err),
@@ -45,6 +48,9 @@ pub fn try_cvc5_sygus_system_safety(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    if !cvc5_sygus_enabled() {
+        return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
+    }
     match try_cvc5_sygus_system_safety_inner(system, property, timeout_ms) {
         Ok(()) => Ic3Result::Proved,
         Err(err) => Ic3Result::Unknown(err),
@@ -59,6 +65,9 @@ pub(super) fn try_cvc5_sygus_pooled_system_safety(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    if !cvc5_sygus_enabled() {
+        return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
+    }
     match try_cvc5_sygus_pooled_system_safety_inner(system, entity, n_slots, property, timeout_ms) {
         Ok(()) => Ic3Result::Proved,
         Err(err) => Ic3Result::Unknown(err),
@@ -248,7 +257,7 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     );
 
     let trans_clauses = system
-        .steps
+        .actions
         .iter()
         .map(|step| {
             encode_system_step(
@@ -468,7 +477,7 @@ pub(super) fn encode_transition(
 
 pub(super) fn encode_system_step(
     tm: &Cvc5Tm,
-    step: &IRStep,
+    step: &IRSystemAction,
     fields: &[IRField],
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
@@ -476,7 +485,7 @@ pub(super) fn encode_system_step(
 ) -> Result<Cvc5Term, String> {
     if step.return_expr.is_some() {
         return Err(format!(
-            "cvc5 SyGuS system safety does not support step return expressions yet (`{}`)",
+            "cvc5 SyGuS system safety does not support action return expressions yet (`{}`)",
             step.name
         ));
     }
@@ -510,7 +519,7 @@ pub(super) fn encode_system_step(
 
 pub(super) fn collect_system_updates(
     tm: &Cvc5Tm,
-    step: &IRStep,
+    step: &IRSystemAction,
     curr_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
 ) -> Result<HashMap<String, Cvc5Term>, String> {
@@ -583,7 +592,7 @@ pub(super) fn finite_param_values(
 ) -> Result<Vec<Cvc5Term>, String> {
     finite_domain_values(tm, &param.ty, enum_catalog).ok_or_else(|| {
         format!(
-            "cvc5 SyGuS system safety only supports Bool and fieldless-enum step params today (`{}`)",
+            "cvc5 SyGuS system safety only supports Bool and fieldless-enum action params today (`{}`)",
             param.name
         )
     })

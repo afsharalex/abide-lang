@@ -631,10 +631,10 @@ pub struct IRSystem {
     /// command declarations with return types.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<IRCommand>,
-    pub steps: Vec<IRStep>,
+    pub actions: Vec<IRSystemAction>,
     /// fsm declarations on direct system fields.
     /// These constrain allowed transitions for enum-typed flat state
-    /// fields mutated by system steps.
+    /// fields mutated by system actions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fsm_decls: Vec<IRFsm>,
     /// derived fields declared on this system.
@@ -736,7 +736,7 @@ pub struct IRCommand {
 // data attached to the verification site.
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct IRStep {
+pub struct IRSystemAction {
     pub name: std::string::String,
     pub params: Vec<IRTransParam>,
     pub guard: IRExpr,

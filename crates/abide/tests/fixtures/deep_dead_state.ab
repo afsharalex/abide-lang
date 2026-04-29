@@ -24,33 +24,19 @@ entity E {
 }
 
 system DeepChain(es: Store<E>) {
-  command spawn()
+  command spawn() { create E {} }
 
-  step spawn() { create E {} }
+  command advance1() { choose e: E where e.state == @S0 { e.step1() } }
 
-  command advance1()
+  command advance2() { choose e: E where e.state == @S1 { e.step2() } }
 
-  step advance1() { choose e: E where e.state == @S0 { e.step1() } }
+  command advance3() { choose e: E where e.state == @S2 { e.step3() } }
 
-  command advance2()
+  command advance4() { choose e: E where e.state == @S3 { e.step4() } }
 
-  step advance2() { choose e: E where e.state == @S1 { e.step2() } }
+  command advance5() { choose e: E where e.state == @S4 { e.step5() } }
 
-  command advance3()
-
-  step advance3() { choose e: E where e.state == @S2 { e.step3() } }
-
-  command advance4()
-
-  step advance4() { choose e: E where e.state == @S3 { e.step4() } }
-
-  command advance5()
-
-  step advance5() { choose e: E where e.state == @S4 { e.step5() } }
-
-  command advance6()
-
-  step advance6() { choose e: E where e.state == @S5 { e.step6() } }
+  command advance6() { choose e: E where e.state == @S5 { e.step6() } }
 }
 
 // Must NOT be PROVED — S6 is a dead state where Goal never holds.

@@ -24,19 +24,19 @@ use std::collections::HashMap;
 /// only flips `stutter` when the assume block contains an explicit
 /// `Stutter` or `NoStutter` item.
 pub(super) fn resolve_assumption_sets(env: &mut Env) {
-    // Snapshot the system → command index. The inner map is command-name →
+    // Snapshot the system → executable action index. The inner map is action-name →
     // `is_parameterized`. The flag is used to populate `per_tuple` per
-    // parameterized fair commands default to per-tuple fairness.
+    // parameterized fair actions default to per-tuple fairness.
     let system_events: HashMap<String, HashMap<String, bool>> = env
         .systems
         .iter()
         .map(|(sys_name, sys)| {
-            let commands: HashMap<String, bool> = sys
-                .commands
+            let actions: HashMap<String, bool> = sys
+                .actions
                 .iter()
                 .map(|c| (c.name.clone(), !c.params.is_empty()))
                 .collect();
-            (sys_name.clone(), commands)
+            (sys_name.clone(), actions)
         })
         .collect();
 

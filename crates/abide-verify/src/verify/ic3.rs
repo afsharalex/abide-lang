@@ -177,7 +177,7 @@ pub fn try_ic3_system(
             if !all_system_names.contains(&sys.name) {
                 all_system_names.push(sys.name.clone());
             }
-            for event in &sys.steps {
+            for event in &sys.actions {
                 collect_crosscall_targets(&event.body, &mut to_scan);
             }
         }

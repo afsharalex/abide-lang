@@ -44,12 +44,12 @@ system Commerce(orders: Store<Order>) {
 
 Model systems over explicit `Store<T>` pools and route behavior through commands and queries.
 
-## Commands, steps, queries, predicates
+## Commands, actions, queries, predicates
 
 Use the system surface deliberately:
 
 - `command` — public callable operation, with its body inline when needed
-- `step` — private executable clause for internal reusable behavior
+- `action` — private executable behavior inside an entity or system
 - `query` — public pure observation
 - `pred` — internal pure helper
 

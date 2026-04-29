@@ -23,7 +23,6 @@ pub enum IdeSymbolKind {
     Program,
     Proc,
     Command,
-    Step,
     Query,
     Pred,
     Prop,
@@ -56,7 +55,6 @@ impl IdeSymbolKind {
             Self::Program => "program",
             Self::Proc => "proc",
             Self::Command => "command",
-            Self::Step => "step",
             Self::Query => "query",
             Self::Pred => "pred",
             Self::Prop => "prop",
@@ -82,7 +80,7 @@ impl IdeSymbolKind {
             Self::Type | Self::Record | Self::Alias | Self::Newtype => 4,
             Self::Entity => 5,
             Self::Interface | Self::System | Self::Program | Self::Proc => 6,
-            Self::Field | Self::Action | Self::Derived | Self::Invariant | Self::Step => 7,
+            Self::Field | Self::Action | Self::Derived | Self::Invariant => 7,
             Self::Const => 8,
             Self::Prop | Self::Verify | Self::Theorem | Self::Lemma | Self::Scene | Self::Axiom => {
                 9
@@ -532,15 +530,15 @@ fn collect_program_symbols(
                                 IdeSymbolKind::Command,
                             );
                         }
-                        SystemItem::Step(step) => {
+                        SystemItem::Action(action) => {
                             push_symbol(
                                 out,
                                 file_id,
                                 source,
                                 tokens,
-                                step.span,
-                                &step.name,
-                                IdeSymbolKind::Step,
+                                action.span,
+                                &action.name,
+                                IdeSymbolKind::Action,
                             );
                         }
                         SystemItem::Query(query) => {

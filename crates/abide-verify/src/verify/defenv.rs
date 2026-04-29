@@ -2545,7 +2545,7 @@ mod tests {
                 fields: vec![],
                 entities: vec![],
                 commands: vec![],
-                steps: vec![],
+                actions: vec![],
                 fsm_decls: vec![],
                 derived_fields: vec![],
                 invariants: vec![],
@@ -3533,7 +3533,7 @@ mod tests {
             fields: vec![],
             entities: vec![],
             commands: vec![],
-            steps: vec![],
+            actions: vec![],
             fsm_decls: vec![],
             derived_fields: vec![IRDerivedField {
                 name: "always_true".to_owned(),

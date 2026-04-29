@@ -18,7 +18,8 @@ use rustsat_batsat::BasicSolver;
 use abide_witness::{rel, EntitySlotRef, WitnessValue};
 
 use crate::ir::types::{
-    Cardinality, IRAction, IREntity, IRExpr, IRProgram, IRScene, IRStep, IRType, IRVerify, LitVal,
+    Cardinality, IRAction, IREntity, IRExpr, IRProgram, IRScene, IRSystemAction, IRType, IRVerify,
+    LitVal,
 };
 
 use super::scene::collect_ordering_leaf_vars;
@@ -316,7 +317,7 @@ fn build_create_only_scene_sat(
             .get(&scene_event.system)
             .ok_or_else(|| format!("unknown system `{}`", scene_event.system))?;
         let step = system
-            .steps
+            .actions
             .iter()
             .find(|step| step.name == scene_event.event)
             .ok_or_else(|| {
@@ -844,7 +845,7 @@ fn supports_create_only_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Resul
             return Ok(false);
         }
         let Some(step) = system
-            .steps
+            .actions
             .iter()
             .find(|step| step.name == scene_event.event)
         else {
@@ -1006,7 +1007,7 @@ fn relational_stateful_scene_spec(
                 {
                     return Ok(None);
                 }
-                let Some(step) = system.steps.iter().find(|step| step.name == event.event) else {
+                let Some(step) = system.actions.iter().find(|step| step.name == event.event) else {
                     return Err(format!(
                         "scene `{}` references unknown command `{}`",
                         scene.name, event.event
@@ -1064,7 +1065,7 @@ fn relational_stateful_scene_spec(
 }
 
 fn create_spec(
-    step: &IRStep,
+    step: &IRSystemAction,
     entities_by_name: &HashMap<String, &IREntity>,
 ) -> Result<(String, HashMap<String, SimpleValue>), String> {
     let crate::ir::types::IRAction::Create { entity, fields } = &step.body[0] else {
@@ -1871,8 +1872,8 @@ fn relational_verify_spec(
         );
     }
 
-    let mut steps = Vec::with_capacity(system.steps.len());
-    for step in &system.steps {
+    let mut steps = Vec::with_capacity(system.actions.len());
+    for step in &system.actions {
         let Some(spec) = parse_relational_step(step, &entities_by_name, &entities)? else {
             return Ok(None);
         };
@@ -1937,7 +1938,7 @@ fn build_scene_default_field_map(
 }
 
 fn parse_relational_step(
-    step: &IRStep,
+    step: &IRSystemAction,
     entities_by_name: &HashMap<String, &IREntity>,
     entity_specs: &HashMap<String, RelationalEntitySpec>,
 ) -> Result<Option<RelationalSystemStepSpec>, String> {
@@ -1965,7 +1966,7 @@ fn parse_relational_step(
 }
 
 fn parse_relational_scene_step(
-    step: &IRStep,
+    step: &IRSystemAction,
     args: &[IRExpr],
     entities_by_name: &HashMap<String, &IREntity>,
     entity_specs: &HashMap<String, RelationalEntitySpec>,

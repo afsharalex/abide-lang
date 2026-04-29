@@ -10,15 +10,11 @@ entity Flag {
 }
 
 system Switch(flags: Store<Flag>) {
-  command create_flag()
-
-  step create_flag() {
+  command create_flag() {
     create Flag {}
   }
 
-  command turn_on()
-
-  step turn_on() {
+  command turn_on() {
     choose f: Flag where not f.on {
       f.on' = true
     }

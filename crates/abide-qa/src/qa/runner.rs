@@ -412,8 +412,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
   }
 }
@@ -475,8 +474,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == @Pending {
+  command ship(order: Order) requires order.status == @Pending {
     order.status' = @Shipped
   }
 }
@@ -537,8 +535,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command submit(order: Order)
-  step submit(order: Order) requires order.status == @Pending {
+  command submit(order: Order) requires order.status == @Pending {
     order.status' = @Confirmed
   }
 }
@@ -600,8 +597,7 @@ entity Order {
 }
 
 system Commerce(orders: Store<Order>) {
-  command tick()
-  step tick() {}
+  command tick() {}
 }
 "#,
         )

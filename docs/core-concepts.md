@@ -141,5 +141,5 @@ program Publishing(documents: Store<Document>) {
 ## Terminology
 
 - `command` is the public system operation surface.
-- `step` is a private executable clause when you want an implementation that is not part of the public command surface.
+- `action` is private executable behavior inside an entity or system.
 - `program` and `proc` describe orchestration structure.

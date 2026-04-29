@@ -646,7 +646,7 @@ impl Env {
                         &field.ty,
                     );
                 }
-                for step in &mut system.steps {
+                for step in &mut system.actions {
                     step.params = step
                         .params
                         .iter()

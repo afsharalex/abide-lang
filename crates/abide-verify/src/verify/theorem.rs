@@ -490,7 +490,7 @@ pub(super) fn check_theorem_block(
         }
     }
     for sys in &relevant_systems {
-        for event in &sys.steps {
+        for event in &sys.actions {
             if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
                 return VerificationResult::Unprovable {
                     name: theorem.name.clone(),
@@ -1405,7 +1405,7 @@ mod tests {
                 fields: vec![],
                 entities: vec!["Task".to_owned()],
                 commands: vec![],
-                steps: vec![],
+                actions: vec![],
                 fsm_decls: vec![],
                 derived_fields: vec![],
                 invariants: vec![],

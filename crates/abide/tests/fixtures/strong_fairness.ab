@@ -27,21 +27,13 @@ entity E {
 // fairness is now a property of the verification site, not the system.
 system Sys(es: Store<E>) {
 
-  command spawn()
+  command spawn() { create E {} }
 
-  step spawn() { create E {} }
+  command go_b() { choose e: E where e.state == @A { e.to_b() } }
 
-  command go_b()
+  command go_a() { choose e: E where e.state == @B { e.to_a() } }
 
-  step go_b() { choose e: E where e.state == @A { e.to_b() } }
-
-  command go_a()
-
-  step go_a() { choose e: E where e.state == @B { e.to_a() } }
-
-  command go_c()
-
-  step go_c() { choose e: E where e.state == @A { e.to_c() } }
+  command go_c() { choose e: E where e.state == @A { e.to_c() } }
 }
 
 // ── Test 1: Strong fairness prevents A↔B starvation (theorem) ──────

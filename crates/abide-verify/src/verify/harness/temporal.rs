@@ -19,7 +19,7 @@ pub fn transition_constraints(
     let mut disjuncts = Vec::new();
 
     for system in systems {
-        for event in &system.steps {
+        for event in &system.actions {
             let event_formula = encode_step(pool, vctx, entities, systems, event, step);
             let sys_frames =
                 system_field_frame_conjuncts(pool, vctx, systems, system, &event.body, step);
@@ -83,7 +83,7 @@ pub fn try_transition_constraints_with_fire(
     let mut constraints = Vec::new();
 
     for system in systems {
-        for (clause_idx, event) in system.steps.iter().enumerate() {
+        for (clause_idx, event) in system.actions.iter().enumerate() {
             let key = (system.name.clone(), event.name.clone());
             fire_vars.entry(key).or_default();
             clause_fire_vars
@@ -97,7 +97,7 @@ pub fn try_transition_constraints_with_fire(
         let mut command_clauses: HashMap<(String, String), Vec<Bool>> = HashMap::new();
 
         for system in systems {
-            for (clause_idx, event) in system.steps.iter().enumerate() {
+            for (clause_idx, event) in system.actions.iter().enumerate() {
                 let key = (system.name.clone(), event.name.clone());
                 let clause_fire_var = smt::bool_var(&format!(
                     "fire_{}_{}_c{}_t{step}",
@@ -265,7 +265,7 @@ pub fn encode_step_enabled(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
 ) -> Bool {
     try_encode_step_enabled(pool, vctx, entities, systems, event, step)
@@ -277,7 +277,7 @@ pub fn try_encode_step_enabled(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
 ) -> Result<Bool, String> {
     try_encode_step_enabled_inner(pool, vctx, entities, systems, event, step, None, 0)
@@ -289,7 +289,7 @@ pub fn encode_step_enabled_with_params(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     params: HashMap<String, SmtValue>,
 ) -> Bool {
@@ -303,7 +303,7 @@ pub fn try_encode_step_enabled_with_params(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     params: HashMap<String, SmtValue>,
 ) -> Result<Bool, String> {
@@ -317,7 +317,7 @@ fn encode_step_enabled_inner(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     override_params: Option<HashMap<String, SmtValue>>,
     depth: usize,
@@ -341,7 +341,7 @@ fn try_encode_step_enabled_inner(
     vctx: &VerifyContext,
     entities: &[IREntity],
     systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     override_params: Option<HashMap<String, SmtValue>>,
     depth: usize,
@@ -353,7 +353,7 @@ fn try_encode_step_enabled_inner(
     let store_param_types: HashMap<String, String> = systems
         .iter()
         .find(|s| {
-            s.steps
+            s.actions
                 .iter()
                 .any(|st| std::ptr::eq(st, event) || st.name == event.name)
         })
@@ -547,8 +547,8 @@ fn try_encode_step_enabled_inner(
             } => {
                 if depth < 5 {
                     if let Some(target_sys) = systems.iter().find(|s| s.name == *sys_name) {
-                        let matching: Vec<&IRStep> = target_sys
-                            .steps
+                        let matching: Vec<&IRSystemAction> = target_sys
+                            .actions
                             .iter()
                             .filter(|s| s.name == *cmd_name)
                             .collect();

@@ -10,12 +10,14 @@
 //! 3. All verify/ code automatically uses the new backend
 
 use std::borrow::Borrow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 // ── Z3 imports (the ONLY place in verify/ that touches z3::) ─────────
 use z3::ast::{
@@ -60,6 +62,35 @@ pub enum ChcResult {
     Counterexample(String),
     /// Solver could not determine result.
     Unknown(String),
+}
+
+/// Solver call limits applied at the actual backend check/query boundary.
+///
+/// A zero timeout means "no explicit limit". Callers should prefer passing a
+/// clamped verifier budget here over setting a solver option separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SolverLimits {
+    timeout_ms: u64,
+}
+
+impl SolverLimits {
+    pub const NONE: Self = Self { timeout_ms: 0 };
+
+    pub const fn from_timeout_ms(timeout_ms: u64) -> Self {
+        Self { timeout_ms }
+    }
+
+    pub const fn timeout_ms(self) -> Option<u64> {
+        if self.timeout_ms == 0 {
+            None
+        } else {
+            Some(self.timeout_ms)
+        }
+    }
+
+    fn timeout_duration(self) -> Option<Duration> {
+        self.timeout_ms().map(Duration::from_millis)
+    }
 }
 
 /// Backend-neutral view of a datatype constructor branch.
@@ -285,6 +316,26 @@ pub fn backend_score(
     score
 }
 
+fn with_z3_interrupt_after<R>(limits: SolverLimits, f: impl FnOnce() -> R) -> R {
+    let Some(timeout) = limits.timeout_duration() else {
+        return f();
+    };
+
+    let ctx = z3::Context::thread_local();
+    std::thread::scope(|scope| {
+        let handle = ctx.handle();
+        let (done_tx, done_rx) = mpsc::channel();
+        scope.spawn(move || {
+            if done_rx.recv_timeout(timeout).is_err() {
+                handle.interrupt();
+            }
+        });
+        let result = f();
+        let _ = done_tx.send(());
+        result
+    })
+}
+
 // ── SolverBackend trait ─────────────────────────────────────────────
 
 /// Abstraction over an SMT solver backend.
@@ -349,6 +400,12 @@ pub trait SolverBackend {
     fn solver_new(ctx: &Self::Context) -> Self;
     fn solver_assert(&self, c: &Self::Bool);
     fn solver_check(&self) -> SatResult;
+    fn solver_check_with_limits(&self, limits: SolverLimits) -> SatResult {
+        if let Some(timeout_ms) = limits.timeout_ms() {
+            self.solver_set_timeout(timeout_ms);
+        }
+        self.solver_check()
+    }
     fn solver_push(&self);
     fn solver_pop(&self);
     fn solver_set_timeout(&self, ms: u64);
@@ -514,6 +571,7 @@ pub trait SolverBackend {
 /// Wraps a `z3::Solver` and delegates all operations to the z3 crate.
 pub struct Z3Backend {
     solver: Z3Solver,
+    timeout_ms: Cell<u64>,
 }
 
 impl fmt::Debug for Z3Backend {
@@ -563,6 +621,7 @@ impl SolverBackend for Z3Backend {
     fn solver_new(_ctx: &Self::Context) -> Self {
         Self {
             solver: Z3Solver::new(),
+            timeout_ms: Cell::new(0),
         }
     }
 
@@ -571,13 +630,20 @@ impl SolverBackend for Z3Backend {
     }
 
     fn solver_check(&self) -> SatResult {
-        match self.solver.check() {
+        self.solver_check_with_limits(SolverLimits::from_timeout_ms(self.timeout_ms.get()))
+    }
+
+    fn solver_check_with_limits(&self, limits: SolverLimits) -> SatResult {
+        if let Some(timeout_ms) = limits.timeout_ms() {
+            self.solver_set_timeout(timeout_ms);
+        }
+        with_z3_interrupt_after(limits, || match self.solver.check() {
             Z3SatResult::Sat => SatResult::Sat,
             Z3SatResult::Unsat => SatResult::Unsat,
             Z3SatResult::Unknown => {
                 SatResult::Unknown(self.solver.get_reason_unknown().unwrap_or_default())
             }
-        }
+        })
     }
 
     fn solver_push(&self) {
@@ -589,8 +655,9 @@ impl SolverBackend for Z3Backend {
     }
 
     fn solver_set_timeout(&self, ms: u64) {
+        self.timeout_ms.set(ms);
         let mut params = Z3Params::new();
-        params.set_u32("timeout", ms as u32);
+        params.set_u32("timeout", ms.min(u64::from(u32::MAX)) as u32);
         self.solver.set_params(&params);
     }
 
@@ -1043,6 +1110,7 @@ fn cvc5_int_value(term: &Cvc5Term) -> Option<i64> {
 /// This is currently feature-gated and not yet the active backend.
 pub struct Cvc5Backend {
     solver: Rc<RefCell<Cvc5Solver>>,
+    timeout_ms: Cell<u64>,
 }
 
 impl fmt::Debug for Cvc5Backend {
@@ -1095,6 +1163,7 @@ impl SolverBackend for Cvc5Backend {
         solver.set_option("incremental", "true");
         Self {
             solver: Rc::new(RefCell::new(solver)),
+            timeout_ms: Cell::new(0),
         }
     }
 
@@ -1103,6 +1172,13 @@ impl SolverBackend for Cvc5Backend {
     }
 
     fn solver_check(&self) -> SatResult {
+        self.solver_check_with_limits(SolverLimits::from_timeout_ms(self.timeout_ms.get()))
+    }
+
+    fn solver_check_with_limits(&self, limits: SolverLimits) -> SatResult {
+        if let Some(timeout_ms) = limits.timeout_ms() {
+            self.solver_set_timeout(timeout_ms);
+        }
         let result = self.solver.borrow_mut().check_sat();
         if result.is_sat() {
             SatResult::Sat
@@ -1122,6 +1198,7 @@ impl SolverBackend for Cvc5Backend {
     }
 
     fn solver_set_timeout(&self, ms: u64) {
+        self.timeout_ms.set(ms);
         self.solver
             .borrow_mut()
             .set_option("tlimit-per", &ms.to_string());
@@ -1979,6 +2056,13 @@ impl SolverBackend for RuntimeBackend {
         match self {
             RuntimeBackend::Z3(solver) => solver.solver_check(),
             RuntimeBackend::Cvc5(solver) => solver.solver_check(),
+        }
+    }
+
+    fn solver_check_with_limits(&self, limits: SolverLimits) -> SatResult {
+        match self {
+            RuntimeBackend::Z3(solver) => solver.solver_check_with_limits(limits),
+            RuntimeBackend::Cvc5(solver) => solver.solver_check_with_limits(limits),
         }
     }
 
@@ -3290,6 +3374,7 @@ impl SolverBackend for RuntimeBackend {
 }
 
 pub(crate) fn z3_check_chc(chc_text: &str, error_relation: &str, timeout_ms: u64) -> ChcResult {
+    let limits = SolverLimits::from_timeout_ms(timeout_ms);
     let fp = Z3Fixedpoint::new();
 
     let mut params = Z3Params::new();
@@ -3309,7 +3394,7 @@ pub(crate) fn z3_check_chc(chc_text: &str, error_relation: &str, timeout_ms: u64
     fp.register_relation(&error_rel);
 
     let error_query = error_rel.apply(&[]);
-    match fp.query(&error_query) {
+    match with_z3_interrupt_after(limits, || fp.query(&error_query)) {
         Z3SatResult::Unsat => ChcResult::Proved,
         Z3SatResult::Sat => {
             let answer = fp.get_answer().map_or_else(String::new, |a| format!("{a}"));
@@ -3349,6 +3434,10 @@ impl<B: SolverBackend> AbideSolver<B> {
 
     pub fn check(&self) -> SatResult {
         self.backend.solver_check()
+    }
+
+    pub fn check_with_limits(&self, limits: SolverLimits) -> SatResult {
+        self.backend.solver_check_with_limits(limits)
     }
 
     pub fn push(&self) {
@@ -3602,6 +3691,32 @@ mod tests {
 
         exercise_backend_surface::<Z3Backend>();
         exercise_backend_surface::<Cvc5Backend>();
+    }
+
+    #[test]
+    fn z3_check_with_limits_accepts_explicit_timeout() {
+        let solver = AbideSolver::<Z3Backend>::new();
+        solver.assert(Z3Backend::bool_const(&(), true));
+
+        assert_eq!(
+            solver.check_with_limits(SolverLimits::from_timeout_ms(1_000)),
+            SatResult::Sat
+        );
+    }
+
+    #[test]
+    fn z3_chc_timeout_limit_returns_typed_result() {
+        let chc = r#"
+            (declare-rel Reach (Int))
+            (declare-rel Error ())
+            (declare-var x Int)
+            (rule (Reach 0) base)
+            (rule (=> (and (Reach x) (< x 5)) (Reach (+ x 1))) step)
+            (rule (=> (and (Reach x) (< x 0)) Error) err)
+        "#;
+
+        let result = z3_check_chc(chc, "Error", 1_000);
+        assert!(matches!(result, ChcResult::Proved), "got: {result:?}");
     }
 
     #[test]

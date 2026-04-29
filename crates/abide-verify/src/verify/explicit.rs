@@ -10,16 +10,16 @@ use abide_witness::{
 use serde::{Deserialize, Serialize};
 
 use crate::ir::types::{
-    IRAction, IRCreateField, IREntity, IRExpr, IRField, IRProgram, IRStep, IRTransParam,
-    IRTransition, IRType, IRVerify, LitVal,
+    IRAction, IRCreateField, IREntity, IRExpr, IRField, IRFsm, IRProgram, IRSystemAction,
+    IRTransParam, IRTransition, IRType, IRVerify, LitVal,
 };
 
 use super::context::VerifyContext;
 use super::defenv;
 use super::transition;
 use super::{
-    build_assumptions_for_system_scope, verification_timeout_hint, FairnessEventAnalysis,
-    FairnessKind, FairnessStatus, VerificationResult,
+    build_assumptions_for_system_scope, verification_timeout_hint, DeadlockEventDiag,
+    FairnessEventAnalysis, FairnessKind, FairnessStatus, VerificationResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,13 +68,14 @@ struct ExplicitEntitySpec<'a> {
     fields: Vec<IRField>,
     field_indices: HashMap<String, usize>,
     transitions: HashMap<String, &'a IRTransition>,
+    fsm_decls: Vec<IRFsm>,
 }
 
 #[derive(Clone)]
 struct ExplicitStepRef<'a> {
     system: String,
     store_param_count: usize,
-    step: &'a IRStep,
+    step: &'a IRSystemAction,
 }
 
 #[derive(Clone)]
@@ -232,7 +233,7 @@ impl<'a> ExplicitModel<'a> {
                 }
                 initial_system_values.push(value);
             }
-            for step in &sys.steps {
+            for step in &sys.actions {
                 for param in &step.params {
                     ensure_supported_explicit_param_type(&param.ty)?;
                 }
@@ -620,6 +621,28 @@ impl<'a> ExplicitModel<'a> {
             }
         }
         Ok(false)
+    }
+
+    fn deadlock_diagnostics(&self, state: &ExplicitState) -> Vec<DeadlockEventDiag> {
+        let mut diagnostics = Vec::new();
+        let mut seen = HashSet::new();
+        for step in &self.steps {
+            let key = (step.system.clone(), step.step.name.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let enabled = self
+                .step_enabled_by_key(state, &step.system, &step.step.name)
+                .unwrap_or(false);
+            if !enabled {
+                diagnostics.push(DeadlockEventDiag {
+                    system: step.system.clone(),
+                    event: step.step.name.clone(),
+                    reason: "not enabled in explicit-state fragment".to_owned(),
+                });
+            }
+        }
+        diagnostics
     }
 
     fn step_enabled_by_binding(
@@ -1431,7 +1454,7 @@ pub(super) fn try_check_verify_block_explicit(
                 step: index,
                 reason: "no enabled step in the explicit-state fragment and stutter is opted out"
                     .to_owned(),
-                event_diagnostics: Vec::new(),
+                event_diagnostics: model.deadlock_diagnostics(&node.state),
                 assumptions,
                 span: verify_block.span,
                 file: verify_block.file.clone(),
@@ -1621,6 +1644,7 @@ fn build_entity_spec<'a>(
         fields: entity.fields.clone(),
         field_indices,
         transitions,
+        fsm_decls: entity.fsm_decls.clone(),
     })
 }
 
@@ -2341,6 +2365,15 @@ fn execute_action(
                     Ok::<_, String>((index, value))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if !fsm_updates_are_allowed(
+                spec,
+                next.entity_slots[binding.entity_index][binding.slot]
+                    .values
+                    .as_slice(),
+                &update_values,
+            ) {
+                return Ok(Vec::new());
+            }
             for (index, value) in update_values {
                 next.entity_slots[binding.entity_index][binding.slot].values[index] = value;
             }
@@ -2558,6 +2591,54 @@ fn pattern_matches(value: &ExplicitValue, pattern: &crate::ir::types::IRPattern)
             pattern_matches(value, left) || pattern_matches(value, right)
         }
     }
+}
+
+fn fsm_updates_are_allowed(
+    spec: &ExplicitEntitySpec<'_>,
+    old_values: &[ExplicitValue],
+    update_values: &[(usize, ExplicitValue)],
+) -> bool {
+    for fsm in &spec.fsm_decls {
+        let Some(&field_index) = spec.field_indices.get(&fsm.field) else {
+            continue;
+        };
+        let Some((_, new_value)) = update_values
+            .iter()
+            .find(|(index, _)| *index == field_index)
+        else {
+            continue;
+        };
+        let Some(old_value) = old_values.get(field_index) else {
+            continue;
+        };
+        if old_value == new_value {
+            continue;
+        }
+        let (
+            ExplicitValue::Enum {
+                enum_name: old_enum,
+                variant: old_variant,
+            },
+            ExplicitValue::Enum {
+                enum_name: new_enum,
+                variant: new_variant,
+            },
+        ) = (old_value, new_value)
+        else {
+            return false;
+        };
+        if old_enum != &fsm.enum_name || new_enum != &fsm.enum_name {
+            return false;
+        }
+        if !fsm
+            .transitions
+            .iter()
+            .any(|transition| transition.from == *old_variant && transition.to == *new_variant)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn transition_value_locals(
@@ -3366,6 +3447,7 @@ mod tests {
             fields,
             field_indices,
             transitions: HashMap::new(),
+            fsm_decls: Vec::new(),
         }
     }
 
@@ -3392,8 +3474,8 @@ mod tests {
         }
     }
 
-    fn leaked_step(name: &str, params: Vec<IRTransParam>) -> &'static IRStep {
-        Box::leak(Box::new(IRStep {
+    fn leaked_step(name: &str, params: Vec<IRTransParam>) -> &'static IRSystemAction {
+        Box::leak(Box::new(IRSystemAction {
             name: name.to_owned(),
             params,
             guard: bool_lit(true),
@@ -3402,7 +3484,7 @@ mod tests {
         }))
     }
 
-    fn simple_model<'a>(step: &'a IRStep) -> ExplicitModel<'a> {
+    fn simple_model<'a>(step: &'a IRSystemAction) -> ExplicitModel<'a> {
         ExplicitModel {
             roots: vec!["Sys".to_owned()],
             system_fields: vec![],

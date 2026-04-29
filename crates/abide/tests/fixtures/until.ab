@@ -12,26 +12,18 @@ entity Signal {
 
 system Direct(signals: Store<Signal>) {
 
-  command make_signal()
+  command make_signal() { create Signal {} }
 
-  step make_signal() { create Signal {} }
-
-  command toggle()
-
-  step toggle() {
+  command toggle() {
     choose s: Signal where s.color == @Red { s.go_green() }
   }
 }
 
 system Indirect(signals: Store<Signal>) {
 
-  command make_signal()
+  command make_signal() { create Signal {} }
 
-  step make_signal() { create Signal {} }
-
-  command step_yellow()
-
-  step step_yellow() {
+  command step_yellow() {
     choose s: Signal where s.color == @Red { s.go_yellow() }
   }
 }
@@ -58,10 +50,8 @@ verify indirect_fails {
 
 system StuckRed(signals: Store<Signal>) {
 
-  command make_signal()
-
-  step make_signal() { create Signal {} }
-  // No step changes color — signals stay Red forever
+  command make_signal() { create Signal {} }
+  // No action changes color — signals stay Red forever
 }
 
 // Red until Green — should FAIL because Green never occurs

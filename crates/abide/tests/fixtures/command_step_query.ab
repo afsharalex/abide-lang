@@ -12,12 +12,10 @@ entity Order {
 
 system Billing(orders: Store<Order>) {
 
-  command charge(order: Order)
-
   query payable(order: Order) =
     order.status == 0
 
-  step charge(order: Order)
+  command charge(order: Order)
     requires payable(order)
   {
     order.mark_paid()

@@ -7,7 +7,7 @@ pub(crate) fn encode_step_inner(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
@@ -48,7 +48,7 @@ pub(crate) fn try_encode_step_inner(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
@@ -84,7 +84,7 @@ pub(crate) fn try_encode_step_inner_legacy(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
@@ -127,7 +127,7 @@ pub(crate) fn try_encode_step_inner_legacy(
 
     // derive the owning system for system field and store parameter resolution.
     let owning_system = all_systems.iter().find(|s| {
-        s.steps
+        s.actions
             .iter()
             .any(|st| std::ptr::eq(st, event) || st.name == event.name)
     });
@@ -862,7 +862,7 @@ pub(crate) fn try_encode_step_inner_legacy(
                 // frame the slots in the union that it didn't individually touch.
                 if let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) {
                     let matching_steps: Vec<_> = target_sys
-                        .steps
+                        .actions
                         .iter()
                         .filter(|s| s.name == *command_name)
                         .collect();
@@ -998,7 +998,7 @@ pub(super) fn try_encode_step_inner_macro(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
@@ -1050,7 +1050,7 @@ pub(super) fn try_encode_step_branches_dispatch(
     vctx: &VerifyContext,
     entities: &[IREntity],
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
     step: usize,
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
@@ -1191,10 +1191,10 @@ pub(super) fn try_encode_step_branches_dispatch(
 
 pub(super) fn step_scope_metadata(
     all_systems: &[IRSystem],
-    event: &IRStep,
+    event: &IRSystemAction,
 ) -> (String, HashMap<String, String>, HashMap<String, String>) {
     let owning_system = all_systems.iter().find(|s| {
-        s.steps
+        s.actions
             .iter()
             .any(|st| std::ptr::eq(st, event) || st.name == event.name)
     });
@@ -1853,7 +1853,7 @@ pub(super) fn try_encode_macro_call(
         return Ok(vec![]);
     };
     let matching_steps: Vec<_> = target_sys
-        .steps
+        .actions
         .iter()
         .filter(|s| s.name == *command_name)
         .collect();

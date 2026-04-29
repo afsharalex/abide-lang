@@ -1503,7 +1503,7 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
                 *rt = ctx.resolve_ty(rt);
             }
         }
-        for step in &mut system.steps {
+        for step in &mut system.actions {
             let (resolved_params, step_bound) =
                 resolve_params_lr(ctx, &step.params, HashMap::new());
             step.params = resolved_params;
@@ -1517,7 +1517,7 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
                 .iter()
                 .map(|ea| resolve_event_action(ctx, &step_bound, ea))
                 .collect();
-            // resolve step return expression
+            // resolve action return expression
             if let Some(ref mut re) = step.return_expr {
                 *re = resolve_expr(ctx, &step_bound, re);
             }
@@ -2081,8 +2081,7 @@ mod tests {
         let (_result, errors) = elaborate_all(
             "enum Outcome = Ok { value: real }\n\
              system Bank {\n\
-               command open_account(initial_balance: int) -> Outcome\n\
-               step open_account(initial_balance: int) {\n\
+               command open_account(initial_balance: int) -> Outcome {\n\
                  return @Ok { value: initial_balance }\n\
                }\n\
              }",
@@ -2527,8 +2526,7 @@ mod tests {
              enum Status = Active\n\
              entity Order { id: identity }\n\
              system S {\n\
-               command noop()\n\
-               step noop() { }\n\
+               command noop() { }\n\
              }\n\
              scene test_scene {\n\
                given {\n\

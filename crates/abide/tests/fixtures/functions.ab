@@ -76,9 +76,7 @@ prop students_have_valid_status for Grading =
 
 system Grading(students: Store<Student>) {
 
-  command enroll_student()
-
-  step enroll_student() {
+  command enroll_student() {
     create Student {
       status = @Enrolled
       score = 0
@@ -86,8 +84,6 @@ system Grading(students: Store<Student>) {
   }
 
   command complete_course(student_id: identity, final_score: int)
-
-  step complete_course(student_id: identity, final_score: int)
     requires exists s: Student in students |
       s.id == student_id and
       s.status == @Enrolled {
@@ -96,9 +92,7 @@ system Grading(students: Store<Student>) {
     }
   }
 
-  command drop_student(student_id: identity)
-
-  step drop_student(student_id: identity) {
+  command drop_student(student_id: identity) {
     choose s: Student where s.id == student_id {
       s.drop_course()
     }

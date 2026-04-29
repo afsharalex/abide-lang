@@ -2,7 +2,7 @@ use super::super::smt::{self, AbideSolver, SatResult};
 use super::*;
 use crate::ir::types::{
     IRAction, IRAssumptionSet, IRCommand, IRCommandRef, IRField, IRFsm, IRFsmTransition, IRProgram,
-    IRQuery, IRStep, IRSystem, IRTransRef, IRUpdate, IRVariant, LitVal,
+    IRQuery, IRSystem, IRSystemAction, IRTransRef, IRUpdate, IRVariant, LitVal,
 };
 
 fn make_order_entity() -> IREntity {
@@ -137,7 +137,7 @@ fn make_system_with_int_fields() -> IRSystem {
             params: vec![],
             return_type: None,
         }],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "handle".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -196,7 +196,7 @@ fn make_system_with_fsm_field() -> IRSystem {
             params: vec![],
             return_type: None,
         }],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "advance".to_owned(),
             params: vec![],
             guard: IRExpr::Lit {
@@ -254,7 +254,7 @@ fn make_billing_query_program() -> (IRProgram, IRSystem) {
         fields: vec![],
         entities: vec![],
         commands: vec![],
-        steps: vec![],
+        actions: vec![],
         fsm_decls: vec![],
         derived_fields: vec![],
         invariants: vec![],
@@ -323,8 +323,8 @@ fn fire_tracking_aggregates_multi_clause_commands_per_step() {
                 params: vec![],
                 return_type: None,
             }],
-            steps: vec![
-                IRStep {
+            actions: vec![
+                IRSystemAction {
                     name: "tick".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -335,7 +335,7 @@ fn fire_tracking_aggregates_multi_clause_commands_per_step() {
                     body: vec![],
                     return_expr: None,
                 },
-                IRStep {
+                IRSystemAction {
                     name: "tick".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -371,8 +371,8 @@ fn fire_tracking_aggregates_multi_clause_commands_per_step() {
                 params: vec![],
                 return_type: None,
             }],
-            steps: vec![
-                IRStep {
+            actions: vec![
+                IRSystemAction {
                     name: "tick".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -383,7 +383,7 @@ fn fire_tracking_aggregates_multi_clause_commands_per_step() {
                     body: vec![],
                     return_expr: None,
                 },
-                IRStep {
+                IRSystemAction {
                     name: "tick".to_owned(),
                     params: vec![],
                     guard: IRExpr::Lit {
@@ -846,7 +846,7 @@ fn test_forall_inactive_slot_framed() {
     let pool = create_slot_pool(&[entity.clone()], &scopes, 1);
 
     // Build a ForAll event with deposit action
-    let event = IRStep {
+    let event = IRSystemAction {
         name: "deposit_all".to_owned(),
         params: vec![],
         guard: IRExpr::Lit {
@@ -1050,7 +1050,7 @@ fn apply_on_entity_param_ties_param_to_slot() {
     };
 
     // event tick(j: Job) { j.toggle() }
-    let tick = IRStep {
+    let tick = IRSystemAction {
         name: "tick".to_owned(),
         params: vec![IRTransParam {
             name: "j".to_owned(),
@@ -1104,7 +1104,7 @@ fn apply_on_entity_param_ties_param_to_slot() {
         fields: vec![],
         entities: vec!["Job".to_owned()],
         commands: vec![],
-        steps: vec![tick.clone()],
+        actions: vec![tick.clone()],
         fsm_decls: vec![],
         derived_fields: vec![],
         invariants: vec![],
@@ -1209,7 +1209,7 @@ fn enabled_for_apply_on_param_checks_action_guard() {
         fsm_decls: vec![],
     };
 
-    let tick = IRStep {
+    let tick = IRSystemAction {
         name: "tick".to_owned(),
         params: vec![IRTransParam {
             name: "j".to_owned(),
@@ -1389,7 +1389,7 @@ fn enabled_for_apply_resolves_param_target_when_transition_name_is_shared() {
     };
 
     // event tick(j: Job) { j.toggle() }
-    let tick = IRStep {
+    let tick = IRSystemAction {
         name: "tick".to_owned(),
         params: vec![IRTransParam {
             name: "j".to_owned(),
@@ -1639,7 +1639,7 @@ fn fairness_tuple_enumeration_covers_entity_params_and_rejects_non_entity() {
         &HashMap::from([(entity.name.clone(), 2_usize)]),
         1,
     );
-    let event = IRStep {
+    let event = IRSystemAction {
         name: "tick".to_owned(),
         params: vec![
             IRTransParam {
@@ -1667,7 +1667,7 @@ fn fairness_tuple_enumeration_covers_entity_params_and_rejects_non_entity() {
         super::fairness::enumerate_entity_param_tuples(&event, &pool).expect("entity tuples");
     assert_eq!(tuples.len(), 4);
 
-    let mixed_event = IRStep {
+    let mixed_event = IRSystemAction {
         params: vec![IRTransParam {
             name: "count".to_owned(),
             ty: IRType::Int,
@@ -1692,7 +1692,7 @@ fn fairness_constraints_expand_per_tuple_entity_events() {
         fields: vec![],
         entities: vec!["Order".to_owned()],
         commands: vec![],
-        steps: vec![IRStep {
+        actions: vec![IRSystemAction {
             name: "tick".to_owned(),
             params: vec![IRTransParam {
                 name: "o".to_owned(),

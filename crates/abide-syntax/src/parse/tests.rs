@@ -330,12 +330,11 @@ system StripeAdapter implements PaymentProcessor {
 }
 
 #[test]
-fn parse_step_macro_let_call_and_match() {
+fn parse_action_macro_let_call_and_match() {
     let program = parse_program(
         r#"
 system Billing {
-  command submit()
-  step submit() {
+  action submit() {
     let result = Stripe::charge(1)
     match result {
       ok { value: id } => { charged' = true }
@@ -355,9 +354,9 @@ system Billing {
         })
         .expect("expected system");
 
-    let step = match &system.items[1] {
-        SystemItem::Step(step) => step,
-        other => panic!("expected Step, got {other:?}"),
+    let step = match &system.items[0] {
+        SystemItem::Action(step) => step,
+        other => panic!("expected Action, got {other:?}"),
     };
 
     assert!(matches!(step.items[0], crate::ast::EventItem::LetCall(_)));
@@ -374,12 +373,11 @@ system Billing {
 }
 
 #[test]
-fn parse_step_macro_direct_call_match() {
+fn parse_action_macro_direct_call_match() {
     let program = parse_program(
         r#"
 system Billing {
-  command submit()
-  step submit() {
+  action submit() {
     match Stripe::charge(1) {
       ok { value: id } => { charged' = true }
     }
@@ -397,9 +395,9 @@ system Billing {
         })
         .expect("expected system");
 
-    let step = match &system.items[1] {
-        SystemItem::Step(step) => step,
-        other => panic!("expected Step, got {other:?}"),
+    let step = match &system.items[0] {
+        SystemItem::Action(step) => step,
+        other => panic!("expected Action, got {other:?}"),
     };
 
     match &step.items[0] {
@@ -1049,12 +1047,10 @@ fn use_entity_rejected_in_system() {
 #[test]
 fn system_decl() {
     let src = r"system Commerce(orders: Store<Order>) {
-  command pay(order_id: identity)
-
-  step pay(order_id: identity) {
-choose o: Order where o.id == order_id {
-  o.submit()
-}
+  command pay(order_id: identity) {
+    choose o: Order where o.id == order_id {
+      o.submit()
+    }
   }
 }";
     let prog = parse_program(src);
@@ -1063,7 +1059,7 @@ choose o: Order where o.id == order_id {
         assert_eq!(s.params.len(), 1);
         assert_eq!(s.params[0].name, "orders");
         assert_eq!(s.params[0].entity_type, "Order");
-        assert_eq!(s.items.len(), 2); // command + step
+        assert_eq!(s.items.len(), 1);
     } else {
         panic!("expected System");
     }
@@ -1528,9 +1524,7 @@ status' = @AwaitingPayment
 #[test]
 fn create_block() {
     let src = r"system Billing(intents: Store<PaymentIntent>) {
-  command open_intent(order_id: identity)
-
-  step open_intent(order_id: identity) {
+  action open_intent(order_id: identity) {
 create PaymentIntent {
   order_id = order_id
   amount = 0
@@ -1540,11 +1534,11 @@ create PaymentIntent {
 }";
     let prog = parse_program(src);
     if let TopDecl::System(s) = &prog.decls[0] {
-        if let SystemItem::Step(e) = &s.items[1] {
+        if let SystemItem::Action(e) = &s.items[0] {
             assert_eq!(e.items.len(), 1);
             assert!(matches!(e.items[0], EventItem::Create(_)));
         } else {
-            panic!("expected Step");
+            panic!("expected Action");
         }
     } else {
         panic!("expected System");
@@ -2172,12 +2166,22 @@ fn scene_body_contextual_help() {
 }
 
 #[test]
-fn step_body_assert_instead_of_requires() {
-    let err = try_parse("system S { step e() { assert true } }").unwrap_err();
+fn action_body_assert_instead_of_requires() {
+    let err = try_parse("system S { action e() { assert true } }").unwrap_err();
     let help = extract_help(&err).expect("should have help");
     assert!(
         help.contains("requires"),
         "help should suggest 'requires': {help}"
+    );
+}
+
+#[test]
+fn source_step_syntax_is_rejected() {
+    let err = try_parse("system S { step e() { } }").unwrap_err();
+    let help = extract_help(&err).expect("should have help");
+    assert!(
+        help.contains("Use `action`"),
+        "help should point to action syntax: {help}"
     );
 }
 
@@ -2893,7 +2897,7 @@ fn seq_right_assoc() {
 #[test]
 fn system_flat_field() {
     let prog = parse_program(
-        "system S { screen: int = 0 command handle(i: int) step handle(i: int) requires screen == 0 { screen' = 1 } }",
+        "system S { screen: int = 0 command handle(i: int) requires screen == 0 { screen' = 1 } }",
     );
     match &prog.decls[0] {
         TopDecl::System(s) => {
@@ -2922,8 +2926,7 @@ fn system_struct_typed_field() {
         struct UiState { screen: int, mode: int }
         system S {
             ui: UiState = UiState { screen: 0, mode: 1 }
-            command handle(i: int)
-            step handle(i: int) requires ui.screen == 0 { ui.screen' = 1 }
+            command handle(i: int) requires ui.screen == 0 { ui.screen' = 1 }
         }
     ";
     let prog = parse_program(src);

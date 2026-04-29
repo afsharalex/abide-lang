@@ -103,7 +103,7 @@ fn transition_system_from_verify(
         .collect::<HashMap<_, _>>();
 
     let mut transitions = Vec::new();
-    for step in &system.steps {
+    for step in &system.actions {
         if !step.params.is_empty() || !is_true_expr(&step.guard) || step.body.is_empty() {
             return Ok(None);
         }
@@ -1357,8 +1357,8 @@ fn repeated_empty_lower_bounds(trace: &RelTrace, upper: Vec<RelTuple>) -> Vec<Re
 mod tests {
     use super::*;
     use crate::ir::types::{
-        IRAssumptionSet, IRField, IRStep, IRStoreDecl, IRSystem, IRTransition, IRUpdate, IRVariant,
-        IRVerifySystem,
+        IRAssumptionSet, IRField, IRStoreDecl, IRSystem, IRSystemAction, IRTransition, IRUpdate,
+        IRVariant, IRVerifySystem,
     };
     use crate::verify::ltl::{Formula, LassoWord};
 
@@ -1502,8 +1502,8 @@ mod tests {
             fields: Vec::new(),
             entities: vec!["Order".to_owned()],
             commands: Vec::new(),
-            steps: vec![
-                IRStep {
+            actions: vec![
+                IRSystemAction {
                     name: "open".to_owned(),
                     params: Vec::new(),
                     guard: bool_expr(true),
@@ -1516,7 +1516,7 @@ mod tests {
                     }],
                     return_expr: None,
                 },
-                IRStep {
+                IRSystemAction {
                     name: "pay".to_owned(),
                     params: Vec::new(),
                     guard: bool_expr(true),
@@ -1922,7 +1922,7 @@ mod tests {
             fields: Vec::new(),
             entities: vec!["Order".to_owned(), "Payment".to_owned()],
             commands: Vec::new(),
-            steps: vec![IRStep {
+            actions: vec![IRSystemAction {
                 name: "settle".to_owned(),
                 params: Vec::new(),
                 guard: bool_expr(true),

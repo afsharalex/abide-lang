@@ -269,7 +269,7 @@ pub(super) fn monomorphize_generics(env: &mut Env) {
         }
     }
 
-    // Walk system fields, commands, steps, queries, system-local preds, derived fields
+    // Walk system fields, commands, actions, queries, system-local preds, derived fields
     for system in env.systems.values() {
         for field in &system.fields {
             collect_all_param_uses(&field.ty, &mut all_params);
@@ -282,7 +282,7 @@ pub(super) fn monomorphize_generics(env: &mut Env) {
                 collect_all_param_uses(rt, &mut all_params);
             }
         }
-        for step in &system.steps {
+        for step in &system.actions {
             for (_, t) in &step.params {
                 collect_all_param_uses(t, &mut all_params);
             }

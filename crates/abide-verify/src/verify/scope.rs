@@ -132,7 +132,7 @@ pub(super) fn compute_verify_scope(
             if !system_names.contains(&sys.name) {
                 system_names.push(sys.name.clone());
             }
-            for event in &sys.steps {
+            for event in &sys.actions {
                 collect_crosscall_systems(&event.body, &mut systems_to_scan);
             }
             // Follow let bindings: a program's let bindings define
@@ -231,7 +231,7 @@ pub(super) fn compute_theorem_scope(
             if !system_names.contains(&sys.name) {
                 system_names.push(sys.name.clone());
             }
-            for event in &sys.steps {
+            for event in &sys.actions {
                 collect_crosscall_systems(&event.body, &mut systems_to_scan);
             }
             // Follow let bindings: a program's let bindings define
@@ -375,7 +375,7 @@ pub(super) fn validate_symmetry(
     // transitively. If any event's combined action tree has 2+ references
     // to the quantified entity type, symmetry breaks.
     for sys in systems {
-        for event in &sys.steps {
+        for event in &sys.actions {
             let mut count = 0;
             count_entity_actions_with_crosscall(
                 &event.body,
@@ -462,7 +462,7 @@ fn count_entity_actions_with_crosscall(
                 if visited_crosscalls.insert(key) {
                     // Follow into the CrossCall target's step body
                     if let Some(sys) = all_systems.iter().find(|s| s.name == *system) {
-                        if let Some(step) = sys.steps.iter().find(|e| e.name == *command) {
+                        if let Some(step) = sys.actions.iter().find(|e| e.name == *command) {
                             count_entity_actions_with_crosscall(
                                 &step.body,
                                 entity_name,
@@ -482,7 +482,7 @@ fn count_entity_actions_with_crosscall(
                     let key = (system.clone(), command.clone());
                     if visited_crosscalls.insert(key) {
                         if let Some(sys) = all_systems.iter().find(|s| s.name == *system) {
-                            if let Some(step) = sys.steps.iter().find(|e| e.name == *command) {
+                            if let Some(step) = sys.actions.iter().find(|e| e.name == *command) {
                                 count_entity_actions_with_crosscall(
                                     &step.body,
                                     entity_name,
@@ -612,7 +612,7 @@ pub(super) fn validate_crosscall_arities(
                     return Err(format!("CrossCall target system not found: {system}"));
                 };
                 let matching_steps: Vec<_> =
-                    sys.steps.iter().filter(|s| s.name == *command).collect();
+                    sys.actions.iter().filter(|s| s.name == *command).collect();
                 if matching_steps.is_empty() {
                     return Err(format!(
                         "CrossCall target command not found: {system}::{command}"
@@ -640,7 +640,7 @@ pub(super) fn validate_crosscall_arities(
                         return Err(format!("CrossCall target system not found: {system}"));
                     };
                     let matching_steps: Vec<_> =
-                        sys.steps.iter().filter(|s| s.name == *command).collect();
+                        sys.actions.iter().filter(|s| s.name == *command).collect();
                     if matching_steps.is_empty() {
                         return Err(format!(
                             "CrossCall target command not found: {system}::{command}"
@@ -881,8 +881,8 @@ mod tests {
         }
     }
 
-    fn step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRStep {
-        crate::ir::types::IRStep {
+    fn step(name: &str, body: Vec<IRAction>) -> crate::ir::types::IRSystemAction {
+        crate::ir::types::IRSystemAction {
             name: name.to_owned(),
             params: vec![],
             guard: bool_lit(true),
@@ -891,14 +891,18 @@ mod tests {
         }
     }
 
-    fn system(name: &str, entities: Vec<&str>, steps: Vec<crate::ir::types::IRStep>) -> IRSystem {
+    fn system(
+        name: &str,
+        entities: Vec<&str>,
+        actions: Vec<crate::ir::types::IRSystemAction>,
+    ) -> IRSystem {
         IRSystem {
             name: name.to_owned(),
             store_params: vec![],
             fields: vec![],
             entities: entities.into_iter().map(str::to_owned).collect(),
             commands: vec![],
-            steps,
+            actions,
             fsm_decls: vec![],
             derived_fields: vec![],
             invariants: vec![],
@@ -1103,7 +1107,7 @@ mod tests {
 
     #[test]
     fn validate_crosscall_arities_reports_missing_targets_and_nested_mismatch() {
-        let target = crate::ir::types::IRStep {
+        let target = crate::ir::types::IRSystemAction {
             name: "record".to_owned(),
             params: vec![IRTransParam {
                 name: "id".to_owned(),

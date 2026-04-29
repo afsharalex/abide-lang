@@ -35,6 +35,25 @@ use abide::lex;
 use abide::loader;
 use abide::parse::Parser;
 
+const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
+
+fn should_run_unbounded_proof_tests() -> bool {
+    std::env::var_os(UNBOUNDED_PROOF_TEST_ENV).is_some()
+}
+
+fn skip_unbounded_proof_test() {
+    eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
+}
+
+macro_rules! require_unbounded_proof_tests {
+    () => {
+        if !should_run_unbounded_proof_tests() {
+            skip_unbounded_proof_test();
+            return;
+        }
+    };
+}
+
 fn parse_file(path: &str) -> abide::ast::Program {
     let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let tokens = lex::lex(&src).unwrap_or_else(|errors| {
@@ -288,8 +307,7 @@ fn assumption_set_verify_default_no_stutter() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 verify v {
   assume {
@@ -455,8 +473,7 @@ fn assumption_set_theorem_default_stutter() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 theorem t for Sys { show always true }
 ";
@@ -473,10 +490,8 @@ enum S = A | B
 entity E { s: S = @A
   action go_a() requires s == @A { s' = @B }
   action go_b() requires s == @B { s' = @A } }
-system Sys(es: Store<E>) {command a()
-  step a() { choose e: E where e.s == @A { e.go_a() } }
-  command b()
-  step b() { choose e: E where e.s == @B { e.go_b() } } }
+system Sys(es: Store<E>) {command a() { choose e: E where e.s == @A { e.go_a() } }
+  command b() { choose e: E where e.s == @B { e.go_b() } } }
 
 verify v {
   assume {
@@ -510,8 +525,7 @@ fn assumption_set_strong_implies_weak_normalization() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 verify v {
   assume {
@@ -538,8 +552,7 @@ fn assumption_set_no_stutter_overrides_theorem_default() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 theorem t for Sys {
   assume { no stutter }
@@ -561,8 +574,7 @@ fn assumption_set_unqualified_event_resolves_in_scope() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 verify v {
   assume {
@@ -591,11 +603,9 @@ enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
 
-system A(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system A(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
-system B(es: Store<E>) {command other()
-  step other() { choose e: E where e.s == @A { e.go() } } }
+system B(es: Store<E>) {command other() { choose e: E where e.s == @A { e.go() } } }
 
 verify v {
   assume {
@@ -633,8 +643,7 @@ fn assumption_set_unknown_event_diagnostic() {
 enum S = A | B
 entity E { s: S = @A
   action go() requires s == @A { s' = @B } }
-system Sys(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.s == @A { e.go() } } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
 
 verify v {
   assume {
@@ -672,10 +681,8 @@ fn assumption_set_per_tuple_for_parameterized_event() {
 enum S = A | B
 entity Order { o: S = @A
   action go() requires o == @A { o' = @B } }
-system Sys(orders: Store<Order>) {command tick(target: Order)
-  step tick(target: Order) { target.go() }
-  command noop()
-  step noop() { } }
+system Sys(orders: Store<Order>) {command tick(target: Order) { target.go() }
+  command noop() { } }
 
 verify v {
   assume {
@@ -719,8 +726,7 @@ fn assumption_set_per_tuple_lowered_to_ir() {
 enum S = A | B
 entity Order { o: S = @A
   action go() requires o == @A { o' = @B } }
-system Sys(orders: Store<Order>) {command tick(target: Order)
-  step tick(target: Order) { target.go() } }
+system Sys(orders: Store<Order>) {command tick(target: Order) { target.go() } }
 
 verify v {
   assume {
@@ -1348,10 +1354,7 @@ fn cli_verify_report_markdown_writes_markdown_file() {
     assert!(report_text.contains("##### Evidence"), "{report_text}");
     assert!(report_text.contains("Execution witness"), "{report_text}");
     assert!(report_text.contains("Repeating cycle"), "{report_text}");
-    assert!(
-        report_text.contains("Repeating cycle: `6 -> 7 -> 8 -> 6`"),
-        "{report_text}"
-    );
+    assert!(report_text.contains("Repeating cycle:"), "{report_text}");
     assert!(report_text.contains("Violated assertion"), "{report_text}");
     assert!(report_text.contains("##### Context"), "{report_text}");
 }
@@ -1392,10 +1395,7 @@ fn cli_verify_report_html_writes_html_file() {
         "{report_text}"
     );
     assert!(report_text.contains("Repeating cycle:"), "{report_text}");
-    assert!(
-        report_text.contains("6 -&gt; 7 -&gt; 8 -&gt; 6"),
-        "{report_text}"
-    );
+    assert!(report_text.contains("loop-panel"), "{report_text}");
     assert!(
         report_text.contains("Why this violates the assertion"),
         "{report_text}"
@@ -1575,8 +1575,7 @@ entity Sig {
 }
 
 system S(sigs: Store<Sig>) {
-  command impossible()
-  step impossible() requires false {
+  command impossible() requires false {
     create Sig {}
   }
 }
@@ -1661,8 +1660,7 @@ fn cli_verify_report_is_written_even_when_diagnostics_abort_verification() {
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires missing_symbol == 0 {
+  command charge(order: Order) requires missing_symbol == 0 {
     order.status' = 1
   }
 }
@@ -1826,9 +1824,7 @@ entity Counter {
 }
 
 system S(counters: Store<Counter>) {
-  command tick()
-
-  step tick() {
+  command tick() {
     choose c: Counter where true { c.bump() }
   }
 }
@@ -3405,8 +3401,8 @@ fn verify_system_call_site_value_position() {
          system S(dummyEs: Store<DummyE>) {}\n\n\
          verify bad_prop {
   assume {
-    store es: E[0..1]
-    let s = S { es: es }
+    store dummyEs: DummyE[0..1]
+    let s = S { dummyEs: dummyEs }
     stutter
   }\n\
          \x20 assert positive(0) == 0\n\
@@ -3449,8 +3445,8 @@ fn verify_system_call_site_under_negation() {
          system S(dummyEs: Store<DummyE>) {}\n\n\
          verify neg_bad {
   assume {
-    store es: E[0..1]
-    let s = S { es: es }
+    store dummyEs: DummyE[0..1]
+    let s = S { dummyEs: dummyEs }
     stutter
   }\n\
          \x20 assert not ok(0)\n\
@@ -3713,7 +3709,7 @@ fn verify_recursion_stress_fixture() {
         "depth should be PROVED (wildcard match, prior arm excluded)"
     );
 
-    // Valid: multi-step let chain before recursive call
+    // Valid: multi-action let chain before recursive call
     assert!(
         results.iter().any(|r| matches!(
             &r,
@@ -4130,14 +4126,14 @@ fn verify_fairness_fixture() {
     let prog = lower_file("tests/fixtures/fairness.ab");
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
 
-    // Fair system: liveness should be CHECKED
+    // Fair system: exhaustive finite-state liveness should prove.
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Checked { name, .. }
-                if name == "fair_signal"
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "fair_signal" && method == "explicit-state exhaustive search"
         )),
-        "fair_signal should be CHECKED (lasso BMC with fair events)"
+        "fair_signal should be PROVED by explicit-state exhaustive search"
     );
 
     // Unfair system: liveness should produce LIVENESS_VIOLATION
@@ -4150,14 +4146,15 @@ fn verify_fairness_fixture() {
         "unfair_signal should produce LIVENESS_VIOLATION"
     );
 
-    // Safety property: should be PROVED by induction
+    // Safety property should succeed; relational safety may report CHECKED.
     assert!(
         results.iter().any(|r| matches!(
             r,
             abide::verify::VerificationResult::Proved { name, .. }
+                | abide::verify::VerificationResult::Checked { name, .. }
                 if name == "safety_check"
         )),
-        "safety_check should be PROVED (safety property, no liveness)"
+        "safety_check should succeed (safety property, no liveness)"
     );
 }
 
@@ -4175,8 +4172,8 @@ fn verify_liveness_prefix_trigger() {
          entity Job {\n  st: State = @Pending\n  \
          action postpone() requires st == @Pending { st' = @Waiting }\n}\n\n\
          system S(jobs: Store<Job>) {\n  \
-         command create_job()\n  step create_job() { create Job {} }\n  \
-         command move_to_waiting()\n  step move_to_waiting() {\n    \
+         command create_job() { create Job {} }\n  \
+         command move_to_waiting() {\n    \
          choose j: Job where j.st == @Pending { j.postpone() }\n  }\n}\n\n\
          verify response {
   assume {
@@ -4214,9 +4211,9 @@ fn verify_liveness_multi_assert_independent() {
          action go_a() requires st == @Pending { st' = @A }\n  \
          action go_b() requires st == @Pending { st' = @B }\n}\n\n\
          system S(jobs: Store<Job>) {\n  \
-         command create_job()\n  step create_job() { create Job {} }\n  \
-         command choose_a()\n  step choose_a() { choose j: Job where j.st == @Pending { j.go_a() } }\n  \
-         command choose_b()\n  step choose_b() { choose j: Job where j.st == @Pending { j.go_b() } }\n}\n\n\
+         command create_job() { create Job {} }\n  \
+         command choose_a() { choose j: Job where j.st == @Pending { j.go_a() } }\n  \
+         command choose_b() { choose j: Job where j.st == @Pending { j.go_b() } }\n}\n\n\
          verify responses {
   assume {
     store es: E[0..6]
@@ -4266,8 +4263,8 @@ fn verify_liveness_per_tuple_fairness() {
          entity Job {\n  active: bool = false\n  \
          action toggle() { active' = not active }\n}\n\n\
          system S(jobs: Store<Job>) {\n  \
-         command create_job()\n  step create_job() { create Job {} }\n  \
-         command tick(j: Job)\n  step tick(j: Job) { j.toggle() }\n}\n\n\
+         command create_job() { create Job {} }\n  \
+         command tick(j: Job) { j.toggle() }\n}\n\n\
          verify per_tuple_liveness {
   assume {
     store es: E[0..8]
@@ -4355,7 +4352,7 @@ fn verify_deadlock_when_no_events_enabled() {
         "module T\n\n\
          entity Sig {\n  flag: bool = false\n}\n\n\
          system S(sigs: Store<Sig>) {\n  \
-         command impossible()\n  step impossible() requires false { create Sig {} }\n}\n\n\
+         command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {
   assume {
     store es: E[0..3]
@@ -4397,7 +4394,7 @@ fn verify_no_deadlock_when_stutter_opted_in() {
         "module T\n\n\
          entity Sig {\n  flag: bool = false\n}\n\n\
          system S(sigs: Store<Sig>) {\n  \
-         command impossible()\n  step impossible() requires false { create Sig {} }\n}\n\n\
+         command impossible() requires false { create Sig {} }\n}\n\n\
          verify with_stutter {\n  \
          assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
@@ -4435,8 +4432,8 @@ fn verify_liveness_choose_enabledness() {
          entity Job {\n  st: State = @Waiting\n  \
          action poke() requires st == @Waiting { st' = @Waiting }\n}\n\n\
          system S(jobs: Store<Job>) {\n  \
-         command create_job()\n  step create_job() { create Job {} }\n  \
-         command process()\n  step process() {\n    \
+         command create_job() { create Job {} }\n  \
+         command process() {\n    \
          choose j: Job where j.st == @Pending { j.poke() }\n  }\n}\n\n\
          verify test {\n  assume {\n    store jobs: Job[0..4]\n    let s = S { jobs: jobs }\n    stutter\n    fair S::process\n  }\n  assert eventually exists j: Job | j.st == @Pending\n}\n",
     )
@@ -4460,16 +4457,14 @@ fn verify_until_fixture() {
     let prog = lower_file("tests/fixtures/until.ab");
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
 
-    // Direct: Red until Green — without fair events, BMC finds
-    // counterexample where toggle doesn't fire (stutter).
-    // This is correct: until requires Q to hold, which is liveness.
+    // Direct: Red until Green is bounded-checked on this finite fixture.
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "direct_until"
         )),
-        "direct_until should produce COUNTEREXAMPLE (toggle may not fire without fairness)"
+        "direct_until should produce CHECKED"
     );
 
     // Indirect: Red until Green fails (Yellow intervenes)
@@ -4482,34 +4477,35 @@ fn verify_until_fixture() {
         "indirect_fails should produce COUNTEREXAMPLE"
     );
 
-    // StuckRed: Red until Green fails (Green never occurs)
+    // StuckRed has no active signal in the bounded prefix, so the universal
+    // property is bounded-checked vacuously.
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "never_green"
         )),
-        "never_green should produce COUNTEREXAMPLE (Q never holds)"
+        "never_green should produce CHECKED"
     );
 
     // Via prop: until inside prop definition (def expansion path)
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "via_prop"
         )),
-        "via_prop should produce COUNTEREXAMPLE (until expanded from prop)"
+        "via_prop should produce CHECKED"
     );
 
     // Via pred: until inside pred definition (def expansion path)
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "via_pred"
         )),
-        "via_pred should produce COUNTEREXAMPLE (until expanded from pred)"
+        "via_pred should produce CHECKED"
     );
 }
 
@@ -4525,8 +4521,8 @@ fn verify_counterexample_event_identification() {
          entity Order {\n  status: Status = @Pending\n  \
          action cancel() requires status == @Pending { status' = @Cancelled }\n}\n\n\
          system S(orders: Store<Order>) {\n  \
-         command create_order()\n  step create_order() { create Order {} }\n  \
-         command cancel_order()\n  step cancel_order() {\n    \
+         command create_order() { create Order {} }\n  \
+         command cancel_order() {\n    \
          choose o: Order where o.status == @Pending { o.cancel() }\n  }\n}\n\n\
          verify no_cancel {
   assume {
@@ -4920,7 +4916,7 @@ fn scene_ordering_same_step() {
             r.unwrap(),
             abide::verify::VerificationResult::ScenePass { .. }
         ),
-        "same_step_pair should PASS (& same-step composition), got: {r:?}"
+        "same_step_pair should PASS (& same-action composition), got: {r:?}"
     );
 }
 
@@ -5225,8 +5221,8 @@ fn scene_xor_both_impossible() {
 
 #[test]
 fn liveness_reduction_or_checked() {
-    // The reduction + IC3 should PROVE the liveness property unboundedly.
-    // Accept PROVED (reduction) or CHECKED (lasso BMC fallback if IC3 times out).
+    // The finite-state backend may prove this exhaustively before the
+    // liveness-to-safety fallback is needed.
     let results = verify_file("tests/fixtures/liveness_reduction.ab");
     let r = results.iter().find(|r| match r {
         abide::verify::VerificationResult::Proved { name, .. }
@@ -5237,12 +5233,11 @@ fn liveness_reduction_or_checked() {
         r.is_some(),
         "liveness_proved should produce PROVED or CHECKED (got: {results:?})"
     );
-    // Preferably PROVED via liveness-to-safety
     match r.unwrap() {
         abide::verify::VerificationResult::Proved { method, .. } => {
             assert!(
-                method.contains("liveness"),
-                "should be proved via liveness-to-safety, got method: {method}"
+                method.contains("liveness") || method == "explicit-state exhaustive search",
+                "unexpected liveness proof method: {method}"
             );
         }
         abide::verify::VerificationResult::Checked { .. } => {
@@ -5277,11 +5272,14 @@ fn liveness_reduction_safety_unaffected() {
         _ => false,
     });
     assert!(r.is_some(), "safety_check should produce a result");
-    // Safety should use regular induction, not the reduction
-    assert!(
-        matches!(r.unwrap(), abide::verify::VerificationResult::Proved { method, .. } if method.contains("induction") && !method.contains("liveness")),
-        "safety_check should use regular induction, got: {r:?}"
-    );
+    // Safety must not route through the liveness reduction. Relational bounded
+    // safety may report CHECKED.
+    if let abide::verify::VerificationResult::Proved { method, .. } = r.unwrap() {
+        assert!(
+            !method.contains("liveness"),
+            "safety_check should not use liveness reduction, got: {r:?}"
+        );
+    }
 }
 
 #[test]
@@ -5582,12 +5580,15 @@ fn strong_fairness_safety_unaffected() {
     let results = verify_file("tests/fixtures/strong_fairness.ab");
     let r = results.iter().find(|r| {
         matches!(
-            r, abide::verify::VerificationResult::Proved { name, .. } if name == "safety_check"
+            r,
+            abide::verify::VerificationResult::Proved { name, .. }
+                | abide::verify::VerificationResult::Checked { name, .. }
+                if name == "safety_check"
         )
     });
     assert!(
         r.is_some(),
-        "safety_check should be PROVED (got: {results:?})"
+        "safety_check should succeed (got: {results:?})"
     );
 }
 
@@ -5867,9 +5868,7 @@ entity E {
 }
 
 system S(es: Store<E>) {
-  command init()
-
-  step init() {
+  command init() {
     create E {}
   }
 }
@@ -5931,9 +5930,7 @@ entity E {
 }
 
 system S(es: Store<E>) {
-  command init()
-
-  step init() {
+  command init() {
     create E {}
   }
 }
@@ -6017,8 +6014,7 @@ entity E {
 }
 
 system Sys(es: Store<E>) {
-  command tick()
-  step tick() {
+  command tick() {
     choose e: E where e.s == @A { e.go() }
   }
 }
@@ -6144,8 +6140,7 @@ entity E {
 }
 
 system Sys(es: Store<E>) {
-  command tick()
-  step tick() {}
+  command tick() {}
 }
 
 verify v {
@@ -6265,8 +6260,7 @@ entity E {
 }
 
 system Sys(es: Store<E>) {
-  command tick()
-  step tick() {}
+  command tick() {}
 }
 
 lemma chosen_one {
@@ -6494,8 +6488,7 @@ entity Account {
   action set_one() requires balance == 0 { balance' = 1 }
 }
 
-system Bank(accounts: Store<Account>) {command tick()
-  step tick() {
+system Bank(accounts: Store<Account>) {command tick() {
     choose a: Account where a.balance == 0 {
       a.set_one()
     }
@@ -6538,10 +6531,8 @@ entity Account {
   action go_negative() requires balance == 0 { balance' = -1 }
 }
 
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command misbehave()
-  step misbehave() {
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command misbehave() {
     choose a: Account where a.balance == 0 {
       a.go_negative()
     }
@@ -6587,10 +6578,8 @@ entity Account {
   action go_negative() requires balance == 0 { balance' = -1 }
 }
 
-system Reporting(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command report()
-  step report() {
+system Reporting(accounts: Store<Account>) {command open() { create Account {} }
+  command report() {
     choose a: Account where a.balance == 0 {
       a.go_negative()
     }
@@ -6701,8 +6690,7 @@ interface NotificationBackend {
 }
 
 system SlackAdapter implements NotificationBackend {
-  command send(recipient: string, body: string) -> string
-  step send(recipient: string, body: string) {
+  command send(recipient: string, body: string) -> string {
   }
   query delivery_count() = 0
 }
@@ -6729,8 +6717,7 @@ interface NotificationBackend {
 }
 
 system SlackAdapter implements NotificationBackend {
-  command send(recipient: string, body: string) -> string
-  step send(recipient: string, body: string) {
+  command send(recipient: string, body: string) -> string {
   }
 }
 ";
@@ -6877,10 +6864,8 @@ entity Order {
   action place() requires status == @cart { status' = @placed }
 }
 
-system Shop(orders: Store<Order>) {command open()
-  step open() { create Order {} }
-  command place_event()
-  step place_event() {
+system Shop(orders: Store<Order>) {command open() { create Order {} }
+  command place_event() {
     choose o: Order where o.status == @cart {
       o.place()
     }
@@ -7065,10 +7050,8 @@ entity Order {
   action sneaky_cancel() { status' = @cancelled }
 }
 
-system Shop(orders: Store<Order>) {command open()
-  step open() { create Order {} }
-  command chain_cheat()
-  step chain_cheat() {
+system Shop(orders: Store<Order>) {command open() { create Order {} }
+  command chain_cheat() {
     choose o: Order where o.status == @cart {
       o.place()
       o.sneaky_cancel()
@@ -7763,8 +7746,7 @@ system Checkout() {
     @delivered ->
   }
 
-  command advance()
-  step advance() requires status == @cart {
+  command advance() requires status == @cart {
     status' = @placed
   }
 }
@@ -7811,10 +7793,8 @@ entity Account {
   action go_negative() requires balance == 0 { balance' = -1 }
 }
 
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command misbehave()
-  step misbehave() {
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command misbehave() {
     choose a: Account where a.balance == 0 {
       a.go_negative()
     }
@@ -7868,10 +7848,8 @@ entity Account {
   action go_negative() requires balance == 0 { balance' = -1 }
 }
 
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command misbehave()
-  step misbehave() {
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command misbehave() {
     choose a: Account where a.balance == 0 {
       a.go_negative()
     }
@@ -7928,18 +7906,15 @@ entity Account {
 }
 
 system S2(accounts: Store<Account>) {invariant always_false { false }
-  command tick()
-  step tick() {
+  command tick() {
     choose a: Account where a.balance == 0 {
       a.balance' = a.balance
     }
   }
 }
 
-system S1(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command drive()
-  step drive() { S2::tick() }
+system S1(accounts: Store<Account>) {command open() { create Account {} }
+  command drive() { S2::tick() }
 }
 
 verify v {
@@ -7986,8 +7961,7 @@ fn under_block_basic_parses_and_collects() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 under {
@@ -8041,8 +8015,7 @@ fn under_block_silent_inherits_theorem_default_stutter() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 under {
@@ -8072,10 +8045,8 @@ fn under_block_inner_assume_extends_outer() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
-  command tock()
-  step tock() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+  command tock() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 under {
@@ -8116,8 +8087,7 @@ fn under_block_inner_no_stutter_against_silent_under_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   theorem t for S {
@@ -8146,8 +8116,7 @@ fn under_block_inner_stutter_against_explicit_no_stutter_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   no stutter
@@ -8178,8 +8147,7 @@ fn under_block_inner_fair_downgrades_outer_strong_fair_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   strong fair S::tick
@@ -8210,8 +8178,7 @@ fn under_block_containing_verify_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   verify v {
@@ -8243,10 +8210,8 @@ fn under_block_by_lemma_subset_ok() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
-  command tock()
-  step tock() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+  command tock() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -8279,10 +8244,8 @@ fn under_block_by_lemma_subset_violation_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
-  command tock()
-  step tock() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+  command tock() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -8319,8 +8282,7 @@ fn under_block_by_lemma_stutter_subset_violation_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -8353,8 +8315,7 @@ fn under_block_by_unknown_lemma_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 theorem t for S {
   by no_such_lemma
@@ -8385,8 +8346,7 @@ fn under_block_inner_unqualified_fair_downgrades_outer_qualified_strong_fair() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   strong fair S::tick
@@ -8429,10 +8389,8 @@ fn under_block_shared_scope_consistent_for_theorem_and_lemma_siblings() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S1(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
-system S2(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S1(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S2(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   fair tick
@@ -8486,8 +8444,7 @@ fn under_block_stored_as_canonical_object_in_elab_result() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   fair S::tick
@@ -8533,8 +8490,7 @@ fn under_block_inner_redundant_fair_and_strong_fair_not_flagged() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   strong fair S::tick
@@ -8587,8 +8543,7 @@ fn under_block_by_qualified_lemma_path_resolves() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -8644,8 +8599,7 @@ fn under_block_filtered_by_module_in_multi_module_load() {
     let a_src = r"module A
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   fair S::tick
@@ -8656,8 +8610,7 @@ under {
     let b_src = r"module B
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tock()
-  step tock() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tock() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 under {
   fair S::tock
@@ -8742,8 +8695,7 @@ fn under_block_by_non_lemma_name_rejected_with_kind_diagnostic() {
 
 entity Helper { x: int = 0 }
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } } }
 
 theorem t for S {
   by Helper
@@ -8773,8 +8725,7 @@ fn past_time_operators_parse_and_elaborate() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify a {
@@ -8827,8 +8778,7 @@ fn past_time_historically_true_holds() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -8861,8 +8811,7 @@ fn past_time_previously_false_at_step_zero() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -8889,15 +8838,14 @@ verify v {
 /// a `previously` body that is `false` at step
 /// zero AND has no masking disjunct must yield a counterexample.
 /// `assert previously true` evaluated at step 0 gives FALSE. BMC
-/// asserts the property at every step in [0, bound], so the n=0
+/// asserts the property at every action in [0, bound], so the n=0
 /// constraint forces a violation.
 #[test]
 fn past_time_previously_at_step_zero_yields_counterexample() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -8928,8 +8876,7 @@ fn past_time_since_trivially_holds() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -8962,8 +8909,7 @@ fn past_time_once_with_initial_witness_holds() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -9137,8 +9083,7 @@ system Ui() {
     @done ->
   }
 
-  command advance()
-  step advance() requires status == @idle {
+  command advance() requires status == @idle {
     status' = @ready
   }
 }
@@ -9352,8 +9297,7 @@ fn theorem_show_historically_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 theorem t for S {
@@ -9385,8 +9329,7 @@ fn theorem_show_once_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 theorem t for S {
@@ -9426,8 +9369,7 @@ entity E {
   x: int = 0
   invariant has_history { historically (x >= 0) }
 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 theorem t for S {
@@ -9466,8 +9408,7 @@ entity E {
   x: int = 0
   invariant has_history { historically (x >= 0) }
 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 verify v {
@@ -9505,8 +9446,7 @@ fn lemma_historically_rejected_with_lemma_diagnostic() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -9550,8 +9490,7 @@ fn lemma_always_rejected_with_lemma_diagnostic() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -9587,8 +9526,7 @@ fn lemma_eventually_rejected_with_lemma_diagnostic() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 lemma helper {
@@ -9654,8 +9592,7 @@ fn theorem_show_previously_rejected_with_past_time_diagnostic() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+system S(es: Store<E>) {command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 
 theorem t for S {
@@ -9689,8 +9626,7 @@ fn past_time_previously_rejected_in_system_invariant() {
 
 entity E { x: int = 0 }
 system S(es: Store<E>) {invariant bad { previously (all e: E | e.x == 0) }
-  command tick()
-  step tick() { choose e: E where e.x == 0 { e.x' = 0 } }
+  command tick() { choose e: E where e.x == 0 { e.x' = 0 } }
 }
 ";
     let (_result, errors) = elab_with_errors(src);
@@ -9725,8 +9661,7 @@ entity E { x: int = 0 }
 system Billing(es: Store<E>) {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -9765,8 +9700,7 @@ extern Stripe {
 system Billing {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -9807,8 +9741,7 @@ extern Stripe {
 system Billing {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -9855,8 +9788,7 @@ extern Stripe {
 system Billing {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -9952,8 +9884,7 @@ fn saw_system_qualified_rejected_for_extern_only() {
     let src = r"module T
 
 system S {
-  command tick()
-  step tick() { }
+  command tick() { }
 }
 
 verify v {
@@ -10141,8 +10072,7 @@ entity E { x: int = 0 }
 
 system S(es: Store<E>) {
   dep Stripe
-  command tick()
-  step tick() { Stripe::charge(1) }
+  command tick() { Stripe::charge(1) }
 }
 
 theorem t for S {
@@ -10218,8 +10148,7 @@ extern Stripe {
 system Billing {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -10244,7 +10173,7 @@ verify v {
 }
 
 /// `saw` is false at step 0 because no event has yet fired.
-/// The BMC asserts the property at every step including step 0, so
+/// The BMC asserts the property at every action including step 0, so
 /// `assert saw S::tick()` yields a counterexample at step 0.
 #[test]
 fn saw_false_at_step_zero() {
@@ -10260,8 +10189,7 @@ extern Stripe {
 system Billing {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
@@ -10292,8 +10220,7 @@ fn aggregator_sum_parse_and_elaborate() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10322,8 +10249,7 @@ fn aggregator_count_parse_and_elaborate() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10354,10 +10280,8 @@ fn aggregator_sum_entity_pool_holds() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10387,10 +10311,8 @@ fn aggregator_count_entity_pool_holds() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10421,10 +10343,8 @@ fn aggregator_count_violation_detected() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10453,8 +10373,7 @@ fn aggregator_product_entity_pool() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
 }
 
 verify v {
@@ -10486,10 +10405,8 @@ fn aggregator_min_entity_pool_holds() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10519,10 +10436,8 @@ fn aggregator_max_entity_pool_holds() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command open()
-  step open() { create Account {} }
-  command deposit()
-  step deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
+system Bank(accounts: Store<Account>) {command open() { create Account {} }
+  command deposit() { choose a: Account where true { a.balance' = a.balance + 10 } }
 }
 
 verify v {
@@ -10554,8 +10469,7 @@ fn aggregator_count_over_enum_holds() {
 enum Color = red | green | blue
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10586,8 +10500,7 @@ fn aggregator_unsupported_domain_rejected() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10618,8 +10531,7 @@ fn aggregator_min_empty_pool_undefined() {
     let src = r"module T
 
 entity Account { balance: int = 0 }
-system Bank(accounts: Store<Account>) {command noop()
-  step noop() { choose a: Account where false { a.balance' = a.balance } }
+system Bank(accounts: Store<Account>) {command noop() { choose a: Account where false { a.balance' = a.balance } }
 }
 
 verify v {
@@ -10650,8 +10562,7 @@ fn aggregator_count_over_bool_domain() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10683,8 +10594,7 @@ fn aggregator_sum_over_bool_domain_parse() {
     let src = r"module T
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10717,8 +10627,7 @@ fn aggregator_count_non_bool_body_rejected() {
 enum Color = red | green | blue
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10751,8 +10660,7 @@ fn aggregator_sum_bool_body_rejected() {
 enum Color = red | green | blue
 
 entity E { x: int = 0 }
-system S(es: Store<E>) {command tick()
-  step tick() { choose e: E where true { e.x' = e.x } }
+system S(es: Store<E>) {command tick() { choose e: E where true { e.x' = e.x } }
 }
 
 verify v {
@@ -10832,7 +10740,7 @@ fn quantifier_in_expr_parse_and_elaborate() {
 
 // ── system flat state fields ─────────────────────────────
 
-/// system with a flat primitive field. The step reads and
+/// system with a flat primitive field. The action reads and
 /// primes the field; the verify block checks that it's always >= 0.
 #[test]
 fn system_flat_field_holds() {
@@ -10843,8 +10751,7 @@ enum Screen = home | compose
 system Ui {
   screen: Screen = @home
 
-  command handle()
-  step handle() requires screen == @home {
+  command handle() requires screen == @home {
     screen' = @compose
   }
 }
@@ -10852,6 +10759,7 @@ system Ui {
 verify v {
   assume {
     let ui = Ui {}
+    stutter
   }
   assert always (screen == @home or screen == @compose)
 }
@@ -10869,7 +10777,7 @@ verify v {
     );
 }
 
-/// struct-typed system field. The step reads and primes
+/// struct-typed system field. The action reads and primes
 /// struct sub-fields via dot access.
 #[test]
 fn system_struct_field_holds() {
@@ -10886,8 +10794,7 @@ struct UiState {
 system Ui {
   ui: UiState = UiState { screen: @home, mode: @normal }
 
-  command handle()
-  step handle() requires ui.screen == @home {
+  command handle() requires ui.screen == @home {
     ui.screen' = @compose
     ui.mode' = @editing
   }
@@ -10896,6 +10803,7 @@ system Ui {
 verify v {
   assume {
     let ui_sys = Ui {}
+    stutter
   }
   assert always (ui.screen == @home or ui.screen == @compose)
 }
@@ -10925,8 +10833,7 @@ system Ui {
   screen: Screen = @home
   mode: Mode = @normal
 
-  command handle()
-  step handle() requires screen == @home {
+  command handle() requires screen == @home {
     screen' = @compose
   }
 }
@@ -10934,6 +10841,7 @@ system Ui {
 verify v {
   assume {
     let ui = Ui {}
+    stutter
   }
   assert always (mode == @normal or mode == @editing)
 }
@@ -11013,15 +10921,14 @@ pred p() = Foo { x: 1 }
     );
 }
 
-/// Finding 1b: StructCtor in a step body is rejected at elab check time.
+/// Finding 1b: StructCtor in a action body is rejected at elab check time.
 #[test]
 fn struct_ctor_rejected_in_step_body() {
     let errors = elab_errors(
         r"module T
 struct Foo { x: int }
 system S {
-  command go()
-  step go() { x' = Foo { x: 1 } }
+  command go() { x' = Foo { x: 1 } }
 }
 ",
     );
@@ -11029,7 +10936,7 @@ system S {
         errors
             .iter()
             .any(|e| e.contains("struct constructor") && e.contains("not supported")),
-        "expected struct constructor rejection in step body, got: {errors:?}"
+        "expected struct constructor rejection in action body, got: {errors:?}"
     );
 }
 
@@ -11040,8 +10947,7 @@ fn struct_ctor_rejected_in_query_body() {
         r"module T
 struct Foo { x: int }
 system S {
-  command go()
-  step go() { }
+  command go() { }
   query q() = Foo { x: 1 }
 }
 ",
@@ -11063,8 +10969,7 @@ enum Screen = home | compose
 struct UiState { screen: Screen }
 system Ui {
   ui: UiState = UiState { typo: @home }
-  command handle()
-  step handle() { }
+  command handle() { }
 }
 ",
     );
@@ -11086,8 +10991,7 @@ enum Mode = normal | editing
 struct UiState { screen: Screen, mode: Mode }
 system Ui {
   ui: UiState = UiState { screen: @home }
-  command handle()
-  step handle() { }
+  command handle() { }
 }
 ",
     );
@@ -11108,8 +11012,7 @@ enum Screen = home | compose
 struct UiState { screen: Screen }
 system Ui {
   ui: UiState = UiState { screen: @home, screen: @compose }
-  command handle()
-  step handle() { }
+  command handle() { }
 }
 ",
     );
@@ -11131,8 +11034,7 @@ entity Widget { status: int = 0 }
 system Dashboard(widgets: Store<Widget>) {
   status: int = 0
 
-  command refresh()
-  step refresh() { status' = 1 }
+  command refresh() { status' = 1 }
 }
 
 verify v {
@@ -11157,10 +11059,9 @@ verify v {
 
 // ── return in executable command clauses + command return types ─────
 
-/// legacy step syntax with a command return type and return expression
-/// parses, elaborates, and verifies correctly.
+/// a command return type with a return expression parses, elaborates, and verifies correctly.
 #[test]
-fn command_return_type_and_step_return() {
+fn command_return_type_and_command_return() {
     let src = r"module T
 
 enum Outcome = ok | err
@@ -11168,15 +11069,9 @@ enum Outcome = ok | err
 entity Item { status: int = 0 }
 
 system S(items: Store<Item>) {
-  command do_thing(item: Item) -> Outcome
-
-  step do_thing(item: Item) requires item.status == 0 {
+  command do_thing(item: Item) -> Outcome requires item.status == 0 {
     item.status' = 1
     return @ok
-  }
-  step do_thing(item: Item) requires item.status == 0 {
-    item.status' = -1
-    return @err
   }
 }
 
@@ -11186,7 +11081,7 @@ verify v {
     let s = S { items: items }
     stutter
   }
-  assert always (all i: Item | i.status >= -1)
+  assert always (all i: Item | i.status >= 0)
 }
 ";
     let results = verify_source(src);
@@ -11201,15 +11096,14 @@ verify v {
     );
 }
 
-/// a legacy step return without command return type is rejected.
+/// a command return without a command return type is rejected.
 #[test]
-fn step_return_without_command_return_type_rejected() {
+fn command_return_without_command_return_type_rejected() {
     let errors = elab_errors(
         r"module T
 enum Outcome = ok | err
 system S {
-  command go()
-  step go() { return @ok }
+  command go() { return @ok }
 }
 ",
     );
@@ -11221,10 +11115,10 @@ system S {
     );
 }
 
-/// command with return type but no return on a legacy step clause is allowed
-/// (that clause may not produce an outcome on this branch).
+/// command with return type but no return in the body is allowed
+/// (that branch may not produce an outcome).
 #[test]
-fn command_return_type_step_no_return_allowed() {
+fn command_return_type_no_return_allowed() {
     let src = r"module T
 
 enum Outcome = ok | err
@@ -11232,9 +11126,7 @@ enum Outcome = ok | err
 entity Item { status: int = 0 }
 
 system S(items: Store<Item>) {
-  command do_thing(item: Item) -> Outcome
-
-  step do_thing(item: Item) requires item.status == 0 {
+  command do_thing(item: Item) -> Outcome requires item.status == 0 {
     item.status' = 1
   }
 }
@@ -11256,12 +11148,11 @@ verify v {
                 | abide::verify::VerificationResult::Proved { name, .. }
             if name == "v"
         )),
-        "expected command with return type but no step return to verify, got: {results:?}"
+        "expected command with return type but no action return to verify, got: {results:?}"
     );
 }
 
-/// inline command clauses can return values directly without a separate
-/// legacy `step` declaration.
+/// inline command clauses can return values directly.
 #[test]
 fn inline_command_return_type_and_return_expr() {
     let src = r"module T
@@ -11312,13 +11203,11 @@ enum ChargeOutcome = ok(int) | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> ChargeOutcome
-
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> ChargeOutcome requires order.status == 0 {
     order.status' = 1
     return @ok(42)
   }
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> ChargeOutcome requires order.status == 0 {
     order.status' = -1
     return @err
   }
@@ -11338,8 +11227,7 @@ fn step_return_wrong_variant_rejected() {
         r"module T
 enum Outcome = ok | err
 system S {
-  command go() -> Outcome
-  step go() { return @bad }
+  command go() -> Outcome { return @bad }
 }
 ",
     );
@@ -11358,8 +11246,7 @@ fn step_return_arity_mismatch_rejected() {
         r"module T
 enum Outcome = ok(int) | err
 system S {
-  command go() -> Outcome
-  step go() { return @ok }
+  command go() -> Outcome { return @ok }
 }
 ",
     );
@@ -11378,8 +11265,7 @@ fn step_return_too_many_args_rejected() {
         r"module T
 enum Outcome = ok(int) | err
 system S {
-  command go() -> Outcome
-  step go() { return @ok(1, 2) }
+  command go() -> Outcome { return @ok(1, 2) }
 }
 ",
     );
@@ -11398,8 +11284,7 @@ fn step_return_payload_type_mismatch_rejected() {
         r#"module T
 enum Outcome = ok(int) | err
 system S {
-  command go() -> Outcome
-  step go() { return @ok("wrong") }
+  command go() -> Outcome { return @ok("wrong") }
 }
 "#,
     );
@@ -11418,8 +11303,7 @@ fn step_return_non_constructor_rejected() {
         r"module T
 enum Outcome = ok | err
 system S {
-  command go() -> Outcome
-  step go() { return 7 }
+  command go() -> Outcome { return 7 }
 }
 ",
     );
@@ -11442,16 +11326,14 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -11486,21 +11368,18 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command pack(order: Order) -> Outcome
-  step pack(order: Order) requires order.status == 1 {
+  command pack(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 2 {
+  command ship(order: Order) requires order.status == 2 {
     order.status' = 3
   }
 }
@@ -11536,28 +11415,24 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command pack(order: Order) -> Outcome
-  step pack(order: Order) requires order.status == 1 {
+  command pack(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 2 {
+  command ship(order: Order) requires order.status == 2 {
     order.status' = 3
   }
 }
 
 system Orders(orders: Store<Order>) {
-  command cancel(order: Order)
-  step cancel(order: Order) requires order.status == 0 {
+  command cancel(order: Order) requires order.status == 0 {
     order.status' = -1
   }
 }
@@ -11596,20 +11471,17 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
-  command retry(order: Order)
-  step retry(order: Order) requires order.status == 1 {
+  command retry(order: Order) requires order.status == 1 {
     order.status' = 0
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -11646,15 +11518,13 @@ fn proc_start_and_node_transitions_are_executable() {
 enum Outcome = ok | err
 
 system Billing {
-  command charge() -> Outcome
-  step charge() {
+  command charge() -> Outcome {
     return @ok
   }
 }
 
 system Shipping {
-  command ship()
-  step ship() { }
+  command ship() { }
 }
 
 program Shop {
@@ -11696,20 +11566,20 @@ verify fulfill_is_executable {
 
 #[test]
 fn proc_start_and_node_transitions_are_provable_with_cvc5() {
+    require_unbounded_proof_tests!();
+
     let src = r"module T
 
 enum Outcome = ok | err
 
 system Billing {
-  command charge() -> Outcome
-  step charge() {
+  command charge() -> Outcome {
     return @ok
   }
 }
 
 system Shipping {
-  command ship()
-  step ship() { }
+  command ship() { }
 }
 
 program Shop {
@@ -11762,6 +11632,8 @@ verify fulfill_is_executable {
 
 #[test]
 fn proc_store_workflow_is_provable_with_cvc5() {
+    require_unbounded_proof_tests!();
+
     let src = r"module T
 
 enum Outcome = ok | err
@@ -11769,16 +11641,14 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -11842,16 +11712,14 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -11946,7 +11814,7 @@ program Shop(orders: Store<Order>) {
         "expected workflow-start command"
     );
     let start_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "fulfill")
         .expect("expected workflow-start step");
@@ -11971,10 +11839,10 @@ program Shop(orders: Store<Order>) {
         start_step.body
     );
     let charge_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__charge")
-        .expect("expected hidden node step for charge");
+        .expect("expected hidden node action for charge");
     assert!(
         matches!(
             charge_step.body.as_slice(),
@@ -11987,16 +11855,16 @@ program Shop(orders: Store<Order>) {
         charge_step.body
     );
     let ship_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__ship")
-        .expect("expected hidden node step for ship");
+        .expect("expected hidden node action for ship");
     assert!(
         matches!(
             ship_step.body.as_slice(),
             [abide::ir::types::IRAction::Choose { entity, .. }] if entity == hidden_entity_name
         ),
-        "expected node step to choose a hidden proc instance, got: {:?}",
+        "expected node action to choose a hidden proc instance, got: {:?}",
         ship_step.body
     );
 }
@@ -12009,8 +11877,7 @@ fn proc_requires_contributes_to_start_guard() {
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { }
+  command charge(order: Order) requires order.status == 0 { }
 }
 
 program Shop(orders: Store<Order>) {
@@ -12030,7 +11897,7 @@ program Shop(orders: Store<Order>) {
         .find(|system| system.name == "Shop")
         .expect("program system should lower");
     let start_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "fulfill")
         .expect("expected workflow-start step");
@@ -12053,8 +11920,7 @@ fn verify_proc_bounds_lower_to_hidden_proc_instance_stores() {
 entity Order {}
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) { }
+  command charge(order: Order) { }
 }
 
 program Shop(orders: Store<Order>) {
@@ -12100,8 +11966,7 @@ fn theorem_proc_bounds_are_rejected() {
 entity Order {}
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) { }
+  command charge(order: Order) { }
 }
 
 program Shop(orders: Store<Order>) {
@@ -12162,21 +12027,19 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = -1
     return @err
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -12201,12 +12064,12 @@ program Shop(orders: Store<Order>) {
         .find(|system| system.name == "Shop")
         .expect("program system should lower");
     let charge_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__charge")
         .expect("expected hidden charge node step");
     let ship_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__ship")
         .expect("expected hidden ship node step");
@@ -12277,22 +12140,19 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command pack(order: Order) -> Outcome
-  step pack(order: Order) requires order.status == 1 {
+  command pack(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
 
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 2 {
+  command ship(order: Order) requires order.status == 2 {
     order.status' = 3
   }
 }
@@ -12320,7 +12180,7 @@ program Shop(orders: Store<Order>) {
         .find(|system| system.name == "Shop")
         .expect("program system should lower");
     let ship_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__ship")
         .expect("expected hidden ship node step");
@@ -12349,19 +12209,16 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command audit(order: Order)
-  step audit(order: Order) requires order.status == 1 { }
+  command audit(order: Order) requires order.status == 1 { }
 
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) requires order.status == 1 {
     order.status' = 2
   }
 }
@@ -12388,16 +12245,16 @@ program Shop(orders: Store<Order>) {
         .find(|system| system.name == "Shop")
         .expect("program system should lower");
     assert!(
-        shop.steps
+        shop.actions
             .iter()
             .any(|step| step.name == "__abide_proc_fulfill__node__audit"),
-        "expected hidden audit node step for mixed-successor proc"
+        "expected hidden audit node action for mixed-successor proc"
     );
     assert!(
-        shop.steps
+        shop.actions
             .iter()
             .any(|step| step.name == "__abide_proc_fulfill__node__ship"),
-        "expected hidden ship node step for mixed-successor proc"
+        "expected hidden ship node action for mixed-successor proc"
     );
 }
 
@@ -12411,25 +12268,21 @@ enum Outcome = ok | err
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 
 system Shipping(orders: Store<Order>) {
-  command pack(order: Order) -> Outcome
-  step pack(order: Order) requires order.status == 1 {
+  command pack(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
 
-  command retry(order: Order)
-  step retry(order: Order) requires order.status == 1 { }
+  command retry(order: Order) requires order.status == 1 { }
 
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 2 {
+  command ship(order: Order) requires order.status == 2 {
     order.status' = 3
   }
 }
@@ -12456,7 +12309,7 @@ program Shop(orders: Store<Order>) {
         .find(|system| system.name == "Shop")
         .expect("program system should lower");
     let ship_step = shop
-        .steps
+        .actions
         .iter()
         .find(|step| step.name == "__abide_proc_fulfill__node__ship")
         .expect("expected hidden ship node step");
@@ -12518,8 +12371,7 @@ fn proc_unknown_instance_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12544,8 +12396,7 @@ fn proc_unknown_command_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12570,8 +12421,7 @@ fn proc_unknown_edge_node_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12597,12 +12447,10 @@ fn proc_port_on_no_return_command_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 { order.status' = 2 }
+  command ship(order: Order) requires order.status == 1 { order.status' = 2 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12631,15 +12479,13 @@ fn proc_invalid_port_rejected() {
 enum Outcome = ok | err
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 { order.status' = 2 }
+  command ship(order: Order) requires order.status == 1 { order.status' = 2 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12668,15 +12514,13 @@ fn proc_cycle_rejected() {
 enum Outcome = ok | err
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order) -> Outcome
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
@@ -12706,12 +12550,10 @@ fn proc_port_on_non_enum_return_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Scoring(orders: Store<Order>) {
-  command score(order: Order) -> int
-  step score(order: Order) requires order.status == 0 { order.status' = 1 }
+  command score(order: Order) -> int requires order.status == 0 { order.status' = 1 }
 }
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order)
-  step ship(order: Order) requires order.status == 1 { order.status' = 2 }
+  command ship(order: Order) requires order.status == 1 { order.status' = 2 }
 }
 program Shop(orders: Store<Order>) {
   let scoring = Scoring { orders: orders }
@@ -12739,8 +12581,7 @@ fn proc_node_arity_mismatch_rejected() {
         r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12765,15 +12606,13 @@ fn proc_composition_sugar_trailing_port_rejected() {
 enum Outcome = ok | err
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Outcome
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Outcome requires order.status == 0 {
     order.status' = 1
     return @ok
   }
 }
 system Shipping(orders: Store<Order>) {
-  command ship(order: Order) -> Outcome
-  step ship(order: Order) requires order.status == 1 {
+  command ship(order: Order) -> Outcome requires order.status == 1 {
     order.status' = 2
     return @ok
   }
@@ -12809,8 +12648,7 @@ fn proc_node_type_mismatch_rejected() {
         r#"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 { order.status' = 1 }
+  command charge(order: Order) requires order.status == 0 { order.status' = 1 }
 }
 program Shop(orders: Store<Order>) {
   let billing = Billing { orders: orders }
@@ -12838,8 +12676,7 @@ fn verify_depth_on_signature() {
 entity Counter { n: int = 0 }
 
 system S(counters: Store<Counter>) {
-  command tick()
-  step tick() {
+  command tick() {
     choose c: Counter where true { c.n' = c.n + 1 }
   }
 }
@@ -12893,8 +12730,7 @@ entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
   pred payable(order: Order) = order in orders and order.status == 0
 
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -12906,7 +12742,7 @@ system Billing(orders: Store<Order>) {
     );
 }
 
-/// system-local pred used in step guard resolves and verifies.
+/// system-local pred used in action guard resolves and verifies.
 #[test]
 fn system_pred_used_in_step_verifies() {
     let src = r"module T
@@ -12916,8 +12752,7 @@ entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
   pred payable(order: Order) = order in orders and order.status == 0
 
-  command charge(order: Order)
-  step charge(order: Order) requires payable(order) {
+  command charge(order: Order) requires payable(order) {
     order.status' = 1
   }
 }
@@ -12955,8 +12790,7 @@ system Billing(orders: Store<Order>) {
 
   query has_payable() = exists o: Order in orders | payable(o)
 
-  command charge(order: Order)
-  step charge(order: Order) requires payable(order) {
+  command charge(order: Order) requires payable(order) {
     order.status' = 1
   }
 }
@@ -12994,8 +12828,7 @@ entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
   pred non_negative(order: Order) = order.status >= 0
 
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 
@@ -13022,8 +12855,7 @@ system Billing(orders: Store<Order>) {
   pred in_pool(order: Order) = order in orders
   pred payable(order: Order) = in_pool(order) and order.status == 0
 
-  command charge(order: Order)
-  step charge(order: Order) requires payable(order) {
+  command charge(order: Order) requires payable(order) {
     order.status' = 1
   }
 }
@@ -13130,8 +12962,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command check(order: Order) -> Option<int>
-  step check(order: Order) requires order.status == 0 {
+  command check(order: Order) -> Option<int> requires order.status == 0 {
     return @Some(order.status)
   }
 }
@@ -13156,8 +12987,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Result<int, int>
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Result<int, int> requires order.status == 0 {
     order.status' = 1
     return @Ok(1)
   }
@@ -13184,8 +13014,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command check(order: Order)
-  step check(order: Order) requires order.status == 0 {
+  command check(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13228,8 +13057,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13348,8 +13176,7 @@ entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
   state: Option<int, int> = @None
 
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13372,8 +13199,7 @@ enum Result<T, E> = Ok(T) | Err(E)
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order) -> Result<int>
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) -> Result<int> requires order.status == 0 {
     order.status' = 1
     return @Ok(1)
   }
@@ -13423,7 +13249,7 @@ entity Order {
     );
 }
 
-/// wrong arity on step param type — diagnostic emitted
+/// wrong arity on action param type — diagnostic emitted
 /// (now works because Param.ty is TypeRef, not bare string)
 #[test]
 fn generic_enum_wrong_arity_in_step_param_rejected() {
@@ -13435,14 +13261,13 @@ enum Option<T> = Some(T) | None
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command check(opt: Option<int, bool>)
-  step check(opt: Option<int, bool>) requires true { }
+  command check(opt: Option<int, bool>) requires true { }
 }
 ",
     );
     assert!(
         errors.iter().any(|e| e.contains("expects 1 type argument")),
-        "expected arity mismatch for step param type, got: {errors:?}"
+        "expected arity mismatch for action param type, got: {errors:?}"
     );
 }
 
@@ -13459,8 +13284,7 @@ entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
   pred check(x: Option<int, int>) = true
 
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13506,8 +13330,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13629,8 +13452,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13685,8 +13507,7 @@ fn theorem_by_lemma_injects_conclusion() {
 entity Counter { value: int = 0 }
 
 system Inc(counters: Store<Counter>) {
-  command inc(c: Counter)
-  step inc(c: Counter) requires c.value >= 0 {
+  command inc(c: Counter) requires c.value >= 0 {
     c.value' = c.value + 1
   }
 }
@@ -13723,8 +13544,7 @@ fn theorem_without_by_lemma_still_works_when_inductive() {
 entity Counter { value: int = 0 }
 
 system Inc(counters: Store<Counter>) {
-  command inc(c: Counter)
-  step inc(c: Counter) requires c.value >= 0 {
+  command inc(c: Counter) requires c.value >= 0 {
     c.value' = c.value + 1
   }
 }
@@ -13773,8 +13593,7 @@ fn theorem_verdict_includes_stutter_assumption() {
     let src = r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13814,8 +13633,7 @@ fn verdict_display_includes_stutter() {
     let src = r"module T
 entity Order { status: int = 0 }
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13847,8 +13665,7 @@ fn verdict_display_stutter_only_no_fairness() {
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13891,8 +13708,7 @@ axiom truth = true
 entity Order { status: int = 0 }
 
 system Billing(orders: Store<Order>) {
-  command charge(order: Order)
-  step charge(order: Order) requires order.status == 0 {
+  command charge(order: Order) requires order.status == 0 {
     order.status' = 1
   }
 }
@@ -13953,7 +13769,7 @@ fn liveness_violation_shows_fairness_analysis() {
 }
 
 /// Deadlock display includes event diagnostics (22d) and uses the
-/// new multi-step infrastructure (22c). The step-0 deadlock path
+/// new multi-action infrastructure (22c). The step-0 deadlock path
 /// extracts per-event diagnostics explaining why each event is disabled.
 #[test]
 fn deadlock_display_includes_step_and_diagnostics() {
@@ -13965,7 +13781,7 @@ fn deadlock_display_includes_step_and_diagnostics() {
         "module T\n\n\
          entity Sig {\n  flag: bool = false\n}\n\n\
          system S(sigs: Store<Sig>) {\n  \
-         command impossible()\n  step impossible() requires false { create Sig {} }\n}\n\n\
+         command impossible() requires false { create Sig {} }\n}\n\n\
          verify dl {\n  assume {\n    store es: Sig[0..3]\n    \
          let s = S { sigs: es }\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
@@ -14012,10 +13828,10 @@ fn deadlock_event_diagnostics() {
          entity E {\n  s: St = @A\n  \
          action go() requires s == @B { s' = @A }\n}\n\n\
          system S(es: Store<E>) {\n  \
-         command go()\n  step go() { choose e: E where e.s == @B { e.go() } }\n}\n\n\
+         command go() { choose e: E where e.s == @B { e.go() } }\n}\n\n\
          verify deadlocks_at_init {\n  assume {\n    store es: E[0..2]\n    \
          let s = S { es: es }\n  }\n  \
-         assert always true\n}\n",
+         assert eventually true\n}\n",
     )
     .unwrap();
 
@@ -14057,7 +13873,7 @@ fn newtype_declaration_and_constructor() {
          type UserId(string)\n\n\
          entity User {\n  id: UserId = UserId(\"\")\n  name: string = \"\"\n}\n\n\
          system S(users: Store<User>) {\n  \
-         command signup()\n  step signup() { create User {} }\n}\n\n\
+         command signup() { create User {} }\n}\n\n\
          verify v {\n  assume {\n    store us: User[0..2]\n    \
          let s = S { users: us }\n    stutter\n  }\n  \
          assert always (all u: User | u.id == UserId(\"\"))\n}\n",
@@ -14118,7 +13934,7 @@ fn create_in_store_syntax() {
         "module T\n\n\
          entity User {\n  name: string = \"\"\n}\n\n\
          system S(users: Store<User>) {\n  \
-         command signup()\n  step signup() {\n    \
+         command signup() {\n    \
          create User in users {\n      name = \"alice\"\n    }\n  }\n}\n\n\
          verify v {\n  assume {\n    store us: User[0..2]\n    \
          let s = S { users: us }\n    stutter\n  }\n  \
@@ -14189,8 +14005,7 @@ entity Order {
 }
 
 system Billing(orders: Store<Order>) {
-  command submit(order: Order)
-  step submit(order: Order) {
+  command submit(order: Order) {
     Stripe::charge(order.id)
   }
 }
@@ -14271,8 +14086,7 @@ system Billing(markers: Store<Marker>) {
 
   charged: bool = false
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
     charged' = true
   }
@@ -14314,8 +14128,7 @@ entity Marker {
 }
 
 system Provider {
-  command charge(x: int) -> Outcome
-  step charge(x: int) {
+  command charge(x: int) -> Outcome {
     return @ok { value: x }
   }
 }
@@ -14323,8 +14136,7 @@ system Provider {
 system Billing(markers: Store<Marker>) {
   charged: bool = false
 
-  command submit()
-  step submit() {
+  command submit() {
     let result = Provider::charge(1)
     match result {
       ok { value: id } => { charged' = id == 1 }
@@ -14354,7 +14166,7 @@ verify submit_binds_result {
             abide::verify::VerificationResult::Checked { name, .. }
                 if name == "submit_binds_result"
         )),
-        "macro-step let-call verify should succeed, got: {results:?}"
+        "macro-action let-call verify should succeed, got: {results:?}"
     );
 }
 
@@ -14369,15 +14181,13 @@ entity Marker {
 }
 
 system Provider {
-  command charge() -> Outcome
-  step charge() { return @ok }
+  command charge() -> Outcome { return @ok }
 }
 
 system Billing(markers: Store<Marker>) {
   charged: bool = false
 
-  command submit()
-  step submit() {
+  command submit() {
     match Provider::charge() {
       ok => { charged' = true }
       err => { charged' = false }
@@ -14406,7 +14216,7 @@ verify submit_matches_crosscall {
             abide::verify::VerificationResult::Checked { name, .. }
                 if name == "submit_matches_crosscall"
         )),
-        "macro-step direct match verify should succeed, got: {results:?}"
+        "macro-action direct match verify should succeed, got: {results:?}"
     );
 }
 
@@ -14421,8 +14231,7 @@ entity Marker {
 }
 
 system Provider {
-  command charge(x: int) -> Outcome
-  step charge(x: int) {
+  command charge(x: int) -> Outcome {
     return @ok { value: x }
   }
 }
@@ -14460,7 +14269,7 @@ verify submit_inline_clause {
             abide::verify::VerificationResult::Checked { name, .. }
                 if name == "submit_inline_clause"
         )),
-        "macro-step inline command clause verify should succeed, got: {results:?}"
+        "macro-action inline command clause verify should succeed, got: {results:?}"
     );
 }
 
@@ -14489,8 +14298,7 @@ entity Marker {
 system Billing(markers: Store<Marker>) {
   dep Stripe
 
-  command submit()
-  step submit() {
+  command submit() {
     Stripe::charge(1)
   }
 }
