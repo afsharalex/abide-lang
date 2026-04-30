@@ -420,6 +420,22 @@ impl<'a> ExplicitModel<'a> {
             }
             initial_entity_slots.push(slots);
         }
+        for range in system.store_ranges().values() {
+            if range.max_active != range.slot_count {
+                return Ok(None);
+            }
+            let Some(&entity_index) = entity_indices.get(&range.entity_type) else {
+                continue;
+            };
+            for slot in range.start_slot..range.start_slot + range.min_active {
+                if let Some(slot_state) = initial_entity_slots
+                    .get_mut(entity_index)
+                    .and_then(|slots| slots.get_mut(slot))
+                {
+                    slot_state.active = true;
+                }
+            }
+        }
 
         Ok(Some((
             Self {
@@ -1355,7 +1371,7 @@ pub fn explore_verify_state_space(
             .map(|store| ExplicitStateSpaceStoreBound {
                 name: store.name.clone(),
                 entity_type: store.entity_type.clone(),
-                slots: store.hi.max(1) as usize,
+                slots: usize::try_from(store.hi.max(1)).unwrap_or(1),
             })
             .collect(),
         states: nodes

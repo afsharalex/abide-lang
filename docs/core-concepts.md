@@ -35,6 +35,8 @@ system Banking(accounts: Store<Account>[..8]) {
 }
 ```
 
+Store bounds are finite and active. An exact bound such as `Store<Account>[3]` starts with three active accounts. A range such as `Store<Account>[1..8]` starts with one active account and may grow through create actions until it reaches eight. An at-most bound such as `Store<Account>[..8]` starts empty.
+
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
 - Store bounds are finite: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.

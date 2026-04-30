@@ -111,6 +111,7 @@ abide verify order.ab
 - `entity` declares stateful domain objects with fields and actions.
 - `system ... (orders: Store<Order>[..4])` declares a system over a finite pool of entities.
 - Store bounds can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
+- The lower bound is the initial active population. `[1..4]` starts with one active entity and can grow to four; `[..4]` starts empty.
 - `command` declares a public system operation and may include its body inline.
 - `verify` checks universal properties.
 - `scene` checks existential witness scenarios.

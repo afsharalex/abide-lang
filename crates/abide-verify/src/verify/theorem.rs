@@ -592,7 +592,7 @@ pub(super) fn check_theorem_block(
             solver.set_timeout(timeout_ms);
         }
 
-        for c in initial_state_constraints(&pool) {
+        for c in initial_state_constraints(&pool, &HashMap::new()) {
             solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, &relevant_entities) {
@@ -806,7 +806,7 @@ pub(super) fn check_theorem_block(
             solver.set_timeout(timeout_ms);
         }
 
-        for c in initial_state_constraints(&pool) {
+        for c in initial_state_constraints(&pool, &HashMap::new()) {
             solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, &relevant_entities) {
@@ -1100,7 +1100,7 @@ fn try_ic3_on_theorem(
                 file: theorem.file.clone(),
             });
         }
-        for c in initial_state_constraints(&pool) {
+        for c in initial_state_constraints(&pool, &HashMap::new()) {
             probe_solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, system.relevant_entities()) {

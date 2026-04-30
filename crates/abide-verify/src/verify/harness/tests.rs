@@ -566,9 +566,88 @@ fn initial_state_all_inactive() {
     scopes.insert("Order".to_owned(), 3);
     let pool = create_slot_pool(&[entity], &scopes, 2);
 
-    let constraints = initial_state_constraints(&pool);
+    let constraints = initial_state_constraints(&pool, &HashMap::new());
     // 3 slots should produce 3 "not active at step 0" constraints
     assert_eq!(constraints.len(), 3);
+}
+
+#[test]
+fn initial_state_activates_store_lower_bound_prefix() {
+    let entity = make_order_entity();
+    let mut scopes = HashMap::new();
+    scopes.insert("Order".to_owned(), 3);
+    let pool = create_slot_pool(&[entity], &scopes, 0);
+    let mut ranges = HashMap::new();
+    ranges.insert(
+        "orders".to_owned(),
+        crate::verify::scope::VerifyStoreRange {
+            entity_type: "Order".to_owned(),
+            start_slot: 0,
+            slot_count: 2,
+            min_active: 1,
+            max_active: 2,
+        },
+    );
+
+    let constraints = initial_state_constraints(&pool, &ranges);
+    assert_eq!(constraints.len(), 3);
+
+    let solver = AbideSolver::new();
+    for constraint in &constraints {
+        solver.assert(constraint);
+    }
+    if let Some(SmtValue::Bool(active_0)) = pool.active_at("Order", 0, 0) {
+        solver.assert(smt::bool_not(active_0));
+    }
+    assert_eq!(
+        solver.check(),
+        SatResult::Unsat,
+        "slot 0 is inside the store lower-bound prefix and must start active"
+    );
+}
+
+#[test]
+fn store_active_cardinality_constraints_enforce_exact_store_population() {
+    let entity = make_order_entity();
+    let mut scopes = HashMap::new();
+    scopes.insert("Order".to_owned(), 2);
+    let pool = create_slot_pool(&[entity], &scopes, 0);
+    let mut ranges = HashMap::new();
+    ranges.insert(
+        "orders".to_owned(),
+        crate::verify::scope::VerifyStoreRange {
+            entity_type: "Order".to_owned(),
+            start_slot: 0,
+            slot_count: 2,
+            min_active: 1,
+            max_active: 1,
+        },
+    );
+
+    let constraints = store_active_cardinality_constraints(&pool, &ranges);
+    let both_inactive = AbideSolver::new();
+    for constraint in &constraints {
+        both_inactive.assert(constraint);
+    }
+    if let Some(SmtValue::Bool(active_0)) = pool.active_at("Order", 0, 0) {
+        both_inactive.assert(smt::bool_not(active_0));
+    }
+    if let Some(SmtValue::Bool(active_1)) = pool.active_at("Order", 1, 0) {
+        both_inactive.assert(smt::bool_not(active_1));
+    }
+    assert_eq!(both_inactive.check(), SatResult::Unsat);
+
+    let exactly_one = AbideSolver::new();
+    for constraint in &constraints {
+        exactly_one.assert(constraint);
+    }
+    if let Some(SmtValue::Bool(active_0)) = pool.active_at("Order", 0, 0) {
+        exactly_one.assert(active_0);
+    }
+    if let Some(SmtValue::Bool(active_1)) = pool.active_at("Order", 1, 0) {
+        exactly_one.assert(smt::bool_not(active_1));
+    }
+    assert_eq!(exactly_one.check(), SatResult::Sat);
 }
 
 #[test]

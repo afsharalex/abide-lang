@@ -917,6 +917,9 @@ fn relational_stateful_scene_spec(
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     let mut entities = HashMap::new();
     for store in &scene.stores {
+        if store.lo > 0 || store.hi <= 0 {
+            return Ok(None);
+        }
         if !system
             .entities
             .iter()
@@ -1850,6 +1853,9 @@ fn relational_verify_spec(
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     let mut entities = HashMap::new();
     for store in &verify.stores {
+        if store.lo > 0 || store.hi <= 0 {
+            return Ok(None);
+        }
         if !system
             .entities
             .iter()

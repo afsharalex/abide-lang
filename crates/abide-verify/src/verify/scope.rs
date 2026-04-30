@@ -21,6 +21,8 @@ pub struct VerifyStoreRange {
     pub entity_type: String,
     pub start_slot: usize,
     pub slot_count: usize,
+    pub min_active: usize,
+    pub max_active: usize,
 }
 
 /// Compute the canonical entity scope and reachable systems for a
@@ -82,8 +84,12 @@ pub(super) fn compute_verify_scope(
     // independent slots. Example: two `Order[0..3]` stores → 6 slots total.
     for store in &verify_block.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let hi = store.hi.max(1) as usize;
-        bound = bound.max(hi);
+        let slot_count = store.hi.max(1) as usize;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let lo = store.lo.max(0) as usize;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let max_active = store.hi.max(0) as usize;
+        bound = bound.max(slot_count);
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         // Track this store's slot range before accumulating.
         store_ranges.insert(
@@ -91,11 +97,13 @@ pub(super) fn compute_verify_scope(
             VerifyStoreRange {
                 entity_type: store.entity_type.clone(),
                 start_slot: existing,
-                slot_count: hi,
+                slot_count,
+                min_active: lo,
+                max_active,
             },
         );
         // Each store gets its own slot range within the entity pool.
-        scope.insert(store.entity_type.clone(), existing + hi);
+        scope.insert(store.entity_type.clone(), existing + slot_count);
     }
 
     // Collect system names from the verify target list.
@@ -961,7 +969,7 @@ mod tests {
                 IRStoreDecl {
                     name: "pending".to_owned(),
                     entity_type: "Order".to_owned(),
-                    lo: 0,
+                    lo: 1,
                     hi: 2,
                 },
                 IRStoreDecl {
@@ -990,7 +998,13 @@ mod tests {
         assert!(systems.contains(&"Orders".to_owned()));
         assert!(systems.contains(&"Audit".to_owned()));
         assert_eq!(ranges["pending"].start_slot, 0);
+        assert_eq!(ranges["pending"].slot_count, 2);
+        assert_eq!(ranges["pending"].min_active, 1);
+        assert_eq!(ranges["pending"].max_active, 2);
         assert_eq!(ranges["archived"].start_slot, 2);
+        assert_eq!(ranges["archived"].slot_count, 3);
+        assert_eq!(ranges["archived"].min_active, 0);
+        assert_eq!(ranges["archived"].max_active, 3);
     }
 
     #[test]

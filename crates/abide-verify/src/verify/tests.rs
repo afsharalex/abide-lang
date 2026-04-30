@@ -21720,6 +21720,35 @@ fn relational_scene_fragment_detects_create_only_cardinality_scene() {
 }
 
 #[test]
+fn scene_store_lower_bound_activates_initial_entities() {
+    let ir = lower_source_file(
+        "scene_store_lower_bound.ab",
+        "module StoreCardinality\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {}\n\n\
+         scene lower_bound_active {\n\
+           given {\n\
+             store orders: Order[1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           then {\n\
+             assert exists o: Order in orders | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "lower_bound_active")),
+        "store lower bound should provide an initial active entity: {results:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_passes_exact_two_creates() {
     let ir = lower_source_file(
         "rel_scene_pass.ab",
@@ -23086,6 +23115,36 @@ fn relational_verify_fragment_detects_create_only_bounded_verify() {
         relational::supports_verify_fragment(&ir, verify)
             .expect("support detection should succeed"),
         "create-only bounded verify should be routed to relational backend"
+    );
+}
+
+#[test]
+fn verify_store_lower_bound_activates_initial_entities() {
+    let ir = lower_source_file(
+        "verify_store_lower_bound.ab",
+        "module StoreCardinality\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {}\n\n\
+         verify lower_bound_active_verify {\n\
+           assume {\n\
+             stutter\n\
+             store orders: Order[1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always (exists o: Order in orders | o.status == @Pending)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &short_solver_regression_config());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }
+                if name == "lower_bound_active_verify"
+        )),
+        "store lower bound should provide an initial active entity for verify blocks: {results:?}"
     );
 }
 

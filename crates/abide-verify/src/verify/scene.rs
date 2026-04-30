@@ -16,6 +16,7 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::harness::{
     self, create_slot_pool_with_systems, domain_constraints, encode_step_with_params,
+    store_active_cardinality_constraints,
 };
 use super::property::{encode_prop_expr_with_ctx, encode_prop_value_with_ctx, PropertyCtx};
 use super::scope::{
@@ -584,6 +585,18 @@ pub(super) fn check_scene_block(
                     entity_type: entity_type.clone(),
                     start_slot: *start_slot,
                     slot_count: *slot_count,
+                    min_active: scene
+                        .stores
+                        .iter()
+                        .find(|store| store.name == *store_name)
+                        .map(|store| usize::try_from(store.lo.max(0)).unwrap_or(usize::MAX))
+                        .unwrap_or(0),
+                    max_active: scene
+                        .stores
+                        .iter()
+                        .find(|store| store.name == *store_name)
+                        .map(|store| usize::try_from(store.hi.max(0)).unwrap_or(usize::MAX))
+                        .unwrap_or(*slot_count),
                 },
             )
         })
@@ -832,16 +845,35 @@ pub(super) fn check_scene_block(
         .values()
         .map(|(entity, slot)| (entity.clone(), *slot))
         .collect();
+    let lower_bound_active_slots: HashSet<(String, usize)> = scene_property_store_ranges
+        .values()
+        .flat_map(|range| {
+            (range.start_slot..range.start_slot + range.min_active)
+                .map(|slot| (range.entity_type.clone(), slot))
+        })
+        .collect();
+    for (entity, slot) in &lower_bound_active_slots {
+        if let Some(SmtValue::Bool(active)) = pool.active_at(entity, *slot, 0) {
+            solver.assert(active);
+        }
+    }
     for entity in &relevant_entities {
         let n_slots = pool.slots_for(&entity.name);
         for slot in 0..n_slots {
             if activated_slots.contains(&(entity.name.clone(), slot)) {
                 continue; // already activated by a given or activate declaration
             }
+            if lower_bound_active_slots.contains(&(entity.name.clone(), slot)) {
+                continue; // initialized active by the store lower bound
+            }
             if let Some(SmtValue::Bool(active)) = pool.active_at(&entity.name, slot, 0) {
                 solver.assert(smt::bool_not(active));
             }
         }
+    }
+
+    for c in store_active_cardinality_constraints(&pool, &scene_property_store_ranges) {
+        solver.assert(&c);
     }
 
     // ── 4a. Validate scene events and determine referenced vars ────

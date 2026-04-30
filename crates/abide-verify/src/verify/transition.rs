@@ -14,8 +14,9 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::harness::{
     create_slot_pool_with_systems, domain_constraints, initial_state_constraints, lasso_loopback,
-    symmetry_breaking_constraints, try_fairness_constraints, try_system_field_initial_constraints,
-    try_transition_constraints_with_fire, FireTracking, LassoLoop, SlotPool,
+    store_active_cardinality_constraints, symmetry_breaking_constraints, try_fairness_constraints,
+    try_system_field_initial_constraints, try_transition_constraints_with_fire, FireTracking,
+    LassoLoop, SlotPool,
 };
 use super::ic3;
 use super::scope::{
@@ -617,7 +618,11 @@ impl<'a> TransitionSmtEncoding<'a> {
             steps,
             system.relevant_systems(),
         );
-        let initial_constraints = initial_state_constraints(&pool);
+        let mut initial_constraints = initial_state_constraints(&pool, system.store_ranges());
+        initial_constraints.extend(store_active_cardinality_constraints(
+            &pool,
+            system.store_ranges(),
+        ));
         let system_initial_constraints = if plan.include_system_initial_constraints {
             let mut out = Vec::new();
             for sys in system.relevant_systems() {

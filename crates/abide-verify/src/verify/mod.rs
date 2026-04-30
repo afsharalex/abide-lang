@@ -75,7 +75,8 @@ use crate::ir::types::{IRAction, IRExpr, IRProgram, IRSystem, IRType, IRVerify};
 pub use self::chc::ChcSelection;
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints, SlotPool,
+    create_slot_pool_with_systems, domain_constraints, initial_state_constraints,
+    store_active_cardinality_constraints, SlotPool,
 };
 use self::smt::SmtValue;
 use self::solver::{
@@ -2656,7 +2657,10 @@ fn try_induction_on_verify(
         let solver = AbideSolver::new();
         solver.set_timeout(config.induction_timeout_ms);
 
-        for c in initial_state_constraints(&pool) {
+        for c in initial_state_constraints(&pool, system.store_ranges()) {
+            solver.assert(&c);
+        }
+        for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
             solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
