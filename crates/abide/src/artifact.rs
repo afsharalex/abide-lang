@@ -6,8 +6,8 @@ use miette::{Context, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 
 use crate::simulate::SimulationResult;
-use crate::verify::VerificationResult;
-use crate::witness::{op, EvidenceEnvelope, EvidencePayload, WitnessPayload, WitnessValue};
+use crate::verify::{DeadlockEventDiag, VerificationResult};
+use crate::witness::{op, rel, EvidenceEnvelope, EvidencePayload, WitnessPayload, WitnessValue};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceArtifactBundle {
@@ -173,6 +173,8 @@ pub enum TraceTopology {
 pub struct TraceFrame {
     index: usize,
     facts: Vec<TraceFact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocked_guards: Vec<TraceBlockedGuard>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transition_to_next: Option<TraceTransition>,
 }
@@ -182,6 +184,13 @@ pub struct TraceFact {
     owner: String,
     field: String,
     value: WitnessValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceBlockedGuard {
+    system: String,
+    event: String,
+    reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,23 +282,37 @@ fn verification_artifact(
     result: &VerificationResult,
     config: &VerifyArtifactConfig<'_>,
 ) -> Option<TraceArtifact> {
-    let (name, outcome, evidence) = match result {
+    let (name, outcome, evidence, deadlock_diagnostics) = match result {
         VerificationResult::Counterexample { name, evidence, .. } => {
-            (name.clone(), "counterexample", evidence.clone()?)
+            (name.clone(), "counterexample", evidence.clone()?, None)
         }
-        VerificationResult::Deadlock { name, evidence, .. } => {
-            (name.clone(), "deadlock", evidence.clone()?)
-        }
+        VerificationResult::Deadlock {
+            name,
+            evidence,
+            event_diagnostics,
+            ..
+        } => (
+            name.clone(),
+            "deadlock",
+            evidence.clone()?,
+            Some(event_diagnostics),
+        ),
         VerificationResult::LivenessViolation { name, evidence, .. } => {
-            (name.clone(), "liveness_violation", evidence.clone()?)
+            (name.clone(), "liveness_violation", evidence.clone()?, None)
+        }
+        VerificationResult::ScenePass { name, evidence, .. } => {
+            (name.clone(), "scene_pass", evidence.clone()?, None)
         }
         VerificationResult::Admitted { name, evidence, .. } => {
-            (name.clone(), "admitted", evidence.clone()?)
+            (name.clone(), "admitted", evidence.clone()?, None)
         }
         _ => return None,
     };
 
-    let normalized_trace = normalized_trace_for_evidence(&evidence);
+    let mut normalized_trace = normalized_trace_for_evidence(&evidence);
+    if let (Some(trace), Some(diagnostics)) = (&mut normalized_trace, deadlock_diagnostics) {
+        attach_blocked_guard_diagnostics(trace, diagnostics);
+    }
 
     Some(TraceArtifact {
         id: 0,
@@ -341,18 +364,42 @@ fn normalized_trace_for_evidence(evidence: &EvidenceEnvelope) -> Option<Normaliz
     let EvidencePayload::Witness(witness) = evidence.payload() else {
         return None;
     };
-    let WitnessPayload::Operational(witness) = witness.payload() else {
-        return None;
-    };
-    let topology = match witness {
-        op::OperationalWitness::Counterexample { .. } | op::OperationalWitness::Deadlock { .. } => {
-            TraceTopology::Linear
+    match witness.payload() {
+        WitnessPayload::Operational(witness) => {
+            let topology = match witness {
+                op::OperationalWitness::Counterexample { .. }
+                | op::OperationalWitness::Deadlock { .. } => TraceTopology::Linear,
+                op::OperationalWitness::Liveness { witness } => TraceTopology::Lasso {
+                    loop_start: witness.loop_start(),
+                },
+            };
+            Some(normalized_trace_from_behavior(witness.behavior(), topology))
         }
-        op::OperationalWitness::Liveness { witness } => TraceTopology::Lasso {
-            loop_start: witness.loop_start(),
-        },
+        WitnessPayload::Relational(witness) => Some(normalized_trace_from_relational(witness)),
+        _ => None,
+    }
+}
+
+fn attach_blocked_guard_diagnostics(
+    trace: &mut NormalizedTrace,
+    diagnostics: &[DeadlockEventDiag],
+) {
+    let Some(frame) = trace.frames.last_mut() else {
+        return;
     };
-    Some(normalized_trace_from_behavior(witness.behavior(), topology))
+    frame.blocked_guards.extend(
+        diagnostics
+            .iter()
+            .map(trace_blocked_guard_from_deadlock_diag),
+    );
+}
+
+fn trace_blocked_guard_from_deadlock_diag(diagnostic: &DeadlockEventDiag) -> TraceBlockedGuard {
+    TraceBlockedGuard {
+        system: diagnostic.system.clone(),
+        event: diagnostic.event.clone(),
+        reason: diagnostic.reason.clone(),
+    }
 }
 
 fn normalized_trace_from_behavior(
@@ -366,6 +413,7 @@ fn normalized_trace_from_behavior(
         .map(|(index, state)| TraceFrame {
             index,
             facts: trace_facts_for_state(state),
+            blocked_guards: Vec::new(),
             transition_to_next: behavior.transition_after_state(index).map(|transition| {
                 let next = behavior.state(index + 1);
                 trace_transition(transition, state, next)
@@ -481,6 +529,118 @@ fn trace_changes_between_states(before: &op::State, after: &op::State) -> Vec<Tr
             })
         })
         .collect()
+}
+
+fn normalized_trace_from_relational(witness: &rel::RelationalWitness) -> NormalizedTrace {
+    match witness {
+        rel::RelationalWitness::Snapshot(state) => NormalizedTrace {
+            topology: TraceTopology::Linear,
+            frames: vec![TraceFrame {
+                index: 0,
+                facts: trace_facts_for_relational_state(state),
+                blocked_guards: Vec::new(),
+                transition_to_next: None,
+            }],
+        },
+        rel::RelationalWitness::Temporal(temporal) => {
+            let topology = temporal
+                .loop_start()
+                .map_or(TraceTopology::Linear, |loop_start| TraceTopology::Lasso {
+                    loop_start,
+                });
+            let frames = temporal
+                .states()
+                .iter()
+                .enumerate()
+                .map(|(index, state)| {
+                    let next = temporal.states().get(index + 1);
+                    let facts = trace_facts_for_relational_state(state);
+                    TraceFrame {
+                        index,
+                        blocked_guards: Vec::new(),
+                        transition_to_next: next.map(|next| TraceTransition {
+                            label: format!("relational step {index}"),
+                            atomic_steps: Vec::new(),
+                            observations: Vec::new(),
+                            changes: trace_changes_between_relation_states(state, next),
+                        }),
+                        facts,
+                    }
+                })
+                .collect();
+            NormalizedTrace { topology, frames }
+        }
+    }
+}
+
+fn trace_facts_for_relational_state(state: &rel::RelationalState) -> Vec<TraceFact> {
+    let mut facts = Vec::new();
+    for relation in state.relation_instances() {
+        facts.push(TraceFact {
+            owner: render_relation_id(relation.id()),
+            field: "tuples".to_owned(),
+            value: WitnessValue::Set(
+                relation
+                    .relation()
+                    .tuples()
+                    .iter()
+                    .map(|tuple| WitnessValue::Tuple(tuple.values().to_vec()))
+                    .collect(),
+            ),
+        });
+    }
+    for (name, value) in state.evaluations() {
+        facts.push(TraceFact {
+            owner: "Evaluation".to_owned(),
+            field: name.clone(),
+            value: value.clone(),
+        });
+    }
+    facts.sort_by(|left, right| (&left.owner, &left.field).cmp(&(&right.owner, &right.field)));
+    facts
+}
+
+fn relation_state_value_map(
+    state: &rel::RelationalState,
+) -> BTreeMap<(String, String), WitnessValue> {
+    trace_facts_for_relational_state(state)
+        .into_iter()
+        .map(|fact| ((fact.owner, fact.field), fact.value))
+        .collect()
+}
+
+fn trace_changes_between_relation_states(
+    before: &rel::RelationalState,
+    after: &rel::RelationalState,
+) -> Vec<TraceChange> {
+    let before = relation_state_value_map(before);
+    let after = relation_state_value_map(after);
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|(owner, field)| {
+            let before_value = before.get(&(owner.clone(), field.clone())).cloned();
+            let after_value = after.get(&(owner.clone(), field.clone())).cloned();
+            (before_value != after_value).then_some(TraceChange {
+                owner,
+                field,
+                before: before_value,
+                after: after_value,
+            })
+        })
+        .collect()
+}
+
+fn render_relation_id(id: &rel::RelationId) -> String {
+    match id {
+        rel::RelationId::StoreExtent { store } => format!("store {store}"),
+        rel::RelationId::Field { owner, field } => format!("{owner}.{field}"),
+        rel::RelationId::Named { name } => name.clone(),
+        rel::RelationId::Derived { name } => format!("derived {name}"),
+    }
 }
 
 fn simulation_outcome(simulation: &SimulationResult) -> &'static str {
@@ -626,6 +786,7 @@ pub fn render_trace_artifact_draw(artifact: &TraceArtifact) -> Result<String, St
                 render_trace_value(&fact.value)
             ));
         }
+        render_blocked_guards(&mut out, &frame.blocked_guards, "  ");
         if let Some(transition) = &frame.transition_to_next {
             out.push_str(&format!("  -- {} -->\n", transition.label));
             for step in &transition.atomic_steps {
@@ -702,7 +863,7 @@ pub fn render_trace_artifact_state(
         frame.index,
         marker
     ));
-    if frame.facts.is_empty() {
+    if frame.facts.is_empty() && frame.blocked_guards.is_empty() {
         out.push_str("  no active state facts\n");
         return Ok(out);
     }
@@ -714,6 +875,7 @@ pub fn render_trace_artifact_state(
             render_trace_value(&fact.value)
         ));
     }
+    render_blocked_guards(&mut out, &frame.blocked_guards, "  ");
     Ok(out)
 }
 
@@ -795,6 +957,19 @@ fn render_topology(topology: &TraceTopology) -> String {
     match topology {
         TraceTopology::Linear => "linear".to_owned(),
         TraceTopology::Lasso { loop_start } => format!("lasso(loop_start={loop_start})"),
+    }
+}
+
+fn render_blocked_guards(out: &mut String, blocked_guards: &[TraceBlockedGuard], indent: &str) {
+    if blocked_guards.is_empty() {
+        return;
+    }
+    out.push_str(&format!("{indent}blocked guards:\n"));
+    for guard in blocked_guards {
+        out.push_str(&format!(
+            "{indent}  {}::{} blocked: {}\n",
+            guard.system, guard.event, guard.reason
+        ));
     }
 }
 
@@ -950,6 +1125,50 @@ mod tests {
             .expect("valid evidence")
     }
 
+    fn sample_relational_evidence() -> EvidenceEnvelope {
+        let state0 = rel::RelationalState::builder()
+            .extent_member("orders", op::EntitySlotRef::new("Order", 0))
+            .expect("extent member")
+            .field_relation(
+                "Order",
+                "paid",
+                rel::RelationInstance::builder(2)
+                    .tuple(rel::TupleValue::new(vec![
+                        WitnessValue::SlotRef(op::EntitySlotRef::new("Order", 0)),
+                        WitnessValue::Bool(false),
+                    ]))
+                    .expect("tuple")
+                    .build()
+                    .expect("relation"),
+            )
+            .expect("field relation")
+            .build()
+            .expect("state");
+        let state1 = rel::RelationalState::builder()
+            .extent_member("orders", op::EntitySlotRef::new("Order", 0))
+            .expect("extent member")
+            .field_relation(
+                "Order",
+                "paid",
+                rel::RelationInstance::builder(2)
+                    .tuple(rel::TupleValue::new(vec![
+                        WitnessValue::SlotRef(op::EntitySlotRef::new("Order", 0)),
+                        WitnessValue::Bool(true),
+                    ]))
+                    .expect("tuple")
+                    .build()
+                    .expect("relation"),
+            )
+            .expect("field relation")
+            .build()
+            .expect("state");
+        let temporal =
+            rel::TemporalRelationalWitness::new(vec![state0, state1], None).expect("temporal");
+        let witness = rel::RelationalWitness::temporal(temporal).expect("relational witness");
+        EvidenceEnvelope::witness(WitnessEnvelope::relational(witness).expect("valid envelope"))
+            .expect("valid evidence")
+    }
+
     fn verify_config() -> VerifyArtifactConfig<'static> {
         VerifyArtifactConfig {
             solver: "z3",
@@ -996,6 +1215,86 @@ mod tests {
             json["normalized_trace"]["frames"][0]["transition_to_next"]["changes"][0]["field"],
             "balance"
         );
+    }
+
+    #[test]
+    fn scene_pass_artifacts_keep_replayable_evidence() {
+        let results = vec![VerificationResult::ScenePass {
+            name: "happy_path".to_owned(),
+            time_ms: 12,
+            evidence: Some(sample_evidence()),
+            span: None,
+            file: None,
+        }];
+
+        let artifacts = verification_trace_artifacts(&results, &verify_config());
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].name(), "happy_path");
+        assert_eq!(artifacts[0].outcome(), "scene_pass");
+        let draw = render_trace_artifact_draw(&artifacts[0]).expect("scene draw");
+        assert!(draw.contains("-- Banking::withdraw -->"), "{draw}");
+    }
+
+    #[test]
+    fn relational_witness_artifacts_get_normalized_trace_frames() {
+        let results = vec![VerificationResult::Counterexample {
+            name: "paid_safety".to_owned(),
+            evidence: Some(sample_relational_evidence()),
+            evidence_extraction_error: None,
+            assumptions: vec![],
+            span: None,
+            file: None,
+        }];
+
+        let artifacts = verification_trace_artifacts(&results, &verify_config());
+
+        assert_eq!(artifacts.len(), 1);
+        let json = serde_json::to_value(&artifacts[0]).expect("serialize artifact");
+        assert_eq!(
+            json["normalized_trace"]["frames"][0]["facts"][0]["owner"],
+            "Order.paid"
+        );
+        assert_eq!(
+            json["normalized_trace"]["frames"][0]["transition_to_next"]["label"],
+            "relational step 0"
+        );
+        let draw = render_trace_artifact_draw(&artifacts[0]).expect("draw relational trace");
+        assert!(draw.contains("Order.paid.tuples"), "{draw}");
+        assert!(draw.contains("relational step 0"), "{draw}");
+    }
+
+    #[test]
+    fn deadlock_artifacts_attach_blocked_guard_diagnostics_to_final_frame() {
+        let results = vec![VerificationResult::Deadlock {
+            name: "workflow_progress".to_owned(),
+            evidence: Some(sample_evidence()),
+            evidence_extraction_error: None,
+            step: 1,
+            reason: "no enabled events".to_owned(),
+            event_diagnostics: vec![DeadlockEventDiag {
+                system: "Banking".to_owned(),
+                event: "withdraw".to_owned(),
+                reason: "guard `balance > 0` is false".to_owned(),
+            }],
+            assumptions: vec![],
+            span: None,
+            file: None,
+        }];
+
+        let artifacts = verification_trace_artifacts(&results, &verify_config());
+
+        assert_eq!(artifacts.len(), 1);
+        let json = serde_json::to_value(&artifacts[0]).expect("serialize artifact");
+        assert_eq!(
+            json["normalized_trace"]["frames"][1]["blocked_guards"][0]["reason"],
+            "guard `balance > 0` is false"
+        );
+        let draw = render_trace_artifact_draw(&artifacts[0]).expect("draw deadlock trace");
+        assert!(draw.contains("blocked guards"), "{draw}");
+        assert!(draw.contains("Banking::withdraw blocked"), "{draw}");
+        let state = render_trace_artifact_state(&artifacts[0], 1).expect("deadlock state");
+        assert!(state.contains("guard `balance > 0` is false"), "{state}");
     }
 
     #[test]

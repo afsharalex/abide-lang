@@ -1215,7 +1215,7 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
 
 // ── Counterexample extraction ───────────────────────────────────────
 
-fn render_ir_type(ty: &IRType) -> String {
+pub(super) fn render_ir_type(ty: &IRType) -> String {
     match ty {
         IRType::Int => "Int".to_owned(),
         IRType::Bool => "Bool".to_owned(),
@@ -1244,7 +1244,7 @@ fn render_ir_type(ty: &IRType) -> String {
     }
 }
 
-fn extract_witness_value(
+pub(super) fn extract_witness_value(
     model: &Model,
     val: &SmtValue,
     variants: &super::context::VariantMap,
@@ -1380,7 +1380,7 @@ fn extract_witness_value(
     }
 }
 
-fn extract_state_from_model(
+pub(super) fn extract_state_from_model(
     model: &Model,
     pool: &SlotPool,
     vctx: &VerifyContext,

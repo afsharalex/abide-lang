@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use abide_witness::{op, EvidenceEnvelope, WitnessEnvelope};
+
 use super::smt::{self, AbideSolver, Bool, Int, SatResult};
 
 use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSystemAction};
@@ -25,8 +27,8 @@ use super::scope::{
 };
 use super::smt::SmtValue;
 use super::walkers::{
-    collect_event_body_entities, collect_field_refs_in_expr, elapsed_ms,
-    find_unsupported_scene_expr, scan_event_creates,
+    collect_event_body_entities, collect_field_refs_in_expr, elapsed_ms, extract_state_from_model,
+    extract_witness_value, find_unsupported_scene_expr, scan_event_creates,
 };
 use super::{
     clamp_timeout_to_deadline, collect_var_refs_in_expr, expand_through_defs, expr_span,
@@ -358,6 +360,136 @@ pub(super) fn build_scene_event_params(
         override_params.insert(param.name.clone(), val);
     }
     Ok(override_params)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scene_pass_evidence(
+    solver: &AbideSolver,
+    pool: &harness::SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    relevant_entities: &[crate::ir::types::IREntity],
+    relevant_systems: &[crate::ir::types::IRSystem],
+    resolved_events: &[ResolvedSceneEvent<'_>],
+    instances: &[FiringInst],
+    given_bindings: &HashMap<String, (String, usize)>,
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+    bound: usize,
+) -> Result<EvidenceEnvelope, String> {
+    let model = solver
+        .get_model()
+        .ok_or_else(|| "solver did not provide a model for scene witness extraction".to_owned())?;
+    let mut behavior = op::Behavior::builder();
+    for step in 0..=bound {
+        behavior = behavior.state(extract_state_from_model(
+            &model,
+            pool,
+            vctx,
+            relevant_entities,
+            relevant_systems,
+            step,
+        )?);
+
+        if step < bound {
+            let mut transition = op::Transition::builder();
+            let mut selected = 0usize;
+            for inst in instances {
+                let Some(inst_step) = model
+                    .eval(&inst.step_var, true)
+                    .and_then(|value| value.as_i64())
+                else {
+                    continue;
+                };
+                if inst_step != step as i64 {
+                    continue;
+                }
+                if let Some(fires) = &inst.fires_var {
+                    let Some(true) = model.eval(fires, true).and_then(|value| value.as_bool())
+                    else {
+                        continue;
+                    };
+                }
+                let re = &resolved_events[inst.event_idx];
+                let step_ir = re.steps[0];
+                let params = build_scene_event_params(
+                    re,
+                    pool,
+                    vctx,
+                    defs,
+                    given_bindings,
+                    store_ranges,
+                    step,
+                    "<scene>",
+                )?;
+                let step_id = op::AtomicStepId::new(format!(
+                    "{step}:{}::{}#{}",
+                    re.scene_event.system,
+                    re.scene_event.event,
+                    inst.inst_idx + 1
+                ))
+                .map_err(|err| format!("generated scene atomic step id is invalid: {err}"))?;
+                let mut atomic = op::AtomicStep::builder(
+                    step_id,
+                    re.scene_event.system.clone(),
+                    re.scene_event.event.clone(),
+                )
+                .step_name(format!("scene:{}", re.scene_event.var));
+                for param in &step_ir.params {
+                    if let Some(value) = params.get(&param.name) {
+                        let value = extract_witness_value(
+                            &model,
+                            value,
+                            &vctx.variants,
+                            &param.ty,
+                        )
+                        .map_err(|err| {
+                            format!(
+                                "failed to extract scene parameter {} for {}::{} at step {step}: {err}",
+                                param.name, re.scene_event.system, re.scene_event.event
+                            )
+                        })?;
+                        let binding = op::Binding::new(param.name.clone(), value)
+                            .map(|binding| {
+                                binding.with_ty_hint(super::walkers::render_ir_type(&param.ty))
+                            })
+                            .map_err(|err| {
+                                format!("generated scene parameter binding is invalid: {err}")
+                            })?;
+                        atomic = atomic.param(binding);
+                    }
+                }
+                transition = transition.atomic_step(
+                    atomic
+                        .build()
+                        .map_err(|err| format!("scene atomic step extraction failed: {err}"))?,
+                );
+                selected += 1;
+            }
+            if selected == 0 {
+                transition = transition.observation(
+                    op::TransitionObservation::new("stutter", op::WitnessValue::Bool(true))
+                        .map_err(|err| {
+                            format!("generated scene stutter observation is invalid: {err}")
+                        })?,
+                );
+            }
+            behavior = behavior.transition(
+                transition
+                    .build()
+                    .map_err(|err| format!("scene transition extraction failed: {err}"))?,
+            );
+        }
+    }
+    let behavior = behavior
+        .build()
+        .map_err(|err| format!("scene behavior extraction failed: {err}"))?;
+    let witness = op::OperationalWitness::counterexample(behavior)
+        .map_err(|err| format!("scene witness validation failed: {err}"))?;
+    EvidenceEnvelope::witness(
+        WitnessEnvelope::operational(witness)
+            .map_err(|err| format!("scene witness envelope validation failed: {err}"))?,
+    )
+    .map_err(|err| format!("scene evidence validation failed: {err}"))
 }
 
 /// Collect all event variable names referenced in an ordering expression.
@@ -1675,12 +1807,29 @@ pub(super) fn check_scene_block(
     let elapsed = elapsed_ms(&start);
 
     match solver.check() {
-        SatResult::Sat => VerificationResult::ScenePass {
-            name: scene.name.clone(),
-            time_ms: elapsed,
-            span: None,
-            file: None,
-        },
+        SatResult::Sat => {
+            let evidence = scene_pass_evidence(
+                &solver,
+                &pool,
+                vctx,
+                defs,
+                &relevant_entities,
+                &relevant_systems,
+                &resolved_events,
+                &instances,
+                &given_bindings,
+                &then_ctx.store_ranges,
+                bound,
+            )
+            .ok();
+            VerificationResult::ScenePass {
+                name: scene.name.clone(),
+                time_ms: elapsed,
+                evidence,
+                span: None,
+                file: None,
+            }
+        }
         SatResult::Unsat => VerificationResult::SceneFail {
             name: scene.name.clone(),
             reason: crate::messages::SCENE_UNSATISFIABLE.to_owned(),

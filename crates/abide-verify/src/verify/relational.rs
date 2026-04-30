@@ -264,6 +264,7 @@ impl<'a> RelationalSceneObligation<'a> {
             Ok(SolverResult::Sat) => VerificationResult::ScenePass {
                 name: self.scene.name.clone(),
                 time_ms: elapsed(),
+                evidence: None,
                 span: None,
                 file: None,
             },

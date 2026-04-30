@@ -10559,6 +10559,14 @@ fn scene_happy_path_passes() {
         "expected ScenePass, got: {:?}",
         results[0]
     );
+    let witness = results[0]
+        .operational_witness()
+        .expect("passing scene should carry a replayable operational witness");
+    assert_eq!(witness.behavior().states().len(), 2);
+    assert_eq!(witness.behavior().transitions().len(), 1);
+    let step = &witness.behavior().transitions()[0].atomic_steps()[0];
+    assert_eq!(step.system(), "Auth");
+    assert_eq!(step.command(), "lock_account");
 }
 
 #[test]

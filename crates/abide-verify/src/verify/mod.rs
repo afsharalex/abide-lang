@@ -399,6 +399,8 @@ pub enum VerificationResult {
     ScenePass {
         name: String,
         time_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<EvidenceEnvelope>,
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
@@ -554,11 +556,13 @@ impl VerificationResult {
             Self::ScenePass {
                 name,
                 time_ms,
+                evidence,
                 span,
                 file,
             } => Self::ScenePass {
                 name,
                 time_ms,
+                evidence,
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
@@ -735,6 +739,7 @@ impl VerificationResult {
         match self {
             Self::Admitted { evidence, .. }
             | Self::Counterexample { evidence, .. }
+            | Self::ScenePass { evidence, .. }
             | Self::LivenessViolation { evidence, .. }
             | Self::Deadlock { evidence, .. } => evidence.as_ref(),
             _ => None,
