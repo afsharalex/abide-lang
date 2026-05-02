@@ -182,7 +182,7 @@ Shape:
 ```json
 {
   "system": "Billing",
-  "event": "charge",
+  "command": "charge",
   "kind": "weak",
   "status": "enabled_but_starved"
 }
@@ -201,7 +201,7 @@ Shape:
 ```json
 {
   "system": "Billing",
-  "event": "charge",
+  "command": "charge",
   "reason": "guard is false"
 }
 ```

@@ -74,9 +74,9 @@ Highlights:
 - multiple systems over shared stores
 - predicates reused in command guards
 
-## Workflow orchestration
+## Command orchestration
 
-See: [`examples/workflow.ab`](../examples/workflow.ab)
+See: [`examples/orchestration.ab`](../examples/orchestration.ab)
 
 Highlights:
 - `proc` dependency graphs

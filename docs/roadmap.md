@@ -86,7 +86,7 @@ Syntax and semantics are evolving. Early feedback is welcome.
 
 Today Abide is strongest on a finite or finitely scoped vertical slice:
 
-- entity/system workflow and state-machine specs
+- entity/system command-flow and state-machine specs
 - bounded safety and bounded liveness checks
 - scenes
 - imperative helper functions with contracts

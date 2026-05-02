@@ -33,20 +33,14 @@ pub enum Token {
     Extern,
     #[token("system")]
     System,
-    #[token("workflow")]
-    Workflow,
     #[token("implements")]
     Implements,
     #[token("dep")]
     Dep,
     #[token("action")]
     Action,
-    #[token("event")]
-    Event,
     #[token("command")]
     Command,
-    #[token("step")]
-    Step,
     #[token("query")]
     Query,
     #[token("store")]
@@ -307,13 +301,10 @@ impl std::fmt::Display for Token {
             Self::Interface => write!(f, "interface"),
             Self::Extern => write!(f, "extern"),
             Self::System => write!(f, "system"),
-            Self::Workflow => write!(f, "workflow"),
             Self::Implements => write!(f, "implements"),
             Self::Dep => write!(f, "dep"),
             Self::Action => write!(f, "action"),
-            Self::Event => write!(f, "event"),
             Self::Command => write!(f, "command"),
-            Self::Step => write!(f, "step"),
             Self::Query => write!(f, "query"),
             Self::Store => write!(f, "store"),
             Self::Activate => write!(f, "activate"),
@@ -463,7 +454,7 @@ mod tests {
 
     #[test]
     fn keywords() {
-        let src = "module include as use const fn type enum struct entity system action event command step query fair strong sorry todo mut";
+        let src = "module include as use const fn type enum struct entity system action command query fair strong sorry todo mut";
         let tokens = lex_ok(src);
         assert_eq!(
             tokens,
@@ -480,15 +471,26 @@ mod tests {
                 Token::Entity,
                 Token::System,
                 Token::Action,
-                Token::Event,
                 Token::Command,
-                Token::Step,
                 Token::Query,
                 Token::Fair,
                 Token::Strong,
                 Token::Sorry,
                 Token::Todo,
                 Token::Mut,
+            ]
+        );
+    }
+
+    #[test]
+    fn removed_surface_words_are_identifiers() {
+        let tokens = lex_ok("step event workflow");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Name("step".to_owned()),
+                Token::Name("event".to_owned()),
+                Token::Name("workflow".to_owned()),
             ]
         );
     }

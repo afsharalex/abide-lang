@@ -553,33 +553,14 @@ impl Parser {
                 self.cur_span(),
                 crate::messages::USE_ENTITY_REMOVED,
             )),
-            Some(Token::Fair) => Err(ParseError::expected_with_help(
+            Some(tok @ (Token::Fair | Token::Strong)) => Err(ParseError::expected(
                 "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
-                "`fair`",
+                &format!("`{tok}`"),
                 self.cur_span(),
-                crate::messages::HINT_LEGACY_FAIR_EVENT,
-            )),
-            Some(Token::Strong) => Err(ParseError::expected_with_help(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
-                "`strong`",
-                self.cur_span(),
-                crate::messages::HINT_LEGACY_FAIR_EVENT,
-            )),
-            Some(Token::Event) => Err(ParseError::expected_with_help(
-                "system item (`command`, `action`, or `query`)",
-                "`event`",
-                self.cur_span(),
-                crate::messages::EVENT_KEYWORD_REMOVED,
             )),
             Some(Token::Dep) => Ok(SystemItem::Dep(self.dep_decl()?)),
             Some(Token::Command) => Ok(SystemItem::Command(self.system_command_decl()?)),
             Some(Token::Action) => Ok(SystemItem::Action(self.system_action_decl()?)),
-            Some(Token::Step) => Err(ParseError::expected_with_help(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
-                "`step`",
-                self.cur_span(),
-                "`step` is not source syntax. Use `action` for private executable system behavior or put the body directly on a public `command`.",
-            )),
             Some(Token::Query) => Ok(SystemItem::Query(self.query_decl()?)),
             Some(Token::Pred) => Ok(SystemItem::Pred(self.pred_decl()?)),
             Some(Token::Fsm) => Ok(SystemItem::Fsm(self.fsm_decl()?)),
@@ -907,13 +888,13 @@ impl Parser {
             Some(Token::Match) => Ok(EventItem::Match(self.event_match_block()?)),
             // Detect wrong-context keywords with helpful suggestions
             Some(Token::Given | Token::Then) => Err(ParseError::expected_with_help(
-                "event body item",
+                "command/action body item",
                 &format!("`{}`", self.peek().unwrap()),
                 self.cur_span(),
                 crate::messages::HINT_EVENT_BODY,
             )),
             Some(Token::Assert) => Err(ParseError::expected_with_help(
-                "event body item",
+                "command/action body item",
                 "`assert`",
                 self.cur_span(),
                 crate::messages::HINT_ASSERT_IN_EVENT,

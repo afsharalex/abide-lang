@@ -109,7 +109,7 @@ verify fair_progress {
 
 ## Scenes are existential witnesses
 
-Use scenes to demonstrate reachability or successful workflows:
+Use scenes to demonstrate reachability or successful command flows:
 
 ```abide
 scene paid_order_can_ship {
@@ -127,7 +127,7 @@ scene paid_order_can_ship {
 }
 ```
 
-## Workflow orchestration
+## Command orchestration
 
 ```abide
 proc release(editorial: Editorial) {

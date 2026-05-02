@@ -598,12 +598,6 @@ impl Parser {
             Some(Token::Extern) => Ok(TopDecl::Extern(self.extern_decl()?)),
             Some(Token::System) => Ok(TopDecl::System(self.system_decl()?)),
             Some(Token::Proc) => Ok(TopDecl::Proc(self.proc_decl()?)),
-            Some(Token::Workflow) => Err(ParseError::expected_with_help(
-                "top-level declaration",
-                "`workflow`",
-                self.cur_span(),
-                "the `workflow` keyword has been replaced by reusable named `proc` declarations plus `program`-side `use proc_name(...)`",
-            )),
             Some(Token::Program) => Ok(TopDecl::Program(self.program_decl()?)),
             Some(Token::Pred) => Ok(TopDecl::Pred(self.pred_decl()?)),
             Some(Token::Prop) => Ok(TopDecl::Prop(self.prop_decl()?)),

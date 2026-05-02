@@ -105,7 +105,7 @@ Abide’s temporal surface includes:
 - `eventually`
 - `until`
 - past-time operators such as `historically`, `once`, `previously`, `since`
-- `saw` for observation-style event reasoning
+- `saw` for observation-style command reasoning
 
 Fairness is declared at the verification site, not on commands:
 
@@ -221,7 +221,7 @@ type may be written or inferred from `Set<T>` and `Seq<T>` sources:
 
 ## Programs and procs
 
-For workflow-style orchestration, Abide provides `proc` and `program`:
+For command orchestration, Abide provides `proc` and `program`:
 
 ```abide
 proc release(editorial: Editorial) {

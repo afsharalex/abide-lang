@@ -1526,31 +1526,45 @@ fn lemma_decl_with_assume_block() {
     assert_eq!(l.body.len(), 1);
 }
 
-/// Per REPLACED, `fair event` modifier syntax on system event
-/// declarations is rejected with `LEGACY_FAIR_EVENT_REJECTED`.
 #[test]
-fn legacy_fair_event_modifier_rejected() {
-    let src = r"system S(jobs: Store<Job>) {
-  fair event tick() {}
-}";
-    let err = parse_program_err(src);
-    assert!(
-        err.to_string().contains("fair"),
-        "expected legacy fair-event diagnostic, got: {err}"
-    );
-}
+fn removed_surface_words_parse_as_identifiers() {
+    let src = r"
+const step = 1
+const event = 2
+const workflow = 3
 
-/// Same for `strong fair event`.
-#[test]
-fn legacy_strong_fair_event_modifier_rejected() {
-    let src = r"system S(jobs: Store<Job>) {
-  strong fair event tick() {}
+system S {
+  action event() {}
+  step: int
+  workflow: int
 }";
-    let err = parse_program_err(src);
-    assert!(
-        err.to_string().contains("strong"),
-        "expected legacy strong-fair-event diagnostic, got: {err}"
-    );
+    let prog = parse_program(src);
+    let const_names: Vec<_> = prog
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            TopDecl::Const(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(const_names, vec!["step", "event", "workflow"]);
+
+    let system = match &prog.decls[3] {
+        TopDecl::System(system) => system,
+        other => panic!("expected System, got {other:?}"),
+    };
+    match &system.items[0] {
+        SystemItem::Action(action) => assert_eq!(action.name, "event"),
+        other => panic!("expected Action, got {other:?}"),
+    }
+    match &system.items[1] {
+        SystemItem::Field(field) => assert_eq!(field.name, "step"),
+        other => panic!("expected Field, got {other:?}"),
+    }
+    match &system.items[2] {
+        SystemItem::Field(field) => assert_eq!(field.name, "workflow"),
+        other => panic!("expected Field, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2311,16 +2325,6 @@ fn action_body_assert_instead_of_requires() {
     assert!(
         help.contains("requires"),
         "help should suggest 'requires': {help}"
-    );
-}
-
-#[test]
-fn source_step_syntax_is_rejected() {
-    let err = try_parse("system S { step e() { } }").unwrap_err();
-    let help = extract_help(&err).expect("should have help");
-    assert!(
-        help.contains("Use `action`"),
-        "help should point to action syntax: {help}"
     );
 }
 

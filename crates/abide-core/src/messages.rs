@@ -33,13 +33,13 @@ pub const FOR_SYSTEM_REMOVED: &str =
      in `assume { }` blocks — write `verify v { assume { store es: E[0..3]; \
      let s = S { es: es } } ... }` instead";
 
-/// Hint when `assert` appears inside an event body.
+/// Hint when `assert` appears inside an executable command/action body.
 pub const HINT_ASSERT_IN_EVENT: &str =
-    "'assert' belongs in verify blocks, not event bodies. Did you mean 'requires'?";
+    "'assert' belongs in verify blocks, not command/action bodies. Did you mean 'requires'?";
 
-/// Hint for valid event body contents.
+/// Hint for valid executable command/action body contents.
 pub const HINT_EVENT_BODY: &str =
-    "event bodies contain: 'choose', 'for', 'create', or expressions like 'entity.action()'";
+    "command/action bodies contain: 'choose', 'for', 'create', or expressions like 'entity.action()'";
 
 /// Hint for valid verify body contents.
 pub const HINT_VERIFY_BODY: &str = "verify blocks contain 'assert' statements";
@@ -58,18 +58,6 @@ pub const HINT_SCENE_BODY: &str = "scene blocks use 'given', 'when', and 'then',
 pub const HINT_SCENE_BODY_STRUCTURE: &str =
     "scene blocks contain: given { ... }, when { ... }, then { ... }";
 
-/// Diagnostic for the legacy `fair event` / `strong fair event` modifier
-/// syntax on system command declarations. Fairness is no longer a
-/// declaration modifier.
-/// It now lives in `assume { fair X }` blocks on the verification site.
-pub const LEGACY_FAIR_EVENT_REJECTED: &str =
-    "`fair`/`strong fair` are no longer event-declaration modifiers";
-
-/// Hint accompanying `LEGACY_FAIR_EVENT_REJECTED` — points the user at the
-/// new position for fairness annotations.
-pub const HINT_LEGACY_FAIR_EVENT: &str =
-    "move fairness to an `assume { fair Sys::name }` block on the relevant verify/theorem/lemma";
-
 /// Diagnostic when an `assume { }` block contains both `stutter` and
 /// `no stutter`. The block must choose one or the other, not both.
 pub const ASSUME_STUTTER_CONFLICT: &str =
@@ -79,18 +67,18 @@ pub const ASSUME_STUTTER_CONFLICT: &str =
 pub const HINT_ASSUME_STUTTER_CONFLICT: &str =
     "remove one — `stutter` opts in, `no stutter` opts out";
 
-/// Diagnostic when an event path inside `assume { fair PATH }` does not
-/// resolve to a known event in scope.
-pub const UNKNOWN_FAIR_EVENT: &str = "fairness annotation references an unknown event";
+/// Diagnostic when a command path inside `assume { fair PATH }` does not
+/// resolve to a known command in scope.
+pub const UNKNOWN_FAIR_EVENT: &str = "fairness annotation references an unknown command";
 
 /// Hint accompanying `UNKNOWN_FAIR_EVENT`.
 pub const HINT_UNKNOWN_FAIR_EVENT: &str =
-    "use `Sys::event` qualified form, and ensure the event is declared in a system in scope";
+    "use `Sys::command` qualified form, and ensure the command is declared in a system in scope";
 
-/// Diagnostic when an unqualified event name in `assume { fair NAME }`
+/// Diagnostic when an unqualified command name in `assume { fair NAME }`
 /// matches more than one system in the verification site's scope.
 pub const AMBIGUOUS_FAIR_EVENT: &str =
-    "fairness annotation is ambiguous — multiple systems define this event";
+    "fairness annotation is ambiguous — multiple systems define this command";
 
 /// an `under` block may not contain a `verify`
 /// declaration. `verify` blocks are bounded model checks; `under` blocks
@@ -262,7 +250,7 @@ pub const SCENE_EMPTY_SCOPE: &str = "no systems or entities found";
 
 /// Theorem: liveness properties require bounded checking, not unbounded proof.
 pub const THEOREM_LIVENESS_UNSUPPORTED: &str = "theorem contains 'eventually' — \
-     liveness properties require a verify block with fair event declarations";
+     liveness properties require a verify block with fair command assumptions";
 
 /// Liveness violation diagnostic label.
 pub fn label_liveness_violation(name: &str) -> String {
@@ -271,7 +259,9 @@ pub fn label_liveness_violation(name: &str) -> String {
 
 /// Deadlock diagnostic label.
 pub fn label_deadlock(name: &str, step: usize) -> String {
-    format!("deadlock for '{name}' at step {step} (no events enabled, stutter is opted out)")
+    format!(
+        "deadlock for '{name}' at step {step} (no commands/actions enabled, stutter is opted out)"
+    )
 }
 
 /// BMC: Z3 returned unknown without timeout.
@@ -312,7 +302,7 @@ pub const THEOREM_STEP_UNKNOWN: &str = "Z3 returned unknown when checking induct
 /// so the inductive step would be vacuously discharged from a
 /// contradictory transition relation.
 pub const THEOREM_VACUOUS_UNDER_NO_STUTTER: &str =
-    "trace cannot extend under `assume { no stutter }` — no event is enabled at the \
+    "trace cannot extend under `assume { no stutter }` — no command/action is enabled at the \
      current step and stutter is opted out, so the induction step would be vacuously \
      discharged. Add `assume { stutter }` to allow stutter steps, or fix the \
      precondition that traps the system.";
@@ -346,17 +336,17 @@ pub const INVARIANT_PARAM_REJECTED: &str = "invariants cannot take parameters �
 
 /// Two invariants on the same entity or system share the same name,
 /// or an invariant name collides with a field, derived field, action,
-/// or event in the same scope.
+/// or executable command/action in the same scope.
 pub const INVARIANT_DUPLICATE_NAME: &str =
     "duplicate invariant name in this entity or system — invariant \
      names must be unique within their containing scope and must not \
-     collide with fields, derived fields, actions, or events";
+     collide with fields, derived fields, actions, or commands";
 
 /// Format an invariant violation diagnostic with the failing invariant
-/// name. Used by the verifier when an event boundary fails to preserve
+/// name. Used by the verifier when a transition boundary fails to preserve
 /// a named invariant on an entity in scope.
 pub fn invariant_violated(name: &str) -> String {
-    format!("invariant `{name}` is not preserved by every event")
+    format!("invariant `{name}` is not preserved by every command/action")
 }
 
 // ── fsm declaration messages ( / ) ─────────────────────
@@ -422,7 +412,7 @@ pub fn fsm_trap_state(entity: &str, field: &str, state: &str) -> String {
 }
 
 /// Format a fsm transition violation diagnostic. Used by the verifier
-/// when an event boundary moves an entity field along an edge that
+/// when a transition boundary moves an entity field along an edge that
 /// the fsm transition table does not allow.
 pub fn fsm_invalid_transition(entity: &str, field: &str, from: &str, to: &str) -> String {
     format!(
@@ -564,23 +554,23 @@ pub const HELP_NON_EXHAUSTIVE_MATCH: &str =
 
 // ── Scene cardinality and composition ───────────────────────────────
 
-/// Error: ^| used with multi-instance event.
+/// Error: ^| used with a multi-instance scene command.
 pub fn scene_xor_multi_instance(scene: &str, var: &str, n: usize) -> String {
     format!(
-        "scene '{scene}': event '{var}' in `^|` has {n} instances; \
+        "scene '{scene}': command '{var}' in `^|` has {n} instances; \
          exclusive choice requires single-instance cardinality ({{one}} or {{lone}})"
     )
 }
 
-/// Error: ^| event lacks fire tracking.
+/// Error: ^| command lacks fire tracking.
 pub fn scene_xor_no_fire_tracking(scene: &str, var: &str) -> String {
     format!(
-        "scene '{scene}': event '{var}' in `^|` requires \
+        "scene '{scene}': command '{var}' in `^|` requires \
          {{lone}} cardinality (has no fire tracking)"
     )
 }
 
-/// Error: same-step & with multi-instance event.
+/// Error: same-step & with multi-instance command.
 pub fn scene_same_step_multi_instance(
     scene: &str,
     var_a: &str,
@@ -590,15 +580,15 @@ pub fn scene_same_step_multi_instance(
 ) -> String {
     format!(
         "scene '{scene}': same-step composition `&` requires {{one}} or {{lone}} cardinality; \
-         event '{var_a}' has {n_a} instances, event '{var_b}' has {n_b} instances"
+         command '{var_a}' has {n_a} instances, command '{var_b}' has {n_b} instances"
     )
 }
 
-/// Error: same-step & events touch the same entity type.
+/// Error: same-step & commands touch the same entity type.
 pub fn scene_same_step_entity_conflict(scene: &str, entity: &str) -> String {
     format!(
-        "scene '{scene}': same-step composition `&` is not supported for events that touch \
-         the same entity type '{entity}'. Use events on different entity types or separate steps."
+        "scene '{scene}': same-step composition `&` is not supported for commands that touch \
+         the same entity type '{entity}'. Use commands on different entity types or separate transitions."
     )
 }
 
@@ -621,11 +611,11 @@ pub const SYMMETRY_REDUCTION_FAILED: &str =
      (asymmetric entity interactions or IC3 timeout); \
      lasso BMC provides bounded checking";
 
-/// Error: unknown event variable in scene ordering.
+/// Error: unknown command variable in scene ordering.
 pub fn scene_ordering_unknown_var(scene: &str, var: &str, declared: &str) -> String {
     format!(
-        "scene '{scene}': ordering references unknown event variable '{var}'; \
-         declared event variables: {declared}"
+        "scene '{scene}': ordering references unknown command variable '{var}'; \
+         declared command variables: {declared}"
     )
 }
 
@@ -657,13 +647,13 @@ pub fn collection_op_unsupported_arity(type_name: &str, func_name: &str, n: usiz
 /// Parser-level rejection: `saw E::f(args) ->...` or `saw E::f(args) =>...`.
 /// `saw` matches the call only; return-value matching is forbidden.
 pub const SAW_RETURN_VALUE_FORBIDDEN: &str =
-    "`saw` matches the event call, not the return value — \
+    "`saw` matches the command call, not the return value — \
      arrow forms (`->`, `=>`) after `saw` are not allowed";
 
 /// Hint accompanying `SAW_RETURN_VALUE_FORBIDDEN`.
 pub const HINT_SAW_RETURN_VALUE_FORBIDDEN: &str =
     "pattern-match the return value at the call site if needed; \
-     `saw` only observes which event was called with which arguments";
+     `saw` only observes which command was called with which arguments";
 
 /// `saw` is not valid in invariant bodies. Invariants
 /// are pure state predicates; `saw` reasons about trace history.
@@ -686,27 +676,23 @@ pub const THEOREM_SAW_UNSUPPORTED: &str =
 /// Hint accompanying `THEOREM_SAW_UNSUPPORTED`.
 pub const HINT_THEOREM_SAW_UNSUPPORTED: &str =
     "use a `verify` block with bounded model checking — \
-     `saw` semantics in induction/IC3 require event-history \
+     `saw` semantics in induction/IC3 require command-history \
      variables, which are not yet implemented";
 
 /// `saw` is currently restricted to explicit extern-boundary commands.
 pub const SAW_EXTERN_QUALIFIED_ONLY: &str =
     "`saw` is currently restricted to extern boundary commands — use the explicit form `Extern::command(...)`";
 
-/// `saw` event path does not resolve to a known extern command.
+/// `saw` command path does not resolve to a known extern command.
 pub const SAW_UNKNOWN_EVENT: &str =
     "`saw` references an unknown extern command — use `Extern::command(...)`";
 
-/// `saw` argument count does not match the event's parameter count.
+/// `saw` argument count does not match the command's parameter count.
 pub fn saw_arity_mismatch(sys: &str, evt: &str, expected: usize, got: usize) -> String {
     format!("`saw {sys}::{evt}` expects {expected} arguments but got {got}")
 }
 
 // ── command / action / query ───────────────────────────────
-
-/// `event` keyword is no longer valid in system bodies.
-pub const EVENT_KEYWORD_REMOVED: &str = "`event` has been replaced by `command` — \
-     declare a `command` directly, optionally with a guarded body";
 
 /// `ensures` is not valid on executable command/action declarations.
 pub const ACTION_ENSURES_NOT_ALLOWED: &str = "`ensures` is not valid on executable \

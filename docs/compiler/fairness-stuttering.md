@@ -65,6 +65,5 @@ Backends that support temporal reasoning must preserve the effective
   precise unsupported result.
 - External TLC oracles must not add stronger fairness than the matching Abide
   `assume { ... }` block. When Abide uses no-stutter semantics, a TLC model may
-  use an explicit real-step fairness approximation only to rule out infinite
+  use an explicit real-transition fairness approximation only to rule out infinite
   synthetic stuttering before the target condition is reached.
-

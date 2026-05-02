@@ -1,6 +1,6 @@
-module Workflow
+module Orchestration
 
-// Workflow — proc/program orchestration over public commands.
+// Proc/program orchestration over public commands.
 
 enum DocumentStatus = Draft | Submitted | Approved | Published
 

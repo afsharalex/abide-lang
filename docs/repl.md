@@ -19,7 +19,7 @@ The REPL has two modes, switchable at any time:
 
 Switch with `/qa` and `/abide`.
 
-## Workflow
+## Interactive Session
 
 ```
 $ abide repl commerce/
