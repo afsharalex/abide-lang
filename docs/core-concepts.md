@@ -27,7 +27,7 @@ entity Account {
 Systems operate over explicit entity pools:
 
 ```abide
-system Banking(accounts: Store<Account>[..8]) {
+system Banking(accounts: Store<Account>) {
   command deposit(account: Account, amount: real)
     requires amount > 0 {
     account.deposit(amount)
@@ -35,11 +35,10 @@ system Banking(accounts: Store<Account>[..8]) {
 }
 ```
 
-Store bounds are finite and active. An exact bound such as `Store<Account>[3]` starts with three active accounts. A range such as `Store<Account>[1..8]` starts with one active account and may grow through create actions until it reaches eight. An at-most bound such as `Store<Account>[..8]` starts empty.
-
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
-- Store bounds are finite: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.
+- Store parameter bounds are optional cardinality contracts: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population and maximum create capacity for that check or scene.
 - `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
 - `pred` stays internal to the system.

@@ -43,7 +43,7 @@ entity Order {
 ## Systems
 
 ```abide
-system Commerce(orders: Store<Order>[..8]) {
+system Commerce(orders: Store<Order>) {
   command pay(order: Order)
     requires order.status == @Pending {
     order.mark_paid()
@@ -59,8 +59,8 @@ system Commerce(orders: Store<Order>[..8]) {
 
 Notes:
 - `Store<T>` constructor params are the current entity-pool surface.
-- Store constructor params may carry finite bounds: `Store<Order>[N]`, `Store<Order>[lo..hi]`, or `Store<Order>[..hi]`.
-- Store bounds also define the active startup population: `[N]` starts with exactly `N` active entities, `[lo..hi]` starts with `lo`, and `[..hi]` starts with `0`; create actions may grow the active population up to the upper bound.
+- Store constructor params may optionally carry cardinality contracts: `Store<Order>[N]`, `Store<Order>[lo..hi]`, or `Store<Order>[..hi]`.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population: `[N]` starts with exactly `N` active entities, `[lo..hi]` starts with `lo`, and `[..hi]` starts with `0`; create actions may grow the active population up to the upper bound.
 - `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
 - `pred` is internal and pure.

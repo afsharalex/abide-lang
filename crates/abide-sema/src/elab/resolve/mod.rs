@@ -9,8 +9,8 @@ use super::env::Env;
 use super::error::{ElabError, ErrorKind};
 use super::types::{
     BuiltinTy, EContract, EEventAction, EExpr, ELetBinding, EMatchArm, EMatchScrutinee, EProc,
-    EProcDepCond, EProcEdge, EProcNode, EProcUse, ESceneWhen, EStoreDecl, GenericTypeDef, Literal,
-    Ty, VariantFieldsMap,
+    EProcDepCond, EProcEdge, EProcNode, EProcUse, ESceneWhen, EStoreDecl, ESystem, GenericTypeDef,
+    Literal, Ty, VariantFieldsMap,
 };
 use crate::ast::UseDecl;
 
@@ -179,6 +179,9 @@ fn validate_store_bounds(env: &mut Env) {
             &mut errors,
         );
     }
+    for system in env.systems.values() {
+        validate_store_param_binding_bounds(system, env, &mut errors);
+    }
 
     env.errors.extend(errors);
 }
@@ -227,12 +230,12 @@ fn validate_store_binding_bounds(
                 continue;
             };
             if let Some(min) = param.lo {
-                if store.hi < min {
+                if store.lo < min {
                     errors.push(ElabError::new(
                         ErrorKind::TypeMismatch,
                         format!(
-                            "{owner_kind} `{owner_name}` binds store `{store_name}` with upper bound {} to `{}::{param_name}`, which requires at least {min} slot(s)",
-                            store.hi, system.name
+                            "{owner_kind} `{owner_name}` binds store `{store_name}` with lower bound {} to `{}::{param_name}`, which requires at least {min} active entity slot(s)",
+                            store.lo, system.name
                         ),
                         owner_kind,
                     ));
@@ -248,6 +251,76 @@ fn validate_store_binding_bounds(
                         ),
                         owner_kind,
                     ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_store_param_binding_bounds(system: &ESystem, env: &Env, errors: &mut Vec<ElabError>) {
+    if system.let_bindings.is_empty() {
+        return;
+    }
+
+    for binding in &system.let_bindings {
+        let Some(child_system) = env.systems.get(&binding.system_type) else {
+            continue;
+        };
+        for (child_param_name, parent_param_name) in &binding.store_bindings {
+            let Some(child_param) = child_system
+                .store_params
+                .iter()
+                .find(|param| param.name == *child_param_name)
+            else {
+                continue;
+            };
+            let Some(parent_param) = system
+                .store_params
+                .iter()
+                .find(|param| param.name == *parent_param_name)
+            else {
+                continue;
+            };
+            if let Some(min) = child_param.lo {
+                match parent_param.lo {
+                    Some(parent_min) if parent_min >= min => {}
+                    Some(parent_min) => errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "program/system `{}` binds store parameter `{parent_param_name}` with lower bound {parent_min} to `{}::{child_param_name}`, which requires at least {min} active entity slot(s)",
+                            system.name, child_system.name
+                        ),
+                        "system store binding",
+                    )),
+                    None => errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "program/system `{}` binds unbounded store parameter `{parent_param_name}` to `{}::{child_param_name}`, which requires at least {min} active entity slot(s)",
+                            system.name, child_system.name
+                        ),
+                        "system store binding",
+                    )),
+                }
+            }
+            if let Some(max) = child_param.hi {
+                match parent_param.hi {
+                    Some(parent_max) if parent_max <= max => {}
+                    Some(parent_max) => errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "program/system `{}` binds store parameter `{parent_param_name}` with upper bound {parent_max} to `{}::{child_param_name}`, which allows at most {max} active entity slot(s)",
+                            system.name, child_system.name
+                        ),
+                        "system store binding",
+                    )),
+                    None => errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "program/system `{}` binds unbounded store parameter `{parent_param_name}` to `{}::{child_param_name}`, which allows at most {max} active entity slot(s)",
+                            system.name, child_system.name
+                        ),
+                        "system store binding",
+                    )),
                 }
             }
         }
@@ -2157,6 +2230,50 @@ mod tests {
     }
 
     #[test]
+    fn store_param_min_bounds_reject_loose_store_scope() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[1..4]) {}\n\
+             verify maybe_empty_orders {\n\
+               assume {\n\
+                 store orders: Order[0..4]\n\
+                 let shop = Shop { orders: orders }\n\
+               }\n\
+               assert true\n\
+             }",
+        );
+
+        assert!(
+            errors.iter().any(|err| err.message.contains(
+                "binds store `orders` with lower bound 0 to `Shop::orders`, which requires at least 1 active entity slot"
+            )),
+            "expected store parameter lower-bound error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn store_param_exact_bounds_reject_loose_store_scope() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[2]) {}\n\
+             verify maybe_two_orders {\n\
+               assume {\n\
+                 store orders: Order[0..2]\n\
+                 let shop = Shop { orders: orders }\n\
+               }\n\
+               assert true\n\
+             }",
+        );
+
+        assert!(
+            errors.iter().any(|err| err.message.contains(
+                "binds store `orders` with lower bound 0 to `Shop::orders`, which requires at least 2 active entity slot"
+            )),
+            "expected exact store parameter lower-bound error, got: {errors:?}"
+        );
+    }
+
+    #[test]
     fn store_param_exact_bounds_accept_matching_store_scope() {
         let (_result, errors) = elaborate_all(
             "entity Order { status: int = 0 }\n\
@@ -2167,6 +2284,37 @@ mod tests {
                  let shop = Shop { orders: orders }\n\
                }\n\
                assert true\n\
+             }",
+        );
+
+        assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
+    }
+
+    #[test]
+    fn program_store_params_must_satisfy_child_system_contracts() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[2]) {}\n\
+             program Demo(orders: Store<Order>[0..2]) {\n\
+               let shop = Shop { orders: orders }\n\
+             }",
+        );
+
+        assert!(
+            errors.iter().any(|err| err.message.contains(
+                "program/system `Demo` binds store parameter `orders` with lower bound 0 to `Shop::orders`, which requires at least 2 active entity slot"
+            )),
+            "expected program store parameter lower-bound error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn program_store_params_accept_matching_child_system_contracts() {
+        let (_result, errors) = elaborate_all(
+            "entity Order { status: int = 0 }\n\
+             system Shop(orders: Store<Order>[2]) {}\n\
+             program Demo(orders: Store<Order>[2]) {\n\
+               let shop = Shop { orders: orders }\n\
              }",
         );
 

@@ -33,7 +33,7 @@ Use:
 Current Abide systems take explicit store pools:
 
 ```abide
-system Commerce(orders: Store<Order>[..6]) {
+system Commerce(orders: Store<Order>) {
   command confirm_order(order_id: identity) {
     choose o: Order where o.id == order_id {
       o.confirm()
@@ -54,7 +54,7 @@ Use the system surface deliberately:
 - `pred` — internal pure helper
 
 ```abide
-system Billing(orders: Store<Order>[..6]) {
+system Billing(orders: Store<Order>) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 

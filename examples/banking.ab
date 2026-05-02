@@ -31,7 +31,7 @@ entity Account {
 pred can_withdraw(a: Account, amount: real) =
   a.status == @Active and a.balance >= amount and amount > 0
 
-system Banking(accounts: Store<Account>[..8]) {
+system Banking(accounts: Store<Account>) {
   command open_account(initial_balance: real)
     requires initial_balance >= 0 {
     create Account {

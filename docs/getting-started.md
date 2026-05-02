@@ -3,7 +3,7 @@
 Abide is a specification language for stateful systems, workflows, and verification.
 
 This guide uses the syntax that the current compiler accepts on `master`:
-- store-backed systems: `system Commerce(orders: Store<Order>[..4])`
+- store-backed systems: `system Commerce(orders: Store<Order>)`
 - public commands and queries, with inline command bodies where needed
 - verification blocks with explicit `assume { store ...; let ... }`
 
@@ -43,7 +43,7 @@ entity Order {
   }
 }
 
-system Commerce(orders: Store<Order>[..4]) {
+system Commerce(orders: Store<Order>) {
   command create_order(total: real)
     requires total > 0 {
     create Order {
@@ -193,9 +193,10 @@ See [`examples/collections.ab`](../examples/collections.ab) for a complete runna
 ## What the pieces mean
 
 - `entity` declares stateful domain objects with fields and actions.
-- `system ... (orders: Store<Order>[..4])` declares a system over a finite pool of entities.
-- Store bounds can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
-- The lower bound is the initial active population. `[1..4]` starts with one active entity and can grow to four; `[..4]` starts empty.
+- `system ... (orders: Store<Order>)` declares a system over an entity pool. Put concrete checking bounds on `store` declarations in `assume` or `given` blocks.
+- Store bounds in `assume` or `given` blocks can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
+- In those concrete checking scopes, the lower bound is the initial active population. `[1..4]` starts with one active entity and can grow to four; `[..4]` starts empty.
+- Optional bounds on `Store<T>` system parameters are cardinality contracts, not ordinary demo scopes. Omit them unless the system really requires a minimum, maximum, or exact active population.
 - `command` declares a public system operation and may include its body inline.
 - `verify` checks universal properties.
 - `scene` checks existential witness scenarios.
@@ -226,7 +227,7 @@ module Commerce
 use Commerce::Order
 use Commerce::OrderStatus
 
-system Commerce(orders: Store<Order>[..4]) {
+system Commerce(orders: Store<Order>) {
   command create_order(total: real) { create Order { total = total } }
 }
 ```

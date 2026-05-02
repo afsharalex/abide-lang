@@ -7,13 +7,13 @@ Curated examples live in [`abide-lang/examples/`](../examples/). Every example l
 See: [`examples/order.ab`](../examples/order.ab)
 
 Highlights:
-- store-backed system constructor: `system Orders(orders: Store<Order>[..4])`
+- store-backed system constructor: `system Orders(orders: Store<Order>)`
 - inline `command` bodies
 - `query`
 - `verify` with `assume { store ...; let ... }`
 
 ```abide
-system Orders(orders: Store<Order>[..4]) {
+system Orders(orders: Store<Order>) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
@@ -35,7 +35,7 @@ Highlights:
 - existential witness scenes
 
 ```abide
-system Banking(accounts: Store<Account>[..8]) {
+system Banking(accounts: Store<Account>) {
   command deposit(account_id: identity, amount: real)
     requires amount > 0 {
     choose a: Account where a.id == account_id {
@@ -55,7 +55,7 @@ Highlights:
 - public `query` surface
 
 ```abide
-system Billing(orders: Store<Order>[..6], intents: Store<PaymentIntent>[..6]) {
+system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
   command process_payment(intent_id: identity) {
     choose p: PaymentIntent where p.id == intent_id {
       p.capture()

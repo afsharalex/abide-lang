@@ -24,7 +24,7 @@ entity Document {
   }
 }
 
-system Editorial(documents: Store<Document>[..4]) {
+system Editorial(documents: Store<Document>) {
   command submit_pending() {
     choose d: Document where d.status == @Draft {
       d.submit()

@@ -40,7 +40,7 @@ entity PaymentIntent {
   }
 }
 
-system Commerce(orders: Store<Order>[..6]) {
+system Commerce(orders: Store<Order>) {
   command create_order(total: real)
     requires total > 0 {
     create Order {
@@ -70,7 +70,7 @@ system Commerce(orders: Store<Order>[..6]) {
     order.status == @AwaitingPayment and order.total > 0
 }
 
-system Billing(orders: Store<Order>[..6], intents: Store<PaymentIntent>[..6]) {
+system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
   command open_intent(order_id: identity, amount: real)
     requires amount > 0 {
     create PaymentIntent {
