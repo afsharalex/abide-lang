@@ -156,6 +156,9 @@ pub(super) fn encode_pure_expr_inner(
         IRExpr::Choose { .. } => Err(
             "choose expression is not yet supported in verifier encoding".to_owned(),
         ),
+        IRExpr::RelComp { .. } => {
+            Err("relation comprehension is not supported in fn contract encoding".to_owned())
+        }
 
         IRExpr::Ctor {
             enum_name, ctor, args, ..

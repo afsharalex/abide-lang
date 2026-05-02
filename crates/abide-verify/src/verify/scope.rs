@@ -788,6 +788,20 @@ pub(super) fn collect_saw_systems_expr(expr: &IRExpr, targets: &mut Vec<String>)
             }
             collect_saw_systems_expr(filter, targets);
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            collect_saw_systems_expr(projection, targets);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    collect_saw_systems_expr(source, targets);
+                }
+            }
+            collect_saw_systems_expr(filter, targets);
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             for element in elements {
                 collect_saw_systems_expr(element, targets);

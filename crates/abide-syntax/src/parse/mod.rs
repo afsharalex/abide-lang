@@ -468,6 +468,32 @@ impl Parser {
         }
     }
 
+    fn expect_qualified_name_segment(&mut self) -> Result<(String, Span), ParseError> {
+        match self.peek() {
+            Some(Token::Sum) => {
+                let span = self.advance().1;
+                Ok(("sum".to_owned(), span))
+            }
+            Some(Token::Product) => {
+                let span = self.advance().1;
+                Ok(("product".to_owned(), span))
+            }
+            Some(Token::Min) => {
+                let span = self.advance().1;
+                Ok(("min".to_owned(), span))
+            }
+            Some(Token::Max) => {
+                let span = self.advance().1;
+                Ok(("max".to_owned(), span))
+            }
+            Some(Token::Count) => {
+                let span = self.advance().1;
+                Ok(("count".to_owned(), span))
+            }
+            _ => self.expect_name(),
+        }
+    }
+
     fn expect_string(&mut self) -> Result<(String, Span), ParseError> {
         match self.peek() {
             Some(Token::StringLit(_)) => {

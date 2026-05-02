@@ -154,8 +154,20 @@ fn parse_workflow() {
 }
 
 #[test]
+fn parse_relations() {
+    parse_file("tests/fixtures/relations.ab");
+}
+
+#[test]
 fn lex_all_fixtures() {
-    for name in &["simple", "auth", "commerce", "inventory", "workflow"] {
+    for name in &[
+        "simple",
+        "auth",
+        "commerce",
+        "inventory",
+        "workflow",
+        "relations",
+    ] {
         let path = format!("tests/fixtures/{name}.ab");
         let src = std::fs::read_to_string(&path).unwrap();
         lex::lex(&src).unwrap_or_else(|errors| {
@@ -947,6 +959,126 @@ fn verify_inventory_fixture() {
         .filter(|r| matches!(&r, abide::verify::VerificationResult::ScenePass { .. }))
         .collect();
     assert_eq!(scene_passes.len(), 2, "both inventory scenes should pass");
+}
+
+#[test]
+fn verify_relations_fixture() {
+    let results = verify_file("tests/fixtures/relations.ab");
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_join_passes" && *depth == 0
+        )),
+        "relation join should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_transpose_passes" && *depth == 0
+        )),
+        "relation transpose should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_reach_passes" && *depth == 0
+        )),
+        "relation reflexive closure should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_closure_passes" && *depth == 0
+        )),
+        "relation transitive closure should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_projection_passes" && *depth == 0
+        )),
+        "relation projection should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_intersection_passes" && *depth == 0
+        )),
+        "relation intersection should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_empty_join_cardinality_passes" && *depth == 0
+        )),
+        "empty relation join cardinality should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_nary_join_passes" && *depth == 0
+        )),
+        "n-ary relation join should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_mixed_projection_passes" && *depth == 0
+        )),
+        "mixed-column relation projection should be routed to RustSAT"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, depth, .. }
+                if name == "relation_nested_composition_passes" && *depth == 0
+        )),
+        "nested relation composition should be routed to RustSAT"
+    );
+    let counterexample = results
+        .iter()
+        .find(|r| {
+            matches!(
+                &r,
+                abide::verify::VerificationResult::Counterexample { name, .. }
+                    if name == "relation_counterexample_renders_witness"
+            )
+        })
+        .expect("false relation equality should produce a counterexample");
+    assert!(
+        counterexample.relational_witness().is_some(),
+        "relation counterexample should include relational witness evidence: {counterexample:?}"
+    );
+    let rendered = counterexample.to_string();
+    assert!(
+        rendered.contains("relation derived left") && rendered.contains("(1, 3)"),
+        "rendered relation witness should include the computed left relation: {rendered}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                if name == "relation_field_current_subset_next"
+        )),
+        "current field relation should be checked as a subset of next"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Counterexample { name, .. }
+                if name == "relation_field_next_not_subset_current"
+        )),
+        "reverse field relation subset should produce a counterexample"
+    );
 }
 
 #[test]

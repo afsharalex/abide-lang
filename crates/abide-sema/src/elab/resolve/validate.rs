@@ -131,6 +131,15 @@ pub(super) fn validate_saw_expressions(env: &mut Env, ctx: &super::Ctx) {
                 }
                 walk(filter, arities, extern_names, errors);
             }
+            EExpr::RelComp(_, projection, bindings, filter, _) => {
+                walk(projection, arities, extern_names, errors);
+                for binding in bindings {
+                    if let Some(source) = &mut binding.source {
+                        walk(source, arities, extern_names, errors);
+                    }
+                }
+                walk(filter, arities, extern_names, errors);
+            }
             EExpr::TupleLit(_, elems, _)
             | EExpr::SetLit(_, elems, _)
             | EExpr::SeqLit(_, elems, _) => {
@@ -344,6 +353,15 @@ pub(super) fn validate_aggregate_bodies(env: &mut Env) {
             EExpr::SetComp(_, proj, _, _, filter, _) => {
                 if let Some(p) = proj {
                     walk(p, errors);
+                }
+                walk(filter, errors);
+            }
+            EExpr::RelComp(_, projection, bindings, filter, _) => {
+                walk(projection, errors);
+                for binding in bindings {
+                    if let Some(source) = &binding.source {
+                        walk(source, errors);
+                    }
                 }
                 walk(filter, errors);
             }
@@ -725,6 +743,15 @@ pub(super) fn collect_ty_params_in_expr(expr: &EExpr, out: &mut Vec<(String, Vec
                 collect_ty_params_in_expr(e, out);
             }
             collect_ty_params_in_expr(body, out);
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            collect_ty_params_in_expr(projection, out);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    collect_ty_params_in_expr(source, out);
+                }
+            }
+            collect_ty_params_in_expr(filter, out);
         }
         EExpr::MapUpdate(_, map, key, val, _) => {
             collect_ty_params_in_expr(map, out);

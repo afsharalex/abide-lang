@@ -18,8 +18,8 @@ use rustsat_batsat::BasicSolver;
 use abide_witness::{rel, EntitySlotRef, WitnessValue};
 
 use crate::ir::types::{
-    Cardinality, IRAction, IREntity, IRExpr, IRProgram, IRScene, IRSystemAction, IRType, IRVerify,
-    LitVal,
+    Cardinality, IRAction, IREntity, IRExpr, IRProgram, IRScene, IRStoreDecl, IRSystemAction,
+    IRType, IRVerify, LitVal,
 };
 
 use super::scene::collect_ordering_leaf_vars;
@@ -37,7 +37,7 @@ struct CreateInstance {
     field_values: HashMap<String, SimpleValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SimpleValue {
     Bool(bool),
     Int(i64),
@@ -129,9 +129,88 @@ enum RelSnapshotExpr {
         bindings: Vec<RelQuantBinding>,
         pred: RelScopedPred,
     },
+    StoreExtentSubset {
+        entity: String,
+        left: RelStateRef,
+        right: RelStateRef,
+    },
+    FieldRelationSubset {
+        entity: String,
+        field: String,
+        left: RelStateRef,
+        right: RelStateRef,
+    },
+    RelationSubset {
+        left: RelValueExpr,
+        right: RelValueExpr,
+    },
     And(Box<RelSnapshotExpr>, Box<RelSnapshotExpr>),
     Or(Box<RelSnapshotExpr>, Box<RelSnapshotExpr>),
     Not(Box<RelSnapshotExpr>),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelStateRef {
+    Current,
+    Next,
+}
+
+#[derive(Debug, Clone)]
+enum RelValueExpr {
+    StoreExtent {
+        entity: String,
+        state_ref: RelStateRef,
+    },
+    Field {
+        entity: String,
+        field: String,
+        state_ref: RelStateRef,
+    },
+    Comprehension {
+        projection: Vec<RelProjection>,
+        bindings: Vec<RelComprehensionBinding>,
+        filter: RelScopedPred,
+    },
+    Join(Box<RelValueExpr>, Box<RelValueExpr>),
+    Product(Box<RelValueExpr>, Box<RelValueExpr>),
+    Project {
+        expr: Box<RelValueExpr>,
+        columns: Vec<usize>,
+    },
+    Union(Box<RelValueExpr>, Box<RelValueExpr>),
+    Intersection(Box<RelValueExpr>, Box<RelValueExpr>),
+    Difference(Box<RelValueExpr>, Box<RelValueExpr>),
+    Transpose(Box<RelValueExpr>),
+    Closure {
+        expr: Box<RelValueExpr>,
+        reflexive: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct RelComprehensionBinding {
+    var: String,
+    entity: String,
+    source_ref: RelStateRef,
+}
+
+#[derive(Debug, Clone)]
+enum RelProjection {
+    Entity {
+        binding: String,
+        entity: String,
+    },
+    Field {
+        binding: String,
+        entity: String,
+        field: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RelAtomRef {
+    EntitySlot { entity: String, slot: usize },
+    Value(SimpleValue),
 }
 
 #[derive(Debug, Clone)]
@@ -1893,7 +1972,8 @@ fn relational_verify_spec(
     let entity_names: Vec<_> = entities.keys().cloned().collect();
     let mut assertions = Vec::with_capacity(verify.asserts.len());
     for assertion in &verify.asserts {
-        let Some(snapshot) = parse_verify_assertion(assertion, &entity_names)? else {
+        let Some(snapshot) = parse_verify_assertion(assertion, &entity_names, &verify.stores)?
+        else {
             return Ok(None);
         };
         assertions.push(snapshot);
@@ -2839,16 +2919,18 @@ fn parse_scoped_field_operand(
 fn parse_verify_assertion(
     expr: &IRExpr,
     entity_names: &[String],
+    stores: &[IRStoreDecl],
 ) -> Result<Option<RelSnapshotExpr>, String> {
     let IRExpr::Always { body, .. } = expr else {
         return Ok(None);
     };
-    parse_snapshot_expr(body, entity_names)
+    parse_snapshot_expr(body, entity_names, stores)
 }
 
 fn parse_snapshot_expr(
     expr: &IRExpr,
     entity_names: &[String],
+    stores: &[IRStoreDecl],
 ) -> Result<Option<RelSnapshotExpr>, String> {
     match expr {
         IRExpr::Lit {
@@ -2858,10 +2940,10 @@ fn parse_snapshot_expr(
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
-            let Some(left) = parse_snapshot_expr(left, entity_names)? else {
+            let Some(left) = parse_snapshot_expr(left, entity_names, stores)? else {
                 return Ok(None);
             };
-            let Some(right) = parse_snapshot_expr(right, entity_names)? else {
+            let Some(right) = parse_snapshot_expr(right, entity_names, stores)? else {
                 return Ok(None);
             };
             Ok(Some(match op.as_str() {
@@ -2875,14 +2957,397 @@ fn parse_snapshot_expr(
             }))
         }
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let Some(inner) = parse_snapshot_expr(operand, entity_names)? else {
+            let Some(inner) = parse_snapshot_expr(operand, entity_names, stores)? else {
                 return Ok(None);
             };
             Ok(Some(RelSnapshotExpr::Not(Box::new(inner))))
         }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpSetSubset" || op == "OpLe" => {
+            if let Some((entity, left, right)) = parse_store_extent_subset(left, right, stores) {
+                return Ok(Some(RelSnapshotExpr::StoreExtentSubset {
+                    entity,
+                    left,
+                    right,
+                }));
+            }
+            if let Some((entity, field, left, right)) =
+                parse_field_relation_subset(left, right, stores)
+            {
+                return Ok(Some(RelSnapshotExpr::FieldRelationSubset {
+                    entity,
+                    field,
+                    left,
+                    right,
+                }));
+            }
+            if let (Some(left_expr), Some(right_expr)) = (
+                parse_relation_value_expr(left, stores)?,
+                parse_relation_value_expr(right, stores)?,
+            ) {
+                return Ok(Some(RelSnapshotExpr::RelationSubset {
+                    left: left_expr,
+                    right: right_expr,
+                }));
+            }
+            Ok(None)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpEq" => {
+            if let Some((entity, field, left_ref, right_ref)) =
+                parse_field_relation_subset(left, right, stores)
+            {
+                return Ok(Some(RelSnapshotExpr::And(
+                    Box::new(RelSnapshotExpr::FieldRelationSubset {
+                        entity: entity.clone(),
+                        field: field.clone(),
+                        left: left_ref,
+                        right: right_ref,
+                    }),
+                    Box::new(RelSnapshotExpr::FieldRelationSubset {
+                        entity,
+                        field,
+                        left: right_ref,
+                        right: left_ref,
+                    }),
+                )));
+            }
+            if let (Some(left_expr), Some(right_expr)) = (
+                parse_relation_value_expr(left, stores)?,
+                parse_relation_value_expr(right, stores)?,
+            ) {
+                return Ok(Some(RelSnapshotExpr::And(
+                    Box::new(RelSnapshotExpr::RelationSubset {
+                        left: left_expr.clone(),
+                        right: right_expr.clone(),
+                    }),
+                    Box::new(RelSnapshotExpr::RelationSubset {
+                        left: right_expr,
+                        right: left_expr,
+                    }),
+                )));
+            }
+            Ok(None)
+        }
         IRExpr::Exists { .. } => parse_snapshot_quantifier_chain(expr, entity_names),
         IRExpr::Forall { .. } => parse_snapshot_quantifier_chain(expr, entity_names),
         _ => Ok(None),
+    }
+}
+
+fn parse_store_extent_subset(
+    left: &IRExpr,
+    right: &IRExpr,
+    stores: &[IRStoreDecl],
+) -> Option<(String, RelStateRef, RelStateRef)> {
+    let (left_name, left_ref) = parse_store_extent_ref(left)?;
+    let (right_name, right_ref) = parse_store_extent_ref(right)?;
+    if left_name != right_name {
+        return None;
+    }
+    stores
+        .iter()
+        .find(|store| store.name == left_name)
+        .map(|store| (store.entity_type.clone(), left_ref, right_ref))
+}
+
+fn parse_relation_value_expr(
+    expr: &IRExpr,
+    stores: &[IRStoreDecl],
+) -> Result<Option<RelValueExpr>, String> {
+    if let Some((store_name, field, state_ref)) = parse_field_relation_ref(expr) {
+        let Some(store) = stores.iter().find(|store| store.name == store_name) else {
+            return Ok(None);
+        };
+        return Ok(Some(RelValueExpr::Field {
+            entity: store.entity_type.clone(),
+            field: field.to_owned(),
+            state_ref,
+        }));
+    }
+    if let Some((store_name, state_ref)) = parse_store_extent_ref(expr) {
+        let Some(store) = stores.iter().find(|store| store.name == store_name) else {
+            return Ok(None);
+        };
+        return Ok(Some(RelValueExpr::StoreExtent {
+            entity: store.entity_type.clone(),
+            state_ref,
+        }));
+    }
+
+    match expr {
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            let mut parsed_bindings = Vec::with_capacity(bindings.len());
+            let mut binding_entities = HashMap::new();
+            for binding in bindings {
+                let IRType::Entity { name: entity } = &binding.domain else {
+                    return Ok(None);
+                };
+                let Some(source) = &binding.source else {
+                    return Ok(None);
+                };
+                let Some((store_name, source_ref)) = parse_store_extent_ref(source) else {
+                    return Ok(None);
+                };
+                let Some(store) = stores.iter().find(|store| store.name == store_name) else {
+                    return Ok(None);
+                };
+                if store.entity_type != *entity {
+                    return Ok(None);
+                }
+                parsed_bindings.push(RelComprehensionBinding {
+                    var: binding.var.clone(),
+                    entity: entity.clone(),
+                    source_ref,
+                });
+                binding_entities.insert(binding.var.clone(), entity.clone());
+            }
+            let allowed_bindings = parsed_bindings
+                .iter()
+                .map(|binding| binding.var.as_str())
+                .collect::<Vec<_>>();
+            let Some(filter) = parse_scoped_predicate_expr(
+                filter,
+                None,
+                None,
+                &HashMap::new(),
+                &allowed_bindings,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(projection) =
+                parse_relation_projection(projection, &binding_entities, &allowed_bindings)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Comprehension {
+                projection,
+                bindings: parsed_bindings,
+                filter,
+            }))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpRelJoin" || op == "OpRelationJoin" => {
+            let Some(left) = parse_relation_value_expr(left, stores)? else {
+                return Ok(None);
+            };
+            let Some(right) = parse_relation_value_expr(right, stores)? else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Join(Box::new(left), Box::new(right))))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpRelProduct" || op == "OpRelationProduct" => {
+            let Some(left) = parse_relation_value_expr(left, stores)? else {
+                return Ok(None);
+            };
+            let Some(right) = parse_relation_value_expr(right, stores)? else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Product(Box::new(left), Box::new(right))))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpRelProject" || op == "OpRelationProject" => {
+            let Some(expr) = parse_relation_value_expr(left, stores)? else {
+                return Ok(None);
+            };
+            let Some(columns) = parse_relation_project_columns(right) else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Project {
+                expr: Box::new(expr),
+                columns,
+            }))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(op.as_str(), "OpSetUnion" | "OpSetIntersect" | "OpSetDiff") => {
+            let Some(left) = parse_relation_value_expr(left, stores)? else {
+                return Ok(None);
+            };
+            let Some(right) = parse_relation_value_expr(right, stores)? else {
+                return Ok(None);
+            };
+            Ok(Some(match op.as_str() {
+                "OpSetUnion" => RelValueExpr::Union(Box::new(left), Box::new(right)),
+                "OpSetIntersect" => RelValueExpr::Intersection(Box::new(left), Box::new(right)),
+                "OpSetDiff" => RelValueExpr::Difference(Box::new(left), Box::new(right)),
+                _ => unreachable!(),
+            }))
+        }
+        IRExpr::UnOp { op, operand, .. }
+            if op == "OpRelTranspose" || op == "OpRelationTranspose" =>
+        {
+            let Some(operand) = parse_relation_value_expr(operand, stores)? else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Transpose(Box::new(operand))))
+        }
+        IRExpr::UnOp { op, operand, .. }
+            if matches!(
+                op.as_str(),
+                "OpRelClosure" | "OpRelationClosure" | "OpRelReach" | "OpRelationReach"
+            ) =>
+        {
+            let Some(operand) = parse_relation_value_expr(operand, stores)? else {
+                return Ok(None);
+            };
+            Ok(Some(RelValueExpr::Closure {
+                expr: Box::new(operand),
+                reflexive: matches!(op.as_str(), "OpRelReach" | "OpRelationReach"),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn parse_relation_project_columns(expr: &IRExpr) -> Option<Vec<usize>> {
+    let mut columns = Vec::new();
+    collect_relation_project_columns(expr, &mut columns)?;
+    (!columns.is_empty()).then_some(columns)
+}
+
+fn collect_relation_project_columns(expr: &IRExpr, out: &mut Vec<usize>) -> Option<()> {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Int { value },
+            ..
+        } if *value >= 0 => {
+            out.push((*value).try_into().ok()?);
+            Some(())
+        }
+        IRExpr::App { func, arg, .. } if is_relation_tuple_app(func) => {
+            collect_relation_project_columns(func, out)?;
+            collect_relation_project_columns(arg, out)
+        }
+        IRExpr::Var { name, .. } if name == "Tuple" => Some(()),
+        _ => None,
+    }
+}
+
+fn is_relation_tuple_app(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Var { name, .. } => name == "Tuple",
+        IRExpr::App { func, .. } => is_relation_tuple_app(func),
+        _ => false,
+    }
+}
+
+fn parse_relation_projection(
+    projection: &IRExpr,
+    binding_entities: &HashMap<String, String>,
+    allowed_bindings: &[&str],
+) -> Option<Vec<RelProjection>> {
+    let projection_items = relation_projection_items(projection)?;
+    let mut out = Vec::with_capacity(projection_items.len());
+    for item in projection_items {
+        match item {
+            IRExpr::Var { name, .. } if allowed_bindings.contains(&name.as_str()) => {
+                out.push(RelProjection::Entity {
+                    binding: name.clone(),
+                    entity: binding_entities.get(name)?.clone(),
+                });
+            }
+            IRExpr::Field { expr, field, .. } => {
+                let IRExpr::Var { name, .. } = expr.as_ref() else {
+                    return None;
+                };
+                if !allowed_bindings.contains(&name.as_str()) {
+                    return None;
+                }
+                out.push(RelProjection::Field {
+                    binding: name.clone(),
+                    entity: binding_entities.get(name)?.clone(),
+                    field: field.clone(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn relation_projection_items(expr: &IRExpr) -> Option<Vec<&IRExpr>> {
+    let mut items = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            IRExpr::App { func, arg, .. } => {
+                items.push(arg.as_ref());
+                current = func;
+            }
+            IRExpr::Var { name, .. } if name == "Tuple" => {
+                items.reverse();
+                return Some(items);
+            }
+            _ if items.is_empty() => return Some(vec![expr]),
+            _ => return None,
+        }
+    }
+}
+
+fn parse_field_relation_subset(
+    left: &IRExpr,
+    right: &IRExpr,
+    stores: &[IRStoreDecl],
+) -> Option<(String, String, RelStateRef, RelStateRef)> {
+    let (left_store, left_field, left_ref) = parse_field_relation_ref(left)?;
+    let (right_store, right_field, right_ref) = parse_field_relation_ref(right)?;
+    if left_store != right_store || left_field != right_field {
+        return None;
+    }
+    stores
+        .iter()
+        .find(|store| store.name == left_store)
+        .map(|store| {
+            (
+                store.entity_type.clone(),
+                left_field.to_owned(),
+                left_ref,
+                right_ref,
+            )
+        })
+}
+
+fn parse_field_relation_ref(expr: &IRExpr) -> Option<(&str, &str, RelStateRef)> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    if op != "OpRelationField" {
+        return None;
+    }
+    let (store, state_ref) = parse_store_extent_ref(left)?;
+    let IRExpr::Var { name, .. } = right.as_ref() else {
+        return None;
+    };
+    let field = name.rsplit("::").next()?;
+    Some((store, field, state_ref))
+}
+
+fn parse_store_extent_ref(expr: &IRExpr) -> Option<(&str, RelStateRef)> {
+    match expr {
+        IRExpr::Var { name, .. } => Some((name.as_str(), RelStateRef::Current)),
+        IRExpr::Prime { expr, .. } => {
+            let IRExpr::Var { name, .. } = expr.as_ref() else {
+                return None;
+            };
+            Some((name.as_str(), RelStateRef::Next))
+        }
+        _ => None,
     }
 }
 
@@ -3244,11 +3709,59 @@ fn collect_snapshot_values(
                 .collect::<HashMap<_, _>>();
             collect_scoped_pred_values_for_entity(pred, &binding_entities, domains, entity_name);
         }
+        RelSnapshotExpr::StoreExtentSubset { .. } | RelSnapshotExpr::FieldRelationSubset { .. } => {
+        }
+        RelSnapshotExpr::RelationSubset { left, right } => {
+            collect_relation_value_expr_values(left, domains, entity_name);
+            collect_relation_value_expr_values(right, domains, entity_name);
+        }
         RelSnapshotExpr::And(left, right) | RelSnapshotExpr::Or(left, right) => {
             collect_snapshot_values(left, domains, entity_name);
             collect_snapshot_values(right, domains, entity_name);
         }
         RelSnapshotExpr::Not(inner) => collect_snapshot_values(inner, domains, entity_name),
+    }
+}
+
+fn collect_relation_value_expr_values(
+    expr: &RelValueExpr,
+    domains: &mut HashMap<String, Vec<SimpleValue>>,
+    entity_name: &str,
+) {
+    match expr {
+        RelValueExpr::StoreExtent { .. } => {}
+        RelValueExpr::Field { .. } => {}
+        RelValueExpr::Comprehension {
+            projection: _,
+            bindings,
+            filter,
+        } => {
+            let binding_entities = bindings
+                .iter()
+                .map(|binding| (binding.var.as_str(), binding.entity.as_str()))
+                .collect::<HashMap<_, _>>();
+            collect_scoped_pred_values_for_entity(filter, &binding_entities, domains, entity_name);
+        }
+        RelValueExpr::Join(left, right) => {
+            collect_relation_value_expr_values(left, domains, entity_name);
+            collect_relation_value_expr_values(right, domains, entity_name);
+        }
+        RelValueExpr::Product(left, right)
+        | RelValueExpr::Union(left, right)
+        | RelValueExpr::Intersection(left, right)
+        | RelValueExpr::Difference(left, right) => {
+            collect_relation_value_expr_values(left, domains, entity_name);
+            collect_relation_value_expr_values(right, domains, entity_name);
+        }
+        RelValueExpr::Project { expr, .. } => {
+            collect_relation_value_expr_values(expr, domains, entity_name);
+        }
+        RelValueExpr::Transpose(inner) => {
+            collect_relation_value_expr_values(inner, domains, entity_name);
+        }
+        RelValueExpr::Closure { expr, .. } => {
+            collect_relation_value_expr_values(expr, domains, entity_name);
+        }
     }
 }
 
@@ -3521,7 +4034,8 @@ fn encode_verify_violation_into(
     let mut violations = Vec::with_capacity(assertions.len() * (bound + 1));
     for assertion in assertions {
         for state_idx in 0..=bound {
-            let holds = encode_verify_snapshot_into(assertion, entity_states, sat, state_idx)?;
+            let holds =
+                encode_verify_snapshot_into(assertion, entity_states, sat, state_idx, bound)?;
             violations.push(!holds);
         }
     }
@@ -3536,6 +4050,7 @@ fn encode_verify_snapshot_into(
     entity_states: &HashMap<String, EntityStateEncoding>,
     sat: &mut SatInstance,
     state_idx: usize,
+    bound: usize,
 ) -> Result<rustsat::types::Lit, String> {
     match expr {
         RelSnapshotExpr::Bool(value) => Ok(const_lit(sat, *value)),
@@ -3577,14 +4092,96 @@ fn encode_verify_snapshot_into(
                 &mut assignment,
             )
         }
+        RelSnapshotExpr::StoreExtentSubset {
+            entity,
+            left,
+            right,
+        } => {
+            let Some(left_idx) = relation_state_index(*left, state_idx, bound) else {
+                return Ok(const_lit(sat, true));
+            };
+            let Some(right_idx) = relation_state_index(*right, state_idx, bound) else {
+                return Ok(const_lit(sat, true));
+            };
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let left_active = &state.active_by_state[left_idx];
+            let right_active = &state.active_by_state[right_idx];
+            let clauses = left_active
+                .iter()
+                .zip(right_active)
+                .map(|(&left, &right)| or_lit(sat, &[!left, right]))
+                .collect::<Result<Vec<_>, _>>()?;
+            and_lit(sat, &clauses)
+        }
+        RelSnapshotExpr::FieldRelationSubset {
+            entity,
+            field,
+            left,
+            right,
+        } => {
+            let Some(left_idx) = relation_state_index(*left, state_idx, bound) else {
+                return Ok(const_lit(sat, true));
+            };
+            let Some(right_idx) = relation_state_index(*right, state_idx, bound) else {
+                return Ok(const_lit(sat, true));
+            };
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let encoding = state
+                .field_encodings
+                .get(field)
+                .ok_or_else(|| format!("missing relational field `{entity}.{field}`"))?;
+            let mut clauses = Vec::new();
+            for slot in 0..state.slot_count {
+                let left_active = state.active_by_state[left_idx][slot];
+                let right_active = state.active_by_state[right_idx][slot];
+                for value_idx in 0..encoding.values.len() {
+                    let left_lit = encoding.state_lits[left_idx][slot][value_idx];
+                    let right_lit = encoding.state_lits[right_idx][slot][value_idx];
+                    clauses.push(or_lit(sat, &[!left_active, !left_lit, right_active])?);
+                    clauses.push(or_lit(sat, &[!left_active, !left_lit, right_lit])?);
+                }
+            }
+            and_lit(sat, &clauses)
+        }
+        RelSnapshotExpr::RelationSubset { left, right } => {
+            let domains = relation_value_domains(left, entity_states)?;
+            let tuples = relation_domain_tuples(&domains);
+            let mut clauses = Vec::with_capacity(tuples.len());
+            for tuple in tuples {
+                let left_lit = encode_relation_value_membership(
+                    left,
+                    &tuple,
+                    entity_states,
+                    sat,
+                    state_idx,
+                    bound,
+                )?;
+                let right_lit = encode_relation_value_membership(
+                    right,
+                    &tuple,
+                    entity_states,
+                    sat,
+                    state_idx,
+                    bound,
+                )?;
+                clauses.push(or_lit(sat, &[!left_lit, right_lit])?);
+            }
+            and_lit(sat, &clauses)
+        }
         RelSnapshotExpr::And(left, right) => {
-            let left_lit = encode_verify_snapshot_into(left, entity_states, sat, state_idx)?;
-            let right_lit = encode_verify_snapshot_into(right, entity_states, sat, state_idx)?;
+            let left_lit = encode_verify_snapshot_into(left, entity_states, sat, state_idx, bound)?;
+            let right_lit =
+                encode_verify_snapshot_into(right, entity_states, sat, state_idx, bound)?;
             and_lit(sat, &[left_lit, right_lit])
         }
         RelSnapshotExpr::Or(left, right) => {
-            let left_lit = encode_verify_snapshot_into(left, entity_states, sat, state_idx)?;
-            let right_lit = encode_verify_snapshot_into(right, entity_states, sat, state_idx)?;
+            let left_lit = encode_verify_snapshot_into(left, entity_states, sat, state_idx, bound)?;
+            let right_lit =
+                encode_verify_snapshot_into(right, entity_states, sat, state_idx, bound)?;
             or_lit(sat, &[left_lit, right_lit])
         }
         RelSnapshotExpr::Not(inner) => Ok(!encode_verify_snapshot_into(
@@ -3592,7 +4189,781 @@ fn encode_verify_snapshot_into(
             entity_states,
             sat,
             state_idx,
+            bound,
         )?),
+    }
+}
+
+fn relation_state_index(state_ref: RelStateRef, state_idx: usize, bound: usize) -> Option<usize> {
+    match state_ref {
+        RelStateRef::Current => Some(state_idx),
+        RelStateRef::Next if state_idx < bound => Some(state_idx + 1),
+        RelStateRef::Next => None,
+    }
+}
+
+fn relation_value_domains(
+    expr: &RelValueExpr,
+    entity_states: &HashMap<String, EntityStateEncoding>,
+) -> Result<Vec<Vec<RelAtomRef>>, String> {
+    match expr {
+        RelValueExpr::StoreExtent { entity, .. } => {
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            Ok(vec![(0..state.slot_count)
+                .map(|slot| RelAtomRef::EntitySlot {
+                    entity: entity.clone(),
+                    slot,
+                })
+                .collect()])
+        }
+        RelValueExpr::Field { entity, field, .. } => {
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let encoding = state
+                .field_encodings
+                .get(field)
+                .ok_or_else(|| format!("missing relational field `{entity}.{field}`"))?;
+            Ok(vec![
+                (0..state.slot_count)
+                    .map(|slot| RelAtomRef::EntitySlot {
+                        entity: entity.clone(),
+                        slot,
+                    })
+                    .collect(),
+                encoding
+                    .values
+                    .iter()
+                    .cloned()
+                    .map(RelAtomRef::Value)
+                    .collect(),
+            ])
+        }
+        RelValueExpr::Comprehension { projection, .. } => projection
+            .iter()
+            .map(|item| match item {
+                RelProjection::Entity { entity, .. } => {
+                    let state = entity_states
+                        .get(entity)
+                        .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+                    Ok((0..state.slot_count)
+                        .map(|slot| RelAtomRef::EntitySlot {
+                            entity: entity.clone(),
+                            slot,
+                        })
+                        .collect())
+                }
+                RelProjection::Field { entity, field, .. } => {
+                    let state = entity_states
+                        .get(entity)
+                        .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+                    let encoding = state
+                        .field_encodings
+                        .get(field)
+                        .ok_or_else(|| format!("missing relational field `{entity}.{field}`"))?;
+                    Ok(encoding
+                        .values
+                        .iter()
+                        .cloned()
+                        .map(RelAtomRef::Value)
+                        .collect())
+                }
+            })
+            .collect(),
+        RelValueExpr::Join(left, right) => {
+            let left_domains = relation_value_domains(left, entity_states)?;
+            let right_domains = relation_value_domains(right, entity_states)?;
+            if left_domains.is_empty() || right_domains.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut domains = Vec::new();
+            domains.extend(left_domains[..left_domains.len() - 1].iter().cloned());
+            domains.extend(right_domains[1..].iter().cloned());
+            Ok(domains)
+        }
+        RelValueExpr::Product(left, right) => {
+            let mut domains = relation_value_domains(left, entity_states)?;
+            domains.extend(relation_value_domains(right, entity_states)?);
+            Ok(domains)
+        }
+        RelValueExpr::Project { expr, columns } => {
+            let domains = relation_value_domains(expr, entity_states)?;
+            columns
+                .iter()
+                .map(|column| {
+                    domains
+                        .get(*column)
+                        .cloned()
+                        .ok_or_else(|| format!("relation project column {column} out of bounds"))
+                })
+                .collect()
+        }
+        RelValueExpr::Union(left, right)
+        | RelValueExpr::Intersection(left, right)
+        | RelValueExpr::Difference(left, right) => {
+            let left_domains = relation_value_domains(left, entity_states)?;
+            let right_domains = relation_value_domains(right, entity_states)?;
+            if left_domains.len() != right_domains.len() {
+                return Err("relation set operation arity mismatch".to_owned());
+            }
+            Ok(left_domains)
+        }
+        RelValueExpr::Transpose(inner) => {
+            let mut domains = relation_value_domains(inner, entity_states)?;
+            if domains.len() == 2 {
+                domains.swap(0, 1);
+                Ok(domains)
+            } else {
+                Err("Rel::transpose requires a binary relation".to_owned())
+            }
+        }
+        RelValueExpr::Closure { expr, .. } => {
+            let domains = relation_value_domains(expr, entity_states)?;
+            if domains.len() != 2 {
+                return Err("Rel::closure requires a binary relation".to_owned());
+            }
+            if domains[0] != domains[1] {
+                return Err("Rel::closure requires a homogeneous binary relation".to_owned());
+            }
+            Ok(domains)
+        }
+    }
+}
+
+fn relation_domain_tuples(domains: &[Vec<RelAtomRef>]) -> Vec<Vec<RelAtomRef>> {
+    let mut out = Vec::new();
+    collect_relation_domain_tuples(domains, 0, &mut Vec::new(), &mut out);
+    out
+}
+
+fn collect_relation_domain_tuples(
+    domains: &[Vec<RelAtomRef>],
+    index: usize,
+    current: &mut Vec<RelAtomRef>,
+    out: &mut Vec<Vec<RelAtomRef>>,
+) {
+    if index == domains.len() {
+        out.push(current.clone());
+        return;
+    }
+    for atom in &domains[index] {
+        current.push(atom.clone());
+        collect_relation_domain_tuples(domains, index + 1, current, out);
+        current.pop();
+    }
+}
+
+fn encode_relation_value_membership(
+    expr: &RelValueExpr,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+) -> Result<rustsat::types::Lit, String> {
+    match expr {
+        RelValueExpr::StoreExtent { entity, state_ref } => {
+            if tuple.len() != 1 {
+                return Ok(const_lit(sat, false));
+            }
+            let RelAtomRef::EntitySlot {
+                entity: atom_entity,
+                slot,
+            } = &tuple[0]
+            else {
+                return Ok(const_lit(sat, false));
+            };
+            if atom_entity != entity {
+                return Ok(const_lit(sat, false));
+            }
+            let Some(real_state_idx) = relation_state_index(*state_ref, state_idx, bound) else {
+                return Ok(const_lit(sat, false));
+            };
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            if *slot >= state.slot_count {
+                return Ok(const_lit(sat, false));
+            }
+            Ok(state.active_by_state[real_state_idx][*slot])
+        }
+        RelValueExpr::Field {
+            entity,
+            field,
+            state_ref,
+        } => encode_field_relation_membership(
+            entity,
+            field,
+            *state_ref,
+            tuple,
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+        ),
+        RelValueExpr::Comprehension {
+            projection,
+            bindings,
+            filter,
+        } => encode_relation_comprehension_membership(
+            projection,
+            bindings,
+            filter,
+            tuple,
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+        ),
+        RelValueExpr::Transpose(inner) => {
+            if tuple.len() != 2 {
+                return Ok(const_lit(sat, false));
+            }
+            let reversed = vec![tuple[1].clone(), tuple[0].clone()];
+            encode_relation_value_membership(inner, &reversed, entity_states, sat, state_idx, bound)
+        }
+        RelValueExpr::Product(left, right) => {
+            let left_arity = relation_value_domains(left, entity_states)?.len();
+            if tuple.len() < left_arity {
+                return Ok(const_lit(sat, false));
+            }
+            let left_lit = encode_relation_value_membership(
+                left,
+                &tuple[..left_arity],
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            let right_lit = encode_relation_value_membership(
+                right,
+                &tuple[left_arity..],
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            and_lit(sat, &[left_lit, right_lit])
+        }
+        RelValueExpr::Project { expr, columns } => {
+            if tuple.len() != columns.len() {
+                return Ok(const_lit(sat, false));
+            }
+            let inner_domains = relation_value_domains(expr, entity_states)?;
+            let mut reasons = Vec::new();
+            for candidate in relation_domain_tuples(&inner_domains) {
+                let selected = columns
+                    .iter()
+                    .map(|column| candidate.get(*column).cloned())
+                    .collect::<Option<Vec<_>>>();
+                if selected.as_deref() == Some(tuple) {
+                    reasons.push(encode_relation_value_membership(
+                        expr,
+                        &candidate,
+                        entity_states,
+                        sat,
+                        state_idx,
+                        bound,
+                    )?);
+                }
+            }
+            or_lit(sat, &reasons)
+        }
+        RelValueExpr::Union(left, right) => {
+            let left_lit = encode_relation_value_membership(
+                left,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            let right_lit = encode_relation_value_membership(
+                right,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            or_lit(sat, &[left_lit, right_lit])
+        }
+        RelValueExpr::Intersection(left, right) => {
+            let left_lit = encode_relation_value_membership(
+                left,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            let right_lit = encode_relation_value_membership(
+                right,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            and_lit(sat, &[left_lit, right_lit])
+        }
+        RelValueExpr::Difference(left, right) => {
+            let left_lit = encode_relation_value_membership(
+                left,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            let right_lit = encode_relation_value_membership(
+                right,
+                tuple,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            and_lit(sat, &[left_lit, !right_lit])
+        }
+        RelValueExpr::Join(left, right) => {
+            let left_domains = relation_value_domains(left, entity_states)?;
+            let right_domains = relation_value_domains(right, entity_states)?;
+            if left_domains.is_empty() || right_domains.is_empty() {
+                return Ok(const_lit(sat, false));
+            }
+            let left_arity = left_domains.len();
+            let right_arity = right_domains.len();
+            if tuple.len() != left_arity + right_arity - 2 {
+                return Ok(const_lit(sat, false));
+            }
+            let mut middle = left_domains[left_arity - 1].clone();
+            middle.retain(|atom| right_domains[0].contains(atom));
+            let mut reasons = Vec::new();
+            for atom in middle {
+                let mut left_tuple = tuple[..left_arity - 1].to_vec();
+                left_tuple.push(atom.clone());
+                let mut right_tuple = vec![atom];
+                right_tuple.extend(tuple[left_arity - 1..].iter().cloned());
+                let left_lit = encode_relation_value_membership(
+                    left,
+                    &left_tuple,
+                    entity_states,
+                    sat,
+                    state_idx,
+                    bound,
+                )?;
+                let right_lit = encode_relation_value_membership(
+                    right,
+                    &right_tuple,
+                    entity_states,
+                    sat,
+                    state_idx,
+                    bound,
+                )?;
+                reasons.push(and_lit(sat, &[left_lit, right_lit])?);
+            }
+            or_lit(sat, &reasons)
+        }
+        RelValueExpr::Closure { expr, reflexive } => encode_relation_closure_membership(
+            expr,
+            *reflexive,
+            tuple,
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_closure_membership(
+    expr: &RelValueExpr,
+    reflexive: bool,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+) -> Result<rustsat::types::Lit, String> {
+    if tuple.len() != 2 {
+        return Ok(const_lit(sat, false));
+    }
+    let domains = relation_value_domains(expr, entity_states)?;
+    if domains.len() != 2 {
+        return Err("Rel::closure requires a binary relation".to_owned());
+    }
+    if domains[0] != domains[1] {
+        return Err("Rel::closure requires a homogeneous binary relation".to_owned());
+    }
+    if !domains[0].contains(&tuple[0]) || !domains[1].contains(&tuple[1]) {
+        return Ok(const_lit(sat, false));
+    }
+
+    let node_count = domains[0].len();
+    let mut reasons = Vec::new();
+    if reflexive && tuple[0] == tuple[1] {
+        reasons.push(const_lit(sat, true));
+    }
+    if node_count > 0 {
+        let mut memo = HashMap::new();
+        reasons.push(encode_relation_path_within(
+            expr,
+            &tuple[0],
+            &tuple[1],
+            node_count,
+            &domains[0],
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+            &mut memo,
+        )?);
+    }
+    or_lit(sat, &reasons)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_path_within(
+    expr: &RelValueExpr,
+    start: &RelAtomRef,
+    end: &RelAtomRef,
+    max_edges: usize,
+    nodes: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+    memo: &mut HashMap<(RelAtomRef, RelAtomRef, usize), rustsat::types::Lit>,
+) -> Result<rustsat::types::Lit, String> {
+    if max_edges == 0 {
+        return Ok(const_lit(sat, false));
+    }
+    let key = (start.clone(), end.clone(), max_edges);
+    if let Some(lit) = memo.get(&key) {
+        return Ok(*lit);
+    }
+
+    let edge = encode_relation_value_membership(
+        expr,
+        &[start.clone(), end.clone()],
+        entity_states,
+        sat,
+        state_idx,
+        bound,
+    )?;
+    let lit = if max_edges == 1 {
+        edge
+    } else {
+        let mut reasons = vec![edge];
+        for middle in nodes {
+            let first = encode_relation_value_membership(
+                expr,
+                &[start.clone(), middle.clone()],
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            )?;
+            let rest = encode_relation_path_within(
+                expr,
+                middle,
+                end,
+                max_edges - 1,
+                nodes,
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+                memo,
+            )?;
+            reasons.push(and_lit(sat, &[first, rest])?);
+        }
+        or_lit(sat, &reasons)?
+    };
+    memo.insert(key, lit);
+    Ok(lit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_field_relation_membership(
+    entity: &str,
+    field: &str,
+    state_ref: RelStateRef,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+) -> Result<rustsat::types::Lit, String> {
+    if tuple.len() != 2 {
+        return Ok(const_lit(sat, false));
+    }
+    let RelAtomRef::EntitySlot {
+        entity: tuple_entity,
+        slot,
+    } = &tuple[0]
+    else {
+        return Ok(const_lit(sat, false));
+    };
+    let RelAtomRef::Value(value) = &tuple[1] else {
+        return Ok(const_lit(sat, false));
+    };
+    if tuple_entity != entity {
+        return Ok(const_lit(sat, false));
+    }
+    let Some(real_state_idx) = relation_state_index(state_ref, state_idx, bound) else {
+        return Ok(const_lit(sat, false));
+    };
+    let state = entity_states
+        .get(entity)
+        .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+    if *slot >= state.slot_count {
+        return Ok(const_lit(sat, false));
+    }
+    let encoding = state
+        .field_encodings
+        .get(field)
+        .ok_or_else(|| format!("missing relational field `{entity}.{field}`"))?;
+    let Some(value_idx) = encoding
+        .values
+        .iter()
+        .position(|candidate| candidate == value)
+    else {
+        return Ok(const_lit(sat, false));
+    };
+    and_lit(
+        sat,
+        &[
+            state.active_by_state[real_state_idx][*slot],
+            encoding.state_lits[real_state_idx][*slot][value_idx],
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_comprehension_membership(
+    projection: &[RelProjection],
+    bindings: &[RelComprehensionBinding],
+    filter: &RelScopedPred,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+) -> Result<rustsat::types::Lit, String> {
+    if projection.len() != tuple.len() {
+        return Ok(const_lit(sat, false));
+    }
+    let mut assignments = Vec::new();
+    encode_relation_comprehension_assignments(
+        projection,
+        bindings,
+        filter,
+        tuple,
+        entity_states,
+        sat,
+        state_idx,
+        bound,
+        0,
+        &mut HashMap::new(),
+        &mut assignments,
+    )?;
+    or_lit(sat, &assignments)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_comprehension_assignments(
+    projection: &[RelProjection],
+    bindings: &[RelComprehensionBinding],
+    filter: &RelScopedPred,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+    index: usize,
+    assignment: &mut HashMap<String, (String, usize)>,
+    out: &mut Vec<rustsat::types::Lit>,
+) -> Result<(), String> {
+    if index == bindings.len() {
+        out.push(encode_relation_comprehension_assignment(
+            projection,
+            bindings,
+            filter,
+            tuple,
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+            assignment,
+        )?);
+        return Ok(());
+    }
+    let binding = &bindings[index];
+    let state = entity_states
+        .get(&binding.entity)
+        .ok_or_else(|| format!("missing relational entity state for `{}`", binding.entity))?;
+    for slot in 0..state.slot_count {
+        assignment.insert(binding.var.clone(), (binding.entity.clone(), slot));
+        encode_relation_comprehension_assignments(
+            projection,
+            bindings,
+            filter,
+            tuple,
+            entity_states,
+            sat,
+            state_idx,
+            bound,
+            index + 1,
+            assignment,
+            out,
+        )?;
+    }
+    assignment.remove(&binding.var);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_comprehension_assignment(
+    projection: &[RelProjection],
+    bindings: &[RelComprehensionBinding],
+    filter: &RelScopedPred,
+    tuple: &[RelAtomRef],
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+    assignment: &HashMap<String, (String, usize)>,
+) -> Result<rustsat::types::Lit, String> {
+    let mut constraints = Vec::new();
+    for binding in bindings {
+        let Some(source_idx) = relation_state_index(binding.source_ref, state_idx, bound) else {
+            return Ok(const_lit(sat, false));
+        };
+        let state = entity_states
+            .get(&binding.entity)
+            .ok_or_else(|| format!("missing relational entity state for `{}`", binding.entity))?;
+        let Some((_, slot)) = assignment.get(&binding.var) else {
+            return Ok(const_lit(sat, false));
+        };
+        constraints.push(state.active_by_state[source_idx][*slot]);
+    }
+
+    let binding_slots = assignment
+        .iter()
+        .map(|(var, (entity, slot))| {
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let slots = (0..state.slot_count)
+                .map(|candidate| const_lit(sat, candidate == *slot))
+                .collect::<Vec<_>>();
+            Ok((var.clone(), (entity.clone(), slots)))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    let current_fields = fields_for_state(entity_states, state_idx);
+    constraints.push(encode_scoped_pred_with_bindings(
+        sat,
+        filter,
+        &binding_slots,
+        &current_fields,
+        entity_states,
+    )?);
+
+    for (projection, atom) in projection.iter().zip(tuple) {
+        constraints.push(encode_projection_matches_atom(
+            projection,
+            atom,
+            assignment,
+            entity_states,
+            sat,
+            state_idx,
+        )?);
+    }
+
+    and_lit(sat, &constraints)
+}
+
+fn fields_for_state(
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    state_idx: usize,
+) -> HashMap<String, HashMap<String, Vec<Vec<rustsat::types::Lit>>>> {
+    entity_states
+        .iter()
+        .map(|(entity_name, state)| {
+            (
+                entity_name.clone(),
+                state
+                    .field_encodings
+                    .iter()
+                    .map(|(field_name, encoding)| {
+                        (field_name.clone(), encoding.state_lits[state_idx].clone())
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn encode_projection_matches_atom(
+    projection: &RelProjection,
+    atom: &RelAtomRef,
+    assignment: &HashMap<String, (String, usize)>,
+    entity_states: &HashMap<String, EntityStateEncoding>,
+    sat: &mut SatInstance,
+    state_idx: usize,
+) -> Result<rustsat::types::Lit, String> {
+    match projection {
+        RelProjection::Entity { binding, entity } => {
+            let Some((assigned_entity, slot)) = assignment.get(binding) else {
+                return Ok(const_lit(sat, false));
+            };
+            let RelAtomRef::EntitySlot {
+                entity: atom_entity,
+                slot: atom_slot,
+            } = atom
+            else {
+                return Ok(const_lit(sat, false));
+            };
+            Ok(const_lit(
+                sat,
+                assigned_entity == entity && atom_entity == entity && atom_slot == slot,
+            ))
+        }
+        RelProjection::Field {
+            binding,
+            entity,
+            field,
+        } => {
+            let Some((assigned_entity, slot)) = assignment.get(binding) else {
+                return Ok(const_lit(sat, false));
+            };
+            let RelAtomRef::Value(value) = atom else {
+                return Ok(const_lit(sat, false));
+            };
+            if assigned_entity != entity {
+                return Ok(const_lit(sat, false));
+            }
+            let state = entity_states
+                .get(entity)
+                .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
+            let encoding = state
+                .field_encodings
+                .get(field)
+                .ok_or_else(|| format!("missing relational field `{entity}.{field}`"))?;
+            let Some(value_idx) = encoding
+                .values
+                .iter()
+                .position(|candidate| candidate == value)
+            else {
+                return Ok(const_lit(sat, false));
+            };
+            Ok(encoding.state_lits[state_idx][*slot][value_idx])
+        }
     }
 }
 

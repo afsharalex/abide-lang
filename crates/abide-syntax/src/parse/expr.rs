@@ -4,7 +4,9 @@ use super::{
     infix_bp, postfix_bp, Parser, BP_CHOICE, BP_NAMED_PAIR, BP_NAMED_PAIR_RHS, BP_NOT, BP_NOT_RHS,
     BP_PREFIX_EXPR, BP_UNARY, BP_UNARY_RHS,
 };
-use crate::ast::{AggKind, Expr, ExprKind, FieldPat, LetBind, MatchArm, Pattern, SawArg};
+use crate::ast::{
+    AggKind, Expr, ExprKind, FieldPat, LetBind, MatchArm, Pattern, RelCompBinding, SawArg,
+};
 use crate::diagnostic::ParseError;
 use crate::lex::Token;
 use crate::span::Span;
@@ -712,9 +714,9 @@ impl Parser {
             Some(Token::Name(_)) => {
                 let (n1, n1_span) = self.expect_name()?;
                 if self.eat(&Token::ColonColon).is_some() {
-                    let (n2, n2_span) = self.expect_name()?;
+                    let (n2, n2_span) = self.expect_qualified_name_segment()?;
                     if self.eat(&Token::ColonColon).is_some() {
-                        let (n3, n3_span) = self.expect_name()?;
+                        let (n3, n3_span) = self.expect_qualified_name_segment()?;
                         Ok(Expr {
                             kind: ExprKind::Qual3(n1, n2, n3),
                             span: n1_span.merge(n3_span),
@@ -768,6 +770,13 @@ impl Parser {
             }
             Some(Token::LParen) => {
                 self.advance();
+                if matches!(&lhs.kind, ExprKind::Var(name) if name == "Rel") {
+                    let saved = self.pos;
+                    if let Ok(expr) = self.relation_comprehension_call(start) {
+                        return Ok(expr);
+                    }
+                    self.pos = saved;
+                }
                 let args = self.comma_sep_expr(&Token::RParen)?;
                 let end = self.expect(&Token::RParen)?;
                 Ok(Expr {
@@ -836,5 +845,42 @@ impl Parser {
             items.push(self.expr()?);
         }
         Ok(items)
+    }
+
+    fn relation_comprehension_call(&mut self, start: Span) -> Result<Expr, ParseError> {
+        let projection = self.expr_bp(BP_CHOICE.1)?;
+        self.expect(&Token::Pipe)?;
+        let mut bindings = Vec::new();
+        loop {
+            let (var, var_span) = self.expect_name()?;
+            self.expect(&Token::Colon)?;
+            let domain = self.type_ref()?;
+            let source = if self.eat(&Token::In).is_some() {
+                Some(Box::new(self.expr_bp(BP_CHOICE.1)?))
+            } else {
+                None
+            };
+            let span = var_span.merge(source.as_ref().map_or(domain.span, |expr| expr.span));
+            bindings.push(RelCompBinding {
+                var,
+                domain,
+                source,
+                span,
+            });
+            if self.eat(&Token::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(&Token::Where)?;
+        let filter = self.expr()?;
+        let end = self.expect(&Token::RParen)?;
+        Ok(Expr {
+            kind: ExprKind::RelComp {
+                projection: Box::new(projection),
+                bindings,
+                filter: Box::new(filter),
+            },
+            span: start.merge(end),
+        })
     }
 }

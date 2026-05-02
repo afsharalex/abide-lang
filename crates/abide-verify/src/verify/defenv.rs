@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ir::types::{IRExpr, IRProgram, IRQuery, IRType};
+use crate::ir::types::{IRExpr, IRProgram, IRQuery, IRRelCompBinding, IRType};
 
 /// Global counter for generating fresh variable names during alpha-renaming.
 static FRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -896,6 +896,27 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 bound.remove(var);
             }
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            let mut added = Vec::new();
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    free_vars_inner(source, bound, fv);
+                }
+                if bound.insert(binding.var.clone()) {
+                    added.push(binding.var.clone());
+                }
+            }
+            free_vars_inner(projection, bound, fv);
+            free_vars_inner(filter, bound, fv);
+            for name in added {
+                bound.remove(&name);
+            }
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             for e in elements {
                 free_vars_inner(e, bound, fv);
@@ -1484,6 +1505,64 @@ fn substitute_var_inner(
                 }
             }
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ty,
+            ..
+        } => {
+            let mut shadowed = false;
+            let mut new_bindings = Vec::new();
+            for binding in bindings {
+                let source = binding.source.map(|source| {
+                    if shadowed {
+                        source
+                    } else {
+                        Box::new(substitute_var_inner(
+                            *source,
+                            var_name,
+                            replacement,
+                            repl_fv,
+                        ))
+                    }
+                });
+                if binding.var == var_name {
+                    shadowed = true;
+                }
+                new_bindings.push(IRRelCompBinding {
+                    var: binding.var,
+                    domain: binding.domain,
+                    source,
+                });
+            }
+
+            IRExpr::RelComp {
+                projection: if shadowed {
+                    projection
+                } else {
+                    Box::new(substitute_var_inner(
+                        *projection,
+                        var_name,
+                        replacement,
+                        repl_fv,
+                    ))
+                },
+                bindings: new_bindings,
+                filter: if shadowed {
+                    filter
+                } else {
+                    Box::new(substitute_var_inner(
+                        *filter,
+                        var_name,
+                        replacement,
+                        repl_fv,
+                    ))
+                },
+                ty,
+                span: None,
+            }
+        }
         IRExpr::SetLit { elements, ty, .. } => IRExpr::SetLit {
             elements: elements
                 .into_iter()
@@ -1692,6 +1771,17 @@ fn find_var_type(expr: &IRExpr, name: &str) -> Option<IRType> {
             .iter()
             .find_map(|b| find_var_type(&b.expr, name))
             .or_else(|| find_var_type(body, name)),
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => bindings
+            .iter()
+            .filter_map(|binding| binding.source.as_deref())
+            .find_map(|source| find_var_type(source, name))
+            .or_else(|| find_var_type(projection, name))
+            .or_else(|| find_var_type(filter, name)),
         IRExpr::Match {
             scrutinee, arms, ..
         } => find_var_type(scrutinee, name).or_else(|| {

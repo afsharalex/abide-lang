@@ -143,6 +143,21 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
                     .as_ref()
                     .is_some_and(|expr| needs_property_encoder(expr))
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            needs_property_encoder(projection)
+                || needs_property_encoder(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| needs_property_encoder(source))
+                })
+        }
         IRExpr::Lit { .. }
         | IRExpr::Var { .. }
         | IRExpr::Prime { .. }

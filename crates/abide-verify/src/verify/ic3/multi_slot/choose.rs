@@ -327,6 +327,21 @@ pub(in crate::verify::ic3) fn ic3_expr_mentions_var(expr: &IRExpr, target: &str)
                     .as_ref()
                     .is_some_and(|expr| ic3_expr_mentions_var(expr, target))
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            ic3_expr_mentions_var(projection, target)
+                || ic3_expr_mentions_var(filter, target)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|expr| ic3_expr_mentions_var(expr, target))
+                })
+        }
         IRExpr::App { func, arg, .. } => {
             ic3_expr_mentions_var(func, target) || ic3_expr_mentions_var(arg, target)
         }

@@ -1,0 +1,108 @@
+module Relations
+
+// Finite relation checks over first-class relation values.
+enum OrderStage = Draft | Paid | Shipped
+enum FulfillmentPhase = Open | Complete
+enum HandlingLane = Manual | Automated
+enum CustomerKey = CustomerOne | CustomerTwo
+enum CustomerSegment = Vip | Standard
+enum NodeKey = NodeA | NodeB | NodeC
+
+type StagePhaseRel = Rel<OrderStage, FulfillmentPhase>
+type StagePhaseLaneRel = Rel<(OrderStage, FulfillmentPhase, HandlingLane)>
+
+verify stage_lane_join {
+  assert Rel::join(
+    Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete)),
+    Rel((@Open, @Manual), (@Complete, @Automated))
+  ) == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+
+verify transpose_flips_columns {
+  assert Rel::transpose(
+    Rel((@Draft, @Open), (@Shipped, @Complete))
+  ) == Rel((@Open, @Draft), (@Complete, @Shipped))
+}
+
+verify lifecycle_reachability {
+  assert Rel::closure(
+    Rel((@Draft, @Paid), (@Paid, @Shipped))
+  ) == Rel((@Draft, @Paid), (@Paid, @Shipped), (@Draft, @Shipped))
+}
+
+verify lifecycle_reachability_with_identity {
+  assert Rel::reach(
+    Rel((@Draft, @Paid), (@Paid, @Shipped))
+  ) == Rel(
+    (@Draft, @Draft),
+    (@Paid, @Paid),
+    (@Shipped, @Shipped),
+    (@Draft, @Paid),
+    (@Paid, @Shipped),
+    (@Draft, @Shipped)
+  )
+}
+
+verify product_cardinality {
+  assert #Rel::product(Rel(@Draft, @Paid), Rel(@Manual)) == 2
+}
+
+verify projection_keeps_order_ids {
+  assert Rel::project(
+    Rel((@Draft, @Open, @Manual), (@Shipped, @Complete, @Automated)),
+    0
+  ) == Rel(@Draft, @Shipped)
+}
+
+entity Customer {
+  id: CustomerKey = @CustomerOne
+  segment: CustomerSegment = @Vip
+}
+
+entity Order {
+  customer_id: CustomerKey = @CustomerOne
+}
+
+entity Node {
+  id: NodeKey = @NodeA
+  next_id: NodeKey = @NodeA
+}
+
+system Commerce(orders: Store<Order>, customers: Store<Customer>) {
+  command create_pair() {
+    create Customer { id = @CustomerOne segment = @Vip }
+    create Order { customer_id = @CustomerOne }
+  }
+}
+
+system Graph(nodes: Store<Node>) {
+  command create_chain() {
+    create Node { id = @NodeA next_id = @NodeB }
+    create Node { id = @NodeB next_id = @NodeC }
+    create Node { id = @NodeC next_id = @NodeC }
+  }
+}
+
+verify filtered_relation_comprehension_matches_join {
+  assume {
+    store orders: Order[0..3]
+    store customers: Customer[0..3]
+    let commerce = Commerce { orders: orders, customers: customers }
+  }
+
+  assert always Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)
+    <= (Rel::field(orders, Order::customer_id) |> Rel::join(Rel::transpose(Rel::field(customers, Customer::id))))
+
+  assert always Rel::project(Rel((o, c) | o: Order in orders, c: Customer in customers where true), 0)
+    <= orders
+}
+
+verify store_backed_relation_reachability {
+  assume {
+    store nodes: Node[0..3]
+    let graph = Graph { nodes: nodes }
+  }
+
+  assert always Rel((a, c) | a: Node in nodes, c: Node in nodes where a.id == @NodeA and c.id == @NodeC)
+    <= Rel::reach(Rel((left, right) | left: Node in nodes, right: Node in nodes where left.next_id == right.id))
+}

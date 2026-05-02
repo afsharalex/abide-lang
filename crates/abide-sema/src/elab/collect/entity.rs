@@ -626,6 +626,14 @@ pub(super) fn find_first_prime(expr: &EExpr) -> Option<crate::span::Span> {
             .as_ref()
             .and_then(|p| find_first_prime(p))
             .or_else(|| find_first_prime(filter)),
+        EExpr::RelComp(_, projection, bindings, filter, _) => find_first_prime(projection)
+            .or_else(|| {
+                bindings
+                    .iter()
+                    .filter_map(|binding| binding.source.as_deref())
+                    .find_map(find_first_prime)
+            })
+            .or_else(|| find_first_prime(filter)),
         EExpr::QualCall(_, _, _, args, _) => args.iter().find_map(find_first_prime),
         // Imperative constructs — these are exactly the forms that
         // hide nested primes from `extract_updates`. Walk into every
@@ -1067,6 +1075,22 @@ pub(super) fn collect_var_names_inner(
             collect_var_names_inner(pred, bound, into);
             if was_new {
                 bound.remove(comp_var);
+            }
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            let mut added = Vec::new();
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    collect_var_names_inner(source, bound, into);
+                }
+                if bound.insert(binding.var.clone()) {
+                    added.push(binding.var.clone());
+                }
+            }
+            collect_var_names_inner(projection, bound, into);
+            collect_var_names_inner(filter, bound, into);
+            for name in added {
+                bound.remove(&name);
             }
         }
         EExpr::MapLit(_, kvs, _) => {

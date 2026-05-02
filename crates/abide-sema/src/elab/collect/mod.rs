@@ -302,6 +302,9 @@ pub fn resolve_type_ref(tr: &ast::TypeRef) -> Ty {
                 ("Set", [a]) => Ty::Set(Box::new(a.clone())),
                 ("Seq", [a]) => Ty::Seq(Box::new(a.clone())),
                 ("Map", [k, v]) => Ty::Map(Box::new(k.clone()), Box::new(v.clone())),
+                ("Store", [Ty::Named(entity) | Ty::Entity(entity)]) => Ty::Store(entity.clone()),
+                ("Rel", [Ty::Tuple(columns)]) => Ty::Relation(columns.clone()),
+                ("Rel", columns) if !columns.is_empty() => Ty::Relation(columns.to_vec()),
                 _ => Ty::Param(n.clone(), resolved_args),
             }
         }

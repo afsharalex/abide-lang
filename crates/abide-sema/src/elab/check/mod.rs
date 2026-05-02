@@ -451,13 +451,28 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
         EExpr::UnOp(_, _, e, _) | EExpr::Prime(_, e, _) | EExpr::Field(_, e, _, _) => {
             check_collection_homogeneity(e, ctx, errors);
         }
-        EExpr::Call(_, f, args, _) => {
+        EExpr::Pipe(_, left, right, _) => {
+            check_collection_homogeneity(left, ctx, errors);
+            check_collection_homogeneity(right, ctx, errors);
+        }
+        EExpr::Call(_, f, args, span) => {
+            if let EExpr::Var(_, name, _) = f.as_ref() {
+                if is_relation_operation_name(name) {
+                    push_relation_error(
+                        errors,
+                        ctx,
+                        *span,
+                        format!("relation operation `{name}` must be called as `Rel::{name}`"),
+                    );
+                }
+            }
             check_collection_homogeneity(f, ctx, errors);
             for a in args {
                 check_collection_homogeneity(a, ctx, errors);
             }
         }
-        EExpr::QualCall(_, _, _, args, _) => {
+        EExpr::QualCall(_, namespace, name, args, span) => {
+            check_relation_builtin(namespace, name, args, ctx, *span, errors);
             for a in args {
                 check_collection_homogeneity(a, ctx, errors);
             }
@@ -486,9 +501,273 @@ pub(super) fn types_compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::Set(a), Ty::Set(b)) => types_compatible(a, b),
         (Ty::Seq(a), Ty::Seq(b)) => types_compatible(a, b),
         (Ty::Map(ka, va), Ty::Map(kb, vb)) => types_compatible(ka, kb) && types_compatible(va, vb),
+        (Ty::Store(a), Ty::Store(b)) => a == b,
+        (Ty::Relation(a), Ty::Relation(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| types_compatible(a, b))
+        }
+        (Ty::Relation(columns), Ty::Set(element)) | (Ty::Set(element), Ty::Relation(columns)) => {
+            match element.as_ref() {
+                Ty::Tuple(elements) => {
+                    columns.len() == elements.len()
+                        && columns
+                            .iter()
+                            .zip(elements.iter())
+                            .all(|(a, b)| types_compatible(a, b))
+                }
+                single => {
+                    columns.len() == 1
+                        && columns
+                            .first()
+                            .is_some_and(|column| types_compatible(column, single))
+                }
+            }
+        }
         (Ty::Entity(a), Ty::Entity(b)) => a == b,
+        (Ty::Tuple(a), Ty::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| types_compatible(a, b))
+        }
         (Ty::Alias(a, _), Ty::Alias(b, _)) => a == b,
+        (Ty::Alias(_, a), b) | (b, Ty::Alias(_, a)) => types_compatible(a, b),
+        (Ty::Refinement(a, _), b) | (b, Ty::Refinement(a, _)) => types_compatible(a, b),
+        (Ty::Entity(a), Ty::Named(b)) | (Ty::Named(a), Ty::Entity(b)) => a == b,
         _ => false,
+    }
+}
+
+fn relation_columns(ty: &Ty) -> Option<Vec<Ty>> {
+    match ty {
+        Ty::Relation(columns) => Some(columns.clone()),
+        Ty::Set(element) => match element.as_ref() {
+            Ty::Tuple(columns) => Some(columns.clone()),
+            column => Some(vec![column.clone()]),
+        },
+        _ => None,
+    }
+}
+
+fn relation_arg_columns(args: &[EExpr], index: usize) -> Option<Vec<Ty>> {
+    args.get(index).and_then(|arg| relation_columns(&arg.ty()))
+}
+
+fn push_relation_error(
+    errors: &mut Vec<ElabError>,
+    ctx: &str,
+    span: Option<crate::span::Span>,
+    message: impl Into<String>,
+) {
+    let mut err = ElabError::new(ErrorKind::TypeMismatch, message.into(), ctx.to_owned());
+    err.span = span;
+    errors.push(err);
+}
+
+fn is_relation_operation_name(name: &str) -> bool {
+    matches!(
+        name,
+        "join" | "transpose" | "closure" | "reach" | "product" | "project" | "field"
+    )
+}
+
+fn check_relation_builtin(
+    namespace: &str,
+    name: &str,
+    args: &[EExpr],
+    ctx: &str,
+    span: Option<crate::span::Span>,
+    errors: &mut Vec<ElabError>,
+) {
+    if namespace != "Rel" {
+        return;
+    }
+    match name {
+        "join" => {
+            let Some(left) = relation_arg_columns(args, 0) else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::join requires a relation as its first argument",
+                );
+                return;
+            };
+            let Some(right) = relation_arg_columns(args, 1) else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::join requires a relation as its second argument",
+                );
+                return;
+            };
+            let Some(left_join) = left.last() else {
+                return;
+            };
+            let Some(right_join) = right.first() else {
+                return;
+            };
+            if !types_compatible(left_join, right_join) {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    format!(
+                        "Rel::join requires matching join columns, got {} and {}",
+                        left_join.name(),
+                        right_join.name()
+                    ),
+                );
+            }
+        }
+        "product" => {
+            if relation_arg_columns(args, 0).is_none() {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::product requires a relation as its first argument",
+                );
+            }
+            if relation_arg_columns(args, 1).is_none() {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::product requires a relation as its second argument",
+                );
+            }
+        }
+        "project" => {
+            let Some(columns) = relation_arg_columns(args, 0) else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::project requires a relation as its first argument",
+                );
+                return;
+            };
+            if args.len() < 2 {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::project requires at least one column index",
+                );
+            }
+            for arg in &args[1..] {
+                match arg {
+                    EExpr::Lit(_, Literal::Int(value), _) if *value >= 0 => {
+                        if *value as usize >= columns.len() {
+                            push_relation_error(
+                                errors,
+                                ctx,
+                                span,
+                                format!(
+                                    "Rel::project column {value} is out of bounds for arity {}",
+                                    columns.len()
+                                ),
+                            );
+                        }
+                    }
+                    _ => push_relation_error(
+                        errors,
+                        ctx,
+                        span,
+                        "Rel::project column indexes must be non-negative integer literals",
+                    ),
+                }
+            }
+        }
+        "transpose" => {
+            if !matches!(relation_arg_columns(args, 0).as_deref(), Some([_, _])) {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::transpose requires a binary relation",
+                );
+            }
+        }
+        "closure" | "reach" => {
+            let Some(columns) = relation_arg_columns(args, 0) else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    format!("Rel::{name} requires a homogeneous binary relation"),
+                );
+                return;
+            };
+            let [left, right] = columns.as_slice() else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    format!("Rel::{name} requires a homogeneous binary relation"),
+                );
+                return;
+            };
+            if !types_compatible(left, right) {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    format!("Rel::{name} requires a homogeneous binary relation"),
+                );
+            }
+        }
+        "field" => {
+            if args.len() != 2 {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::field requires a store and an Entity::field selector",
+                );
+                return;
+            }
+            let store_entity = match args.first().map(EExpr::ty) {
+                Some(Ty::Store(entity)) => entity,
+                Some(Ty::Error) => return,
+                _ => {
+                    push_relation_error(
+                        errors,
+                        ctx,
+                        span,
+                        "Rel::field requires a store as its first argument",
+                    );
+                    return;
+                }
+            };
+            let Some(EExpr::Qual(_, owner, field, _)) = args.get(1) else {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::field requires an Entity::field selector as its second argument",
+                );
+                return;
+            };
+            let owner = owner.rsplit("::").next().unwrap_or(owner);
+            if owner != store_entity {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    format!(
+                        "Rel::field store entity `{store_entity}` does not match field owner `{owner}`"
+                    ),
+                );
+            }
+            if field.is_empty() {
+                push_relation_error(
+                    errors,
+                    ctx,
+                    span,
+                    "Rel::field requires a non-empty field selector",
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -634,6 +913,15 @@ fn check_unresolved_constructors(
         EExpr::SetComp(_, proj, _, _, filter, _) => {
             if let Some(p) = proj {
                 check_unresolved_constructors(p, ctx, span, known_names, errors);
+            }
+            check_unresolved_constructors(filter, ctx, span, known_names, errors);
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            check_unresolved_constructors(projection, ctx, span, known_names, errors);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    check_unresolved_constructors(source, ctx, span, known_names, errors);
+                }
             }
             check_unresolved_constructors(filter, ctx, span, known_names, errors);
         }
@@ -965,6 +1253,16 @@ fn find_unsupported_verifier_expr(expr: &EExpr) -> Option<&'static str> {
             .as_ref()
             .and_then(|expr| find_unsupported_verifier_expr(expr))
             .or_else(|| find_unsupported_verifier_expr(filter)),
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            find_unsupported_verifier_expr(projection)
+                .or_else(|| {
+                    bindings
+                        .iter()
+                        .filter_map(|binding| binding.source.as_deref())
+                        .find_map(find_unsupported_verifier_expr)
+                })
+                .or_else(|| find_unsupported_verifier_expr(filter))
+        }
         EExpr::MapLit(_, entries, _) => entries.iter().find_map(|(key, value)| {
             find_unsupported_verifier_expr(key).or_else(|| find_unsupported_verifier_expr(value))
         }),
@@ -1218,6 +1516,17 @@ fn collect_name_refs(
             if let Some(p) = proj {
                 collect_name_refs(p, known_names, &inner_bound, refs);
             }
+            collect_name_refs(filter, known_names, &inner_bound, refs);
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            let mut inner_bound = bound.clone();
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    collect_name_refs(source, known_names, bound, refs);
+                }
+                inner_bound.insert(binding.var.clone());
+            }
+            collect_name_refs(projection, known_names, &inner_bound, refs);
             collect_name_refs(filter, known_names, &inner_bound, refs);
         }
         EExpr::Block(items, _) => {

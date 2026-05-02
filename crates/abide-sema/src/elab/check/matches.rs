@@ -175,6 +175,15 @@ pub(super) fn check_match_exhaustiveness(
             }
             check_match_exhaustiveness(filter, types, entities, errors);
         }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            check_match_exhaustiveness(projection, types, entities, errors);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    check_match_exhaustiveness(source, types, entities, errors);
+                }
+            }
+            check_match_exhaustiveness(filter, types, entities, errors);
+        }
         EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) | EExpr::TupleLit(_, elems, _) => {
             for e in elems {
                 check_match_exhaustiveness(e, types, entities, errors);

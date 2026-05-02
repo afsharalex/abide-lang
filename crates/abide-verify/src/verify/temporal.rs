@@ -946,6 +946,21 @@ pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
         IRExpr::SetComp {
             filter, projection, ..
         } => contains_liveness(filter) || projection.as_ref().is_some_and(|p| contains_liveness(p)),
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            contains_liveness(projection)
+                || contains_liveness(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| contains_liveness(source))
+                })
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().any(contains_liveness)
         }
@@ -1035,6 +1050,21 @@ pub(super) fn contains_temporal(expr: &IRExpr) -> bool {
         IRExpr::SetComp {
             filter, projection, ..
         } => contains_temporal(filter) || projection.as_ref().is_some_and(|p| contains_temporal(p)),
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            contains_temporal(projection)
+                || contains_temporal(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| contains_temporal(source))
+                })
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().any(contains_temporal)
         }
@@ -1122,6 +1152,21 @@ pub(super) fn contains_past_time(expr: &IRExpr) -> bool {
             filter, projection, ..
         } => {
             contains_past_time(filter) || projection.as_ref().is_some_and(|p| contains_past_time(p))
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            contains_past_time(projection)
+                || contains_past_time(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| contains_past_time(source))
+                })
         }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().any(contains_past_time)

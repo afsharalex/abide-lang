@@ -1,6 +1,6 @@
 //! Expression resolution — name and constructor resolution in expression trees.
 
-use super::super::types::{EExpr, EPattern, Ty};
+use super::super::types::{BinOp, EExpr, EPattern, Literal, Ty};
 use std::collections::HashMap;
 
 use super::Ctx;
@@ -26,10 +26,16 @@ fn infer_field_type(ctx: &Ctx, base: &EExpr, field_name: &str) -> Ty {
     Ty::Error
 }
 
-fn infer_qualcall_type(type_name: &str, func_name: &str, args: &[EExpr]) -> Ty {
+fn infer_qualcall_type(ctx: &Ctx, type_name: &str, func_name: &str, args: &[EExpr]) -> Ty {
     let bool_ty = Ty::Builtin(crate::elab::types::BuiltinTy::Bool);
     let int_ty = Ty::Builtin(crate::elab::types::BuiltinTy::Int);
     match (type_name, func_name) {
+        ("Rel", "join") => infer_relation_join_type(args),
+        ("Rel", "product") => infer_relation_product_type(args),
+        ("Rel", "project") => infer_relation_project_type(args),
+        ("Rel", "transpose") => infer_relation_transpose_type(args),
+        ("Rel", "closure" | "reach") => infer_relation_closure_type(args),
+        ("Rel", "field") => infer_relation_field_type(ctx, args),
         ("Set", "union" | "intersect" | "diff") => args
             .first()
             .map(|arg| arg.ty().clone())
@@ -62,6 +68,192 @@ fn infer_qualcall_type(type_name: &str, func_name: &str, args: &[EExpr]) -> Ty {
     }
 }
 
+fn relation_columns(ty: &Ty) -> Option<Vec<Ty>> {
+    match ty {
+        Ty::Relation(columns) => Some(columns.clone()),
+        Ty::Set(element) => match element.as_ref() {
+            Ty::Tuple(columns) => Some(columns.clone()),
+            column => Some(vec![column.clone()]),
+        },
+        _ => None,
+    }
+}
+
+fn relation_type_from_columns(columns: Vec<Ty>) -> Ty {
+    match columns.as_slice() {
+        [] => Ty::Error,
+        _ => Ty::Relation(columns),
+    }
+}
+
+fn relation_type_from_projection(projection: &EExpr) -> Ty {
+    match projection.ty() {
+        Ty::Tuple(columns) => relation_type_from_columns(columns.clone()),
+        ty => relation_type_from_columns(vec![ty.clone()]),
+    }
+}
+
+fn ty_same(left: &Ty, right: &Ty) -> bool {
+    match (left, right) {
+        (Ty::Builtin(left), Ty::Builtin(right)) => left == right,
+        (Ty::Enum(left, _), Ty::Enum(right, _))
+        | (Ty::Enum(left, _), Ty::Named(right))
+        | (Ty::Named(left), Ty::Enum(right, _)) => left == right,
+        (Ty::Entity(left), Ty::Entity(right))
+        | (Ty::Named(left), Ty::Named(right))
+        | (Ty::Entity(left), Ty::Named(right))
+        | (Ty::Named(left), Ty::Entity(right)) => left == right,
+        (Ty::Set(left), Ty::Set(right)) => ty_same(left, right),
+        (Ty::Seq(left), Ty::Seq(right)) => ty_same(left, right),
+        (Ty::Map(left_key, left_value), Ty::Map(right_key, right_value)) => {
+            ty_same(left_key, right_key) && ty_same(left_value, right_value)
+        }
+        (Ty::Store(left), Ty::Store(right)) => left == right,
+        (Ty::Relation(left), Ty::Relation(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| ty_same(left, right))
+        }
+        (Ty::Tuple(left), Ty::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| ty_same(left, right))
+        }
+        (Ty::Alias(_, left), right) | (right, Ty::Alias(_, left)) => ty_same(left, right),
+        (Ty::Refinement(left, _), right) | (right, Ty::Refinement(left, _)) => ty_same(left, right),
+        (Ty::Error, _) | (_, Ty::Error) => true,
+        _ => false,
+    }
+}
+
+fn infer_relation_join_type(args: &[EExpr]) -> Ty {
+    let Some(left) = args.first().and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let Some(right) = args.get(1).and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let Some(left_join) = left.last() else {
+        return Ty::Error;
+    };
+    let Some(right_join) = right.first() else {
+        return Ty::Error;
+    };
+    if !ty_same(left_join, right_join) {
+        return Ty::Error;
+    }
+    let mut columns = left[..left.len() - 1].to_vec();
+    columns.extend(right[1..].iter().cloned());
+    relation_type_from_columns(columns)
+}
+
+fn infer_relation_set_op_type(op: BinOp, left: &EExpr, right: &EExpr) -> Option<Ty> {
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+        return None;
+    }
+    let left_columns = relation_columns(&left.ty())?;
+    let right_columns = relation_columns(&right.ty())?;
+    if left_columns.len() == right_columns.len()
+        && left_columns
+            .iter()
+            .zip(right_columns.iter())
+            .all(|(left, right)| ty_same(left, right))
+    {
+        Some(relation_type_from_columns(left_columns))
+    } else {
+        Some(Ty::Error)
+    }
+}
+
+fn infer_relation_product_type(args: &[EExpr]) -> Ty {
+    let Some(left) = args.first().and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let Some(right) = args.get(1).and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let mut columns = left;
+    columns.extend(right);
+    relation_type_from_columns(columns)
+}
+
+fn relation_project_indices(args: &[EExpr]) -> Option<Vec<usize>> {
+    args.iter()
+        .map(|arg| match arg {
+            EExpr::Lit(_, Literal::Int(value), _) if *value >= 0 => Some(*value as usize),
+            _ => None,
+        })
+        .collect()
+}
+
+fn infer_relation_project_type(args: &[EExpr]) -> Ty {
+    let Some(source) = args.first().and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let Some(indices) = relation_project_indices(&args[1..]) else {
+        return Ty::Error;
+    };
+    let mut columns = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(column) = source.get(index) else {
+            return Ty::Error;
+        };
+        columns.push(column.clone());
+    }
+    relation_type_from_columns(columns)
+}
+
+fn infer_relation_transpose_type(args: &[EExpr]) -> Ty {
+    let Some(columns) = args.first().and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let [left, right] = columns.as_slice() else {
+        return Ty::Error;
+    };
+    relation_type_from_columns(vec![right.clone(), left.clone()])
+}
+
+fn infer_relation_closure_type(args: &[EExpr]) -> Ty {
+    let Some(columns) = args.first().and_then(|arg| relation_columns(&arg.ty())) else {
+        return Ty::Error;
+    };
+    let [left, right] = columns.as_slice() else {
+        return Ty::Error;
+    };
+    if ty_same(left, right) {
+        relation_type_from_columns(columns)
+    } else {
+        Ty::Error
+    }
+}
+
+fn infer_relation_field_type(ctx: &Ctx, args: &[EExpr]) -> Ty {
+    let Some(store_arg) = args.first() else {
+        return Ty::Error;
+    };
+    let Ty::Store(store_entity) = store_arg.ty() else {
+        return Ty::Error;
+    };
+    let Some(EExpr::Qual(_, owner, field_name, _)) = args.get(1) else {
+        return Ty::Error;
+    };
+    let owner = last_segment(owner);
+    if owner != store_entity {
+        return Ty::Error;
+    }
+    let Some(entity) = ctx.entities.get(owner) else {
+        return Ty::Error;
+    };
+    let Some(field) = entity.fields.iter().find(|field| field.name == *field_name) else {
+        return Ty::Error;
+    };
+    Ty::Relation(vec![Ty::Entity(entity.name.clone()), field.ty.clone()])
+}
+
 fn infer_index_type(map: &EExpr) -> Ty {
     match map.ty() {
         Ty::Map(_, value) => value.as_ref().clone(),
@@ -90,29 +282,36 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
             let resolved_ty = infer_field_type(ctx, &resolved_base, f);
             EExpr::Field(resolved_ty, Box::new(resolved_base), f.clone(), *sp)
         }
-        EExpr::Prime(ty, e, sp) => {
-            EExpr::Prime(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
+        EExpr::Prime(_, e, sp) => {
+            let resolved_expr = resolve_expr(ctx, bound, e);
+            EExpr::Prime(resolved_expr.ty(), Box::new(resolved_expr), *sp)
         }
-        EExpr::BinOp(ty, op, a, b, sp) => EExpr::BinOp(
-            ty.clone(),
-            *op,
-            Box::new(resolve_expr(ctx, bound, a)),
-            Box::new(resolve_expr(ctx, bound, b)),
-            *sp,
-        ),
+        EExpr::BinOp(ty, op, a, b, sp) => {
+            let resolved_left = resolve_expr(ctx, bound, a);
+            let resolved_right = resolve_expr(ctx, bound, b);
+            let resolved_ty = infer_relation_set_op_type(*op, &resolved_left, &resolved_right)
+                .unwrap_or_else(|| ty.clone());
+            EExpr::BinOp(
+                resolved_ty,
+                *op,
+                Box::new(resolved_left),
+                Box::new(resolved_right),
+                *sp,
+            )
+        }
         EExpr::UnOp(ty, op, e, sp) => {
             EExpr::UnOp(ty.clone(), *op, Box::new(resolve_expr(ctx, bound, e)), *sp)
         }
-        EExpr::Call(ty, f, args, sp) => EExpr::Call(
-            ty.clone(),
-            Box::new(resolve_expr(ctx, bound, f)),
-            args.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
-            *sp,
-        ),
+        EExpr::Call(ty, f, args, sp) => {
+            let resolved_func = resolve_expr(ctx, bound, f);
+            let resolved_args: Vec<EExpr> =
+                args.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+            EExpr::Call(ty.clone(), Box::new(resolved_func), resolved_args, *sp)
+        }
         EExpr::QualCall(_ty, type_name, func_name, args, sp) => {
             let resolved_args: Vec<EExpr> =
                 args.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
-            let resolved_ty = infer_qualcall_type(type_name, func_name, &resolved_args);
+            let resolved_ty = infer_qualcall_type(ctx, type_name, func_name, &resolved_args);
             EExpr::QualCall(
                 resolved_ty,
                 type_name.clone(),
@@ -342,6 +541,34 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 *sp,
             )
         }
+        EExpr::RelComp(_ty, projection, bindings, filter, sp) => {
+            let mut inner_bound = bound.clone();
+            let resolved_bindings = bindings
+                .iter()
+                .map(|binding| {
+                    let resolved_domain = ctx.resolve_ty(&binding.domain);
+                    inner_bound.insert(binding.var.clone(), resolved_domain.clone());
+                    super::super::types::ERelCompBinding {
+                        var: binding.var.clone(),
+                        domain: resolved_domain,
+                        source: binding
+                            .source
+                            .as_ref()
+                            .map(|source| Box::new(resolve_expr(ctx, bound, source))),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let resolved_projection = resolve_expr(ctx, &inner_bound, projection);
+            let resolved_filter = resolve_expr(ctx, &inner_bound, filter);
+            let resolved_ty = relation_type_from_projection(&resolved_projection);
+            EExpr::RelComp(
+                resolved_ty,
+                Box::new(resolved_projection),
+                resolved_bindings,
+                Box::new(resolved_filter),
+                *sp,
+            )
+        }
         EExpr::MapUpdate(_ty, m, k, v, sp) => {
             let resolved_map = resolve_expr(ctx, bound, m);
             let resolved_key = resolve_expr(ctx, bound, k);
@@ -377,26 +604,51 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 .unwrap_or_else(|| Ty::Named(s.clone()));
             EExpr::Qual(ty, s.clone(), n.clone(), *sp)
         }
-        EExpr::TupleLit(ty, es, sp) => EExpr::TupleLit(
-            ty.clone(),
-            es.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
-            *sp,
-        ),
+        EExpr::TupleLit(_ty, es, sp) => {
+            let resolved_items: Vec<EExpr> =
+                es.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+            let item_tys = resolved_items
+                .iter()
+                .map(|item| item.ty().clone())
+                .collect();
+            EExpr::TupleLit(Ty::Tuple(item_tys), resolved_items, *sp)
+        }
         EExpr::In(ty, a, b, sp) => EExpr::In(
             ty.clone(),
             Box::new(resolve_expr(ctx, bound, a)),
             Box::new(resolve_expr(ctx, bound, b)),
             *sp,
         ),
-        EExpr::Card(ty, e, sp) => {
-            EExpr::Card(ty.clone(), Box::new(resolve_expr(ctx, bound, e)), *sp)
-        }
-        EExpr::Pipe(ty, a, b, sp) => EExpr::Pipe(
-            ty.clone(),
-            Box::new(resolve_expr(ctx, bound, a)),
-            Box::new(resolve_expr(ctx, bound, b)),
+        EExpr::Card(_ty, e, sp) => EExpr::Card(
+            Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+            Box::new(resolve_expr(ctx, bound, e)),
             *sp,
         ),
+        EExpr::Pipe(ty, a, b, sp) => {
+            let resolved_left = resolve_expr(ctx, bound, a);
+            let resolved_right = resolve_expr(ctx, bound, b);
+            if let EExpr::QualCall(_, namespace, name, args, _) = &resolved_right {
+                if namespace == "Rel" {
+                    let mut piped_args = Vec::with_capacity(args.len() + 1);
+                    piped_args.push(resolved_left);
+                    piped_args.extend(args.iter().cloned());
+                    let resolved_ty = infer_qualcall_type(ctx, namespace, name, &piped_args);
+                    return EExpr::QualCall(
+                        resolved_ty,
+                        namespace.clone(),
+                        name.clone(),
+                        piped_args,
+                        *sp,
+                    );
+                }
+            }
+            EExpr::Pipe(
+                ty.clone(),
+                Box::new(resolved_left),
+                Box::new(resolved_right),
+                *sp,
+            )
+        }
         EExpr::Block(items, sp) => EExpr::Block(
             items.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
             *sp,
@@ -436,12 +688,21 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
             *sp,
         ),
         // ── Collection literals: resolve elements and infer collection type ──
-        EExpr::SetLit(_ty, elems, sp) => {
+        EExpr::SetLit(ty, elems, sp) => {
             let resolved_elems: Vec<EExpr> =
                 elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
             // Infer element type from first element (or leave as unresolved)
             let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
-            EExpr::SetLit(Ty::Set(Box::new(elem_ty)), resolved_elems, *sp)
+            let collection_ty = if matches!(ty, Ty::Relation(_)) {
+                match elem_ty {
+                    Ty::Tuple(columns) => Ty::Relation(columns),
+                    Ty::Error => Ty::Error,
+                    single => Ty::Relation(vec![single]),
+                }
+            } else {
+                Ty::Set(Box::new(elem_ty))
+            };
+            EExpr::SetLit(collection_ty, resolved_elems, *sp)
         }
         EExpr::SeqLit(_ty, elems, sp) => {
             let resolved_elems: Vec<EExpr> =

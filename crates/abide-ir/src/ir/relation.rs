@@ -140,6 +140,7 @@ pub enum IRRelationExpr {
     Empty(IRRelationType),
     SingletonTuple {
         tuple_type: IRRelationType,
+        values: Vec<String>,
     },
     Union(Box<IRRelationExpr>, Box<IRRelationExpr>),
     Intersection(Box<IRRelationExpr>, Box<IRRelationExpr>),
@@ -159,7 +160,7 @@ impl IRRelationExpr {
     pub fn relation_type(&self) -> Result<IRRelationType, IRRelationTypeError> {
         match self {
             Self::Symbol(symbol) => Ok(symbol.relation_type.clone()),
-            Self::Empty(ty) | Self::SingletonTuple { tuple_type: ty } => Ok(ty.clone()),
+            Self::Empty(ty) | Self::SingletonTuple { tuple_type: ty, .. } => Ok(ty.clone()),
             Self::Union(left, right)
             | Self::Intersection(left, right)
             | Self::Difference(left, right) => {

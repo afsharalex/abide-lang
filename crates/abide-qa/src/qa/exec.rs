@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use abide_ir::ir;
 use abide_sema::elab::env::Env;
 use abide_sema::elab::types::{
-    AssumptionSet, BuiltinTy, EExpr, ELetBinding, EPattern, EStoreDecl, EVerify, Quantifier, Ty,
+    AssumptionSet, BuiltinTy, EExpr, ELetBinding, EPattern, ERelCompBinding, EStoreDecl, EVerify,
+    Quantifier, Ty,
 };
 use abide_syntax::{
     ast::{Expr, ExprKind, TypeRef, TypeRefKind},
@@ -1785,6 +1786,58 @@ fn rewrite_owner_scoped_expr(
                 *span,
             )
         }
+        EExpr::RelComp(ty, projection, bindings, filter, span) => {
+            let mut rewritten_bindings = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let rewritten_source = binding
+                    .source
+                    .as_ref()
+                    .map(|source| {
+                        rewrite_owner_scoped_expr(
+                            source,
+                            owner,
+                            owner_kind,
+                            implicit_var,
+                            owner_fields,
+                            bound_vars,
+                        )
+                        .map(Box::new)
+                    })
+                    .transpose()?;
+                bound_vars.push(binding.var.clone());
+                rewritten_bindings.push(ERelCompBinding {
+                    var: binding.var.clone(),
+                    domain: binding.domain.clone(),
+                    source: rewritten_source,
+                });
+            }
+            let rewritten_projection = rewrite_owner_scoped_expr(
+                projection,
+                owner,
+                owner_kind,
+                implicit_var,
+                owner_fields,
+                bound_vars,
+            )?;
+            let rewritten_filter = rewrite_owner_scoped_expr(
+                filter,
+                owner,
+                owner_kind,
+                implicit_var,
+                owner_fields,
+                bound_vars,
+            )?;
+            for _ in bindings {
+                bound_vars.pop();
+            }
+            EExpr::RelComp(
+                ty.clone(),
+                Box::new(rewritten_projection),
+                rewritten_bindings,
+                Box::new(rewritten_filter),
+                *span,
+            )
+        }
         EExpr::SetLit(ty, items, span) => EExpr::SetLit(
             ty.clone(),
             rewrite_expr_list(
@@ -2369,6 +2422,7 @@ fn expr_kind_name(kind: &ExprKind) -> &'static str {
         ExprKind::MapUpdate(_, _, _) => "map update",
         ExprKind::Index(_, _) => "index access",
         ExprKind::SetComp { .. } => "set comprehension",
+        ExprKind::RelComp { .. } => "relation comprehension",
         ExprKind::Block(_) => "block",
         ExprKind::VarDecl { .. } => "variable declaration",
         ExprKind::While { .. } => "while loop",
@@ -2601,6 +2655,36 @@ impl TemporalTargetCollector {
                     self.collect_expr(model, projection);
                 }
                 self.collect_expr(model, filter);
+            }
+            ExprKind::RelComp {
+                projection,
+                bindings,
+                filter,
+            } => {
+                let mut previous_bindings = Vec::new();
+                for binding in bindings {
+                    if let Some(owner) = type_ref_owner_name(&binding.domain) {
+                        if model.entity_names.iter().any(|name| name == &owner) {
+                            self.owner_candidates.insert(owner.clone());
+                            previous_bindings.push((
+                                binding.var.clone(),
+                                self.bindings.insert(binding.var.clone(), owner),
+                            ));
+                        }
+                    }
+                    if let Some(source) = &binding.source {
+                        self.collect_expr(model, source);
+                    }
+                }
+                self.collect_expr(model, projection);
+                self.collect_expr(model, filter);
+                for (var, previous) in previous_bindings {
+                    if let Some(previous) = previous {
+                        self.bindings.insert(var, previous);
+                    } else {
+                        self.bindings.remove(&var);
+                    }
+                }
             }
             ExprKind::Block(exprs) | ExprKind::TupleLit(exprs) => {
                 for expr in exprs {

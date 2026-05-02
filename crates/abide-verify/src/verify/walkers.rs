@@ -184,6 +184,21 @@ pub(super) fn body_contains_assert(expr: &IRExpr) -> bool {
             body_contains_assert(filter)
                 || projection.as_ref().is_some_and(|p| body_contains_assert(p))
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            body_contains_assert(projection)
+                || body_contains_assert(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| body_contains_assert(source))
+                })
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().any(body_contains_assert)
         }
@@ -338,6 +353,21 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
             body_contains_sorry(filter)
                 || projection.as_ref().is_some_and(|p| body_contains_sorry(p))
         }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            body_contains_sorry(projection)
+                || body_contains_sorry(filter)
+                || bindings.iter().any(|binding| {
+                    binding
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| body_contains_sorry(source))
+                })
+        }
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             elements.iter().any(body_contains_sorry)
         }
@@ -469,6 +499,22 @@ pub(super) fn collect_def_refs_inner(
             if let Some(proj) = projection {
                 collect_def_refs_inner(proj, &inner_bound, refs);
             }
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            let mut inner_bound = bound.clone();
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    collect_def_refs_inner(source, bound, refs);
+                }
+                inner_bound.insert(binding.var.clone());
+            }
+            collect_def_refs_inner(projection, &inner_bound, refs);
+            collect_def_refs_inner(filter, &inner_bound, refs);
         }
         IRExpr::BinOp { left, right, .. }
         | IRExpr::Until { left, right, .. }
@@ -1113,6 +1159,17 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             })
         }
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => bindings
+            .iter()
+            .filter_map(|binding| binding.source.as_deref())
+            .find_map(find_unsupported_scene_expr)
+            .or_else(|| find_unsupported_scene_expr(projection))
+            .or_else(|| find_unsupported_scene_expr(filter)),
         IRExpr::Sorry { .. } => Some("Sorry"),
         IRExpr::Todo { .. } => Some("Todo"),
         IRExpr::Card { expr, .. } => match expr.as_ref() {

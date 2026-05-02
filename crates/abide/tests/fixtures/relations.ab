@@ -1,0 +1,115 @@
+module RelationFixture
+
+enum OrderStage = Draft | Paid | Shipped
+enum FulfillmentPhase = Open | Complete
+enum HandlingLane = Manual | Automated
+enum Disposition = Escalate | Clear
+
+verify relation_join_passes {
+  assert Rel::join(
+    Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete)),
+    Rel((@Open, @Manual), (@Complete, @Automated))
+  ) == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+
+verify relation_transpose_passes {
+  assert Rel::transpose(
+    Rel((@Draft, @Open), (@Shipped, @Complete))
+  ) == Rel((@Open, @Draft), (@Complete, @Shipped))
+}
+
+verify relation_closure_passes {
+  assert Rel::closure(
+    Rel((@Draft, @Paid), (@Paid, @Shipped))
+  ) == Rel((@Draft, @Paid), (@Paid, @Shipped), (@Draft, @Shipped))
+}
+
+verify relation_reach_passes {
+  assert Rel::reach(
+    Rel((@Draft, @Paid), (@Paid, @Shipped))
+  ) == Rel(
+    (@Draft, @Draft),
+    (@Paid, @Paid),
+    (@Shipped, @Shipped),
+    (@Draft, @Paid),
+    (@Paid, @Shipped),
+    (@Draft, @Shipped)
+  )
+}
+
+verify relation_projection_passes {
+  assert Rel::project(
+    Rel((@Draft, @Open, @Manual), (@Shipped, @Complete, @Automated)),
+    0
+  ) == Rel(@Draft, @Shipped)
+}
+
+verify relation_intersection_passes {
+  assert Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete))
+    * Rel((@Paid, @Open), (@Shipped, @Open))
+    == Rel((@Paid, @Open))
+}
+
+verify relation_empty_join_cardinality_passes {
+  assert #Rel::join(
+    Rel((@Draft, @Open)),
+    Rel((@Complete, @Manual))
+  ) == 0
+}
+
+verify relation_nary_join_passes {
+  assert Rel::join(
+    Rel((@Draft, @Open, @Manual), (@Paid, @Open, @Manual), (@Shipped, @Complete, @Automated)),
+    Rel((@Manual, @Escalate), (@Automated, @Clear))
+  ) == Rel((@Draft, @Open, @Escalate), (@Paid, @Open, @Escalate), (@Shipped, @Complete, @Clear))
+}
+
+verify relation_mixed_projection_passes {
+  assert Rel::project(
+    Rel((@Draft, @Open, @Manual), (@Paid, @Open, @Manual), (@Shipped, @Complete, @Automated)),
+    0,
+    2
+  ) == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+
+verify relation_nested_composition_passes {
+  assert Rel::project(
+    Rel::join(
+      Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete)),
+      Rel((@Open, @Manual), (@Complete, @Automated))
+    ),
+    0
+  ) == Rel(@Draft, @Paid, @Shipped)
+}
+
+verify relation_counterexample_renders_witness {
+  assert Rel::join(Rel((1, 2)), Rel((2, 3))) == Rel((1, 4))
+}
+
+enum FieldStatus = Pending
+
+entity FieldOrder {
+  status: FieldStatus = @Pending
+}
+
+system FieldOrders(orders: Store<FieldOrder>[..1]) {
+  action create_order() {
+    create FieldOrder {}
+  }
+}
+
+verify relation_field_current_subset_next [depth: 1] {
+  assume {
+    store orders: FieldOrder[0..1]
+    let field_orders = FieldOrders { orders: orders }
+  }
+  assert always Rel::field(orders, FieldOrder::status) <= Rel::field(orders', FieldOrder::status)
+}
+
+verify relation_field_next_not_subset_current [depth: 1] {
+  assume {
+    store orders: FieldOrder[0..1]
+    let field_orders = FieldOrders { orders: orders }
+  }
+  assert always Rel::field(orders', FieldOrder::status) <= Rel::field(orders, FieldOrder::status)
+}

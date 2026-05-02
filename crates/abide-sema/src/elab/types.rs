@@ -10,6 +10,13 @@ pub type VariantRecordFields = Vec<(String, Ty)>;
 pub type EnumVariantFields = Vec<(String, VariantRecordFields)>;
 pub type VariantFieldsMap = HashMap<String, EnumVariantFields>;
 
+#[derive(Clone, Debug)]
+pub struct ERelCompBinding {
+    pub var: String,
+    pub domain: Ty,
+    pub source: Option<Box<EExpr>>,
+}
+
 /// Semantic type representation (resolved from parse-level `TypeRef`/`Name`).
 #[derive(Debug, Clone)]
 pub enum Ty {
@@ -37,6 +44,10 @@ pub enum Ty {
     Seq(Box<Ty>),
     /// Map<K, V>
     Map(Box<Ty>, Box<Ty>),
+    /// Store<E> — finite store of entity instances.
+    Store(String),
+    /// Rel<A, B, ...> — finite n-ary tuple relation.
+    Relation(Vec<Ty>),
     /// (A, B,...)
     Tuple(Vec<Ty>),
     /// Refinement type: base type + predicate (Int { $ > 0 })
@@ -63,6 +74,8 @@ impl Ty {
             Self::Set(_) => "Set",
             Self::Seq(_) => "Seq",
             Self::Map(_, _) => "Map",
+            Self::Store(_) => "Store",
+            Self::Relation(_) => "Rel",
             Self::Tuple(_) => "Tuple",
             Self::Refinement(base, _) => base.name(),
         }
@@ -919,6 +932,13 @@ pub enum EExpr {
         Box<EExpr>,
         Option<crate::span::Span>,
     ),
+    RelComp(
+        Ty,
+        Box<EExpr>,
+        Vec<ERelCompBinding>,
+        Box<EExpr>,
+        Option<crate::span::Span>,
+    ),
     SetLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
     SeqLit(Ty, Vec<EExpr>, Option<crate::span::Span>),
     MapLit(Ty, Vec<(EExpr, EExpr)>, Option<crate::span::Span>),
@@ -1031,6 +1051,7 @@ impl EExpr {
             | Self::MapUpdate(ty, _, _, _, _)
             | Self::Index(ty, _, _, _)
             | Self::SetComp(ty, _, _, _, _, _)
+            | Self::RelComp(ty, _, _, _, _)
             | Self::SetLit(ty, _, _)
             | Self::SeqLit(ty, _, _)
             | Self::MapLit(ty, _, _)

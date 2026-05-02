@@ -106,6 +106,62 @@ Then run:
 abide verify order.ab
 ```
 
+## Rel checks
+
+Abide can check finite relation expressions directly. `Rel<T...>` is the
+first-class collection type for finite tuple relations. Relation operations
+are associated functions on `Rel`, such as `Rel::join(left, right)`.
+Pipeline form is also supported when the operation remains fully qualified:
+`left |> Rel::join(right)`.
+
+```abide
+enum OrderStage = Draft | Paid | Shipped
+enum FulfillmentPhase = Open | Complete
+enum HandlingLane = Manual | Automated
+
+verify stage_lanes {
+  assert Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete))
+    |> Rel::join(Rel((@Open, @Manual), (@Complete, @Automated)))
+    == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+
+verify lifecycle_reachability {
+  assert Rel::reach(
+    Rel((@Draft, @Paid), (@Paid, @Shipped))
+  ) == Rel(
+    (@Draft, @Draft),
+    (@Paid, @Paid),
+    (@Shipped, @Shipped),
+    (@Draft, @Paid),
+    (@Paid, @Shipped),
+    (@Draft, @Shipped)
+  )
+}
+```
+
+Run it the same way:
+
+```sh
+abide verify relations.ab
+```
+
+For a failing relation equality or subset, verify output includes the computed
+tuple sets that caused the counterexample.
+
+Store-backed relation comprehensions build relations from finite entity pools:
+
+```abide
+assert always Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)
+  <= (Rel::field(orders, Order::customer_id) |> Rel::join(Rel::transpose(Rel::field(customers, Customer::id))))
+```
+
+They can also be composed with reachability operations:
+
+```abide
+assert always Rel((a, c) | a: Node in nodes, c: Node in nodes where a.id == @NodeA and c.id == @NodeC)
+  <= Rel::reach(Rel((left, right) | left: Node in nodes, right: Node in nodes where left.next_id == right.id))
+```
+
 ## What the pieces mean
 
 - `entity` declares stateful domain objects with fields and actions.

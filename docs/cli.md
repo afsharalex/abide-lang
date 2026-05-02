@@ -63,6 +63,7 @@ abide verify spec.ab
 abide verify spec.ab --solver auto --progress
 abide verify spec.ab --bounded-only
 abide verify spec.ab --report json reports/
+abide verify examples/relations.ab --witness-semantics relational
 ```
 
 Selected flags:
@@ -86,6 +87,10 @@ Selected flags:
 - `--report <format> [output_dir]`
 - `--target <target>`
 - `--trace-artifact <path>`
+
+Relation counterexamples use the normal verify result path. With relational
+witness evidence available, human output shows derived tuple sets and JSON
+reports include the same witness envelope.
 
 ## `abide run`
 

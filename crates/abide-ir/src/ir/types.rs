@@ -356,6 +356,15 @@ pub enum IRExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    RelComp {
+        projection: Box<IRExpr>,
+        bindings: Vec<IRRelCompBinding>,
+        filter: Box<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     /// Cardinality: `#S` — count of elements in a set/collection.
     Card {
         expr: Box<IRExpr>,
@@ -466,6 +475,13 @@ pub struct LetBinding {
     #[serde(rename = "type")]
     pub ty: IRType,
     pub expr: IRExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRRelCompBinding {
+    pub var: std::string::String,
+    pub domain: IRType,
+    pub source: Option<Box<IRExpr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

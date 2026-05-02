@@ -154,6 +154,80 @@ sum o: Order in orders | o.total
 max o: Order in orders | o.total
 ```
 
+## Relations
+
+Relations are finite sets of tuples. Unary relations are ordinary sets, and
+binary or wider relations use tuple elements:
+
+```abide
+enum OrderStage = Draft | Paid | Shipped
+enum FulfillmentPhase = Open | Complete
+enum HandlingLane = Manual | Automated
+
+type StagePhaseRel = Rel<OrderStage, FulfillmentPhase>
+type StagePhaseLaneRel = Rel<(OrderStage, FulfillmentPhase, HandlingLane)>
+
+Rel(@Draft, @Paid)
+Rel((@Draft, @Open), (@Shipped, @Complete))
+```
+
+Relation operations are associated operations on the first-class `Rel` type:
+
+```abide
+Rel::join(
+  Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete)),
+  Rel((@Open, @Manual), (@Complete, @Automated))
+)
+
+Rel::transpose(Rel((@Draft, @Open)))
+Rel::closure(Rel((@Draft, @Paid), (@Paid, @Shipped)))
+Rel::reach(Rel((@Draft, @Paid), (@Paid, @Shipped)))
+Rel::product(Rel(@Draft, @Paid), Rel(@Manual))
+Rel::project(Rel((@Draft, @Open, @Manual)), 0)
+Rel::field(orders, Order::status)
+
+Rel((@Draft, @Open), (@Paid, @Open))
+  |> Rel::join(Rel((@Open, @Manual)))
+```
+
+Store-backed comprehensions can be passed to the same operations:
+
+```abide
+Rel::reach(Rel((a, b) | a: Node in nodes, b: Node in nodes where a.next_id == b.id))
+```
+
+Static relation checks support equality, subset, and cardinality:
+
+```abide
+verify stage_lane_join {
+  assert Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete))
+    |> Rel::join(Rel((@Open, @Manual), (@Complete, @Automated)))
+    == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+
+verify product_size {
+  assert #Rel::product(Rel(@Draft, @Paid), Rel(@Manual)) == 2
+}
+
+verify lifecycle_reachability {
+  assert Rel::reach(Rel((@Draft, @Paid), (@Paid, @Shipped))) == Rel(
+    (@Draft, @Draft),
+    (@Paid, @Paid),
+    (@Shipped, @Shipped),
+    (@Draft, @Paid),
+    (@Paid, @Shipped),
+    (@Draft, @Shipped)
+  )
+}
+```
+
+Relation comprehensions over finite stores use a tuple projection, one or more
+typed store bindings, and a `where` filter:
+
+```abide
+Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)
+```
+
 ## Imperative functions
 
 ```abide

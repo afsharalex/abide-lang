@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::relation::{IRRelationExpr, IRRelationSource, IRRelationType};
 use crate::span::Span;
 
 #[test]
@@ -53,6 +54,316 @@ fn lower_expr_binop_propagates_span() {
         IRExpr::BinOp { span, .. } => assert_eq!(span, Some(sp)),
         other => panic!("expected BinOp, got {other:?}"),
     }
+}
+
+#[test]
+fn lower_relation_join_uses_relation_ir() {
+    let relation_ty =
+        |left: E::Ty, right: E::Ty| E::Ty::Set(Box::new(E::Ty::Tuple(vec![left, right])));
+    let customer_ty = E::Ty::Entity("Customer".to_owned());
+    let order_customer = E::EExpr::Var(
+        relation_ty(E::Ty::Entity("Order".to_owned()), customer_ty.clone()),
+        "order_customer".to_owned(),
+        None,
+    );
+    let customer_segment = E::EExpr::Var(
+        relation_ty(customer_ty, E::Ty::Builtin(E::BuiltinTy::String)),
+        "customer_segment".to_owned(),
+        None,
+    );
+    let expr = E::EExpr::QualCall(
+        relation_ty(
+            E::Ty::Entity("Order".to_owned()),
+            E::Ty::Builtin(E::BuiltinTy::String),
+        ),
+        "Rel".to_owned(),
+        "join".to_owned(),
+        vec![order_customer, customer_segment],
+        None,
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let lowered = lower_relation_expr(&expr, &ctx).expect("relation join should lower");
+
+    assert!(matches!(lowered, IRRelationExpr::Join(_, _)));
+    assert_eq!(
+        lowered.relation_type().expect("join type"),
+        IRRelationType::binary(
+            IRType::Entity {
+                name: "Order".to_owned()
+            },
+            IRType::String
+        )
+    );
+    let IRRelationExpr::Join(left, right) = lowered else {
+        unreachable!("asserted above")
+    };
+    let IRRelationExpr::Symbol(left_symbol) = left.as_ref() else {
+        panic!("left side should lower to a relation symbol")
+    };
+    assert_eq!(
+        left_symbol.source,
+        IRRelationSource::UserRelation {
+            name: "order_customer".to_owned()
+        }
+    );
+    let IRRelationExpr::Symbol(right_symbol) = right.as_ref() else {
+        panic!("right side should lower to a relation symbol")
+    };
+    assert_eq!(
+        right_symbol.source,
+        IRRelationSource::UserRelation {
+            name: "customer_segment".to_owned()
+        }
+    );
+}
+
+#[test]
+fn lower_relation_project_uses_literal_columns() {
+    let tuple_set_ty = E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Entity("Customer".to_owned()),
+        E::Ty::Builtin(E::BuiltinTy::String),
+    ])));
+    let projected_ty = E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Builtin(E::BuiltinTy::String),
+    ])));
+    let expr = E::EExpr::QualCall(
+        projected_ty,
+        "Rel".to_owned(),
+        "project".to_owned(),
+        vec![
+            E::EExpr::Var(tuple_set_ty, "order_customer_segment".to_owned(), None),
+            E::EExpr::Lit(E::Ty::Builtin(E::BuiltinTy::Int), E::Literal::Int(0), None),
+            E::EExpr::Lit(E::Ty::Builtin(E::BuiltinTy::Int), E::Literal::Int(2), None),
+        ],
+        None,
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let lowered = lower_relation_expr(&expr, &ctx).expect("relation project should lower");
+
+    assert!(matches!(lowered, IRRelationExpr::Project { .. }));
+    assert_eq!(
+        lowered.relation_type().expect("project type"),
+        IRRelationType::binary(
+            IRType::Entity {
+                name: "Order".to_owned()
+            },
+            IRType::String
+        )
+    );
+    let IRRelationExpr::Project { columns, .. } = lowered else {
+        unreachable!("asserted above")
+    };
+    assert_eq!(columns, vec![0, 2]);
+}
+
+#[test]
+fn lower_relation_derived_operators_use_relation_ir() {
+    let unary_ty = |name: &str| E::Ty::Set(Box::new(E::Ty::Entity(name.to_owned())));
+    let binary_ty = |left: &str, right: &str| {
+        E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+            E::Ty::Entity(left.to_owned()),
+            E::Ty::Entity(right.to_owned()),
+        ])))
+    };
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let product = E::EExpr::QualCall(
+        binary_ty("Order", "Customer"),
+        "Rel".to_owned(),
+        "product".to_owned(),
+        vec![
+            E::EExpr::Var(unary_ty("Order"), "orders".to_owned(), None),
+            E::EExpr::Var(unary_ty("Customer"), "customers".to_owned(), None),
+        ],
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&product, &ctx).expect("product should lower"),
+        IRRelationExpr::Product(_, _)
+    ));
+
+    let transpose = E::EExpr::QualCall(
+        binary_ty("Customer", "Order"),
+        "Rel".to_owned(),
+        "transpose".to_owned(),
+        vec![E::EExpr::Var(
+            binary_ty("Order", "Customer"),
+            "order_customer".to_owned(),
+            None,
+        )],
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&transpose, &ctx).expect("transpose should lower"),
+        IRRelationExpr::Transpose(_)
+    ));
+
+    let edge = E::EExpr::Var(binary_ty("Node", "Node"), "edge".to_owned(), None);
+    let closure = E::EExpr::QualCall(
+        binary_ty("Node", "Node"),
+        "Rel".to_owned(),
+        "closure".to_owned(),
+        vec![edge.clone()],
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&closure, &ctx).expect("closure should lower"),
+        IRRelationExpr::TransitiveClosure(_)
+    ));
+
+    let reach = E::EExpr::QualCall(
+        binary_ty("Node", "Node"),
+        "Rel".to_owned(),
+        "reach".to_owned(),
+        vec![edge],
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&reach, &ctx).expect("reach should lower"),
+        IRRelationExpr::ReflexiveTransitiveClosure(_)
+    ));
+}
+
+#[test]
+fn lower_relation_set_operators_use_relation_ir() {
+    let rel_ty = E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Entity("Customer".to_owned()),
+    ])));
+    let lhs = E::EExpr::Var(rel_ty.clone(), "lhs".to_owned(), None);
+    let rhs = E::EExpr::Var(rel_ty.clone(), "rhs".to_owned(), None);
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let union = E::EExpr::BinOp(
+        rel_ty.clone(),
+        E::BinOp::Add,
+        Box::new(lhs.clone()),
+        Box::new(rhs.clone()),
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&union, &ctx).expect("union should lower"),
+        IRRelationExpr::Union(_, _)
+    ));
+
+    let intersection = E::EExpr::BinOp(
+        rel_ty.clone(),
+        E::BinOp::Mul,
+        Box::new(lhs.clone()),
+        Box::new(rhs.clone()),
+        None,
+    );
+    assert!(matches!(
+        lower_relation_expr(&intersection, &ctx).expect("intersection should lower"),
+        IRRelationExpr::Intersection(_, _)
+    ));
+
+    let difference = E::EExpr::BinOp(rel_ty, E::BinOp::Sub, Box::new(lhs), Box::new(rhs), None);
+    assert!(matches!(
+        lower_relation_expr(&difference, &ctx).expect("difference should lower"),
+        IRRelationExpr::Difference(_, _)
+    ));
+}
+
+#[test]
+fn lower_relation_tuple_set_literals_use_relation_ir() {
+    let rel_ty = E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Entity("Customer".to_owned()),
+    ])));
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let empty = E::EExpr::SetLit(rel_ty.clone(), vec![], None);
+    assert!(matches!(
+        lower_relation_expr(&empty, &ctx).expect("empty relation should lower"),
+        IRRelationExpr::Empty(_)
+    ));
+
+    let tuple = E::EExpr::TupleLit(
+        E::Ty::Tuple(vec![
+            E::Ty::Entity("Order".to_owned()),
+            E::Ty::Entity("Customer".to_owned()),
+        ]),
+        vec![
+            E::EExpr::Var(E::Ty::Entity("Order".to_owned()), "order".to_owned(), None),
+            E::EExpr::Var(
+                E::Ty::Entity("Customer".to_owned()),
+                "customer".to_owned(),
+                None,
+            ),
+        ],
+        None,
+    );
+    let singleton = E::EExpr::SetLit(rel_ty, vec![tuple], None);
+    assert!(matches!(
+        lower_relation_expr(&singleton, &ctx).expect("singleton relation should lower"),
+        IRRelationExpr::SingletonTuple { .. }
+    ));
+}
+
+#[test]
+fn lower_relation_type_literal_preserves_nary_columns() {
+    let rel_ty = E::Ty::Relation(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Entity("Customer".to_owned()),
+        E::Ty::Builtin(E::BuiltinTy::String),
+    ]);
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let empty = E::EExpr::SetLit(rel_ty, vec![], None);
+    let lowered = lower_relation_expr(&empty, &ctx).expect("empty relation should lower");
+
+    assert_eq!(lowered.relation_type().expect("relation type").arity(), 3);
+}
+
+#[test]
+fn lower_relation_field_uses_store_scoped_relation_symbol() {
+    let result_ty = E::Ty::Relation(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Enum("Status".to_owned(), vec!["Pending".to_owned()]),
+    ]);
+    let expr = E::EExpr::QualCall(
+        result_ty,
+        "Rel".to_owned(),
+        "field".to_owned(),
+        vec![
+            E::EExpr::Var(E::Ty::Store("Order".to_owned()), "orders".to_owned(), None),
+            E::EExpr::Qual(
+                E::Ty::Named("Order".to_owned()),
+                "Order".to_owned(),
+                "status".to_owned(),
+                None,
+            ),
+        ],
+        None,
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let lowered = lower_relation_expr(&expr, &ctx).expect("field relation should lower");
+
+    let IRRelationExpr::Symbol(symbol) = lowered else {
+        panic!("expected relation symbol");
+    };
+    assert_eq!(symbol.name, "orders.status");
+    assert_eq!(
+        symbol.source,
+        IRRelationSource::EntityField {
+            entity: "Order".to_owned(),
+            field: "status".to_owned()
+        }
+    );
+    assert_eq!(symbol.relation_type.arity(), 2);
 }
 
 #[test]

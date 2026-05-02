@@ -324,6 +324,15 @@ pub(super) fn check_ctor_records_in_expr(
             }
             check_ctor_records_in_expr(filter, variant_fields, errors);
         }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            check_ctor_records_in_expr(projection, variant_fields, errors);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    check_ctor_records_in_expr(source, variant_fields, errors);
+                }
+            }
+            check_ctor_records_in_expr(filter, variant_fields, errors);
+        }
         EExpr::TupleLit(_, elems, _) | EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) => {
             for e in elems {
                 check_ctor_records_in_expr(e, variant_fields, errors);

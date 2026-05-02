@@ -556,6 +556,28 @@ fn tuple_literal() {
 }
 
 #[test]
+fn relation_comprehension() {
+    let e = parse_expr(
+        "Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)",
+    );
+    match &e.kind {
+        ExprKind::RelComp {
+            projection,
+            bindings,
+            filter,
+        } => {
+            assert!(matches!(projection.kind, ExprKind::TupleLit(_)));
+            assert_eq!(bindings.len(), 2);
+            assert_eq!(bindings[0].var, "o");
+            assert_eq!(bindings[1].var, "c");
+            assert!(bindings.iter().all(|binding| binding.source.is_some()));
+            assert!(matches!(filter.kind, ExprKind::Eq(_, _)));
+        }
+        other => panic!("expected RelComp, got {other:?}"),
+    }
+}
+
+#[test]
 fn paren_expr() {
     let e = parse_expr("(a + b)");
     assert!(matches!(e.kind, ExprKind::Add(_, _)));

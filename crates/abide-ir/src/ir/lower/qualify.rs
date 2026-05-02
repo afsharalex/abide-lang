@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::super::types::{
     IRAction, IRActionMatchArm, IRActionMatchScrutinee, IRCreateField, IRExpr, IRMatchArm,
-    LetBinding,
+    IRRelCompBinding, LetBinding,
 };
 
 /// Collect variable names bound by an IR pattern (PVar, PCtor fields, POr).
@@ -406,6 +406,37 @@ pub(super) fn qualify_query_vars_scoped(
                 projection: projection
                     .as_ref()
                     .map(|p| Box::new(qualify_query_vars_scoped(p, renames, &inner_bound))),
+                ty: ty.clone(),
+                span: *span,
+            }
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ty,
+            span,
+        } => {
+            let mut inner_bound = bound.clone();
+            let bindings = bindings
+                .iter()
+                .map(|binding| {
+                    let source = binding
+                        .source
+                        .as_ref()
+                        .map(|source| Box::new(qualify_query_vars_scoped(source, renames, bound)));
+                    inner_bound.insert(binding.var.clone());
+                    IRRelCompBinding {
+                        var: binding.var.clone(),
+                        domain: binding.domain.clone(),
+                        source,
+                    }
+                })
+                .collect();
+            IRExpr::RelComp {
+                projection: Box::new(qualify_query_vars_scoped(projection, renames, &inner_bound)),
+                bindings,
+                filter: Box::new(qualify_query_vars_scoped(filter, renames, &inner_bound)),
                 ty: ty.clone(),
                 span: *span,
             }

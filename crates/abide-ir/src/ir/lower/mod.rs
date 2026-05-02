@@ -5,9 +5,11 @@
 
 mod expr;
 mod qualify;
+mod relation_expr;
 mod system;
 
 use expr::{card_from_text, lower_expr};
+pub use relation_expr::{lower_relation_expr, RelationLowerError};
 use system::{lower_extern, lower_system, synthesize_proc_entities};
 
 use crate::elab::types as E;
@@ -242,6 +244,16 @@ fn lower_ty(ty: &E::Ty, ctx: &LowerCtx<'_>) -> IRType {
         E::Ty::Map(k, v) => IRType::Map {
             key: Box::new(lower_ty(k, ctx)),
             value: Box::new(lower_ty(v, ctx)),
+        },
+        E::Ty::Store(entity) => IRType::Set {
+            element: Box::new(IRType::Entity {
+                name: entity.clone(),
+            }),
+        },
+        E::Ty::Relation(columns) => IRType::Set {
+            element: Box::new(IRType::Tuple {
+                elements: columns.iter().map(|column| lower_ty(column, ctx)).collect(),
+            }),
         },
         E::Ty::Tuple(ts) => IRType::Tuple {
             elements: ts.iter().map(|t| lower_ty(t, ctx)).collect(),

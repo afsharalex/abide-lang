@@ -121,6 +121,87 @@ verify fair_toggle {
 }
 ```
 
+## Relations
+
+Relations model finite links between values. `Rel<T...>` is the
+first-class collection type for finite tuple relations:
+
+```abide
+enum OrderStage = Draft | Paid | Shipped
+enum FulfillmentPhase = Open | Complete
+enum HandlingLane = Manual | Automated
+
+type StagePhaseRel = Rel<OrderStage, FulfillmentPhase>
+type StagePhaseLaneRel = Rel<(OrderStage, FulfillmentPhase, HandlingLane)>
+
+verify stage_lane_links {
+  assert Rel((@Draft, @Open), (@Paid, @Open), (@Shipped, @Complete))
+    |> Rel::join(Rel((@Open, @Manual), (@Complete, @Automated)))
+    == Rel((@Draft, @Manual), (@Paid, @Manual), (@Shipped, @Automated))
+}
+```
+
+`Rel<A, B>` is a binary relation. `Rel<(A, B, C)>` is an explicit
+n-ary relation. Relation literals use `Rel(...)`; each element is either a
+single value for a unary relation or a tuple for a multi-column relation.
+
+Supported relation operations:
+
+- `Rel::join(left, right)` composes two relations by matching the last column of `left` with the first column of `right`. Joining `Rel<(OrderStage, FulfillmentPhase)>` with `Rel<(FulfillmentPhase, HandlingLane)>` yields `Rel<(OrderStage, HandlingLane)>`.
+- `Rel::transpose(relation)` reverses the columns of a binary relation. `Rel<(OrderStage, FulfillmentPhase)>` becomes `Rel<(FulfillmentPhase, OrderStage)>`.
+- `Rel::closure(relation)` computes the transitive closure of a homogeneous binary relation. It includes paths of one or more edges.
+- `Rel::reach(relation)` computes the reflexive transitive closure of a homogeneous binary relation. It includes the same paths as `closure`, plus identity pairs for every value in the relation's finite domain.
+- `Rel::product(left, right)` computes the cartesian product of two relations. Product appends the columns of `right` after the columns of `left`.
+- `Rel::project(relation, column)` keeps one column from a relation. Columns are zero-based.
+- `Rel::field(store, Entity::field)` derives the current store-backed relation from active entities to one of their finite fields.
+
+Pipeline form is supported when the relation operation remains fully qualified:
+
+```abide
+Rel((@Draft, @Open), (@Paid, @Open))
+  |> Rel::join(Rel((@Open, @Manual)))
+```
+
+Examples:
+
+```abide
+verify relation_examples {
+  assert Rel::transpose(Rel((@Draft, @Open)))
+    == Rel((@Open, @Draft))
+
+  assert Rel::closure(Rel((@Draft, @Paid), (@Paid, @Shipped)))
+    == Rel((@Draft, @Paid), (@Paid, @Shipped), (@Draft, @Shipped))
+
+  assert #Rel::product(Rel(@Draft, @Paid), Rel(@Manual)) == 2
+
+  assert Rel::project(Rel((@Draft, @Open, @Manual)), 0)
+    == Rel(@Draft)
+}
+```
+
+`Rel::field(orders, Order::status)` derives the finite relation of active store
+members to their field values:
+
+```abide
+assert always Rel::field(orders, Order::status)
+  <= Rel::field(orders', Order::status)
+```
+
+Relation comprehensions build finite relations from active store members:
+
+```abide
+assert always Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)
+  <= (Rel::field(orders, Order::customer_id) |> Rel::join(Rel::transpose(Rel::field(customers, Customer::id))))
+```
+
+The same relation operations compose over store-backed comprehensions. For
+example, `Rel::reach(Rel((a, b) | a: Node in nodes, b: Node in nodes where a.next_id == b.id))`
+checks finite reachability through the active node store.
+
+Static relation verification supports equality, subset, and cardinality over
+finite relation expressions. Counterexamples render the computed tuples so
+the mismatch can be inspected directly.
+
 ## Programs and procs
 
 For workflow-style orchestration, Abide provides `proc` and `program`:

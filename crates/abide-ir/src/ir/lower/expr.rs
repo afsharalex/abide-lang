@@ -1,7 +1,8 @@
 //! Expression lowering — EExpr to IRExpr.
 
 use super::super::types::{
-    IRAggKind, IRExpr, IRFieldPat, IRMatchArm, IRPattern, IRType, LetBinding, LitVal,
+    IRAggKind, IRExpr, IRFieldPat, IRMatchArm, IRPattern, IRRelCompBinding, IRType, LetBinding,
+    LitVal,
 };
 use super::{lower_ty, lower_while_contracts, LowerCtx};
 use crate::elab::types as E;
@@ -75,6 +76,12 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
                 (E::BinOp::Sub, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetDiff".to_owned(),
                 (E::BinOp::Le, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetSubset".to_owned(),
                 (E::BinOp::Add, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetUnion".to_owned(),
+                (E::BinOp::Mul, E::Ty::Relation(_), E::Ty::Relation(_)) => {
+                    "OpSetIntersect".to_owned()
+                }
+                (E::BinOp::Sub, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetDiff".to_owned(),
+                (E::BinOp::Le, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetSubset".to_owned(),
+                (E::BinOp::Add, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetUnion".to_owned(),
                 _ => format!("{:?}", lower_binop(*op)),
             };
             IRExpr::BinOp {
@@ -129,6 +136,73 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             })
         }
         E::EExpr::QualCall(ty, type_name, func_name, args, sp) => {
+            if type_name == "Rel" && func_name == "field" {
+                let lowered_store =
+                    args.first()
+                        .map(|arg| lower_expr(arg, ctx))
+                        .unwrap_or_else(|| IRExpr::Var {
+                            name: crate::messages::collection_op_unsupported_arity(
+                                type_name,
+                                func_name,
+                                args.len(),
+                            )
+                            .clone(),
+                            ty: lower_ty(ty, ctx),
+                            span: *sp,
+                        });
+                let selector_name = match args.get(1) {
+                    Some(E::EExpr::Qual(_, owner, field, _)) => format!("{owner}::{field}"),
+                    _ => crate::messages::collection_op_unsupported_arity(
+                        type_name,
+                        func_name,
+                        args.len(),
+                    )
+                    .clone(),
+                };
+                return IRExpr::BinOp {
+                    op: "OpRelationField".to_owned(),
+                    left: Box::new(lowered_store),
+                    right: Box::new(IRExpr::Var {
+                        name: selector_name,
+                        ty: IRType::String,
+                        span: *sp,
+                    }),
+                    ty: lower_ty(ty, ctx),
+                    span: *sp,
+                };
+            }
+            if type_name == "Rel" && func_name == "project" && args.len() >= 2 {
+                let relation = lower_expr(&args[0], ctx);
+                let columns = if args.len() == 2 {
+                    lower_expr(&args[1], ctx)
+                } else {
+                    let lowered_columns: Vec<IRExpr> =
+                        args[1..].iter().map(|arg| lower_expr(arg, ctx)).collect();
+                    let tuple_ty = IRType::Tuple {
+                        elements: vec![IRType::Int; lowered_columns.len()],
+                    };
+                    lowered_columns.into_iter().fold(
+                        IRExpr::Var {
+                            name: "Tuple".to_owned(),
+                            ty: tuple_ty.clone(),
+                            span: *sp,
+                        },
+                        |acc, arg| IRExpr::App {
+                            func: Box::new(acc),
+                            arg: Box::new(arg),
+                            ty: tuple_ty.clone(),
+                            span: *sp,
+                        },
+                    )
+                };
+                return IRExpr::BinOp {
+                    op: "OpRelProject".to_owned(),
+                    left: Box::new(relation),
+                    right: Box::new(columns),
+                    ty: lower_ty(ty, ctx),
+                    span: *sp,
+                };
+            }
             let op = format!("Op{type_name}{}", capitalize(func_name));
             let lowered_args: Vec<IRExpr> = args.iter().map(|a| lower_expr(a, ctx)).collect();
             match lowered_args.len() {
@@ -393,6 +467,23 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             domain: lower_ty(domain, ctx),
             filter: Box::new(lower_expr(filter, ctx)),
             projection: proj.as_ref().map(|p| Box::new(lower_expr(p, ctx))),
+            ty: lower_ty(ty, ctx),
+            span: *sp,
+        },
+        E::EExpr::RelComp(ty, projection, bindings, filter, sp) => IRExpr::RelComp {
+            projection: Box::new(lower_expr(projection, ctx)),
+            bindings: bindings
+                .iter()
+                .map(|binding| IRRelCompBinding {
+                    var: binding.var.clone(),
+                    domain: lower_ty(&binding.domain, ctx),
+                    source: binding
+                        .source
+                        .as_ref()
+                        .map(|source| Box::new(lower_expr(source, ctx))),
+                })
+                .collect(),
+            filter: Box::new(lower_expr(filter, ctx)),
             ty: lower_ty(ty, ctx),
             span: *sp,
         },

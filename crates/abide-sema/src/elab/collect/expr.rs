@@ -2,7 +2,9 @@
 
 use super::resolve_type_ref;
 use crate::ast;
-use crate::elab::types::{BinOp, BuiltinTy, EContract, EExpr, EPattern, Literal, Ty, UnOp};
+use crate::elab::types::{
+    BinOp, BuiltinTy, EContract, EExpr, EPattern, ERelCompBinding, Literal, Ty, UnOp,
+};
 
 /// Recognize qualified built-in collection calls: `Set::union`, `Map::domain`, etc.
 /// Returns Some(EExpr) if recognized, None if not a built-in.
@@ -24,6 +26,10 @@ pub(super) fn collect_qualified_call(
         ))
     };
     match (type_name, func_name) {
+        // Relation operations on the first-class finite relation type.
+        ("Rel", "join" | "transpose" | "closure" | "reach" | "product" | "project" | "field") => {
+            qc(u)
+        }
         // Set operations (2-arg: set × set → set/bool)
         ("Set", "union" | "intersect" | "diff") => qc(u),
         ("Set", "member" | "subset" | "disjoint") => qc(bool_ty),
@@ -136,6 +142,13 @@ pub(super) fn collect_expr(expr: &ast::Expr) -> EExpr {
                 match name.as_str() {
                     "Set" => {
                         return EExpr::SetLit(u(), args.iter().map(collect_expr).collect(), sp);
+                    }
+                    "Rel" => {
+                        return EExpr::SetLit(
+                            Ty::Relation(Vec::new()),
+                            args.iter().map(collect_expr).collect(),
+                            sp,
+                        );
                     }
                     "Seq" => {
                         return EExpr::SeqLit(u(), args.iter().map(collect_expr).collect(), sp);
@@ -485,6 +498,27 @@ pub(super) fn collect_expr(expr: &ast::Expr) -> EExpr {
                 sp,
             )
         }
+        ast::ExprKind::RelComp {
+            projection,
+            bindings,
+            filter,
+        } => EExpr::RelComp(
+            Ty::Relation(Vec::new()),
+            Box::new(collect_expr(projection)),
+            bindings
+                .iter()
+                .map(|binding| ERelCompBinding {
+                    var: binding.var.clone(),
+                    domain: resolve_type_ref(&binding.domain),
+                    source: binding
+                        .source
+                        .as_ref()
+                        .map(|expr| Box::new(collect_expr(expr))),
+                })
+                .collect(),
+            Box::new(collect_expr(filter)),
+            sp,
+        ),
 
         // Imperative constructs
         ast::ExprKind::Block(items) => collect_block_items(items),

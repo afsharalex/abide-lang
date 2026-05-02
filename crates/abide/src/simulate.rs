@@ -1749,6 +1749,7 @@ impl<'a> Runtime<'a> {
             | IRExpr::Aggregate { .. }
             | IRExpr::Saw { .. }
             | IRExpr::SetComp { .. }
+            | IRExpr::RelComp { .. }
             | IRExpr::While { .. } => Err(format!(
                 "simulation does not yet support expression kind `{}`",
                 expr_kind(expr)
@@ -2463,6 +2464,7 @@ fn expr_kind(expr: &IRExpr) -> &'static str {
         IRExpr::SeqLit { .. } => "seq_lit",
         IRExpr::MapLit { .. } => "map_lit",
         IRExpr::SetComp { .. } => "set_comp",
+        IRExpr::RelComp { .. } => "rel_comp",
         IRExpr::Card { .. } => "card",
         IRExpr::Sorry { .. } => "sorry",
         IRExpr::Todo { .. } => "todo",

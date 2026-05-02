@@ -1145,6 +1145,13 @@ pub enum ExprKind {
         domain: TypeRef,
         filter: Box<Expr>,
     },
+    /// Relation comprehension:
+    /// `Rel((a, b) | a: A in as, b: B in bs where predicate)`.
+    RelComp {
+        projection: Box<Expr>,
+        bindings: Vec<RelCompBinding>,
+        filter: Box<Expr>,
+    },
 
     // Imperative constructs (fn body)
     Block(Vec<Expr>),
@@ -1187,6 +1194,14 @@ pub enum ExprKind {
     False,
     Sorry,
     Todo,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelCompBinding {
+    pub var: String,
+    pub domain: TypeRef,
+    pub source: Option<Box<Expr>>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

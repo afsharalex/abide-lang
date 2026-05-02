@@ -148,6 +148,15 @@ pub(super) fn check_invariant_body_no_liveness(expr: &EExpr, errors: &mut Vec<El
                 }
                 walk(body, errors);
             }
+            EExpr::RelComp(_, projection, bindings, filter, _) => {
+                walk(projection, errors);
+                for binding in bindings {
+                    if let Some(source) = &binding.source {
+                        walk(source, errors);
+                    }
+                }
+                walk(filter, errors);
+            }
             EExpr::Match(scrut, arms, _) => {
                 walk(scrut, errors);
                 for (_, guard, body) in arms {

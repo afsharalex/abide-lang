@@ -21728,6 +21728,286 @@ fn relational_scene_fragment_detects_create_only_cardinality_scene() {
 }
 
 #[test]
+fn verify_routes_static_relation_join_subset_to_rustsat() {
+    let ir = lower_source_file(
+        "static_relation_join.ab",
+        "module StaticRelation\n\n\
+         verify join_subset {\n\
+           assert Rel::join(Set((1, 2)), Set((2, 3))) <= Set((1, 3))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Checked { name, depth, .. }
+                if name == "join_subset" && *depth == 0)
+        ),
+        "static relation assertion should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_static_relation_cardinality_to_rustsat() {
+    let ir = lower_source_file(
+        "static_relation_cardinality.ab",
+        "module StaticRelation\n\n\
+         verify relation_cardinality {\n\
+           assert #Rel::join(Set((1, 2)), Set((2, 3))) == 1\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Checked { name, depth, .. }
+                if name == "relation_cardinality" && *depth == 0)
+        ),
+        "relation cardinality should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_static_relation_closure_equality_to_rustsat() {
+    let ir = lower_source_file(
+        "static_relation_closure.ab",
+        "module StaticRelation\n\n\
+         verify closure_subset {\n\
+           assert Rel::closure(Set((1, 2))) <= Set((1, 2))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Checked { name, depth, .. }
+                if name == "closure_subset" && *depth == 0)
+        ),
+        "closure assertion should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_static_relation_false_equality_reports_counterexample() {
+    let ir = lower_source_file(
+        "static_relation_false.ab",
+        "module StaticRelation\n\n\
+         verify bad_relation_equality {\n\
+           assert Rel::join(Set((1, 2)), Set((2, 3))) == Set((1, 4))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Counterexample { name, .. }
+                if name == "bad_relation_equality"
+                    && r.relational_witness().is_some())
+        ),
+        "false relation equality should report relational counterexample evidence: {results:?}"
+    );
+    let rendered = results
+        .iter()
+        .find(|r| matches!(r, VerificationResult::Counterexample { name, .. } if name == "bad_relation_equality"))
+        .map(ToString::to_string)
+        .expect("counterexample result");
+    assert!(
+        rendered.contains("relation derived left") && rendered.contains("(1, 3)"),
+        "relation counterexample should render the computed left tuple set: {rendered}"
+    );
+    assert!(
+        rendered.contains("relation derived right") && rendered.contains("(1, 4)"),
+        "relation counterexample should render the computed right tuple set: {rendered}"
+    );
+}
+
+#[test]
+fn verify_routes_mutable_store_extent_relation_subset_to_rustsat() {
+    let ir = lower_source_file(
+        "mutable_store_relation.ab",
+        "module MutableRelation\n\n\
+         entity Order {\n  flag: bool = false\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         verify store_extent_monotonic {\n\
+           assume {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always orders <= orders'\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. }
+                if name == "store_extent_monotonic")),
+        "store extent relation subset should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_filtered_relation_comprehension_join_over_finite_stores_to_rustsat() {
+    let ir = lower_source_file(
+        "relation_comprehension_join.ab",
+        "module RelationComprehension\n\n\
+         enum CustomerId = CustomerOne | CustomerTwo\n\
+         enum Segment = Vip | Standard\n\n\
+         entity Customer {\n\
+           id: CustomerId = @CustomerOne\n\
+           segment: Segment = @Vip\n\
+         }\n\n\
+         entity Order {\n\
+           customer_id: CustomerId = @CustomerOne\n\
+         }\n\n\
+         system Commerce(orders: Store<Order>, customers: Store<Customer>) {\n\
+           command create_pair() {\n\
+             create Customer { id = @CustomerOne segment = @Vip }\n\
+             create Order { customer_id = @CustomerOne }\n\
+           }\n\
+         }\n\n\
+         verify filtered_relation_comprehension_matches_join {\n\
+           assume {\n\
+             store orders: Order[0..3]\n\
+             store customers: Customer[0..3]\n\
+             let commerce = Commerce { orders: orders, customers: customers }\n\
+           }\n\
+           assert always Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)\n\
+             <= (Rel::field(orders, Order::customer_id) |> Rel::join(Rel::transpose(Rel::field(customers, Customer::id))))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. }
+                if name == "filtered_relation_comprehension_matches_join")),
+        "filtered relation comprehension should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_filtered_relation_comprehension_subset_reports_counterexample_when_filter_is_too_strict()
+{
+    let ir = lower_source_file(
+        "relation_comprehension_counterexample.ab",
+        "module RelationComprehension\n\n\
+         enum CustomerId = CustomerOne\n\n\
+         entity Customer { id: CustomerId = @CustomerOne }\n\
+         entity Order { customer_id: CustomerId = @CustomerOne }\n\n\
+         system Commerce(orders: Store<Order>, customers: Store<Customer>) {\n\
+           command create_pair() {\n\
+             create Customer { id = @CustomerOne }\n\
+             create Order { customer_id = @CustomerOne }\n\
+           }\n\
+         }\n\n\
+         verify filtered_relation_comprehension_counterexample {\n\
+           assume {\n\
+             store orders: Order[0..3]\n\
+             store customers: Customer[0..3]\n\
+             let commerce = Commerce { orders: orders, customers: customers }\n\
+           }\n\
+           assert always Rel((o, c) | o: Order in orders, c: Customer in customers where o.customer_id == c.id)\n\
+             <= Rel((o, c) | o: Order in orders, c: Customer in customers where false)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Counterexample { name, .. }
+                if name == "filtered_relation_comprehension_counterexample")
+        ),
+        "strict filtered relation subset should produce a counterexample: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_store_relation_product_and_projection_to_rustsat() {
+    let ir = lower_source_file(
+        "store_relation_product_projection.ab",
+        "module RelationComprehension\n\n\
+         enum CustomerId = CustomerOne\n\n\
+         entity Customer { id: CustomerId = @CustomerOne }\n\
+         entity Order { customer_id: CustomerId = @CustomerOne }\n\n\
+         system Commerce(orders: Store<Order>, customers: Store<Customer>) {\n\
+           command create_pair() {\n\
+             create Customer { id = @CustomerOne }\n\
+             create Order { customer_id = @CustomerOne }\n\
+           }\n\
+         }\n\n\
+         verify store_relation_product_and_projection {\n\
+           assume {\n\
+             store orders: Order[0..3]\n\
+             store customers: Customer[0..3]\n\
+             let commerce = Commerce { orders: orders, customers: customers }\n\
+           }\n\
+           assert always Rel::project(Rel((o, c) | o: Order in orders, c: Customer in customers where true), 0) <= orders\n\
+           assert always Rel::product(orders, customers) <= Rel((o, c) | o: Order in orders, c: Customer in customers where true)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. }
+                if name == "store_relation_product_and_projection")),
+        "store relation product/projection should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_store_relation_reachability_to_rustsat() {
+    let ir = lower_source_file(
+        "store_relation_reachability.ab",
+        "module RelationReachability\n\n\
+         enum NodeId = A | B | C\n\n\
+         entity Node {\n\
+           id: NodeId = @A\n\
+           next_id: NodeId = @A\n\
+         }\n\n\
+         system Graph(nodes: Store<Node>) {\n\
+           command create_chain() {\n\
+             create Node { id = @A next_id = @B }\n\
+             create Node { id = @B next_id = @C }\n\
+             create Node { id = @C next_id = @C }\n\
+           }\n\
+         }\n\n\
+         verify store_relation_reachability {\n\
+           assume {\n\
+             store nodes: Node[0..3]\n\
+             let graph = Graph { nodes: nodes }\n\
+           }\n\
+           assert always Rel((a, c) | a: Node in nodes, c: Node in nodes where a.id == @A and c.id == @C)\n\
+             <= Rel::reach(Rel((left, right) | left: Node in nodes, right: Node in nodes where left.next_id == right.id))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. }
+                if name == "store_relation_reachability")),
+        "store relation reachability should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
 fn scene_store_lower_bound_activates_initial_entities() {
     let ir = lower_source_file(
         "scene_store_lower_bound.ab",

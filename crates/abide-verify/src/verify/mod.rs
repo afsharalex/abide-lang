@@ -1903,6 +1903,7 @@ pub(super) fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
         | IRExpr::SeqLit { span, .. }
         | IRExpr::MapLit { span, .. }
         | IRExpr::SetComp { span, .. }
+        | IRExpr::RelComp { span, .. }
         | IRExpr::Card { span, .. }
         | IRExpr::Assert { span, .. }
         | IRExpr::Assume { span, .. }
@@ -2340,6 +2341,62 @@ fn check_verify_block_tiered(
         .is_some_and(transition::TransitionVerifyObligation::has_liveness);
 
     record_verify_assert_precondition_obligations(ir, vctx, defs, effective_block);
+
+    if !config.unbounded_only
+        && effective_block.systems.is_empty()
+        && effective_block.stores.is_empty()
+    {
+        if let Some(result) =
+            relation_sat::try_check_static_relation_assertions(&effective_block.asserts)
+        {
+            return match result {
+                Ok(relation_sat::StaticRelationOutcome::Checked) => VerificationResult::Checked {
+                    name: effective_block.name.clone(),
+                    depth: 0,
+                    time_ms: 0,
+                    assumptions: build_assumptions_for_system_scope(
+                        ir,
+                        &system_names,
+                        &effective_block.assumption_set,
+                        &[],
+                    ),
+                    span: effective_block.span,
+                    file: effective_block.file.clone(),
+                },
+                Ok(relation_sat::StaticRelationOutcome::Counterexample {
+                    witness,
+                    witness_error,
+                }) => {
+                    let (evidence, evidence_extraction_error) = match witness {
+                        Some(witness) => match relational_evidence(witness) {
+                            Ok(evidence) => (Some(evidence), witness_error),
+                            Err(err) => (None, Some(err)),
+                        },
+                        None => (None, witness_error),
+                    };
+                    VerificationResult::Counterexample {
+                        name: effective_block.name.clone(),
+                        evidence,
+                        evidence_extraction_error,
+                        assumptions: build_assumptions_for_system_scope(
+                            ir,
+                            &system_names,
+                            &effective_block.assumption_set,
+                            &[],
+                        ),
+                        span: effective_block.span,
+                        file: effective_block.file.clone(),
+                    }
+                }
+                Err(hint) => VerificationResult::Unprovable {
+                    name: effective_block.name.clone(),
+                    hint,
+                    span: effective_block.span,
+                    file: effective_block.file.clone(),
+                },
+            };
+        }
+    }
 
     if !has_liveness && !config.unbounded_only {
         let Some(relational_config) = clamp_config_to_deadline(config, deadline) else {

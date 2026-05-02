@@ -938,6 +938,30 @@ fn substitute_expr(expr: &EExpr, bindings: &HashMap<String, String>) -> EExpr {
             )),
             *span,
         ),
+        EExpr::RelComp(ty, projection, rel_bindings, filter, span) => {
+            let bound_names = rel_bindings
+                .iter()
+                .map(|binding| binding.var.as_str())
+                .collect::<Vec<_>>();
+            let scoped_bindings = bindings_without(bindings, &bound_names);
+            EExpr::RelComp(
+                ty.clone(),
+                Box::new(substitute_expr(projection, &scoped_bindings)),
+                rel_bindings
+                    .iter()
+                    .map(|binding| crate::elab::types::ERelCompBinding {
+                        var: binding.var.clone(),
+                        domain: binding.domain.clone(),
+                        source: binding
+                            .source
+                            .as_ref()
+                            .map(|source| Box::new(substitute_expr(source, bindings))),
+                    })
+                    .collect(),
+                Box::new(substitute_expr(filter, &scoped_bindings)),
+                *span,
+            )
+        }
         EExpr::SetLit(ty, items, span) => EExpr::SetLit(
             ty.clone(),
             items
@@ -1509,6 +1533,18 @@ fn resolve_ty(
             Box::new(resolve_ty(types, entities, generic_types, k)),
             Box::new(resolve_ty(types, entities, generic_types, v)),
         ),
+        Ty::Store(entity) => Ty::Store(
+            entities
+                .get(entity.as_str())
+                .cloned()
+                .unwrap_or_else(|| entity.clone()),
+        ),
+        Ty::Relation(columns) => Ty::Relation(
+            columns
+                .iter()
+                .map(|column| resolve_ty(types, entities, generic_types, column))
+                .collect(),
+        ),
         Ty::Tuple(ts) => Ty::Tuple(
             ts.iter()
                 .map(|t| resolve_ty(types, entities, generic_types, t))
@@ -1740,10 +1776,15 @@ fn resolve_props(env: &mut Env, ctx: &Ctx) {
 
 fn resolve_verifies(env: &mut Env, ctx: &Ctx) {
     for verify in &mut env.verifies {
+        let bound = verify
+            .stores
+            .iter()
+            .map(|store| (store.name.clone(), Ty::Store(store.entity_type.clone())))
+            .collect::<HashMap<_, _>>();
         verify.asserts = verify
             .asserts
             .iter()
-            .map(|e| resolve_expr(ctx, &HashMap::new(), e))
+            .map(|e| resolve_expr(ctx, &bound, e))
             .collect();
     }
 }
@@ -1754,6 +1795,9 @@ fn resolve_scenes(env: &mut Env, ctx: &Ctx) {
         // Given vars get Ty::Entity so that field accesses (o.status) carry the
         // entity type, enabling downstream checks like match exhaustiveness.
         let mut scene_bound: HashMap<String, Ty> = HashMap::new();
+        for store in &scene.stores {
+            scene_bound.insert(store.name.clone(), Ty::Store(store.entity_type.clone()));
+        }
         for given in &mut scene.givens {
             let resolved_ty = ctx.resolve_ty(&Ty::Named(given.entity_type.clone()));
             scene_bound.insert(given.var.clone(), resolved_ty);
@@ -2075,6 +2119,13 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let prog = parser.parse_program().expect("parse error");
         crate::elab::elaborate(&prog)
+    }
+
+    fn relation_columns(ty: &Ty) -> &[Ty] {
+        let Ty::Relation(columns) = ty else {
+            panic!("expected Relation result type, got {ty:?}");
+        };
+        columns
     }
 
     #[test]
@@ -2711,5 +2762,258 @@ mod tests {
             }
             other => panic!("expected Quant in axiom body, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn relation_join_qualified_builtin_infers_tuple_set_type() {
+        let env = elaborate_src(r#"const joined = Rel::join(Set((1, true)), Set((true, "ok")))"#);
+
+        let body = &env.consts.get("joined").expect("joined const").body;
+        let EExpr::QualCall(ty, namespace, name, _, _) = body else {
+            panic!("expected relation builtin QualCall, got {body:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "join");
+        assert!(matches!(
+            relation_columns(ty),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_bare_join_is_not_a_builtin() {
+        let (_result, errors) =
+            elaborate_all(r#"const joined = join(Set((1, true)), Set((true, "ok")))"#);
+
+        assert!(
+            errors.iter().any(|error| error
+                .message
+                .contains("relation operation `join` must be called as `Rel::join`")),
+            "bare relation function names should produce a qualified-call diagnostic: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn relation_type_alias_resolves_to_first_class_relation() {
+        let env = elaborate_src("type Edge = Rel<int, string>");
+
+        let edge = env.types.get("Edge").expect("Edge alias");
+        let Ty::Alias(_, inner) = edge else {
+            panic!("expected type alias, got {edge:?}");
+        };
+        let Ty::Relation(columns) = inner.as_ref() else {
+            panic!("expected Relation columns, got {inner:?}");
+        };
+        assert!(matches!(
+            columns.as_slice(),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_tuple_type_alias_resolves_to_nary_relation() {
+        let env = elaborate_src("type EdgeFact = Rel<(int, string, bool)>");
+
+        let edge = env.types.get("EdgeFact").expect("EdgeFact alias");
+        let Ty::Alias(_, inner) = edge else {
+            panic!("expected type alias, got {edge:?}");
+        };
+        let Ty::Relation(columns) = inner.as_ref() else {
+            panic!("expected Relation columns, got {inner:?}");
+        };
+        assert_eq!(columns.len(), 3);
+    }
+
+    #[test]
+    fn relation_literal_infers_first_class_relation_type() {
+        let env = elaborate_src(r#"const edges = Rel((1, "ok"))"#);
+
+        let body = &env.consts.get("edges").expect("edges const").body;
+        let Ty::Relation(columns) = body.ty() else {
+            panic!("expected Relation literal type, got {body:?}");
+        };
+        assert!(matches!(
+            columns.as_slice(),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_field_infers_store_backed_field_relation_type() {
+        let env = elaborate_src(
+            "enum Status = Pending | Paid\n\
+             entity Order { status: Status = @Pending }\n\
+             verify status_relation {\n\
+               assume { store orders: Order[0..2] }\n\
+               assert Rel::field(orders, Order::status) == Rel::field(orders, Order::status)\n\
+             }",
+        );
+
+        assert!(
+            env.errors.is_empty(),
+            "expected no errors, got {:?}",
+            env.errors
+        );
+        let assert = &env.verifies[0].asserts[0];
+        let EExpr::BinOp(_, _, left, _, _) = assert else {
+            panic!("expected equality assertion, got {assert:?}");
+        };
+        let EExpr::QualCall(ty, namespace, name, _, _) = left.as_ref() else {
+            panic!("expected Rel::field call, got {left:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "field");
+        let Ty::Relation(columns) = ty else {
+            panic!("expected Relation result type, got {ty:?}");
+        };
+        assert!(
+            matches!(columns.as_slice(), [Ty::Entity(entity), Ty::Enum(status, _)] if entity == "Order" && status == "Status")
+        );
+    }
+
+    #[test]
+    fn relation_field_rejects_store_entity_mismatch() {
+        let (_result, errors) = elaborate_all(
+            "enum Status = Pending | Paid\n\
+             entity Order { status: Status = @Pending }\n\
+             entity Customer { status: Status = @Pending }\n\
+             verify status_relation {\n\
+               assume { store customers: Customer[0..2] }\n\
+               assert Rel::field(customers, Order::status) == Rel::field(customers, Order::status)\n\
+             }",
+        );
+
+        assert!(
+            errors.iter().any(|error| error
+                .message
+                .contains("Rel::field store entity `Customer` does not match field owner `Order`")),
+            "expected store/entity mismatch diagnostic, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn relation_pipe_supports_qualified_associated_call() {
+        let env = elaborate_src(r#"const joined = Set((1, true)) |> Rel::join(Set((true, "ok")))"#);
+
+        let body = &env.consts.get("joined").expect("joined const").body;
+        let EExpr::QualCall(ty, namespace, name, args, _) = body else {
+            panic!("expected relation builtin QualCall, got {body:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "join");
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            relation_columns(ty),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_namespace_transpose_infers_swapped_tuple_set_type() {
+        let env = elaborate_src(r#"const flipped = Rel::transpose(Set((1, "ok")))"#);
+
+        let body = &env.consts.get("flipped").expect("flipped const").body;
+        let EExpr::QualCall(ty, namespace, name, _, _) = body else {
+            panic!("expected relation builtin QualCall, got {body:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "transpose");
+        assert!(matches!(
+            relation_columns(ty),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_closure_reports_non_homogeneous_binary_relation() {
+        let (_result, errors) = elaborate_all(r#"const bad = Rel::closure(Set((1, "ok")))"#);
+
+        assert!(
+            errors.iter().any(|error| error
+                .message
+                .contains("Rel::closure requires a homogeneous binary relation")),
+            "expected closure relation diagnostic, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn relation_product_builds_tuple_relation_from_unary_relations() {
+        let env = elaborate_src(r#"const pairs = Rel::product(Set(1), Set("ok"))"#);
+
+        let body = &env.consts.get("pairs").expect("pairs const").body;
+        let EExpr::QualCall(ty, namespace, name, _, _) = body else {
+            panic!("expected relation builtin QualCall, got {body:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "product");
+        assert!(matches!(
+            relation_columns(ty),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_project_keeps_selected_tuple_columns() {
+        let env = elaborate_src(r#"const projected = Rel::project(Set((1, true, "ok")), 0, 2)"#);
+
+        let body = &env.consts.get("projected").expect("projected const").body;
+        let EExpr::QualCall(ty, namespace, name, _, _) = body else {
+            panic!("expected relation builtin QualCall, got {body:?}");
+        };
+        assert_eq!(namespace, "Rel");
+        assert_eq!(name, "project");
+        assert!(matches!(
+            relation_columns(ty),
+            [
+                Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                Ty::Builtin(crate::elab::types::BuiltinTy::String),
+            ]
+        ));
+    }
+
+    #[test]
+    fn relation_project_requires_qualified_associated_call() {
+        let (_result, errors) =
+            elaborate_all(r#"const projected = project(Set((1, true, "ok")), 2)"#);
+
+        assert!(
+            errors.iter().any(|error| error
+                .message
+                .contains("relation operation `project` must be called as `Rel::project`")),
+            "bare relation function names should produce a qualified-call diagnostic: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn relation_cardinality_infers_int() {
+        let env = elaborate_src(r#"const relation_size = #Set((1, true))"#);
+
+        let body = &env
+            .consts
+            .get("relation_size")
+            .expect("relation_size const")
+            .body;
+        assert!(matches!(
+            body.ty(),
+            Ty::Builtin(crate::elab::types::BuiltinTy::Int)
+        ));
     }
 }
