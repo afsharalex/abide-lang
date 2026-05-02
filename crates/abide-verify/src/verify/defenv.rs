@@ -883,10 +883,14 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
         }
         IRExpr::SetComp {
             var,
+            source,
             filter,
             projection,
             ..
         } => {
+            if let Some(source) = source {
+                free_vars_inner(source, bound, fv);
+            }
             let was_new = bound.insert(var.clone());
             free_vars_inner(filter, bound, fv);
             if let Some(p) = projection {
@@ -1447,15 +1451,25 @@ fn substitute_var_inner(
         IRExpr::SetComp {
             var,
             domain,
+            source,
             filter,
             projection,
             ty,
             ..
         } => {
+            let source = source.map(|source| {
+                Box::new(substitute_var_inner(
+                    *source,
+                    var_name,
+                    replacement,
+                    repl_fv,
+                ))
+            });
             if var == var_name {
                 IRExpr::SetComp {
                     var,
                     domain,
+                    source,
                     filter,
                     projection,
                     ty,
@@ -1475,6 +1489,7 @@ fn substitute_var_inner(
                 IRExpr::SetComp {
                     var: fresh,
                     domain,
+                    source,
                     span: None,
                     filter: Box::new(substitute_var_inner(
                         renamed_filter,
@@ -1491,6 +1506,7 @@ fn substitute_var_inner(
                 IRExpr::SetComp {
                     var,
                     domain,
+                    source,
                     span: None,
                     filter: Box::new(substitute_var_inner(
                         *filter,
@@ -2114,6 +2130,7 @@ mod tests {
             IRExpr::SetComp {
                 var: "x".to_owned(),
                 domain: IRType::Int,
+                source: None,
                 filter: Box::new(status_ref.clone()),
                 projection: Some(Box::new(count_ref.clone())),
                 ty: IRType::Set {
@@ -2339,6 +2356,7 @@ mod tests {
                 IRExpr::SetComp {
                     var: "y".to_owned(),
                     domain: IRType::Int,
+                    source: None,
                     filter: Box::new(bin(
                         "OpEq",
                         target.clone(),

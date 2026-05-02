@@ -179,9 +179,15 @@ pub(super) fn body_contains_assert(expr: &IRExpr) -> bool {
         } => body_contains_assert(map) || body_contains_assert(key) || body_contains_assert(value),
         IRExpr::Index { map, key, .. } => body_contains_assert(map) || body_contains_assert(key),
         IRExpr::SetComp {
-            filter, projection, ..
+            source,
+            filter,
+            projection,
+            ..
         } => {
-            body_contains_assert(filter)
+            source
+                .as_ref()
+                .is_some_and(|source| body_contains_assert(source))
+                || body_contains_assert(filter)
                 || projection.as_ref().is_some_and(|p| body_contains_assert(p))
         }
         IRExpr::RelComp {
@@ -348,9 +354,15 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
         } => body_contains_sorry(map) || body_contains_sorry(key) || body_contains_sorry(value),
         IRExpr::Index { map, key, .. } => body_contains_sorry(map) || body_contains_sorry(key),
         IRExpr::SetComp {
-            filter, projection, ..
+            source,
+            filter,
+            projection,
+            ..
         } => {
-            body_contains_sorry(filter)
+            source
+                .as_ref()
+                .is_some_and(|source| body_contains_sorry(source))
+                || body_contains_sorry(filter)
                 || projection.as_ref().is_some_and(|p| body_contains_sorry(p))
         }
         IRExpr::RelComp {
@@ -489,10 +501,14 @@ pub(super) fn collect_def_refs_inner(
         }
         IRExpr::SetComp {
             var,
+            source,
             filter,
             projection,
             ..
         } => {
+            if let Some(source) = source {
+                collect_def_refs_inner(source, bound, refs);
+            }
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone());
             collect_def_refs_inner(filter, &inner_bound, refs);
@@ -957,19 +973,29 @@ pub(super) fn count_entity_quantifiers(expr: &IRExpr, counts: &mut HashMap<Strin
         // SetComp introduces an entity binder — count it like Forall
         IRExpr::SetComp {
             domain: crate::ir::types::IRType::Entity { name },
+            source,
             filter,
             projection,
             ..
         } => {
             *counts.entry(name.clone()).or_insert(0) += 1;
+            if let Some(source) = source {
+                count_entity_quantifiers(source, counts);
+            }
             count_entity_quantifiers(filter, counts);
             if let Some(proj) = projection {
                 count_entity_quantifiers(proj, counts);
             }
         }
         IRExpr::SetComp {
-            filter, projection, ..
+            source,
+            filter,
+            projection,
+            ..
         } => {
+            if let Some(source) = source {
+                count_entity_quantifiers(source, counts);
+            }
             count_entity_quantifiers(filter, counts);
             if let Some(proj) = projection {
                 count_entity_quantifiers(proj, counts);
@@ -1146,17 +1172,40 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             })
         }),
         IRExpr::SetComp {
+            source: Some(source),
+            filter,
+            projection,
+            ..
+        } if matches!(
+            source.as_ref(),
+            IRExpr::SetLit { .. } | IRExpr::SeqLit { .. }
+        ) =>
+        {
+            find_unsupported_scene_expr(source)
+                .or_else(|| find_unsupported_scene_expr(filter))
+                .or_else(|| {
+                    projection
+                        .as_ref()
+                        .and_then(|p| find_unsupported_scene_expr(p))
+                })
+        }
+        IRExpr::SetComp {
             domain: IRType::Entity { .. },
+            source,
             filter,
             projection,
             ..
         } => {
             // Entity-domain comprehension is supported; check sub-expressions
-            find_unsupported_scene_expr(filter).or_else(|| {
-                projection
-                    .as_ref()
-                    .and_then(|p| find_unsupported_scene_expr(p))
-            })
+            source
+                .as_ref()
+                .and_then(|source| find_unsupported_scene_expr(source))
+                .or_else(|| find_unsupported_scene_expr(filter))
+                .or_else(|| {
+                    projection
+                        .as_ref()
+                        .and_then(|p| find_unsupported_scene_expr(p))
+                })
         }
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
         IRExpr::RelComp {
@@ -1178,14 +1227,19 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             // Entity-domain set comprehension — bounded sum over slots
             IRExpr::SetComp {
                 domain: IRType::Entity { .. },
+                source,
                 filter,
                 projection,
                 ..
-            } => find_unsupported_scene_expr(filter).or_else(|| {
-                projection
-                    .as_ref()
-                    .and_then(|p| find_unsupported_scene_expr(p))
-            }),
+            } => source
+                .as_ref()
+                .and_then(|source| find_unsupported_scene_expr(source))
+                .or_else(|| find_unsupported_scene_expr(filter))
+                .or_else(|| {
+                    projection
+                        .as_ref()
+                        .and_then(|p| find_unsupported_scene_expr(p))
+                }),
             // Anything else: unsupported (infinite domain, field expression, etc.)
             _ => Some("cardinality (#) of non-literal, non-comprehension expression"),
         },
@@ -2562,6 +2616,7 @@ mod tests {
                         domain: IRType::Entity {
                             name: "Order".to_owned(),
                         },
+                        source: None,
                         filter: Box::new(bin(
                             "OpEq",
                             var(
@@ -2665,6 +2720,7 @@ mod tests {
                 domain: IRType::Entity {
                     name: "Order".to_owned(),
                 },
+                source: None,
                 filter: Box::new(bool_lit(true)),
                 projection: None,
                 ty: IRType::Set {
@@ -2717,6 +2773,7 @@ mod tests {
             find_unsupported_scene_expr(&IRExpr::SetComp {
                 var: "x".to_owned(),
                 domain: IRType::Int,
+                source: None,
                 filter: Box::new(bool_lit(true)),
                 projection: None,
                 ty: IRType::Set {

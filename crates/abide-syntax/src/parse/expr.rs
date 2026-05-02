@@ -658,20 +658,27 @@ impl Parser {
                     span,
                 })
             }
-            // Set comprehension: { var: Type where filter } or { expr | var: Type where filter }
+            // Set comprehension:
+            // `{ var: Type where filter }`
+            // `{ expr | var: Type in source where filter }`
+            // `{ expr | var in source where filter }`
             Some(Token::LBrace) => {
                 self.advance(); // consume {
-                                // Check for simple form: Name: TypeRef where...
-                                // Lookahead: peek(0)=Name, peek(1)=Colon, peek(2)=Name (type start)
                 if matches!(self.peek(), Some(Token::Name(_)))
-                    && matches!(self.peek_at(1), Some(Token::Colon))
+                    && matches!(self.peek_at(1), Some(Token::Colon) | Some(Token::In))
                 {
-                    // Could be simple set comp or projection form (if the expr before | happens to
-                    // start with Name:). Try simple form first: parse var: type where filter.
                     let saved = self.pos;
                     let (var, _) = self.expect_name()?;
-                    self.expect(&Token::Colon)?;
-                    let domain = self.type_ref()?;
+                    let domain = if self.eat(&Token::Colon).is_some() {
+                        Some(self.type_ref()?)
+                    } else {
+                        None
+                    };
+                    let source = if self.eat(&Token::In).is_some() {
+                        Some(Box::new(self.expr_bp(BP_CHOICE.1)?))
+                    } else {
+                        None
+                    };
                     if matches!(self.peek(), Some(Token::Where)) {
                         // Simple form confirmed
                         self.advance(); // consume where
@@ -682,6 +689,7 @@ impl Parser {
                                 projection: None,
                                 var,
                                 domain,
+                                source,
                                 filter: Box::new(filter),
                             },
                             span: start.merge(end),
@@ -695,8 +703,16 @@ impl Parser {
                 let projection = self.expr_bp(BP_CHOICE.1)?;
                 self.expect(&Token::Pipe)?;
                 let (var, _) = self.expect_name()?;
-                self.expect(&Token::Colon)?;
-                let domain = self.type_ref()?;
+                let domain = if self.eat(&Token::Colon).is_some() {
+                    Some(self.type_ref()?)
+                } else {
+                    None
+                };
+                let source = if self.eat(&Token::In).is_some() {
+                    Some(Box::new(self.expr_bp(BP_CHOICE.1)?))
+                } else {
+                    None
+                };
                 self.expect(&Token::Where)?;
                 let filter = self.expr()?;
                 let end = self.expect(&Token::RBrace)?;
@@ -705,6 +721,7 @@ impl Parser {
                         projection: Some(Box::new(projection)),
                         var,
                         domain,
+                        source,
                         filter: Box::new(filter),
                     },
                     span: start.merge(end),

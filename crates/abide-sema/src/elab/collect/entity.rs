@@ -622,9 +622,10 @@ pub(super) fn find_first_prime(expr: &EExpr) -> Option<crate::span::Span> {
         EExpr::MapUpdate(_, m, k, v, _) => find_first_prime(m)
             .or_else(|| find_first_prime(k))
             .or_else(|| find_first_prime(v)),
-        EExpr::SetComp(_, projection, _, _, filter, _) => projection
+        EExpr::SetComp(_, projection, _, _, source, filter, _) => projection
             .as_ref()
             .and_then(|p| find_first_prime(p))
+            .or_else(|| source.as_deref().and_then(find_first_prime))
             .or_else(|| find_first_prime(filter)),
         EExpr::RelComp(_, projection, bindings, filter, _) => find_first_prime(projection)
             .or_else(|| {
@@ -1067,7 +1068,10 @@ pub(super) fn collect_var_names_inner(
         }
         // set comprehension binds the
         // comprehension variable in head and predicate.
-        EExpr::SetComp(_, head, comp_var, _, pred, _) => {
+        EExpr::SetComp(_, head, comp_var, _, source, pred, _) => {
+            if let Some(source) = source {
+                collect_var_names_inner(source, bound, into);
+            }
             let was_new = bound.insert(comp_var.clone());
             if let Some(h) = head {
                 collect_var_names_inner(h, bound, into);

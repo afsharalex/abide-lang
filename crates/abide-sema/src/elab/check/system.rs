@@ -1152,7 +1152,7 @@ fn expr_span(expr: &EExpr) -> Option<crate::span::Span> {
         | EExpr::Pipe(_, _, _, span)
         | EExpr::MapUpdate(_, _, _, _, span)
         | EExpr::Index(_, _, _, span)
-        | EExpr::SetComp(_, _, _, _, _, span)
+        | EExpr::SetComp(_, _, _, _, _, _, span)
         | EExpr::RelComp(_, _, _, _, span)
         | EExpr::QualCall(_, _, _, _, span)
         | EExpr::Lam(_, _, _, span)

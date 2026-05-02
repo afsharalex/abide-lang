@@ -318,9 +318,12 @@ pub(super) fn check_ctor_records_in_expr(
             check_ctor_records_in_expr(m, variant_fields, errors);
             check_ctor_records_in_expr(k, variant_fields, errors);
         }
-        EExpr::SetComp(_, proj, _, _, filter, _) => {
+        EExpr::SetComp(_, proj, _, _, source, filter, _) => {
             if let Some(p) = proj {
                 check_ctor_records_in_expr(p, variant_fields, errors);
+            }
+            if let Some(source) = source {
+                check_ctor_records_in_expr(source, variant_fields, errors);
             }
             check_ctor_records_in_expr(filter, variant_fields, errors);
         }

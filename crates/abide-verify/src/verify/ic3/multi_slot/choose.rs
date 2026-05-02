@@ -320,9 +320,15 @@ pub(in crate::verify::ic3) fn ic3_expr_mentions_var(expr: &IRExpr, target: &str)
             ic3_expr_mentions_var(key, target) || ic3_expr_mentions_var(value, target)
         }),
         IRExpr::SetComp {
-            filter, projection, ..
+            source,
+            filter,
+            projection,
+            ..
         } => {
-            ic3_expr_mentions_var(filter, target)
+            source
+                .as_ref()
+                .is_some_and(|source| ic3_expr_mentions_var(source, target))
+                || ic3_expr_mentions_var(filter, target)
                 || projection
                     .as_ref()
                     .is_some_and(|expr| ic3_expr_mentions_var(expr, target))

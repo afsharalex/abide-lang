@@ -99,6 +99,23 @@ program Publishing(documents: Store<Document>[..4]) {
 }
 ```
 
+## Collection comprehensions
+
+See: [`examples/collections.ab`](../examples/collections.ab)
+
+Highlights:
+- set comprehensions over finite `Set(...)` sources
+- set comprehensions over finite `Seq(...)` sources
+- binder type inference from source collections
+- explicit binder type annotations when desired
+
+```abide
+assert { x * 2 | x in Set(1, 2, 3) where x > 1 } == Set(4, 6)
+
+assert { amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
+  == Set(25.0, 50.0)
+```
+
 ## Functions and imperative verification
 
 See:

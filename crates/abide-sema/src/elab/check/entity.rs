@@ -142,9 +142,12 @@ pub(super) fn check_invariant_body_no_liveness(expr: &EExpr, errors: &mut Vec<El
                     walk(v, errors);
                 }
             }
-            EExpr::SetComp(_, proj, _, _, body, _) => {
+            EExpr::SetComp(_, proj, _, _, source, body, _) => {
                 if let Some(p) = proj {
                     walk(p, errors);
+                }
+                if let Some(source) = source {
+                    walk(source, errors);
                 }
                 walk(body, errors);
             }

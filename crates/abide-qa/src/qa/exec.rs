@@ -1753,7 +1753,20 @@ fn rewrite_owner_scoped_expr(
             )?),
             *span,
         ),
-        EExpr::SetComp(ty, projection, name, domain_ty, filter, span) => {
+        EExpr::SetComp(ty, projection, name, domain_ty, source, filter, span) => {
+            let rewritten_source = source
+                .as_ref()
+                .map(|source| {
+                    rewrite_owner_scoped_expr(
+                        source,
+                        owner,
+                        owner_kind,
+                        implicit_var,
+                        owner_fields,
+                        bound_vars,
+                    )
+                })
+                .transpose()?;
             bound_vars.push(name.clone());
             let rewritten_projection = projection
                 .as_ref()
@@ -1782,6 +1795,7 @@ fn rewrite_owner_scoped_expr(
                 rewritten_projection.map(Box::new),
                 name.clone(),
                 domain_ty.clone(),
+                rewritten_source.map(Box::new),
                 Box::new(rewritten_filter),
                 *span,
             )
@@ -2641,15 +2655,21 @@ impl TemporalTargetCollector {
             ExprKind::SetComp {
                 projection,
                 domain,
+                source,
                 filter,
                 ..
             } => {
-                if let Some(owner) = type_ref_owner_name(domain) {
-                    if model.entity_names.iter().any(|name| name == &owner)
-                        || model.system_names.iter().any(|name| name == &owner)
-                    {
-                        self.owner_candidates.insert(owner);
+                if let Some(domain) = domain {
+                    if let Some(owner) = type_ref_owner_name(domain) {
+                        if model.entity_names.iter().any(|name| name == &owner)
+                            || model.system_names.iter().any(|name| name == &owner)
+                        {
+                            self.owner_candidates.insert(owner);
+                        }
                     }
+                }
+                if let Some(source) = source {
+                    self.collect_expr(model, source);
                 }
                 if let Some(projection) = projection {
                     self.collect_expr(model, projection);

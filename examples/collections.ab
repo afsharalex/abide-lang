@@ -1,0 +1,39 @@
+module Collections
+
+// Finite collection comprehensions over explicit Set and Seq sources.
+
+entity Dummy {
+  id: identity
+}
+
+system Fixture(dummies: Store<Dummy>) {
+  command noop() { }
+}
+
+verify set_source_comprehension {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { x * 2 | x in Set(1, 2, 3) where x > 1 } == Set(4, 6)
+}
+
+verify typed_set_source_comprehension {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { x * 2 | x: int in Set(1, 2, 3) where x > 1 } == Set(4, 6)
+}
+
+verify seq_source_comprehension {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
+    == Set(25.0, 50.0)
+}

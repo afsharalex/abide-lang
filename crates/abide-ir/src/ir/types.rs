@@ -349,6 +349,7 @@ pub enum IRExpr {
     SetComp {
         var: std::string::String,
         domain: IRType,
+        source: Option<Box<IRExpr>>,
         filter: Box<IRExpr>,
         projection: Option<Box<IRExpr>>,
         #[serde(rename = "type")]

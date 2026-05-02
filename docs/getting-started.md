@@ -162,6 +162,34 @@ assert always Rel((a, c) | a: Node in nodes, c: Node in nodes where a.id == @Nod
   <= Rel::reach(Rel((left, right) | left: Node in nodes, right: Node in nodes where left.next_id == right.id))
 ```
 
+## Collection comprehensions
+
+Set comprehensions can filter and map finite collection sources:
+
+```abide
+entity Dummy {
+  id: identity
+}
+
+system Fixture(dummies: Store<Dummy>) {
+  command noop() { }
+}
+
+verify collection_examples {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { x * 2 | x in Set(1, 2, 3) where x > 1 } == Set(4, 6)
+
+  assert { amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
+    == Set(25.0, 50.0)
+}
+```
+
+See [`examples/collections.ab`](../examples/collections.ab) for a complete runnable file.
+
 ## What the pieces mean
 
 - `entity` declares stateful domain objects with fields and actions.

@@ -1535,6 +1535,7 @@ fn normalize_verifier_choose_term(
         IRExpr::SetComp {
             var,
             domain,
+            source,
             filter,
             projection,
             ty,
@@ -1558,6 +1559,11 @@ fn normalize_verifier_choose_term(
                 IRExpr::SetComp {
                     var: var.clone(),
                     domain: domain.clone(),
+                    source: source
+                        .as_ref()
+                        .map(|source| normalize_verifier_choose_expr(source))
+                        .transpose()?
+                        .map(Box::new),
                     filter: Box::new(normalize_verifier_choose_expr(filter)?),
                     projection,
                     ty: ty.clone(),
@@ -2106,6 +2112,46 @@ pub(super) fn encode_prop_value(
                 .map(|elem| encode_prop_value(pool, vctx, defs, ctx, elem, step))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(smt::seq_literal(elem_ty, &elems))
+        }
+        IRExpr::SetComp {
+            var,
+            source: Some(source),
+            filter,
+            projection,
+            ty,
+            ..
+        } => {
+            let elements = match source.as_ref() {
+                IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+                _ => {
+                    return Err(
+                        "sourced SetComp in verifier properties currently requires a finite Set or Seq literal source"
+                            .to_owned(),
+                    );
+                }
+            };
+            let IRType::Set { element } = ty else {
+                return Err(format!("SetComp with non-Set result type: {ty:?}"));
+            };
+            let result_elem_sort = smt::ir_type_to_sort(element);
+            let false_val = smt::bool_val(false).to_dynamic();
+            let true_val = smt::bool_val(true).to_dynamic();
+            let mut arr = smt::const_array(&result_elem_sort, &false_val);
+
+            for element_expr in elements {
+                let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
+                let inner_ctx = ctx.with_local(var, value.clone());
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
+                let key = if let Some(proj_expr) = projection {
+                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)?.to_dynamic()
+                } else {
+                    value.to_dynamic()
+                };
+                let stored = arr.store(&key, &true_val);
+                arr = smt::array_ite(&filter_val, &stored, &arr);
+            }
+
+            Ok(SmtValue::Array(arr))
         }
         IRExpr::SetComp {
             var,

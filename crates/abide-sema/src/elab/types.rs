@@ -929,6 +929,7 @@ pub enum EExpr {
         Option<Box<EExpr>>,
         String,
         Ty,
+        Option<Box<EExpr>>,
         Box<EExpr>,
         Option<crate::span::Span>,
     ),
@@ -1050,7 +1051,7 @@ impl EExpr {
             | Self::Pipe(ty, _, _, _)
             | Self::MapUpdate(ty, _, _, _, _)
             | Self::Index(ty, _, _, _)
-            | Self::SetComp(ty, _, _, _, _, _)
+            | Self::SetComp(ty, _, _, _, _, _, _)
             | Self::RelComp(ty, _, _, _, _)
             | Self::SetLit(ty, _, _)
             | Self::SeqLit(ty, _, _)

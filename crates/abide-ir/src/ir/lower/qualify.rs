@@ -392,6 +392,7 @@ pub(super) fn qualify_query_vars_scoped(
         IRExpr::SetComp {
             var,
             domain,
+            source,
             filter,
             projection,
             ty,
@@ -402,6 +403,9 @@ pub(super) fn qualify_query_vars_scoped(
             IRExpr::SetComp {
                 var: var.clone(),
                 domain: domain.clone(),
+                source: source
+                    .as_ref()
+                    .map(|source| Box::new(qualify_query_vars_scoped(source, renames, bound))),
                 filter: Box::new(qualify_query_vars_scoped(filter, renames, &inner_bound)),
                 projection: projection
                     .as_ref()

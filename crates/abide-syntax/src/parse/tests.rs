@@ -1940,11 +1940,14 @@ fn set_comp_simple() {
             projection,
             var,
             domain,
+            source,
             filter,
         } => {
             assert!(projection.is_none());
             assert_eq!(var, "a");
+            let domain = domain.as_ref().expect("explicit domain");
             assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
+            assert!(source.is_none());
             assert!(matches!(filter.kind, ExprKind::Eq(_, _)));
         }
         other => panic!("expected SetComp, got {other:?}"),
@@ -1959,13 +1962,71 @@ fn set_comp_projection() {
             projection,
             var,
             domain,
+            source,
             filter,
         } => {
             assert!(projection.is_some());
             let proj = projection.as_ref().unwrap();
             assert!(matches!(&proj.kind, ExprKind::Field(_, ref f) if f == "balance"));
             assert_eq!(var, "a");
+            let domain = domain.as_ref().expect("explicit domain");
             assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
+            assert!(source.is_none());
+            assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
+        }
+        other => panic!("expected SetComp, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_comp_projection_with_source() {
+    let e = parse_expr("{ x * 2 | x: int in values where x > 0 }");
+    match &e.kind {
+        ExprKind::SetComp {
+            projection,
+            var,
+            domain,
+            source,
+            filter,
+        } => {
+            assert!(matches!(
+                projection.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Mul(_, _))
+            ));
+            assert_eq!(var, "x");
+            let domain = domain.as_ref().expect("explicit domain");
+            assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "int"));
+            assert!(matches!(
+                source.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Var(ref n)) if n == "values"
+            ));
+            assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
+        }
+        other => panic!("expected SetComp, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_comp_projection_with_inferred_source_type() {
+    let e = parse_expr("{ x * 2 | x in values where x > 0 }");
+    match &e.kind {
+        ExprKind::SetComp {
+            projection,
+            var,
+            domain,
+            source,
+            filter,
+        } => {
+            assert!(matches!(
+                projection.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Mul(_, _))
+            ));
+            assert_eq!(var, "x");
+            assert!(domain.is_none());
+            assert!(matches!(
+                source.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Var(ref n)) if n == "values"
+            ));
             assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
         }
         other => panic!("expected SetComp, got {other:?}"),

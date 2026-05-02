@@ -910,9 +910,12 @@ fn check_unresolved_constructors(
             check_unresolved_constructors(m, ctx, span, known_names, errors);
             check_unresolved_constructors(k, ctx, span, known_names, errors);
         }
-        EExpr::SetComp(_, proj, _, _, filter, _) => {
+        EExpr::SetComp(_, proj, _, _, source, filter, _) => {
             if let Some(p) = proj {
                 check_unresolved_constructors(p, ctx, span, known_names, errors);
+            }
+            if let Some(source) = source {
+                check_unresolved_constructors(source, ctx, span, known_names, errors);
             }
             check_unresolved_constructors(filter, ctx, span, known_names, errors);
         }
@@ -1149,7 +1152,7 @@ fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
         | EExpr::Choose(_, _, _, _, sp)
         | EExpr::MapUpdate(_, _, _, _, sp)
         | EExpr::Index(_, _, _, sp)
-        | EExpr::SetComp(_, _, _, _, _, sp)
+        | EExpr::SetComp(_, _, _, _, _, _, sp)
         | EExpr::SetLit(_, _, sp)
         | EExpr::SeqLit(_, _, sp)
         | EExpr::MapLit(_, _, sp)
@@ -1249,9 +1252,10 @@ fn find_unsupported_verifier_expr(expr: &EExpr) -> Option<&'static str> {
         EExpr::Index(_, map, key, _) => {
             find_unsupported_verifier_expr(map).or_else(|| find_unsupported_verifier_expr(key))
         }
-        EExpr::SetComp(_, projection, _, _, filter, _) => projection
+        EExpr::SetComp(_, projection, _, _, source, filter, _) => projection
             .as_ref()
             .and_then(|expr| find_unsupported_verifier_expr(expr))
+            .or_else(|| source.as_deref().and_then(find_unsupported_verifier_expr))
             .or_else(|| find_unsupported_verifier_expr(filter)),
         EExpr::RelComp(_, projection, bindings, filter, _) => {
             find_unsupported_verifier_expr(projection)
@@ -1510,9 +1514,12 @@ fn collect_name_refs(
             collect_name_refs(m, known_names, bound, refs);
             collect_name_refs(k, known_names, bound, refs);
         }
-        EExpr::SetComp(_, proj, var, _, filter, _) => {
+        EExpr::SetComp(_, proj, var, _, source, filter, _) => {
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone());
+            if let Some(source) = source {
+                collect_name_refs(source, known_names, bound, refs);
+            }
             if let Some(p) = proj {
                 collect_name_refs(p, known_names, &inner_bound, refs);
             }

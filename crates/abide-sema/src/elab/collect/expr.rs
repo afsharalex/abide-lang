@@ -485,15 +485,17 @@ pub(super) fn collect_expr(expr: &ast::Expr) -> EExpr {
             projection,
             var,
             domain,
+            source,
             filter,
         } => {
-            let dom = resolve_type_ref(domain);
+            let dom = domain.as_ref().map_or(Ty::Error, resolve_type_ref);
             let proj = projection.as_ref().map(|p| Box::new(collect_expr(p)));
             EExpr::SetComp(
                 u(),
                 proj,
                 var.clone(),
                 dom,
+                source.as_ref().map(|expr| Box::new(collect_expr(expr))),
                 Box::new(collect_expr(filter)),
                 sp,
             )

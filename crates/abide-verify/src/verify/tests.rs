@@ -14209,6 +14209,7 @@ fn set_comprehension_simple_form() {
         domain: IRType::Entity {
             name: "Obj".to_owned(),
         },
+        source: None,
         filter: Box::new(IRExpr::BinOp {
             op: "OpEq".to_owned(),
             left: Box::new(IRExpr::Field {
@@ -14373,6 +14374,7 @@ fn set_comprehension_membership_check() {
         domain: IRType::Entity {
             name: "Obj".to_owned(),
         },
+        source: None,
         filter: Box::new(IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
@@ -14523,6 +14525,7 @@ fn set_comprehension_projection_form() {
         domain: IRType::Entity {
             name: "Obj".to_owned(),
         },
+        source: None,
         filter: Box::new(IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
@@ -14615,6 +14618,62 @@ fn set_comprehension_projection_form() {
         ),
         "projection SetComp should encode without error: got {}",
         results[0]
+    );
+}
+
+#[test]
+fn set_comprehension_maps_over_inferred_set_source() {
+    let ir = lower_source_file(
+        "sourced_set_comprehension.ab",
+        "module SourcedSetComp\n\n\
+         entity Dummy { id: identity }\n\n\
+         system S(dummies: Store<Dummy>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify map_over_set_source {\n\
+           assume {\n\
+             store dummies: Dummy[0..1]\n\
+             let s = S { dummies: dummies }\n\
+           }\n\
+           assert { x * 2 | x in Set(1, 2, 3) where x > 1 } == Set(4, 6)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|result| matches!(result, VerificationResult::Proved { name, .. } if name == "map_over_set_source")),
+        "sourced set comprehension should prove mapped set equality: {results:?}"
+    );
+}
+
+#[test]
+fn set_comprehension_maps_over_inferred_seq_source() {
+    let ir = lower_source_file(
+        "sourced_seq_comprehension.ab",
+        "module SourcedSeqComp\n\n\
+         entity Dummy { id: identity }\n\n\
+         system S(dummies: Store<Dummy>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify map_over_seq_source {\n\
+           assume {\n\
+             store dummies: Dummy[0..1]\n\
+             let s = S { dummies: dummies }\n\
+           }\n\
+           assert { amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 } == Set(25.0, 50.0)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |result| matches!(result, VerificationResult::Proved { name, .. } if name == "map_over_seq_source")
+        ),
+        "sourced seq comprehension should prove mapped set equality: {results:?}"
     );
 }
 
@@ -15216,6 +15275,7 @@ fn card_set_comp_bounded_sum() {
         domain: IRType::Entity {
             name: "Obj".to_owned(),
         },
+        source: None,
         filter: Box::new(IRExpr::BinOp {
             op: "OpEq".to_owned(),
             left: Box::new(IRExpr::Field {

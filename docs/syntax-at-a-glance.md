@@ -109,6 +109,28 @@ scene successful_payment {
 }
 ```
 
+## Collections
+
+Set comprehensions can filter a typed domain:
+
+```abide
+{ o: Order where o.status == @Paid }
+```
+
+They can also project/map each selected value:
+
+```abide
+{ o.total | o: Order where o.status == @Paid }
+```
+
+For finite collection sources, add `in source`. The binder type can be written
+explicitly or inferred from the source collection:
+
+```abide
+{ x * 2 | x: int in Set(1, 2, 3) where x > 1 }
+{ amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
+```
+
 ## Programs and procs
 
 ```abide

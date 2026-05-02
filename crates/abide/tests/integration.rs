@@ -159,6 +159,11 @@ fn parse_relations() {
 }
 
 #[test]
+fn parse_collections() {
+    parse_file("tests/fixtures/collections.ab");
+}
+
+#[test]
 fn lex_all_fixtures() {
     for name in &[
         "simple",
@@ -167,6 +172,8 @@ fn lex_all_fixtures() {
         "inventory",
         "workflow",
         "relations",
+        "collections",
+        "collection_comprehensions",
     ] {
         let path = format!("tests/fixtures/{name}.ab");
         let src = std::fs::read_to_string(&path).unwrap();
@@ -823,7 +830,14 @@ fn lower_commerce() {
 #[test]
 fn lower_all_fixtures() {
     // Single-file fixtures
-    for name in &["simple", "auth", "inventory", "workflow"] {
+    for name in &[
+        "simple",
+        "auth",
+        "inventory",
+        "workflow",
+        "collections",
+        "collection_comprehensions",
+    ] {
         let path = format!("tests/fixtures/{name}.ab");
         let prog = lower_file(&path);
         let json = ir::emit_json(&prog).expect("IR serialization should succeed");
@@ -5952,6 +5966,55 @@ fn collection_ops_all_proved() {
         });
         assert!(r.is_some(), "{name} should be PROVED (got: {results:?})");
     }
+}
+
+#[test]
+fn collection_comprehensions_all_proved() {
+    let results = verify_file("tests/fixtures/collection_comprehensions.ab");
+    let expected = [
+        "set_source_comprehension",
+        "typed_set_source_comprehension",
+        "seq_source_comprehension",
+    ];
+    for name in &expected {
+        let result = results.iter().find(|result| match result {
+            abide::verify::VerificationResult::Proved { name: actual, .. } => actual == name,
+            _ => false,
+        });
+        assert!(
+            result.is_some(),
+            "{name} should be PROVED (got: {results:?})"
+        );
+    }
+}
+
+#[test]
+fn real_set_comprehension_without_finite_source_has_actionable_diagnostic() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("real_set_comprehension.ab");
+    std::fs::write(
+        &path,
+        "const bad = { x | x: real where x >= 0.0 and x <= 1.0 }\n",
+    )
+    .expect("write spec");
+
+    let (env, load_errors, _) = abide::loader::load_files(&[path]);
+    assert!(load_errors.is_empty(), "load errors: {load_errors:?}");
+    let (_, errors) = abide::elab::elaborate_env(env);
+
+    let error = errors
+        .iter()
+        .find(|error| {
+            error.message.contains("set comprehension")
+                && error.message.contains("real")
+                && error.message.contains("finite source")
+        })
+        .unwrap_or_else(|| {
+            panic!("expected actionable real set-comprehension diagnostic, got: {errors:?}")
+        });
+    let help = error.help.as_deref().unwrap_or_default();
+    assert!(help.contains("Set("), "{help}");
+    assert!(help.contains("real intervals are not enumerable"), "{help}");
 }
 
 // ── entity and system invariants () ────────────────

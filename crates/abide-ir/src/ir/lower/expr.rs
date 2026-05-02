@@ -462,9 +462,12 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::SetComp(ty, proj, var, domain, filter, sp) => IRExpr::SetComp {
+        E::EExpr::SetComp(ty, proj, var, domain, source, filter, sp) => IRExpr::SetComp {
             var: var.clone(),
             domain: lower_ty(domain, ctx),
+            source: source
+                .as_ref()
+                .map(|source| Box::new(lower_expr(source, ctx))),
             filter: Box::new(lower_expr(filter, ctx)),
             projection: proj.as_ref().map(|p| Box::new(lower_expr(p, ctx))),
             ty: lower_ty(ty, ctx),

@@ -202,6 +202,23 @@ Static relation verification supports equality, subset, and cardinality over
 finite relation expressions. Counterexamples render the computed tuples so
 the mismatch can be inspected directly.
 
+## Collection comprehensions
+
+Set comprehensions filter finite domains and can project each selected value:
+
+```abide
+{ o: Order where o.status == @Paid }
+{ o.total | o: Order where o.status == @Paid }
+```
+
+When the source is an explicit finite collection, use `in source`. The binder
+type may be written or inferred from `Set<T>` and `Seq<T>` sources:
+
+```abide
+{ x * 2 | x: int in Set(1, 2, 3) where x > 1 }
+{ amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
+```
+
 ## Programs and procs
 
 For workflow-style orchestration, Abide provides `proc` and `program`:

@@ -2,7 +2,7 @@
 
 use super::super::env::Env;
 use super::super::error::{ElabError, ErrorKind};
-use super::super::types::{EEventAction, EExpr, Ty};
+use super::super::types::{BuiltinTy, EContract, EEventAction, EExpr, EFieldDefault, Ty};
 use std::collections::{HashMap, HashSet};
 
 /// Resolve and validate extern-boundary `saw` expressions.
@@ -125,9 +125,12 @@ pub(super) fn validate_saw_expressions(env: &mut Env, ctx: &super::Ctx) {
                 walk(k, arities, extern_names, errors);
                 walk(v, arities, extern_names, errors);
             }
-            EExpr::SetComp(_, proj, _, _, filter, _) => {
+            EExpr::SetComp(_, proj, _, _, source, filter, _) => {
                 if let Some(p) = proj {
                     walk(p, arities, extern_names, errors);
+                }
+                if let Some(source) = source {
+                    walk(source, arities, extern_names, errors);
                 }
                 walk(filter, arities, extern_names, errors);
             }
@@ -350,9 +353,12 @@ pub(super) fn validate_aggregate_bodies(env: &mut Env) {
                 walk(k, errors);
                 walk(v, errors);
             }
-            EExpr::SetComp(_, proj, _, _, filter, _) => {
+            EExpr::SetComp(_, proj, _, _, source, filter, _) => {
                 if let Some(p) = proj {
                     walk(p, errors);
+                }
+                if let Some(source) = source {
+                    walk(source, errors);
                 }
                 walk(filter, errors);
             }
@@ -490,6 +496,355 @@ pub(super) fn validate_aggregate_bodies(env: &mut Env) {
         );
         err.span = sp;
         env.errors.push(err);
+    }
+}
+
+/// Validate that set comprehensions do not implicitly range over
+/// non-enumerable real domains. A finite source is still allowed, e.g.
+/// `{ x | x in Set(0.0, 0.5) where x >= 0.0 }`.
+pub(super) fn validate_set_comprehension_sources(env: &mut Env) {
+    let mut errors = Vec::new();
+
+    for v in &env.verifies {
+        for a in &v.asserts {
+            validate_set_comprehension_expr(a, &mut errors);
+        }
+    }
+    for t in &env.theorems {
+        for s in &t.shows {
+            validate_set_comprehension_expr(s, &mut errors);
+        }
+        for inv in &t.invariants {
+            validate_set_comprehension_expr(inv, &mut errors);
+        }
+    }
+    for l in &env.lemmas {
+        for b in &l.body {
+            validate_set_comprehension_expr(b, &mut errors);
+        }
+    }
+    for a in &env.axioms {
+        validate_set_comprehension_expr(&a.body, &mut errors);
+    }
+    for scene in &env.scenes {
+        for e in &scene.given_constraints {
+            validate_set_comprehension_expr(e, &mut errors);
+        }
+        for e in &scene.thens {
+            validate_set_comprehension_expr(e, &mut errors);
+        }
+    }
+    for p in env.props.values() {
+        validate_set_comprehension_expr(&p.body, &mut errors);
+    }
+    for p in env.preds.values() {
+        validate_set_comprehension_expr(&p.body, &mut errors);
+    }
+    for c in env.consts.values() {
+        validate_set_comprehension_expr(&c.body, &mut errors);
+    }
+    for entity in env.entities.values() {
+        for field in &entity.fields {
+            if let Some(default) = &field.default {
+                validate_set_comprehension_field_default(default, &mut errors);
+            }
+        }
+        for action in &entity.actions {
+            for req in &action.requires {
+                validate_set_comprehension_expr(req, &mut errors);
+            }
+            for ens in &action.ensures {
+                validate_set_comprehension_expr(ens, &mut errors);
+            }
+            for body in &action.body {
+                validate_set_comprehension_expr(body, &mut errors);
+            }
+        }
+        for inv in &entity.invariants {
+            validate_set_comprehension_expr(&inv.body, &mut errors);
+        }
+        for d in &entity.derived_fields {
+            validate_set_comprehension_expr(&d.body, &mut errors);
+        }
+    }
+    for system in env.systems.values() {
+        for field in &system.fields {
+            if let Some(default) = &field.default {
+                validate_set_comprehension_field_default(default, &mut errors);
+            }
+        }
+        for action in &system.actions {
+            for req in &action.requires {
+                validate_set_comprehension_expr(req, &mut errors);
+            }
+            for item in &action.body {
+                validate_set_comprehension_event_action(item, &mut errors);
+            }
+            if let Some(ret) = &action.return_expr {
+                validate_set_comprehension_expr(ret, &mut errors);
+            }
+        }
+        for query in &system.queries {
+            validate_set_comprehension_expr(&query.body, &mut errors);
+        }
+        for pred in &system.preds {
+            validate_set_comprehension_expr(&pred.body, &mut errors);
+        }
+        for inv in &system.invariants {
+            validate_set_comprehension_expr(&inv.body, &mut errors);
+        }
+        for d in &system.derived_fields {
+            validate_set_comprehension_expr(&d.body, &mut errors);
+        }
+    }
+    for f in env.fns.values() {
+        validate_set_comprehension_expr(&f.body, &mut errors);
+        for c in &f.contracts {
+            match c {
+                EContract::Requires(e) | EContract::Ensures(e) | EContract::Invariant(e) => {
+                    validate_set_comprehension_expr(e, &mut errors);
+                }
+                EContract::Decreases { measures, .. } => {
+                    for m in measures {
+                        validate_set_comprehension_expr(m, &mut errors);
+                    }
+                }
+            }
+        }
+    }
+
+    env.errors.extend(errors);
+}
+
+fn validate_set_comprehension_expr(expr: &EExpr, errors: &mut Vec<ElabError>) {
+    match expr {
+        EExpr::SetComp(_, projection, _, domain, source, filter, span) => {
+            if source.is_none() && is_real_domain(domain) {
+                let mut err = ElabError::new(
+                    ErrorKind::InvalidScope,
+                    "set comprehension over real requires an explicit finite source",
+                    "set comprehension domain",
+                )
+                .with_help(
+                    "Use a finite source such as `{ x | x in Set(0.0, 0.5, 1.0) where ... }`; real intervals are not enumerable.",
+                );
+                err.span = *span;
+                errors.push(err);
+            }
+            if let Some(projection) = projection {
+                validate_set_comprehension_expr(projection, errors);
+            }
+            if let Some(source) = source {
+                validate_set_comprehension_expr(source, errors);
+            }
+            validate_set_comprehension_expr(filter, errors);
+        }
+        EExpr::Call(_, f, args, _) => {
+            validate_set_comprehension_expr(f, errors);
+            for a in args {
+                validate_set_comprehension_expr(a, errors);
+            }
+        }
+        EExpr::CallR(_, f, args, refs, _) => {
+            validate_set_comprehension_expr(f, errors);
+            for a in args {
+                validate_set_comprehension_expr(a, errors);
+            }
+            for r in refs {
+                validate_set_comprehension_expr(r, errors);
+            }
+        }
+        EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
+            validate_set_comprehension_expr(body, errors);
+        }
+        EExpr::Let(bindings, body, _) => {
+            for (_, _, value) in bindings {
+                validate_set_comprehension_expr(value, errors);
+            }
+            validate_set_comprehension_expr(body, errors);
+        }
+        EExpr::BinOp(_, _, l, r, _)
+        | EExpr::Until(_, l, r, _)
+        | EExpr::Since(_, l, r, _)
+        | EExpr::Seq(_, l, r, _)
+        | EExpr::SameStep(_, l, r, _)
+        | EExpr::Assign(_, l, r, _)
+        | EExpr::In(_, l, r, _)
+        | EExpr::Pipe(_, l, r, _)
+        | EExpr::Index(_, l, r, _) => {
+            validate_set_comprehension_expr(l, errors);
+            validate_set_comprehension_expr(r, errors);
+        }
+        EExpr::UnOp(_, _, e, _)
+        | EExpr::Always(_, e, _)
+        | EExpr::Eventually(_, e, _)
+        | EExpr::Historically(_, e, _)
+        | EExpr::Once(_, e, _)
+        | EExpr::Previously(_, e, _)
+        | EExpr::Prime(_, e, _)
+        | EExpr::Card(_, e, _)
+        | EExpr::Assert(_, e, _)
+        | EExpr::Assume(_, e, _)
+        | EExpr::Field(_, e, _, _)
+        | EExpr::NamedPair(_, _, e, _) => validate_set_comprehension_expr(e, errors),
+        EExpr::IfElse(cond, then_e, else_e, _) => {
+            validate_set_comprehension_expr(cond, errors);
+            validate_set_comprehension_expr(then_e, errors);
+            if let Some(e) = else_e {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EExpr::Match(scrutinee, arms, _) => {
+            validate_set_comprehension_expr(scrutinee, errors);
+            for (_, guard, body) in arms {
+                if let Some(g) = guard {
+                    validate_set_comprehension_expr(g, errors);
+                }
+                validate_set_comprehension_expr(body, errors);
+            }
+        }
+        EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
+            for (_, e) in fields {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EExpr::Block(exprs, _) => {
+            for e in exprs {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EExpr::Aggregate(_, _, _, _, body, filter, _) => {
+            validate_set_comprehension_expr(body, errors);
+            if let Some(f) = filter {
+                validate_set_comprehension_expr(f, errors);
+            }
+        }
+        EExpr::While(cond, _, body, _) => {
+            validate_set_comprehension_expr(cond, errors);
+            validate_set_comprehension_expr(body, errors);
+        }
+        EExpr::VarDecl(_, _, init, rest, _) => {
+            validate_set_comprehension_expr(init, errors);
+            validate_set_comprehension_expr(rest, errors);
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            validate_set_comprehension_expr(projection, errors);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    validate_set_comprehension_expr(source, errors);
+                }
+            }
+            validate_set_comprehension_expr(filter, errors);
+        }
+        EExpr::MapUpdate(_, map, key, val, _) => {
+            validate_set_comprehension_expr(map, errors);
+            validate_set_comprehension_expr(key, errors);
+            validate_set_comprehension_expr(val, errors);
+        }
+        EExpr::Choose(_, _, _, predicate, _) => {
+            if let Some(predicate) = predicate {
+                validate_set_comprehension_expr(predicate, errors);
+            }
+        }
+        EExpr::Saw(_, _, _, args, _) => {
+            for e in args.iter().flatten() {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for a in args {
+                validate_set_comprehension_expr(a, errors);
+            }
+        }
+        EExpr::TupleLit(_, elems, _) | EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) => {
+            for e in elems {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EExpr::MapLit(_, pairs, _) => {
+            for (k, v) in pairs {
+                validate_set_comprehension_expr(k, errors);
+                validate_set_comprehension_expr(v, errors);
+            }
+        }
+        EExpr::Lit(..)
+        | EExpr::Var(..)
+        | EExpr::Qual(..)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_)
+        | EExpr::Unresolved(..) => {}
+    }
+}
+
+fn validate_set_comprehension_event_action(item: &EEventAction, errors: &mut Vec<ElabError>) {
+    match item {
+        EEventAction::Choose(_, _, guard, body) => {
+            validate_set_comprehension_expr(guard, errors);
+            for b in body {
+                validate_set_comprehension_event_action(b, errors);
+            }
+        }
+        EEventAction::ForAll(_, _, body) => {
+            for b in body {
+                validate_set_comprehension_event_action(b, errors);
+            }
+        }
+        EEventAction::Create(_, _, fields) => {
+            for (_, e) in fields {
+                validate_set_comprehension_expr(e, errors);
+            }
+        }
+        EEventAction::CrossCall(_, _, args) | EEventAction::LetCrossCall(_, _, _, args) => {
+            for a in args {
+                validate_set_comprehension_expr(a, errors);
+            }
+        }
+        EEventAction::Match(scrutinee, arms) => {
+            if let super::super::types::EMatchScrutinee::CrossCall(_, _, args) = scrutinee {
+                for a in args {
+                    validate_set_comprehension_expr(a, errors);
+                }
+            }
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    validate_set_comprehension_expr(guard, errors);
+                }
+                for item in &arm.body {
+                    validate_set_comprehension_event_action(item, errors);
+                }
+            }
+        }
+        EEventAction::Apply(target, _, refs, args) => {
+            validate_set_comprehension_expr(target, errors);
+            for r in refs {
+                validate_set_comprehension_expr(r, errors);
+            }
+            for a in args {
+                validate_set_comprehension_expr(a, errors);
+            }
+        }
+        EEventAction::Expr(e) => validate_set_comprehension_expr(e, errors),
+    }
+}
+
+fn validate_set_comprehension_field_default(default: &EFieldDefault, errors: &mut Vec<ElabError>) {
+    match default {
+        EFieldDefault::Value(expr) | EFieldDefault::Where(expr) => {
+            validate_set_comprehension_expr(expr, errors);
+        }
+        EFieldDefault::In(values) => {
+            for value in values {
+                validate_set_comprehension_expr(value, errors);
+            }
+        }
+    }
+}
+
+fn is_real_domain(ty: &Ty) -> bool {
+    match ty {
+        Ty::Builtin(BuiltinTy::Real) => true,
+        Ty::Alias(_, inner) | Ty::Refinement(inner, _) => is_real_domain(inner),
+        _ => false,
     }
 }
 
@@ -738,9 +1093,12 @@ pub(super) fn collect_ty_params_in_expr(expr: &EExpr, out: &mut Vec<(String, Vec
             collect_ty_params_in_expr(cond, out);
             collect_ty_params_in_expr(body, out);
         }
-        EExpr::SetComp(_, expr, _, _, body, _) => {
+        EExpr::SetComp(_, expr, _, _, source, body, _) => {
             if let Some(e) = expr {
                 collect_ty_params_in_expr(e, out);
+            }
+            if let Some(source) = source {
+                collect_ty_params_in_expr(source, out);
             }
             collect_ty_params_in_expr(body, out);
         }

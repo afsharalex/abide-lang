@@ -4631,6 +4631,7 @@ pub(super) fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExp
         IRExpr::SetComp {
             var,
             domain,
+            source,
             filter,
             projection,
             ty,
@@ -4638,6 +4639,9 @@ pub(super) fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExp
         } => IRExpr::SetComp {
             var: var.clone(),
             domain: domain.clone(),
+            source: source
+                .as_ref()
+                .map(|source| Box::new(expand_through_defs(source, defs))),
             filter: Box::new(expand_through_defs(filter, defs)),
             projection: projection
                 .as_ref()

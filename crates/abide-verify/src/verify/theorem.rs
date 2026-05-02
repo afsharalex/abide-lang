@@ -1741,6 +1741,7 @@ mod tests {
         assert_needs(IRExpr::SetComp {
             var: "x".to_owned(),
             domain: IRType::Int,
+            source: None,
             filter: Box::new(bool_lit(true)),
             projection: Some(Box::new(choose)),
             ty: IRType::Set {

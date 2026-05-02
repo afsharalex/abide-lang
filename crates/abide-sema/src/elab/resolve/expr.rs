@@ -93,6 +93,37 @@ fn relation_type_from_projection(projection: &EExpr) -> Ty {
     }
 }
 
+fn set_source_element_type(source_ty: &Ty) -> Ty {
+    match source_ty {
+        Ty::Set(element) | Ty::Seq(element) => element.as_ref().clone(),
+        Ty::Map(key, value) => Ty::Tuple(vec![key.as_ref().clone(), value.as_ref().clone()]),
+        Ty::Store(entity) => Ty::Entity(entity.clone()),
+        _ => Ty::Error,
+    }
+}
+
+fn infer_numeric_binop_type(op: crate::elab::types::BinOp, left: &Ty, right: &Ty) -> Option<Ty> {
+    use crate::elab::types::BinOp;
+    use crate::elab::types::BuiltinTy::{Float, Int, Real};
+
+    if !matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    ) {
+        return None;
+    }
+    match (left, right) {
+        (Ty::Builtin(Float), Ty::Builtin(_)) | (Ty::Builtin(_), Ty::Builtin(Float)) => {
+            Some(Ty::Builtin(Float))
+        }
+        (Ty::Builtin(Real), Ty::Builtin(Int | Real)) | (Ty::Builtin(Int), Ty::Builtin(Real)) => {
+            Some(Ty::Builtin(Real))
+        }
+        (Ty::Builtin(Int), Ty::Builtin(Int)) => Some(Ty::Builtin(Int)),
+        _ => None,
+    }
+}
+
 fn ty_same(left: &Ty, right: &Ty) -> bool {
     match (left, right) {
         (Ty::Builtin(left), Ty::Builtin(right)) => left == right,
@@ -290,6 +321,9 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
             let resolved_left = resolve_expr(ctx, bound, a);
             let resolved_right = resolve_expr(ctx, bound, b);
             let resolved_ty = infer_relation_set_op_type(*op, &resolved_left, &resolved_right)
+                .or_else(|| {
+                    infer_numeric_binop_type(*op, &resolved_left.ty(), &resolved_right.ty())
+                })
                 .unwrap_or_else(|| ty.clone());
             EExpr::BinOp(
                 resolved_ty,
@@ -527,16 +561,35 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 .collect();
             EExpr::Match(Box::new(resolved_scrut), resolved_arms, *sp)
         }
-        EExpr::SetComp(ty, proj, var, vty, filter, sp) => {
-            let resolved_vty = ctx.resolve_ty(vty);
+        EExpr::SetComp(_ty, proj, var, vty, source, filter, sp) => {
+            let resolved_source = source
+                .as_ref()
+                .map(|source| Box::new(resolve_expr(ctx, bound, source)));
+            let explicit_vty = ctx.resolve_ty(vty);
+            let resolved_vty = if matches!(explicit_vty, Ty::Error) {
+                resolved_source
+                    .as_deref()
+                    .map(EExpr::ty)
+                    .map(|ty| set_source_element_type(&ty))
+                    .unwrap_or(Ty::Error)
+            } else {
+                explicit_vty
+            };
             let mut inner_bound = bound.clone();
             inner_bound.insert(var.clone(), resolved_vty.clone());
+            let resolved_proj = proj
+                .as_ref()
+                .map(|p| Box::new(resolve_expr(ctx, &inner_bound, p)));
+            let element_ty = resolved_proj
+                .as_deref()
+                .map(EExpr::ty)
+                .unwrap_or_else(|| resolved_vty.clone());
             EExpr::SetComp(
-                ty.clone(),
-                proj.as_ref()
-                    .map(|p| Box::new(resolve_expr(ctx, &inner_bound, p))),
+                Ty::Set(Box::new(element_ty)),
+                resolved_proj,
                 var.clone(),
                 resolved_vty,
+                resolved_source,
                 Box::new(resolve_expr(ctx, &inner_bound, filter)),
                 *sp,
             )

@@ -1226,6 +1226,7 @@ mod tests {
                 body: IRExpr::SetComp {
                     var: "v".to_owned(),
                     domain: IRType::Bool,
+                    source: None,
                     filter: Box::new(IRExpr::Saw {
                         system_name: "Body".to_owned(),
                         event_name: "hit".to_owned(),

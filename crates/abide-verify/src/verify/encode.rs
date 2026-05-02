@@ -701,6 +701,7 @@ pub(super) fn encode_pure_expr_inner(
         IRExpr::SetComp {
             var,
             domain,
+            source,
             filter,
             projection,
             ..
@@ -720,10 +721,46 @@ pub(super) fn encode_pure_expr_inner(
                 domain, &bound_var, &inner_env, vctx, defs, precheck,
             )?;
 
- // Combine filter with domain predicate: domain_pred ∧ filter
-            let restricted_filter = match domain_pred {
-                Some(dp) => smt::bool_and(&[&dp, &filter_bool]),
-                None => filter_bool,
+            let source_pred = if let Some(source) = source {
+                match expr_type(source) {
+                    Some(IRType::Set { .. }) => {
+                        let source_val =
+                            encode_pure_expr_inner(source, env, vctx, defs, precheck)?;
+                        let source_arr = source_val.as_array()?;
+                        let selected = source_arr.select(&bound_var.to_dynamic());
+                        Some(
+                            smt::dynamic_to_typed_value(selected, &IRType::Bool).to_bool()?,
+                        )
+                    }
+                    Some(other) => {
+                        return Err(format!(
+                            "sourced set comprehension verification currently supports Set sources, got {other:?}"
+                        ));
+                    }
+                    None => {
+                        return Err(
+                            "sourced set comprehension verification requires a typed source"
+                                .to_owned(),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Combine filter with domain/source predicates.
+            let mut restrictions = vec![filter_bool];
+            if let Some(dp) = domain_pred {
+                restrictions.push(dp);
+            }
+            if let Some(sp) = source_pred {
+                restrictions.push(sp);
+            }
+            let restriction_refs = restrictions.iter().collect::<Vec<_>>();
+            let restricted_filter = if restriction_refs.len() == 1 {
+                restrictions[0].clone()
+            } else {
+                smt::bool_and(&restriction_refs)
             };
 
             if let Some(proj) = projection {

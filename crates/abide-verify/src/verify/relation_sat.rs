@@ -579,7 +579,10 @@ pub(super) enum StaticRelationOutcome {
 pub(super) fn try_check_static_relation_assertions(
     assertions: &[IRExpr],
 ) -> Option<Result<StaticRelationOutcome, String>> {
-    if assertions.is_empty() || !assertions.iter().any(contains_relation_surface) {
+    if assertions.is_empty()
+        || !assertions.iter().any(contains_relation_surface)
+        || assertions.iter().any(contains_set_comprehension)
+    {
         return None;
     }
     Some(check_static_relation_assertions(assertions))
@@ -1333,6 +1336,24 @@ fn contains_relation_surface(expr: &IRExpr) -> bool {
         | IRExpr::Assert { expr, .. }
         | IRExpr::Assume { expr, .. }
         | IRExpr::Prime { expr, .. } => contains_relation_surface(expr),
+        _ => false,
+    }
+}
+
+fn contains_set_comprehension(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::SetComp { .. } => true,
+        IRExpr::BinOp { left, right, .. } => {
+            contains_set_comprehension(left) || contains_set_comprehension(right)
+        }
+        IRExpr::UnOp { operand, .. }
+        | IRExpr::Card { expr: operand, .. }
+        | IRExpr::Assert { expr: operand, .. }
+        | IRExpr::Assume { expr: operand, .. }
+        | IRExpr::Prime { expr: operand, .. } => contains_set_comprehension(operand),
+        IRExpr::App { func, arg, .. } => {
+            contains_set_comprehension(func) || contains_set_comprehension(arg)
+        }
         _ => false,
     }
 }

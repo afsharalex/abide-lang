@@ -169,9 +169,12 @@ pub(super) fn check_match_exhaustiveness(
             check_match_exhaustiveness(m, types, entities, errors);
             check_match_exhaustiveness(k, types, entities, errors);
         }
-        EExpr::SetComp(_, proj, _, _, filter, _) => {
+        EExpr::SetComp(_, proj, _, _, source, filter, _) => {
             if let Some(p) = proj {
                 check_match_exhaustiveness(p, types, entities, errors);
+            }
+            if let Some(source) = source {
+                check_match_exhaustiveness(source, types, entities, errors);
             }
             check_match_exhaustiveness(filter, types, entities, errors);
         }

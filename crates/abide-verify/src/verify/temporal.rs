@@ -944,8 +944,17 @@ pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
         } => contains_liveness(map) || contains_liveness(key) || contains_liveness(value),
         IRExpr::Index { map, key, .. } => contains_liveness(map) || contains_liveness(key),
         IRExpr::SetComp {
-            filter, projection, ..
-        } => contains_liveness(filter) || projection.as_ref().is_some_and(|p| contains_liveness(p)),
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            source
+                .as_ref()
+                .is_some_and(|source| contains_liveness(source))
+                || contains_liveness(filter)
+                || projection.as_ref().is_some_and(|p| contains_liveness(p))
+        }
         IRExpr::RelComp {
             projection,
             bindings,
@@ -1048,8 +1057,17 @@ pub(super) fn contains_temporal(expr: &IRExpr) -> bool {
         } => contains_temporal(map) || contains_temporal(key) || contains_temporal(value),
         IRExpr::Index { map, key, .. } => contains_temporal(map) || contains_temporal(key),
         IRExpr::SetComp {
-            filter, projection, ..
-        } => contains_temporal(filter) || projection.as_ref().is_some_and(|p| contains_temporal(p)),
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            source
+                .as_ref()
+                .is_some_and(|source| contains_temporal(source))
+                || contains_temporal(filter)
+                || projection.as_ref().is_some_and(|p| contains_temporal(p))
+        }
         IRExpr::RelComp {
             projection,
             bindings,
@@ -1149,9 +1167,16 @@ pub(super) fn contains_past_time(expr: &IRExpr) -> bool {
         } => contains_past_time(map) || contains_past_time(key) || contains_past_time(value),
         IRExpr::Index { map, key, .. } => contains_past_time(map) || contains_past_time(key),
         IRExpr::SetComp {
-            filter, projection, ..
+            source,
+            filter,
+            projection,
+            ..
         } => {
-            contains_past_time(filter) || projection.as_ref().is_some_and(|p| contains_past_time(p))
+            source
+                .as_ref()
+                .is_some_and(|source| contains_past_time(source))
+                || contains_past_time(filter)
+                || projection.as_ref().is_some_and(|p| contains_past_time(p))
         }
         IRExpr::RelComp {
             projection,

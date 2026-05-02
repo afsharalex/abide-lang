@@ -25,7 +25,7 @@ use assumptions::{resolve_assumption_sets, resolve_by_lemmas_subset_containment}
 mod validate;
 use validate::{
     validate_aggregate_bodies, validate_remaining_type_params, validate_saw_expressions,
-    validate_unresolved_types,
+    validate_set_comprehension_sources, validate_unresolved_types,
 };
 
 /// Immutable context for expression resolution, cloned once from Env.
@@ -140,6 +140,9 @@ pub fn resolve(env: &mut Env) {
     // validate aggregate body types —
     // count body must be bool, sum/product/min/max body must be numeric.
     validate_aggregate_bodies(env);
+
+    // validate source-less set comprehensions over non-enumerable domains.
+    validate_set_comprehension_sources(env);
 
     // catch any Ty::Param that survived resolution — wrong-arity
     // generics or non-generic types used with type args in expression-level
@@ -922,7 +925,7 @@ fn substitute_expr(expr: &EExpr, bindings: &HashMap<String, String>) -> EExpr {
             Box::new(substitute_expr(key, bindings)),
             *span,
         ),
-        EExpr::SetComp(ty, body, var, domain_ty, pred, span) => EExpr::SetComp(
+        EExpr::SetComp(ty, body, var, domain_ty, source, pred, span) => EExpr::SetComp(
             ty.clone(),
             body.as_ref().map(|expr| {
                 Box::new(substitute_expr(
@@ -932,6 +935,9 @@ fn substitute_expr(expr: &EExpr, bindings: &HashMap<String, String>) -> EExpr {
             }),
             var.clone(),
             domain_ty.clone(),
+            source
+                .as_ref()
+                .map(|expr| Box::new(substitute_expr(expr, bindings))),
             Box::new(substitute_expr(
                 pred,
                 &bindings_without(bindings, &[var.as_str()]),
@@ -2813,6 +2819,97 @@ mod tests {
                 Ty::Builtin(crate::elab::types::BuiltinTy::Int),
                 Ty::Builtin(crate::elab::types::BuiltinTy::String),
             ]
+        ));
+    }
+
+    #[test]
+    fn set_comprehension_infers_binder_type_from_set_source() {
+        let env = elaborate_src("const doubled = { x * 2 | x in Set(1, 2, 3) where x > 0 }");
+
+        let body = &env.consts.get("doubled").expect("doubled const").body;
+        let EExpr::SetComp(ty, projection, var, domain, source, _, _) = body else {
+            panic!("expected sourced set comprehension, got {body:?}");
+        };
+        assert_eq!(var, "x");
+        assert!(source.is_some());
+        assert!(matches!(
+            domain,
+            Ty::Builtin(crate::elab::types::BuiltinTy::Int)
+        ));
+        assert!(matches!(
+            projection.as_deref().map(EExpr::ty),
+            Some(Ty::Builtin(crate::elab::types::BuiltinTy::Int))
+        ));
+        assert!(matches!(
+            ty,
+            Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(crate::elab::types::BuiltinTy::Int))
+        ));
+    }
+
+    #[test]
+    fn set_comprehension_infers_binder_type_from_seq_source() {
+        let env = elaborate_src("const positive = { x | x in Seq(1.0, 2.0) where x > 0.0 }");
+
+        let body = &env.consts.get("positive").expect("positive const").body;
+        let EExpr::SetComp(ty, projection, var, domain, source, _, _) = body else {
+            panic!("expected sourced set comprehension, got {body:?}");
+        };
+        assert_eq!(var, "x");
+        assert!(source.is_some());
+        assert!(matches!(
+            domain,
+            Ty::Builtin(crate::elab::types::BuiltinTy::Real)
+        ));
+        assert!(matches!(
+            projection.as_deref().map(EExpr::ty),
+            Some(Ty::Builtin(crate::elab::types::BuiltinTy::Real))
+        ));
+        assert!(matches!(
+            ty,
+            Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(crate::elab::types::BuiltinTy::Real))
+        ));
+    }
+
+    #[test]
+    fn set_comprehension_over_real_domain_requires_finite_source() {
+        let (_result, errors) =
+            elaborate_all("const bad = { x | x: real where x >= 0.0 and x <= 1.0 }");
+
+        assert!(
+            errors.iter().any(|error| {
+                error.message.contains("set comprehension")
+                    && error.message.contains("real")
+                    && error.message.contains("finite source")
+                    && error
+                        .help
+                        .as_deref()
+                        .is_some_and(|help| help.contains("Set(") && help.contains("real intervals"))
+            }),
+            "real set comprehensions should explain that real intervals are not enumerable: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn set_comprehension_over_finite_real_source_is_allowed() {
+        let env = elaborate_src("const good = { x | x in Set(0.0, 0.5, 1.0) where x >= 0.5 }");
+
+        assert!(
+            env.errors.is_empty(),
+            "finite real source should not produce elaboration errors: {:?}",
+            env.errors
+        );
+        let body = &env.consts.get("good").expect("good const").body;
+        let EExpr::SetComp(ty, _, _, domain, source, _, _) = body else {
+            panic!("expected sourced set comprehension, got {body:?}");
+        };
+        assert!(source.is_some());
+        assert!(matches!(
+            domain,
+            Ty::Builtin(crate::elab::types::BuiltinTy::Real)
+        ));
+        assert!(matches!(
+            ty,
+            Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(crate::elab::types::BuiltinTy::Real))
         ));
     }
 

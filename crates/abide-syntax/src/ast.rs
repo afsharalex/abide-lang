@@ -1138,11 +1138,13 @@ pub enum ExprKind {
     MapUpdate(Box<Expr>, Box<Expr>, Box<Expr>),
     /// Index access: m[k] — reads from map/seq
     Index(Box<Expr>, Box<Expr>),
-    /// Set comprehension: { expr | var: Type where filter } or { var: Type where filter }
+    /// Set comprehension: `{ expr | var: Type in source where filter }`
+    /// or `{ var in source where filter }`.
     SetComp {
         projection: Option<Box<Expr>>,
         var: String,
-        domain: TypeRef,
+        domain: Option<TypeRef>,
+        source: Option<Box<Expr>>,
         filter: Box<Expr>,
     },
     /// Relation comprehension:
