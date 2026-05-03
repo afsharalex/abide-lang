@@ -278,7 +278,7 @@ pub const PRECHECK_UNRESOLVED_FN: &str =
 pub const TIERED_LIVENESS_SKIP: &str = "induction not applicable (liveness)";
 
 /// Tiered dispatch: induction failed with IC3 skipped.
-pub const TIERED_NO_IC3: &str = "induction failed (IC3 skipped via --no-ic3)";
+pub const TIERED_NO_IC3: &str = "induction failed (IC3/PDR not enabled for this verify block)";
 
 /// Tiered dispatch: both induction and IC3 failed.
 pub const TIERED_BOTH_FAILED: &str = "induction and IC3 failed";

@@ -11772,7 +11772,10 @@ fn ic3_proves_property_induction_cannot() {
         scenes: vec![],
     };
 
-    let config = VerifyConfig::default();
+    let config = VerifyConfig {
+        no_ic3: false,
+        ..VerifyConfig::default()
+    };
     let results = verify_all(&ir, &config);
 
     // We expect:
@@ -11810,7 +11813,7 @@ fn ic3_proves_property_induction_cannot() {
 fn no_ic3_flag_skips_ic3_verify_falls_to_bmc() {
     require_unbounded_proof_tests!();
 
-    // Same IR as ic3_proves_property_induction_cannot, but with --no-ic3.
+    // Same IR as ic3_proves_property_induction_cannot, but with verify IC3 disabled.
     // Verify block: induction fails, IC3 skipped, falls to BMC → CHECKED.
     let ir = make_two_counter_ir();
     let config = VerifyConfig {
@@ -11823,14 +11826,14 @@ fn no_ic3_flag_skips_ic3_verify_falls_to_bmc() {
     // Verify block: BMC fallback (CHECKED)
     assert!(
         matches!(&results[0], VerificationResult::Checked { .. }),
-        "expected CHECKED with --no-ic3, got: {}",
+        "expected CHECKED with verify IC3 disabled, got: {}",
         results[0]
     );
 
-    // Theorem: IC3 skipped, induction fails → UNPROVABLE
+    // Theorem: proof-oriented path still tries IC3 by default.
     assert!(
-        matches!(&results[1], VerificationResult::Unprovable { .. }),
-        "expected UNPROVABLE with --no-ic3, got: {}",
+        matches!(&results[1], VerificationResult::Proved { method, .. } if method == "IC3/PDR"),
+        "expected theorem to still prove with IC3/PDR, got: {}",
         results[1]
     );
 }
@@ -11866,7 +11869,7 @@ fn bounded_only_skips_theorem_proving() {
 fn unbounded_only_no_ic3_gives_accurate_hint() {
     require_unbounded_proof_tests!();
 
-    // --unbounded-only + --no-ic3: hint should say IC3 was skipped.
+    // --unbounded-only with verify IC3 disabled: hint should say IC3 was not enabled.
     let ir = make_two_counter_ir();
     let config = VerifyConfig {
         unbounded_only: true,
@@ -11879,8 +11882,8 @@ fn unbounded_only_no_ic3_gives_accurate_hint() {
     let verify_result = &results[0];
     assert!(
         matches!(verify_result, VerificationResult::Unprovable { hint, .. }
-            if hint.contains("--no-ic3")),
-        "expected UNPROVABLE mentioning --no-ic3, got: {verify_result}"
+            if hint.contains("IC3/PDR not enabled")),
+        "expected UNPROVABLE mentioning IC3/PDR was not enabled, got: {verify_result}"
     );
 }
 

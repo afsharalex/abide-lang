@@ -954,7 +954,10 @@ pub struct VerifyConfig {
     pub prop_bmc_depth: usize,
     /// Timeout for IC3/PDR attempts, in milliseconds.
     pub ic3_timeout_ms: u64,
-    /// Skip IC3/PDR verification (for speed).
+    /// Skip IC3/PDR for ordinary verify blocks.
+    ///
+    /// Theorems remain proof-oriented and may use IC3 unless a theorem-specific
+    /// strategy gate is added. Scene and run/simulate paths do not use IC3.
     pub no_ic3: bool,
     /// Skip automatic prop verification.
     pub no_prop_verify: bool,
@@ -982,7 +985,7 @@ impl Default for VerifyConfig {
             overall_timeout_ms: 1_200_000,
             prop_bmc_depth: 10,
             ic3_timeout_ms: 1_200_000,
-            no_ic3: false,
+            no_ic3: true,
             no_prop_verify: false,
             no_fn_verify: false,
             progress: false,
@@ -2465,7 +2468,8 @@ fn check_verify_block_tiered(
         // Induction failed or timed out — try IC3
     }
 
-    // Tier 1b: Try IC3/PDR (unless bounded-only, no-ic3, or liveness)
+    // Tier 1b: Try IC3/PDR for ordinary verify blocks only when explicitly
+    // enabled (unless bounded-only or liveness).
     if !config.bounded_only && !config.no_ic3 && !has_liveness {
         let Some(ic3_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {

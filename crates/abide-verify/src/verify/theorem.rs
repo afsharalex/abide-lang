@@ -173,7 +173,7 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
 /// **IC3/PDR** is tried first — it automatically discovers strengthening
 /// invariants, proving properties that aren't directly 1-inductive.
 ///
-/// If IC3 fails or is skipped (`--no-ic3`), falls back to staged
+/// If IC3 fails, falls back to staged
 /// 1-induction with user-provided invariants:
 ///
 /// 0. Invariant base: I holds at step 0
@@ -1074,10 +1074,6 @@ fn try_ic3_on_theorem(
     config: &VerifyConfig,
     deadline: Option<Instant>,
 ) -> Option<VerificationResult> {
-    if config.no_ic3 {
-        return None;
-    }
-
     let start = Instant::now();
 
     let Some(safety) =

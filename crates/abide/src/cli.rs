@@ -142,9 +142,9 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
         ic3_timeout: u64,
 
-        /// Skip IC3/PDR verification (for speed)
+        /// Opt ordinary verify blocks into IC3/PDR proof search
         #[arg(long)]
-        no_ic3: bool,
+        ic3: bool,
 
         /// Skip automatic prop verification
         #[arg(long)]
@@ -392,7 +392,7 @@ pub fn run() -> miette::Result<()> {
             induction_timeout,
             bmc_timeout,
             ic3_timeout,
-            no_ic3,
+            ic3,
             no_prop_verify,
             no_fn_verify,
             progress,
@@ -459,6 +459,7 @@ pub fn run() -> miette::Result<()> {
                 .transpose()
                 .map_err(|err| miette::miette!("{err}"))?;
 
+            let no_ic3 = !ic3;
             let config = crate::verify::VerifyConfig {
                 solver_selection,
                 chc_selection,

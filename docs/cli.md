@@ -76,7 +76,7 @@ Selected flags:
 - `--induction-timeout <secs>`
 - `--bmc-timeout <secs>`
 - `--ic3-timeout <secs>`
-- `--no-ic3`
+- `--ic3`
 - `--no-prop-verify`
 - `--no-fn-verify`
 - `--no-relational-symmetry-breaking`
