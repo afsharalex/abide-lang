@@ -6256,6 +6256,40 @@ theorem t for Sys {
 }
 
 #[test]
+fn unit_enum_match_patterns_use_bare_constructor_syntax() {
+    let src = r"module T
+
+enum Status = A | B
+
+fn bare(s: Status): bool = match s { A => true B => false }
+";
+
+    let (_result, errors) = elab_with_errors(src);
+    assert!(
+        errors.is_empty(),
+        "unit constructor patterns should use bare variant syntax, got: {errors:?}"
+    );
+}
+
+#[test]
+fn unit_enum_match_patterns_reject_empty_braces() {
+    let src = r"module T
+
+enum Status = A | B
+
+fn braced(s: Status): bool = match s { A {} => true B {} => false }
+";
+
+    let (_result, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|error| error
+            .message
+            .contains("unit constructor pattern `A {}` should be written `A`")),
+        "expected unit constructor empty-brace diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
 fn verifier_supports_pure_let_and_match_in_scene() {
     let src = r"module T
 
@@ -14412,6 +14446,50 @@ verify submit_matches_crosscall {
                 if name == "submit_matches_crosscall"
         )),
         "macro-action direct match verify should succeed, got: {results:?}"
+    );
+}
+
+#[test]
+fn macro_step_direct_match_rejects_empty_brace_unit_patterns() {
+    let src = r"module T
+
+enum Outcome = ok | err
+
+entity Marker {
+  id: int = 0
+}
+
+system Provider {
+  command charge() -> Outcome { return @ok }
+}
+
+system Billing(markers: Store<Marker>) {
+  charged: bool = false
+
+  command submit() {
+    match Provider::charge() {
+      ok {} => { charged' = true }
+      err {} => { charged' = false }
+    }
+  }
+}
+
+verify submit_matches_empty_brace_unit_patterns {
+  assume {
+    store ms: Marker[0..1]
+    let billing = Billing { markers: ms }
+    stutter
+  }
+  assert always true
+}
+";
+
+    let (_result, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|error| error
+            .message
+            .contains("unit constructor pattern `ok {}` should be written `ok`")),
+        "expected unit constructor empty-brace diagnostic in action match, got: {errors:?}"
     );
 }
 

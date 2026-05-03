@@ -7,6 +7,7 @@ use super::super::error::{ElabError, ErrorKind};
 use super::super::types::{
     EEventAction, EExpr, EExtern, EExternAssume, EMatchScrutinee, EProcDepCond, ESystem, Ty,
 };
+use super::matches::{check_pattern_shape, resolve_to_enum_info};
 
 pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     let mut errors = Vec::new();
@@ -305,6 +306,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
             &step.body,
             &mut errors,
             step.span.or(system.span),
+            &mut HashMap::new(),
         );
     }
 
@@ -942,10 +944,12 @@ fn validate_crosscalls_in_actions(
     actions: &[EEventAction],
     errors: &mut Vec<ElabError>,
     fallback_span: Option<crate::span::Span>,
+    local_return_types: &mut HashMap<String, Ty>,
 ) {
     for action in actions {
         match action {
             EEventAction::Choose(_, _, _, body) | EEventAction::ForAll(_, _, body) => {
+                let mut scoped_return_types = local_return_types.clone();
                 validate_crosscalls_in_actions(
                     env,
                     system_name,
@@ -954,9 +958,10 @@ fn validate_crosscalls_in_actions(
                     body,
                     errors,
                     fallback_span,
+                    &mut scoped_return_types,
                 );
             }
-            EEventAction::LetCrossCall(_, target, command, args) => {
+            EEventAction::LetCrossCall(name, target, command, args) => {
                 validate_crosscall_target(
                     env,
                     system_name,
@@ -968,6 +973,9 @@ fn validate_crosscalls_in_actions(
                     errors,
                     fallback_span,
                 );
+                if let Some(return_type) = command_return_type(env, target, command) {
+                    local_return_types.insert(name.clone(), return_type.clone());
+                }
             }
             EEventAction::CrossCall(target, command, args) => {
                 validate_crosscall_target(
@@ -983,6 +991,26 @@ fn validate_crosscalls_in_actions(
                 );
             }
             EEventAction::Match(scrutinee, arms) => {
+                let scrutinee_ty = match scrutinee {
+                    EMatchScrutinee::Var(name) => local_return_types.get(name),
+                    EMatchScrutinee::CrossCall(target, command, _) => {
+                        command_return_type(env, target, command)
+                    }
+                };
+                if let Some(ty) = scrutinee_ty {
+                    if let Some((enum_name, constructors)) = resolve_to_enum_info(ty, &env.types) {
+                        for arm in arms {
+                            check_pattern_shape(
+                                &arm.pattern,
+                                enum_name,
+                                constructors,
+                                &env.variant_fields,
+                                fallback_span.unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                                errors,
+                            );
+                        }
+                    }
+                }
                 if let EMatchScrutinee::CrossCall(target, command, args) = scrutinee {
                     validate_crosscall_target(
                         env,
@@ -997,6 +1025,7 @@ fn validate_crosscalls_in_actions(
                     );
                 }
                 for arm in arms {
+                    let mut scoped_return_types = local_return_types.clone();
                     validate_crosscalls_in_actions(
                         env,
                         system_name,
@@ -1005,6 +1034,7 @@ fn validate_crosscalls_in_actions(
                         &arm.body,
                         errors,
                         fallback_span,
+                        &mut scoped_return_types,
                     );
                 }
             }
@@ -1013,6 +1043,22 @@ fn validate_crosscalls_in_actions(
             | EEventAction::Expr(_) => {}
         }
     }
+}
+
+fn command_return_type<'a>(env: &'a Env, target: &str, command: &str) -> Option<&'a Ty> {
+    if let Some(system) = env.systems.get(target) {
+        return system
+            .commands
+            .iter()
+            .find(|candidate| candidate.name == command)
+            .and_then(|candidate| candidate.return_type.as_ref());
+    }
+    env.externs.get(target).and_then(|ext| {
+        ext.commands
+            .iter()
+            .find(|candidate| candidate.name == command)
+            .and_then(|candidate| candidate.return_type.as_ref())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

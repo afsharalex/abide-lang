@@ -245,7 +245,9 @@ struct RelationalSystemStepSpec {
 #[derive(Debug, Clone)]
 struct RelationalEntitySpec {
     slot_count: usize,
+    initial_lower_bound: usize,
     defaults: HashMap<String, SimpleValue>,
+    field_domains: HashMap<String, Vec<SimpleValue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,8 +530,13 @@ fn build_stateful_scene_sat(
             .map(|_| sat.new_lit())
             .collect::<Vec<_>>()];
 
-        let mut field_domains =
-            collect_field_domains(&entity_spec.defaults, &all_steps, &[], entity_name);
+        let mut field_domains = collect_field_domains(
+            &entity_spec.defaults,
+            &entity_spec.field_domains,
+            &all_steps,
+            &[],
+            entity_name,
+        );
         for given in &givens {
             if given.entity == *entity_name {
                 collect_pred_values(&given.predicate, &mut field_domains);
@@ -677,11 +684,23 @@ impl<'a> RelationalVerifyObligation<'a> {
         let mut entity_states = HashMap::new();
         for (entity_name, entity_spec) in &entities {
             let mut active_by_state = Vec::with_capacity(bound + 1);
-            active_by_state.push(
-                (0..entity_spec.slot_count)
-                    .map(|_| const_lit(&mut sat, false))
-                    .collect::<Vec<_>>(),
-            );
+            if entity_spec.initial_lower_bound == 0 {
+                active_by_state.push(
+                    (0..entity_spec.slot_count)
+                        .map(|_| const_lit(&mut sat, false))
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                active_by_state.push(
+                    (0..entity_spec.slot_count)
+                        .map(|_| sat.new_lit())
+                        .collect::<Vec<_>>(),
+                );
+                sat.add_card_constr(CardConstraint::new_lb(
+                    active_by_state[0].clone(),
+                    entity_spec.initial_lower_bound,
+                ));
+            }
             for _ in 0..bound {
                 active_by_state.push(
                     (0..entity_spec.slot_count)
@@ -689,8 +708,13 @@ impl<'a> RelationalVerifyObligation<'a> {
                         .collect::<Vec<_>>(),
                 );
             }
-            let field_domains =
-                collect_field_domains(&entity_spec.defaults, &steps, &assertions, entity_name);
+            let field_domains = collect_field_domains(
+                &entity_spec.defaults,
+                &entity_spec.field_domains,
+                &steps,
+                &assertions,
+                entity_name,
+            );
             let field_encodings = build_field_encodings(
                 &mut sat,
                 &entity_spec.defaults,
@@ -1020,7 +1044,9 @@ fn relational_stateful_scene_spec(
             store.entity_type.clone(),
             RelationalEntitySpec {
                 slot_count: usize::try_from(store.hi.max(1)).unwrap_or(1),
+                initial_lower_bound: 0,
                 defaults,
+                field_domains: finite_field_domains(entity_ir),
             },
         );
     }
@@ -1933,7 +1959,7 @@ fn relational_verify_spec(
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     let mut entities = HashMap::new();
     for store in &verify.stores {
-        if store.lo > 0 || store.hi <= 0 {
+        if store.hi <= 0 || store.lo > store.hi || entities.contains_key(&store.entity_type) {
             return Ok(None);
         }
         if !system
@@ -1953,7 +1979,9 @@ fn relational_verify_spec(
             store.entity_type.clone(),
             RelationalEntitySpec {
                 slot_count: usize::try_from(store.hi.max(1)).unwrap_or(1),
+                initial_lower_bound: usize::try_from(store.lo).unwrap_or(0),
                 defaults,
+                field_domains: finite_field_domains(entity_ir),
             },
         );
     }
@@ -1965,10 +1993,6 @@ fn relational_verify_spec(
         };
         steps.push(spec);
     }
-    if steps.is_empty() {
-        return Ok(None);
-    }
-
     let entity_names: Vec<_> = entities.keys().cloned().collect();
     let mut assertions = Vec::with_capacity(verify.asserts.len());
     for assertion in &verify.asserts {
@@ -1994,15 +2018,38 @@ fn build_default_field_map(
 ) -> Result<Option<HashMap<String, SimpleValue>>, String> {
     let mut out = HashMap::new();
     for field in &entity.fields {
-        let Some(default) = &field.default else {
-            return Ok(None);
-        };
-        let Some(value) = simple_value(default) else {
-            return Ok(None);
-        };
-        out.insert(field.name.clone(), value);
+        if let Some(default) = &field.default {
+            let Some(value) = simple_value(default) else {
+                return Ok(None);
+            };
+            out.insert(field.name.clone(), value);
+        }
     }
     Ok(Some(out))
+}
+
+fn finite_field_domains(entity: &IREntity) -> HashMap<String, Vec<SimpleValue>> {
+    let mut out = HashMap::new();
+    for field in &entity.fields {
+        let Some(values) = finite_type_values(&field.ty) else {
+            continue;
+        };
+        out.insert(field.name.clone(), values);
+    }
+    out
+}
+
+fn finite_type_values(ty: &IRType) -> Option<Vec<SimpleValue>> {
+    match ty {
+        IRType::Bool => Some(vec![SimpleValue::Bool(false), SimpleValue::Bool(true)]),
+        IRType::Enum { name, variants } => Some(
+            variants
+                .iter()
+                .map(|variant| SimpleValue::Ctor(name.clone(), variant.name.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 fn build_scene_default_field_map(
@@ -3566,11 +3613,12 @@ fn parse_field_operand(
 
 fn collect_field_domains(
     defaults: &HashMap<String, SimpleValue>,
+    base_domains: &HashMap<String, Vec<SimpleValue>>,
     steps: &[RelationalSystemStepSpec],
     assertions: &[RelSnapshotExpr],
     entity_name: &str,
 ) -> HashMap<String, Vec<SimpleValue>> {
-    let mut domains = HashMap::new();
+    let mut domains = base_domains.clone();
     for (field, value) in defaults {
         push_domain_value(&mut domains, field, value.clone());
     }
@@ -3774,12 +3822,15 @@ fn build_field_encodings(
 ) -> Result<HashMap<String, FieldDomainEncoding>, String> {
     let mut out = HashMap::new();
     for (field, domain) in domains {
-        let Some(default) = defaults.get(field) else {
-            return Err(format!("missing deterministic default for field `{field}`"));
-        };
-        let Some(default_idx) = domain.iter().position(|candidate| candidate == default) else {
-            return Err(format!("default domain mismatch for field `{field}`"));
-        };
+        let default_idx = defaults
+            .get(field)
+            .map(|default| {
+                domain
+                    .iter()
+                    .position(|candidate| candidate == default)
+                    .ok_or_else(|| format!("default domain mismatch for field `{field}`"))
+            })
+            .transpose()?;
         let mut state_lits = Vec::with_capacity(bound + 1);
         for state_idx in 0..=bound {
             let mut slot_lits = Vec::with_capacity(slot_count);
@@ -3787,7 +3838,9 @@ fn build_field_encodings(
                 let value_lits: Vec<_> = (0..domain.len()).map(|_| sat.new_lit()).collect();
                 sat.add_card_constr(CardConstraint::new_eq(value_lits.clone(), 1));
                 if state_idx == 0 {
-                    sat.add_unit(value_lits[default_idx]);
+                    if let Some(default_idx) = default_idx {
+                        sat.add_unit(value_lits[default_idx]);
+                    }
                 }
                 slot_lits.push(value_lits);
             }

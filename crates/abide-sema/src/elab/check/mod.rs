@@ -137,28 +137,58 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
     // Check match expression exhaustiveness and collection literal homogeneity
     for f in env.fns.values() {
         let fn_ctx = format!("fn {}", f.name);
-        check_match_exhaustiveness(&f.body, &env.types, &env.entities, &mut errors);
+        check_match_exhaustiveness(
+            &f.body,
+            &env.types,
+            &env.entities,
+            &env.variant_fields,
+            &mut errors,
+        );
         check_collection_homogeneity(&f.body, &fn_ctx, &mut errors);
         for c in &f.contracts {
             match c {
                 EContract::Requires(e) | EContract::Ensures(e) | EContract::Invariant(e) => {
-                    check_match_exhaustiveness(e, &env.types, &env.entities, &mut errors);
+                    check_match_exhaustiveness(
+                        e,
+                        &env.types,
+                        &env.entities,
+                        &env.variant_fields,
+                        &mut errors,
+                    );
                     check_collection_homogeneity(e, &fn_ctx, &mut errors);
                 }
                 EContract::Decreases { measures, .. } => {
                     for m in measures {
-                        check_match_exhaustiveness(m, &env.types, &env.entities, &mut errors);
+                        check_match_exhaustiveness(
+                            m,
+                            &env.types,
+                            &env.entities,
+                            &env.variant_fields,
+                            &mut errors,
+                        );
                     }
                 }
             }
         }
     }
     for pred in env.preds.values() {
-        check_match_exhaustiveness(&pred.body, &env.types, &env.entities, &mut errors);
+        check_match_exhaustiveness(
+            &pred.body,
+            &env.types,
+            &env.entities,
+            &env.variant_fields,
+            &mut errors,
+        );
         check_collection_homogeneity(&pred.body, &format!("pred {}", pred.name), &mut errors);
     }
     for prop in env.props.values() {
-        check_match_exhaustiveness(&prop.body, &env.types, &env.entities, &mut errors);
+        check_match_exhaustiveness(
+            &prop.body,
+            &env.types,
+            &env.entities,
+            &env.variant_fields,
+            &mut errors,
+        );
         check_collection_homogeneity(&prop.body, &format!("prop {}", prop.name), &mut errors);
     }
     for verify in &env.verifies {
@@ -168,7 +198,13 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                 &format!("verify {} assertion", verify.name),
                 &mut errors,
             );
-            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_match_exhaustiveness(
+                a,
+                &env.types,
+                &env.entities,
+                &env.variant_fields,
+                &mut errors,
+            );
             check_collection_homogeneity(a, &format!("verify {}", verify.name), &mut errors);
         }
     }
@@ -179,22 +215,46 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                 &format!("theorem {} show expression", theorem.name),
                 &mut errors,
             );
-            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_match_exhaustiveness(
+                a,
+                &env.types,
+                &env.entities,
+                &env.variant_fields,
+                &mut errors,
+            );
             check_collection_homogeneity(a, &format!("theorem {}", theorem.name), &mut errors);
         }
     }
     for lemma in &env.lemmas {
         for a in &lemma.body {
-            check_match_exhaustiveness(a, &env.types, &env.entities, &mut errors);
+            check_match_exhaustiveness(
+                a,
+                &env.types,
+                &env.entities,
+                &env.variant_fields,
+                &mut errors,
+            );
             check_collection_homogeneity(a, &format!("lemma {}", lemma.name), &mut errors);
         }
     }
     for c in env.consts.values() {
-        check_match_exhaustiveness(&c.body, &env.types, &env.entities, &mut errors);
+        check_match_exhaustiveness(
+            &c.body,
+            &env.types,
+            &env.entities,
+            &env.variant_fields,
+            &mut errors,
+        );
         check_collection_homogeneity(&c.body, &format!("const {}", c.name), &mut errors);
     }
     for a in &env.axioms {
-        check_match_exhaustiveness(&a.body, &env.types, &env.entities, &mut errors);
+        check_match_exhaustiveness(
+            &a.body,
+            &env.types,
+            &env.entities,
+            &env.variant_fields,
+            &mut errors,
+        );
         check_collection_homogeneity(&a.body, &format!("axiom {}", a.name), &mut errors);
     }
     for scene in &env.scenes {
@@ -205,7 +265,13 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                     &format!("scene {} given condition", scene.name),
                     &mut errors,
                 );
-                check_match_exhaustiveness(cond, &env.types, &env.entities, &mut errors);
+                check_match_exhaustiveness(
+                    cond,
+                    &env.types,
+                    &env.entities,
+                    &env.variant_fields,
+                    &mut errors,
+                );
             }
         }
         for constraint in &scene.given_constraints {
@@ -224,7 +290,13 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                             &format!("scene {} event argument", scene.name),
                             &mut errors,
                         );
-                        check_match_exhaustiveness(arg, &env.types, &env.entities, &mut errors);
+                        check_match_exhaustiveness(
+                            arg,
+                            &env.types,
+                            &env.entities,
+                            &env.variant_fields,
+                            &mut errors,
+                        );
                     }
                 }
                 ESceneWhen::Assume(e) => {
@@ -233,7 +305,13 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                         &format!("scene {} when assumption", scene.name),
                         &mut errors,
                     );
-                    check_match_exhaustiveness(e, &env.types, &env.entities, &mut errors);
+                    check_match_exhaustiveness(
+                        e,
+                        &env.types,
+                        &env.entities,
+                        &env.variant_fields,
+                        &mut errors,
+                    );
                 }
             }
         }
@@ -243,7 +321,13 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                 &format!("scene {} then assertion", scene.name),
                 &mut errors,
             );
-            check_match_exhaustiveness(then_expr, &env.types, &env.entities, &mut errors);
+            check_match_exhaustiveness(
+                then_expr,
+                &env.types,
+                &env.entities,
+                &env.variant_fields,
+                &mut errors,
+            );
         }
     }
 

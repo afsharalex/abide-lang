@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::super::error::{ElabError, ErrorKind};
-use super::super::types::{EEntity, EExpr, EPattern, Ty};
+use super::super::types::{EEntity, EExpr, EPattern, Ty, VariantFieldsMap};
 
 /// Walk an expression tree and check every match expression for exhaustiveness.
 ///
@@ -15,17 +15,18 @@ pub(super) fn check_match_exhaustiveness(
     expr: &EExpr,
     types: &HashMap<String, Ty>,
     entities: &HashMap<String, EEntity>,
+    variant_fields: &VariantFieldsMap,
     errors: &mut Vec<ElabError>,
 ) {
     match expr {
         EExpr::Match(scrut, arms, span) => {
             // Recurse into scrutinee and arm bodies first
-            check_match_exhaustiveness(scrut, types, entities, errors);
+            check_match_exhaustiveness(scrut, types, entities, variant_fields, errors);
             for (_, guard, body) in arms {
                 if let Some(g) = guard {
-                    check_match_exhaustiveness(g, types, entities, errors);
+                    check_match_exhaustiveness(g, types, entities, variant_fields, errors);
                 }
-                check_match_exhaustiveness(body, types, entities, errors);
+                check_match_exhaustiveness(body, types, entities, variant_fields, errors);
             }
 
             // Check exhaustiveness for enum scrutinee types.
@@ -40,9 +41,20 @@ pub(super) fn check_match_exhaustiveness(
                 None
             };
             let ty_to_check = resolved_field_ty.as_ref().unwrap_or(&scrut_ty);
-            let Some(constructors) = resolve_to_enum(ty_to_check, types) else {
+            let Some((enum_name, constructors)) = resolve_to_enum_info(ty_to_check, types) else {
                 return;
             };
+
+            for (pat, _, _) in arms {
+                check_pattern_shape(
+                    pat,
+                    enum_name,
+                    constructors,
+                    variant_fields,
+                    span.unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                    errors,
+                );
+            }
 
             // Collect covered constructors from unguarded arms.
             // An unguarded wildcard/variable covers everything.
@@ -93,8 +105,8 @@ pub(super) fn check_match_exhaustiveness(
         | EExpr::In(_, l, r, _)
         | EExpr::Until(_, l, r, _)
         | EExpr::Since(_, l, r, _) => {
-            check_match_exhaustiveness(l, types, entities, errors);
-            check_match_exhaustiveness(r, types, entities, errors);
+            check_match_exhaustiveness(l, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(r, types, entities, variant_fields, errors);
         }
         EExpr::UnOp(_, _, e, _)
         | EExpr::Always(_, e, _)
@@ -108,105 +120,105 @@ pub(super) fn check_match_exhaustiveness(
         | EExpr::Card(_, e, _)
         | EExpr::Field(_, e, _, _)
         | EExpr::NamedPair(_, _, e, _) => {
-            check_match_exhaustiveness(e, types, entities, errors);
+            check_match_exhaustiveness(e, types, entities, variant_fields, errors);
         }
         EExpr::Call(_, f, args, _) | EExpr::CallR(_, f, _, args, _) => {
-            check_match_exhaustiveness(f, types, entities, errors);
+            check_match_exhaustiveness(f, types, entities, variant_fields, errors);
             for a in args {
-                check_match_exhaustiveness(a, types, entities, errors);
+                check_match_exhaustiveness(a, types, entities, variant_fields, errors);
             }
         }
         EExpr::QualCall(_, _, _, args, _) => {
             for a in args {
-                check_match_exhaustiveness(a, types, entities, errors);
+                check_match_exhaustiveness(a, types, entities, variant_fields, errors);
             }
         }
         EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
-            check_match_exhaustiveness(body, types, entities, errors);
+            check_match_exhaustiveness(body, types, entities, variant_fields, errors);
         }
         EExpr::Choose(_, _, _, predicate, _) => {
             if let Some(pred) = predicate {
-                check_match_exhaustiveness(pred, types, entities, errors);
+                check_match_exhaustiveness(pred, types, entities, variant_fields, errors);
             }
         }
         EExpr::Let(binds, body, _) => {
             for (_, _, e) in binds {
-                check_match_exhaustiveness(e, types, entities, errors);
+                check_match_exhaustiveness(e, types, entities, variant_fields, errors);
             }
-            check_match_exhaustiveness(body, types, entities, errors);
+            check_match_exhaustiveness(body, types, entities, variant_fields, errors);
         }
         EExpr::IfElse(cond, then_e, else_e, _) => {
-            check_match_exhaustiveness(cond, types, entities, errors);
-            check_match_exhaustiveness(then_e, types, entities, errors);
+            check_match_exhaustiveness(cond, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(then_e, types, entities, variant_fields, errors);
             if let Some(el) = else_e {
-                check_match_exhaustiveness(el, types, entities, errors);
+                check_match_exhaustiveness(el, types, entities, variant_fields, errors);
             }
         }
         EExpr::Block(items, _) => {
             for e in items {
-                check_match_exhaustiveness(e, types, entities, errors);
+                check_match_exhaustiveness(e, types, entities, variant_fields, errors);
             }
         }
         EExpr::VarDecl(_, _, init, rest, _) => {
-            check_match_exhaustiveness(init, types, entities, errors);
-            check_match_exhaustiveness(rest, types, entities, errors);
+            check_match_exhaustiveness(init, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(rest, types, entities, variant_fields, errors);
         }
         EExpr::While(cond, _, body, _) => {
-            check_match_exhaustiveness(cond, types, entities, errors);
-            check_match_exhaustiveness(body, types, entities, errors);
+            check_match_exhaustiveness(cond, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(body, types, entities, variant_fields, errors);
         }
         EExpr::CtorRecord(_, _, _, args, _) | EExpr::StructCtor(_, _, args, _) => {
             for (_, e) in args {
-                check_match_exhaustiveness(e, types, entities, errors);
+                check_match_exhaustiveness(e, types, entities, variant_fields, errors);
             }
         }
         EExpr::MapUpdate(_, m, k, v, _) => {
-            check_match_exhaustiveness(m, types, entities, errors);
-            check_match_exhaustiveness(k, types, entities, errors);
-            check_match_exhaustiveness(v, types, entities, errors);
+            check_match_exhaustiveness(m, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(k, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(v, types, entities, variant_fields, errors);
         }
         EExpr::Index(_, m, k, _) => {
-            check_match_exhaustiveness(m, types, entities, errors);
-            check_match_exhaustiveness(k, types, entities, errors);
+            check_match_exhaustiveness(m, types, entities, variant_fields, errors);
+            check_match_exhaustiveness(k, types, entities, variant_fields, errors);
         }
         EExpr::SetComp(_, proj, _, _, source, filter, _) => {
             if let Some(p) = proj {
-                check_match_exhaustiveness(p, types, entities, errors);
+                check_match_exhaustiveness(p, types, entities, variant_fields, errors);
             }
             if let Some(source) = source {
-                check_match_exhaustiveness(source, types, entities, errors);
+                check_match_exhaustiveness(source, types, entities, variant_fields, errors);
             }
-            check_match_exhaustiveness(filter, types, entities, errors);
+            check_match_exhaustiveness(filter, types, entities, variant_fields, errors);
         }
         EExpr::RelComp(_, projection, bindings, filter, _) => {
-            check_match_exhaustiveness(projection, types, entities, errors);
+            check_match_exhaustiveness(projection, types, entities, variant_fields, errors);
             for binding in bindings {
                 if let Some(source) = &binding.source {
-                    check_match_exhaustiveness(source, types, entities, errors);
+                    check_match_exhaustiveness(source, types, entities, variant_fields, errors);
                 }
             }
-            check_match_exhaustiveness(filter, types, entities, errors);
+            check_match_exhaustiveness(filter, types, entities, variant_fields, errors);
         }
         EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) | EExpr::TupleLit(_, elems, _) => {
             for e in elems {
-                check_match_exhaustiveness(e, types, entities, errors);
+                check_match_exhaustiveness(e, types, entities, variant_fields, errors);
             }
         }
         EExpr::MapLit(_, entries, _) => {
             for (k, v) in entries {
-                check_match_exhaustiveness(k, types, entities, errors);
-                check_match_exhaustiveness(v, types, entities, errors);
+                check_match_exhaustiveness(k, types, entities, variant_fields, errors);
+                check_match_exhaustiveness(v, types, entities, variant_fields, errors);
             }
         }
         EExpr::Saw(_, _, _, args, _) => {
             for e in args.iter().flatten() {
-                check_match_exhaustiveness(e, types, entities, errors);
+                check_match_exhaustiveness(e, types, entities, variant_fields, errors);
             }
         }
         EExpr::Aggregate(_, _, _, _, body, in_filter, _) => {
-            check_match_exhaustiveness(body, types, entities, errors);
+            check_match_exhaustiveness(body, types, entities, variant_fields, errors);
             if let Some(f) = in_filter {
-                check_match_exhaustiveness(f, types, entities, errors);
+                check_match_exhaustiveness(f, types, entities, variant_fields, errors);
             }
         }
         // Leaves — no sub-expressions to recurse into
@@ -262,18 +274,57 @@ pub(super) fn collect_covered_ctors<'a>(
     }
 }
 
-/// Follow alias chains to find the underlying enum constructors.
-/// Handles `type A = Enum`, `type A = B` where `B = Enum`, etc.
-/// Returns `None` if the type is not an enum (or alias chain to one).
-pub(super) fn resolve_to_enum<'a>(
+pub(super) fn check_pattern_shape(
+    pat: &EPattern,
+    enum_name: &str,
+    constructors: &[String],
+    variant_fields: &VariantFieldsMap,
+    span: crate::span::Span,
+    errors: &mut Vec<ElabError>,
+) {
+    match pat {
+        EPattern::Ctor(name, fields) => {
+            if !constructors.iter().any(|ctor| ctor == name) {
+                return;
+            }
+            let declared_fields = variant_fields
+                .get(enum_name)
+                .and_then(|variants| {
+                    variants
+                        .iter()
+                        .find(|(variant, _)| variant == name)
+                        .map(|(_, fields)| fields.as_slice())
+                })
+                .unwrap_or(&[]);
+            if fields.is_empty() && declared_fields.is_empty() {
+                errors.push(ElabError::with_span(
+                    ErrorKind::TypeMismatch,
+                    format!(
+                        "unit constructor pattern `{name} {{}}` should be written `{name}`; \
+                         braces are only for destructuring constructor fields"
+                    ),
+                    String::new(),
+                    span,
+                ));
+            }
+        }
+        EPattern::Or(left, right) => {
+            check_pattern_shape(left, enum_name, constructors, variant_fields, span, errors);
+            check_pattern_shape(right, enum_name, constructors, variant_fields, span, errors);
+        }
+        EPattern::Var(_) | EPattern::Wild => {}
+    }
+}
+
+pub(super) fn resolve_to_enum_info<'a>(
     ty: &'a Ty,
     types: &'a HashMap<String, Ty>,
-) -> Option<&'a Vec<String>> {
+) -> Option<(&'a str, &'a Vec<String>)> {
     let mut current = ty;
     // Limit iterations to prevent infinite loops on cyclic aliases
     for _ in 0..20 {
         match current {
-            Ty::Enum(_, ctors) => return Some(ctors),
+            Ty::Enum(name, ctors) => return Some((name, ctors)),
             Ty::Alias(_, inner) => {
                 current = inner.as_ref();
             }

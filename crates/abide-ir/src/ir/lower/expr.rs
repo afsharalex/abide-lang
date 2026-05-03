@@ -428,18 +428,21 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::Match(scrutinee, arms, sp) => IRExpr::Match {
-            scrutinee: Box::new(lower_expr(scrutinee, ctx)),
-            arms: arms
-                .iter()
-                .map(|(pat, guard, body)| IRMatchArm {
-                    pattern: lower_pattern(pat),
-                    guard: guard.as_ref().map(|g| lower_expr(g, ctx)),
-                    body: lower_expr(body, ctx),
-                })
-                .collect(),
-            span: *sp,
-        },
+        E::EExpr::Match(scrutinee, arms, sp) => {
+            let scrut_ty = scrutinee.ty();
+            IRExpr::Match {
+                scrutinee: Box::new(lower_expr(scrutinee, ctx)),
+                arms: arms
+                    .iter()
+                    .map(|(pat, guard, body)| IRMatchArm {
+                        pattern: lower_pattern_for_scrutinee(pat, &scrut_ty),
+                        guard: guard.as_ref().map(|g| lower_expr(g, ctx)),
+                        body: lower_expr(body, ctx),
+                    })
+                    .collect(),
+                span: *sp,
+            }
+        }
         E::EExpr::Choose(ty, binder, domain_ty, predicate, sp) => IRExpr::Choose {
             var: binder.clone(),
             domain: lower_ty(domain_ty, ctx),
@@ -628,6 +631,32 @@ pub(super) fn lower_pattern(pat: &E::EPattern) -> IRPattern {
             left: Box::new(lower_pattern(left)),
             right: Box::new(lower_pattern(right)),
         },
+    }
+}
+
+fn lower_pattern_for_scrutinee(pat: &E::EPattern, scrutinee_ty: &E::Ty) -> IRPattern {
+    match pat {
+        E::EPattern::Var(name) if enum_contains_constructor(scrutinee_ty, name) => {
+            IRPattern::PCtor {
+                name: name.clone(),
+                fields: Vec::new(),
+            }
+        }
+        E::EPattern::Or(left, right) => IRPattern::POr {
+            left: Box::new(lower_pattern_for_scrutinee(left, scrutinee_ty)),
+            right: Box::new(lower_pattern_for_scrutinee(right, scrutinee_ty)),
+        },
+        _ => lower_pattern(pat),
+    }
+}
+
+fn enum_contains_constructor(ty: &E::Ty, name: &str) -> bool {
+    match ty {
+        E::Ty::Enum(_, constructors) => constructors.iter().any(|ctor| ctor == name),
+        E::Ty::Alias(_, inner) | E::Ty::Refinement(inner, _) => {
+            enum_contains_constructor(inner, name)
+        }
+        _ => false,
     }
 }
 

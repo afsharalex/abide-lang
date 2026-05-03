@@ -21695,8 +21695,8 @@ system Client {
 
   command request() {
     match InsuranceGateway::authorize() {
-      Authorized {} => { authorized' = true }
-      Denied {} => { denied' = true }
+      Authorized => { authorized' = true }
+      Denied => { denied' = true }
     }
   }
 }
@@ -21910,8 +21910,8 @@ system Client {
 
   command request() {
     match Gateway::authorize() {
-      Authorized {} => { authorized' = true }
-      Denied {} => { denied' = true }
+      Authorized => { authorized' = true }
+      Denied => { denied' = true }
     }
   }
 }
@@ -22360,6 +22360,72 @@ fn verify_routes_store_relation_product_and_projection_to_rustsat() {
             .any(|r| matches!(r, VerificationResult::Checked { name, .. }
                 if name == "store_relation_product_and_projection")),
         "store relation product/projection should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
+fn verify_routes_projected_field_relation_subset_under_always_to_rustsat() {
+    let ir = lower_source_file(
+        "projected_field_relation_subset.ab",
+        "module ProjectedFieldRelation\n\n\
+         enum NodeId = Root | Home\n\n\
+         entity FsNode {\n\
+           id: NodeId = @Root\n\
+           parent_id: NodeId = @Root\n\
+         }\n\n\
+         system FileTree(nodes: Store<FsNode>) {}\n\n\
+         verify every_parent_id_names_an_existing_node {\n\
+           assume {\n\
+             store nodes: FsNode[1..2]\n\
+             let tree = FileTree { nodes: nodes }\n\
+             stutter\n\
+           }\n\
+           assert always Rel::project(Rel::field(nodes, FsNode::parent_id), 1)\n\
+             <= Rel::project(Rel::field(nodes, FsNode::id), 1)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. }
+                if name == "every_parent_id_names_an_existing_node")),
+        "projected field relation subset should stay in relational backend, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_projected_field_relation_subset_reports_counterexample_for_arbitrary_initial_store() {
+    let ir = lower_source_file(
+        "projected_field_relation_subset_counterexample.ab",
+        "module ProjectedFieldRelation\n\n\
+         enum NodeId = Root | Home\n\n\
+         entity FsNode {\n\
+           id: NodeId\n\
+           parent_id: NodeId\n\
+         }\n\n\
+         system FileTree(nodes: Store<FsNode>) {}\n\n\
+         verify every_parent_id_names_an_existing_node {\n\
+           assume {\n\
+             store nodes: FsNode[1]\n\
+             let tree = FileTree { nodes: nodes }\n\
+             stutter\n\
+           }\n\
+           assert always Rel::project(Rel::field(nodes, FsNode::parent_id), 1)\n\
+             <= Rel::project(Rel::field(nodes, FsNode::id), 1)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Counterexample { name, .. }
+                if name == "every_parent_id_names_an_existing_node")
+        ),
+        "arbitrary finite initial store should produce a relational counterexample: {results:?}"
     );
 }
 
