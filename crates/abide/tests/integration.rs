@@ -6272,6 +6272,54 @@ fn bare(s: Status): bool = match s { A => true B => false }
 }
 
 #[test]
+fn payload_enum_match_patterns_can_ignore_payload_with_bare_constructor() {
+    let src = r"module T
+
+enum BookingResult =
+  Booked { appointment_id: int }
+  | NotEligible
+
+fn is_booked(result: BookingResult): bool =
+  match result {
+    Booked => true
+    NotEligible => false
+  }
+
+enum MarkerStatus = Alive
+
+entity Marker {
+  status: MarkerStatus = @Alive
+}
+
+system Scheduling(markers: Store<Marker>) {}
+
+verify bare_payload_constructor_pattern {
+  assume {
+    stutter
+    store markers: Marker[1]
+    let scheduling = Scheduling { markers: markers }
+  }
+
+  assert always all marker: Marker |
+    marker.status == @Alive implies
+      is_booked(@Booked { appointment_id: 7 })
+        and is_booked(@NotEligible) == false
+}
+";
+
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+                if name == "bare_payload_constructor_pattern"
+        )),
+        "bare payload constructor pattern should match the variant and ignore fields, got: {results:?}"
+    );
+}
+
+#[test]
 fn unit_enum_match_patterns_reject_empty_braces() {
     let src = r"module T
 
