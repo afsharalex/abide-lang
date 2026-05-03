@@ -1522,7 +1522,7 @@ fn render_result_html_source_note(result: &verify::VerificationResult) -> Option
 
 fn render_terminal_summary(result: &verify::VerificationResult) -> String {
     format!(
-        "{:<8}{} - {}",
+        "{}: {} - {}",
         render_result_heading_kind(result),
         result_primary_name(result),
         result_secondary_summary(result)
@@ -3017,6 +3017,21 @@ fn report_result_debug_evidence(result: &verify::VerificationResult, failure_str
 mod tests {
     use super::*;
     use abide_witness::{EvidenceEnvelope, WitnessEnvelope};
+
+    #[test]
+    fn terminal_summary_separates_verdict_from_name() {
+        let result = verify::VerificationResult::SceneFail {
+            name: "eligible_patient_can_book".to_owned(),
+            reason: "scenario is unsatisfiable".to_owned(),
+            span: None,
+            file: None,
+        };
+
+        assert_eq!(
+            render_terminal_summary(&result),
+            "SCENE FAIL: eligible_patient_can_book - scenario is unsatisfiable"
+        );
+    }
 
     #[test]
     fn operational_trace_text_includes_saw_observation() {
