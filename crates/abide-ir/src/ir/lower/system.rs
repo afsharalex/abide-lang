@@ -320,11 +320,11 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
                     path[0]
                 )));
             }
-            E::EExternAssume::Expr(_, _) => {
-                preds.push(hidden_extern_pred(&format!(
-                    "__abide_extern_assume_expr__{}",
-                    idx + 1
-                )));
+            E::EExternAssume::Expr(expr, _) => {
+                preds.push(hidden_extern_pred_with_body(
+                    &format!("__abide_extern_assume_expr__{}", idx + 1),
+                    lower_expr(expr, ctx),
+                ));
             }
             _ => {}
         }
@@ -348,14 +348,21 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
 }
 
 fn hidden_extern_pred(name: &str) -> IRFunction {
-    IRFunction {
-        name: name.to_owned(),
-        ty: IRType::Bool,
-        body: IRExpr::Lit {
+    hidden_extern_pred_with_body(
+        name,
+        IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
             span: None,
         },
+    )
+}
+
+fn hidden_extern_pred_with_body(name: &str, body: IRExpr) -> IRFunction {
+    IRFunction {
+        name: name.to_owned(),
+        ty: IRType::Bool,
+        body,
         prop_target: None,
         requires: Vec::new(),
         ensures: Vec::new(),

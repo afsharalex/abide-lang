@@ -4,7 +4,7 @@
 //! backend path, but callers should depend on this obligation shape rather than
 //! reaching directly into solver-specific entry points.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{
     IRAssumptionSet, IRCommandRef, IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify,
@@ -14,15 +14,15 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::harness::{
     create_slot_pool_with_systems, domain_constraints, initial_state_constraints, lasso_loopback,
-    store_active_cardinality_constraints, symmetry_breaking_constraints, try_fairness_constraints,
-    try_system_field_initial_constraints, try_transition_constraints_with_fire, FireTracking,
-    LassoLoop, SlotPool,
+    store_active_cardinality_constraints, symmetry_breaking_constraints, try_encode_guard_expr,
+    try_fairness_constraints, try_system_field_initial_constraints,
+    try_transition_constraints_with_fire, FireTracking, LassoLoop, SlotPool,
 };
 use super::ic3;
 use super::scope::{
     compute_theorem_scope, compute_verify_scope, select_verify_relevant, VerifyStoreRange,
 };
-use super::smt::Bool;
+use super::smt::{Bool, SmtValue};
 use super::solver::{active_solver_family, SolverFamily};
 use super::sygus;
 use super::temporal::{CompiledTemporalFormula, LivenessPattern};
@@ -34,6 +34,7 @@ pub struct TransitionAssumptions {
     weak_fair_event_keys: Vec<(String, String)>,
     strong_fair_event_keys: Vec<(String, String)>,
     per_tuple_fair_event_keys: Vec<(String, String)>,
+    extern_assume_exprs: Vec<IRExpr>,
 }
 
 impl TransitionAssumptions {
@@ -55,6 +56,76 @@ impl TransitionAssumptions {
                 .iter()
                 .map(|event| (event.system.clone(), event.command.clone()))
                 .collect(),
+            extern_assume_exprs: Vec::new(),
+        }
+    }
+
+    fn with_reachable_extern_assumptions(
+        mut self,
+        ir: &IRProgram,
+        system_names: &[String],
+    ) -> Self {
+        let mut to_scan = system_names.to_vec();
+        let mut scanned = HashSet::new();
+
+        while let Some(system_name) = to_scan.pop() {
+            if !scanned.insert(system_name.clone()) {
+                continue;
+            }
+            let Some(system) = ir.systems.iter().find(|system| system.name == system_name) else {
+                continue;
+            };
+
+            if system
+                .preds
+                .iter()
+                .any(|pred| pred.name == "__abide_extern__marker")
+            {
+                for pred in &system.preds {
+                    if let Some(command) = pred.name.strip_prefix("__abide_extern_assume_wf__") {
+                        self.push_weak_fair(system.name.clone(), command.to_owned());
+                    } else if let Some(command) =
+                        pred.name.strip_prefix("__abide_extern_assume_sf__")
+                    {
+                        self.push_strong_fair(system.name.clone(), command.to_owned());
+                    } else if pred
+                        .name
+                        .strip_prefix("__abide_extern_assume_expr__")
+                        .is_some()
+                    {
+                        self.extern_assume_exprs.push(pred.body.clone());
+                    }
+                }
+            }
+
+            for action in &system.actions {
+                super::scope::collect_crosscall_systems(&action.body, &mut to_scan);
+            }
+            for binding in &system.let_bindings {
+                if !to_scan.contains(&binding.system_type) {
+                    to_scan.push(binding.system_type.clone());
+                }
+            }
+        }
+
+        self
+    }
+
+    fn push_weak_fair(&mut self, system: String, command: String) {
+        let event = (system, command);
+        if !self.weak_fair_event_keys.contains(&event)
+            && !self.strong_fair_event_keys.contains(&event)
+        {
+            self.weak_fair_event_keys.push(event);
+        }
+    }
+
+    fn push_strong_fair(&mut self, system: String, command: String) {
+        let event = (system, command);
+        self.weak_fair_event_keys
+            .retain(|existing| existing != &event);
+        if !self.strong_fair_event_keys.contains(&event) {
+            self.strong_fair_event_keys.push(event);
         }
     }
 
@@ -113,6 +184,10 @@ impl TransitionAssumptions {
         }
         out
     }
+
+    pub fn extern_assume_exprs(&self) -> &[IRExpr] {
+        &self.extern_assume_exprs
+    }
 }
 
 #[derive(Clone)]
@@ -145,6 +220,8 @@ impl<'a> TransitionSystemSpec<'a> {
         if system_names.is_empty() {
             return None;
         }
+        let assumptions = TransitionAssumptions::from_ir(assumption_set)
+            .with_reachable_extern_assumptions(ir, &system_names);
         Some(Self {
             ir,
             vctx,
@@ -153,7 +230,7 @@ impl<'a> TransitionSystemSpec<'a> {
             slots_per_entity,
             bound,
             store_ranges,
-            assumptions: TransitionAssumptions::from_ir(assumption_set),
+            assumptions,
             relevant_entities,
             relevant_systems,
         })
@@ -174,6 +251,7 @@ impl<'a> TransitionSystemSpec<'a> {
         }
         let (relevant_entities, relevant_systems) =
             select_verify_relevant(ir, &slots_per_entity, &system_names);
+        let assumptions = assumptions.with_reachable_extern_assumptions(ir, &system_names);
         Some(Self {
             ir,
             vctx,
@@ -263,6 +341,8 @@ impl<'a> TransitionSystemSpec<'a> {
         }
         let (relevant_entities, relevant_systems) =
             select_verify_relevant(ir, &slots_per_entity, &system_names);
+        let assumptions = TransitionAssumptions::from_ir(&theorem.assumption_set)
+            .with_reachable_extern_assumptions(ir, &system_names);
 
         Some(Self {
             ir,
@@ -272,7 +352,7 @@ impl<'a> TransitionSystemSpec<'a> {
             slots_per_entity,
             bound: 0,
             store_ranges: HashMap::new(),
-            assumptions: TransitionAssumptions::from_ir(&theorem.assumption_set),
+            assumptions,
             relevant_entities,
             relevant_systems,
         })
@@ -540,6 +620,30 @@ pub struct TransitionSmtEncoding<'a> {
     fairness_constraints: Vec<Bool>,
 }
 
+fn try_extern_assume_expr_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    exprs: &[IRExpr],
+    steps: usize,
+) -> Result<Vec<Bool>, String> {
+    let params: HashMap<String, SmtValue> = HashMap::new();
+    let store_param_types: HashMap<String, String> = HashMap::new();
+    let mut constraints = Vec::new();
+    for expr in exprs {
+        for step in 0..=steps {
+            constraints.push(try_encode_guard_expr(
+                pool,
+                vctx,
+                expr,
+                &params,
+                &store_param_types,
+                step,
+            )?);
+        }
+    }
+    Ok(constraints)
+}
+
 #[derive(Clone)]
 pub struct TransitionExecutionPlan<'a> {
     system: TransitionSystemSpec<'a>,
@@ -641,7 +745,14 @@ impl<'a> TransitionSmtEncoding<'a> {
         } else {
             Vec::new()
         };
-        let domain_constraints = domain_constraints(&pool, system.vctx, system.relevant_entities());
+        let mut domain_constraints =
+            domain_constraints(&pool, system.vctx, system.relevant_entities());
+        domain_constraints.extend(try_extern_assume_expr_constraints(
+            &pool,
+            system.vctx,
+            system.assumptions().extern_assume_exprs(),
+            steps,
+        )?);
         let fire_tracking = try_transition_constraints_with_fire(
             &pool,
             system.vctx,

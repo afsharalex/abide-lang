@@ -291,9 +291,29 @@ fn select_systems<'a>(
             .iter()
             .find(|system| system.name == name)
             .ok_or_else(|| format!("unknown system `{name}`"))?;
+        if is_extern_system(system) {
+            return Err(format!(
+                "cannot simulate extern system `{name}` directly; select a system that depends on it"
+            ));
+        }
         return Ok(vec![system]);
     }
-    Ok(program.systems.iter().collect())
+    let systems = program
+        .systems
+        .iter()
+        .filter(|system| !is_extern_system(system))
+        .collect::<Vec<_>>();
+    if systems.is_empty() {
+        return Err("no non-extern systems found to simulate".to_owned());
+    }
+    Ok(systems)
+}
+
+fn is_extern_system(system: &IRSystem) -> bool {
+    system
+        .preds
+        .iter()
+        .any(|pred| pred.name == "__abide_extern__marker")
 }
 
 fn simulation_state_assertion(assertion: &IRExpr) -> Option<&IRExpr> {
@@ -358,6 +378,7 @@ struct Runtime<'a> {
     entry_systems: BTreeSet<String>,
     entities: BTreeMap<String, &'a IREntity>,
     functions: BTreeMap<String, &'a IRFunction>,
+    extern_assume_exprs: Vec<IRExpr>,
     state: RuntimeState,
     rng: LcgRng,
     next_identity: usize,
@@ -417,6 +438,26 @@ impl<'a> Runtime<'a> {
             .iter()
             .map(|function| (function.name.clone(), function))
             .collect();
+        let extern_assume_exprs = systems
+            .values()
+            .filter(|system| {
+                system
+                    .preds
+                    .iter()
+                    .any(|pred| pred.name == "__abide_extern__marker")
+            })
+            .flat_map(|system| {
+                system
+                    .preds
+                    .iter()
+                    .filter(|pred| {
+                        pred.name
+                            .strip_prefix("__abide_extern_assume_expr__")
+                            .is_some()
+                    })
+                    .map(|pred| pred.body.clone())
+            })
+            .collect::<Vec<_>>();
 
         let mut state = RuntimeState::default();
         let mut required_entities = BTreeSet::new();
@@ -462,16 +503,24 @@ impl<'a> Runtime<'a> {
             state.entity_slots.insert(entity_name, slots);
         }
 
-        Ok(Self {
+        let runtime = Self {
             program,
             systems,
             entry_systems,
             entities,
             functions,
+            extern_assume_exprs,
             state,
             rng: LcgRng::new(config.seed),
             next_identity: 1,
-        })
+        };
+        if !runtime.state_satisfies_extern_assumptions()? {
+            return Err(
+                "extern assume expression is not satisfied in the initial simulation state"
+                    .to_owned(),
+            );
+        }
+        Ok(runtime)
     }
 
     fn snapshot(&self) -> op::State {
@@ -529,6 +578,9 @@ impl<'a> Runtime<'a> {
                     if self.eval_bool(&step.guard, &env)? {
                         let mut probe = self.clone();
                         if probe.execute_step(system, step, &params, false).is_err() {
+                            continue;
+                        }
+                        if !probe.state_satisfies_extern_assumptions()? {
                             continue;
                         }
                         out.push(CommandCandidate {
@@ -762,6 +814,11 @@ impl<'a> Runtime<'a> {
             })?;
 
         let capture = self.execute_step(system, step, &candidate.params, true)?;
+        if !self.state_satisfies_extern_assumptions()? {
+            return Err(
+                "extern assume expression is not satisfied after simulation step".to_owned(),
+            );
+        }
         let mut builder = op::Transition::builder().atomic_step(capture.atomic_step);
         for observation in capture.observations {
             builder = builder.observation(observation);
@@ -1070,12 +1127,54 @@ impl<'a> Runtime<'a> {
             .get(target_system)
             .copied()
             .ok_or_else(|| format!("unknown cross-call system `{target_system}`"))?;
-        let step = target
+        let steps = target
             .actions
             .iter()
-            .find(|step| step.name == command)
-            .ok_or_else(|| format!("unknown cross-call command `{target_system}::{command}`"))?;
+            .filter(|step| step.name == command)
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return Err(format!(
+                "unknown cross-call command `{target_system}::{command}`"
+            ));
+        }
+        let mut executable_steps = Vec::new();
+        for step in steps {
+            let guard_env = Self::eval_env(&target.name, None, &params);
+            if !self.eval_bool(&step.guard, &guard_env)? {
+                continue;
+            }
+            let mut probe = self.clone();
+            if probe.execute_step(target, step, &params, false).is_ok()
+                && probe.state_satisfies_extern_assumptions()?
+            {
+                executable_steps.push(step);
+            }
+        }
+        if executable_steps.is_empty() {
+            return Err(format!(
+                "cross-call command `{target_system}::{command}` has no executable outcome"
+            ));
+        }
+        let selected_index = self.rng.next_index(executable_steps.len());
+        let step = executable_steps[selected_index];
         self.execute_step(target, step, &params, false)
+    }
+
+    fn state_satisfies_extern_assumptions(&self) -> Result<bool, String> {
+        let default_system = self.default_eval_system();
+        for expr in &self.extern_assume_exprs {
+            let env = EvalEnv {
+                current_system: &default_system,
+                current_slot: None,
+                locals: BTreeMap::new(),
+            };
+            if !self.eval_bool(expr, &env).map_err(|err| {
+                format!("unsupported extern assume expression in simulation: {err}")
+            })? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn record_cross_call_observations(
@@ -2852,6 +2951,167 @@ system Billing {
             billing_fields.get("charged"),
             Some(&WitnessValue::Bool(true)),
             "expected cross-call scrutinee match to update charged"
+        );
+    }
+
+    #[test]
+    fn simulate_extern_cross_call_samples_all_may_outcomes_across_seeds() {
+        let lowered = lower_source(
+            r"module T
+
+enum AuthorizationResult = Authorized | Denied
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+    return @Denied
+  }
+}
+
+system Client {
+  dep InsuranceGateway
+  authorized: bool = false
+  denied: bool = false
+
+  command request() {
+    match InsuranceGateway::authorize() {
+      Authorized {} => { authorized' = true }
+      Denied {} => { denied' = true }
+    }
+  }
+}
+",
+        );
+
+        let mut saw_authorized = false;
+        let mut saw_denied = false;
+        for seed in 0..12 {
+            let result = simulate_program(
+                &lowered.ir_program,
+                &SimulateConfig {
+                    steps: 1,
+                    seed,
+                    slots_per_entity: 0,
+                    entity_slot_overrides: BTreeMap::new(),
+                    system: Some("Client".to_owned()),
+                },
+            )
+            .expect("simulate");
+            let final_state = result
+                .behavior
+                .states()
+                .last()
+                .expect("final state should exist");
+            let fields = final_state
+                .system_fields()
+                .get("Client")
+                .expect("client system fields");
+            saw_authorized |= matches!(fields.get("authorized"), Some(WitnessValue::Bool(true)));
+            saw_denied |= matches!(fields.get("denied"), Some(WitnessValue::Bool(true)));
+        }
+
+        assert!(
+            saw_authorized && saw_denied,
+            "simulation should sample every finite extern may outcome across deterministic seeds"
+        );
+    }
+
+    #[test]
+    fn simulate_rejects_unsatisfied_reachable_extern_assume_expr() {
+        let lowered = lower_source(
+            r"module T
+
+enum AuthorizationResult = Authorized | Denied
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+    return @Denied
+  }
+
+  assume {
+    false
+  }
+}
+
+system Client {
+  dep InsuranceGateway
+  authorized: bool = false
+  denied: bool = false
+
+  command request() {
+    match InsuranceGateway::authorize() {
+      Authorized {} => { authorized' = true }
+      Denied {} => { denied' = true }
+    }
+  }
+}
+",
+        );
+
+        let err = simulate_program(
+            &lowered.ir_program,
+            &SimulateConfig {
+                steps: 1,
+                seed: 0,
+                slots_per_entity: 0,
+                entity_slot_overrides: BTreeMap::new(),
+                system: Some("Client".to_owned()),
+            },
+        )
+        .expect_err("unsatisfied extern assumption should reject simulation");
+
+        assert!(
+            err.contains("extern assume"),
+            "expected extern assume diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn simulate_default_selection_excludes_extern_systems() {
+        let lowered = lower_source(
+            r"module T
+
+enum AuthorizationResult = Authorized
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+  }
+}
+
+system Client {
+  dep InsuranceGateway
+
+  command request() {
+    InsuranceGateway::authorize()
+  }
+}
+",
+        );
+
+        let result = simulate_program(
+            &lowered.ir_program,
+            &SimulateConfig {
+                steps: 1,
+                seed: 0,
+                slots_per_entity: 0,
+                entity_slot_overrides: BTreeMap::new(),
+                system: None,
+            },
+        )
+        .expect("simulate");
+
+        assert_eq!(
+            result.systems,
+            vec!["Client".to_owned()],
+            "extern systems should be dependencies, not default simulation roots"
         );
     }
 

@@ -113,6 +113,7 @@ pub fn resolve(env: &mut Env) {
     let ctx = Ctx::from_env(env);
     resolve_entities(env, &ctx);
     resolve_systems(env, &ctx);
+    resolve_externs(env, &ctx);
     resolve_preds(env, &ctx);
     resolve_props(env, &ctx);
     resolve_verifies(env, &ctx);
@@ -1756,6 +1757,42 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
     }
 }
 
+fn resolve_externs(env: &mut Env, ctx: &Ctx) {
+    for ext in env.externs.values_mut() {
+        for cmd in &mut ext.commands {
+            let (resolved_params, _) = resolve_params_lr(ctx, &cmd.params, HashMap::new());
+            cmd.params = resolved_params;
+            if let Some(ref mut rt) = cmd.return_type {
+                *rt = ctx.resolve_ty(rt);
+            }
+        }
+
+        let command_return_types: HashMap<String, Option<Ty>> = ext
+            .commands
+            .iter()
+            .map(|cmd| (cmd.name.clone(), cmd.return_type.clone()))
+            .collect();
+
+        for may in &mut ext.mays {
+            let expected_return = command_return_types
+                .get(&may.command)
+                .and_then(|ty| ty.as_ref());
+            for ret in &mut may.returns {
+                *ret = resolve_expr(ctx, &HashMap::new(), ret);
+                if let Some(expected) = expected_return {
+                    resolve_ctor_type_from_context(ret, expected);
+                }
+            }
+        }
+
+        for assume in &mut ext.assumes {
+            if let crate::elab::types::EExternAssume::Expr(expr, _) = assume {
+                *expr = resolve_expr(ctx, &HashMap::new(), expr);
+            }
+        }
+    }
+}
+
 fn resolve_event_action(ctx: &Ctx, bound: &HashMap<String, Ty>, ea: &EEventAction) -> EEventAction {
     match ea {
         EEventAction::Choose(v, ty, guard, body) => {
@@ -2390,6 +2427,48 @@ mod tests {
             "unknown named types should be rewritten to poison, got: {:?}",
             user.fields[0].ty
         );
+    }
+
+    #[test]
+    fn extern_command_return_type_and_may_returns_are_resolved() {
+        let env = elaborate_src(
+            "enum AuthorizationResult = Authorized | Denied\n\
+             extern InsuranceGateway {\n\
+               command authorize(patient_id: identity) -> AuthorizationResult\n\
+               may authorize {\n\
+                 return @Authorized\n\
+                 return @Denied\n\
+               }\n\
+             }",
+        );
+
+        assert!(
+            env.errors.is_empty(),
+            "extern result fixture should resolve without errors: {:?}",
+            env.errors
+        );
+        let gateway = env
+            .externs
+            .get("InsuranceGateway")
+            .expect("extern collected");
+        let command = gateway
+            .commands
+            .iter()
+            .find(|command| command.name == "authorize")
+            .expect("extern command collected");
+        assert!(
+            matches!(
+                command.return_type,
+                Some(Ty::Enum(ref name, _)) if name == "AuthorizationResult"
+            ),
+            "extern command result type should resolve to enum, got {:?}",
+            command.return_type
+        );
+        let may = gateway.mays.first().expect("may block collected");
+        assert!(may.returns.iter().all(|ret| matches!(
+            ret,
+            EExpr::Var(Ty::Enum(name, _), _, _) if name == "AuthorizationResult"
+        )));
     }
 
     #[test]

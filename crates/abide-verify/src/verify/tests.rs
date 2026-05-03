@@ -21612,6 +21612,340 @@ fn lower_source_file(name: &str, source: &str) -> IRProgram {
 }
 
 #[test]
+fn lower_extern_command_result_named_enum() {
+    let ir = lower_source_file(
+        "extern_result.ab",
+        r"
+module ExternResult
+
+enum AuthorizationResult = Authorized | Denied
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+    return @Denied
+  }
+
+  assume {
+    fair authorize
+  }
+}
+",
+    );
+
+    let gateway = ir
+        .systems
+        .iter()
+        .find(|system| system.name == "InsuranceGateway")
+        .expect("extern boundary should lower as an IR system");
+    let command = gateway
+        .commands
+        .iter()
+        .find(|command| command.name == "authorize")
+        .expect("extern command should lower");
+
+    let Some(IRType::Enum { name, variants }) = command.return_type.as_ref() else {
+        panic!(
+            "extern command return type should lower to enum, got {:?}",
+            command.return_type
+        );
+    };
+    assert_eq!(name, "AuthorizationResult");
+    assert_eq!(
+        variants
+            .iter()
+            .map(|variant| variant.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Authorized", "Denied"]
+    );
+    assert_eq!(gateway.actions.len(), 2);
+    assert!(gateway.actions.iter().all(|action| matches!(
+        action.return_expr,
+        Some(IRExpr::Ctor {
+            ref enum_name,
+            ..
+        }) if enum_name == "AuthorizationResult"
+    )));
+}
+
+#[test]
+fn explicit_state_explores_all_extern_may_outcomes() {
+    let ir = lower_source_file(
+        "extern_may_outcomes.ab",
+        r"
+module ExternMayOutcomes
+
+enum AuthorizationResult = Authorized | Denied
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+    return @Denied
+  }
+}
+
+system Client {
+  dep InsuranceGateway
+  authorized: bool = false
+  denied: bool = false
+
+  command request() {
+    match InsuranceGateway::authorize() {
+      Authorized {} => { authorized' = true }
+      Denied {} => { denied' = true }
+    }
+  }
+}
+
+verify explore_extern_may [depth: 1] {
+  assume {
+    let client = Client {}
+  }
+  assert true
+}
+",
+    );
+    let verify = ir
+        .verifies
+        .iter()
+        .find(|verify| verify.name == "explore_extern_may")
+        .expect("verify block should lower");
+    let state_space = super::explicit::explore_verify_state_space(
+        &ir,
+        verify,
+        &VerifyConfig {
+            no_ic3: true,
+            ..VerifyConfig::default()
+        },
+    )
+    .expect("explicit exploration should not error")
+    .expect("explicit state space should be available");
+
+    let client_fields = state_space
+        .states
+        .iter()
+        .filter_map(|state| state.system_fields().get("Client"))
+        .collect::<Vec<_>>();
+    let authorized_reachable = client_fields.iter().any(|fields| {
+        matches!(
+            fields.get("authorized"),
+            Some(abide_witness::WitnessValue::Bool(true))
+        )
+    });
+    let denied_reachable = client_fields.iter().any(|fields| {
+        matches!(
+            fields.get("denied"),
+            Some(abide_witness::WitnessValue::Bool(true))
+        )
+    });
+
+    assert!(
+        authorized_reachable && denied_reachable,
+        "extern may outcomes should both be reachable, got {:?}",
+        state_space.states
+    );
+}
+
+#[test]
+fn reachable_extern_fairness_is_part_of_transition_assumptions() {
+    let ir = lower_source_file(
+        "extern_fairness_assumptions.ab",
+        r"
+module ExternFairnessAssumptions
+
+enum AuthorizationResult = Authorized
+
+extern InsuranceGateway {
+  command authorize() -> AuthorizationResult
+  command settle() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+  }
+
+  may settle {
+    return @Authorized
+  }
+
+  assume {
+    fair authorize
+    strong fair settle
+  }
+}
+
+system Client {
+  dep InsuranceGateway
+
+  command request() {
+    InsuranceGateway::authorize()
+    InsuranceGateway::settle()
+  }
+}
+
+verify extern_fairness_is_semantic [depth: 1] {
+  assume {
+    let client = Client {}
+  }
+  assert true
+}
+",
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::from_ir(&ir);
+    let verify = ir
+        .verifies
+        .iter()
+        .find(|verify| verify.name == "extern_fairness_is_semantic")
+        .expect("verify block should lower");
+    let obligation =
+        super::transition::TransitionVerifyObligation::for_verify(&ir, &vctx, verify, &defs)
+            .expect("transition obligation should be available");
+    let assumptions = obligation.system().assumptions();
+
+    assert!(
+        assumptions
+            .weak_fair_event_keys()
+            .contains(&("InsuranceGateway".to_owned(), "authorize".to_owned())),
+        "reachable extern weak fairness should be semantic"
+    );
+    assert!(
+        assumptions
+            .strong_fair_event_keys()
+            .contains(&("InsuranceGateway".to_owned(), "settle".to_owned())),
+        "reachable extern strong fairness should be semantic"
+    );
+}
+
+#[test]
+fn reachable_extern_expr_assumption_constrains_transition_encoding() {
+    let ir = lower_source_file(
+        "extern_expr_assumption.ab",
+        r"
+module ExternExprAssumption
+
+extern Gateway {
+  command ping()
+
+  may ping {
+  }
+
+  assume {
+    false
+  }
+}
+
+system Client {
+  dep Gateway
+
+  command request() {
+    Gateway::ping()
+  }
+}
+
+verify extern_expr_assumption_is_semantic [depth: 1] {
+  assume {
+    let client = Client {}
+  }
+  assert true
+}
+",
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let verify = ir
+        .verifies
+        .iter()
+        .find(|verify| verify.name == "extern_expr_assumption_is_semantic")
+        .expect("verify block should lower");
+    let system = super::transition::TransitionSystemSpec::for_verify_shallow(&ir, &vctx, verify)
+        .expect("transition system should be available");
+    let encoding = super::transition::TransitionSmtEncoding::from_plan(
+        super::transition::TransitionExecutionPlan::for_bmc(system, 1),
+    )
+    .expect("transition encoding should be available");
+    let solver = AbideSolver::new();
+    for constraint in encoding.initial_constraints() {
+        solver.assert(constraint);
+    }
+    for constraint in encoding.domain_constraints() {
+        solver.assert(constraint);
+    }
+
+    assert_eq!(
+        solver.check(),
+        SatResult::Unsat,
+        "reachable extern assume expressions must constrain the solver encoding"
+    );
+}
+
+#[test]
+fn explicit_state_declines_unsatisfied_extern_expr_assumption() {
+    let ir = lower_source_file(
+        "explicit_extern_expr_assumption.ab",
+        r"
+module ExplicitExternExprAssumption
+
+enum AuthorizationResult = Authorized | Denied
+
+extern Gateway {
+  command authorize() -> AuthorizationResult
+
+  may authorize {
+    return @Authorized
+    return @Denied
+  }
+
+  assume {
+    false
+  }
+}
+
+system Client {
+  dep Gateway
+  authorized: bool = false
+  denied: bool = false
+
+  command request() {
+    match Gateway::authorize() {
+      Authorized {} => { authorized' = true }
+      Denied {} => { denied' = true }
+    }
+  }
+}
+
+verify extern_expr_assumption_is_not_explicit [depth: 1] {
+  assume {
+    let client = Client {}
+  }
+  assert true
+}
+",
+    );
+    let verify = ir
+        .verifies
+        .iter()
+        .find(|verify| verify.name == "extern_expr_assumption_is_not_explicit")
+        .expect("verify block should lower");
+
+    assert!(
+        super::explicit::explore_verify_state_space(
+            &ir,
+            verify,
+            &VerifyConfig {
+                no_ic3: true,
+                ..VerifyConfig::default()
+            },
+        )
+        .expect("explicit fragment analysis should not error")
+        .is_none(),
+        "explicit-state backend must not ignore unsatisfied extern assume expressions"
+    );
+}
+
+#[test]
 fn fixture_auth_smoke_results_cover_verify_and_scene_paths() {
     let results = verify_fixture("auth.ab");
 

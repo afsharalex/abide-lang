@@ -157,6 +157,7 @@ struct ExplicitModel<'a> {
     step_indices: HashMap<(String, String), usize>,
     safety_properties: Vec<IRExpr>,
     liveness_monitors: Vec<ExplicitLivenessMonitor>,
+    extern_assume_exprs: Vec<IRExpr>,
     stutter: bool,
     weak_fair: Vec<(String, String)>,
     strong_fair: Vec<(String, String)>,
@@ -362,6 +363,19 @@ impl<'a> ExplicitModel<'a> {
                 return Ok(None);
             }
         }
+        let extern_assume_exprs = system.assumptions().extern_assume_exprs().to_vec();
+        for expr in &extern_assume_exprs {
+            if !supports_state_expr(
+                expr,
+                None,
+                &system_field_indices,
+                &entity_specs,
+                &HashSet::new(),
+                &HashMap::new(),
+            ) {
+                return Ok(None);
+            }
+        }
         for step in &steps {
             let value_locals: HashSet<String> = step
                 .step
@@ -437,31 +451,44 @@ impl<'a> ExplicitModel<'a> {
             }
         }
 
-        Ok(Some((
-            Self {
-                roots: system.selected_system_names().to_vec(),
-                system_fields,
-                system_field_indices,
-                entity_specs,
-                entity_indices,
-                steps,
-                step_indices,
-                safety_properties,
-                liveness_monitors,
-                stutter: system.assumptions().stutter(),
-                weak_fair: system.assumptions().weak_fair_event_keys().to_vec(),
-                strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
-                per_tuple_fair: system.assumptions().per_tuple_fair_event_keys().to_vec(),
-            },
-            ExplicitState {
-                system_values: initial_system_values,
-                entity_slots: initial_entity_slots,
-            },
-        )))
+        let model = Self {
+            roots: system.selected_system_names().to_vec(),
+            system_fields,
+            system_field_indices,
+            entity_specs,
+            entity_indices,
+            steps,
+            step_indices,
+            safety_properties,
+            liveness_monitors,
+            extern_assume_exprs,
+            stutter: system.assumptions().stutter(),
+            weak_fair: system.assumptions().weak_fair_event_keys().to_vec(),
+            strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
+            per_tuple_fair: system.assumptions().per_tuple_fair_event_keys().to_vec(),
+        };
+        let initial_state = ExplicitState {
+            system_values: initial_system_values,
+            entity_slots: initial_entity_slots,
+        };
+        if !model.state_satisfies_extern_assumptions(&initial_state)? {
+            return Ok(None);
+        }
+
+        Ok(Some((model, initial_state)))
     }
 
     fn has_liveness(&self) -> bool {
         !self.liveness_monitors.is_empty()
+    }
+
+    fn state_satisfies_extern_assumptions(&self, state: &ExplicitState) -> Result<bool, String> {
+        for expr in &self.extern_assume_exprs {
+            if !self.eval_bool(state, expr)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn eval_bool(&self, state: &ExplicitState, expr: &IRExpr) -> Result<bool, String> {
@@ -501,6 +528,9 @@ impl<'a> ExplicitModel<'a> {
                 enumerate_param_bindings_for_state(&step.step.params, state, &self.entity_specs)?
             {
                 for (next, choices) in self.execute_step_with_bindings(state, step, &bindings)? {
+                    if !self.state_satisfies_extern_assumptions(&next)? {
+                        continue;
+                    }
                     out.push((
                         next,
                         ExplicitEdge::Step {
@@ -1295,6 +1325,13 @@ impl<'a> ExplicitModel<'a> {
         self.step_indices
             .get(&(system.to_owned(), command.to_owned()))
             .and_then(|index| self.steps.get(*index))
+    }
+
+    fn steps_by_key(&self, system: &str, command: &str) -> Vec<&ExplicitStepRef<'a>> {
+        self.steps
+            .iter()
+            .filter(|step| step.system == system && step.step.name == command)
+            .collect()
     }
 }
 
@@ -2514,71 +2551,74 @@ fn execute_cross_call_like_result(
     caller_system: Option<&str>,
     value_locals: &HashMap<String, ExplicitValue>,
 ) -> Result<Vec<(ExplicitState, Option<ExplicitValue>, Vec<op::Choice>)>, String> {
-    let Some(callee) = model.step_by_key(system, command) else {
+    let callees = model.steps_by_key(system, command);
+    if callees.is_empty() {
         return Err("unsupported cross-call in explicit-state fragment".to_owned());
-    };
-    if args.len() != callee.step.params.len()
-        || (!refs.is_empty() && refs.len() != callee.store_param_count)
-    {
-        return Err("unsupported cross-call in explicit-state fragment".to_owned());
-    }
-    let callee_bindings = callee
-        .step
-        .params
-        .iter()
-        .zip(args.iter())
-        .map(|(param, arg)| {
-            Ok::<_, String>((
-                param.name.clone(),
-                eval_expr(
-                    &state,
-                    arg,
-                    caller_system,
-                    &model.system_field_indices,
-                    &model.entity_specs,
-                    value_locals,
-                    &HashMap::new(),
-                )?,
-            ))
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    if !eval_bool_with_locals(
-        &state,
-        &callee.step.guard,
-        Some(&callee.system),
-        &model.system_field_indices,
-        &model.entity_specs,
-        &callee_bindings,
-        &HashMap::new(),
-    )? {
-        return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for (next, callee_locals, choices) in execute_actions(
-        model,
-        state,
-        &callee.system,
-        &callee.step.body,
-        &callee_bindings,
-        &HashMap::new(),
-    )? {
-        let result = callee
+    for callee in callees {
+        if args.len() != callee.step.params.len()
+            || (!refs.is_empty() && refs.len() != callee.store_param_count)
+        {
+            return Err("unsupported cross-call in explicit-state fragment".to_owned());
+        }
+        let callee_bindings = callee
             .step
-            .return_expr
-            .as_ref()
-            .map(|expr| {
-                eval_expr(
-                    &next,
-                    expr,
-                    Some(&callee.system),
-                    &model.system_field_indices,
-                    &model.entity_specs,
-                    &callee_locals,
-                    &HashMap::new(),
-                )
+            .params
+            .iter()
+            .zip(args.iter())
+            .map(|(param, arg)| {
+                Ok::<_, String>((
+                    param.name.clone(),
+                    eval_expr(
+                        &state,
+                        arg,
+                        caller_system,
+                        &model.system_field_indices,
+                        &model.entity_specs,
+                        value_locals,
+                        &HashMap::new(),
+                    )?,
+                ))
             })
-            .transpose()?;
-        out.push((next, result, choices));
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        if !eval_bool_with_locals(
+            &state,
+            &callee.step.guard,
+            Some(&callee.system),
+            &model.system_field_indices,
+            &model.entity_specs,
+            &callee_bindings,
+            &HashMap::new(),
+        )? {
+            continue;
+        }
+        for (next, callee_locals, choices) in execute_actions(
+            model,
+            state.clone(),
+            &callee.system,
+            &callee.step.body,
+            &callee_bindings,
+            &HashMap::new(),
+        )? {
+            let result = callee
+                .step
+                .return_expr
+                .as_ref()
+                .map(|expr| {
+                    eval_expr(
+                        &next,
+                        expr,
+                        Some(&callee.system),
+                        &model.system_field_indices,
+                        &model.entity_specs,
+                        &callee_locals,
+                        &HashMap::new(),
+                    )
+                })
+                .transpose()?;
+            out.push((next, result, choices));
+        }
     }
     Ok(out)
 }
@@ -3515,6 +3555,7 @@ mod tests {
             step_indices: HashMap::from([(("Sys".to_owned(), step.name.clone()), 0usize)]),
             safety_properties: vec![],
             liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
