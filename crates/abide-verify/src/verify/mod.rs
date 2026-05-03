@@ -2399,9 +2399,46 @@ fn check_verify_block_tiered(
                 },
             };
         }
+
+        return check_static_verify_assertions(ir, vctx, defs, effective_block, config);
     }
 
-    if !has_liveness && !config.unbounded_only {
+    // When stutter is explicitly opted out, deadlock is part of the observable
+    // result surface. Check it before optimized backends that can prove/check
+    // "no property violation" but do not return deadlock as a distinct outcome.
+    if !verify_block.assumption_set.stutter {
+        if let Some(deadlock) = check_for_deadlock(
+            ir,
+            vctx,
+            effective_block,
+            config,
+            deadline,
+            config.witness_semantics,
+        ) {
+            return deadlock;
+        }
+    }
+
+    let scoped_system_has_actions = effective_block.systems.iter().any(|scope| {
+        ir.systems
+            .iter()
+            .any(|system| system.name == scope.name && !system.actions.is_empty())
+    });
+    let mut bounded_checked_result: Option<VerificationResult> = None;
+
+    if let Some(result) =
+        explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
+    {
+        if config.bounded_only
+            || has_liveness
+            || !matches!(result, VerificationResult::Checked { .. })
+        {
+            return result;
+        }
+        bounded_checked_result = Some(result);
+    }
+
+    if effective_block.assumption_set.stutter && !has_liveness && !config.unbounded_only {
         let Some(relational_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {
                 name: effective_block.name.clone(),
@@ -2419,34 +2456,28 @@ fn check_verify_block_tiered(
             relational_config.witness_semantics,
             relational_config.relational_symmetry_breaking,
         ) {
-            return materialize_relational_verify_outcome(ir, effective_block, bound, result);
-        }
-    }
-
-    if let Some(result) =
-        explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
-    {
-        return result;
-    }
-
-    // / revised: when stutter is opted out, check for
-    // a global deadlock BEFORE running any proof technique. Without
-    // this gate, both 1-induction and IC3 can vacuously prove `always
-    // P` from a contradictory transition relation (`P ∧ false → P'`
-    // is trivially true). The relational backend gets first refusal
-    // above because its supported fragment may legally enable same-step
-    // create/apply behavior that the generic SMT deadlock probe does
-    // not model.
-    if !verify_block.assumption_set.stutter {
-        if let Some(deadlock) = check_for_deadlock(
-            ir,
-            vctx,
-            effective_block,
-            config,
-            deadline,
-            config.witness_semantics,
-        ) {
-            return deadlock;
+            match result {
+                relational::RelationalVerifyOutcome::Checked { .. } if !config.bounded_only => {
+                    // Keep the relational SAT backend as a bounded safety
+                    // screen. If it only establishes the current bound, still
+                    // allow stronger proof tiers to discharge the verify block
+                    // as PROVED before falling back to CHECKED.
+                    bounded_checked_result = Some(materialize_relational_verify_outcome(
+                        ir,
+                        effective_block,
+                        bound,
+                        result,
+                    ));
+                }
+                result => {
+                    return materialize_relational_verify_outcome(
+                        ir,
+                        effective_block,
+                        bound,
+                        result,
+                    );
+                }
+            }
         }
     }
 
@@ -2497,6 +2528,12 @@ fn check_verify_block_tiered(
         if let Some(result) =
             try_cvc5_sygus_on_verify(ir, vctx, defs, effective_block, &sygus_config)
         {
+            return result;
+        }
+    }
+
+    if scoped_system_has_actions {
+        if let Some(result) = bounded_checked_result {
             return result;
         }
     }
@@ -2581,6 +2618,80 @@ fn check_verify_block_tiered(
         };
     };
     check_verify_block(ir, vctx, defs, effective_block, &bmc_config)
+}
+
+fn check_static_verify_assertions(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> VerificationResult {
+    let assumptions = build_assumptions_for_system_scope(ir, &[], &verify_block.assumption_set, &[]);
+    if verify_block.asserts.is_empty() {
+        return VerificationResult::Checked {
+            name: verify_block.name.clone(),
+            depth: 0,
+            time_ms: 0,
+            assumptions,
+            span: verify_block.span,
+            file: verify_block.file.clone(),
+        };
+    }
+
+    let solver = AbideSolver::new();
+    if config.bmc_timeout_ms > 0 {
+        solver.set_timeout(config.bmc_timeout_ms);
+    }
+
+    let env = HashMap::new();
+    let mut negated = Vec::with_capacity(verify_block.asserts.len());
+    for assertion in &verify_block.asserts {
+        let Ok(encoded) = encode_pure_expr(assertion, &env, vctx, defs) else {
+            return VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: "verify block did not produce a transition-system obligation".to_owned(),
+                span: verify_block.span,
+                file: verify_block.file.clone(),
+            };
+        };
+        let Ok(prop) = encoded.to_bool() else {
+            return VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: "static verify assertion did not encode as a boolean".to_owned(),
+                span: expr_span(assertion),
+                file: verify_block.file.clone(),
+            };
+        };
+        negated.push(smt::bool_not(&prop));
+    }
+
+    let refs: Vec<&Bool> = negated.iter().collect();
+    solver.assert(smt::bool_or(&refs));
+    match solver.check() {
+        SatResult::Sat => VerificationResult::Counterexample {
+            name: verify_block.name.clone(),
+            evidence: None,
+            evidence_extraction_error: None,
+            assumptions,
+            span: verify_block.span,
+            file: verify_block.file.clone(),
+        },
+        SatResult::Unsat => VerificationResult::Checked {
+            name: verify_block.name.clone(),
+            depth: 0,
+            time_ms: 0,
+            assumptions,
+            span: verify_block.span,
+            file: verify_block.file.clone(),
+        },
+        SatResult::Unknown(reason) => VerificationResult::Unprovable {
+            name: verify_block.name.clone(),
+            hint: format!("static verify assertion check was inconclusive: {reason}"),
+            span: verify_block.span,
+            file: verify_block.file.clone(),
+        },
+    }
 }
 
 fn try_cvc5_sygus_on_verify(
@@ -3554,15 +3665,17 @@ fn check_verify_block(
     for sys in system.relevant_systems() {
         for event in &sys.actions {
             if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: format!(
-                        "unsupported expression in {}.{} event guard: {kind}",
-                        sys.name, event.name
-                    ),
-                    span: None,
-                    file: None,
-                };
+                if kind != crate::messages::PRECHECK_UNRESOLVED_FN {
+                    return VerificationResult::Unprovable {
+                        name: verify_block.name.clone(),
+                        hint: format!(
+                            "unsupported expression in {}.{} event guard: {kind}",
+                            sys.name, event.name
+                        ),
+                        span: None,
+                        file: None,
+                    };
+                }
             }
             if let Some(kind) = find_unsupported_in_actions(&event.body) {
                 return VerificationResult::Unprovable {

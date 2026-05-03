@@ -888,7 +888,7 @@ pub struct IRVerifySystem {
 // and lowered into IR here so the verifier can read it.
 //
 // Construct defaults are applied during elab collection:
-// * verify → stutter = false
+// * verify → stutter = true
 // * theorem → stutter = true
 // * lemma → stutter = true
 //
@@ -939,12 +939,12 @@ impl IRAssumptionSet {
     }
 
     /// Construct the IR-level assumption set default for a `verify`
-    /// site: stutter off, no fairness. Mirrors
+    /// site: stutter on, no fairness. Mirrors
     /// `elab::types::AssumptionSet::default_for_verify`.
     #[must_use]
     pub fn default_for_verify() -> Self {
         Self {
-            stutter: false,
+            stutter: true,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),

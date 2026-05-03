@@ -491,7 +491,7 @@ pub struct EProp {
 // after construct defaults are applied and normalization is run.
 //
 // Defaults:
-// * verify → stutter = false (closed-system, deadlock-detecting)
+// * verify → stutter = true (TLA+-style idle steps)
 // * theorem → stutter = true (refinement-friendly, TLA+-style)
 // * lemma → stutter = true
 //
@@ -550,11 +550,11 @@ pub struct AssumptionSet {
 
 impl AssumptionSet {
     /// Construct the default `AssumptionSet` for a verify block:
-    /// stutter off, no fairness.
+    /// stutter on, no fairness.
     #[must_use]
     pub fn default_for_verify() -> Self {
         Self {
-            stutter: false,
+            stutter: true,
             weak_fair: std::collections::BTreeSet::new(),
             strong_fair: std::collections::BTreeSet::new(),
             per_tuple: std::collections::BTreeSet::new(),
@@ -1165,8 +1165,8 @@ mod assumption_set_tests {
     }
 
     #[test]
-    fn defaults_distinguish_verify_from_theorem() {
-        assert!(!AssumptionSet::default_for_verify().stutter);
+    fn defaults_enable_stutter_for_verify_and_theorem() {
+        assert!(AssumptionSet::default_for_verify().stutter);
         assert!(AssumptionSet::default_for_theorem_or_lemma().stutter);
     }
 

@@ -274,6 +274,9 @@ pub fn try_encode_slot_expr(
             };
 
             if kind != AppHeadKind::Query {
+                if let Some(expanded) = ctx.vctx.defs.expand_app(expr) {
+                    return try_encode_slot_expr(ctx, &expanded, step);
+                }
                 return Err(format!(
                     "slot expression reached pure application `{full_name}` \
                      without expansion; App in slot encoding is reserved for \

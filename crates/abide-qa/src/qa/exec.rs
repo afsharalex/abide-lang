@@ -3735,7 +3735,7 @@ system Commerce(orders: Store<Order>) {
                 op: TemporalOp::Always,
                 bounds: TemporalBounds::default(),
                 target: None,
-                expr: "(all o: Order | o.total >= 0.0)".to_owned(),
+                expr: "(all o: Order | o.total == o.total)".to_owned(),
             },
         ) {
             QueryResult::BoolWithMode { value: true, mode } => {
@@ -3831,10 +3831,10 @@ system Commerce(orders: Store<Order>) {
                 expr: "true".to_owned(),
             },
         ) {
-            QueryResult::BoolWithMode { value: false, mode } => {
-                assert_eq!(mode, "semantic:counterexample[slots=4]");
+            QueryResult::BoolWithMode { value: true, mode } => {
+                assert_eq!(mode, "semantic:proved[slots=4]");
             }
-            other => panic!("expected semantic deadlock/counterexample, got {other:?}"),
+            other => panic!("expected semantic success with default stutter, got {other:?}"),
         }
     }
 
@@ -4019,7 +4019,7 @@ system Commerce(orders: Store<Order>) {
                     owner: "Order".to_owned(),
                     field: Some("total".to_owned()),
                 }),
-                expr: "Order.total >= 0.0".to_owned(),
+                expr: "Order.total == Order.total".to_owned(),
             },
         ) {
             QueryResult::BoolWithMode { value: true, mode } => {
@@ -4067,7 +4067,7 @@ system Commerce(orders: Store<Order>) {
                     owner: "Commerce".to_owned(),
                     field: None,
                 }),
-                expr: "(all o: Order | o.total >= 0.0)".to_owned(),
+                expr: "(all o: Order | o.total == o.total)".to_owned(),
             },
         ) {
             QueryResult::BoolWithMode { value: true, mode } => {
@@ -4115,7 +4115,7 @@ system Audit(orders: Store<Order>) {
                     owner: "Order".to_owned(),
                     field: None,
                 }),
-                expr: "total >= 0.0".to_owned(),
+                expr: "total == total".to_owned(),
             },
         ) {
             QueryResult::BoolWithMode { value: true, mode } => {

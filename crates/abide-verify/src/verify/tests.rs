@@ -162,24 +162,11 @@ fn make_order_ir(assert_expr: IRExpr, bound: usize) -> IRProgram {
         procs: vec![],
     };
 
-    // / revised: these tests exercise the
-    // verification dispatcher (BMC, induction, IC3) on a fixture
-    // whose only event (`confirm_order`) requires an active Order
-    // and there is no `create_order` event. Under verify's
-    // default no-stutter assumption, the BMC trace cannot extend
-    // past the initial state and the new direct deadlock
-    // detection would short-circuit every test in this module to
-    // a Deadlock verdict — masking the BMC/IC3/induction logic
-    // the tests are actually trying to cover.
-    //
-    // The verify block here mirrors what a user would write as
-    // `verify... { assume { stutter }... }`: the construct is
-    // still `verify` (not `theorem`), but the assumption set has
-    // explicitly opted into stutter. We construct the
-    // IRAssumptionSet directly rather than calling
-    // `default_for_theorem_or_lemma()` to avoid muddying the
-    // construct kind — verify blocks default to no stutter, the
-    // stutter here is the user's explicit opt-in.
+    // These tests exercise the verification dispatcher (BMC, induction, IC3)
+    // on a fixture whose only event (`confirm_order`) requires an active Order
+    // and there is no `create_order` event. Stutter stays enabled so the BMC
+    // trace can extend and the tests cover the dispatcher path rather than
+    // deadlock reporting.
     let verify = IRVerify {
         name: "test_verify".to_owned(),
         depth: Some(bound),
@@ -11731,15 +11718,9 @@ fn ic3_proves_property_induction_cannot() {
         verifies: vec![IRVerify {
             name: "v".to_owned(),
             depth: None,
-            // opt into stutter so the BMC trace can
-            // extend. The fixture system has no creates and
-            // `step` requires an active Counter — under verify's
-            // default no-stutter assumption, deadlock detection
-            // would short-circuit before BMC ran. We construct
-            // the IRAssumptionSet directly (rather than via the
-            // theorem helper) to keep the construct kind clear:
-            // verify defaults to no-stutter and this stutter is
-            // the user's explicit opt-in.
+            // Keep stutter enabled so the BMC trace can extend.
+            // The fixture system has no creates and `step`
+            // requires an active Counter.
             stores: vec![],
             assumption_set: crate::ir::types::IRAssumptionSet {
                 stutter: true,
@@ -12079,15 +12060,9 @@ fn make_two_counter_ir() -> IRProgram {
         verifies: vec![IRVerify {
             name: "v".to_owned(),
             depth: None,
-            // opt into stutter so the BMC trace can
-            // extend. The fixture system has no creates and
-            // `step` requires an active Counter — under verify's
-            // default no-stutter assumption, deadlock detection
-            // would short-circuit before BMC ran. We construct
-            // the IRAssumptionSet directly (rather than via the
-            // theorem helper) to keep the construct kind clear:
-            // verify defaults to no-stutter and this stutter is
-            // the user's explicit opt-in.
+            // Keep stutter enabled so the BMC trace can extend.
+            // The fixture system has no creates and `step`
+            // requires an active Counter.
             stores: vec![],
             assumption_set: crate::ir::types::IRAssumptionSet {
                 stutter: true,
@@ -21432,7 +21407,7 @@ fn cvc5_bmc_failures_carry_operational_witnesses_without_degradation() {
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {\n  \
-         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n  }\n  \
+         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    no stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     );
     let config = VerifyConfig {
@@ -21486,7 +21461,7 @@ fn cvc5_bmc_failures_can_carry_relational_witnesses_without_degradation() {
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {\n  \
-         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n  }\n  \
+         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    no stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     );
     let config = VerifyConfig {
@@ -21979,7 +21954,7 @@ fn fixture_counterexample_deadlock_and_liveness_results_carry_operational_witnes
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {\n  \
-         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n  }\n  \
+         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    no stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     );
     let deep_dead_state = verify_all(&deadlock_ir, &VerifyConfig::default());
@@ -22033,7 +22008,7 @@ fn fixture_counterexample_deadlock_and_liveness_results_can_carry_relational_wit
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {\n  \
-         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n  }\n  \
+         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    no stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     );
     let config = VerifyConfig {
@@ -23919,9 +23894,11 @@ fn relational_verify_fragment_checks_create_only_safety() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "pending_orders")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "pending_orders"
+        )),
         "create-only bounded verify should check through the relational backend: {results:?}"
     );
 }
@@ -24013,9 +23990,11 @@ fn relational_verify_fragment_checks_create_and_update_safety() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "known_statuses")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "known_statuses"
+        )),
         "create-plus-apply bounded verify should check through the relational backend: {results:?}"
     );
 }
@@ -24110,9 +24089,11 @@ fn relational_verify_fragment_checks_finite_transition_args_safety() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "never_cancelled")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "never_cancelled"
+        )),
         "transition-arg bounded verify should check through the relational backend: {results:?}"
     );
 }
@@ -24188,9 +24169,11 @@ fn relational_verify_fragment_supports_sequential_multi_action_step_bodies() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "known_statuses")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "known_statuses"
+        )),
         "sequential multi-action bounded verify should check through the relational backend: {results:?}"
     );
 }
@@ -24228,9 +24211,11 @@ fn relational_verify_fragment_checks_two_entity_pools() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "known_state")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "known_state"
+        )),
         "two-entity bounded verify should check through the relational backend: {results:?}"
     );
 }
@@ -24417,9 +24402,11 @@ fn relational_verify_fragment_checks_cross_entity_ref_and_args_safety() {
     );
     let results = verify_all(&ir, &VerifyConfig::default());
     assert!(
-        results.iter().any(
-            |r| matches!(r, VerificationResult::Checked { name, .. } if name == "synced_orders_not_cancelled")
-        ),
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. }
+                | VerificationResult::Proved { name, .. } if name == "synced_orders_not_cancelled"
+        )),
         "cross-entity ref+arg bounded verify should check through the relational backend: {results:?}"
     );
 }

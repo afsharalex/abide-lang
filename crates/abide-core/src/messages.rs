@@ -65,7 +65,7 @@ pub const ASSUME_STUTTER_CONFLICT: &str =
 
 /// Hint accompanying `ASSUME_STUTTER_CONFLICT`.
 pub const HINT_ASSUME_STUTTER_CONFLICT: &str =
-    "remove one — `stutter` opts in, `no stutter` opts out";
+    "remove one — stutter is the default, `no stutter` opts out";
 
 /// Diagnostic when a command path inside `assume { fair PATH }` does not
 /// resolve to a known command in scope.
@@ -304,7 +304,7 @@ pub const THEOREM_STEP_UNKNOWN: &str = "Z3 returned unknown when checking induct
 pub const THEOREM_VACUOUS_UNDER_NO_STUTTER: &str =
     "trace cannot extend under `assume { no stutter }` — no command/action is enabled at the \
      current step and stutter is opted out, so the induction step would be vacuously \
-     discharged. Add `assume { stutter }` to allow stutter steps, or fix the \
+     discharged. Remove `no stutter` to allow stutter steps, or fix the \
      precondition that traps the system.";
 
 // ── Derived field messages ──────────────────────────────────────────

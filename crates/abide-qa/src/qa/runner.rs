@@ -425,7 +425,6 @@ system Commerce(orders: Store<Order>) {
 load "spec.ab"
 ask always on Commerce true
 artifacts
-show artifact deadlock:qa_temporal_always_on_commerce_true
 "#,
         )
         .expect("write script");
@@ -435,19 +434,11 @@ show artifact deadlock:qa_temporal_always_on_commerce_true
         assert!(result
             .output
             .iter()
-            .any(|line| line.contains("false [semantic:counterexample[slots=4]]")));
+            .any(|line| line.contains("true [semantic:proved[slots=4]]")));
         assert!(result
             .output
             .iter()
-            .any(|line| line.contains("stored 1 artifact(s)")));
-        assert!(result
-            .output
-            .iter()
-            .any(|line| line.contains("#1 deadlock qa_temporal_always_on_commerce_true")));
-        assert!(result
-            .output
-            .iter()
-            .any(|line| line.contains("witness kind: deadlock")));
+            .any(|line| line.contains("No stored artifacts.")));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -499,15 +490,8 @@ ask always on Commerce true
             .collect::<Vec<_>>();
         assert!(json_lines.iter().any(|value| {
             value["verb"] == "ask"
-                && value["value"] == false
-                && value["mode"] == "semantic:counterexample[slots=4]"
-        }));
-        assert!(json_lines.iter().any(|value| {
-            value["verb"] == "artifact"
-                && value["status"] == "stored"
-                && value["id"] == 1
-                && value["kind"] == "deadlock"
-                && value["selector"] == "deadlock:qa_temporal_always_on_commerce_true"
+                && value["value"] == true
+                && value["mode"] == "semantic:proved[slots=4]"
         }));
 
         let _ = fs::remove_dir_all(&dir);

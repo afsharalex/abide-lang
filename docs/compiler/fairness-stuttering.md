@@ -7,22 +7,19 @@ across the current verifier surfaces.
 
 | Construct | Default stutter | Fairness default |
 | --- | --- | --- |
-| `verify` | off | no fair commands |
-| QA semantic temporal query | off | no fair commands |
+| `verify` | on | no fair commands |
+| QA semantic temporal query | on | no fair commands |
 | `theorem` | on | no fair commands |
 | `lemma` | on | no fair commands |
 | auto-verified `prop` | on | no fair commands |
 
-`verify` blocks use no-stutter semantics by default so deadlocks remain visible.
-Users opt into stuttering with `assume { stutter }`.
-
-`theorem`, `lemma`, and auto-verified `prop` declarations use stuttering by
-default because those proof obligations are interpreted over TLA-style
+`verify`, `theorem`, `lemma`, and auto-verified `prop` declarations use
+stuttering by default because obligations are interpreted over TLA-style
 behaviors unless the user writes `assume { no stutter }`.
 
 QA semantic temporal queries are lowered to synthetic `verify` blocks, not
-synthetic theorems. They therefore use no-stutter defaults and report deadlocks
-instead of silently accepting infinite idle behavior.
+synthetic theorems. They therefore inherit the same default stuttering behavior
+as `verify`.
 
 ## Fairness Strength
 
@@ -64,6 +61,7 @@ Backends that support temporal reasoning must preserve the effective
   must decline those obligations so another backend can handle them or report a
   precise unsupported result.
 - External TLC oracles must not add stronger fairness than the matching Abide
-  `assume { ... }` block. When Abide uses no-stutter semantics, a TLC model may
-  use an explicit real-transition fairness approximation only to rule out infinite
-  synthetic stuttering before the target condition is reached.
+  `assume { ... }` block. When an Abide check explicitly opts into
+  `no stutter`, a TLC model may use an explicit real-transition fairness
+  approximation only to rule out infinite synthetic stuttering before the target
+  condition is reached.

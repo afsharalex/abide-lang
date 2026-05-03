@@ -31,13 +31,10 @@ system CreateInChoose(tasks: Store<Task>, auditLogs: Store<AuditLog>) {
 // After start_with_log fires, if a task became InProgress then
 // an AuditLog must exist. Should be CHECKED.
 //
-// Opt into stutter so the BMC trace can vacuously hold
-// when no Tasks have been created (the system has no create_task
-// step; under no-stutter the deadlock detector would short-circuit
-// before BMC ran).
+// Default stutter lets the BMC trace vacuously hold when no Tasks have been
+// created.
 verify create_in_choose {
   assume {
-    stutter
     store tasks: Task[0..3]
     store auditLogs: AuditLog[0..3]
     let createInChoose = CreateInChoose { tasks: tasks, auditLogs: auditLogs }
@@ -99,12 +96,9 @@ system CrossCallInChoose(tasks: Store<Task>) {
 
 // After completing a task, it should be Done. Should be CHECKED.
 //
-// Opt into stutter for the same reason as create_in_choose:
-// the system has no create_task step, so a no-stutter trace can't
-// extend past the initial state.
+// Default stutter lets the trace extend even when no task exists.
 verify crosscall_in_choose {
   assume {
-    stutter
     store tasks: Task[0..3]
     let crossCallInChoose = CrossCallInChoose { tasks: tasks }
   }
@@ -140,10 +134,9 @@ system ForAllInChoose(tasks: Store<Task>, workers: Store<Worker>) {
 // After the step, if a task is InProgress then no worker should
 // remain InProgress (they were all deactivated). Should be CHECKED.
 //
-// Opt into stutter for the same reason: there is no `create_task` step.
+// Default stutter lets the trace extend even when no task exists.
 verify forall_in_choose {
   assume {
-    stutter
     store tasks: Task[0..3]
     store workers: Worker[0..3]
     let forAllInChoose = ForAllInChoose { tasks: tasks, workers: workers }
@@ -182,7 +175,6 @@ system CrossEntityApply(tasks: Store<Task>, workers: Store<Worker>) {
 // Worker slot must be framed to prevent the solver from mutating it.
 verify cross_entity_target {
   assume {
-    stutter
     store tasks: Task[0..5]
     store workers: Worker[0..5]
     let crossEntityApply = CrossEntityApply { tasks: tasks, workers: workers }

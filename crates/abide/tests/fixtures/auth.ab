@@ -130,14 +130,11 @@ prop deleted_is_final for Auth =
 
 // Bounded checks
 //
-// Opt into stutter: the system has no `create_user` command,
-// so under verify's default no-stutter assumption the BMC trace
-// cannot extend past the initial state. The properties are vacuously
-// true when no Users exist; stutter lets the trace remain valid
-// through the bound while the verifier checks that.
+// The system has no `create_user` command. Default stutter lets the trace
+// remain valid through the bound while the verifier checks properties that are
+// vacuously true when no Users exist.
 verify auth_safety {
   assume {
-    stutter
     store users: User[0..10]
     store sessions: Session[0..10]
     let auth = Auth { users: users, sessions: sessions }

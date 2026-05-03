@@ -1866,7 +1866,7 @@ mod tests {
             .expect("supported");
 
         assert_eq!(transition_system.transitions.len(), 4);
-        assert!(!transition_system.allow_stutter);
+        assert!(transition_system.allow_stutter);
         assert!(transition_system
             .transitions
             .iter()

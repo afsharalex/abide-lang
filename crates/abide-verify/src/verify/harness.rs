@@ -444,9 +444,11 @@ pub(super) fn build_step_params(params: &[IRTransParam], step: usize) -> HashMap
 /// Returns: `event_1(step) OR event_2(step) OR... [OR stutter(step)]`
 ///
 /// Stutter is **conditional** on the verification site's
-/// `assume { stutter }` block.
+/// assumption set. `verify`, `theorem`, and `lemma` default to stutter on;
+/// use `assume { no stutter }` when a blocked state should be reported as
+/// deadlock rather than treated as an idle behavior.
 /// The construct defaults are:
-/// * `verify` → stutter off (closed-system, deadlock-detecting)
+/// * `verify` → stutter on (TLA+-style idle steps)
 /// * `theorem`/`lemma` → stutter on (refinement-friendly, TLA+-style)
 ///   The caller passes the verification site's `IRAssumptionSet` so each
 ///   site sees the trace model it actually opted into.

@@ -192,14 +192,11 @@ prop eventual_resolution for DocumentMgmt =
 
 // Bounded checks
 //
-// Opt into stutter: the system has no `create_document`
-// step, so under verify's default no-stutter assumption the BMC
-// trace cannot extend past the initial state. The properties are
-// vacuously true when no Documents exist; stutter lets the trace
-// remain valid through the bound while the verifier checks that.
+// The system has no `create_document` command. Default stutter lets the
+// trace remain valid through the bound while the verifier checks properties
+// that are vacuously true when no Documents exist.
 verify workflow_safety {
   assume {
-    stutter
     store documents: Document[0..10]
     store auditEntrys: AuditEntry[0..10]
     let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }
@@ -211,7 +208,6 @@ verify workflow_safety {
 
 verify workflow_liveness {
   assume {
-    stutter
     store documents: Document[0..5]
     store auditEntrys: AuditEntry[0..5]
     let documentMgmt = DocumentMgmt { documents: documents, auditEntrys: auditEntrys }

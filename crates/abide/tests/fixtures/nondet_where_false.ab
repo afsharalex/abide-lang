@@ -17,17 +17,15 @@ system S(impossibles: Store<Impossible>) {
 
 // Vacuously true: no Impossible entity can ever be created.
 //
-// Opt into stutter so the BMC trace can extend even though
-// `mk` appears enabled to the deadlock detector (an inactive slot
-// exists) but is actually unsatisfiable when fired (the create body
-// asserts `x where false`). With stutter on, the trace can stutter
-// indefinitely with no Impossible entities and the universal
+// Default stutter lets the BMC trace extend even though `mk` appears enabled
+// to the deadlock detector (an inactive slot exists) but is actually
+// unsatisfiable when fired (the create body asserts `x where false`). The trace
+// can stutter indefinitely with no Impossible entities and the universal
 // quantifier is vacuously true.
 verify where_false_vacuous {
   assume {
     store impossibles: Impossible[0..3]
     let s = S { impossibles: impossibles }
-    stutter
     fair S::mk
   }
   assert always all t: Impossible | false

@@ -320,7 +320,7 @@ fn parse_source(src: &str) -> abide::ast::Program {
 }
 
 #[test]
-fn assumption_set_verify_default_no_stutter() {
+fn assumption_set_verify_default_stutter() {
     let src = r"module T
 
 enum S = A | B
@@ -336,7 +336,7 @@ verify v {
 ";
     let result = elaborate_source(src);
     let v = result.verifies.iter().find(|v| v.name == "v").expect("v");
-    assert!(!v.assumption_set.stutter, "verify default is no stutter");
+    assert!(v.assumption_set.stutter, "verify default is stutter");
     assert!(v.assumption_set.weak_fair.is_empty());
     assert!(v.assumption_set.strong_fair.is_empty());
 }
@@ -1351,7 +1351,7 @@ fn cli_verify_verbose_prints_human_readable_details() {
         "expected verbose output to include the labeled miette failure: stderr={stderr}"
     );
     assert!(
-        stderr.contains("Loop fairness analysis:"),
+        stderr.contains("Fairness"),
         "expected verbose output to include the failure witness trace: stderr={stderr}"
     );
 }
@@ -1730,6 +1730,7 @@ verify deadlocked {
   assume {
     store sigs: Sig[0..1]
     let s = S { sigs: sigs }
+    no stutter
   }
   assert always all s: Sig | not s.flag
 }
@@ -2414,13 +2415,13 @@ fn verify_contracts_cli_output() {
         "CLI should succeed for valid contracts"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PROVED  fn abs"), "should show abs proved");
+    assert!(stdout.contains("PROVED: fn abs"), "should show abs proved");
     assert!(
-        stdout.contains("PROVED  fn max_val"),
+        stdout.contains("PROVED: fn max_val"),
         "should show max_val proved"
     );
     assert!(
-        stdout.contains("PROVED  fn clamp"),
+        stdout.contains("PROVED: fn clamp"),
         "should show clamp proved"
     );
 }
@@ -2436,7 +2437,7 @@ fn verify_contracts_no_fn_verify_flag() {
     // With --no-fn-verify, no fn contract results should appear
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("PROVED  fn"),
+        !stdout.contains("PROVED: fn"),
         "no fn contract results should appear with --no-fn-verify"
     );
 }
@@ -3211,7 +3212,7 @@ fn verify_valid_nested_while_proves() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED  fn matrix_sum"),
+        stdout.contains("PROVED: fn matrix_sum"),
         "should show matrix_sum proved: {stdout}"
     );
 }
@@ -3250,7 +3251,7 @@ fn verify_imperative_if_else_with_assignments() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED  fn conditional_assign"),
+        stdout.contains("PROVED: fn conditional_assign"),
         "should show conditional_assign proved: {stdout}"
     );
 }
@@ -3294,7 +3295,7 @@ fn verify_branch_condition_propagated_to_loop() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED  fn branch_inner"),
+        stdout.contains("PROVED: fn branch_inner"),
         "should prove branch_inner: {stdout}"
     );
 }
@@ -3510,15 +3511,15 @@ fn verify_call_site_cli_output() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED  fn caller_good"),
+        stdout.contains("PROVED: fn caller_good"),
         "caller_good proved: {stdout}"
     );
     assert!(
-        stdout.contains("PROVED  fn caller_literal"),
+        stdout.contains("PROVED: fn caller_literal"),
         "caller_literal proved: {stdout}"
     );
     assert!(
-        stdout.contains("PROVED  fn add_positive"),
+        stdout.contains("PROVED: fn add_positive"),
         "add_positive proved: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3793,12 +3794,12 @@ fn verify_termination_cli_output() {
     assert!(!output.status.success(), "should fail due to bad_recurse");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED  fn factorial"),
+        stdout.contains("PROVED: fn factorial"),
         "factorial proved: {stdout}"
     );
-    assert!(stdout.contains("PROVED  fn fib"), "fib proved: {stdout}");
+    assert!(stdout.contains("PROVED: fn fib"), "fib proved: {stdout}");
     assert!(
-        stdout.contains("PROVED  fn no_recursion"),
+        stdout.contains("PROVED: fn no_recursion"),
         "no_recursion proved: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4068,19 +4069,14 @@ fn verify_one_lone_fixture() {
 fn verify_nonentity_quantifier_in_verify_block() {
     let dir = tempfile::tempdir().expect("create tempdir");
 
-    // False property: not all Colors are Red.
-    // opt into stutter so the empty system has a valid trace
-    // (verify defaults to no-stutter; with no events the BMC would
-    // otherwise have no transitions to encode).
+    // False property: not all Colors are Red. The empty system has a valid
+    // trace under the default stutter semantics.
     let file = dir.path().join("enum_quant_verify.ab");
     std::fs::write(
         &file,
         "module T\n\nenum Color = Red | Green | Blue\n\nsystem S {}\n\n\
          verify q {
   assume {
-    store es: E[0..1]
-    let s = S { es: es }
-  stutter
   }\n  assert all c: Color | c == @Color::Red\n}\n",
     )
     .unwrap();
@@ -4479,20 +4475,19 @@ fn verify_liveness_per_tuple_fairness() {
     );
 }
 
-/// / revised: when stutter is opted out (verify default
-/// per revised), a system that reaches a state where no events
-/// are enabled must be reported as DEADLOCK, not silently as CHECKED.
+/// When stutter is explicitly opted out, a system that reaches a state where
+/// no events are enabled must be reported as DEADLOCK, not silently as CHECKED.
 ///
 /// The fixture below has a single event whose `requires false` precondition
-/// is never satisfiable. Under ambient stutter, the verifier could stutter
-/// forever and report a property-style verdict. Under no-stutter (the
-/// default), the BMC's transition constraint is unsatisfiable from the
-/// initial state, and the new direct deadlock detection turns that into
-/// a Deadlock verdict instead of a misleading Checked.
+/// is never satisfiable. Under ambient stutter, the verifier can stutter
+/// forever and report a property-style verdict. Under explicit no-stutter,
+/// the BMC's transition constraint is unsatisfiable from the initial state,
+/// and direct deadlock detection turns that into a Deadlock verdict instead
+/// of a misleading Checked.
 #[test]
 fn verify_deadlock_when_no_events_enabled() {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let file = dir.path().join("deadlock_simple.ab");
+    let file = dir.path().join("deadlock_no_stutter.ab");
     std::fs::write(
         &file,
         "module T\n\n\
@@ -4501,8 +4496,9 @@ fn verify_deadlock_when_no_events_enabled() {
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify deadlocked {
   assume {
-    store es: E[0..3]
-    let s = S { es: es }
+    store sigs: Sig[0..3]
+    let s = S { sigs: sigs }
+    no stutter
   }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     )
@@ -4524,25 +4520,24 @@ fn verify_deadlock_when_no_events_enabled() {
 
     assert!(
         matches!(result_for, abide::verify::VerificationResult::Deadlock { .. }),
-        "verify block with no enabled events under no-stutter must report DEADLOCK, not CHECKED or COUNTEREXAMPLE: got {result_for:?}"
+        "verify block with explicit no-stutter and no enabled events must report DEADLOCK, not CHECKED or COUNTEREXAMPLE: got {result_for:?}"
     );
 }
 
-/// opting into stutter via `assume { stutter }` recovers the
-/// earlier behavior — the same fixture above no longer reports
+/// The default stutter behavior means the same fixture no longer reports
 /// DEADLOCK because the BMC can extend the trace via stutter steps.
 #[test]
-fn verify_no_deadlock_when_stutter_opted_in() {
+fn verify_no_deadlock_when_stutter_default_applies() {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let file = dir.path().join("deadlock_with_stutter.ab");
+    let file = dir.path().join("deadlock_with_default_stutter.ab");
     std::fs::write(
         &file,
         "module T\n\n\
          entity Sig {\n  flag: bool = false\n}\n\n\
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
-         verify with_stutter {\n  \
-         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n    stutter\n  }\n  \
+         verify with_default_stutter {\n  \
+         assume {\n    store sigs: Sig[0..3]\n    let s = S { sigs: sigs }\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     )
     .unwrap();
@@ -4555,14 +4550,16 @@ fn verify_no_deadlock_when_stutter_opted_in() {
         .find(|r| match r {
             abide::verify::VerificationResult::Checked { name, .. }
             | abide::verify::VerificationResult::Proved { name, .. }
-            | abide::verify::VerificationResult::Deadlock { name, .. } => name == "with_stutter",
+            | abide::verify::VerificationResult::Deadlock { name, .. } => {
+                name == "with_default_stutter"
+            }
             _ => false,
         })
-        .expect("with_stutter result");
+        .expect("with_default_stutter result");
 
     assert!(
         !matches!(result_for, abide::verify::VerificationResult::Deadlock { .. }),
-        "verify block with `assume {{ stutter }}` must NOT report DEADLOCK (the stutter self-loop is always a valid trace step, so the property is checked normally): got {result_for:?}"
+        "verify block with default stutter must NOT report DEADLOCK (the stutter self-loop is always a valid trace step, so the property is checked normally): got {result_for:?}"
     );
 }
 
@@ -14060,7 +14057,7 @@ fn deadlock_display_includes_step_and_diagnostics() {
          system S(sigs: Store<Sig>) {\n  \
          command impossible() requires false { create Sig {} }\n}\n\n\
          verify dl {\n  assume {\n    store es: Sig[0..3]\n    \
-         let s = S { sigs: es }\n  }\n  \
+         let s = S { sigs: es }\n    no stutter\n  }\n  \
          assert always all s: Sig | s.flag == false\n}\n",
     )
     .unwrap();
@@ -14107,7 +14104,7 @@ fn deadlock_event_diagnostics() {
          system S(es: Store<E>) {\n  \
          command go() { choose e: E where e.s == @B { e.go() } }\n}\n\n\
          verify deadlocks_at_init {\n  assume {\n    store es: E[0..2]\n    \
-         let s = S { es: es }\n  }\n  \
+         let s = S { es: es }\n    no stutter\n  }\n  \
          assert eventually true\n}\n",
     )
     .unwrap();

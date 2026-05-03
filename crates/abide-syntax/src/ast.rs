@@ -769,7 +769,8 @@ pub enum AssumeItem {
     Fair { path: EventPath, span: Span },
     /// `strong fair Sys::event` — strong fairness on the named event.
     StrongFair { path: EventPath, span: Span },
-    /// `stutter` — opt-in to stutter steps for this verification site.
+    /// `stutter` — explicit stutter marker for this verification site.
+    /// Stutter is the default; this is accepted for clarity.
     Stutter { span: Span },
     /// `no stutter` — opt-out of stutter steps for this verification site.
     NoStutter { span: Span },
