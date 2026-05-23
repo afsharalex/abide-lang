@@ -2080,6 +2080,7 @@ fn validate_action(
                 steps,
                 step_indices,
                 value_locals,
+                slot_locals,
                 active_calls,
             )? {
                 return Err("unsupported LetCrossCall in explicit-state fragment".to_owned());
@@ -2108,6 +2109,7 @@ fn validate_action(
                         steps,
                         step_indices,
                         value_locals,
+                        slot_locals,
                         active_calls,
                     )?;
                     return Ok(value_locals.clone());
@@ -2226,6 +2228,7 @@ fn validate_action(
                 steps,
                 step_indices,
                 value_locals,
+                slot_locals,
                 active_calls,
             )?;
             Ok(value_locals.clone())
@@ -2254,6 +2257,7 @@ fn validate_action(
                         steps,
                         step_indices,
                         value_locals,
+                        slot_locals,
                         active_calls,
                     )? {
                         return Err("unsupported match in explicit-state fragment".to_owned());
@@ -2308,6 +2312,7 @@ fn validate_cross_call_like(
     steps: &[ExplicitStepRef<'_>],
     step_indices: &HashMap<(String, String), usize>,
     value_locals: &HashSet<String>,
+    slot_locals: &HashMap<String, usize>,
     active_calls: &mut HashSet<(String, String)>,
 ) -> Result<bool, String> {
     let Some(step_index) = step_indices.get(&(system.to_owned(), command.to_owned())) else {
@@ -2334,7 +2339,7 @@ fn validate_cross_call_like(
                 system_field_types,
                 entity_specs,
                 value_locals,
-                &HashMap::new(),
+                slot_locals,
             )
         {
             active_calls.remove(&call_key);
@@ -2635,6 +2640,7 @@ fn execute_action(
                 args,
                 Some(current_system),
                 value_locals,
+                slot_locals,
             )? {
                 let Some(result) = result else {
                     return Err("unsupported LetCrossCall in explicit-state fragment".to_owned());
@@ -2662,6 +2668,7 @@ fn execute_action(
                         args,
                         Some(current_system),
                         value_locals,
+                        slot_locals,
                     );
                 }
                 return Err("unsupported apply in explicit-state fragment".to_owned());
@@ -2795,6 +2802,7 @@ fn execute_action(
             args,
             Some(current_system),
             value_locals,
+            slot_locals,
         ),
         IRAction::Match { scrutinee, arms } => {
             let mut branches = Vec::new();
@@ -2819,6 +2827,7 @@ fn execute_action(
                         args,
                         Some(current_system),
                         value_locals,
+                        slot_locals,
                     )? {
                         let Some(result) = result else {
                             return Err("unsupported match in explicit-state fragment".to_owned());
@@ -2876,6 +2885,7 @@ fn execute_cross_call_like(
     args: &[IRExpr],
     caller_system: Option<&str>,
     value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<Vec<ExplicitActionState>, String> {
     Ok(execute_cross_call_like_result(
         model,
@@ -2886,6 +2896,7 @@ fn execute_cross_call_like(
         args,
         caller_system,
         value_locals,
+        slot_locals,
     )?
     .into_iter()
     .map(|(state, _, choices)| (state, value_locals.clone(), choices))
@@ -2901,6 +2912,7 @@ fn execute_cross_call_like_result(
     args: &[IRExpr],
     caller_system: Option<&str>,
     value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<Vec<(ExplicitState, Option<ExplicitValue>, Vec<op::Choice>)>, String> {
     let callees = model.steps_by_key(system, command);
     if callees.is_empty() {
@@ -2928,7 +2940,7 @@ fn execute_cross_call_like_result(
                         &model.system_field_indices,
                         &model.entity_specs,
                         value_locals,
-                        &HashMap::new(),
+                        slot_locals,
                     )?,
                 ))
             })
@@ -5490,6 +5502,138 @@ mod tests {
             &HashMap::new(),
         )
         .expect("action match payload bindings should execute guards and bodies");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0.system_values[0], ExplicitValue::Bool(true));
+    }
+
+    #[test]
+    fn explicit_state_cross_call_args_can_read_choose_slot_fields() {
+        let ticket_spec = ExplicitEntitySpec {
+            name: "Ticket".to_owned(),
+            slot_count: 1,
+            fields: vec![IRField {
+                name: "decision".to_owned(),
+                ty: total_payload_enum_type(),
+                default: None,
+                initial_constraint: None,
+            }],
+            field_indices: HashMap::from([("decision".to_owned(), 0usize)]),
+            transitions: HashMap::new(),
+            fsm_decls: Vec::new(),
+        };
+        let record_step = Box::leak(Box::new(IRSystemAction {
+            name: "record".to_owned(),
+            params: vec![IRTransParam {
+                name: "flag".to_owned(),
+                ty: IRType::Bool,
+            }],
+            guard: bool_lit(true),
+            body: vec![IRAction::ExprStmt {
+                expr: bin(
+                    "OpEq",
+                    prime(var("recorded", IRType::Bool)),
+                    var("flag", IRType::Bool),
+                ),
+            }],
+            return_expr: None,
+        }));
+        let system_fields = HashMap::from([
+            ("Audit::recorded".to_owned(), 0usize),
+            ("recorded".to_owned(), 0usize),
+        ]);
+        let system_field_types = HashMap::from([
+            ("Audit::recorded".to_owned(), IRType::Bool),
+            ("recorded".to_owned(), IRType::Bool),
+        ]);
+        let steps = vec![ExplicitStepRef {
+            system: "Audit".to_owned(),
+            store_param_count: 0,
+            step: record_step,
+        }];
+        let step_indices = HashMap::from([(("Audit".to_owned(), "record".to_owned()), 0usize)]);
+        let arg = IRExpr::Field {
+            expr: Box::new(IRExpr::Field {
+                expr: Box::new(var(
+                    "ticket",
+                    IRType::Entity {
+                        name: "Ticket".to_owned(),
+                    },
+                )),
+                field: "decision".to_owned(),
+                ty: total_payload_enum_type(),
+                span: None,
+            }),
+            field: "allowed".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let action = IRAction::Choose {
+            var: "ticket".to_owned(),
+            entity: "Ticket".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![IRAction::CrossCall {
+                system: "Audit".to_owned(),
+                command: "record".to_owned(),
+                args: vec![arg],
+            }],
+        };
+        let entity_specs = vec![ticket_spec];
+
+        validate_actions(
+            std::slice::from_ref(&action),
+            "Queue",
+            &system_fields,
+            &system_field_types,
+            &entity_specs,
+            &steps,
+            &step_indices,
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("cross-call args should validate against choose slot fields");
+
+        let model = ExplicitModel {
+            roots: vec!["Audit".to_owned(), "Queue".to_owned()],
+            system_fields: vec![ExplicitFieldRef {
+                system: "Audit".to_owned(),
+                field: "recorded".to_owned(),
+            }],
+            system_field_indices: system_fields,
+            entity_specs,
+            entity_indices: HashMap::from([("Ticket".to_owned(), 0usize)]),
+            steps,
+            step_indices,
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let state = ExplicitState {
+            system_values: vec![ExplicitValue::Bool(false)],
+            entity_slots: vec![vec![ExplicitEntitySlotState {
+                active: true,
+                values: vec![ExplicitValue::Enum {
+                    enum_name: "Decision".to_owned(),
+                    variant: "Accept".to_owned(),
+                    fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+                }],
+            }]],
+        };
+
+        let outcomes = execute_actions(
+            &model,
+            state,
+            "Queue",
+            &[action],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("cross-call args should execute against choose slot fields");
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0.system_values[0], ExplicitValue::Bool(true));

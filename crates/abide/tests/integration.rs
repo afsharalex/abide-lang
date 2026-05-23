@@ -7262,6 +7262,64 @@ verify explicit_payload_create_constraint {
 }
 
 #[test]
+fn explicit_state_verifier_supports_cross_call_args_from_choose_slots() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject { allowed: bool }
+
+entity Ticket {
+  decision: Decision where $.allowed == true
+}
+
+system Audit {
+  recorded: bool = false
+
+  command record(flag: bool) {
+    recorded' = flag
+  }
+}
+
+system Queue(tickets: Store<Ticket>) {
+  command process() {
+    choose ticket: Ticket where true {
+      Audit::record(ticket.decision.allowed)
+    }
+  }
+}
+
+verify explicit_cross_call_choose_slot_arg {
+  assume {
+    let audit = Audit {}
+    store tickets: Ticket[1]
+    let queue = Queue { tickets: tickets }
+    stutter
+  }
+
+  assert always (recorded or not recorded)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_cross_call_choose_slot_arg"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "cross-call args should allow fields from choose slot bindings through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn unit_enum_match_patterns_use_bare_constructor_syntax() {
     let src = r"module T
 
