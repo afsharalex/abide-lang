@@ -6413,6 +6413,262 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
 }
 
 #[test]
+fn build_system_chc_supports_macro_step_let_match_routing() {
+    let (entity, mut tys) = make_simple_entity();
+    let outcome_ty = IRTypeEntry {
+        name: "DecisionOutcome".to_owned(),
+        ty: IRType::Enum {
+            name: "DecisionOutcome".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        },
+    };
+    tys.push(outcome_ty.clone());
+
+    let helper = IRSystem {
+        name: "Decision".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec![],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "decide".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![],
+            return_expr: Some(IRExpr::Ctor {
+                enum_name: "DecisionOutcome".to_owned(),
+                ctor: "Open".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+
+    let shop = IRSystem {
+        name: "Shop".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "tick".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![
+                IRAction::LetCrossCall {
+                    name: "decision".to_owned(),
+                    system: "Decision".to_owned(),
+                    command: "decide".to_owned(),
+                    args: vec![],
+                },
+                IRAction::Match {
+                    scrutinee: IRActionMatchScrutinee::Var {
+                        name: "decision".to_owned(),
+                    },
+                    arms: vec![
+                        IRActionMatchArm {
+                            pattern: IRPattern::PCtor {
+                                name: "Open".to_owned(),
+                                fields: vec![],
+                            },
+                            guard: None,
+                            body: vec![IRAction::Choose {
+                                var: "o".to_owned(),
+                                entity: "Order".to_owned(),
+                                filter: Box::new(IRExpr::Lit {
+                                    ty: IRType::Bool,
+                                    value: LitVal::Bool { value: true },
+                                    span: None,
+                                }),
+                                ops: vec![IRAction::Apply {
+                                    target: "o".to_owned(),
+                                    transition: "confirm".to_owned(),
+                                    args: vec![],
+                                    refs: vec![],
+                                }],
+                            }],
+                        },
+                        IRActionMatchArm {
+                            pattern: IRPattern::PWild,
+                            guard: None,
+                            body: vec![IRAction::ExprStmt {
+                                expr: IRExpr::Lit {
+                                    ty: IRType::Bool,
+                                    value: LitVal::Bool { value: true },
+                                    span: None,
+                                },
+                            }],
+                        },
+                    ],
+                },
+            ],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity.clone()],
+        systems: vec![shop.clone(), helper.clone()],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Forall {
+        var: "o".to_owned(),
+        domain: IRType::Entity {
+            name: "Order".to_owned(),
+        },
+        body: Box::new(IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_system_chc(
+        &[&entity],
+        &[&shop, &helper],
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+    )
+    .expect("system CHC should route macro-step let/match actions");
+    assert!(chc.contains("Shop_tick_match_1_arm0_choose_0_s0_confirm"));
+}
+
+#[test]
+fn system_action_encoder_supports_nested_macro_step_let_match_routing() {
+    let (entity, mut tys) = make_simple_entity();
+    tys.push(IRTypeEntry {
+        name: "DecisionOutcome".to_owned(),
+        ty: IRType::Enum {
+            name: "DecisionOutcome".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        },
+    });
+    let helper = IRSystem {
+        name: "Decision".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec![],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "decide".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![],
+            return_expr: Some(IRExpr::Ctor {
+                enum_name: "DecisionOutcome".to_owned(),
+                ctor: "Open".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity.clone()],
+        systems: vec![helper.clone()],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let actions = vec![
+        IRAction::LetCrossCall {
+            name: "decision".to_owned(),
+            system: "Decision".to_owned(),
+            command: "decide".to_owned(),
+            args: vec![],
+        },
+        IRAction::Match {
+            scrutinee: IRActionMatchScrutinee::Var {
+                name: "decision".to_owned(),
+            },
+            arms: vec![IRActionMatchArm {
+                pattern: IRPattern::PCtor {
+                    name: "Open".to_owned(),
+                    fields: vec![],
+                },
+                guard: None,
+                body: vec![IRAction::Apply {
+                    target: "o".to_owned(),
+                    transition: "confirm".to_owned(),
+                    args: vec![],
+                    refs: vec![],
+                }],
+            }],
+        },
+    ];
+    let mut chc = String::new();
+    let mut visited = HashSet::new();
+    visited.insert(("Shop".to_owned(), "tick".to_owned()));
+
+    encode_ops_chc(
+        &mut chc,
+        &actions,
+        &[&entity],
+        &entity,
+        "Order",
+        0,
+        "o",
+        &vctx,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+        "Order_0_f0 Order_0_f1 Order_0_f2 Order_0_active",
+        &[&helper],
+        "unit",
+        &["Order_0_active".to_owned()],
+        &mut visited,
+    )
+    .expect("nested action encoder should route macro-step let/match actions");
+    assert!(chc.contains("unit_match_1_arm0_confirm"));
+}
+
+#[test]
 fn system_scope_translators_cover_scoped_value_guard_and_cross_entity_paths() {
     let (entity, tys) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, tys.clone());

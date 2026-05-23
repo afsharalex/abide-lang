@@ -31,6 +31,42 @@ pub(in crate::verify::ic3) fn encode_step_chc(
     extra_guards: &[String],
     visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
+    encode_step_chc_scoped(
+        chc,
+        actions,
+        event_guard,
+        entities,
+        vctx,
+        slots_per_entity,
+        all_vars_str,
+        all_systems,
+        rule_prefix,
+        extra_guards,
+        visited,
+        &HashMap::new(),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::format_push_string
+)]
+fn encode_step_chc_scoped(
+    chc: &mut String,
+    actions: &[IRAction],
+    event_guard: &IRExpr,
+    entities: &[&IREntity],
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    all_systems: &[&IRSystem],
+    rule_prefix: &str,
+    extra_guards: &[String],
+    visited: &mut HashSet<(String, String)>,
+    local_terms: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut local_terms = local_terms.clone();
     for (ai, action) in actions.iter().enumerate() {
         match action {
             IRAction::Choose {
@@ -53,9 +89,9 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                     let mut choose_guards = extra_guards.to_vec();
                     choose_guards.push(active_var);
                     choose_guards.push(evt_guard);
-                    choose_guards.push(filter_smt);
+                    choose_guards.push(wrap_action_locals(filter_smt, &local_terms));
 
-                    encode_ops_chc(
+                    encode_ops_chc_scoped(
                         chc,
                         ops,
                         entities,
@@ -70,6 +106,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                         &format!("{rule_prefix}_choose_{ai}_s{slot}"),
                         &choose_guards,
                         visited,
+                        &local_terms,
                     )?;
                 }
             }
@@ -92,7 +129,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                     forall_guards.push(active_var);
                     forall_guards.push(evt_guard);
 
-                    encode_ops_chc(
+                    encode_ops_chc_scoped(
                         chc,
                         ops,
                         entities,
@@ -107,6 +144,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                         &format!("{rule_prefix}_forall_{ai}_s{slot}"),
                         &forall_guards,
                         visited,
+                        &local_terms,
                     )?;
                 }
             }
@@ -164,7 +202,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                     cc_guards.push(evt_guard_smt);
                 }
 
-                let result = encode_step_chc(
+                let result = encode_step_chc_scoped(
                     chc,
                     &evt.body,
                     &evt.guard,
@@ -176,6 +214,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
                     &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
                     &cc_guards,
                     visited,
+                    &local_terms,
                 );
                 visited.remove(&key);
                 result?;
@@ -183,10 +222,75 @@ pub(in crate::verify::ic3) fn encode_step_chc(
             IRAction::ExprStmt { .. } => {
                 // No state change — correct to not generate a rule.
             }
-            IRAction::LetCrossCall { .. } | IRAction::Match { .. } => {
-                return Err(
-                    "macro-step command let/match is not yet supported in IC3 encoding".to_owned(),
-                );
+            IRAction::LetCrossCall {
+                name,
+                system: target_sys,
+                command: target_evt,
+                ..
+            } => {
+                let call_guards =
+                    top_level_action_guards(extra_guards, event_guard, &local_terms)?;
+                let return_value = encode_macro_call_chc(
+                    chc,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    target_sys,
+                    target_evt,
+                    &format!("{rule_prefix}_let_{ai}_{target_sys}_{target_evt}"),
+                    &call_guards,
+                    visited,
+                    &local_terms,
+                )?
+                .ok_or_else(|| {
+                    format!("macro-step binding requires `{target_sys}::{target_evt}` to return a value")
+                })?;
+                local_terms.insert(name.clone(), return_value);
+            }
+            IRAction::Match { scrutinee, arms } => {
+                let match_guards =
+                    top_level_action_guards(extra_guards, event_guard, &local_terms)?;
+                let scrut = encode_action_match_scrutinee(
+                    chc,
+                    scrutinee,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    rule_prefix,
+                    ai,
+                    &match_guards,
+                    visited,
+                    &local_terms,
+                )?;
+                for (arm_index, arm) in arms.iter().enumerate() {
+                    let mut arm_guards = extra_guards.to_vec();
+                    arm_guards.push(ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?);
+                    let mut arm_locals = local_terms.clone();
+                    for (name, term) in ic3_match_pattern_bindings(&scrut, &arm.pattern, vctx)? {
+                        arm_locals.insert(name, term);
+                    }
+                    if let Some(guard) = &arm.guard {
+                        arm_guards.push(encode_non_entity_guard_with_locals(guard, &arm_locals)?);
+                    }
+                    encode_step_chc_scoped(
+                        chc,
+                        &arm.body,
+                        event_guard,
+                        entities,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_match_{ai}_arm{arm_index}"),
+                        &arm_guards,
+                        visited,
+                        &arm_locals,
+                    )?;
+                }
             }
             IRAction::Apply { .. } => {
                 return Err(
@@ -205,6 +309,7 @@ pub(in crate::verify::ic3) fn encode_step_chc(
 /// `bound_var` is the variable name from the enclosing Choose/ForAll — Apply
 /// targets are validated against it to catch malformed IR.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(dead_code)]
 pub(in crate::verify::ic3) fn encode_ops_chc(
     chc: &mut String,
     ops: &[IRAction],
@@ -221,6 +326,44 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
     guards: &[String],
     visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
+    encode_ops_chc_scoped(
+        chc,
+        ops,
+        entities,
+        bound_entity,
+        bound_ent_name,
+        bound_slot,
+        bound_var,
+        vctx,
+        slots_per_entity,
+        all_vars_str,
+        all_systems,
+        rule_prefix,
+        guards,
+        visited,
+        &HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn encode_ops_chc_scoped(
+    chc: &mut String,
+    ops: &[IRAction],
+    entities: &[&IREntity],
+    bound_entity: &IREntity,
+    bound_ent_name: &str,
+    bound_slot: usize,
+    bound_var: &str,
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    all_systems: &[&IRSystem],
+    rule_prefix: &str,
+    guards: &[String],
+    visited: &mut HashSet<(String, String)>,
+    local_terms: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut local_terms = local_terms.clone();
     // Reject multi-apply on same entity — IC3's per-Apply CHC rules model
     // sequential transitions as separate derivation steps, not atomic
     // intra-event composition. BMC handles this via intermediate variable
@@ -315,7 +458,7 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                         "cyclic CrossCall detected: {target_sys}.{target_evt}"
                     ));
                 }
-                let result = encode_step_chc(
+                let result = encode_step_chc_scoped(
                     chc,
                     &evt.body,
                     &evt.guard,
@@ -327,6 +470,7 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                     &format!("{rule_prefix}_cc_{oi}_{target_sys}_{target_evt}"),
                     guards,
                     visited,
+                    &local_terms,
                 );
                 visited.remove(&key);
                 result?;
@@ -348,8 +492,8 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                     let active_var = format!("{ent_name}_{slot}_active");
                     let mut nested = guards.to_vec();
                     nested.push(active_var);
-                    nested.push(filter_smt);
-                    encode_ops_chc(
+                    nested.push(wrap_action_locals(filter_smt, &local_terms));
+                    encode_ops_chc_scoped(
                         chc,
                         inner_ops,
                         entities,
@@ -364,6 +508,7 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                         &format!("{rule_prefix}_choose_{oi}_s{slot}"),
                         &nested,
                         visited,
+                        &local_terms,
                     )?;
                 }
             }
@@ -382,7 +527,7 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                     let active_var = format!("{ent_name}_{slot}_active");
                     let mut nested = guards.to_vec();
                     nested.push(active_var);
-                    encode_ops_chc(
+                    encode_ops_chc_scoped(
                         chc,
                         inner_ops,
                         entities,
@@ -397,21 +542,267 @@ pub(in crate::verify::ic3) fn encode_ops_chc(
                         &format!("{rule_prefix}_forall_{oi}_s{slot}"),
                         &nested,
                         visited,
+                        &local_terms,
                     )?;
                 }
             }
             IRAction::ExprStmt { .. } => {
                 // No state change — correct to skip.
             }
-            IRAction::LetCrossCall { .. } | IRAction::Match { .. } => {
-                return Err(
-                    "macro-step command let/match is not yet supported in IC3 nested encoding"
-                        .to_owned(),
-                );
+            IRAction::LetCrossCall {
+                name,
+                system: target_sys,
+                command: target_evt,
+                ..
+            } => {
+                let return_value = encode_macro_call_chc(
+                    chc,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    target_sys,
+                    target_evt,
+                    &format!("{rule_prefix}_let_{oi}_{target_sys}_{target_evt}"),
+                    guards,
+                    visited,
+                    &local_terms,
+                )?
+                .ok_or_else(|| {
+                    format!("macro-step binding requires `{target_sys}::{target_evt}` to return a value")
+                })?;
+                local_terms.insert(name.clone(), return_value);
+            }
+            IRAction::Match { scrutinee, arms } => {
+                let scrut = encode_action_match_scrutinee(
+                    chc,
+                    scrutinee,
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str,
+                    all_systems,
+                    rule_prefix,
+                    oi,
+                    guards,
+                    visited,
+                    &local_terms,
+                )?;
+                for (arm_index, arm) in arms.iter().enumerate() {
+                    let mut arm_guards = guards.to_vec();
+                    arm_guards.push(ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?);
+                    let mut arm_locals = local_terms.clone();
+                    for (name, term) in ic3_match_pattern_bindings(&scrut, &arm.pattern, vctx)? {
+                        arm_locals.insert(name, term);
+                    }
+                    if let Some(guard) = &arm.guard {
+                        arm_guards.push(encode_action_guard_with_locals(
+                            guard,
+                            bound_entity,
+                            vctx,
+                            bound_ent_name,
+                            bound_slot,
+                            &arm_locals,
+                        )?);
+                    }
+                    encode_ops_chc_scoped(
+                        chc,
+                        &arm.body,
+                        entities,
+                        bound_entity,
+                        bound_ent_name,
+                        bound_slot,
+                        bound_var,
+                        vctx,
+                        slots_per_entity,
+                        all_vars_str,
+                        all_systems,
+                        &format!("{rule_prefix}_match_{oi}_arm{arm_index}"),
+                        &arm_guards,
+                        visited,
+                        &arm_locals,
+                    )?;
+                }
             }
         }
     }
     Ok(())
+}
+
+fn top_level_action_guards(
+    extra_guards: &[String],
+    event_guard: &IRExpr,
+    local_terms: &HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let mut guards = extra_guards.to_vec();
+    let evt_guard = encode_non_entity_guard_with_locals(event_guard, local_terms)?;
+    if evt_guard != "true" {
+        guards.push(evt_guard);
+    }
+    Ok(guards)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_macro_call_chc(
+    chc: &mut String,
+    entities: &[&IREntity],
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    all_systems: &[&IRSystem],
+    target_sys: &str,
+    target_evt: &str,
+    rule_prefix: &str,
+    guards: &[String],
+    visited: &mut HashSet<(String, String)>,
+    local_terms: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let sys = all_systems
+        .iter()
+        .find(|s| s.name == *target_sys)
+        .ok_or_else(|| format!("CrossCall target system {target_sys} not found"))?;
+    let evt = sys
+        .actions
+        .iter()
+        .find(|e| e.name == *target_evt)
+        .ok_or_else(|| format!("CrossCall target event {target_sys}.{target_evt} not found"))?;
+
+    let key = (target_sys.to_owned(), target_evt.to_owned());
+    if !visited.insert(key.clone()) {
+        return Err(format!(
+            "cyclic CrossCall detected: {target_sys}.{target_evt}"
+        ));
+    }
+    let result = encode_step_chc_scoped(
+        chc,
+        &evt.body,
+        &evt.guard,
+        entities,
+        vctx,
+        slots_per_entity,
+        all_vars_str,
+        all_systems,
+        rule_prefix,
+        guards,
+        visited,
+        local_terms,
+    );
+    visited.remove(&key);
+    result?;
+
+    evt.return_expr
+        .as_ref()
+        .map(|expr| encode_macro_return_expr(expr, entities, vctx, local_terms))
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_action_match_scrutinee(
+    chc: &mut String,
+    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
+    entities: &[&IREntity],
+    vctx: &VerifyContext,
+    slots_per_entity: &HashMap<String, usize>,
+    all_vars_str: &str,
+    all_systems: &[&IRSystem],
+    rule_prefix: &str,
+    action_index: usize,
+    guards: &[String],
+    visited: &mut HashSet<(String, String)>,
+    local_terms: &HashMap<String, String>,
+) -> Result<String, String> {
+    match scrutinee {
+        crate::ir::types::IRActionMatchScrutinee::Var { name } => local_terms
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("macro-step match references unknown local `{name}`")),
+        crate::ir::types::IRActionMatchScrutinee::CrossCall {
+            system: target_sys,
+            command: target_evt,
+            ..
+        } => {
+            let returned = encode_macro_call_chc(
+                chc,
+                entities,
+                vctx,
+                slots_per_entity,
+                all_vars_str,
+                all_systems,
+                target_sys,
+                target_evt,
+                &format!("{rule_prefix}_match_{action_index}_call_{target_sys}_{target_evt}"),
+                guards,
+                visited,
+                local_terms,
+            )?;
+            returned
+                .ok_or_else(|| "macro-step match requires a returned command outcome".to_owned())
+        }
+    }
+}
+
+fn encode_macro_return_expr(
+    expr: &IRExpr,
+    entities: &[&IREntity],
+    vctx: &VerifyContext,
+    local_terms: &HashMap<String, String>,
+) -> Result<String, String> {
+    let local_names = action_local_names(local_terms);
+    let smt = if let Some(entity) = entities.first() {
+        expr_to_smt_scoped(expr, entity, vctx, &local_names)?
+    } else {
+        let dummy = IREntity {
+            name: "__Unit".to_owned(),
+            fields: vec![],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        expr_to_smt_scoped(expr, &dummy, vctx, &local_names)?
+    };
+    Ok(wrap_action_locals(smt, local_terms))
+}
+
+fn action_local_names(local_terms: &HashMap<String, String>) -> HashSet<String> {
+    local_terms.keys().cloned().collect()
+}
+
+fn wrap_action_locals(smt: String, local_terms: &HashMap<String, String>) -> String {
+    local_terms.iter().fold(smt, |acc, (name, term)| {
+        format!("(let (({name} {term})) {acc})")
+    })
+}
+
+fn encode_action_guard_with_locals(
+    guard: &IRExpr,
+    entity: &IREntity,
+    vctx: &VerifyContext,
+    ent_name: &str,
+    slot: usize,
+    local_terms: &HashMap<String, String>,
+) -> Result<String, String> {
+    let local_names = action_local_names(local_terms);
+    let smt = guard_to_smt_sys_scoped(guard, entity, vctx, ent_name, slot, &local_names)?;
+    Ok(wrap_action_locals(smt, local_terms))
+}
+
+fn encode_non_entity_guard_with_locals(
+    guard: &IRExpr,
+    local_terms: &HashMap<String, String>,
+) -> Result<String, String> {
+    let smt = match guard {
+        IRExpr::Lit {
+            value: LitVal::Bool { value },
+            ..
+        } => value.to_string(),
+        IRExpr::Var { name, ty, .. } if *ty == IRType::Bool && local_terms.contains_key(name) => {
+            name.clone()
+        }
+        _ => return encode_non_entity_guard(guard),
+    };
+    Ok(wrap_action_locals(smt, local_terms))
 }
 
 /// Try to encode an event guard that doesn't reference entity fields.
