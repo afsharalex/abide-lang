@@ -3387,6 +3387,38 @@ fn supports_state_expr(
                 slot_locals,
             )
         }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => {
+            supports_state_expr(
+                cond,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            ) && supports_state_expr(
+                then_body,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            ) && supports_state_expr(
+                else_body,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )
+        }
         IRExpr::Forall {
             var, domain, body, ..
         }
@@ -3635,6 +3667,38 @@ fn eval_expr(
                 system_fields,
                 entity_specs,
                 &nested_value_locals,
+                slot_locals,
+            )
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let condition = eval_expr(
+                state,
+                cond,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )?;
+            let selected = if expect_bool(condition)? {
+                then_body
+            } else {
+                else_body
+                    .as_ref()
+                    .ok_or_else(|| "unsupported expression in explicit-state fragment".to_owned())?
+            };
+            eval_expr(
+                state,
+                selected,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
                 slot_locals,
             )
         }
@@ -5177,6 +5241,53 @@ mod tests {
             eval_expr(
                 &state,
                 &let_expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_ifelse() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::from([
+            ("Orders::flag".to_owned(), 0usize),
+            ("flag".to_owned(), 0usize),
+        ]);
+        let system_field_types = HashMap::from([
+            ("Orders::flag".to_owned(), IRType::Bool),
+            ("flag".to_owned(), IRType::Bool),
+        ]);
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let ifelse_expr = IRExpr::IfElse {
+            cond: Box::new(var("flag", IRType::Bool)),
+            then_body: Box::new(bool_lit(false)),
+            else_body: Some(Box::new(bool_lit(true))),
+            span: None,
+        };
+
+        assert!(supports_state_expr(
+            &ifelse_expr,
+            Some("Orders"),
+            &system_fields,
+            &system_field_types,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &ifelse_expr,
                 Some("Orders"),
                 &system_fields,
                 &specs,

@@ -6843,6 +6843,102 @@ verify explicit_let_expression {
 }
 
 #[test]
+fn explicit_state_verifier_supports_ifelse_expressions_from_defs() {
+    let src = r"module T
+
+fn branch(flag: bool): bool {
+  if flag { true } else { false }
+}
+
+system Gate {
+  open: bool = true
+
+  command tick() {}
+}
+
+verify explicit_ifelse_expression {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always branch(open)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_ifelse_expression"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "expanded if/else expressions should prove through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_action_match_guard_constructor_atoms() {
+    let src = r"module T
+
+enum Mode = Open | Closed
+enum Outcome = ok | err
+
+system Provider {
+  command charge() -> Outcome { return @ok }
+}
+
+system Gate {
+  mode: Mode = @Open
+
+  command submit() {
+    match Provider::charge() {
+      ok if mode == @Open => { mode' = @Closed }
+      err => { }
+    }
+  }
+}
+
+verify explicit_action_match_guard_atom {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (mode == @Open or mode == @Closed)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_action_match_guard_atom"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "action match guards should allow constructor atoms through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_nondeterministic_initial_field_constraints() {
     let src = r"module T
 
