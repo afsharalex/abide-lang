@@ -1253,6 +1253,35 @@ fn pattern_binds_vars(pattern: &crate::ir::types::IRPattern) -> bool {
     }
 }
 
+fn collect_pattern_vars(pattern: &crate::ir::types::IRPattern, out: &mut Vec<String>) {
+    use crate::ir::types::IRPattern;
+    match pattern {
+        IRPattern::PVar { name } => out.push(name.clone()),
+        IRPattern::PCtor { fields, .. } => {
+            for field in fields {
+                collect_pattern_vars(&field.pattern, out);
+            }
+        }
+        IRPattern::POr { left, right } => {
+            collect_pattern_vars(left, out);
+            collect_pattern_vars(right, out);
+        }
+        IRPattern::PWild => {}
+    }
+}
+
+fn bindings_mention_any_pattern_var(
+    bindings: &[crate::ir::types::LetBinding],
+    pattern: &crate::ir::types::IRPattern,
+) -> bool {
+    let mut vars = Vec::new();
+    collect_pattern_vars(pattern, &mut vars);
+    bindings.iter().any(|binding| {
+        vars.iter()
+            .any(|var| property_expr_mentions_var(&binding.expr, var))
+    })
+}
+
 fn match_arm_condition_expr(
     scrutinee: IRExpr,
     arm: &crate::ir::types::IRMatchArm,
@@ -1790,7 +1819,10 @@ fn normalize_verifier_choose_term(
             let mut new_arms = Vec::with_capacity(arms.len());
             for arm in arms {
                 let (body_bindings, body) = normalize_verifier_choose_term(&arm.body)?;
-                if bindings_contain_choose(&body_bindings) && pattern_binds_vars(&arm.pattern) {
+                if bindings_contain_choose(&body_bindings)
+                    && pattern_binds_vars(&arm.pattern)
+                    && bindings_mention_any_pattern_var(&body_bindings, &arm.pattern)
+                {
                     return Err(
                         "bare choose inside value match arms with binding patterns is not yet supported in verifier properties"
                             .to_owned(),
@@ -3726,6 +3758,100 @@ mod tests {
 
         let (bindings, normalized) =
             normalize_verifier_choose_term(&expr).expect("match choose normalization");
+        assert_eq!(bindings.len(), 1);
+        assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
+        assert!(matches!(normalized, IRExpr::Match { .. }));
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_independent_choose_in_binding_match_arms() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let match_expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Lit {
+                ty: int_ty.clone(),
+                value: LitVal::Int { value: 0 },
+                span: None,
+            }),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PVar {
+                    name: "scrutinee_value".to_owned(),
+                },
+                guard: None,
+                body: IRExpr::Choose {
+                    var: "candidate".to_owned(),
+                    domain: int_ty.clone(),
+                    predicate: Some(Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "candidate".to_owned(),
+                            ty: int_ty.clone(),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 1 },
+                            span: None,
+                        }),
+                        ty: IRType::Bool,
+                        span: None,
+                    })),
+                    ty: int_ty.clone(),
+                    span: None,
+                },
+            }],
+            span: None,
+        };
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(match_expr),
+            right: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("independent choose in binding match arm should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn normalize_verifier_choose_hoists_independent_binding_match_arm_choices() {
+        let int_ty = IRType::Int;
+        let expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Lit {
+                ty: int_ty.clone(),
+                value: LitVal::Int { value: 0 },
+                span: None,
+            }),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PVar {
+                    name: "scrutinee_value".to_owned(),
+                },
+                guard: None,
+                body: IRExpr::Choose {
+                    var: "candidate".to_owned(),
+                    domain: int_ty.clone(),
+                    predicate: None,
+                    ty: int_ty,
+                    span: None,
+                },
+            }],
+            span: None,
+        };
+
+        let (bindings, normalized) =
+            normalize_verifier_choose_term(&expr).expect("binding match arm choose");
         assert_eq!(bindings.len(), 1);
         assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
         assert!(matches!(normalized, IRExpr::Match { .. }));
