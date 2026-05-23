@@ -7215,6 +7215,51 @@ verify explicit_payload_initial_constraint {
 }
 
 #[test]
+fn explicit_state_verifier_supports_unconstrained_payload_initial_fields() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject { allowed: bool }
+
+entity Ticket {
+  decision: Decision
+}
+
+system Queue(tickets: Store<Ticket>) {
+  command tick() {}
+}
+
+verify explicit_unconstrained_payload_initial_field {
+  assume {
+    store tickets: Ticket[1]
+    let queue = Queue { tickets: tickets }
+    stutter
+  }
+
+  assert always all ticket: Ticket | ticket.decision.allowed or not ticket.decision.allowed
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_unconstrained_payload_initial_field"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "unconstrained payload initial fields should enumerate finite values through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_payload_create_field_constraints() {
     let src = r"module T
 

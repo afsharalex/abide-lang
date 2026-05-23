@@ -1787,6 +1787,9 @@ fn field_initial_values(
     slot: usize,
 ) -> Result<Vec<ExplicitValue>, String> {
     let Some(initial_constraint) = &field.initial_constraint else {
+        if let Some(values) = unconstrained_payload_initial_values(field)? {
+            return Ok(values);
+        }
         return Ok(vec![entity_field_default_value(field, entity_name, slot)?]);
     };
     let candidates = finite_values_for_type(&field.ty)?;
@@ -1883,7 +1886,7 @@ fn build_entity_spec<'a>(
                 ));
             }
         } else {
-            finite_default_value(field)?;
+            field_initial_values(field, &entity.name, 0)?;
         }
         field_indices.insert(field.name.clone(), index);
     }
@@ -4310,6 +4313,21 @@ fn entity_field_default_value(
     }
 }
 
+fn unconstrained_payload_initial_values(
+    field: &IRField,
+) -> Result<Option<Vec<ExplicitValue>>, String> {
+    if field.default.is_some() {
+        return Ok(None);
+    }
+    let IRType::Enum { variants, .. } = &field.ty else {
+        return Ok(None);
+    };
+    if variants.iter().all(|variant| variant.fields.is_empty()) {
+        return Ok(None);
+    }
+    finite_values_for_type(&field.ty).map(Some)
+}
+
 fn finite_values_for_type(ty: &IRType) -> Result<Vec<ExplicitValue>, String> {
     match ty {
         IRType::Bool => Ok(vec![ExplicitValue::Bool(false), ExplicitValue::Bool(true)]),
@@ -5160,6 +5178,37 @@ mod tests {
             )),
             "all enumerated payload values should satisfy allowed=true: {states:?}"
         );
+    }
+
+    #[test]
+    fn explicit_state_unconstrained_payload_fields_enumerate_finite_values() {
+        let field = IRField {
+            name: "decision".to_owned(),
+            ty: total_payload_enum_type(),
+            default: None,
+            initial_constraint: None,
+        };
+        let entity = IREntity {
+            name: "Ticket".to_owned(),
+            fields: vec![field],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+
+        let spec = build_entity_spec(&entity, 1, None)
+            .expect("unconstrained payload fields should validate as finite explicit-state fields");
+        let states =
+            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
+                .expect("unconstrained payload fields should enumerate finite values");
+
+        assert_eq!(states.len(), 4);
+        assert!(states.iter().all(|state| matches!(
+            &state.entity_slots[0][0].values[0],
+            ExplicitValue::Enum { fields, .. }
+                if fields.iter().any(|(name, value)| name == "allowed" && matches!(value, ExplicitValue::Bool(_)))
+        )));
     }
 
     #[test]
