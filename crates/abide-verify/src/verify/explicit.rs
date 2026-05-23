@@ -200,6 +200,29 @@ fn resolve_system_field_type<'a>(
     system_field_types.get(name)
 }
 
+fn field_types_with_params(
+    base: &HashMap<String, IRType>,
+    params: &[IRTransParam],
+) -> HashMap<String, IRType> {
+    let mut out = base.clone();
+    out.extend(
+        params
+            .iter()
+            .map(|param| (param.name.clone(), param.ty.clone())),
+    );
+    out
+}
+
+fn field_types_with_params_and_fields(
+    base: &HashMap<String, IRType>,
+    params: &[IRTransParam],
+    fields: &[IRField],
+) -> HashMap<String, IRType> {
+    let mut out = field_types_with_params(base, params);
+    out.extend(fields.iter().map(|field| (field.name.clone(), field.ty.clone())));
+    out
+}
+
 impl<'a> ExplicitModel<'a> {
     fn system_is_scheduled(&self, system: &str) -> bool {
         self.roots.iter().any(|root| root == system)
@@ -285,11 +308,12 @@ impl<'a> ExplicitModel<'a> {
                 .iter()
                 .map(|param| param.name.clone())
                 .collect::<HashSet<_>>();
+            let step_field_types = field_types_with_params(&system_field_types, &step.step.params);
             let final_locals = validate_actions(
                 &step.step.body,
                 &step.system,
                 &system_field_indices,
-                &system_field_types,
+                &step_field_types,
                 &entity_specs,
                 &steps,
                 &step_indices,
@@ -302,7 +326,7 @@ impl<'a> ExplicitModel<'a> {
                     return_expr,
                     Some(&step.system),
                     &system_field_indices,
-                    &system_field_types,
+                    &step_field_types,
                     &entity_specs,
                     &final_locals,
                     &HashMap::new(),
@@ -415,11 +439,12 @@ impl<'a> ExplicitModel<'a> {
                 .iter()
                 .map(|param| param.name.clone())
                 .collect();
+            let step_field_types = field_types_with_params(&system_field_types, &step.step.params);
             if !supports_state_expr(
                 &step.step.guard,
                 Some(&step.system),
                 &system_field_indices,
-                &system_field_types,
+                &step_field_types,
                 &entity_specs,
                 &value_locals,
                 &HashMap::new(),
@@ -430,7 +455,7 @@ impl<'a> ExplicitModel<'a> {
                 &step.step.body,
                 &step.system,
                 &system_field_indices,
-                &system_field_types,
+                &step_field_types,
                 &entity_specs,
                 &steps,
                 &step_indices,
@@ -443,7 +468,7 @@ impl<'a> ExplicitModel<'a> {
                     return_expr,
                     Some(&step.system),
                     &system_field_indices,
-                    &system_field_types,
+                    &step_field_types,
                     &entity_specs,
                     &final_locals,
                     &HashMap::new(),
@@ -2074,6 +2099,8 @@ fn validate_action(
             let mut transition_value_locals = value_locals.clone();
             transition_value_locals.extend(trans.params.iter().map(|param| param.name.clone()));
             transition_value_locals.extend(spec.fields.iter().map(|field| field.name.clone()));
+            let transition_field_types =
+                field_types_with_params_and_fields(system_field_types, &trans.params, &spec.fields);
             if args.len() != trans.params.len() || refs.len() != trans.refs.len() {
                 return Err("unsupported apply in explicit-state fragment".to_owned());
             }
@@ -2100,7 +2127,7 @@ fn validate_action(
                         arg,
                         Some(current_system),
                         system_fields,
-                        system_field_types,
+                        &transition_field_types,
                         entity_specs,
                         value_locals,
                         &transition_slot_locals,
@@ -2113,7 +2140,7 @@ fn validate_action(
                 &trans.guard,
                 Some(current_system),
                 system_fields,
-                system_field_types,
+                &transition_field_types,
                 entity_specs,
                 &transition_value_locals,
                 &transition_slot_locals,
@@ -2126,7 +2153,7 @@ fn validate_action(
                         &update.value,
                         Some(current_system),
                         system_fields,
-                        system_field_types,
+                        &transition_field_types,
                         entity_specs,
                         &transition_value_locals,
                         &transition_slot_locals,
@@ -2142,7 +2169,7 @@ fn validate_action(
                     postcondition,
                     Some(current_system),
                     system_fields,
-                    system_field_types,
+                    &transition_field_types,
                     entity_specs,
                     &transition_value_locals,
                     &transition_slot_locals,
@@ -2270,6 +2297,7 @@ fn validate_cross_call_like(
         return Err("unsupported recursive cross-call in explicit-state fragment".to_owned());
     }
     let mut callee_value_locals = HashSet::new();
+    let callee_field_types = field_types_with_params(system_field_types, &callee.step.params);
     for (arg, param) in args.iter().zip(&callee.step.params) {
         if !supports_explicit_param_type(&param.ty)
             || !supports_state_expr(
@@ -2291,7 +2319,7 @@ fn validate_cross_call_like(
         &callee.step.guard,
         Some(&callee.system),
         system_fields,
-        system_field_types,
+        &callee_field_types,
         entity_specs,
         &callee_value_locals,
         &HashMap::new(),
@@ -2303,7 +2331,7 @@ fn validate_cross_call_like(
         &callee.step.body,
         &callee.system,
         system_fields,
-        system_field_types,
+        &callee_field_types,
         entity_specs,
         steps,
         step_indices,
@@ -2322,7 +2350,7 @@ fn validate_cross_call_like(
             return_expr,
             Some(&callee.system),
             system_fields,
-            system_field_types,
+            &callee_field_types,
             entity_specs,
             &final_locals,
             &HashMap::new(),
@@ -3221,8 +3249,12 @@ fn explicit_expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::UnOp { ty, .. }
         | IRExpr::Field { ty, .. }
         | IRExpr::App { ty, .. }
+        | IRExpr::Choose { ty, .. }
         | IRExpr::Lam { param_type: ty, .. } => Some(ty),
-        IRExpr::Let { body, .. } | IRExpr::Prime { expr: body, .. } => explicit_expr_type(body),
+        IRExpr::IfElse { then_body: body, .. }
+        | IRExpr::Let { body, .. }
+        | IRExpr::Prime { expr: body, .. } => explicit_expr_type(body),
+        IRExpr::Match { arms, .. } => arms.first().and_then(|arm| explicit_expr_type(&arm.body)),
         IRExpr::Ctor { .. } => None,
         _ => None,
     }
@@ -4157,7 +4189,7 @@ fn finite_values_for_type(ty: &IRType) -> Result<Vec<ExplicitValue>, String> {
             }
             Ok(values)
         }
-        _ => Err("explicit-state only supports Bool and fieldless-enum step parameters".to_owned()),
+        _ => Err("explicit-state only supports Bool and finite-enum step parameters".to_owned()),
     }
 }
 
@@ -4332,7 +4364,7 @@ fn ensure_supported_explicit_param_type(ty: &IRType) -> Result<(), String> {
         Ok(())
     } else {
         Err(
-            "explicit-state only supports Bool, fieldless-enum, and entity step parameters"
+            "explicit-state only supports Bool, finite-enum, and entity step parameters"
                 .to_owned(),
         )
     }
@@ -4748,6 +4780,16 @@ mod tests {
         ];
         let bindings = enumerate_param_bindings(&params).unwrap();
         assert_eq!(bindings.len(), 4);
+
+        let payload_params = vec![IRTransParam {
+            name: "decision".to_owned(),
+            ty: payload_enum_type(),
+        }];
+        let payload_bindings = enumerate_param_bindings(&payload_params).unwrap();
+        assert_eq!(payload_bindings.len(), 3);
+        assert!(field_types_with_params(&HashMap::new(), &payload_params)
+            .get("decision")
+            .is_some_and(|ty| enum_payload_type_has_field(ty, "allowed")));
     }
 
     #[test]
@@ -5264,6 +5306,52 @@ mod tests {
     }
 
     #[test]
+    fn explicit_state_payload_step_param_field_projection_validates() {
+        let system_fields = HashMap::from([
+            ("Gate::allowed".to_owned(), 0usize),
+            ("allowed".to_owned(), 0usize),
+        ]);
+        let params = vec![IRTransParam {
+            name: "decision".to_owned(),
+            ty: payload_enum_type(),
+        }];
+        let system_field_types = field_types_with_params(
+            &HashMap::from([
+                ("Gate::allowed".to_owned(), IRType::Bool),
+                ("allowed".to_owned(), IRType::Bool),
+            ]),
+            &params,
+        );
+        let value_names = HashSet::from(["decision".to_owned()]);
+        let action = IRAction::ExprStmt {
+            expr: bin(
+                "OpEq",
+                prime(var("allowed", IRType::Bool)),
+                IRExpr::Field {
+                    expr: Box::new(var("decision", payload_enum_type())),
+                    field: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+            ),
+        };
+
+        validate_actions(
+            &[action],
+            "Gate",
+            &system_fields,
+            &system_field_types,
+            &[],
+            &[],
+            &HashMap::new(),
+            &value_names,
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("payload enum step parameters should support payload field projection");
+    }
+
+    #[test]
     fn explicit_entity_spec_consumes_structured_verify_context_defaults() {
         let entity = IREntity {
             name: "Task".to_owned(),
@@ -5347,6 +5435,22 @@ mod tests {
             ty: enum_type(),
             span: None,
         };
+        let choose_payload_projection = IRExpr::Field {
+            expr: Box::new(IRExpr::Choose {
+                var: "decision".to_owned(),
+                domain: payload_enum_type(),
+                predicate: Some(Box::new(bin(
+                    "OpEq",
+                    var("decision", payload_enum_type()),
+                    payload_enum_ctor(false),
+                ))),
+                ty: payload_enum_type(),
+                span: None,
+            }),
+            field: "allowed".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
 
         for expr in [
             &forall_bool,
@@ -5354,6 +5458,7 @@ mod tests {
             &one_enum,
             &lone_enum,
             &choose_enum,
+            &choose_payload_projection,
         ] {
             assert!(supports_state_expr(
                 expr,
@@ -5433,6 +5538,19 @@ mod tests {
                 variant: "Closed".to_owned(),
                 fields: vec![],
             }
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &choose_payload_projection,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(false)
         );
     }
 

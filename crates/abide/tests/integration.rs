@@ -6444,6 +6444,91 @@ verify explicit_payload_enum {
 }
 
 #[test]
+fn explicit_state_verifier_supports_finite_enum_payload_domains() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  command tick() {}
+}
+
+verify explicit_payload_enum_domains {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (some d: Decision | d == @Accept { allowed: true })
+  assert always ((choose d: Decision where d == @Accept { allowed: false }).allowed == false)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_enum_domains"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state finite enum payload domains should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_finite_enum_payload_step_params() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject { allowed: bool }
+
+system Gate {
+  allowed: bool = false
+
+  command decide(decision: Decision) {
+    allowed' = decision.allowed
+  }
+}
+
+verify explicit_payload_enum_step_param {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (allowed or not allowed)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_enum_step_param"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state finite enum payload step params should prove, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_enum_payload_field_projection() {
     let src = r"module T
 
