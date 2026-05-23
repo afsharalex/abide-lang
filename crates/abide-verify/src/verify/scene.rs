@@ -2255,4 +2255,76 @@ mod tests {
                 if reason.contains("unsupported expression kind in scene then assertion")
         ));
     }
+
+    #[test]
+    fn check_scene_block_supports_finite_setcomp_cardinality_assertions() {
+        let mut ir = empty_ir();
+        ir.entities.push(crate::ir::types::IREntity {
+            name: "Task".to_owned(),
+            fields: vec![crate::ir::types::IRField {
+                name: "id".to_owned(),
+                ty: crate::ir::types::IRType::Identity,
+                default: None,
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        });
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let bool_set_ty = crate::ir::types::IRType::Set {
+            element: Box::new(crate::ir::types::IRType::Bool),
+        };
+        let assertion = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Card {
+                expr: Box::new(IRExpr::SetComp {
+                    var: "b".to_owned(),
+                    domain: crate::ir::types::IRType::Bool,
+                    source: None,
+                    filter: Box::new(IRExpr::Var {
+                        name: "b".to_owned(),
+                        ty: crate::ir::types::IRType::Bool,
+                        span: None,
+                    }),
+                    projection: None,
+                    ty: bool_set_ty,
+                    span: None,
+                }),
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: crate::ir::types::IRType::Int,
+                value: crate::ir::types::LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: crate::ir::types::IRType::Bool,
+            span: None,
+        };
+
+        let result = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "finite_setcomp_cardinality",
+                vec![store_decl("tasks", "Task", 1)],
+                vec![],
+                vec![],
+                vec![assertion],
+                vec![],
+            ),
+            &VerifyConfig::default(),
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                VerificationResult::ScenePass { ref name, .. } if name == "finite_setcomp_cardinality"
+            ),
+            "expected finite set-comprehension cardinality scene to pass, got: {result}"
+        );
+    }
 }

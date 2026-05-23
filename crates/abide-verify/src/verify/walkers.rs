@@ -1252,6 +1252,40 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
         IRExpr::Card { expr, .. } => match expr.as_ref() {
             // Compile-time literal cardinality — always supported
             IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => None,
+            IRExpr::SetComp {
+                source: Some(source),
+                filter,
+                projection,
+                ..
+            } if matches!(
+                source.as_ref(),
+                IRExpr::SetLit { .. } | IRExpr::SeqLit { .. }
+            ) =>
+            {
+                find_unsupported_scene_expr(source)
+                    .or_else(|| find_unsupported_scene_expr(filter))
+                    .or_else(|| {
+                        projection
+                            .as_ref()
+                            .and_then(|p| find_unsupported_scene_expr(p))
+                    })
+            }
+            IRExpr::SetComp {
+                domain: IRType::Bool,
+                source: None,
+                filter,
+                projection: None,
+                ..
+            } => find_unsupported_scene_expr(filter),
+            IRExpr::SetComp {
+                domain,
+                source: None,
+                filter,
+                projection: None,
+                ..
+            } if matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields() => {
+                find_unsupported_scene_expr(filter)
+            }
             // Entity-domain set comprehension — bounded sum over slots
             IRExpr::SetComp {
                 domain: IRType::Entity { .. },
