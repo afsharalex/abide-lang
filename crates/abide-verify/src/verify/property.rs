@@ -1171,6 +1171,40 @@ fn guard_branch_choose_bindings(
         .collect()
 }
 
+fn pattern_binds_vars(pattern: &crate::ir::types::IRPattern) -> bool {
+    use crate::ir::types::IRPattern;
+    match pattern {
+        IRPattern::PVar { .. } => true,
+        IRPattern::PCtor { fields, .. } => fields
+            .iter()
+            .any(|field| pattern_binds_vars(&field.pattern)),
+        IRPattern::POr { left, right } => pattern_binds_vars(left) || pattern_binds_vars(right),
+        IRPattern::PWild => false,
+    }
+}
+
+fn match_arm_condition_expr(
+    scrutinee: IRExpr,
+    arm: &crate::ir::types::IRMatchArm,
+) -> IRExpr {
+    IRExpr::Match {
+        scrutinee: Box::new(scrutinee),
+        arms: vec![
+            crate::ir::types::IRMatchArm {
+                pattern: arm.pattern.clone(),
+                guard: arm.guard.clone(),
+                body: bool_literal(true),
+            },
+            crate::ir::types::IRMatchArm {
+                pattern: crate::ir::types::IRPattern::PWild,
+                guard: None,
+                body: bool_literal(false),
+            },
+        ],
+        span: None,
+    }
+}
+
 pub(super) fn normalize_verifier_choose_expr(expr: &IRExpr) -> Result<IRExpr, String> {
     match expr {
         IRExpr::Let { bindings, body, .. } => {
@@ -1665,15 +1699,18 @@ fn normalize_verifier_choose_term(
             scrutinee, arms, ..
         } => {
             let (scrutinee_bindings, scrutinee) = normalize_verifier_choose_term(scrutinee)?;
+            let mut hoisted_bindings = scrutinee_bindings;
             let mut new_arms = Vec::with_capacity(arms.len());
             for arm in arms {
                 let (body_bindings, body) = normalize_verifier_choose_term(&arm.body)?;
-                if bindings_contain_choose(&body_bindings) {
+                if bindings_contain_choose(&body_bindings) && pattern_binds_vars(&arm.pattern) {
                     return Err(
-                        "bare choose inside value match arms is not yet supported in verifier properties"
+                        "bare choose inside value match arms with binding patterns is not yet supported in verifier properties"
                             .to_owned(),
                     );
                 }
+                let guard = match_arm_condition_expr(scrutinee.clone(), arm);
+                hoisted_bindings.extend(guard_branch_choose_bindings(body_bindings, &guard));
                 new_arms.push(crate::ir::types::IRMatchArm {
                     pattern: arm.pattern.clone(),
                     guard: arm
@@ -1681,11 +1718,11 @@ fn normalize_verifier_choose_term(
                         .as_ref()
                         .map(normalize_verifier_choose_expr)
                         .transpose()?,
-                    body: wrap_let_expr(body_bindings, body),
+                    body,
                 });
             }
             Ok((
-                scrutinee_bindings,
+                hoisted_bindings,
                 IRExpr::Match {
                     scrutinee: Box::new(scrutinee),
                     arms: new_arms,
@@ -2870,7 +2907,10 @@ pub(super) fn encode_card(
 #[allow(clippy::needless_borrows_for_generic_args)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IREntity, IRField, IRProgram, IRSystem, IRType, IRVariant, LitVal};
+    use crate::ir::types::{
+        IREntity, IRField, IRMatchArm, IRPattern, IRProgram, IRSystem, IRType, IRTypeEntry,
+        IRVariant, LitVal,
+    };
     use crate::verify::harness::create_slot_pool;
 
     fn empty_ir() -> IRProgram {
@@ -3483,6 +3523,125 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
         assert!(matches!(normalized, IRExpr::IfElse { .. }));
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_choose_in_value_match_arms() {
+        let outcome_ty = IRTypeEntry {
+            name: "DecisionOutcome".to_owned(),
+            ty: IRType::Enum {
+                name: "DecisionOutcome".to_owned(),
+                variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+            },
+        };
+        let ir = IRProgram {
+            types: vec![outcome_ty.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let choose_one = IRExpr::Choose {
+            var: "candidate".to_owned(),
+            domain: int_ty.clone(),
+            predicate: Some(Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "candidate".to_owned(),
+                    ty: int_ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 1 },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            })),
+            ty: int_ty.clone(),
+            span: None,
+        };
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Match {
+                scrutinee: Box::new(IRExpr::Ctor {
+                    enum_name: "DecisionOutcome".to_owned(),
+                    ctor: "Open".to_owned(),
+                    args: vec![],
+                    span: None,
+                }),
+                arms: vec![
+                    IRMatchArm {
+                        pattern: IRPattern::PCtor {
+                            name: "Open".to_owned(),
+                            fields: vec![],
+                        },
+                        guard: None,
+                        body: choose_one,
+                    },
+                    IRMatchArm {
+                        pattern: IRPattern::PWild,
+                        guard: None,
+                        body: IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 0 },
+                            span: None,
+                        },
+                    },
+                ],
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("choose in value match arm should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn normalize_verifier_choose_hoists_value_match_arm_choices() {
+        let int_ty = IRType::Int;
+        let expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Ctor {
+                enum_name: "DecisionOutcome".to_owned(),
+                ctor: "Open".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PCtor {
+                    name: "Open".to_owned(),
+                    fields: vec![],
+                },
+                guard: None,
+                body: IRExpr::Choose {
+                    var: "candidate".to_owned(),
+                    domain: int_ty.clone(),
+                    predicate: None,
+                    ty: int_ty,
+                    span: None,
+                },
+            }],
+            span: None,
+        };
+
+        let (bindings, normalized) =
+            normalize_verifier_choose_term(&expr).expect("match choose normalization");
+        assert_eq!(bindings.len(), 1);
+        assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
+        assert!(matches!(normalized, IRExpr::Match { .. }));
     }
 
     #[test]
