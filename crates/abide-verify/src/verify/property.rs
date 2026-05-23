@@ -1282,10 +1282,7 @@ fn bindings_mention_any_pattern_var(
     })
 }
 
-fn match_arm_condition_expr(
-    scrutinee: IRExpr,
-    arm: &crate::ir::types::IRMatchArm,
-) -> IRExpr {
+fn match_arm_condition_expr(scrutinee: IRExpr, arm: &crate::ir::types::IRMatchArm) -> IRExpr {
     IRExpr::Match {
         scrutinee: Box::new(scrutinee),
         arms: vec![
@@ -2984,6 +2981,46 @@ pub(super) fn encode_card(
         }
         IRExpr::SetComp {
             var,
+            source: Some(source),
+            filter,
+            projection,
+            ..
+        } => {
+            let elements = match source.as_ref() {
+                IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+                _ => return Err(format!("unsupported cardinality expression: {inner:?}")),
+            };
+            let one = smt::int_lit(1);
+            let zero = smt::int_lit(0);
+            let mut terms = Vec::new();
+            let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
+            for element_expr in elements {
+                let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
+                let inner_ctx = ctx.with_local(var, value.clone());
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
+                let key = if let Some(projection) = projection {
+                    encode_prop_value(pool, vctx, defs, &inner_ctx, projection, step)?
+                } else {
+                    value
+                };
+                let mut include_once = filter_val.clone();
+                for (prior_key, prior_filter) in &prior_keys {
+                    let same_key = smt::smt_eq(&key, prior_key)?;
+                    let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
+                    include_once =
+                        smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
+                }
+                terms.push(smt::int_ite(&include_once, &one, &zero));
+                prior_keys.push((key, filter_val));
+            }
+            if terms.is_empty() {
+                return Ok(smt::int_val(0));
+            }
+            let refs: Vec<&Int> = terms.iter().collect();
+            Ok(SmtValue::Int(smt::int_add(&refs)))
+        }
+        IRExpr::SetComp {
+            var,
             domain: IRType::Bool,
             source: None,
             filter,
@@ -4075,6 +4112,82 @@ mod tests {
 
         let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
             .expect("fieldless enum set-comprehension cardinality should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_finite_sourced_setcomp_cardinality() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let set_int_ty = IRType::Set {
+            element: Box::new(int_ty.clone()),
+        };
+        let card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "x".to_owned(),
+                domain: int_ty.clone(),
+                source: Some(Box::new(IRExpr::SetLit {
+                    elements: vec![
+                        IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 1 },
+                            span: None,
+                        },
+                        IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 2 },
+                            span: None,
+                        },
+                        IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 2 },
+                            span: None,
+                        },
+                    ],
+                    ty: set_int_ty.clone(),
+                    span: None,
+                })),
+                filter: Box::new(IRExpr::BinOp {
+                    op: "OpGt".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: int_ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: int_ty.clone(),
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                projection: None,
+                ty: set_int_ty,
+                span: None,
+            }),
+            span: None,
+        };
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(card),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("finite sourced set-comprehension cardinality should encode");
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
