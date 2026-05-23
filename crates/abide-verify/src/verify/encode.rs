@@ -96,6 +96,83 @@ fn expr_type(expr: &IRExpr) -> Option<&IRType> {
     }
 }
 
+fn expr_mentions_var(expr: &IRExpr, target: &str) -> bool {
+    match expr {
+        IRExpr::Var { name, .. } => name == target,
+        IRExpr::Lit { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => false,
+        IRExpr::Prime { expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. }
+        | IRExpr::Field { expr, .. }
+        | IRExpr::Card { expr, .. }
+        | IRExpr::UnOp { operand: expr, .. } => expr_mentions_var(expr, target),
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. }
+        | IRExpr::Since { left, right, .. } => {
+            expr_mentions_var(left, target) || expr_mentions_var(right, target)
+        }
+        IRExpr::App { func, arg, .. } => {
+            expr_mentions_var(func, target) || expr_mentions_var(arg, target)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings
+                .iter()
+                .any(|binding| expr_mentions_var(&binding.expr, target))
+                || expr_mentions_var(body, target)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_mentions_var(cond, target)
+                || expr_mentions_var(then_body, target)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|body| expr_mentions_var(body, target))
+        }
+        IRExpr::Ctor { args, .. } => args.iter().any(|(_, arg)| expr_mentions_var(arg, target)),
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            expr_mentions_var(map, target)
+                || expr_mentions_var(key, target)
+                || expr_mentions_var(value, target)
+        }
+        IRExpr::Index { map, key, .. } => {
+            expr_mentions_var(map, target) || expr_mentions_var(key, target)
+        }
+        IRExpr::SetLit {
+            elements: items, ..
+        }
+        | IRExpr::SeqLit {
+            elements: items, ..
+        } => items.iter().any(|item| expr_mentions_var(item, target)),
+        IRExpr::MapLit { entries, .. } => entries
+            .iter()
+            .any(|(key, value)| expr_mentions_var(key, target) || expr_mentions_var(value, target)),
+        _ => true,
+    }
+}
+
+fn direct_choose_witness_expr<'a>(var: &str, predicate: &'a IRExpr) -> Option<&'a IRExpr> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = predicate
+    else {
+        return None;
+    };
+    if op != "OpEq" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (IRExpr::Var { name, .. }, candidate) if name == var => Some(candidate),
+        (candidate, IRExpr::Var { name, .. }) if name == var => Some(candidate),
+        _ => None,
+    }
+}
+
 // ── Precondition context ────────────────────────────────────────────
 
 /// Context for call-site precondition checking inside `encode_pure_expr`.
@@ -153,9 +230,26 @@ pub(super) fn encode_pure_expr_inner(
             }
             Err(format!("unbound variable in fn contract: '{name}'"))
         }
-        IRExpr::Choose { .. } => Err(
-            "choose expression is not yet supported in verifier encoding".to_owned(),
-        ),
+        IRExpr::Choose {
+            var, predicate, ..
+        } => {
+            let Some(predicate) = predicate.as_deref() else {
+                return Err(
+                    "choose expression is not yet supported in verifier encoding".to_owned(),
+                );
+            };
+            let Some(witness) = direct_choose_witness_expr(var, predicate) else {
+                return Err(
+                    "choose expression is not yet supported in verifier encoding".to_owned(),
+                );
+            };
+            if expr_mentions_var(witness, var) {
+                return Err(
+                    "choose expression is not yet supported in verifier encoding".to_owned(),
+                );
+            }
+            encode_pure_expr_inner(witness, env, vctx, defs, precheck)
+        }
         IRExpr::RelComp { .. } => {
             Err("relation comprehension is not supported in fn contract encoding".to_owned())
         }
@@ -1957,6 +2051,54 @@ mod tests {
         )
         .expect("bind pattern var");
         assert!(matches!(bound_env.get("captured"), Some(SmtValue::Int(_))));
+    }
+
+    #[test]
+    fn encode_pure_expr_supports_direct_choose_equality_witness() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let env = HashMap::from([("x".to_owned(), smt::int_var("x"))]);
+        let choose = IRExpr::Choose {
+            var: "candidate".to_owned(),
+            domain: IRType::Int,
+            predicate: Some(Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "candidate".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            })),
+            ty: IRType::Int,
+            span: None,
+        };
+
+        let result = encode_pure_expr(&choose, &env, &vctx, &defs)
+            .expect("direct choose equality witness should encode");
+        let solver = AbideSolver::new();
+        solver.assert(&smt::bool_not(&smt::int_eq(
+            result.as_int().expect("choose int"),
+            &smt::int_add(&[smt::int_var("x").as_int().expect("x int"), &smt::int_lit(1)]),
+        )));
+        assert_eq!(solver.check(), SatResult::Unsat);
     }
 
     #[test]

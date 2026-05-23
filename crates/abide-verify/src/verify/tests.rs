@@ -17929,6 +17929,82 @@ fn fn_contract_simple_ensures_proved() {
     );
 }
 
+#[test]
+fn fn_contract_supports_direct_choose_witness_body() {
+    let func = IRFunction {
+        name: "next".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: IRType::Int,
+                predicate: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "candidate".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpAdd".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "x".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                            span: None,
+                        }),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                })),
+                ty: IRType::Int,
+                span: None,
+            }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "result".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        decreases: None,
+        span: None,
+        file: None,
+    };
+
+    let ir = make_fn_ir(func);
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(&results[0], VerificationResult::FnContractProved { name, .. } if name == "next"),
+        "expected direct choose witness fn contract to prove, got: {}",
+        results[0]
+    );
+}
+
 /// fn bad(x: Int): Int ensures result > x = x
 /// Body is just x, but ensures says result > x. Should fail.
 #[test]
