@@ -6571,6 +6571,48 @@ verify explicit_payload_projection {
 }
 
 #[test]
+fn explicit_state_verifier_supports_unconstrained_payload_system_fields() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject { allowed: bool }
+
+system Gate {
+  decision: Decision
+
+  command tick() {}
+}
+
+verify explicit_unconstrained_payload_system_field {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (decision.allowed or not decision.allowed)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_unconstrained_payload_system_field"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "unconstrained payload system fields should enumerate finite values through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_counterexample_preserves_enum_payload_witness() {
     let src = r"module T
 

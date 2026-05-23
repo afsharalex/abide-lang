@@ -237,7 +237,7 @@ impl<'a> ExplicitModel<'a> {
         let mut system_fields = Vec::new();
         let mut system_field_indices = HashMap::new();
         let mut system_field_types = HashMap::new();
-        let mut initial_system_values = Vec::new();
+        let mut initial_system_values = vec![Vec::new()];
         let mut entity_specs = Vec::new();
         let mut entity_indices = HashMap::new();
         for entity in system.relevant_entities() {
@@ -259,7 +259,6 @@ impl<'a> ExplicitModel<'a> {
                 return Ok(None);
             }
             for field in &sys.fields {
-                let value = finite_default_value(field)?;
                 let idx = system_fields.len();
                 system_fields.push(ExplicitFieldRef {
                     system: sys.name.clone(),
@@ -281,7 +280,16 @@ impl<'a> ExplicitModel<'a> {
                         system_field_types.insert(field.name.clone(), field.ty.clone());
                     }
                 }
-                initial_system_values.push(value);
+                let values = enumerate_system_initial_values(std::slice::from_ref(field))?;
+                let mut next_initial_system_values = Vec::new();
+                for prefix in &initial_system_values {
+                    for value_vector in &values {
+                        let mut extended = prefix.clone();
+                        extended.extend(value_vector.clone());
+                        next_initial_system_values.push(extended);
+                    }
+                }
+                initial_system_values = next_initial_system_values;
             }
             for step in &sys.actions {
                 for param in &step.params {
@@ -1729,12 +1737,15 @@ fn strongly_connected_components(
 fn enumerate_initial_states(
     entity_specs: &[ExplicitEntitySpec<'_>],
     active_slots: &HashMap<(usize, usize), bool>,
-    system_values: Vec<ExplicitValue>,
+    system_value_options: Vec<Vec<ExplicitValue>>,
 ) -> Result<Vec<ExplicitState>, String> {
-    let mut states = vec![ExplicitState {
-        system_values,
-        entity_slots: vec![Vec::new(); entity_specs.len()],
-    }];
+    let mut states = system_value_options
+        .into_iter()
+        .map(|system_values| ExplicitState {
+            system_values,
+            entity_slots: vec![Vec::new(); entity_specs.len()],
+        })
+        .collect::<Vec<_>>();
 
     for (entity_index, spec) in entity_specs.iter().enumerate() {
         for slot in 0..spec.slot_count {
@@ -1759,6 +1770,41 @@ fn enumerate_initial_states(
     }
 
     Ok(states)
+}
+
+fn enumerate_system_initial_values(fields: &[IRField]) -> Result<Vec<Vec<ExplicitValue>>, String> {
+    let mut out = vec![Vec::new()];
+    for field in fields {
+        let values = system_field_initial_values(field)?;
+        let mut next = Vec::new();
+        for prefix in &out {
+            for value in &values {
+                let mut extended = prefix.clone();
+                extended.push(value.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Ok(out)
+}
+
+fn system_field_initial_values(field: &IRField) -> Result<Vec<ExplicitValue>, String> {
+    let Some(initial_constraint) = &field.initial_constraint else {
+        if let Some(values) = unconstrained_payload_initial_values(field)? {
+            return Ok(values);
+        }
+        return Ok(vec![finite_default_value(field)?]);
+    };
+    let candidates = finite_values_for_type(&field.ty)?;
+    let accepted = field_values_satisfying_constraint(initial_constraint, candidates)?;
+    if accepted.is_empty() {
+        return Err(format!(
+            "explicit-state initial constraint for field `{}` has no finite values",
+            field.name
+        ));
+    }
+    Ok(accepted)
 }
 
 fn enumerate_slot_initial_values(
@@ -5124,9 +5170,12 @@ mod tests {
             fsm_decls: Vec::new(),
         };
 
-        let states =
-            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
-                .unwrap();
+        let states = enumerate_initial_states(
+            &[spec],
+            &HashMap::from([((0usize, 0usize), true)]),
+            vec![vec![]],
+        )
+        .unwrap();
 
         assert_eq!(states.len(), 1);
         assert!(states[0].entity_slots[0][0].active);
@@ -5164,9 +5213,12 @@ mod tests {
 
         let spec = build_entity_spec(&entity, 1, None)
             .expect("payload initial constraints should validate as explicit-state finite");
-        let states =
-            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
-                .expect("payload initial constraints should enumerate finite values");
+        let states = enumerate_initial_states(
+            &[spec],
+            &HashMap::from([((0usize, 0usize), true)]),
+            vec![vec![]],
+        )
+        .expect("payload initial constraints should enumerate finite values");
 
         assert_eq!(states.len(), 2);
         assert!(states[0].entity_slots[0][0].active);
@@ -5199,13 +5251,36 @@ mod tests {
 
         let spec = build_entity_spec(&entity, 1, None)
             .expect("unconstrained payload fields should validate as finite explicit-state fields");
-        let states =
-            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
-                .expect("unconstrained payload fields should enumerate finite values");
+        let states = enumerate_initial_states(
+            &[spec],
+            &HashMap::from([((0usize, 0usize), true)]),
+            vec![vec![]],
+        )
+        .expect("unconstrained payload fields should enumerate finite values");
 
         assert_eq!(states.len(), 4);
         assert!(states.iter().all(|state| matches!(
             &state.entity_slots[0][0].values[0],
+            ExplicitValue::Enum { fields, .. }
+                if fields.iter().any(|(name, value)| name == "allowed" && matches!(value, ExplicitValue::Bool(_)))
+        )));
+    }
+
+    #[test]
+    fn explicit_state_unconstrained_payload_system_fields_enumerate_finite_values() {
+        let fields = vec![IRField {
+            name: "decision".to_owned(),
+            ty: total_payload_enum_type(),
+            default: None,
+            initial_constraint: None,
+        }];
+
+        let values = enumerate_system_initial_values(&fields)
+            .expect("unconstrained payload system fields should enumerate finite values");
+
+        assert_eq!(values.len(), 4);
+        assert!(values.iter().all(|system_values| matches!(
+            &system_values[0],
             ExplicitValue::Enum { fields, .. }
                 if fields.iter().any(|(name, value)| name == "allowed" && matches!(value, ExplicitValue::Bool(_)))
         )));
