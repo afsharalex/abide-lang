@@ -1109,6 +1109,76 @@ fn bindings_contain_choose(bindings: &[crate::ir::types::LetBinding]) -> bool {
         .any(|binding| matches!(binding.expr, IRExpr::Choose { .. }))
 }
 
+fn property_expr_mentions_var(expr: &IRExpr, target: &str) -> bool {
+    match expr {
+        IRExpr::Var { name, .. } => name == target,
+        IRExpr::Lit { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => false,
+        IRExpr::Prime { expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. }
+        | IRExpr::Field { expr, .. }
+        | IRExpr::Card { expr, .. }
+        | IRExpr::UnOp { operand: expr, .. } => property_expr_mentions_var(expr, target),
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. }
+        | IRExpr::Since { left, right, .. } => {
+            property_expr_mentions_var(left, target) || property_expr_mentions_var(right, target)
+        }
+        IRExpr::App { func, arg, .. } => {
+            property_expr_mentions_var(func, target) || property_expr_mentions_var(arg, target)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            bindings
+                .iter()
+                .any(|binding| property_expr_mentions_var(&binding.expr, target))
+                || property_expr_mentions_var(body, target)
+        }
+        IRExpr::Choose { var, predicate, .. } => {
+            var != target
+                && predicate
+                    .as_ref()
+                    .is_some_and(|predicate| property_expr_mentions_var(predicate, target))
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            property_expr_mentions_var(cond, target)
+                || property_expr_mentions_var(then_body, target)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|body| property_expr_mentions_var(body, target))
+        }
+        IRExpr::Ctor { args, .. } => args
+            .iter()
+            .any(|(_, arg)| property_expr_mentions_var(arg, target)),
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            property_expr_mentions_var(map, target)
+                || property_expr_mentions_var(key, target)
+                || property_expr_mentions_var(value, target)
+        }
+        IRExpr::Index { map, key, .. } => {
+            property_expr_mentions_var(map, target) || property_expr_mentions_var(key, target)
+        }
+        IRExpr::SetLit {
+            elements: items, ..
+        }
+        | IRExpr::SeqLit {
+            elements: items, ..
+        } => items
+            .iter()
+            .any(|item| property_expr_mentions_var(item, target)),
+        IRExpr::MapLit { entries, .. } => entries.iter().any(|(key, value)| {
+            property_expr_mentions_var(key, target) || property_expr_mentions_var(value, target)
+        }),
+        _ => true,
+    }
+}
+
 fn bool_literal(value: bool) -> IRExpr {
     IRExpr::Lit {
         ty: IRType::Bool,
@@ -1644,14 +1714,31 @@ fn normalize_verifier_choose_term(
                 .map_or((Vec::new(), None), |(bindings, expr)| {
                     (bindings, Some(Box::new(expr)))
                 });
-            if bindings_contain_choose(&projection_bindings) {
+            let hoist_projection_bindings = !projection_bindings.is_empty()
+                && projection_bindings.iter().all(|binding| {
+                    matches!(binding.expr, IRExpr::Choose { .. })
+                        && !property_expr_mentions_var(&binding.expr, var)
+                });
+            if bindings_contain_choose(&projection_bindings) && !hoist_projection_bindings {
                 return Err(
                     "bare choose inside set comprehension projections is not yet supported in verifier properties"
                         .to_owned(),
                 );
             }
+            let projection = projection.map(|expr| {
+                if hoist_projection_bindings {
+                    expr
+                } else {
+                    Box::new(wrap_let_expr(projection_bindings.clone(), *expr))
+                }
+            });
+            let outer_bindings = if hoist_projection_bindings {
+                projection_bindings
+            } else {
+                Vec::new()
+            };
             Ok((
-                Vec::new(),
+                outer_bindings,
                 IRExpr::SetComp {
                     var: var.clone(),
                     domain: domain.clone(),
@@ -3642,6 +3729,117 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
         assert!(matches!(normalized, IRExpr::Match { .. }));
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_independent_choose_in_setcomp_projection() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let set_int_ty = IRType::Set {
+            element: Box::new(int_ty.clone()),
+        };
+        let set_comp = IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: int_ty.clone(),
+            source: Some(Box::new(IRExpr::SetLit {
+                elements: vec![IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }],
+                ty: set_int_ty.clone(),
+                span: None,
+            })),
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: int_ty.clone(),
+                predicate: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "candidate".to_owned(),
+                        ty: int_ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: int_ty.clone(),
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                })),
+                ty: int_ty.clone(),
+                span: None,
+            })),
+            ty: set_int_ty,
+            span: None,
+        };
+        let property = IRExpr::Index {
+            map: Box::new(set_comp),
+            key: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("independent choose in set-comprehension projection should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn normalize_verifier_choose_hoists_independent_setcomp_projection_choices() {
+        let int_ty = IRType::Int;
+        let set_int_ty = IRType::Set {
+            element: Box::new(int_ty.clone()),
+        };
+        let expr = IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: int_ty.clone(),
+            source: Some(Box::new(IRExpr::SetLit {
+                elements: vec![IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }],
+                ty: set_int_ty.clone(),
+                span: None,
+            })),
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: int_ty.clone(),
+                predicate: None,
+                ty: int_ty,
+                span: None,
+            })),
+            ty: set_int_ty,
+            span: None,
+        };
+
+        let (bindings, normalized) =
+            normalize_verifier_choose_term(&expr).expect("setcomp projection choose");
+        assert_eq!(bindings.len(), 1);
+        assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
+        assert!(matches!(normalized, IRExpr::SetComp { .. }));
     }
 
     #[test]
