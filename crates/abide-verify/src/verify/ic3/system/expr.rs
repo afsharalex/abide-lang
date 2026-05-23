@@ -51,6 +51,49 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_scoped(
                 binding.name, witness, rest_smt
             ));
         }
+        if let Some(witness) = ic3_direct_choose_witness(
+            var,
+            domain,
+            predicate.as_deref(),
+            locals,
+            |term, scope| expr_to_smt_sys_scoped(term, entity, vctx, ent_name, slot, scope),
+            |predicate, scope| {
+                guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
+            },
+            |scrutinee, pattern, scope| {
+                let scrut = expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
+                ic3_match_pattern_bindings(&scrut, pattern, vctx)
+            },
+            |scrutinee, pattern, scope| {
+                let scrut = expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
+                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            },
+        )? {
+            return ic3_witness_binding_formula(
+                &binding.name,
+                var,
+                witness,
+                predicate.as_deref(),
+                locals,
+                |predicate, scope| {
+                    guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
+                },
+                rest_smt,
+            );
+        }
+        if let Some(formula) = ic3_quantified_choose_formula(
+            &binding.name,
+            var,
+            domain,
+            predicate.as_deref(),
+            locals,
+            |predicate, scope| {
+                guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
+            },
+            rest_smt.clone(),
+        )? {
+            return Ok(formula);
+        }
         return Err("choose is not yet supported in IC3 CHC encoding for this domain".to_owned());
     }
 

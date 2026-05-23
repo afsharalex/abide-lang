@@ -4032,6 +4032,113 @@ fn build_multi_slot_chc_supports_payload_field_projection_in_transition_updates(
 }
 
 #[test]
+fn build_system_chc_supports_direct_choose_in_event_guards() {
+    let (entity, tys) = make_simple_entity();
+    let system = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "process".to_owned(),
+            params: vec![],
+            guard: IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: "threshold".to_owned(),
+                    ty: IRType::Int,
+                    expr: IRExpr::Choose {
+                        var: "candidate".to_owned(),
+                        domain: IRType::Int,
+                        predicate: Some(Box::new(ic3_bin(
+                            "OpGt",
+                            ic3_var("candidate", IRType::Int),
+                            ic3_int_lit(1),
+                            IRType::Bool,
+                        ))),
+                        ty: IRType::Int,
+                        span: None,
+                    },
+                }],
+                body: Box::new(ic3_bin(
+                    "OpGt",
+                    ic3_var("threshold", IRType::Int),
+                    ic3_int_lit(1),
+                    IRType::Bool,
+                )),
+                span: None,
+            },
+            body: vec![IRAction::Choose {
+                var: "order".to_owned(),
+                entity: "Order".to_owned(),
+                filter: Box::new(ic3_bin(
+                    "OpEq",
+                    ic3_field(
+                        "order",
+                        "status",
+                        IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        tys[0].ty.clone(),
+                    ),
+                    ic3_status_ctor("Pending"),
+                    IRType::Bool,
+                )),
+                ops: vec![IRAction::Apply {
+                    target: "order".to_owned(),
+                    transition: "confirm".to_owned(),
+                    refs: vec![],
+                    args: vec![],
+                }],
+            }],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(ic3_bool_lit(true)),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_system_chc(
+        &[&ir.entities[0]],
+        &[&ir.systems[0]],
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+    )
+    .expect("system CHC should encode direct choose witnesses in event guards");
+
+    assert!(chc.contains("(let ((threshold (+ 1 1)))"));
+}
+
+#[test]
 fn multi_slot_value_encoder_supports_payload_field_projection() {
     let (entity, tys) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, tys.clone());
@@ -6908,6 +7015,38 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
     .expect("plain system let");
     assert!(plain_let.contains("(let ((limit (+ Order_0_f2 1))"));
     assert!(plain_let.contains("(=> ok"));
+
+    let direct_choose_let = guard_let_to_smt_sys_scoped(
+        &[LetBinding {
+            name: "threshold".to_owned(),
+            ty: IRType::Int,
+            expr: IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: IRType::Int,
+                predicate: Some(Box::new(ic3_bin(
+                    "OpGt",
+                    ic3_var("candidate", IRType::Int),
+                    ic3_int_lit(1),
+                    IRType::Bool,
+                ))),
+                ty: IRType::Int,
+                span: None,
+            },
+        }],
+        &ic3_bin(
+            "OpGt",
+            ic3_var("threshold", IRType::Int),
+            ic3_int_lit(1),
+            IRType::Bool,
+        ),
+        &entity,
+        &vctx,
+        "Order",
+        0,
+        &HashSet::new(),
+    )
+    .expect("system guard let should synthesize a direct choose witness");
+    assert!(direct_choose_let.contains("(let ((threshold (+ 1 1)))"));
 
     assert!(guard_let_to_smt_sys_scoped(
         &[LetBinding {
