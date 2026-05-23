@@ -1917,12 +1917,13 @@ fn validate_actions(
     active_calls: &mut HashSet<(String, String)>,
 ) -> Result<HashSet<String>, String> {
     let mut current_locals = value_locals.clone();
+    let mut current_field_types = system_field_types.clone();
     for action in actions {
         current_locals = validate_action(
             action,
             current_system,
             system_fields,
-            system_field_types,
+            &mut current_field_types,
             entity_specs,
             steps,
             step_indices,
@@ -1938,7 +1939,7 @@ fn validate_action(
     action: &IRAction,
     current_system: &str,
     system_fields: &HashMap<String, usize>,
-    system_field_types: &HashMap<String, IRType>,
+    system_field_types: &mut HashMap<String, IRType>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     steps: &[ExplicitStepRef<'_>],
     step_indices: &HashMap<(String, String), usize>,
@@ -2068,7 +2069,7 @@ fn validate_action(
             command,
             args,
         } => {
-            if !validate_cross_call_like(
+            let Some(return_ty) = validate_cross_call_like(
                 system,
                 command,
                 &[],
@@ -2082,11 +2083,13 @@ fn validate_action(
                 value_locals,
                 slot_locals,
                 active_calls,
-            )? {
+            )?
+            else {
                 return Err("unsupported LetCrossCall in explicit-state fragment".to_owned());
-            }
+            };
             let mut locals = value_locals.clone();
             locals.insert(name.clone());
+            system_field_types.insert(name.clone(), return_ty);
             Ok(locals)
         }
         IRAction::Apply {
@@ -2256,7 +2259,7 @@ fn validate_action(
                     command,
                     args,
                 } => {
-                    if !validate_cross_call_like(
+                    if validate_cross_call_like(
                         system,
                         command,
                         &[],
@@ -2270,7 +2273,9 @@ fn validate_action(
                         value_locals,
                         slot_locals,
                         active_calls,
-                    )? {
+                    )?
+                    .is_none()
+                    {
                         return Err("unsupported match in explicit-state fragment".to_owned());
                     }
                 }
@@ -2325,7 +2330,7 @@ fn validate_cross_call_like(
     value_locals: &HashSet<String>,
     slot_locals: &HashMap<String, usize>,
     active_calls: &mut HashSet<(String, String)>,
-) -> Result<bool, String> {
+) -> Result<Option<IRType>, String> {
     let Some(step_index) = step_indices.get(&(system.to_owned(), command.to_owned())) else {
         return Err("unsupported cross-call in explicit-state fragment".to_owned());
     };
@@ -2388,8 +2393,8 @@ fn validate_cross_call_like(
             return Err(err);
         }
     };
-    let has_finite_return = if let Some(return_expr) = &callee.step.return_expr {
-        if supports_state_expr(
+    let return_ty = if let Some(return_expr) = &callee.step.return_expr {
+        if !supports_state_expr(
             return_expr,
             Some(&callee.system),
             system_fields,
@@ -2398,16 +2403,19 @@ fn validate_cross_call_like(
             &final_locals,
             &HashMap::new(),
         ) {
-            true
-        } else {
             active_calls.remove(&call_key);
             return Err("unsupported cross-call return in explicit-state fragment".to_owned());
         }
+        let Some(return_ty) = explicit_expr_type(return_expr).cloned() else {
+            active_calls.remove(&call_key);
+            return Err("unsupported cross-call return in explicit-state fragment".to_owned());
+        };
+        Some(return_ty)
     } else {
-        false
+        None
     };
     active_calls.remove(&call_key);
-    Ok(has_finite_return)
+    Ok(return_ty)
 }
 
 fn entity_index_for_binding_or_value_local(
@@ -3017,7 +3025,7 @@ fn execute_cross_call_like_result(
                 .return_expr
                 .as_ref()
                 .map(|expr| {
-                    eval_expr(
+                    match eval_expr(
                         &next,
                         expr,
                         Some(&callee.system),
@@ -3025,9 +3033,17 @@ fn execute_cross_call_like_result(
                         &model.entity_specs,
                         &callee_locals,
                         &HashMap::new(),
-                    )
+                    ) {
+                        Ok(value) => Ok(Some(value)),
+                        Err(err) if err == "empty explicit-state choose domain" => Ok(None),
+                        Err(err) => Err(err),
+                    }
                 })
-                .transpose()?;
+                .transpose()?
+                .flatten();
+            if callee.step.return_expr.is_some() && result.is_none() {
+                continue;
+            }
             out.push((next, result, choices));
         }
     }
@@ -3628,8 +3644,30 @@ fn supports_state_expr(
             domain,
             predicate,
             ..
-        } => {
-            finite_values_for_type(domain).is_ok() && {
+        } => match domain {
+            IRType::Entity { name } if entity_specs.iter().any(|spec| spec.name == *name) => {
+                let Some((entity_index, _)) = entity_specs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, spec)| spec.name == *name)
+                else {
+                    return false;
+                };
+                let mut nested_slot_locals = slot_locals.clone();
+                nested_slot_locals.insert(var.clone(), entity_index);
+                predicate.as_ref().is_none_or(|pred| {
+                    supports_state_expr(
+                        pred,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        value_locals,
+                        &nested_slot_locals,
+                    )
+                })
+            }
+            _ if finite_values_for_type(domain).is_ok() => {
                 let mut nested_value_locals = value_locals.clone();
                 nested_value_locals.insert(var.clone());
                 predicate.as_ref().is_none_or(|pred| {
@@ -3644,7 +3682,8 @@ fn supports_state_expr(
                     )
                 })
             }
-        }
+            _ => false,
+        },
         IRExpr::Match {
             scrutinee, arms, ..
         } => {
@@ -5921,6 +5960,142 @@ mod tests {
             &HashMap::new(),
         )
         .expect("entity step parameters should execute as entity action refs");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].0.entity_slots[0][0].values[0],
+            ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned(),
+                fields: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_state_entity_choose_cross_call_returns_feed_entity_actions() {
+        let ticket_ty = IRType::Entity {
+            name: "Ticket".to_owned(),
+        };
+        let status_field = IRField {
+            name: "status".to_owned(),
+            ty: enum_type(),
+            default: Some(enum_ctor("Open")),
+            initial_constraint: None,
+        };
+        let close: &'static IRTransition = Box::leak(Box::new(IRTransition {
+            name: "close".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: bin("OpEq", var("status", enum_type()), enum_ctor("Open")),
+            updates: vec![IRUpdate {
+                field: "status".to_owned(),
+                value: enum_ctor("Closed"),
+            }],
+            postcondition: None,
+        }));
+        let entity_specs = vec![ExplicitEntitySpec {
+            name: "Ticket".to_owned(),
+            slot_count: 1,
+            fields: vec![status_field],
+            field_indices: HashMap::from([("status".to_owned(), 0usize)]),
+            transitions: HashMap::from([("close".to_owned(), close)]),
+            fsm_decls: Vec::new(),
+        }];
+        let pick_open: &'static IRSystemAction = Box::leak(Box::new(IRSystemAction {
+            name: "pick_open".to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: Some(IRExpr::Choose {
+                var: "ticket".to_owned(),
+                domain: ticket_ty.clone(),
+                predicate: Some(Box::new(bin(
+                    "OpEq",
+                    IRExpr::Field {
+                        expr: Box::new(var("ticket", ticket_ty.clone())),
+                        field: "status".to_owned(),
+                        ty: enum_type(),
+                        span: None,
+                    },
+                    enum_ctor("Open"),
+                ))),
+                ty: ticket_ty.clone(),
+                span: None,
+            }),
+        }));
+        let steps = vec![ExplicitStepRef {
+            system: "Picker".to_owned(),
+            store_param_count: 0,
+            step: pick_open,
+        }];
+        let step_indices = HashMap::from([(("Picker".to_owned(), "pick_open".to_owned()), 0usize)]);
+        let actions = vec![
+            IRAction::LetCrossCall {
+                name: "ticket".to_owned(),
+                system: "Picker".to_owned(),
+                command: "pick_open".to_owned(),
+                args: vec![],
+            },
+            IRAction::Apply {
+                target: "ticket".to_owned(),
+                transition: "close".to_owned(),
+                refs: vec![],
+                args: vec![],
+            },
+        ];
+
+        validate_actions(
+            &actions,
+            "Queue",
+            &HashMap::new(),
+            &HashMap::new(),
+            &entity_specs,
+            &steps,
+            &step_indices,
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("entity choose cross-call returns should validate");
+
+        let model = ExplicitModel {
+            roots: vec!["Queue".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs,
+            entity_indices: HashMap::from([("Ticket".to_owned(), 0usize)]),
+            steps,
+            step_indices,
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let state = ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![vec![ExplicitEntitySlotState {
+                active: true,
+                values: vec![ExplicitValue::Enum {
+                    enum_name: "Status".to_owned(),
+                    variant: "Open".to_owned(),
+                    fields: vec![],
+                }],
+            }]],
+        };
+
+        let outcomes = execute_actions(
+            &model,
+            state,
+            "Queue",
+            &actions,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("entity choose cross-call returns should execute");
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(

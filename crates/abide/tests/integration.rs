@@ -7422,6 +7422,65 @@ verify explicit_entity_step_param_action_refs {
 }
 
 #[test]
+fn explicit_state_verifier_supports_entity_choose_cross_call_returns() {
+    let src = r"module T
+
+enum TicketStatus = Open | Closed
+
+entity Ticket {
+  status: TicketStatus = @Open
+
+  action close() requires status == @Open {
+    status' = @Closed
+  }
+}
+
+system Picker(tickets: Store<Ticket>) {
+  command pick_open() -> Ticket {
+    return choose ticket: Ticket where ticket.status == @Open
+  }
+}
+
+system Queue(tickets: Store<Ticket>) {
+  command close_picked() {
+    let ticket = Picker::pick_open()
+    ticket.close()
+  }
+}
+
+verify explicit_entity_choose_cross_call_return {
+  assume {
+    store tickets: Ticket[1]
+    let picker = Picker { tickets: tickets }
+    let queue = Queue { tickets: tickets }
+    stutter
+  }
+
+  assert always all ticket: Ticket | ticket.status == @Open or ticket.status == @Closed
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_entity_choose_cross_call_return"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "entity choose cross-call returns should execute in explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn unit_enum_match_patterns_use_bare_constructor_syntax() {
     let src = r"module T
 
