@@ -186,6 +186,20 @@ fn resolve_system_field_index(
     system_fields.get(name).copied()
 }
 
+fn resolve_system_field_type<'a>(
+    name: &str,
+    current_system: Option<&str>,
+    system_field_types: &'a HashMap<String, IRType>,
+) -> Option<&'a IRType> {
+    if let Some(system) = current_system {
+        let qualified = qualified_system_field_name(system, name);
+        if let Some(ty) = system_field_types.get(&qualified) {
+            return Some(ty);
+        }
+    }
+    system_field_types.get(name)
+}
+
 impl<'a> ExplicitModel<'a> {
     fn system_is_scheduled(&self, system: &str) -> bool {
         self.roots.iter().any(|root| root == system)
@@ -199,6 +213,7 @@ impl<'a> ExplicitModel<'a> {
 
         let mut system_fields = Vec::new();
         let mut system_field_indices = HashMap::new();
+        let mut system_field_types = HashMap::new();
         let mut initial_system_values = Vec::new();
         let mut entity_specs = Vec::new();
         let mut entity_indices = HashMap::new();
@@ -229,12 +244,18 @@ impl<'a> ExplicitModel<'a> {
                 });
                 system_field_indices
                     .insert(qualified_system_field_name(&sys.name, &field.name), idx);
+                system_field_types.insert(
+                    qualified_system_field_name(&sys.name, &field.name),
+                    field.ty.clone(),
+                );
                 if !ambiguous_field_names.contains(&field.name) {
                     if system_field_indices.contains_key(&field.name) {
                         system_field_indices.remove(&field.name);
+                        system_field_types.remove(&field.name);
                         ambiguous_field_names.insert(field.name.clone());
                     } else {
                         system_field_indices.insert(field.name.clone(), idx);
+                        system_field_types.insert(field.name.clone(), field.ty.clone());
                     }
                 }
                 initial_system_values.push(value);
@@ -268,6 +289,7 @@ impl<'a> ExplicitModel<'a> {
                 &step.step.body,
                 &step.system,
                 &system_field_indices,
+                &system_field_types,
                 &entity_specs,
                 &steps,
                 &step_indices,
@@ -280,6 +302,7 @@ impl<'a> ExplicitModel<'a> {
                     return_expr,
                     Some(&step.system),
                     &system_field_indices,
+                    &system_field_types,
                     &entity_specs,
                     &final_locals,
                     &HashMap::new(),
@@ -329,6 +352,7 @@ impl<'a> ExplicitModel<'a> {
                     &trigger,
                     None,
                     &system_field_indices,
+                    &system_field_types,
                     &entity_specs,
                     &HashSet::new(),
                     &static_slot_locals,
@@ -336,6 +360,7 @@ impl<'a> ExplicitModel<'a> {
                     &response,
                     None,
                     &system_field_indices,
+                    &system_field_types,
                     &entity_specs,
                     &HashSet::new(),
                     &static_slot_locals,
@@ -361,6 +386,7 @@ impl<'a> ExplicitModel<'a> {
                 property,
                 None,
                 &system_field_indices,
+                &system_field_types,
                 &entity_specs,
                 &HashSet::new(),
                 &HashMap::new(),
@@ -374,6 +400,7 @@ impl<'a> ExplicitModel<'a> {
                 expr,
                 None,
                 &system_field_indices,
+                &system_field_types,
                 &entity_specs,
                 &HashSet::new(),
                 &HashMap::new(),
@@ -392,6 +419,7 @@ impl<'a> ExplicitModel<'a> {
                 &step.step.guard,
                 Some(&step.system),
                 &system_field_indices,
+                &system_field_types,
                 &entity_specs,
                 &value_locals,
                 &HashMap::new(),
@@ -402,6 +430,7 @@ impl<'a> ExplicitModel<'a> {
                 &step.step.body,
                 &step.system,
                 &system_field_indices,
+                &system_field_types,
                 &entity_specs,
                 &steps,
                 &step_indices,
@@ -414,6 +443,7 @@ impl<'a> ExplicitModel<'a> {
                     return_expr,
                     Some(&step.system),
                     &system_field_indices,
+                    &system_field_types,
                     &entity_specs,
                     &final_locals,
                     &HashMap::new(),
@@ -1792,6 +1822,7 @@ fn build_entity_spec<'a>(
                 initial_constraint,
                 None,
                 &HashMap::new(),
+                &HashMap::new(),
                 &[],
                 &value_locals,
                 &HashMap::new(),
@@ -1806,12 +1837,6 @@ fn build_entity_spec<'a>(
     }
     let mut transitions = HashMap::new();
     for transition in &entity.transitions {
-        if transition.postcondition.is_some() {
-            return Err(format!(
-                "unsupported explicit-state transition `{}::{}`",
-                entity.name, transition.name
-            ));
-        }
         for param in &transition.params {
             ensure_supported_explicit_param_type(&param.ty)?;
         }
@@ -1831,6 +1856,7 @@ fn validate_actions(
     actions: &[IRAction],
     current_system: &str,
     system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     steps: &[ExplicitStepRef<'_>],
     step_indices: &HashMap<(String, String), usize>,
@@ -1844,6 +1870,7 @@ fn validate_actions(
             action,
             current_system,
             system_fields,
+            system_field_types,
             entity_specs,
             steps,
             step_indices,
@@ -1859,6 +1886,7 @@ fn validate_action(
     action: &IRAction,
     current_system: &str,
     system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     steps: &[ExplicitStepRef<'_>],
     step_indices: &HashMap<(String, String), usize>,
@@ -1888,6 +1916,7 @@ fn validate_action(
                 right,
                 Some(current_system),
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 slot_locals,
@@ -1906,6 +1935,7 @@ fn validate_action(
                         value,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         value_locals,
                         slot_locals,
@@ -1938,6 +1968,7 @@ fn validate_action(
                 filter,
                 Some(current_system),
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 &nested_slot_locals,
@@ -1951,6 +1982,31 @@ fn validate_action(
                 ops,
                 current_system,
                 system_fields,
+                system_field_types,
+                entity_specs,
+                steps,
+                step_indices,
+                value_locals,
+                &nested_slot_locals,
+                active_calls,
+            )?;
+            Ok(value_locals.clone())
+        }
+        IRAction::ForAll { var, entity, ops } => {
+            let Some((entity_index, _)) = entity_specs
+                .iter()
+                .enumerate()
+                .find(|(_, candidate)| candidate.name == *entity)
+            else {
+                return Err(format!("unknown explicit-state entity `{entity}`"));
+            };
+            let mut nested_slot_locals = slot_locals.clone();
+            nested_slot_locals.insert(var.clone(), entity_index);
+            validate_actions(
+                ops,
+                current_system,
+                system_fields,
+                system_field_types,
                 entity_specs,
                 steps,
                 step_indices,
@@ -1973,6 +2029,7 @@ fn validate_action(
                 args,
                 Some(current_system),
                 system_fields,
+                system_field_types,
                 entity_specs,
                 steps,
                 step_indices,
@@ -2000,6 +2057,7 @@ fn validate_action(
                         args,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         steps,
                         step_indices,
@@ -2048,6 +2106,7 @@ fn validate_action(
                         arg,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         value_locals,
                         &transition_slot_locals,
@@ -2060,6 +2119,7 @@ fn validate_action(
                 &trans.guard,
                 Some(current_system),
                 system_fields,
+                system_field_types,
                 entity_specs,
                 &transition_value_locals,
                 &transition_slot_locals,
@@ -2072,6 +2132,7 @@ fn validate_action(
                         &update.value,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         &transition_value_locals,
                         &transition_slot_locals,
@@ -2079,6 +2140,22 @@ fn validate_action(
                 {
                     return Err(
                         "unsupported transition update in explicit-state fragment".to_owned()
+                    );
+                }
+            }
+            if let Some(postcondition) = &trans.postcondition {
+                if !supports_state_expr(
+                    postcondition,
+                    Some(current_system),
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    &transition_value_locals,
+                    &transition_slot_locals,
+                ) {
+                    return Err(
+                        "unsupported transition postcondition in explicit-state fragment"
+                            .to_owned(),
                     );
                 }
             }
@@ -2096,6 +2173,7 @@ fn validate_action(
                 args,
                 Some(current_system),
                 system_fields,
+                system_field_types,
                 entity_specs,
                 steps,
                 step_indices,
@@ -2123,6 +2201,7 @@ fn validate_action(
                         args,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         steps,
                         step_indices,
@@ -2142,6 +2221,7 @@ fn validate_action(
                         guard,
                         Some(current_system),
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         value_locals,
                         slot_locals,
@@ -2153,6 +2233,7 @@ fn validate_action(
                     &arm.body,
                     current_system,
                     system_fields,
+                    system_field_types,
                     entity_specs,
                     steps,
                     step_indices,
@@ -2163,7 +2244,6 @@ fn validate_action(
             }
             Ok(value_locals.clone())
         }
-        _ => Err("unsupported action in explicit-state fragment".to_owned()),
     }
 }
 
@@ -2174,6 +2254,7 @@ fn validate_cross_call_like(
     args: &[IRExpr],
     caller_system: Option<&str>,
     system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     steps: &[ExplicitStepRef<'_>],
     step_indices: &HashMap<(String, String), usize>,
@@ -2200,6 +2281,7 @@ fn validate_cross_call_like(
                 arg,
                 caller_system,
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 &HashMap::new(),
@@ -2214,6 +2296,7 @@ fn validate_cross_call_like(
         &callee.step.guard,
         Some(&callee.system),
         system_fields,
+        system_field_types,
         entity_specs,
         &callee_value_locals,
         &HashMap::new(),
@@ -2225,6 +2308,7 @@ fn validate_cross_call_like(
         &callee.step.body,
         &callee.system,
         system_fields,
+        system_field_types,
         entity_specs,
         steps,
         step_indices,
@@ -2243,6 +2327,7 @@ fn validate_cross_call_like(
             return_expr,
             Some(&callee.system),
             system_fields,
+            system_field_types,
             entity_specs,
             &final_locals,
             &HashMap::new(),
@@ -2416,6 +2501,56 @@ fn execute_action(
             }
             Ok(out)
         }
+        IRAction::ForAll { var, entity, ops } => {
+            let Some(&entity_index) = model.entity_indices.get(entity) else {
+                return Err(format!("unknown explicit-state entity `{entity}`"));
+            };
+            let iterated = (0..model.entity_specs[entity_index].slot_count)
+                .filter(|slot| state.entity_slots[entity_index][*slot].active)
+                .map(|slot| op::EntitySlotRef::new(entity.clone(), slot))
+                .collect::<Vec<_>>();
+            let mut frontier = vec![(state, value_locals.clone(), Vec::new())];
+            for selected in &iterated {
+                let mut next_frontier = Vec::new();
+                for (frontier_state, frontier_locals, frontier_choices) in frontier {
+                    let mut nested_slots = slot_locals.clone();
+                    nested_slots.insert(
+                        var.clone(),
+                        ExplicitSlotBinding {
+                            entity_index,
+                            slot: selected.slot(),
+                        },
+                    );
+                    for (next, nested_locals, mut choices) in execute_actions(
+                        model,
+                        frontier_state,
+                        current_system,
+                        ops,
+                        &frontier_locals,
+                        &nested_slots,
+                    )? {
+                        let mut all_choices = frontier_choices.clone();
+                        all_choices.append(&mut choices);
+                        next_frontier.push((next, nested_locals, all_choices));
+                    }
+                }
+                frontier = next_frontier;
+                if frontier.is_empty() {
+                    return Ok(Vec::new());
+                }
+            }
+            Ok(frontier
+                .into_iter()
+                .map(|(next, locals, choices)| {
+                    let mut all_choices = vec![op::Choice::ForAll {
+                        binder: var.clone(),
+                        iterated: iterated.clone(),
+                    }];
+                    all_choices.extend(choices);
+                    (next, locals, all_choices)
+                })
+                .collect())
+        }
         IRAction::LetCrossCall {
             name,
             system,
@@ -2556,6 +2691,27 @@ fn execute_action(
             for (index, value) in update_values {
                 next.entity_slots[binding.entity_index][binding.slot].values[index] = value;
             }
+            if let Some(postcondition) = &trans.postcondition {
+                let post_locals = transition_value_locals(
+                    value_locals,
+                    next.entity_slots[binding.entity_index][binding.slot]
+                        .values
+                        .as_slice(),
+                    spec,
+                    &transition_args,
+                );
+                if !eval_bool_with_locals(
+                    &next,
+                    postcondition,
+                    Some(current_system),
+                    &model.system_field_indices,
+                    &model.entity_specs,
+                    &post_locals,
+                    &transition_slot_locals,
+                )? {
+                    return Ok(Vec::new());
+                }
+            }
             Ok(vec![(next, value_locals.clone(), Vec::new())])
         }
         IRAction::CrossCall {
@@ -2638,7 +2794,6 @@ fn execute_action(
             }
             Ok(out)
         }
-        _ => Err("unsupported action in explicit-state fragment".to_owned()),
     }
 }
 
@@ -3061,10 +3216,60 @@ fn supports_assignment_target(
     }
 }
 
+fn explicit_expr_type(expr: &IRExpr) -> Option<&IRType> {
+    match expr {
+        IRExpr::Lit { ty, .. }
+        | IRExpr::Var { ty, .. }
+        | IRExpr::BinOp { ty, .. }
+        | IRExpr::UnOp { ty, .. }
+        | IRExpr::Field { ty, .. }
+        | IRExpr::App { ty, .. }
+        | IRExpr::Lam { param_type: ty, .. } => Some(ty),
+        IRExpr::Let { body, .. } | IRExpr::Prime { expr: body, .. } => explicit_expr_type(body),
+        IRExpr::Ctor { .. } => None,
+        _ => None,
+    }
+}
+
+fn enum_payload_type_has_field(ty: &IRType, field: &str) -> bool {
+    matches!(
+        ty,
+        IRType::Enum { variants, .. }
+            if variants
+                .iter()
+                .any(|variant| variant.fields.iter().any(|payload| payload.name == field))
+    )
+}
+
+fn fieldless_enum_variant_value(
+    variant_name: &str,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+) -> Option<ExplicitValue> {
+    let mut matches = entity_specs
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .filter_map(|field| {
+            let IRType::Enum { name, variants } = &field.ty else {
+                return None;
+            };
+            variants
+                .iter()
+                .find(|variant| variant.name == variant_name && variant.fields.is_empty())
+                .map(|variant| ExplicitValue::Enum {
+                    enum_name: name.clone(),
+                    variant: variant.name.clone(),
+                    fields: vec![],
+                })
+        });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
 fn supports_state_expr(
     expr: &IRExpr,
     current_system: Option<&str>,
     system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     value_locals: &HashSet<String>,
     slot_locals: &HashMap<String, usize>,
@@ -3076,6 +3281,7 @@ fn supports_state_expr(
                 arg,
                 current_system,
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 slot_locals,
@@ -3084,6 +3290,7 @@ fn supports_state_expr(
         IRExpr::Var { name, .. } => {
             resolve_system_field_index(name, current_system, system_fields).is_some()
                 || value_locals.contains(name)
+                || fieldless_enum_variant_value(name, entity_specs).is_some()
         }
         IRExpr::Field { expr, field, .. } => match expr.as_ref() {
             IRExpr::Var { name, .. } => {
@@ -3095,8 +3302,23 @@ fn supports_state_expr(
                         && entity_specs
                             .iter()
                             .any(|spec| spec.field_indices.contains_key(field)))
+                    || resolve_system_field_type(name, current_system, system_field_types)
+                        .is_some_and(|ty| enum_payload_type_has_field(ty, field))
+                    || explicit_expr_type(expr)
+                        .is_some_and(|ty| enum_payload_type_has_field(ty, field))
             }
-            _ => false,
+            _ => {
+                explicit_expr_type(expr).is_some_and(|ty| enum_payload_type_has_field(ty, field))
+                    && supports_state_expr(
+                        expr,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )
+            }
         },
         IRExpr::BinOp {
             op, left, right, ..
@@ -3119,6 +3341,7 @@ fn supports_state_expr(
                 left,
                 current_system,
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 slot_locals,
@@ -3126,6 +3349,7 @@ fn supports_state_expr(
                 right,
                 current_system,
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 slot_locals,
@@ -3137,6 +3361,7 @@ fn supports_state_expr(
                     operand,
                     current_system,
                     system_fields,
+                    system_field_types,
                     entity_specs,
                     value_locals,
                     slot_locals,
@@ -3168,6 +3393,7 @@ fn supports_state_expr(
                     body,
                     current_system,
                     system_fields,
+                    system_field_types,
                     entity_specs,
                     value_locals,
                     &nested_slot_locals,
@@ -3180,6 +3406,7 @@ fn supports_state_expr(
                     body,
                     current_system,
                     system_fields,
+                    system_field_types,
                     entity_specs,
                     &nested_value_locals,
                     slot_locals,
@@ -3201,6 +3428,7 @@ fn supports_state_expr(
                         pred,
                         current_system,
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         &nested_value_locals,
                         slot_locals,
@@ -3215,6 +3443,7 @@ fn supports_state_expr(
                 scrutinee,
                 current_system,
                 system_fields,
+                system_field_types,
                 entity_specs,
                 value_locals,
                 slot_locals,
@@ -3228,6 +3457,7 @@ fn supports_state_expr(
                         guard,
                         current_system,
                         system_fields,
+                        system_field_types,
                         entity_specs,
                         &arm_value_locals,
                         slot_locals,
@@ -3236,6 +3466,7 @@ fn supports_state_expr(
                     &arm.body,
                     current_system,
                     system_fields,
+                    system_field_types,
                     entity_specs,
                     &arm_value_locals,
                     slot_locals,
@@ -3280,27 +3511,53 @@ fn eval_expr(
             if let Some(value) = value_locals.get(name) {
                 return Ok(value.clone());
             }
-            let index = resolve_system_field_index(name, current_system, system_fields)
-                .ok_or_else(|| format!("unknown explicit-state field `{name}`"))?;
-            Ok(state.system_values[index].clone())
+            if let Some(index) = resolve_system_field_index(name, current_system, system_fields) {
+                return Ok(state.system_values[index].clone());
+            }
+            fieldless_enum_variant_value(name, entity_specs)
+                .ok_or_else(|| format!("unknown explicit-state field `{name}`"))
         }
         IRExpr::Field { expr, field, .. } => {
-            let IRExpr::Var { name, .. } = expr.as_ref() else {
-                return Err("unsupported field projection in explicit-state fragment".to_owned());
-            };
-            let binding = if let Some(binding) = slot_locals.get(name) {
-                *binding
-            } else if let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(name) {
-                explicit_slot_binding_for_ref(entity_specs, selected)?
-            } else {
-                return Err(format!("unknown explicit-state slot binding `{name}`"));
-            };
-            let spec = &entity_specs[binding.entity_index];
-            let field_index = *spec
-                .field_indices
-                .get(field)
-                .ok_or_else(|| format!("unknown explicit-state field `{field}`"))?;
-            Ok(state.entity_slots[binding.entity_index][binding.slot].values[field_index].clone())
+            if let IRExpr::Var { name, .. } = expr.as_ref() {
+                if let Some(binding) = slot_locals.get(name) {
+                    let spec = &entity_specs[binding.entity_index];
+                    let field_index = *spec
+                        .field_indices
+                        .get(field)
+                        .ok_or_else(|| format!("unknown explicit-state field `{field}`"))?;
+                    return Ok(
+                        state.entity_slots[binding.entity_index][binding.slot].values[field_index]
+                            .clone(),
+                    );
+                }
+                if let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(name) {
+                    let binding = explicit_slot_binding_for_ref(entity_specs, selected)?;
+                    let spec = &entity_specs[binding.entity_index];
+                    let field_index = *spec
+                        .field_indices
+                        .get(field)
+                        .ok_or_else(|| format!("unknown explicit-state field `{field}`"))?;
+                    return Ok(
+                        state.entity_slots[binding.entity_index][binding.slot].values[field_index]
+                            .clone(),
+                    );
+                }
+            }
+            match eval_expr(
+                state,
+                expr,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )? {
+                ExplicitValue::Enum { fields, .. } => fields
+                    .into_iter()
+                    .find_map(|(name, value)| (name == *field).then_some(value))
+                    .ok_or_else(|| format!("unknown explicit-state enum payload field `{field}`")),
+                _ => Err("unsupported field projection in explicit-state fragment".to_owned()),
+            }
         }
         IRExpr::BinOp {
             op, left, right, ..
@@ -4265,6 +4522,10 @@ mod tests {
             ("Orders::flag".to_owned(), 0usize),
             ("flag".to_owned(), 0usize),
         ]);
+        let system_field_types = HashMap::from([
+            ("Orders::flag".to_owned(), IRType::Bool),
+            ("flag".to_owned(), IRType::Bool),
+        ]);
         let value_locals = HashMap::from([("local".to_owned(), ExplicitValue::Bool(true))]);
         let slot_locals = HashMap::from([(
             "task".to_owned(),
@@ -4280,6 +4541,7 @@ mod tests {
             &var("flag", IRType::Bool),
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
             &slot_names,
@@ -4298,6 +4560,7 @@ mod tests {
             },
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
             &slot_names,
@@ -4310,6 +4573,7 @@ mod tests {
             },
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
             &slot_names,
@@ -4456,10 +4720,57 @@ mod tests {
             initial_constraint: None,
         };
 
-        let err = finite_default_value(&field).expect_err("non-literal payload default is rejected");
+        let err =
+            finite_default_value(&field).expect_err("non-literal payload default is rejected");
         assert!(
             err.contains("unsupported explicit-state finite enum payload expression"),
             "expected precise payload rejection diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_state_forall_action_iterates_active_slots() {
+        let state = sample_state();
+        let spec = entity_spec();
+        let model = ExplicitModel {
+            roots: vec!["Sys".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs: vec![spec],
+            entity_indices: HashMap::from([("Task".to_owned(), 0)]),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+
+        let outcomes = execute_actions(
+            &model,
+            state.clone(),
+            "Sys",
+            &[IRAction::ForAll {
+                var: "task".to_owned(),
+                entity: "Task".to_owned(),
+                ops: vec![],
+            }],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("forall action should execute over finite active slots");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, state);
+        assert_eq!(
+            outcomes[0].2,
+            vec![op::Choice::ForAll {
+                binder: "task".to_owned(),
+                iterated: vec![op::EntitySlotRef::new("Task", 0)],
+            }]
         );
     }
 
@@ -4497,6 +4808,7 @@ mod tests {
         let state = empty_state();
         let specs = vec![];
         let system_fields = HashMap::new();
+        let system_field_types = HashMap::new();
         let value_locals = HashMap::new();
         let slot_locals = HashMap::new();
         let value_names = HashSet::new();
@@ -4558,6 +4870,7 @@ mod tests {
                 expr,
                 Some("Orders"),
                 &system_fields,
+                &system_field_types,
                 &specs,
                 &value_names,
                 &slot_names,
@@ -4642,6 +4955,10 @@ mod tests {
             ("Orders::flag".to_owned(), 0usize),
             ("flag".to_owned(), 0usize),
         ]);
+        let system_field_types = HashMap::from([
+            ("Orders::flag".to_owned(), IRType::Bool),
+            ("flag".to_owned(), IRType::Bool),
+        ]);
         let value_locals = HashMap::new();
         let slot_locals = HashMap::new();
         let value_names = HashSet::new();
@@ -4678,6 +4995,7 @@ mod tests {
             &match_expr,
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
             &slot_names,
@@ -4702,10 +5020,46 @@ mod tests {
         let state = empty_state();
         let specs = vec![];
         let system_fields = HashMap::new();
-        let value_locals = HashMap::new();
+        let system_field_types = HashMap::new();
+        let value_locals = HashMap::from([(
+            "decision".to_owned(),
+            ExplicitValue::Enum {
+                enum_name: "Decision".to_owned(),
+                variant: "Accept".to_owned(),
+                fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+            },
+        )]);
         let slot_locals = HashMap::new();
-        let value_names = HashSet::new();
+        let value_names = HashSet::from(["decision".to_owned()]);
         let slot_names = HashMap::new();
+        let payload_projection = IRExpr::Field {
+            expr: Box::new(var("decision", payload_enum_type())),
+            field: "allowed".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let lowered_system_state = ExplicitState {
+            system_values: vec![ExplicitValue::Enum {
+                enum_name: "Decision".to_owned(),
+                variant: "Accept".to_owned(),
+                fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+            }],
+            entity_slots: vec![],
+        };
+        let lowered_system_fields = HashMap::from([
+            ("Gate::decision".to_owned(), 0usize),
+            ("decision".to_owned(), 0usize),
+        ]);
+        let lowered_system_field_types = HashMap::from([
+            ("Gate::decision".to_owned(), payload_enum_type()),
+            ("decision".to_owned(), payload_enum_type()),
+        ]);
+        let lowered_payload_projection = IRExpr::Field {
+            expr: Box::new(var("decision", IRType::Int)),
+            field: "allowed".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        };
         let match_expr = IRExpr::Match {
             scrutinee: Box::new(payload_enum_ctor(true)),
             arms: vec![
@@ -4738,6 +5092,7 @@ mod tests {
             &payload_enum_ctor(true),
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
             &slot_names,
@@ -4746,8 +5101,27 @@ mod tests {
             &match_expr,
             Some("Orders"),
             &system_fields,
+            &system_field_types,
             &specs,
             &value_names,
+            &slot_names,
+        ));
+        assert!(supports_state_expr(
+            &payload_projection,
+            Some("Orders"),
+            &system_fields,
+            &system_field_types,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert!(supports_state_expr(
+            &lowered_payload_projection,
+            Some("Gate"),
+            &lowered_system_fields,
+            &lowered_system_field_types,
+            &specs,
+            &HashSet::new(),
             &slot_names,
         ));
         assert_eq!(
@@ -4759,6 +5133,32 @@ mod tests {
                 &specs,
                 &value_locals,
                 &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &payload_projection,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &lowered_system_state,
+                &lowered_payload_projection,
+                Some("Gate"),
+                &lowered_system_fields,
+                &specs,
+                &HashMap::new(),
+                &HashMap::new(),
             )
             .unwrap(),
             ExplicitValue::Bool(true)

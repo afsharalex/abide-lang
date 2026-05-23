@@ -6444,6 +6444,48 @@ verify explicit_payload_enum {
 }
 
 #[test]
+fn explicit_state_verifier_supports_enum_payload_field_projection() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  decision: Decision = @Accept { allowed: true }
+
+  command tick() {}
+}
+
+verify explicit_payload_projection {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always decision.allowed
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_projection"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state enum payload field projection should prove, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_counterexample_preserves_enum_payload_witness() {
     let src = r"module T
 
@@ -6596,6 +6638,115 @@ verify explicit_relational_preference_payload {
                     && method == "explicit-state exhaustive search"
         )),
         "finite fragments should route to explicit-state even when relational witnesses are preferred, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_forall_actions() {
+    let src = r"module T
+
+enum TicketStatus = Open | Closed
+
+entity Ticket {
+  status: TicketStatus = @Open
+
+  action close() requires status == @Open {
+    status' = @Closed
+  }
+}
+
+system Helpdesk(tickets: Store<Ticket>) {
+  command close_all() {
+    for ticket: Ticket {
+      ticket.close()
+    }
+  }
+}
+
+verify explicit_forall_action {
+  assume {
+    store tickets: Ticket[2]
+    let helpdesk = Helpdesk { tickets: tickets }
+    stutter
+  }
+
+  assert always all left: Ticket | all right: Ticket | left.status == right.status
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_forall_action"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state forall actions should prove finite lockstep updates, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_entity_action_postconditions() {
+    let src = r"module T
+
+enum TicketStatus = Open | Closed
+
+entity Ticket {
+  status: TicketStatus = @Open
+
+  action close()
+    requires status == @Open
+    ensures status == @Closed
+  {
+    status' = @Closed
+  }
+}
+
+system Helpdesk(tickets: Store<Ticket>) {
+  command close_all() {
+    for ticket: Ticket {
+      ticket.close()
+    }
+  }
+}
+
+verify explicit_transition_postcondition {
+  assume {
+    store tickets: Ticket[2]
+    let helpdesk = Helpdesk { tickets: tickets }
+    stutter
+  }
+
+  assert always all ticket: Ticket | ticket.status == @Open or ticket.status == @Closed
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_transition_postcondition"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state transition postconditions should prove, got: {results:?}"
     );
 }
 
