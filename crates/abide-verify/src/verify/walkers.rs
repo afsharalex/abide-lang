@@ -1,7 +1,7 @@
 //! Expression analysis predicates and counterexample extraction.
 
 use abide_witness::{op, rel};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use crate::ir::types::{IRAction, IREntity, IRExpr, IRSystem, IRType};
@@ -12,6 +12,24 @@ use super::smt::{self, AbideSolver, Dynamic, Model, SmtValue};
 use super::{DeadlockEventDiag, FairnessEventAnalysis, FairnessKind, FairnessStatus, TraceStep};
 
 // ── Expression analysis predicates ──────────────────────────────────
+
+fn render_enum_witness_value(
+    enum_name: &str,
+    variant: &str,
+    fields: &BTreeMap<String, op::WitnessValue>,
+    render_field: fn(&op::WitnessValue) -> String,
+) -> String {
+    let head = format!("@{enum_name}::{variant}");
+    if fields.is_empty() {
+        return head;
+    }
+    let payload = fields
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", render_field(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{head} {{ {payload} }}")
+}
 
 fn is_extern_boundary_system(system: &IRSystem) -> bool {
     system
@@ -29,7 +47,16 @@ fn render_observation_witness_value(value: &op::WitnessValue) -> String {
         | op::WitnessValue::Float(v)
         | op::WitnessValue::String(v)
         | op::WitnessValue::Identity(v) => v.clone(),
-        op::WitnessValue::EnumVariant { enum_name, variant } => format!("@{enum_name}::{variant}"),
+        op::WitnessValue::EnumVariant {
+            enum_name,
+            variant,
+            fields,
+        } => render_enum_witness_value(
+            enum_name,
+            variant,
+            fields,
+            render_observation_witness_value,
+        ),
         op::WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),
         op::WitnessValue::Tuple(values) => format!(
             "({})",
@@ -642,6 +669,7 @@ fn decode_ic3_value(
             .map(|(enum_name, variant)| op::WitnessValue::EnumVariant {
                 enum_name: enum_name.clone(),
                 variant: variant.clone(),
+                fields: BTreeMap::new(),
             })
             .unwrap_or_else(|| op::WitnessValue::Opaque {
                 display: raw.to_owned(),
@@ -1410,6 +1438,7 @@ pub(super) fn extract_witness_value(
                         return Ok(op::WitnessValue::EnumVariant {
                             enum_name: enum_name.clone(),
                             variant: variant.clone(),
+                            fields: BTreeMap::new(),
                         });
                     }
                     Ok(op::WitnessValue::Opaque {
@@ -1999,7 +2028,11 @@ pub(super) fn render_witness_value(value: &op::WitnessValue) -> String {
         | op::WitnessValue::Float(v)
         | op::WitnessValue::String(v)
         | op::WitnessValue::Identity(v) => v.clone(),
-        op::WitnessValue::EnumVariant { enum_name, variant } => format!("@{enum_name}::{variant}"),
+        op::WitnessValue::EnumVariant {
+            enum_name,
+            variant,
+            fields,
+        } => render_enum_witness_value(enum_name, variant, fields, render_witness_value),
         op::WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),
         op::WitnessValue::Tuple(values) => format!(
             "({})",
@@ -2268,6 +2301,7 @@ mod tests {
             op::WitnessValue::EnumVariant {
                 enum_name: "OrderStatus".to_owned(),
                 variant: "Pending".to_owned(),
+                fields: BTreeMap::new(),
             },
             op::WitnessValue::SlotRef(slot.clone()),
             op::WitnessValue::Set(vec![op::WitnessValue::Int(1), op::WitnessValue::Int(2)]),
@@ -3030,6 +3064,7 @@ mod tests {
                         op::WitnessValue::EnumVariant {
                             enum_name: "OrderStatus".to_owned(),
                             variant: "Pending".to_owned(),
+                            fields: BTreeMap::new(),
                         },
                     )
                     .build(),
@@ -3055,6 +3090,7 @@ mod tests {
                         op::WitnessValue::EnumVariant {
                             enum_name: "OrderStatus".to_owned(),
                             variant: "Confirmed".to_owned(),
+                            fields: BTreeMap::new(),
                         },
                     )
                     .build(),

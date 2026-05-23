@@ -5,6 +5,15 @@ use crate::verify::ic3;
 use crate::verify::solver::{active_solver_family, set_active_solver_family, SolverFamily};
 use crate::verify::transition::{solve_transition_obligation, TransitionObligation};
 
+#[test]
+fn cvc5_sygus_disabled_reason_documents_hard_cancellation_boundary() {
+    let reason = cvc5_sygus_disabled_reason();
+
+    assert!(reason.contains("disabled by default"));
+    assert!(reason.contains("hard cancellation hook"));
+    assert!(reason.contains("ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1"));
+}
+
 fn make_counter_entity() -> IREntity {
     IREntity {
         name: "Counter".to_owned(),

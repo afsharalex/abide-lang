@@ -355,7 +355,9 @@ fn render_witness_value(value: &op::WitnessValue) -> String {
         | op::WitnessValue::Float(v)
         | op::WitnessValue::String(v)
         | op::WitnessValue::Identity(v) => v.clone(),
-        op::WitnessValue::EnumVariant { enum_name, variant } => format!("@{enum_name}::{variant}"),
+        op::WitnessValue::EnumVariant {
+            enum_name, variant, ..
+        } => format!("@{enum_name}::{variant}"),
         op::WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),
         op::WitnessValue::Tuple(values) => format!(
             "({})",

@@ -298,14 +298,17 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     }
 
     for step in &system.actions {
-        validate_crosscalls_in_actions(
+        let crosscall_ctx = CrossCallValidationCtx {
             env,
-            &system.name,
-            &sys_ctx,
-            &system.deps,
+            system_name: &system.name,
+            sys_ctx: &sys_ctx,
+            deps: &system.deps,
+            fallback_span: step.span.or(system.span),
+        };
+        validate_crosscalls_in_actions(
+            &crosscall_ctx,
             &step.body,
             &mut errors,
-            step.span.or(system.span),
             &mut HashMap::new(),
         );
     }
@@ -936,14 +939,18 @@ pub(super) fn check_extern(_env: &Env, ext: &EExtern) -> Vec<ElabError> {
     errors
 }
 
+struct CrossCallValidationCtx<'a> {
+    env: &'a Env,
+    system_name: &'a str,
+    sys_ctx: &'a str,
+    deps: &'a [String],
+    fallback_span: Option<crate::span::Span>,
+}
+
 fn validate_crosscalls_in_actions(
-    env: &Env,
-    system_name: &str,
-    sys_ctx: &str,
-    deps: &[String],
+    ctx: &CrossCallValidationCtx<'_>,
     actions: &[EEventAction],
     errors: &mut Vec<ElabError>,
-    fallback_span: Option<crate::span::Span>,
     local_return_types: &mut HashMap<String, Ty>,
 ) {
     for action in actions {
@@ -951,61 +958,60 @@ fn validate_crosscalls_in_actions(
             EEventAction::Choose(_, _, _, body) | EEventAction::ForAll(_, _, body) => {
                 let mut scoped_return_types = local_return_types.clone();
                 validate_crosscalls_in_actions(
-                    env,
-                    system_name,
-                    sys_ctx,
-                    deps,
+                    ctx,
                     body,
                     errors,
-                    fallback_span,
                     &mut scoped_return_types,
                 );
             }
             EEventAction::LetCrossCall(name, target, command, args) => {
                 validate_crosscall_target(
-                    env,
-                    system_name,
-                    sys_ctx,
-                    deps,
+                    ctx.env,
+                    ctx.system_name,
+                    ctx.sys_ctx,
+                    ctx.deps,
                     target,
                     command,
                     args,
                     errors,
-                    fallback_span,
+                    ctx.fallback_span,
                 );
-                if let Some(return_type) = command_return_type(env, target, command) {
+                if let Some(return_type) = command_return_type(ctx.env, target, command) {
                     local_return_types.insert(name.clone(), return_type.clone());
                 }
             }
             EEventAction::CrossCall(target, command, args) => {
                 validate_crosscall_target(
-                    env,
-                    system_name,
-                    sys_ctx,
-                    deps,
+                    ctx.env,
+                    ctx.system_name,
+                    ctx.sys_ctx,
+                    ctx.deps,
                     target,
                     command,
                     args,
                     errors,
-                    fallback_span,
+                    ctx.fallback_span,
                 );
             }
             EEventAction::Match(scrutinee, arms) => {
                 let scrutinee_ty = match scrutinee {
                     EMatchScrutinee::Var(name) => local_return_types.get(name),
                     EMatchScrutinee::CrossCall(target, command, _) => {
-                        command_return_type(env, target, command)
+                        command_return_type(ctx.env, target, command)
                     }
                 };
                 if let Some(ty) = scrutinee_ty {
-                    if let Some((enum_name, constructors)) = resolve_to_enum_info(ty, &env.types) {
+                    if let Some((enum_name, constructors)) =
+                        resolve_to_enum_info(ty, &ctx.env.types)
+                    {
                         for arm in arms {
                             check_pattern_shape(
                                 &arm.pattern,
                                 enum_name,
                                 constructors,
-                                &env.variant_fields,
-                                fallback_span.unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                                &ctx.env.variant_fields,
+                                ctx.fallback_span
+                                    .unwrap_or(crate::span::Span { start: 0, end: 0 }),
                                 errors,
                             );
                         }
@@ -1013,27 +1019,23 @@ fn validate_crosscalls_in_actions(
                 }
                 if let EMatchScrutinee::CrossCall(target, command, args) = scrutinee {
                     validate_crosscall_target(
-                        env,
-                        system_name,
-                        sys_ctx,
-                        deps,
+                        ctx.env,
+                        ctx.system_name,
+                        ctx.sys_ctx,
+                        ctx.deps,
                         target,
                         command,
                         args,
                         errors,
-                        fallback_span,
+                        ctx.fallback_span,
                     );
                 }
                 for arm in arms {
                     let mut scoped_return_types = local_return_types.clone();
                     validate_crosscalls_in_actions(
-                        env,
-                        system_name,
-                        sys_ctx,
-                        deps,
+                        ctx,
                         &arm.body,
                         errors,
-                        fallback_span,
                         &mut scoped_return_types,
                     );
                 }

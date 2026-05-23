@@ -43,6 +43,8 @@ pub enum WitnessValue {
     EnumVariant {
         enum_name: String,
         variant: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        fields: BTreeMap<String, WitnessValue>,
     },
     SlotRef(EntitySlotRef),
     Tuple(Vec<WitnessValue>),

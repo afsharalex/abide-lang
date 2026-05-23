@@ -1,6 +1,6 @@
 //! Narrow explicit-state backend for finite transition fragments.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use abide_witness::{
@@ -14,7 +14,7 @@ use crate::ir::types::{
     IRTransParam, IRTransition, IRType, IRVerify, LitVal,
 };
 
-use super::context::VerifyContext;
+use super::context::{EntityInfo, VerifyContext};
 use super::defenv;
 use super::transition;
 use super::{
@@ -193,6 +193,7 @@ impl<'a> ExplicitModel<'a> {
 
     fn from_obligation(
         obligation: &'a transition::TransitionVerifyObligation<'a>,
+        vctx: &VerifyContext,
     ) -> Result<Option<(Self, Vec<ExplicitState>)>, String> {
         let system = obligation.system();
 
@@ -205,7 +206,7 @@ impl<'a> ExplicitModel<'a> {
             let Some(&slot_count) = system.slots_per_entity().get(entity.name.as_str()) else {
                 continue;
             };
-            let spec = build_entity_spec(entity, slot_count)?;
+            let spec = build_entity_spec(entity, slot_count, vctx.entities.get(&entity.name))?;
             entity_indices.insert(spec.name.clone(), entity_specs.len());
             entity_specs.push(spec);
         }
@@ -1336,7 +1337,7 @@ pub fn explore_verify_state_space(
             Some(obligation) => obligation,
             None => return Ok(None),
         };
-    let (model, initial_states) = match ExplicitModel::from_obligation(&obligation)? {
+    let (model, initial_states) = match ExplicitModel::from_obligation(&obligation, &vctx)? {
         Some(pair) => pair,
         None => return Ok(None),
     };
@@ -1422,14 +1423,20 @@ pub(super) fn try_check_verify_block_explicit(
     config: &super::VerifyConfig,
     deadline: Option<Instant>,
 ) -> Option<VerificationResult> {
-    if config.witness_semantics != super::WitnessSemantics::Operational {
-        return None;
-    }
-
     let obligation =
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
-    let Ok(Some((model, initial_states))) = ExplicitModel::from_obligation(&obligation) else {
-        return None;
+    let (model, initial_states) = match ExplicitModel::from_obligation(&obligation, vctx) {
+        Ok(Some(model)) => model,
+        Ok(None) => return None,
+        Err(err) if err.contains("unsupported explicit-state finite enum payload expression") => {
+            return Some(VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: err,
+                span: verify_block.span,
+                file: verify_block.file.clone(),
+            });
+        }
+        Err(_) => return None,
     };
 
     let started = Instant::now();
@@ -1759,9 +1766,24 @@ fn field_initial_values(
 fn build_entity_spec<'a>(
     entity: &'a IREntity,
     slot_count: usize,
+    entity_info: Option<&EntityInfo>,
 ) -> Result<ExplicitEntitySpec<'a>, String> {
+    let fields = entity
+        .fields
+        .iter()
+        .map(|field| {
+            let mut field = field.clone();
+            if let Some(default) = entity_info
+                .and_then(|info| info.fields.iter().find(|item| item.name == field.name))
+                .and_then(|info| info.default_expr())
+            {
+                field.default = Some(default.clone());
+            }
+            field
+        })
+        .collect::<Vec<_>>();
     let mut field_indices = HashMap::new();
-    for (index, field) in entity.fields.iter().enumerate() {
+    for (index, field) in fields.iter().enumerate() {
         finite_default_value(field)?;
         if let Some(initial_constraint) = &field.initial_constraint {
             finite_values_for_type(&field.ty)?;
@@ -1798,7 +1820,7 @@ fn build_entity_spec<'a>(
     Ok(ExplicitEntitySpec {
         name: entity.name.clone(),
         slot_count,
-        fields: entity.fields.clone(),
+        fields,
         field_indices,
         transitions,
         fsm_decls: entity.fsm_decls.clone(),
@@ -3894,10 +3916,16 @@ fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
     match value {
         ExplicitValue::Bool(value) => op::WitnessValue::Bool(*value),
         ExplicitValue::Enum {
-            enum_name, variant, ..
+            enum_name,
+            variant,
+            fields,
         } => op::WitnessValue::EnumVariant {
             enum_name: enum_name.clone(),
             variant: variant.clone(),
+            fields: fields
+                .iter()
+                .map(|(name, value)| (name.clone(), witness_value(value)))
+                .collect::<BTreeMap<_, _>>(),
         },
         ExplicitValue::Identity(value) => op::WitnessValue::Identity(value.clone()),
         ExplicitValue::SlotRef(slot_ref) => op::WitnessValue::SlotRef(slot_ref.clone()),
@@ -4377,6 +4405,89 @@ mod tests {
         assert!(states[0].entity_slots[0][0].active);
         assert_eq!(
             states[0].entity_slots[0][0].values[0],
+            ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_witness_value_preserves_enum_payload_fields() {
+        let value = ExplicitValue::Enum {
+            enum_name: "Decision".to_owned(),
+            variant: "Accept".to_owned(),
+            fields: vec![("allowed".to_owned(), ExplicitValue::Bool(false))],
+        };
+
+        let witness = witness_value(&value);
+        let encoded = serde_json::to_value(witness).expect("witness value should serialize");
+
+        assert_eq!(
+            encoded
+                .pointer("/value/fields/allowed/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("bool")
+        );
+        assert_eq!(
+            encoded
+                .pointer("/value/fields/allowed/value")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn explicit_state_rejects_non_literal_finite_enum_payload_default() {
+        let field = IRField {
+            name: "decision".to_owned(),
+            ty: payload_enum_type(),
+            default: Some(IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Accept".to_owned(),
+                args: vec![(
+                    "allowed".to_owned(),
+                    IRExpr::UnOp {
+                        op: "OpNot".to_owned(),
+                        operand: Box::new(bool_lit(false)),
+                        ty: IRType::Bool,
+                        span: None,
+                    },
+                )],
+                span: None,
+            }),
+            initial_constraint: None,
+        };
+
+        let err = finite_default_value(&field).expect_err("non-literal payload default is rejected");
+        assert!(
+            err.contains("unsupported explicit-state finite enum payload expression"),
+            "expected precise payload rejection diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_entity_spec_consumes_structured_verify_context_defaults() {
+        let entity = IREntity {
+            name: "Task".to_owned(),
+            fields: vec![bool_field("active", Some(false))],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let entity_info = EntityInfo {
+            name: "Task".to_owned(),
+            fields: vec![crate::verify::context::FieldInfo {
+                name: "active".to_owned(),
+                ty: IRType::Bool,
+                default: Some(bool_lit(true)),
+            }],
+            actions: vec![],
+        };
+
+        let spec = build_entity_spec(&entity, 1, Some(&entity_info))
+            .expect("entity spec should consume structured context defaults");
+
+        assert_eq!(
+            entity_field_default_value(&spec.fields[0], "Task", 0).unwrap(),
             ExplicitValue::Bool(true)
         );
     }

@@ -1031,7 +1031,9 @@ fn render_trace_value(value: &WitnessValue) -> String {
             value.clone()
         }
         WitnessValue::Identity(value) => format!("#{value}"),
-        WitnessValue::EnumVariant { enum_name, variant } => {
+        WitnessValue::EnumVariant {
+            enum_name, variant, ..
+        } => {
             format!("@{enum_name}::{variant}")
         }
         WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),

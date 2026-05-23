@@ -19920,6 +19920,7 @@ fn verify_all_explicit_state_carries_transition_arg_bindings_through_choose_appl
         &op::WitnessValue::EnumVariant {
             enum_name: "TicketStatus".to_owned(),
             variant: "Done".to_owned(),
+            fields: std::collections::BTreeMap::new(),
         }
     );
 }

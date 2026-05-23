@@ -761,16 +761,15 @@ fn check_relation_builtin(
                 }
             }
         }
-        "transpose" => {
-            if !matches!(relation_arg_columns(args, 0).as_deref(), Some([_, _])) {
-                push_relation_error(
-                    errors,
-                    ctx,
-                    span,
-                    "Rel::transpose requires a binary relation",
-                );
-            }
+        "transpose" if !matches!(relation_arg_columns(args, 0).as_deref(), Some([_, _])) => {
+            push_relation_error(
+                errors,
+                ctx,
+                span,
+                "Rel::transpose requires a binary relation",
+            );
         }
+        "transpose" => {}
         "closure" | "reach" => {
             let Some(columns) = relation_arg_columns(args, 0) else {
                 push_relation_error(

@@ -4,7 +4,7 @@
 //! atom domains and fixed relation symbols, it encodes relation algebra over
 //! tuple membership literals.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rustsat::instances::SatInstance;
 use rustsat::solvers::{Solve, SolverResult};
@@ -1276,6 +1276,7 @@ fn witness_value_for_atom(atom: &RelationAtom, ty: &IRType) -> WitnessValue {
             WitnessValue::EnumVariant {
                 enum_name: name.clone(),
                 variant,
+                fields: BTreeMap::new(),
             }
         }
         _ => WitnessValue::Opaque {

@@ -79,7 +79,17 @@ impl VariantMap {
 pub struct FieldInfo {
     pub name: String,
     pub ty: IRType,
-    pub default: Option<String>, // default value as string (for initial state)
+    pub default: Option<IRExpr>,
+}
+
+impl FieldInfo {
+    pub fn default_expr(&self) -> Option<&IRExpr> {
+        self.default.as_ref()
+    }
+
+    pub fn default_display(&self) -> Option<String> {
+        self.default.as_ref().and_then(default_expr_to_string)
+    }
 }
 
 /// Metadata about an entity for Z3 encoding.
@@ -178,7 +188,7 @@ impl VerifyContext {
                 .map(|f| FieldInfo {
                     name: f.name.clone(),
                     ty: f.ty.clone(),
-                    default: f.default.as_ref().map(default_expr_to_string),
+                    default: f.default.clone(),
                 })
                 .collect();
 
@@ -234,40 +244,44 @@ impl VerifyContext {
     }
 }
 
-fn default_expr_to_string(expr: &IRExpr) -> String {
+fn default_expr_to_string(expr: &IRExpr) -> Option<String> {
     match expr {
-        IRExpr::Lit { value, .. } => lit_value_to_string(value),
+        IRExpr::Lit { value, .. } => Some(lit_value_to_string(value)),
         IRExpr::Ctor { ctor, args, .. } => {
             if args.is_empty() {
-                format!("@{ctor}")
+                Some(format!("@{ctor}"))
             } else {
                 let fields = args
                     .iter()
-                    .map(|(name, value)| format!("{name}: {}", default_expr_to_string(value)))
-                    .collect::<Vec<_>>()
+                    .map(|(name, value)| {
+                        default_expr_to_string(value).map(|value| format!("{name}: {value}"))
+                    })
+                    .collect::<Option<Vec<_>>>()?
                     .join(", ");
-                format!("@{ctor} {{ {fields} }}")
+                Some(format!("@{ctor} {{ {fields} }}"))
             }
         }
-        IRExpr::Var { name, .. } => name.clone(),
-        IRExpr::Field { expr, field, .. } => format!("{}.{field}", default_expr_to_string(expr)),
+        IRExpr::Var { name, .. } => Some(name.clone()),
+        IRExpr::Field { expr, field, .. } => {
+            default_expr_to_string(expr).map(|expr| format!("{expr}.{field}"))
+        }
         IRExpr::BinOp {
             op, left, right, ..
-        } => format!(
+        } => Some(format!(
             "({} {} {})",
-            default_expr_to_string(left),
+            default_expr_to_string(left)?,
             default_binop_symbol(op),
-            default_expr_to_string(right)
-        ),
+            default_expr_to_string(right)?
+        )),
         IRExpr::UnOp { op, operand, .. } => {
-            let operand = default_expr_to_string(operand);
+            let operand = default_expr_to_string(operand)?;
             match default_unop_symbol(op) {
-                "not" => format!("not {operand}"),
-                "-" => format!("-{operand}"),
-                symbol => format!("{symbol}{operand}"),
+                "not" => Some(format!("not {operand}")),
+                "-" => Some(format!("-{operand}")),
+                symbol => Some(format!("{symbol}{operand}")),
             }
         }
-        _ => format!("{expr:?}"),
+        _ => None,
     }
 }
 
@@ -383,12 +397,76 @@ mod default_tests {
                 .fields
                 .iter()
                 .find(|field| field.name == field_name)
-                .and_then(|field| field.default.as_deref())
+                .and_then(FieldInfo::default_display)
         };
 
-        assert_eq!(default_for("status"), Some("@Open"));
-        assert_eq!(default_for("active"), Some("true"));
-        assert_eq!(default_for("count"), Some("3"));
+        assert_eq!(default_for("status"), Some("@Open".to_owned()));
+        assert_eq!(default_for("active"), Some("true".to_owned()));
+        assert_eq!(default_for("count"), Some("3".to_owned()));
+        assert!(matches!(
+            ticket
+                .fields
+                .iter()
+                .find(|field| field.name == "status")
+                .and_then(FieldInfo::default_expr),
+            Some(IRExpr::Ctor { ctor, .. }) if ctor == "Open"
+        ));
+    }
+
+    #[test]
+    fn default_display_covers_structured_exprs_without_debug_fallback() {
+        let bool_lit = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        };
+        let var = IRExpr::Var {
+            name: "order".to_owned(),
+            ty: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            span: None,
+        };
+        assert_eq!(
+            default_expr_to_string(&IRExpr::Field {
+                expr: Box::new(var),
+                field: "status".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            Some("order.status".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::UnOp {
+                op: "OpNot".to_owned(),
+                operand: Box::new(bool_lit.clone()),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            Some("not true".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(bool_lit.clone()),
+                right: Box::new(bool_lit),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            Some("(true and true)".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::Let {
+                bindings: vec![],
+                body: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                span: None,
+            }),
+            None
+        );
     }
 }
 

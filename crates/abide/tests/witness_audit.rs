@@ -180,22 +180,22 @@ verify v {
     let next = behavior.state(1).expect("next state");
     assert!(matches!(
         system_field(initial, "Ui", "mode"),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Mode" && variant == "normal"
     ));
     assert!(matches!(
         system_field(next, "Ui", "mode"),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Mode" && variant == "normal"
     ));
     assert!(matches!(
         system_field(initial, "Ui", "screen"),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Screen" && variant == "home"
     ));
     assert!(matches!(
         system_field(next, "Ui", "screen"),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Screen" && variant == "compose"
     ));
 
@@ -260,7 +260,7 @@ verify v {
     assert_eq!(mode_initial.arity(), 2);
     assert!(matches!(
         tuple_value(mode_initial, 0, 1),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Mode" && variant == "normal"
     ));
 
@@ -270,7 +270,7 @@ verify v {
     assert_eq!(screen_next.arity(), 2);
     assert!(matches!(
         tuple_value(screen_next, 0, 1),
-        WitnessValue::EnumVariant { enum_name, variant }
+        WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Screen" && variant == "compose"
     ));
 }

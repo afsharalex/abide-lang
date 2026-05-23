@@ -709,6 +709,7 @@ impl<'a> Runtime<'a> {
                 .map(|variant| WitnessValue::EnumVariant {
                     enum_name: name.clone(),
                     variant: variant.name.clone(),
+                    fields: BTreeMap::new(),
                 })
                 .collect(),
             IRType::Entity { name } => self
@@ -1538,6 +1539,7 @@ impl<'a> Runtime<'a> {
                     Ok(WitnessValue::EnumVariant {
                         enum_name: enum_name.clone(),
                         variant: ctor.clone(),
+                        fields: BTreeMap::new(),
                     })
                 } else {
                     let mut fields = BTreeMap::new();
@@ -2197,6 +2199,7 @@ fn eval_static_expr(expr: &IRExpr, fresh_identity: Option<usize>) -> Result<Witn
                 Ok(WitnessValue::EnumVariant {
                     enum_name: enum_name.clone(),
                     variant: ctor.clone(),
+                    fields: BTreeMap::new(),
                 })
             } else {
                 let mut fields = BTreeMap::new();
@@ -2238,6 +2241,7 @@ fn zero_value_for_type(ty: &IRType, fresh_identity: Option<usize>) -> Result<Wit
                 Ok(WitnessValue::EnumVariant {
                     enum_name: name.clone(),
                     variant: variant.name.clone(),
+                    fields: BTreeMap::new(),
                 })
             } else {
                 record_value_for_variant(name, variant, fresh_identity)
@@ -2491,10 +2495,12 @@ fn witness_values_equal(left: &WitnessValue, right: &WitnessValue) -> bool {
             WitnessValue::EnumVariant {
                 enum_name: left_enum,
                 variant: left_variant,
+                ..
             },
             WitnessValue::EnumVariant {
                 enum_name: right_enum,
                 variant: right_variant,
+                ..
             },
         ) => {
             left_variant == right_variant
@@ -2593,7 +2599,9 @@ fn render_value(value: &WitnessValue) -> String {
         | WitnessValue::Float(value)
         | WitnessValue::String(value)
         | WitnessValue::Identity(value) => value.clone(),
-        WitnessValue::EnumVariant { enum_name, variant } => format!("@{enum_name}::{variant}"),
+        WitnessValue::EnumVariant {
+            enum_name, variant, ..
+        } => format!("@{enum_name}::{variant}"),
         WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),
         WitnessValue::Tuple(values) => format!(
             "({})",
@@ -2717,6 +2725,7 @@ mod tests {
             Some(&WitnessValue::EnumVariant {
                 enum_name: "Chain".to_owned(),
                 variant: "S0".to_owned(),
+                fields: std::collections::BTreeMap::new(),
             })
         );
     }

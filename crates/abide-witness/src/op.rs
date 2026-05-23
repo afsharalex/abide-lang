@@ -872,6 +872,7 @@ mod tests {
                                 WitnessValue::EnumVariant {
                                     enum_name: "OrderStatus".to_owned(),
                                     variant: "Pending".to_owned(),
+                                    fields: BTreeMap::new(),
                                 },
                             )
                             .build(),
@@ -889,6 +890,7 @@ mod tests {
                                 WitnessValue::EnumVariant {
                                     enum_name: "OrderStatus".to_owned(),
                                     variant: "Charged".to_owned(),
+                                    fields: BTreeMap::new(),
                                 },
                             )
                             .build(),
@@ -910,6 +912,40 @@ mod tests {
         assert_eq!(decoded, witness);
         assert_eq!(decoded.validate(), Ok(()));
         assert!(decoded.behavior().transition_after_state(0).is_some());
+    }
+
+    #[test]
+    fn enum_variant_payload_round_trips_json() {
+        let json = serde_json::json!({
+            "kind": "enum_variant",
+            "value": {
+                "enum_name": "Decision",
+                "variant": "Accept",
+                "fields": {
+                    "allowed": {
+                        "kind": "bool",
+                        "value": false
+                    }
+                }
+            }
+        });
+
+        let decoded: WitnessValue =
+            serde_json::from_value(json).expect("payload enum witness should deserialize");
+        let encoded = serde_json::to_value(decoded).expect("payload enum witness should serialize");
+
+        assert_eq!(
+            encoded
+                .pointer("/value/fields/allowed/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("bool")
+        );
+        assert_eq!(
+            encoded
+                .pointer("/value/fields/allowed/value")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1050,6 +1086,7 @@ mod tests {
                 WitnessValue::EnumVariant {
                     enum_name: "OrderStatus".to_owned(),
                     variant: "pending".to_owned(),
+                    fields: BTreeMap::new(),
                 },
             )
             .build();
@@ -1075,6 +1112,7 @@ mod tests {
             Some(&WitnessValue::EnumVariant {
                 enum_name: "OrderStatus".to_owned(),
                 variant: "pending".to_owned(),
+                fields: BTreeMap::new(),
             })
         );
         assert_eq!(

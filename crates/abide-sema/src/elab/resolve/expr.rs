@@ -928,10 +928,10 @@ pub(super) fn resolve_var_type(ctx: &Ctx, name: &str) -> Ty {
 pub(super) fn resolve_ctor_type_from_context(expr: &mut EExpr, field_ty: &Ty) {
     let Ty::Enum(_, ctors) = field_ty else { return };
     match expr {
-        EExpr::Var(ref mut ty, name, _) if matches!(ty, Ty::Error) => {
-            if ctors.iter().any(|c| c == name) {
-                *ty = field_ty.clone();
-            }
+        EExpr::Var(ref mut ty, name, _)
+            if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == name) =>
+        {
+            *ty = field_ty.clone();
         }
         // Call wrapping a constructor: @Some(42) → Call(Var(@Some), [42])
         EExpr::Call(ref mut ty, ref mut callee, _, _) if matches!(ty, Ty::Error) => {
@@ -942,10 +942,10 @@ pub(super) fn resolve_ctor_type_from_context(expr: &mut EExpr, field_ty: &Ty) {
                 }
             }
         }
-        EExpr::CtorRecord(ref mut ty, _, name, _, _) if matches!(ty, Ty::Error) => {
-            if ctors.iter().any(|c| c == name) {
-                *ty = field_ty.clone();
-            }
+        EExpr::CtorRecord(ref mut ty, _, name, _, _)
+            if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == name) =>
+        {
+            *ty = field_ty.clone();
         }
         _ => {}
     }

@@ -88,6 +88,12 @@ Selected flags:
 - `--target <target>`
 - `--trace-artifact <path>`
 
+`--solver cvc5` can use cvc5 for supported SMT checks. In-process cvc5
+SyGuS invariant synthesis is disabled by default because the cvc5 Rust API
+does not provide a hard cancellation hook; unsupported or disabled SyGuS paths
+report `Unknown`/`Unprovable` diagnostics rather than hanging or claiming a
+proof. Set `ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1` only for isolated opt-in runs.
+
 Relation counterexamples use the normal verify result path. With relational
 witness evidence available, human output shows derived tuple sets and JSON
 reports include the same witness envelope.

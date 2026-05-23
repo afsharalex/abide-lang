@@ -6,7 +6,7 @@
 //! - bounded relational verify fragments over one pooled entity type with
 //!   finite field domains and narrow create / choose-apply operational steps
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use rustsat::instances::SatInstance;
@@ -5493,6 +5493,7 @@ fn simple_witness_value(value: &SimpleValue) -> WitnessValue {
         SimpleValue::Ctor(enum_name, variant) => WitnessValue::EnumVariant {
             enum_name: enum_name.clone(),
             variant: variant.clone(),
+            fields: BTreeMap::new(),
         },
     }
 }

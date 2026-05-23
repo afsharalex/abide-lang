@@ -840,7 +840,9 @@ fn render_witness_value(value: &WitnessValue) -> String {
         WitnessValue::Bool(v) => v.to_string(),
         WitnessValue::Real(v) | WitnessValue::Float(v) | WitnessValue::String(v) => v.clone(),
         WitnessValue::Identity(v) => v.clone(),
-        WitnessValue::EnumVariant { enum_name, variant } => format!("{enum_name}::{variant}"),
+        WitnessValue::EnumVariant {
+            enum_name, variant, ..
+        } => format!("{enum_name}::{variant}"),
         WitnessValue::SlotRef(slot_ref) => render_slot_ref(slot_ref),
         WitnessValue::Tuple(values) => format!(
             "({})",
@@ -908,6 +910,7 @@ mod tests {
                         WitnessValue::EnumVariant {
                             enum_name: "OrderStatus".to_owned(),
                             variant: "Pending".to_owned(),
+                            fields: std::collections::BTreeMap::new(),
                         },
                     )
                     .build(),
@@ -922,6 +925,7 @@ mod tests {
                         WitnessValue::EnumVariant {
                             enum_name: "OrderStatus".to_owned(),
                             variant: "Shipped".to_owned(),
+                            fields: std::collections::BTreeMap::new(),
                         },
                     )
                     .build(),

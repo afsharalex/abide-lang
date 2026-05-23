@@ -835,12 +835,12 @@ entity Ticket {
             .fields
             .iter()
             .find(|field| field.name == field_name)
-            .and_then(|field| field.default.as_deref())
+            .and_then(|field| field.default_display())
     };
 
-    assert_eq!(default_for("status"), Some("@Open"));
-    assert_eq!(default_for("active"), Some("true"));
-    assert_eq!(default_for("weight"), Some("7"));
+    assert_eq!(default_for("status"), Some("@Open".to_owned()));
+    assert_eq!(default_for("active"), Some("true".to_owned()));
+    assert_eq!(default_for("weight"), Some("7".to_owned()));
 }
 
 #[test]
@@ -6440,6 +6440,162 @@ verify explicit_payload_enum {
                     && method == "explicit-state exhaustive search"
         )),
         "explicit-state finite enum payloads should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_counterexample_preserves_enum_payload_witness() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  decision: Decision = @Accept { allowed: false }
+
+  command tick() {}
+}
+
+verify explicit_payload_enum_counterexample {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always
+    match decision {
+      Accept { allowed: allowed } => allowed
+      Reject => false
+    }
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    let result = results
+        .iter()
+        .find(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Counterexample { name, .. }
+                if name == "explicit_payload_enum_counterexample"
+        ))
+        .unwrap_or_else(|| {
+            panic!("expected explicit-state counterexample with payload enum, got: {results:?}")
+        });
+    let evidence = result
+        .evidence()
+        .expect("explicit-state counterexample should carry witness evidence");
+    let json = serde_json::to_value(evidence).expect("evidence should serialize to JSON");
+    let encoded = json.to_string();
+    assert!(
+        encoded.contains("\"allowed\"") && encoded.contains("\"bool\"") && encoded.contains("false"),
+        "enum payload field should be preserved in witness evidence: {encoded}"
+    );
+}
+
+#[test]
+fn explicit_state_rejects_non_literal_finite_enum_payload_defaults() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  decision: Decision = @Accept { allowed: not false }
+
+  command tick() {}
+}
+
+verify explicit_payload_enum_nonliteral_default {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always decision == @Accept { allowed: true }
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "explicit_payload_enum_nonliteral_default"
+                    && hint.contains("unsupported explicit-state finite enum payload expression")
+        )),
+        "non-literal finite enum payload defaults should be rejected explicitly, got: {results:?}"
+    );
+}
+
+#[test]
+fn finite_fragments_route_to_explicit_even_with_relational_witness_preference() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+enum Mode = Idle | Busy
+
+entity Coin {
+  heads: bool where $ == true
+}
+
+system Gate(coins: Store<Coin>) {
+  decision: Decision = @Accept { allowed: true }
+  mode: Mode = @Idle
+
+  command tick() {}
+}
+
+verify explicit_relational_preference_payload {
+  assume {
+    store coins: Coin[1]
+    let gate = Gate { coins: coins }
+    stutter
+  }
+
+  assert always
+    match decision {
+      Accept { allowed: allowed } if @Accept { allowed: allowed } == decision => allowed
+      Accept { allowed: allowed } => allowed
+      Reject => false
+    }
+  assert always (all b: bool | b or not b)
+  assert always ((choose m: Mode where m == @Idle) == @Idle)
+  assert always all coin: Coin | coin.heads
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            witness_semantics: abide::verify::WitnessSemantics::Relational,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_relational_preference_payload"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "finite fragments should route to explicit-state even when relational witnesses are preferred, got: {results:?}"
     );
 }
 
