@@ -1952,9 +1952,6 @@ fn validate_action(
             filter,
             ops,
         } => {
-            let Some(spec) = entity_specs.iter().find(|spec| spec.name == *entity) else {
-                return Err(format!("unknown explicit-state entity `{entity}`"));
-            };
             let Some((entity_index, _)) = entity_specs
                 .iter()
                 .enumerate()
@@ -1974,9 +1971,6 @@ fn validate_action(
                 &nested_slot_locals,
             ) {
                 return Err("unsupported choose filter in explicit-state fragment".to_owned());
-            }
-            if ops.is_empty() || spec.slot_count == 0 {
-                return Err("unsupported choose body in explicit-state fragment".to_owned());
             }
             validate_actions(
                 ops,
@@ -3367,6 +3361,32 @@ fn supports_state_expr(
                     slot_locals,
                 )
         }
+        IRExpr::Let { bindings, body, .. } => {
+            let mut nested_value_locals = value_locals.clone();
+            for binding in bindings {
+                if !supports_state_expr(
+                    &binding.expr,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    &nested_value_locals,
+                    slot_locals,
+                ) {
+                    return false;
+                }
+                nested_value_locals.insert(binding.name.clone());
+            }
+            supports_state_expr(
+                body,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                &nested_value_locals,
+                slot_locals,
+            )
+        }
         IRExpr::Forall {
             var, domain, body, ..
         }
@@ -3593,6 +3613,30 @@ fn eval_expr(
                 slot_locals,
             )?;
             eval_unop(op, value)
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            let mut nested_value_locals = value_locals.clone();
+            for binding in bindings {
+                let value = eval_expr(
+                    state,
+                    &binding.expr,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    &nested_value_locals,
+                    slot_locals,
+                )?;
+                nested_value_locals.insert(binding.name.clone(), value);
+            }
+            eval_expr(
+                state,
+                body,
+                current_system,
+                system_fields,
+                entity_specs,
+                &nested_value_locals,
+                slot_locals,
+            )
         }
         IRExpr::Forall {
             var, domain, body, ..
@@ -4085,6 +4129,14 @@ fn eval_static_finite_expr(expr: &IRExpr) -> Result<ExplicitValue, String> {
                 fields,
             })
         }
+        IRExpr::UnOp { op, operand, .. } => eval_unop(op, eval_static_finite_expr(operand)?),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => eval_binop(
+            op,
+            eval_static_finite_expr(left)?,
+            eval_static_finite_expr(right)?,
+        ),
         _ => Err("unsupported explicit-state finite enum payload expression".to_owned()),
     }
 }
@@ -4699,7 +4751,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_state_rejects_non_literal_finite_enum_payload_default() {
+    fn explicit_state_static_finite_enum_payload_defaults_allow_bool_exprs() {
         let field = IRField {
             name: "decision".to_owned(),
             ty: payload_enum_type(),
@@ -4720,11 +4772,13 @@ mod tests {
             initial_constraint: None,
         };
 
-        let err =
-            finite_default_value(&field).expect_err("non-literal payload default is rejected");
-        assert!(
-            err.contains("unsupported explicit-state finite enum payload expression"),
-            "expected precise payload rejection diagnostic, got: {err}"
+        assert_eq!(
+            finite_default_value(&field).expect("static payload bool expression should evaluate"),
+            ExplicitValue::Enum {
+                enum_name: "Decision".to_owned(),
+                variant: "Accept".to_owned(),
+                fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+            }
         );
     }
 
@@ -4770,6 +4824,70 @@ mod tests {
             vec![op::Choice::ForAll {
                 binder: "task".to_owned(),
                 iterated: vec![op::EntitySlotRef::new("Task", 0)],
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_state_empty_choose_body_validates_and_records_choice() {
+        let state = sample_state();
+        let spec = entity_spec();
+        let model = ExplicitModel {
+            roots: vec!["Sys".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs: vec![spec],
+            entity_indices: HashMap::from([("Task".to_owned(), 0)]),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let action = IRAction::Choose {
+            var: "task".to_owned(),
+            entity: "Task".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![],
+        };
+
+        let validated = validate_actions(
+            std::slice::from_ref(&action),
+            "Sys",
+            &HashMap::new(),
+            &HashMap::new(),
+            &model.entity_specs,
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("empty choose bodies are finite no-op choices");
+
+        assert!(validated.is_empty());
+
+        let outcomes = execute_actions(
+            &model,
+            state.clone(),
+            "Sys",
+            &[action],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("empty choose body should execute over matching active slots");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, state);
+        assert_eq!(
+            outcomes[0].2,
+            vec![op::Choice::Choose {
+                binder: "task".to_owned(),
+                selected: op::EntitySlotRef::new("Task", 0),
             }]
         );
     }
@@ -5004,6 +5122,61 @@ mod tests {
             eval_expr(
                 &state,
                 &match_expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_let_bindings() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::from([
+            ("Orders::flag".to_owned(), 0usize),
+            ("flag".to_owned(), 0usize),
+        ]);
+        let system_field_types = HashMap::from([
+            ("Orders::flag".to_owned(), IRType::Bool),
+            ("flag".to_owned(), IRType::Bool),
+        ]);
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let let_expr = IRExpr::Let {
+            bindings: vec![crate::ir::types::LetBinding {
+                name: "current".to_owned(),
+                ty: IRType::Bool,
+                expr: IRExpr::UnOp {
+                    op: "OpNot".to_owned(),
+                    operand: Box::new(var("flag", IRType::Bool)),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+            }],
+            body: Box::new(var("current", IRType::Bool)),
+            span: None,
+        };
+
+        assert!(supports_state_expr(
+            &let_expr,
+            Some("Orders"),
+            &system_fields,
+            &system_field_types,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &let_expr,
                 Some("Orders"),
                 &system_fields,
                 &specs,

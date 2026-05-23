@@ -6522,11 +6522,13 @@ verify explicit_payload_enum_counterexample {
 
     let result = results
         .iter()
-        .find(|result| matches!(
-            result,
-            abide::verify::VerificationResult::Counterexample { name, .. }
-                if name == "explicit_payload_enum_counterexample"
-        ))
+        .find(|result| {
+            matches!(
+                result,
+                abide::verify::VerificationResult::Counterexample { name, .. }
+                    if name == "explicit_payload_enum_counterexample"
+            )
+        })
         .unwrap_or_else(|| {
             panic!("expected explicit-state counterexample with payload enum, got: {results:?}")
         });
@@ -6536,13 +6538,15 @@ verify explicit_payload_enum_counterexample {
     let json = serde_json::to_value(evidence).expect("evidence should serialize to JSON");
     let encoded = json.to_string();
     assert!(
-        encoded.contains("\"allowed\"") && encoded.contains("\"bool\"") && encoded.contains("false"),
+        encoded.contains("\"allowed\"")
+            && encoded.contains("\"bool\"")
+            && encoded.contains("false"),
         "enum payload field should be preserved in witness evidence: {encoded}"
     );
 }
 
 #[test]
-fn explicit_state_rejects_non_literal_finite_enum_payload_defaults() {
+fn explicit_state_supports_static_finite_enum_payload_default_exprs() {
     let src = r"module T
 
 enum Decision = Accept { allowed: bool } | Reject
@@ -6553,7 +6557,7 @@ system Gate {
   command tick() {}
 }
 
-verify explicit_payload_enum_nonliteral_default {
+verify explicit_payload_enum_static_default {
   assume {
     let gate = Gate {}
     stutter
@@ -6575,11 +6579,11 @@ verify explicit_payload_enum_nonliteral_default {
     assert!(
         results.iter().any(|result| matches!(
             result,
-            abide::verify::VerificationResult::Unprovable { name, hint, .. }
-                if name == "explicit_payload_enum_nonliteral_default"
-                    && hint.contains("unsupported explicit-state finite enum payload expression")
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_enum_static_default"
+                    && method == "explicit-state exhaustive search"
         )),
-        "non-literal finite enum payload defaults should be rejected explicitly, got: {results:?}"
+        "static finite enum payload defaults should prove through explicit-state, got: {results:?}"
     );
 }
 
@@ -6747,6 +6751,94 @@ verify explicit_transition_postcondition {
                     && method == "explicit-state exhaustive search"
         )),
         "explicit-state transition postconditions should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_empty_choose_body() {
+    let src = r"module T
+
+enum TicketStatus = Open | Closed
+
+entity Ticket {
+  status: TicketStatus = @Open
+}
+
+system Helpdesk(tickets: Store<Ticket>) {
+  command inspect_open() {
+    choose ticket: Ticket where ticket.status == @Open {
+    }
+  }
+}
+
+verify explicit_empty_choose_body {
+  assume {
+    store tickets: Ticket[2]
+    let helpdesk = Helpdesk { tickets: tickets }
+    stutter
+  }
+
+  assert always all ticket: Ticket | ticket.status == @Open
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_empty_choose_body"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state empty choose bodies should prove as finite no-op choices, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_let_expressions() {
+    let src = r"module T
+
+system Gate {
+  open: bool = true
+
+  command tick() {}
+}
+
+verify explicit_let_expression {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (let current = open in current)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_let_expression"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state let expressions should prove, got: {results:?}"
     );
 }
 
