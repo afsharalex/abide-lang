@@ -1839,15 +1839,16 @@ fn build_entity_spec<'a>(
         .collect::<Vec<_>>();
     let mut field_indices = HashMap::new();
     for (index, field) in fields.iter().enumerate() {
-        finite_default_value(field)?;
         if let Some(initial_constraint) = &field.initial_constraint {
             finite_values_for_type(&field.ty)?;
             let value_locals = HashSet::from(["$".to_owned()]);
+            let initial_constraint_field_types =
+                HashMap::from([("$".to_owned(), field.ty.clone())]);
             if !supports_state_expr(
                 initial_constraint,
                 None,
                 &HashMap::new(),
-                &HashMap::new(),
+                &initial_constraint_field_types,
                 &[],
                 &value_locals,
                 &HashMap::new(),
@@ -1857,6 +1858,8 @@ fn build_entity_spec<'a>(
                     field.name
                 ));
             }
+        } else {
+            finite_default_value(field)?;
         }
         field_indices.insert(field.name.clone(), index);
     }
@@ -4627,6 +4630,28 @@ mod tests {
         }
     }
 
+    fn total_payload_enum_type() -> IRType {
+        IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![crate::ir::types::IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                IRVariant {
+                    name: "Reject".to_owned(),
+                    fields: vec![crate::ir::types::IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+            ],
+        }
+    }
+
     fn payload_enum_ctor(allowed: bool) -> IRExpr {
         IRExpr::Ctor {
             enum_name: "Decision".to_owned(),
@@ -4948,6 +4973,50 @@ mod tests {
         assert_eq!(
             states[0].entity_slots[0][0].values[0],
             ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_initial_constraints_support_payload_field_projection() {
+        let constrained_field = IRField {
+            name: "decision".to_owned(),
+            ty: total_payload_enum_type(),
+            default: None,
+            initial_constraint: Some(bin(
+                "OpEq",
+                IRExpr::Field {
+                    expr: Box::new(var("$", total_payload_enum_type())),
+                    field: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                bool_lit(true),
+            )),
+        };
+        let entity = IREntity {
+            name: "Ticket".to_owned(),
+            fields: vec![constrained_field],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+
+        let spec = build_entity_spec(&entity, 1, None)
+            .expect("payload initial constraints should validate as explicit-state finite");
+        let states =
+            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
+                .expect("payload initial constraints should enumerate finite values");
+
+        assert_eq!(states.len(), 2);
+        assert!(states[0].entity_slots[0][0].active);
+        assert!(
+            states.iter().all(|state| matches!(
+                &state.entity_slots[0][0].values[0],
+                ExplicitValue::Enum { fields, .. }
+                    if fields.iter().any(|(name, value)| name == "allowed" && value == &ExplicitValue::Bool(true))
+            )),
+            "all enumerated payload values should satisfy allowed=true: {states:?}"
         );
     }
 
