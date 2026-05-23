@@ -88,6 +88,11 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_scoped(
         IRExpr::Field {
             expr: inner, field, ..
         } => {
+            if ic3_expr_type(inner).is_some_and(|ty| ic3_enum_payload_type_has_field(ty, field)) {
+                let inner_smt =
+                    expr_to_smt_sys_scoped(inner, entity, vctx, ent_name, slot, locals)?;
+                return Ok(format!("({field} {inner_smt})"));
+            }
             if let IRExpr::Var { .. } = inner.as_ref() {
                 for (i, f) in entity.fields.iter().enumerate() {
                     if f.name == *field {
