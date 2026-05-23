@@ -1790,6 +1790,36 @@ fn field_initial_values(
         return Ok(vec![entity_field_default_value(field, entity_name, slot)?]);
     };
     let candidates = finite_values_for_type(&field.ty)?;
+    let accepted = field_values_satisfying_constraint(initial_constraint, candidates)?;
+    if accepted.is_empty() {
+        return Err(format!(
+            "explicit-state initial constraint for field `{}` has no finite values",
+            field.name
+        ));
+    }
+    Ok(accepted)
+}
+
+fn field_create_values(
+    field: &IRField,
+    entity_name: &str,
+    slot: usize,
+    provided: Option<ExplicitValue>,
+) -> Result<Vec<ExplicitValue>, String> {
+    let candidates = match provided {
+        Some(value) => vec![value],
+        None => field_initial_values(field, entity_name, slot)?,
+    };
+    let Some(initial_constraint) = &field.initial_constraint else {
+        return Ok(candidates);
+    };
+    field_values_satisfying_constraint(initial_constraint, candidates)
+}
+
+fn field_values_satisfying_constraint(
+    initial_constraint: &IRExpr,
+    candidates: Vec<ExplicitValue>,
+) -> Result<Vec<ExplicitValue>, String> {
     let empty_state = ExplicitState {
         system_values: vec![],
         entity_slots: vec![],
@@ -1808,12 +1838,6 @@ fn field_initial_values(
         )? {
             accepted.push(candidate);
         }
-    }
-    if accepted.is_empty() {
-        return Err(format!(
-            "explicit-state initial constraint for field `{}` has no finite values",
-            field.name
-        ));
     }
     Ok(accepted)
 }
@@ -2442,43 +2466,61 @@ fn execute_action(
                 return Err(format!("unknown explicit-state entity `{entity}`"));
             };
             let spec = &model.entity_specs[entity_index];
+            for field in fields {
+                if !spec.field_indices.contains_key(&field.name) {
+                    return Err(format!("unknown explicit-state field `{}`", field.name));
+                }
+            }
             let mut out = Vec::new();
             for slot in 0..spec.slot_count {
                 if state.entity_slots[entity_index][slot].active {
                     continue;
                 }
-                let mut next = state.clone();
-                let mut values = spec
-                    .fields
-                    .iter()
-                    .map(|field| entity_field_default_value(field, &spec.name, slot))
-                    .collect::<Result<Vec<_>, _>>()?;
-                for field in fields {
-                    let index = *spec
-                        .field_indices
-                        .get(&field.name)
-                        .ok_or_else(|| format!("unknown explicit-state field `{}`", field.name))?;
-                    values[index] = eval_expr(
-                        &next,
-                        &field.value,
-                        Some(current_system),
-                        &model.system_field_indices,
-                        &model.entity_specs,
-                        value_locals,
-                        slot_locals,
-                    )?;
+                let mut value_options = vec![Vec::new()];
+                for spec_field in &spec.fields {
+                    let provided = fields
+                        .iter()
+                        .find(|field| field.name == spec_field.name)
+                        .map(|field| {
+                            eval_expr(
+                                &state,
+                                &field.value,
+                                Some(current_system),
+                                &model.system_field_indices,
+                                &model.entity_specs,
+                                value_locals,
+                                slot_locals,
+                            )
+                        })
+                        .transpose()?;
+                    let values = field_create_values(spec_field, &spec.name, slot, provided)?;
+                    let mut next_options = Vec::new();
+                    for prefix in &value_options {
+                        for value in &values {
+                            let mut extended = prefix.clone();
+                            extended.push(value.clone());
+                            next_options.push(extended);
+                        }
+                    }
+                    value_options = next_options;
+                    if value_options.is_empty() {
+                        break;
+                    }
                 }
-                next.entity_slots[entity_index][slot] = ExplicitEntitySlotState {
-                    active: true,
-                    values,
-                };
-                out.push((
-                    next,
-                    value_locals.clone(),
-                    vec![op::Choice::Create {
-                        created: op::EntitySlotRef::new(entity.clone(), slot),
-                    }],
-                ));
+                for values in value_options {
+                    let mut next = state.clone();
+                    next.entity_slots[entity_index][slot] = ExplicitEntitySlotState {
+                        active: true,
+                        values,
+                    };
+                    out.push((
+                        next,
+                        value_locals.clone(),
+                        vec![op::Choice::Create {
+                            created: op::EntitySlotRef::new(entity.clone(), slot),
+                        }],
+                    ));
+                }
             }
             Ok(out)
         }
@@ -5018,6 +5060,85 @@ mod tests {
             )),
             "all enumerated payload values should satisfy allowed=true: {states:?}"
         );
+    }
+
+    #[test]
+    fn explicit_state_create_enumerates_payload_field_constraints() {
+        let constrained_field = IRField {
+            name: "decision".to_owned(),
+            ty: total_payload_enum_type(),
+            default: None,
+            initial_constraint: Some(bin(
+                "OpEq",
+                IRExpr::Field {
+                    expr: Box::new(var("$", total_payload_enum_type())),
+                    field: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                bool_lit(true),
+            )),
+        };
+        let entity = IREntity {
+            name: "Ticket".to_owned(),
+            fields: vec![constrained_field],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let spec = build_entity_spec(&entity, 1, None)
+            .expect("payload create constraints should validate as explicit-state finite");
+        let model = ExplicitModel {
+            roots: vec!["Queue".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs: vec![spec],
+            entity_indices: HashMap::from([("Ticket".to_owned(), 0usize)]),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let state = ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![vec![ExplicitEntitySlotState {
+                active: false,
+                values: vec![ExplicitValue::Enum {
+                    enum_name: "Decision".to_owned(),
+                    variant: "Accept".to_owned(),
+                    fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+                }],
+            }]],
+        };
+
+        let outcomes = execute_actions(
+            &model,
+            state,
+            "Queue",
+            &[IRAction::Create {
+                entity: "Ticket".to_owned(),
+                fields: vec![],
+            }],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("create should enumerate finite constrained payload values");
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|(next, _, _)| {
+            next.entity_slots[0][0].active
+                && matches!(
+                    &next.entity_slots[0][0].values[0],
+                    ExplicitValue::Enum { fields, .. }
+                        if fields.iter().any(|(name, value)| name == "allowed" && value == &ExplicitValue::Bool(true))
+                )
+        }));
     }
 
     #[test]
