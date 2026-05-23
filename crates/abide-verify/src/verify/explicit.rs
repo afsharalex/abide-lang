@@ -2210,6 +2210,7 @@ fn validate_action(
                 if !pattern_supported(&arm.pattern) {
                     return Err("unsupported match pattern in explicit-state fragment".to_owned());
                 }
+                let arm_value_locals = pattern_value_local_names(value_locals, &arm.pattern);
                 if let Some(guard) = &arm.guard {
                     if !supports_state_expr(
                         guard,
@@ -2217,7 +2218,7 @@ fn validate_action(
                         system_fields,
                         system_field_types,
                         entity_specs,
-                        value_locals,
+                        &arm_value_locals,
                         slot_locals,
                     ) {
                         return Err("unsupported match guard in explicit-state fragment".to_owned());
@@ -2231,7 +2232,7 @@ fn validate_action(
                     entity_specs,
                     steps,
                     step_indices,
-                    value_locals,
+                    &arm_value_locals,
                     slot_locals,
                     active_calls,
                 )?;
@@ -2759,6 +2760,8 @@ fn execute_action(
                     if !pattern_matches(&scrutinee_value, &arm.pattern) {
                         continue;
                     }
+                    let arm_value_locals =
+                        pattern_value_locals(value_locals, &arm.pattern, &scrutinee_value);
                     if let Some(guard) = &arm.guard {
                         if !eval_bool_with_locals(
                             &branch_state,
@@ -2766,7 +2769,7 @@ fn execute_action(
                             Some(current_system),
                             &model.system_field_indices,
                             &model.entity_specs,
-                            value_locals,
+                            &arm_value_locals,
                             slot_locals,
                         )? {
                             continue;
@@ -2777,7 +2780,7 @@ fn execute_action(
                         branch_state.clone(),
                         current_system,
                         &arm.body,
-                        value_locals,
+                        &arm_value_locals,
                         slot_locals,
                     )? {
                         let mut all_choices = branch_choices.clone();
@@ -3257,6 +3260,23 @@ fn fieldless_enum_variant_value(
         });
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
+}
+
+fn fieldless_enum_variant_value_for_type(
+    variant_name: &str,
+    expected_ty: Option<&IRType>,
+) -> Option<ExplicitValue> {
+    let Some(IRType::Enum { name, variants }) = expected_ty else {
+        return None;
+    };
+    variants
+        .iter()
+        .find(|variant| variant.name == variant_name && variant.fields.is_empty())
+        .map(|variant| ExplicitValue::Enum {
+            enum_name: name.clone(),
+            variant: variant.name.clone(),
+            fields: vec![],
+        })
 }
 
 fn supports_state_expr(
@@ -4058,39 +4078,30 @@ fn expect_bool(value: ExplicitValue) -> Result<bool, String> {
 
 fn finite_default_value(field: &IRField) -> Result<ExplicitValue, String> {
     match (&field.ty, field.default.as_ref()) {
-        (IRType::Bool, Some(IRExpr::Lit { value: LitVal::Bool { value }, .. })) => {
-            Ok(ExplicitValue::Bool(*value))
-        }
-        (IRType::Bool, None) => Ok(ExplicitValue::Bool(false)),
-        (
-            IRType::Enum { name, variants },
-            Some(IRExpr::Ctor { ctor, args, .. }),
-        ) if variants.iter().all(|variant| variant.fields.iter().all(|field| finite_values_for_type(&field.ty).is_ok())) =>
+        (IRType::Bool, Some(default)) => match eval_static_finite_expr_for_type(default, &field.ty)?
         {
-            let Some(variant) = variants.iter().find(|variant| variant.name == *ctor) else {
-                return Err(format!("unknown enum constructor `{ctor}`"));
-            };
-            let mut fields = Vec::new();
-            for variant_field in &variant.fields {
-                let Some((_, expr)) = args
+            ExplicitValue::Bool(value) => Ok(ExplicitValue::Bool(value)),
+            _ => Err(format!(
+                "unsupported explicit-state field `{}`; bool default must evaluate to bool",
+                field.name
+            )),
+        },
+        (IRType::Bool, None) => Ok(ExplicitValue::Bool(false)),
+        (IRType::Enum { variants, .. }, Some(default))
+            if variants.iter().all(|variant| {
+                variant
+                    .fields
                     .iter()
-                    .find(|(field_name, _)| field_name == &variant_field.name)
-                else {
-                    return Err(format!(
-                        "missing enum payload field `{}` for `{ctor}`",
-                        variant_field.name
-                    ));
-                };
-                fields.push((
-                    variant_field.name.clone(),
-                    eval_static_finite_expr(expr)?,
-                ));
+                    .all(|field| finite_values_for_type(&field.ty).is_ok())
+            }) =>
+        {
+            match eval_static_finite_expr_for_type(default, &field.ty)? {
+                value @ ExplicitValue::Enum { .. } => Ok(value),
+                _ => Err(format!(
+                    "unsupported explicit-state field `{}`; enum default must evaluate to enum",
+                    field.name
+                )),
             }
-            Ok(ExplicitValue::Enum {
-                enum_name: name.clone(),
-                variant: ctor.clone(),
-                fields,
-            })
         }
         (IRType::Enum { name, variants }, None)
             if variants.iter().all(|variant| variant.fields.is_empty()) =>
@@ -4169,7 +4180,33 @@ fn enumerate_variant_field_values(
     Ok(out)
 }
 
+#[cfg(test)]
 fn eval_static_finite_expr(expr: &IRExpr) -> Result<ExplicitValue, String> {
+    eval_static_finite_expr_with_locals(expr, &HashMap::new(), None)
+}
+
+fn eval_static_finite_expr_for_type(
+    expr: &IRExpr,
+    expected_ty: &IRType,
+) -> Result<ExplicitValue, String> {
+    eval_static_finite_expr_with_locals(expr, &HashMap::new(), Some(expected_ty))
+}
+
+fn eval_static_bool_expr_with_locals(
+    expr: &IRExpr,
+    value_locals: &HashMap<String, ExplicitValue>,
+) -> Result<bool, String> {
+    match eval_static_finite_expr_with_locals(expr, value_locals, Some(&IRType::Bool))? {
+        ExplicitValue::Bool(value) => Ok(value),
+        _ => Err("explicit-state static finite expression must be bool".to_owned()),
+    }
+}
+
+fn eval_static_finite_expr_with_locals(
+    expr: &IRExpr,
+    value_locals: &HashMap<String, ExplicitValue>,
+    expected_ty: Option<&IRType>,
+) -> Result<ExplicitValue, String> {
     match expr {
         IRExpr::Lit {
             value: LitVal::Bool { value },
@@ -4181,10 +4218,24 @@ fn eval_static_finite_expr(expr: &IRExpr) -> Result<ExplicitValue, String> {
             args,
             ..
         } => {
+            let variant_field_types = expected_ty.and_then(|ty| {
+                let IRType::Enum { variants, .. } = ty else {
+                    return None;
+                };
+                variants.iter().find(|variant| variant.name == *ctor)
+            });
             let fields = args
                 .iter()
                 .map(|(name, expr)| {
-                    eval_static_finite_expr(expr).map(|value| (name.clone(), value))
+                    let field_ty = variant_field_types.and_then(|variant| {
+                        variant
+                            .fields
+                            .iter()
+                            .find(|field| field.name == *name)
+                            .map(|field| &field.ty)
+                    });
+                    eval_static_finite_expr_with_locals(expr, value_locals, field_ty)
+                        .map(|value| (name.clone(), value))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ExplicitValue::Enum {
@@ -4193,14 +4244,81 @@ fn eval_static_finite_expr(expr: &IRExpr) -> Result<ExplicitValue, String> {
                 fields,
             })
         }
-        IRExpr::UnOp { op, operand, .. } => eval_unop(op, eval_static_finite_expr(operand)?),
+        IRExpr::Var { name, .. } => value_locals
+            .get(name)
+            .cloned()
+            .or_else(|| fieldless_enum_variant_value_for_type(name, expected_ty))
+            .ok_or_else(|| format!("unknown explicit-state static finite local `{name}`")),
+        IRExpr::Field { expr, field, .. } => {
+            match eval_static_finite_expr_with_locals(expr, value_locals, None)? {
+                ExplicitValue::Enum { fields, .. } => fields
+                    .into_iter()
+                    .find_map(|(name, value)| (name == *field).then_some(value))
+                    .ok_or_else(|| format!("unknown explicit-state enum payload field `{field}`")),
+                _ => Err("unsupported field projection in explicit-state fragment".to_owned()),
+            }
+        }
+        IRExpr::UnOp { op, operand, .. } => {
+            eval_unop(
+                op,
+                eval_static_finite_expr_with_locals(operand, value_locals, None)?,
+            )
+        }
         IRExpr::BinOp {
             op, left, right, ..
         } => eval_binop(
             op,
-            eval_static_finite_expr(left)?,
-            eval_static_finite_expr(right)?,
+            eval_static_finite_expr_with_locals(left, value_locals, None)?,
+            eval_static_finite_expr_with_locals(right, value_locals, None)?,
         ),
+        IRExpr::Let { bindings, body, .. } => {
+            let mut nested_value_locals = value_locals.clone();
+            for binding in bindings {
+                let value =
+                    eval_static_finite_expr_with_locals(&binding.expr, &nested_value_locals, None)?;
+                nested_value_locals.insert(binding.name.clone(), value);
+            }
+            eval_static_finite_expr_with_locals(body, &nested_value_locals, expected_ty)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => {
+            if eval_static_bool_expr_with_locals(cond, value_locals)? {
+                eval_static_finite_expr_with_locals(then_body, value_locals, expected_ty)
+            } else {
+                eval_static_finite_expr_with_locals(else_body, value_locals, expected_ty)
+            }
+        }
+        IRExpr::IfElse {
+            else_body: None, ..
+        } => Err("unsupported explicit-state finite enum payload expression".to_owned()),
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            let scrutinee_value =
+                eval_static_finite_expr_with_locals(scrutinee, value_locals, None)?;
+            for arm in arms {
+                if !pattern_matches(&scrutinee_value, &arm.pattern) {
+                    continue;
+                }
+                let arm_value_locals =
+                    pattern_value_locals(value_locals, &arm.pattern, &scrutinee_value);
+                if let Some(guard) = &arm.guard {
+                    if !eval_static_bool_expr_with_locals(guard, &arm_value_locals)? {
+                        continue;
+                    }
+                }
+                return eval_static_finite_expr_with_locals(
+                    &arm.body,
+                    &arm_value_locals,
+                    expected_ty,
+                );
+            }
+            Err("non-exhaustive match in explicit-state fragment".to_owned())
+        }
         _ => Err("unsupported explicit-state finite enum payload expression".to_owned()),
     }
 }
@@ -4424,7 +4542,9 @@ fn render_explicit_edge_label(edge: &ExplicitEdge) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IRFieldPat, IRMatchArm, IRPattern, IRVariant};
+    use crate::ir::types::{
+        IRActionMatchArm, IRActionMatchScrutinee, IRFieldPat, IRMatchArm, IRPattern, IRVariant,
+    };
 
     fn bool_lit(value: bool) -> IRExpr {
         IRExpr::Lit {
@@ -4847,6 +4967,100 @@ mod tests {
     }
 
     #[test]
+    fn explicit_state_static_finite_enum_payload_defaults_allow_core_exprs() {
+        let let_default = IRExpr::Let {
+            bindings: vec![crate::ir::types::LetBinding {
+                name: "accepted".to_owned(),
+                ty: IRType::Bool,
+                expr: bool_lit(true),
+            }],
+            body: Box::new(IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Accept".to_owned(),
+                args: vec![("allowed".to_owned(), var("accepted", IRType::Bool))],
+                span: None,
+            }),
+            span: None,
+        };
+        let if_default = IRExpr::IfElse {
+            cond: Box::new(bool_lit(true)),
+            then_body: Box::new(payload_enum_ctor(true)),
+            else_body: Some(Box::new(IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Reject".to_owned(),
+                args: vec![],
+                span: None,
+            })),
+            span: None,
+        };
+        let match_default = IRExpr::Match {
+            scrutinee: Box::new(payload_enum_ctor(true)),
+            arms: vec![
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Accept".to_owned(),
+                        fields: vec![IRFieldPat {
+                            name: "allowed".to_owned(),
+                            pattern: IRPattern::PVar {
+                                name: "accepted".to_owned(),
+                            },
+                        }],
+                    },
+                    guard: Some(var("accepted", IRType::Bool)),
+                    body: IRExpr::Ctor {
+                        enum_name: "Decision".to_owned(),
+                        ctor: "Accept".to_owned(),
+                        args: vec![("allowed".to_owned(), var("accepted", IRType::Bool))],
+                        span: None,
+                    },
+                },
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Reject".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: None,
+                    body: IRExpr::Ctor {
+                        enum_name: "Decision".to_owned(),
+                        ctor: "Reject".to_owned(),
+                        args: vec![],
+                        span: None,
+                    },
+                },
+            ],
+            span: None,
+        };
+
+        for default in [let_default, if_default, match_default] {
+            assert_eq!(
+                eval_static_finite_expr(&default)
+                    .expect("static core expression default should evaluate"),
+                ExplicitValue::Enum {
+                    enum_name: "Decision".to_owned(),
+                    variant: "Accept".to_owned(),
+                    fields: vec![("allowed".to_owned(), ExplicitValue::Bool(true))],
+                }
+            );
+        }
+
+        let fieldless_atom_default = IRExpr::IfElse {
+            cond: Box::new(bool_lit(false)),
+            then_body: Box::new(payload_enum_ctor(true)),
+            else_body: Some(Box::new(var("Reject", IRType::Int))),
+            span: None,
+        };
+        assert_eq!(
+            eval_static_finite_expr_for_type(&fieldless_atom_default, &payload_enum_type())
+                .expect("expected enum type should resolve fieldless constructor atoms"),
+            ExplicitValue::Enum {
+                enum_name: "Decision".to_owned(),
+                variant: "Reject".to_owned(),
+                fields: vec![],
+            }
+        );
+    }
+
+    #[test]
     fn explicit_state_forall_action_iterates_active_slots() {
         let state = sample_state();
         let spec = entity_spec();
@@ -4954,6 +5168,99 @@ mod tests {
                 selected: op::EntitySlotRef::new("Task", 0),
             }]
         );
+    }
+
+    #[test]
+    fn explicit_state_action_match_payload_bindings_scope_guards_and_bodies() {
+        let state = ExplicitState {
+            system_values: vec![ExplicitValue::Bool(false)],
+            entity_slots: vec![],
+        };
+        let system_fields = HashMap::from([
+            ("Billing::charged".to_owned(), 0usize),
+            ("charged".to_owned(), 0usize),
+        ]);
+        let system_field_types = HashMap::from([
+            ("Billing::charged".to_owned(), IRType::Bool),
+            ("charged".to_owned(), IRType::Bool),
+        ]);
+        let model = ExplicitModel {
+            roots: vec!["Billing".to_owned()],
+            system_fields: vec![ExplicitFieldRef {
+                system: "Billing".to_owned(),
+                field: "charged".to_owned(),
+            }],
+            system_field_indices: system_fields.clone(),
+            entity_specs: vec![],
+            entity_indices: HashMap::new(),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let payload = ExplicitValue::Enum {
+            enum_name: "Outcome".to_owned(),
+            variant: "ok".to_owned(),
+            fields: vec![("accepted".to_owned(), ExplicitValue::Bool(true))],
+        };
+        let value_locals = HashMap::from([("result".to_owned(), payload)]);
+        let value_names = HashSet::from(["result".to_owned()]);
+        let action = IRAction::Match {
+            scrutinee: IRActionMatchScrutinee::Var {
+                name: "result".to_owned(),
+            },
+            arms: vec![IRActionMatchArm {
+                pattern: IRPattern::PCtor {
+                    name: "ok".to_owned(),
+                    fields: vec![IRFieldPat {
+                        name: "accepted".to_owned(),
+                        pattern: IRPattern::PVar {
+                            name: "accepted".to_owned(),
+                        },
+                    }],
+                },
+                guard: Some(var("accepted", IRType::Bool)),
+                body: vec![IRAction::ExprStmt {
+                    expr: bin(
+                        "OpEq",
+                        prime(var("charged", IRType::Bool)),
+                        var("accepted", IRType::Bool),
+                    ),
+                }],
+            }],
+        };
+
+        validate_actions(
+            std::slice::from_ref(&action),
+            "Billing",
+            &system_fields,
+            &system_field_types,
+            &model.entity_specs,
+            &[],
+            &HashMap::new(),
+            &value_names,
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("action match payload bindings should scope over guards and bodies");
+
+        let outcomes = execute_actions(
+            &model,
+            state,
+            "Billing",
+            &[action],
+            &value_locals,
+            &HashMap::new(),
+        )
+        .expect("action match payload bindings should execute guards and bodies");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0.system_values[0], ExplicitValue::Bool(true));
     }
 
     #[test]

@@ -6588,6 +6588,55 @@ verify explicit_payload_enum_static_default {
 }
 
 #[test]
+fn explicit_state_supports_static_finite_enum_payload_core_expr_defaults() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  let_decision: Decision = let accepted = true in @Accept { allowed: accepted }
+  if_decision: Decision = if true { @Accept { allowed: true } } else { @Reject }
+  match_decision: Decision = match @Accept { allowed: true } {
+    Accept { allowed: accepted } => @Accept { allowed: accepted }
+    Reject => @Reject
+  }
+
+  command tick() {}
+}
+
+verify explicit_payload_enum_core_expr_defaults {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always let_decision.allowed
+  assert always if_decision.allowed
+  assert always match_decision.allowed
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_enum_core_expr_defaults"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "static finite enum payload defaults with core expressions should prove through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
 fn finite_fragments_route_to_explicit_even_with_relational_witness_preference() {
     let src = r"module T
 
@@ -6935,6 +6984,60 @@ verify explicit_action_match_guard_atom {
                     && method == "explicit-state exhaustive search"
         )),
         "action match guards should allow constructor atoms through explicit-state, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_action_match_payload_guard_bindings() {
+    let src = r"module T
+
+enum Outcome = ok { accepted: bool } | err
+
+system Provider {
+  command charge(flag: bool) -> Outcome {
+    return @ok { accepted: flag }
+  }
+}
+
+system Billing {
+  charged: bool = false
+
+  command submit() {
+    match Provider::charge(true) {
+      ok { accepted: accepted } if accepted => { charged' = accepted }
+      ok { accepted: accepted } => { charged' = accepted }
+      err => { charged' = false }
+    }
+  }
+}
+
+verify explicit_action_match_payload_guard {
+  assume {
+    let billing = Billing {}
+    stutter
+  }
+
+  assert always (charged or not charged)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_action_match_payload_guard"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "action-match payload guard bindings should prove through explicit-state, got: {results:?}"
     );
 }
 

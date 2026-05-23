@@ -941,16 +941,16 @@ impl Parser {
         self.expect(&Token::Colon)?;
         let ty = self.type_ref()?;
         let default = if self.eat(&Token::Eq).is_some() {
-            Some(FieldDefault::Value(self.expr_bp(28)?)) // atom-level only (Expr14)
+            Some(FieldDefault::Value(self.expr()?))
         } else if self.eat(&Token::In).is_some() {
             // in { expr, expr,... }
             self.expect(&Token::LBrace)?;
-            let mut exprs = vec![self.expr_bp(28)?];
+            let mut exprs = vec![self.expr()?];
             while self.eat(&Token::Comma).is_some() {
                 if self.peek() == Some(&Token::RBrace) {
                     break; // trailing comma
                 }
-                exprs.push(self.expr_bp(28)?);
+                exprs.push(self.expr()?);
             }
             self.expect(&Token::RBrace)?;
             Some(FieldDefault::In(exprs))

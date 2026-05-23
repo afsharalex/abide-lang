@@ -217,6 +217,7 @@ impl Parser {
                 self.parse_aggregate()
             }
             Some(Token::Let) if min_bp <= BP_PREFIX_EXPR => self.parse_let_expr(),
+            Some(Token::If) if min_bp <= BP_PREFIX_EXPR => self.parse_if_else(),
             Some(Token::Fn) if min_bp <= BP_PREFIX_EXPR => self.parse_lambda(),
             Some(Token::Match) if min_bp <= BP_PREFIX_EXPR => self.parse_match_expr(),
             Some(Token::Choose) if min_bp <= BP_PREFIX_EXPR => self.parse_choose_expr(),

@@ -3086,6 +3086,59 @@ fn system_struct_typed_field() {
         other => panic!("expected System, got {other:?}"),
     }
 }
+
+#[test]
+fn field_defaults_accept_core_expression_forms() {
+    let src = r"
+        enum Decision = Accept { allowed: bool } | Reject
+        system S {
+            a: Decision = let accepted = true in @Accept { allowed: accepted }
+            b: Decision = if true { @Accept { allowed: true } } else { @Reject }
+            c: Decision = match @Accept { allowed: true } {
+              Accept { allowed: accepted } => @Accept { allowed: accepted }
+              Reject => @Reject
+            }
+            command tick() {}
+        }
+    ";
+    let prog = parse_program(src);
+    match &prog.decls[1] {
+        TopDecl::System(system) => {
+            let defaults = system
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    SystemItem::Field(field) => field.default.as_ref(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(defaults.len(), 3);
+            assert!(matches!(
+                defaults[0],
+                FieldDefault::Value(Expr {
+                    kind: ExprKind::Let(..),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                defaults[1],
+                FieldDefault::Value(Expr {
+                    kind: ExprKind::IfElse { .. },
+                    ..
+                })
+            ));
+            assert!(matches!(
+                defaults[2],
+                FieldDefault::Value(Expr {
+                    kind: ExprKind::Match(..),
+                    ..
+                })
+            ));
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+}
+
 #[test]
 fn pub_keyword_is_not_a_declaration_modifier() {
     let err = parse_program_err("pub enum OrderStatus = Pending | Paid");
