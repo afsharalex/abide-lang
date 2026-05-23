@@ -2210,7 +2210,7 @@ mod tests {
     use super::*;
     use crate::ast::Visibility;
     use crate::elab::collect;
-    use crate::elab::types::{EExpr, EFieldDefault};
+    use crate::elab::types::{BinOp, EExpr, EFieldDefault};
     use crate::lex;
     use crate::parse::Parser;
 
@@ -2469,6 +2469,39 @@ mod tests {
             ret,
             EExpr::Var(Ty::Enum(name, _), _, _) if name == "AuthorizationResult"
         )));
+    }
+
+    #[test]
+    fn match_guard_constructor_atoms_do_not_bind_to_bare_constructor_patterns() {
+        let (result, errors) = elaborate_all(
+            "enum Status = Open | Closed\n\
+             verify guarded_match_constructor_atom {\n\
+               assert match @Open {\n\
+                 Open if @Open == @Open => true\n\
+                 Open => false\n\
+                 Closed => true\n\
+               }\n\
+             }",
+        );
+
+        assert!(
+            errors.is_empty(),
+            "guarded match should elaborate without errors, got: {errors:?}"
+        );
+        let verify = result.verifies.first().expect("verify block collected");
+        let EExpr::Match(_, arms, _) = verify.asserts.first().expect("assert collected") else {
+            panic!("expected match assertion, got {:?}", verify.asserts.first());
+        };
+        let Some(EExpr::BinOp(_, BinOp::Eq, lhs, rhs, _)) = arms[0].1.as_ref() else {
+            panic!("expected equality guard, got {:?}", arms[0].1);
+        };
+
+        for side in [lhs.as_ref(), rhs.as_ref()] {
+            assert!(
+                matches!(side, EExpr::Var(Ty::Enum(name, _), ctor, _) if name == "Status" && ctor == "Open"),
+                "guard constructor atom should resolve to Status::Open, got {side:?}"
+            );
+        }
     }
 
     #[test]

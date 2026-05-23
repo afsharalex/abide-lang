@@ -6295,6 +6295,198 @@ theorem t for Sys {
 }
 
 #[test]
+fn explicit_state_verifier_supports_match_expression_guards() {
+    let src = r"module T
+
+enum Status = Open | Closed
+
+entity Ticket {
+  status: Status = @Open
+
+  action close() requires status == @Open {
+    status' = @Closed
+  }
+}
+
+system Helpdesk(tickets: Store<Ticket>) {
+  command close_one() {
+    choose ticket: Ticket where ticket.status == @Open { ticket.close() }
+  }
+}
+
+verify explicit_match_guard {
+  assume {
+    store tickets: Ticket[0..1]
+    let helpdesk = Helpdesk { tickets: tickets }
+    stutter
+  }
+
+  assert always all ticket: Ticket |
+    match ticket.status {
+      Open if ticket.status == @Open => true
+      Open => false
+      Closed => true
+    }
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_match_guard"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state match expression with guarded arm should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_finite_quantifier_and_choose_domains() {
+    let src = r"module T
+
+enum Mode = Idle | Busy
+
+system Controller {
+  flag: bool = false
+  mode: Mode = @Idle
+
+  command tick() {}
+}
+
+verify explicit_finite_domains {
+  assume {
+    let controller = Controller {}
+    stutter
+  }
+
+  assert always (all b: bool | b or not b)
+  assert always (some b: bool | b)
+  assert always (one m: Mode | m == @Busy)
+  assert always (lone m: Mode | m == @Busy)
+  assert always ((choose m: Mode where m == @Idle) == @Idle)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_finite_domains"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state finite quantifier/choose domains should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_finite_enum_payloads() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  decision: Decision = @Accept { allowed: true }
+
+  command tick() {}
+}
+
+verify explicit_payload_enum {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always
+    match decision {
+      Accept { allowed: allowed } => allowed
+      Reject => false
+    }
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_payload_enum"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state finite enum payloads should prove, got: {results:?}"
+    );
+}
+
+#[test]
+fn explicit_state_verifier_supports_nondeterministic_initial_field_constraints() {
+    let src = r"module T
+
+entity Coin {
+  heads: bool where $ == true
+}
+
+system Toss(coins: Store<Coin>) {
+  command tick() {}
+}
+
+verify explicit_initial_constraint {
+  assume {
+    store coins: Coin[1]
+    let toss = Toss { coins: coins }
+    stutter
+  }
+
+  assert always all coin: Coin | coin.heads
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_initial_constraint"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state initial field constraints should prove, got: {results:?}"
+    );
+}
+
+#[test]
 fn unit_enum_match_patterns_use_bare_constructor_syntax() {
     let src = r"module T
 

@@ -25,7 +25,11 @@ use super::{
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ExplicitValue {
     Bool(bool),
-    Enum { enum_name: String, variant: String },
+    Enum {
+        enum_name: String,
+        variant: String,
+        fields: Vec<(String, ExplicitValue)>,
+    },
     Identity(String),
     SlotRef(op::EntitySlotRef),
 }
@@ -189,7 +193,7 @@ impl<'a> ExplicitModel<'a> {
 
     fn from_obligation(
         obligation: &'a transition::TransitionVerifyObligation<'a>,
-    ) -> Result<Option<(Self, ExplicitState)>, String> {
+    ) -> Result<Option<(Self, Vec<ExplicitState>)>, String> {
         let system = obligation.system();
 
         let mut system_fields = Vec::new();
@@ -418,22 +422,7 @@ impl<'a> ExplicitModel<'a> {
             }
         }
 
-        let mut initial_entity_slots = Vec::with_capacity(entity_specs.len());
-        for spec in &entity_specs {
-            let mut slots = Vec::with_capacity(spec.slot_count);
-            for slot in 0..spec.slot_count {
-                let values = spec
-                    .fields
-                    .iter()
-                    .map(|field| entity_field_default_value(field, &spec.name, slot))
-                    .collect::<Result<Vec<_>, _>>()?;
-                slots.push(ExplicitEntitySlotState {
-                    active: false,
-                    values,
-                });
-            }
-            initial_entity_slots.push(slots);
-        }
+        let mut active_slots: HashMap<(usize, usize), bool> = HashMap::new();
         for range in system.store_ranges().values() {
             if range.max_active != range.slot_count {
                 return Ok(None);
@@ -442,12 +431,7 @@ impl<'a> ExplicitModel<'a> {
                 continue;
             };
             for slot in range.start_slot..range.start_slot + range.min_active {
-                if let Some(slot_state) = initial_entity_slots
-                    .get_mut(entity_index)
-                    .and_then(|slots| slots.get_mut(slot))
-                {
-                    slot_state.active = true;
-                }
+                active_slots.insert((entity_index, slot), true);
             }
         }
 
@@ -467,15 +451,20 @@ impl<'a> ExplicitModel<'a> {
             strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
             per_tuple_fair: system.assumptions().per_tuple_fair_event_keys().to_vec(),
         };
-        let initial_state = ExplicitState {
-            system_values: initial_system_values,
-            entity_slots: initial_entity_slots,
-        };
-        if !model.state_satisfies_extern_assumptions(&initial_state)? {
+        let initial_states =
+            enumerate_initial_states(&model.entity_specs, &active_slots, initial_system_values)?
+                .into_iter()
+                .filter(|state| {
+                    model
+                        .state_satisfies_extern_assumptions(state)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+        if initial_states.is_empty() {
             return Ok(None);
         }
 
-        Ok(Some((model, initial_state)))
+        Ok(Some((model, initial_states)))
     }
 
     fn has_liveness(&self) -> bool {
@@ -1347,17 +1336,22 @@ pub fn explore_verify_state_space(
             Some(obligation) => obligation,
             None => return Ok(None),
         };
-    let (model, initial_state) = match ExplicitModel::from_obligation(&obligation)? {
+    let (model, initial_states) = match ExplicitModel::from_obligation(&obligation)? {
         Some(pair) => pair,
         None => return Ok(None),
     };
 
     let deadline = super::verification_deadline(config);
     let depth_bound = verify_block.depth;
-    let mut nodes = vec![initial_state.clone()];
-    let mut depths = vec![0usize];
-    let mut seen: HashMap<ExplicitState, usize> = HashMap::from([(initial_state, 0)]);
-    let mut queue = VecDeque::from([0usize]);
+    let mut nodes = initial_states;
+    let mut depths = vec![0usize; nodes.len()];
+    let mut seen: HashMap<ExplicitState, usize> = nodes
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, state)| (state, index))
+        .collect();
+    let mut queue = (0..nodes.len()).collect::<VecDeque<_>>();
     let mut transitions = Vec::new();
 
     while let Some(index) = queue.pop_front() {
@@ -1434,7 +1428,7 @@ pub(super) fn try_check_verify_block_explicit(
 
     let obligation =
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
-    let Ok(Some((model, initial_state))) = ExplicitModel::from_obligation(&obligation) else {
+    let Ok(Some((model, initial_states))) = ExplicitModel::from_obligation(&obligation) else {
         return None;
     };
 
@@ -1442,15 +1436,22 @@ pub(super) fn try_check_verify_block_explicit(
     let assumptions =
         build_assumptions_for_system_scope(ir, &model.roots, &verify_block.assumption_set, &[]);
 
-    let initial_product = ExplicitProductState {
-        state: initial_state,
-        monitors: vec![MonitorStatus::Idle; model.liveness_monitors.len()],
-    };
-    let mut nodes = vec![initial_product.clone()];
-    let mut parents: Vec<Option<(usize, ExplicitEdge)>> = vec![None];
-    let mut adjacency: Vec<Vec<(usize, ExplicitEdge)>> = vec![Vec::new()];
-    let mut seen: HashMap<ExplicitProductState, usize> = HashMap::from([(initial_product, 0)]);
-    let mut queue = VecDeque::from([0usize]);
+    let mut nodes = initial_states
+        .into_iter()
+        .map(|state| ExplicitProductState {
+            state,
+            monitors: vec![MonitorStatus::Idle; model.liveness_monitors.len()],
+        })
+        .collect::<Vec<_>>();
+    let mut parents: Vec<Option<(usize, ExplicitEdge)>> = vec![None; nodes.len()];
+    let mut adjacency: Vec<Vec<(usize, ExplicitEdge)>> = vec![Vec::new(); nodes.len()];
+    let mut seen: HashMap<ExplicitProductState, usize> = nodes
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, state)| (state, index))
+        .collect();
+    let mut queue = (0..nodes.len()).collect::<VecDeque<_>>();
 
     while let Some(index) = queue.pop_front() {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1663,19 +1664,122 @@ fn strongly_connected_components(
     tarjan.components
 }
 
+fn enumerate_initial_states(
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    active_slots: &HashMap<(usize, usize), bool>,
+    system_values: Vec<ExplicitValue>,
+) -> Result<Vec<ExplicitState>, String> {
+    let mut states = vec![ExplicitState {
+        system_values,
+        entity_slots: vec![Vec::new(); entity_specs.len()],
+    }];
+
+    for (entity_index, spec) in entity_specs.iter().enumerate() {
+        for slot in 0..spec.slot_count {
+            let active = active_slots.contains_key(&(entity_index, slot));
+            let mut slot_options = enumerate_slot_initial_values(spec, slot)?;
+            if !active {
+                slot_options.truncate(1);
+            }
+            let mut next_states = Vec::new();
+            for state in &states {
+                for values in &slot_options {
+                    let mut next = state.clone();
+                    next.entity_slots[entity_index].push(ExplicitEntitySlotState {
+                        active,
+                        values: values.clone(),
+                    });
+                    next_states.push(next);
+                }
+            }
+            states = next_states;
+        }
+    }
+
+    Ok(states)
+}
+
+fn enumerate_slot_initial_values(
+    spec: &ExplicitEntitySpec<'_>,
+    slot: usize,
+) -> Result<Vec<Vec<ExplicitValue>>, String> {
+    let mut out = vec![Vec::new()];
+    for field in &spec.fields {
+        let values = field_initial_values(field, &spec.name, slot)?;
+        let mut next = Vec::new();
+        for prefix in &out {
+            for value in &values {
+                let mut extended = prefix.clone();
+                extended.push(value.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Ok(out)
+}
+
+fn field_initial_values(
+    field: &IRField,
+    entity_name: &str,
+    slot: usize,
+) -> Result<Vec<ExplicitValue>, String> {
+    let Some(initial_constraint) = &field.initial_constraint else {
+        return Ok(vec![entity_field_default_value(field, entity_name, slot)?]);
+    };
+    let candidates = finite_values_for_type(&field.ty)?;
+    let empty_state = ExplicitState {
+        system_values: vec![],
+        entity_slots: vec![],
+    };
+    let mut accepted = Vec::new();
+    for candidate in candidates {
+        let value_locals = HashMap::from([("$".to_owned(), candidate.clone())]);
+        if eval_bool_with_locals(
+            &empty_state,
+            initial_constraint,
+            None,
+            &HashMap::new(),
+            &[],
+            &value_locals,
+            &HashMap::new(),
+        )? {
+            accepted.push(candidate);
+        }
+    }
+    if accepted.is_empty() {
+        return Err(format!(
+            "explicit-state initial constraint for field `{}` has no finite values",
+            field.name
+        ));
+    }
+    Ok(accepted)
+}
+
 fn build_entity_spec<'a>(
     entity: &'a IREntity,
     slot_count: usize,
 ) -> Result<ExplicitEntitySpec<'a>, String> {
     let mut field_indices = HashMap::new();
     for (index, field) in entity.fields.iter().enumerate() {
-        if field.initial_constraint.is_some() {
-            return Err(format!(
-                "unsupported explicit-state entity field `{}`; nondeterministic initial constraints are not supported",
-                field.name
-            ));
-        }
         finite_default_value(field)?;
+        if let Some(initial_constraint) = &field.initial_constraint {
+            finite_values_for_type(&field.ty)?;
+            let value_locals = HashSet::from(["$".to_owned()]);
+            if !supports_state_expr(
+                initial_constraint,
+                None,
+                &HashMap::new(),
+                &[],
+                &value_locals,
+                &HashMap::new(),
+            ) {
+                return Err(format!(
+                    "unsupported explicit-state initial constraint for entity field `{}`",
+                    field.name
+                ));
+            }
+        }
         field_indices.insert(field.name.clone(), index);
     }
     let mut transitions = HashMap::new();
@@ -2626,7 +2730,9 @@ fn execute_cross_call_like_result(
 fn pattern_supported(pattern: &crate::ir::types::IRPattern) -> bool {
     match pattern {
         crate::ir::types::IRPattern::PWild | crate::ir::types::IRPattern::PVar { .. } => true,
-        crate::ir::types::IRPattern::PCtor { name: _, fields } => fields.is_empty(),
+        crate::ir::types::IRPattern::PCtor { name: _, fields } => {
+            fields.iter().all(|field| pattern_supported(&field.pattern))
+        }
         crate::ir::types::IRPattern::POr { left, right } => {
             pattern_supported(left) && pattern_supported(right)
         }
@@ -2637,15 +2743,101 @@ fn pattern_matches(value: &ExplicitValue, pattern: &crate::ir::types::IRPattern)
     match pattern {
         crate::ir::types::IRPattern::PWild | crate::ir::types::IRPattern::PVar { .. } => true,
         crate::ir::types::IRPattern::PCtor { name, fields } => {
-            fields.is_empty()
-                && matches!(
-                    value,
-                    ExplicitValue::Enum { variant, .. } if variant == name
-                )
+            let ExplicitValue::Enum {
+                variant,
+                fields: value_fields,
+                ..
+            } = value
+            else {
+                return false;
+            };
+            variant == name
+                && fields.iter().all(|field_pat| {
+                    value_fields
+                        .iter()
+                        .find(|(field_name, _)| field_name == &field_pat.name)
+                        .is_some_and(|(_, field_value)| {
+                            pattern_matches(field_value, &field_pat.pattern)
+                        })
+                })
         }
         crate::ir::types::IRPattern::POr { left, right } => {
             pattern_matches(value, left) || pattern_matches(value, right)
         }
+    }
+}
+
+fn pattern_value_local_names(
+    value_locals: &HashSet<String>,
+    pattern: &crate::ir::types::IRPattern,
+) -> HashSet<String> {
+    let mut out = value_locals.clone();
+    collect_pattern_value_local_names(pattern, &mut out);
+    out
+}
+
+fn collect_pattern_value_local_names(
+    pattern: &crate::ir::types::IRPattern,
+    out: &mut HashSet<String>,
+) {
+    match pattern {
+        crate::ir::types::IRPattern::PVar { name } => {
+            out.insert(name.clone());
+        }
+        crate::ir::types::IRPattern::POr { left, right } => {
+            collect_pattern_value_local_names(left, out);
+            collect_pattern_value_local_names(right, out);
+        }
+        crate::ir::types::IRPattern::PCtor { fields, .. } => {
+            for field in fields {
+                collect_pattern_value_local_names(&field.pattern, out);
+            }
+        }
+        crate::ir::types::IRPattern::PWild => {}
+    }
+}
+
+fn pattern_value_locals(
+    value_locals: &HashMap<String, ExplicitValue>,
+    pattern: &crate::ir::types::IRPattern,
+    value: &ExplicitValue,
+) -> HashMap<String, ExplicitValue> {
+    let mut out = value_locals.clone();
+    bind_pattern_value_locals(pattern, value, &mut out);
+    out
+}
+
+fn bind_pattern_value_locals(
+    pattern: &crate::ir::types::IRPattern,
+    value: &ExplicitValue,
+    out: &mut HashMap<String, ExplicitValue>,
+) {
+    match pattern {
+        crate::ir::types::IRPattern::PVar { name } => {
+            out.insert(name.clone(), value.clone());
+        }
+        crate::ir::types::IRPattern::POr { left, right } => {
+            bind_pattern_value_locals(left, value, out);
+            bind_pattern_value_locals(right, value, out);
+        }
+        crate::ir::types::IRPattern::PCtor { fields, .. } => {
+            let ExplicitValue::Enum {
+                fields: value_fields,
+                ..
+            } = value
+            else {
+                return;
+            };
+            for field in fields {
+                if let Some((_, field_value)) = value_fields
+                    .iter()
+                    .find(|(field_name, _)| field_name == &field.name)
+                {
+                    bind_pattern_value_locals(&field.pattern, field_value, out);
+                }
+            }
+        }
+        crate::ir::types::IRPattern::PWild => {}
     }
 }
 
@@ -2674,10 +2866,12 @@ fn fsm_updates_are_allowed(
             ExplicitValue::Enum {
                 enum_name: old_enum,
                 variant: old_variant,
+                ..
             },
             ExplicitValue::Enum {
                 enum_name: new_enum,
                 variant: new_variant,
+                ..
             },
         ) = (old_value, new_value)
         else {
@@ -2855,7 +3049,16 @@ fn supports_state_expr(
 ) -> bool {
     match expr {
         IRExpr::Lit { value, .. } => matches!(value, LitVal::Bool { .. }),
-        IRExpr::Ctor { args, .. } => args.is_empty(),
+        IRExpr::Ctor { args, .. } => args.iter().all(|(_, arg)| {
+            supports_state_expr(
+                arg,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )
+        }),
         IRExpr::Var { name, .. } => {
             resolve_system_field_index(name, current_system, system_fields).is_some()
                 || value_locals.contains(name)
@@ -2922,6 +3125,12 @@ fn supports_state_expr(
         }
         | IRExpr::Exists {
             var, domain, body, ..
+        }
+        | IRExpr::One {
+            var, domain, body, ..
+        }
+        | IRExpr::Lone {
+            var, domain, body, ..
         } => match domain {
             IRType::Entity { name } if entity_specs.iter().any(|spec| spec.name == *name) => {
                 let Some((entity_index, _)) = entity_specs
@@ -2942,8 +3151,75 @@ fn supports_state_expr(
                     &nested_slot_locals,
                 )
             }
+            _ if finite_values_for_type(domain).is_ok() => {
+                let mut nested_value_locals = value_locals.clone();
+                nested_value_locals.insert(var.clone());
+                supports_state_expr(
+                    body,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    &nested_value_locals,
+                    slot_locals,
+                )
+            }
             _ => false,
         },
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => {
+            finite_values_for_type(domain).is_ok() && {
+                let mut nested_value_locals = value_locals.clone();
+                nested_value_locals.insert(var.clone());
+                predicate.as_ref().is_none_or(|pred| {
+                    supports_state_expr(
+                        pred,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        &nested_value_locals,
+                        slot_locals,
+                    )
+                })
+            }
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            supports_state_expr(
+                scrutinee,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            ) && arms.iter().all(|arm| {
+                if !pattern_supported(&arm.pattern) {
+                    return false;
+                }
+                let arm_value_locals = pattern_value_local_names(value_locals, &arm.pattern);
+                arm.guard.as_ref().is_none_or(|guard| {
+                    supports_state_expr(
+                        guard,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        &arm_value_locals,
+                        slot_locals,
+                    )
+                }) && supports_state_expr(
+                    &arm.body,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    &arm_value_locals,
+                    slot_locals,
+                )
+            })
+        }
         _ => false,
     }
 }
@@ -2967,10 +3243,17 @@ fn eval_expr(
             ctor,
             args,
             ..
-        } if args.is_empty() => Ok(ExplicitValue::Enum {
-            enum_name: enum_name.clone(),
-            variant: ctor.clone(),
-        }),
+        } => eval_ctor_value(
+            state,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+            enum_name,
+            ctor,
+            args,
+        ),
         IRExpr::Var { name, .. } => {
             if let Some(value) = value_locals.get(name) {
                 return Ok(value.clone());
@@ -3034,72 +3317,298 @@ fn eval_expr(
         }
         IRExpr::Forall {
             var, domain, body, ..
-        } => {
-            let IRType::Entity { name } = domain else {
-                return Err("unsupported quantifier domain in explicit-state fragment".to_owned());
-            };
-            let Some((entity_index, spec)) = entity_specs
-                .iter()
-                .enumerate()
-                .find(|(_, spec)| spec.name == *name)
-            else {
-                return Err("unknown explicit-state quantifier entity".to_owned());
-            };
-            let mut nested_slots = slot_locals.clone();
-            for slot in 0..spec.slot_count {
-                if !state.entity_slots[entity_index][slot].active {
-                    continue;
-                }
-                nested_slots.insert(var.clone(), ExplicitSlotBinding { entity_index, slot });
-                if !eval_bool_with_locals(
-                    state,
-                    body,
-                    current_system,
-                    system_fields,
-                    entity_specs,
-                    value_locals,
-                    &nested_slots,
-                )? {
-                    return Ok(ExplicitValue::Bool(false));
-                }
-            }
-            Ok(ExplicitValue::Bool(true))
-        }
+        } => eval_quantifier(
+            state,
+            var,
+            domain,
+            body,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+            QuantifierMode::Forall,
+        ),
         IRExpr::Exists {
             var, domain, body, ..
+        } => eval_quantifier(
+            state,
+            var,
+            domain,
+            body,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+            QuantifierMode::Exists,
+        ),
+        IRExpr::One {
+            var, domain, body, ..
+        } => eval_quantifier(
+            state,
+            var,
+            domain,
+            body,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+            QuantifierMode::One,
+        ),
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => eval_quantifier(
+            state,
+            var,
+            domain,
+            body,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+            QuantifierMode::Lone,
+        ),
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => eval_choose(
+            state,
+            var,
+            domain,
+            predicate.as_deref(),
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+        ),
+        IRExpr::Match {
+            scrutinee, arms, ..
         } => {
-            let IRType::Entity { name } = domain else {
-                return Err("unsupported quantifier domain in explicit-state fragment".to_owned());
-            };
-            let Some((entity_index, spec)) = entity_specs
-                .iter()
-                .enumerate()
-                .find(|(_, spec)| spec.name == *name)
-            else {
-                return Err("unknown explicit-state quantifier entity".to_owned());
-            };
-            let mut nested_slots = slot_locals.clone();
-            for slot in 0..spec.slot_count {
-                if !state.entity_slots[entity_index][slot].active {
+            let scrutinee_value = eval_expr(
+                state,
+                scrutinee,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )?;
+            for arm in arms {
+                if !pattern_matches(&scrutinee_value, &arm.pattern) {
                     continue;
                 }
-                nested_slots.insert(var.clone(), ExplicitSlotBinding { entity_index, slot });
-                if eval_bool_with_locals(
+                let arm_value_locals =
+                    pattern_value_locals(value_locals, &arm.pattern, &scrutinee_value);
+                if let Some(guard) = &arm.guard {
+                    if !eval_bool_with_locals(
+                        state,
+                        guard,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        &arm_value_locals,
+                        slot_locals,
+                    )? {
+                        continue;
+                    }
+                }
+                return eval_expr(
                     state,
-                    body,
+                    &arm.body,
                     current_system,
                     system_fields,
                     entity_specs,
-                    value_locals,
-                    &nested_slots,
-                )? {
-                    return Ok(ExplicitValue::Bool(true));
-                }
+                    &arm_value_locals,
+                    slot_locals,
+                );
             }
-            Ok(ExplicitValue::Bool(false))
+            Err("non-exhaustive match in explicit-state fragment".to_owned())
         }
         _ => Err("unsupported expression in explicit-state fragment".to_owned()),
     }
+}
+
+fn eval_ctor_value(
+    state: &ExplicitState,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+) -> Result<ExplicitValue, String> {
+    let fields = args
+        .iter()
+        .map(|(name, expr)| {
+            eval_expr(
+                state,
+                expr,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )
+            .map(|value| (name.clone(), value))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ExplicitValue::Enum {
+        enum_name: enum_name.to_owned(),
+        variant: ctor.to_owned(),
+        fields,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum QuantifierMode {
+    Forall,
+    Exists,
+    One,
+    Lone,
+}
+
+fn eval_quantifier(
+    state: &ExplicitState,
+    var: &str,
+    domain: &IRType,
+    body: &IRExpr,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+    mode: QuantifierMode,
+) -> Result<ExplicitValue, String> {
+    let mut matches = 0usize;
+    for (nested_values, nested_slots) in
+        quantifier_bindings(state, var, domain, entity_specs, value_locals, slot_locals)?
+    {
+        if eval_bool_with_locals(
+            state,
+            body,
+            current_system,
+            system_fields,
+            entity_specs,
+            &nested_values,
+            &nested_slots,
+        )? {
+            matches += 1;
+            if matches > 1 && matches!(mode, QuantifierMode::Lone | QuantifierMode::One) {
+                return Ok(ExplicitValue::Bool(false));
+            }
+            if matches == 1 && matches!(mode, QuantifierMode::Exists) {
+                return Ok(ExplicitValue::Bool(true));
+            }
+        } else if matches!(mode, QuantifierMode::Forall) {
+            return Ok(ExplicitValue::Bool(false));
+        }
+    }
+
+    let result = match mode {
+        QuantifierMode::Forall => true,
+        QuantifierMode::Exists => false,
+        QuantifierMode::One => matches == 1,
+        QuantifierMode::Lone => true,
+    };
+    Ok(ExplicitValue::Bool(result))
+}
+
+fn eval_choose(
+    state: &ExplicitState,
+    var: &str,
+    domain: &IRType,
+    predicate: Option<&IRExpr>,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+) -> Result<ExplicitValue, String> {
+    for (nested_values, nested_slots) in
+        quantifier_bindings(state, var, domain, entity_specs, value_locals, slot_locals)?
+    {
+        let selected = nested_values.get(var).cloned().or_else(|| {
+            nested_slots.get(var).map(|binding| {
+                ExplicitValue::SlotRef(op::EntitySlotRef::new(
+                    entity_specs[binding.entity_index].name.clone(),
+                    binding.slot,
+                ))
+            })
+        });
+        let predicate_holds = match predicate {
+            Some(pred) => eval_bool_with_locals(
+                state,
+                pred,
+                current_system,
+                system_fields,
+                entity_specs,
+                &nested_values,
+                &nested_slots,
+            )?,
+            None => true,
+        };
+        if predicate_holds {
+            return selected
+                .ok_or_else(|| format!("unknown explicit-state choose binding `{var}`"));
+        }
+    }
+    Err("empty explicit-state choose domain".to_owned())
+}
+
+fn quantifier_bindings(
+    state: &ExplicitState,
+    var: &str,
+    domain: &IRType,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+) -> Result<
+    Vec<(
+        HashMap<String, ExplicitValue>,
+        HashMap<String, ExplicitSlotBinding>,
+    )>,
+    String,
+> {
+    if let IRType::Entity { name } = domain {
+        let Some((entity_index, spec)) = entity_specs
+            .iter()
+            .enumerate()
+            .find(|(_, spec)| spec.name == *name)
+        else {
+            return Err("unknown explicit-state quantifier entity".to_owned());
+        };
+        let mut bindings = Vec::new();
+        for slot in 0..spec.slot_count {
+            if !state.entity_slots[entity_index][slot].active {
+                continue;
+            }
+            let mut nested_slots = slot_locals.clone();
+            nested_slots.insert(var.to_owned(), ExplicitSlotBinding { entity_index, slot });
+            bindings.push((value_locals.clone(), nested_slots));
+        }
+        return Ok(bindings);
+    }
+
+    finite_values_for_type(domain)
+        .map_err(|_| "unsupported quantifier domain in explicit-state fragment".to_owned())
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| {
+                    let mut nested_values = value_locals.clone();
+                    nested_values.insert(var.to_owned(), value);
+                    (nested_values, slot_locals.clone())
+                })
+                .collect()
+        })
 }
 
 fn eval_bool_with_locals(
@@ -3169,10 +3678,31 @@ fn finite_default_value(field: &IRField) -> Result<ExplicitValue, String> {
         (
             IRType::Enum { name, variants },
             Some(IRExpr::Ctor { ctor, args, .. }),
-        ) if args.is_empty() && variants.iter().all(|variant| variant.fields.is_empty()) => {
+        ) if variants.iter().all(|variant| variant.fields.iter().all(|field| finite_values_for_type(&field.ty).is_ok())) =>
+        {
+            let Some(variant) = variants.iter().find(|variant| variant.name == *ctor) else {
+                return Err(format!("unknown enum constructor `{ctor}`"));
+            };
+            let mut fields = Vec::new();
+            for variant_field in &variant.fields {
+                let Some((_, expr)) = args
+                    .iter()
+                    .find(|(field_name, _)| field_name == &variant_field.name)
+                else {
+                    return Err(format!(
+                        "missing enum payload field `{}` for `{ctor}`",
+                        variant_field.name
+                    ));
+                };
+                fields.push((
+                    variant_field.name.clone(),
+                    eval_static_finite_expr(expr)?,
+                ));
+            }
             Ok(ExplicitValue::Enum {
                 enum_name: name.clone(),
                 variant: ctor.clone(),
+                fields,
             })
         }
         (IRType::Enum { name, variants }, None)
@@ -3184,6 +3714,7 @@ fn finite_default_value(field: &IRField) -> Result<ExplicitValue, String> {
             Ok(ExplicitValue::Enum {
                 enum_name: name.clone(),
                 variant: first.name.clone(),
+                fields: vec![],
             })
         }
         (IRType::Identity, None) => Ok(ExplicitValue::Identity("__explicit_identity__".to_owned())),
@@ -3209,17 +3740,73 @@ fn finite_values_for_type(ty: &IRType) -> Result<Vec<ExplicitValue>, String> {
     match ty {
         IRType::Bool => Ok(vec![ExplicitValue::Bool(false), ExplicitValue::Bool(true)]),
         IRType::Enum { name, variants }
-            if variants.iter().all(|variant| variant.fields.is_empty()) =>
+            if variants.iter().all(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .all(|field| finite_values_for_type(&field.ty).is_ok())
+            }) =>
         {
-            Ok(variants
-                .iter()
-                .map(|variant| ExplicitValue::Enum {
-                    enum_name: name.clone(),
-                    variant: variant.name.clone(),
-                })
-                .collect())
+            let mut values = Vec::new();
+            for variant in variants {
+                for fields in enumerate_variant_field_values(&variant.fields)? {
+                    values.push(ExplicitValue::Enum {
+                        enum_name: name.clone(),
+                        variant: variant.name.clone(),
+                        fields,
+                    });
+                }
+            }
+            Ok(values)
         }
         _ => Err("explicit-state only supports Bool and fieldless-enum step parameters".to_owned()),
+    }
+}
+
+fn enumerate_variant_field_values(
+    fields: &[crate::ir::types::IRVariantField],
+) -> Result<Vec<Vec<(String, ExplicitValue)>>, String> {
+    let mut out = vec![Vec::new()];
+    for field in fields {
+        let values = finite_values_for_type(&field.ty)?;
+        let mut next = Vec::new();
+        for prefix in &out {
+            for value in &values {
+                let mut extended = prefix.clone();
+                extended.push((field.name.clone(), value.clone()));
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Ok(out)
+}
+
+fn eval_static_finite_expr(expr: &IRExpr) -> Result<ExplicitValue, String> {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Bool { value },
+            ..
+        } => Ok(ExplicitValue::Bool(*value)),
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            ..
+        } => {
+            let fields = args
+                .iter()
+                .map(|(name, expr)| {
+                    eval_static_finite_expr(expr).map(|value| (name.clone(), value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ExplicitValue::Enum {
+                enum_name: enum_name.clone(),
+                variant: ctor.clone(),
+                fields,
+            })
+        }
+        _ => Err("unsupported explicit-state finite enum payload expression".to_owned()),
     }
 }
 
@@ -3306,7 +3893,9 @@ fn enumerate_param_bindings_for_state(
 fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
     match value {
         ExplicitValue::Bool(value) => op::WitnessValue::Bool(*value),
-        ExplicitValue::Enum { enum_name, variant } => op::WitnessValue::EnumVariant {
+        ExplicitValue::Enum {
+            enum_name, variant, ..
+        } => op::WitnessValue::EnumVariant {
             enum_name: enum_name.clone(),
             variant: variant.clone(),
         },
@@ -3434,7 +4023,7 @@ fn render_explicit_edge_label(edge: &ExplicitEdge) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::{IRFieldPat, IRPattern, IRVariant};
+    use crate::ir::types::{IRFieldPat, IRMatchArm, IRPattern, IRVariant};
 
     fn bool_lit(value: bool) -> IRExpr {
         IRExpr::Lit {
@@ -3465,6 +4054,31 @@ mod tests {
             enum_name: "Status".to_owned(),
             ctor: variant.to_owned(),
             args: vec![],
+            span: None,
+        }
+    }
+
+    fn payload_enum_type() -> IRType {
+        IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![crate::ir::types::IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                IRVariant::simple("Reject"),
+            ],
+        }
+    }
+
+    fn payload_enum_ctor(allowed: bool) -> IRExpr {
+        IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("allowed".to_owned(), bool_lit(allowed))],
             span: None,
         }
     }
@@ -3583,7 +4197,8 @@ mod tests {
             finite_default_value(&enum_field).unwrap(),
             ExplicitValue::Enum {
                 enum_name: "Status".to_owned(),
-                variant: "Closed".to_owned()
+                variant: "Closed".to_owned(),
+                fields: vec![],
             }
         );
         let identity_field = IRField {
@@ -3738,6 +4353,312 @@ mod tests {
     }
 
     #[test]
+    fn explicit_state_initial_constraints_enumerate_finite_field_values() {
+        let constrained_field = IRField {
+            name: "heads".to_owned(),
+            ty: IRType::Bool,
+            default: None,
+            initial_constraint: Some(bin("OpEq", var("$", IRType::Bool), bool_lit(true))),
+        };
+        let spec = ExplicitEntitySpec {
+            name: "Coin".to_owned(),
+            slot_count: 1,
+            fields: vec![constrained_field],
+            field_indices: HashMap::from([("heads".to_owned(), 0)]),
+            transitions: HashMap::new(),
+            fsm_decls: Vec::new(),
+        };
+
+        let states =
+            enumerate_initial_states(&[spec], &HashMap::from([((0usize, 0usize), true)]), vec![])
+                .unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert!(states[0].entity_slots[0][0].active);
+        assert_eq!(
+            states[0].entity_slots[0][0].values[0],
+            ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_finite_quantifier_and_choose_domains() {
+        let state = empty_state();
+        let specs = vec![];
+        let system_fields = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+
+        let forall_bool = IRExpr::Forall {
+            var: "b".to_owned(),
+            domain: IRType::Bool,
+            body: Box::new(bin(
+                "OpOr",
+                var("b", IRType::Bool),
+                IRExpr::UnOp {
+                    op: "OpNot".to_owned(),
+                    operand: Box::new(var("b", IRType::Bool)),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+            )),
+            span: None,
+        };
+        let exists_enum = IRExpr::Exists {
+            var: "s".to_owned(),
+            domain: enum_type(),
+            body: Box::new(bin("OpEq", var("s", enum_type()), enum_ctor("Closed"))),
+            span: None,
+        };
+        let one_enum = IRExpr::One {
+            var: "s".to_owned(),
+            domain: enum_type(),
+            body: Box::new(bin("OpEq", var("s", enum_type()), enum_ctor("Open"))),
+            span: None,
+        };
+        let lone_enum = IRExpr::Lone {
+            var: "s".to_owned(),
+            domain: enum_type(),
+            body: Box::new(bin("OpEq", var("s", enum_type()), enum_ctor("Open"))),
+            span: None,
+        };
+        let choose_enum = IRExpr::Choose {
+            var: "s".to_owned(),
+            domain: enum_type(),
+            predicate: Some(Box::new(bin(
+                "OpEq",
+                var("s", enum_type()),
+                enum_ctor("Closed"),
+            ))),
+            ty: enum_type(),
+            span: None,
+        };
+
+        for expr in [
+            &forall_bool,
+            &exists_enum,
+            &one_enum,
+            &lone_enum,
+            &choose_enum,
+        ] {
+            assert!(supports_state_expr(
+                expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_names,
+                &slot_names,
+            ));
+        }
+        assert_eq!(
+            eval_expr(
+                &state,
+                &forall_bool,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &exists_enum,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &one_enum,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &lone_enum,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &choose_enum,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned(),
+                fields: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_match_guards() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::from([
+            ("Orders::flag".to_owned(), 0usize),
+            ("flag".to_owned(), 0usize),
+        ]);
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let match_expr = IRExpr::Match {
+            scrutinee: Box::new(enum_ctor("Open")),
+            arms: vec![
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Open".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: Some(bool_lit(false)),
+                    body: bool_lit(false),
+                },
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Open".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: Some(bool_lit(true)),
+                    body: bool_lit(true),
+                },
+                IRMatchArm {
+                    pattern: IRPattern::PWild,
+                    guard: None,
+                    body: bool_lit(false),
+                },
+            ],
+            span: None,
+        };
+
+        assert!(supports_state_expr(
+            &match_expr,
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &match_expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_finite_enum_payloads() {
+        let state = empty_state();
+        let specs = vec![];
+        let system_fields = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let match_expr = IRExpr::Match {
+            scrutinee: Box::new(payload_enum_ctor(true)),
+            arms: vec![
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Accept".to_owned(),
+                        fields: vec![IRFieldPat {
+                            name: "allowed".to_owned(),
+                            pattern: IRPattern::PVar {
+                                name: "allowed".to_owned(),
+                            },
+                        }],
+                    },
+                    guard: None,
+                    body: var("allowed", IRType::Bool),
+                },
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Reject".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: None,
+                    body: bool_lit(false),
+                },
+            ],
+            span: None,
+        };
+
+        assert!(supports_state_expr(
+            &payload_enum_ctor(true),
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert!(supports_state_expr(
+            &match_expr,
+            Some("Orders"),
+            &system_fields,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &match_expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
+        assert_eq!(
+            finite_values_for_type(&payload_enum_type()).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
     fn explicit_assignment_targets_and_application_update_state() {
         let mut state = sample_state();
         let specs = vec![entity_spec()];
@@ -3824,18 +4745,20 @@ mod tests {
             left: Box::new(IRPattern::PWild),
             right: Box::new(ctor.clone()),
         }));
-        assert!(!pattern_supported(&unsupported_ctor));
+        assert!(pattern_supported(&unsupported_ctor));
         assert!(pattern_matches(
             &ExplicitValue::Enum {
                 enum_name: "Status".to_owned(),
-                variant: "Open".to_owned()
+                variant: "Open".to_owned(),
+                fields: vec![],
             },
             &ctor
         ));
         assert!(!pattern_matches(
             &ExplicitValue::Enum {
                 enum_name: "Status".to_owned(),
-                variant: "Closed".to_owned()
+                variant: "Closed".to_owned(),
+                fields: vec![],
             },
             &ctor
         ));

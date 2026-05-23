@@ -549,17 +549,36 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
         }
         EExpr::Match(scrut, arms, sp) => {
             let resolved_scrut = resolve_expr(ctx, bound, scrut);
+            let scrut_ctors = enum_constructors_for_ty(ctx, &resolved_scrut.ty());
             let resolved_arms = arms
                 .iter()
                 .map(|(pat, guard, body)| {
                     let mut arm_bound: HashMap<String, Ty> = bound.clone();
-                    collect_epattern_vars(pat, &mut arm_bound);
+                    collect_epattern_vars_for_scrutinee(
+                        pat,
+                        scrut_ctors.as_deref(),
+                        &mut arm_bound,
+                    );
                     let resolved_guard = guard.as_ref().map(|g| resolve_expr(ctx, &arm_bound, g));
                     let resolved_body = resolve_expr(ctx, &arm_bound, body);
                     (pat.clone(), resolved_guard, resolved_body)
                 })
                 .collect();
             EExpr::Match(Box::new(resolved_scrut), resolved_arms, *sp)
+        }
+        EExpr::Choose(_ty, binder, domain_ty, predicate, sp) => {
+            let resolved_domain = ctx.resolve_ty(domain_ty);
+            let mut inner_bound = bound.clone();
+            inner_bound.insert(binder.clone(), resolved_domain.clone());
+            EExpr::Choose(
+                resolved_domain.clone(),
+                binder.clone(),
+                resolved_domain,
+                predicate
+                    .as_ref()
+                    .map(|pred| Box::new(resolve_expr(ctx, &inner_bound, pred))),
+                *sp,
+            )
         }
         EExpr::SetComp(_ty, proj, var, vty, source, filter, sp) => {
             let resolved_source = source
@@ -858,6 +877,37 @@ pub(super) fn collect_epattern_vars(pat: &EPattern, vars: &mut HashMap<String, T
             collect_epattern_vars(left, vars);
             collect_epattern_vars(right, vars);
         }
+    }
+}
+
+fn collect_epattern_vars_for_scrutinee(
+    pat: &EPattern,
+    constructors: Option<&[String]>,
+    vars: &mut HashMap<String, Ty>,
+) {
+    match pat {
+        EPattern::Var(name) => {
+            if !constructors.is_some_and(|ctors| ctors.iter().any(|ctor| ctor == name)) {
+                vars.insert(name.clone(), Ty::Error);
+            }
+        }
+        EPattern::Ctor(_, fields) => {
+            for (_, fpat) in fields {
+                collect_epattern_vars(fpat, vars);
+            }
+        }
+        EPattern::Wild => {}
+        EPattern::Or(left, right) => {
+            collect_epattern_vars_for_scrutinee(left, constructors, vars);
+            collect_epattern_vars_for_scrutinee(right, constructors, vars);
+        }
+    }
+}
+
+fn enum_constructors_for_ty(ctx: &Ctx, ty: &Ty) -> Option<Vec<String>> {
+    match ctx.resolve_ty(ty) {
+        Ty::Enum(_, ctors) => Some(ctors),
+        _ => None,
     }
 }
 
