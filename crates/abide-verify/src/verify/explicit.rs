@@ -2095,28 +2095,33 @@ fn validate_action(
             refs,
             args,
         } => {
-            if !slot_locals.contains_key(target) {
-                if step_indices.contains_key(&(target.clone(), transition.clone())) {
-                    validate_cross_call_like(
-                        target,
-                        transition,
-                        refs,
-                        args,
-                        Some(current_system),
-                        system_fields,
-                        system_field_types,
-                        entity_specs,
-                        steps,
-                        step_indices,
-                        value_locals,
-                        slot_locals,
-                        active_calls,
-                    )?;
-                    return Ok(value_locals.clone());
-                }
-                return Err("unsupported apply in explicit-state fragment".to_owned());
-            }
-            let Some(spec) = entity_spec_for_binding(entity_specs, slot_locals, target) else {
+            if !slot_locals.contains_key(target)
+                && step_indices.contains_key(&(target.clone(), transition.clone()))
+            {
+                validate_cross_call_like(
+                    target,
+                    transition,
+                    refs,
+                    args,
+                    Some(current_system),
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    steps,
+                    step_indices,
+                    value_locals,
+                    slot_locals,
+                    active_calls,
+                )?;
+                return Ok(value_locals.clone());
+            };
+            let Some(spec) = entity_spec_for_binding_or_value_local(
+                entity_specs,
+                slot_locals,
+                system_field_types,
+                value_locals,
+                target,
+            ) else {
                 return Err("unsupported apply in explicit-state fragment".to_owned());
             };
             let Some(trans) = spec.transitions.get(transition) else {
@@ -2409,6 +2414,24 @@ fn entity_spec_for_binding<'a>(
         .and_then(|entity_index| entity_specs.get(*entity_index))
 }
 
+fn entity_spec_for_binding_or_value_local<'a>(
+    entity_specs: &'a [ExplicitEntitySpec<'a>],
+    slot_locals: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
+    value_locals: &HashSet<String>,
+    target: &str,
+) -> Option<&'a ExplicitEntitySpec<'a>> {
+    entity_spec_for_binding(entity_specs, slot_locals, target).or_else(|| {
+        if !value_locals.contains(target) {
+            return None;
+        }
+        let Some(IRType::Entity { name }) = system_field_types.get(target) else {
+            return None;
+        };
+        entity_specs.iter().find(|spec| spec.name == *name)
+    })
+}
+
 fn execute_actions(
     model: &ExplicitModel<'_>,
     state: ExplicitState,
@@ -2657,23 +2680,25 @@ fn execute_action(
             refs,
             args,
         } => {
-            if !slot_locals.contains_key(target) {
-                if model.step_by_key(target, transition).is_some() {
-                    return execute_cross_call_like(
-                        model,
-                        state,
-                        target,
-                        transition,
-                        refs,
-                        args,
-                        Some(current_system),
-                        value_locals,
-                        slot_locals,
-                    );
-                }
-                return Err("unsupported apply in explicit-state fragment".to_owned());
+            if !slot_locals.contains_key(target) && model.step_by_key(target, transition).is_some()
+            {
+                return execute_cross_call_like(
+                    model,
+                    state,
+                    target,
+                    transition,
+                    refs,
+                    args,
+                    Some(current_system),
+                    value_locals,
+                    slot_locals,
+                );
             }
-            let Some(binding) = slot_locals.get(target) else {
+            let binding = if let Some(binding) = slot_locals.get(target) {
+                *binding
+            } else if let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(target) {
+                explicit_slot_binding_for_ref(&model.entity_specs, selected)?
+            } else {
                 return Err("unsupported apply in explicit-state fragment".to_owned());
             };
             let spec = &model.entity_specs[binding.entity_index];
@@ -4632,7 +4657,8 @@ fn render_explicit_edge_label(edge: &ExplicitEdge) -> String {
 mod tests {
     use super::*;
     use crate::ir::types::{
-        IRActionMatchArm, IRActionMatchScrutinee, IRFieldPat, IRMatchArm, IRPattern, IRVariant,
+        IRActionMatchArm, IRActionMatchScrutinee, IRFieldPat, IRMatchArm, IRPattern, IRUpdate,
+        IRVariant,
     };
 
     fn bool_lit(value: bool) -> IRExpr {
@@ -5637,6 +5663,113 @@ mod tests {
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].0.system_values[0], ExplicitValue::Bool(true));
+    }
+
+    #[test]
+    fn explicit_state_entity_step_params_can_target_entity_actions() {
+        let ticket_ty = IRType::Entity {
+            name: "Ticket".to_owned(),
+        };
+        let status_field = IRField {
+            name: "status".to_owned(),
+            ty: enum_type(),
+            default: Some(enum_ctor("Open")),
+            initial_constraint: None,
+        };
+        let close: &'static IRTransition = Box::leak(Box::new(IRTransition {
+            name: "close".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: bin("OpEq", var("status", enum_type()), enum_ctor("Open")),
+            updates: vec![IRUpdate {
+                field: "status".to_owned(),
+                value: enum_ctor("Closed"),
+            }],
+            postcondition: None,
+        }));
+        let ticket_spec = ExplicitEntitySpec {
+            name: "Ticket".to_owned(),
+            slot_count: 1,
+            fields: vec![status_field],
+            field_indices: HashMap::from([("status".to_owned(), 0usize)]),
+            transitions: HashMap::from([("close".to_owned(), close)]),
+            fsm_decls: Vec::new(),
+        };
+        let action = IRAction::Apply {
+            target: "ticket".to_owned(),
+            transition: "close".to_owned(),
+            refs: vec![],
+            args: vec![],
+        };
+        let system_field_types = HashMap::from([("ticket".to_owned(), ticket_ty.clone())]);
+        let value_names = HashSet::from(["ticket".to_owned()]);
+        let entity_specs = vec![ticket_spec];
+
+        validate_actions(
+            std::slice::from_ref(&action),
+            "Queue",
+            &HashMap::new(),
+            &system_field_types,
+            &entity_specs,
+            &[],
+            &HashMap::new(),
+            &value_names,
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("entity step parameters should validate as entity action targets");
+
+        let model = ExplicitModel {
+            roots: vec!["Queue".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs,
+            entity_indices: HashMap::from([("Ticket".to_owned(), 0usize)]),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let state = ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![vec![ExplicitEntitySlotState {
+                active: true,
+                values: vec![ExplicitValue::Enum {
+                    enum_name: "Status".to_owned(),
+                    variant: "Open".to_owned(),
+                    fields: vec![],
+                }],
+            }]],
+        };
+        let value_locals = HashMap::from([(
+            "ticket".to_owned(),
+            ExplicitValue::SlotRef(op::EntitySlotRef::new("Ticket", 0)),
+        )]);
+
+        let outcomes = execute_actions(
+            &model,
+            state,
+            "Queue",
+            &[action],
+            &value_locals,
+            &HashMap::new(),
+        )
+        .expect("entity step parameters should execute as entity action targets");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].0.entity_slots[0][0].values[0],
+            ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned(),
+                fields: vec![],
+            }
+        );
     }
 
     #[test]
