@@ -51,6 +51,42 @@ pub struct Ic3TraceStep {
     pub assignments: Vec<(String, String, String)>,
 }
 
+fn ic3_expr_type(expr: &IRExpr) -> Option<&IRType> {
+    match expr {
+        IRExpr::Lit { ty, .. }
+        | IRExpr::Var { ty, .. }
+        | IRExpr::BinOp { ty, .. }
+        | IRExpr::UnOp { ty, .. }
+        | IRExpr::Field { ty, .. }
+        | IRExpr::App { ty, .. }
+        | IRExpr::Choose { ty, .. }
+        | IRExpr::MapUpdate { ty, .. }
+        | IRExpr::Index { ty, .. }
+        | IRExpr::SetLit { ty, .. }
+        | IRExpr::SeqLit { ty, .. }
+        | IRExpr::MapLit { ty, .. }
+        | IRExpr::SetComp { ty, .. } => Some(ty),
+        IRExpr::Prime { expr, .. }
+        | IRExpr::Let { body: expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. } => ic3_expr_type(expr),
+        IRExpr::IfElse { then_body, .. } => ic3_expr_type(then_body),
+        IRExpr::Match { arms, .. } => arms.first().and_then(|arm| ic3_expr_type(&arm.body)),
+        IRExpr::Ctor { .. } => None,
+        _ => None,
+    }
+}
+
+fn ic3_enum_payload_type_has_field(ty: &IRType, field: &str) -> bool {
+    matches!(
+        ty,
+        IRType::Enum { variants, .. }
+            if variants
+                .iter()
+                .any(|variant| variant.fields.iter().any(|payload| payload.name == field))
+    )
+}
+
 /// Try to prove a safety property for a single-entity system using IC3/PDR.
 ///
 /// Generates a CHC (Constrained Horn Clause) encoding as an SMT-LIB2 string,

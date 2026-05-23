@@ -505,6 +505,20 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                 }
                 return Err(format!("field {field} not found on entity {entity_name}"));
             }
+            if ic3_expr_type(inner).is_some_and(|ty| ic3_enum_payload_type_has_field(ty, field)) {
+                let inner_smt = expr_to_smt_sys_prop_scoped(
+                    inner,
+                    entities,
+                    slots_per_entity,
+                    current_entity,
+                    vctx,
+                    current_ent_name,
+                    current_slot,
+                    locals,
+                    entity_locals,
+                )?;
+                return Ok(format!("({field} {inner_smt})"));
+            }
             Err(format!(
                 "unsupported field access in system IC3 property: {field}"
             ))

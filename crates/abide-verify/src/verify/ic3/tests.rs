@@ -3628,6 +3628,176 @@ fn ic3_system_supports_match_destructuring_for_constructor_fields() {
 }
 
 #[test]
+fn build_system_chc_supports_payload_field_projection_in_properties() {
+    let result_ty = IRTypeEntry {
+        name: "Result".to_owned(),
+        ty: IRType::Enum {
+            name: "Result".to_owned(),
+            variants: vec![IRVariant {
+                name: "Err".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "code".to_owned(),
+                    ty: IRType::Int,
+                }],
+            }],
+        },
+    };
+
+    let order = IREntity {
+        name: "Order".to_owned(),
+        fields: vec![IRField {
+            name: "status".to_owned(),
+            ty: result_ty.ty.clone(),
+            default: Some(IRExpr::Ctor {
+                enum_name: "Result".to_owned(),
+                ctor: "Err".to_owned(),
+                args: vec![(
+                    "code".to_owned(),
+                    IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 7 },
+                        span: None,
+                    },
+                )],
+                span: None,
+            }),
+            initial_constraint: None,
+        }],
+        transitions: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+
+    let system = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+
+    let ir = IRProgram {
+        types: vec![result_ty],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![order],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpGe".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                            span: None,
+                        }),
+                        field: "status".to_owned(),
+                        ty: ir.types[0].ty.clone(),
+                        span: None,
+                    }),
+                    field: "code".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let mut slots = HashMap::new();
+    slots.insert("Order".to_owned(), 1);
+
+    let chc = build_system_chc(
+        &[&ir.entities[0]],
+        &[&ir.systems[0]],
+        &vctx,
+        &property,
+        &slots,
+    )
+    .expect("system CHC should encode payload field projection properties");
+    assert!(chc.contains("(code Order_0_f0)"));
+}
+
+#[test]
+fn system_property_encoder_supports_payload_field_projection() {
+    let (entity, tys) = make_result_entity_with_payload();
+    let ir = make_ir_for_entity(&entity, tys.clone());
+    let vctx = VerifyContext::from_ir(&ir);
+    let result_ty = tys[0].ty.clone();
+    let entity_ty = IRType::Entity {
+        name: "Order".to_owned(),
+    };
+    let entities = vec![&entity];
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+    let mut entity_locals = Ic3SystemEntityLocals::new();
+    entity_locals.insert("o".to_owned(), ("Order".to_owned(), 0));
+
+    let projection = IRExpr::Field {
+        expr: Box::new(IRExpr::Field {
+            expr: Box::new(IRExpr::Var {
+                name: "o".to_owned(),
+                ty: entity_ty,
+                span: None,
+            }),
+            field: "status".to_owned(),
+            ty: result_ty,
+            span: None,
+        }),
+        field: "code".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+
+    let smt = expr_to_smt_sys_prop_scoped(
+        &projection,
+        &entities,
+        &slots,
+        &entity,
+        &vctx,
+        "Order",
+        0,
+        &HashSet::new(),
+        &entity_locals,
+    )
+    .expect("payload field projection should encode through the datatype selector");
+
+    assert_eq!(smt, "(code Order_0_f0)");
+}
+
+#[test]
 fn ic3_system_supports_cross_entity_let_property() {
     require_unbounded_proof_tests!();
 
