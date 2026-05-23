@@ -802,6 +802,48 @@ fn lower_files(paths: &[&str]) -> ir::types::IRProgram {
 }
 
 #[test]
+fn verify_context_preserves_entity_field_defaults_from_source() {
+    use std::io::Write;
+
+    let src = r"
+module ContextDefaults
+
+enum Status = Open | Closed
+
+entity Ticket {
+  status: Status = @Open
+  active: bool = true
+  weight: int = 7
+}
+";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("context_defaults.ab");
+    let mut file = std::fs::File::create(&path).expect("create fixture");
+    file.write_all(src.as_bytes()).expect("write fixture");
+    drop(file);
+
+    let path_str = path.to_str().expect("fixture path should be utf-8");
+    let prog = lower_file(path_str);
+    let vctx = abide::verify::context::VerifyContext::from_ir(&prog);
+    let ticket = vctx
+        .entities
+        .get("Ticket")
+        .expect("Ticket entity should be in VerifyContext");
+
+    let default_for = |field_name: &str| {
+        ticket
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .and_then(|field| field.default.as_deref())
+    };
+
+    assert_eq!(default_for("status"), Some("@Open"));
+    assert_eq!(default_for("active"), Some("true"));
+    assert_eq!(default_for("weight"), Some("7"));
+}
+
+#[test]
 fn lower_simple() {
     let prog = lower_file("tests/fixtures/simple.ab");
     assert!(!prog.types.is_empty(), "should have IR types");

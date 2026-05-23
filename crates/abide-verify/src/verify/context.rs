@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::defenv::DefEnv;
 use super::smt::{self, DatatypeAccessor, DatatypeSort};
 
-use crate::ir::types::{IRProgram, IRQuery, IRType};
+use crate::ir::types::{IRExpr, IRProgram, IRQuery, IRType, LitVal};
 
 // ── Variant ID mapping ──────────────────────────────────────────────
 
@@ -178,7 +178,7 @@ impl VerifyContext {
                 .map(|f| FieldInfo {
                     name: f.name.clone(),
                     ty: f.ty.clone(),
-                    default: None, // TODO: extract from IR
+                    default: f.default.as_ref().map(default_expr_to_string),
                 })
                 .collect();
 
@@ -231,6 +231,164 @@ impl VerifyContext {
             system_queries,
             defs: DefEnv::from_ir(ir),
         }
+    }
+}
+
+fn default_expr_to_string(expr: &IRExpr) -> String {
+    match expr {
+        IRExpr::Lit { value, .. } => lit_value_to_string(value),
+        IRExpr::Ctor { ctor, args, .. } => {
+            if args.is_empty() {
+                format!("@{ctor}")
+            } else {
+                let fields = args
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", default_expr_to_string(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("@{ctor} {{ {fields} }}")
+            }
+        }
+        IRExpr::Var { name, .. } => name.clone(),
+        IRExpr::Field { expr, field, .. } => format!("{}.{field}", default_expr_to_string(expr)),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => format!(
+            "({} {} {})",
+            default_expr_to_string(left),
+            default_binop_symbol(op),
+            default_expr_to_string(right)
+        ),
+        IRExpr::UnOp { op, operand, .. } => {
+            let operand = default_expr_to_string(operand);
+            match default_unop_symbol(op) {
+                "not" => format!("not {operand}"),
+                "-" => format!("-{operand}"),
+                symbol => format!("{symbol}{operand}"),
+            }
+        }
+        _ => format!("{expr:?}"),
+    }
+}
+
+fn lit_value_to_string(value: &LitVal) -> String {
+    match value {
+        LitVal::Int { value } => value.to_string(),
+        LitVal::Real { value } | LitVal::Float { value } => value.to_string(),
+        LitVal::Bool { value } => value.to_string(),
+        LitVal::Str { value } => format!("{value:?}"),
+    }
+}
+
+fn default_binop_symbol(op: &str) -> &str {
+    match op {
+        "OpEq" => "==",
+        "OpNeq" => "!=",
+        "OpAnd" => "and",
+        "OpOr" => "or",
+        "OpImplies" => "implies",
+        "OpLt" => "<",
+        "OpLe" => "<=",
+        "OpGt" => ">",
+        "OpGe" => ">=",
+        "OpAdd" => "+",
+        "OpSub" => "-",
+        "OpMul" => "*",
+        "OpDiv" => "/",
+        "OpMod" => "%",
+        other => other,
+    }
+}
+
+fn default_unop_symbol(op: &str) -> &str {
+    match op {
+        "OpNot" => "not",
+        "OpNeg" => "-",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+    use crate::ir::types::{
+        IREntity, IRExpr, IRField, IRProgram, IRType, IRTypeEntry, IRVariant, LitVal,
+    };
+
+    #[test]
+    fn from_ir_preserves_entity_field_defaults() {
+        let status_ty = IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        };
+        let ir = IRProgram {
+            types: vec![IRTypeEntry {
+                name: "Status".to_owned(),
+                ty: status_ty.clone(),
+            }],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![IREntity {
+                name: "Ticket".to_owned(),
+                fields: vec![
+                    IRField {
+                        name: "status".to_owned(),
+                        ty: status_ty,
+                        default: Some(IRExpr::Ctor {
+                            enum_name: "Status".to_owned(),
+                            ctor: "Open".to_owned(),
+                            args: vec![],
+                            span: None,
+                        }),
+                        initial_constraint: None,
+                    },
+                    IRField {
+                        name: "active".to_owned(),
+                        ty: IRType::Bool,
+                        default: Some(IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: true },
+                            span: None,
+                        }),
+                        initial_constraint: None,
+                    },
+                    IRField {
+                        name: "count".to_owned(),
+                        ty: IRType::Int,
+                        default: Some(IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 3 },
+                            span: None,
+                        }),
+                        initial_constraint: None,
+                    },
+                ],
+                transitions: vec![],
+                derived_fields: vec![],
+                invariants: vec![],
+                fsm_decls: vec![],
+            }],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+
+        let vctx = VerifyContext::from_ir(&ir);
+        let ticket = vctx.entities.get("Ticket").expect("Ticket metadata");
+        let default_for = |field_name: &str| {
+            ticket
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .and_then(|field| field.default.as_deref())
+        };
+
+        assert_eq!(default_for("status"), Some("@Open"));
+        assert_eq!(default_for("active"), Some("true"));
+        assert_eq!(default_for("count"), Some("3"));
     }
 }
 
