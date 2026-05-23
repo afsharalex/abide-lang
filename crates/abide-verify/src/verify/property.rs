@@ -1109,6 +1109,68 @@ fn bindings_contain_choose(bindings: &[crate::ir::types::LetBinding]) -> bool {
         .any(|binding| matches!(binding.expr, IRExpr::Choose { .. }))
 }
 
+fn bool_literal(value: bool) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Bool,
+        value: crate::ir::types::LitVal::Bool { value },
+        span: None,
+    }
+}
+
+fn not_expr(expr: IRExpr) -> IRExpr {
+    IRExpr::UnOp {
+        op: "OpNot".to_owned(),
+        operand: Box::new(expr),
+        ty: IRType::Bool,
+        span: None,
+    }
+}
+
+fn implies_expr(left: IRExpr, right: IRExpr) -> IRExpr {
+    IRExpr::BinOp {
+        op: "OpImplies".to_owned(),
+        left: Box::new(left),
+        right: Box::new(right),
+        ty: IRType::Bool,
+        span: None,
+    }
+}
+
+fn guard_branch_choose_bindings(
+    bindings: Vec<crate::ir::types::LetBinding>,
+    branch_guard: &IRExpr,
+) -> Vec<crate::ir::types::LetBinding> {
+    bindings
+        .into_iter()
+        .map(|binding| {
+            let IRExpr::Choose {
+                var,
+                domain,
+                predicate,
+                ty,
+                span,
+            } = binding.expr
+            else {
+                return binding;
+            };
+            let predicate_body = predicate
+                .map(|predicate| *predicate)
+                .unwrap_or_else(|| bool_literal(true));
+            crate::ir::types::LetBinding {
+                name: binding.name,
+                ty: binding.ty,
+                expr: IRExpr::Choose {
+                    var,
+                    domain,
+                    predicate: Some(Box::new(implies_expr(branch_guard.clone(), predicate_body))),
+                    ty,
+                    span,
+                },
+            }
+        })
+        .collect()
+}
+
 pub(super) fn normalize_verifier_choose_expr(expr: &IRExpr) -> Result<IRExpr, String> {
     match expr {
         IRExpr::Let { bindings, body, .. } => {
@@ -1577,6 +1639,7 @@ fn normalize_verifier_choose_term(
             else_body,
             ..
         } => {
+            let cond = normalize_verifier_choose_expr(cond)?;
             let (then_bindings, then_body) = normalize_verifier_choose_term(then_body)?;
             let (else_bindings, else_body) = else_body
                 .as_ref()
@@ -1585,18 +1648,15 @@ fn normalize_verifier_choose_term(
                 .map_or((Vec::new(), None), |(bindings, expr)| {
                     (bindings, Some(Box::new(expr)))
                 });
-            if bindings_contain_choose(&then_bindings) || bindings_contain_choose(&else_bindings) {
-                return Err(
-                    "bare choose inside value if/else branches is not yet supported in verifier properties"
-                        .to_owned(),
-                );
-            }
+            let mut bindings = guard_branch_choose_bindings(then_bindings, &cond);
+            let else_guard = not_expr(cond.clone());
+            bindings.extend(guard_branch_choose_bindings(else_bindings, &else_guard));
             Ok((
-                Vec::new(),
+                bindings,
                 IRExpr::IfElse {
-                    cond: Box::new(normalize_verifier_choose_expr(cond)?),
-                    then_body: Box::new(wrap_let_expr(then_bindings, then_body)),
-                    else_body: else_body.map(|body| Box::new(wrap_let_expr(else_bindings, *body))),
+                    cond: Box::new(cond),
+                    then_body: Box::new(then_body),
+                    else_body,
                     span: None,
                 },
             ))
@@ -3331,6 +3391,98 @@ mod tests {
             span: None,
         };
         assert!(encode_prop_expr(&pool, &vctx, &defs, &ctx, &lone_expr, 0).is_ok());
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_choose_in_value_ifelse_branches() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let choose_one = IRExpr::Choose {
+            var: "candidate".to_owned(),
+            domain: int_ty.clone(),
+            predicate: Some(Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "candidate".to_owned(),
+                    ty: int_ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 1 },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            })),
+            ty: int_ty.clone(),
+            span: None,
+        };
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::IfElse {
+                cond: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                then_body: Box::new(choose_one),
+                else_body: Some(Box::new(IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                })),
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("choose in value if/else branch should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn normalize_verifier_choose_hoists_value_ifelse_branch_choices() {
+        let int_ty = IRType::Int;
+        let expr = IRExpr::IfElse {
+            cond: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            then_body: Box::new(IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: int_ty.clone(),
+                predicate: None,
+                ty: int_ty.clone(),
+                span: None,
+            }),
+            else_body: Some(Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 0 },
+                span: None,
+            })),
+            span: None,
+        };
+
+        let (bindings, normalized) =
+            normalize_verifier_choose_term(&expr).expect("if/else choose normalization");
+        assert_eq!(bindings.len(), 1);
+        assert!(matches!(bindings[0].expr, IRExpr::Choose { .. }));
+        assert!(matches!(normalized, IRExpr::IfElse { .. }));
     }
 
     #[test]
