@@ -3951,6 +3951,111 @@ fn system_value_encoder_supports_payload_field_projection() {
 }
 
 #[test]
+fn build_multi_slot_chc_supports_payload_field_projection_in_transition_updates() {
+    let result_ty = IRTypeEntry {
+        name: "Result".to_owned(),
+        ty: IRType::Enum {
+            name: "Result".to_owned(),
+            variants: vec![IRVariant {
+                name: "Err".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "code".to_owned(),
+                    ty: IRType::Int,
+                }],
+            }],
+        },
+    };
+
+    let order = IREntity {
+        name: "Order".to_owned(),
+        fields: vec![
+            IRField {
+                name: "status".to_owned(),
+                ty: result_ty.ty.clone(),
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Result".to_owned(),
+                    ctor: "Err".to_owned(),
+                    args: vec![("code".to_owned(), ic3_int_lit(7))],
+                    span: None,
+                }),
+                initial_constraint: None,
+            },
+            IRField {
+                name: "code".to_owned(),
+                ty: IRType::Int,
+                default: Some(ic3_int_lit(0)),
+                initial_constraint: None,
+            },
+        ],
+        transitions: vec![IRTransition {
+            name: "copy_code".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: ic3_bool_lit(true),
+            updates: vec![IRUpdate {
+                field: "code".to_owned(),
+                value: IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "status".to_owned(),
+                        ty: result_ty.ty.clone(),
+                        span: None,
+                    }),
+                    field: "code".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                },
+            }],
+            postcondition: None,
+        }],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+
+    let ir = make_ir_for_entity(&order, vec![result_ty]);
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(ic3_bool_lit(true)),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_multi_slot_chc(&order, &vctx, &property, 1)
+        .expect("multi-slot CHC should encode payload field projections in transition updates");
+    assert!(chc.contains("(code s0_f0)"));
+}
+
+#[test]
+fn multi_slot_value_encoder_supports_payload_field_projection() {
+    let (entity, tys) = make_result_entity_with_payload();
+    let ir = make_ir_for_entity(&entity, tys.clone());
+    let vctx = VerifyContext::from_ir(&ir);
+    let result_ty = tys[0].ty.clone();
+    let projection = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "status".to_owned(),
+            ty: result_ty,
+            span: None,
+        }),
+        field: "code".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+
+    let smt = expr_to_smt_scoped(&projection, &entity, &vctx, &HashSet::new()).expect(
+        "multi-slot value encoder should project payload fields through datatype selectors",
+    );
+
+    assert_eq!(smt, "(code f0)");
+}
+
+#[test]
 fn ic3_system_supports_cross_entity_let_property() {
     require_unbounded_proof_tests!();
 
