@@ -809,11 +809,18 @@ fn verify_context_preserves_entity_field_defaults_from_source() {
 module ContextDefaults
 
 enum Status = Open | Closed
+enum Decision = Accept { allowed: bool } | Reject
 
 entity Ticket {
   status: Status = @Open
   active: bool = true
   weight: int = 7
+  accepted: bool = let ok = true in ok
+  fallback: bool = if true { true } else { false }
+  mirrored: bool = match @Accept { allowed: true } {
+    Accept { allowed: accepted } => accepted
+    Reject => false
+  }
 }
 ";
     let dir = tempfile::tempdir().expect("tempdir");
@@ -841,6 +848,21 @@ entity Ticket {
     assert_eq!(default_for("status"), Some("@Open".to_owned()));
     assert_eq!(default_for("active"), Some("true".to_owned()));
     assert_eq!(default_for("weight"), Some("7".to_owned()));
+    assert_eq!(
+        default_for("accepted"),
+        Some("let ok = true in ok".to_owned())
+    );
+    assert_eq!(
+        default_for("fallback"),
+        Some("if true { true } else { false }".to_owned())
+    );
+    assert_eq!(
+        default_for("mirrored"),
+        Some(
+            "match @Accept { allowed: true } { Accept { allowed: accepted } => accepted; Reject => false }"
+                .to_owned()
+        )
+    );
 }
 
 #[test]

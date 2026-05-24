@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::defenv::DefEnv;
 use super::smt::{self, DatatypeAccessor, DatatypeSort};
 
-use crate::ir::types::{IRExpr, IRProgram, IRQuery, IRType, LitVal};
+use crate::ir::types::{IRExpr, IRMatchArm, IRPattern, IRProgram, IRQuery, IRType, LitVal};
 
 // ── Variant ID mapping ──────────────────────────────────────────────
 
@@ -281,7 +281,111 @@ fn default_expr_to_string(expr: &IRExpr) -> Option<String> {
                 symbol => Some(format!("{symbol}{operand}")),
             }
         }
+        IRExpr::Let { bindings, body, .. } => {
+            let bindings = bindings
+                .iter()
+                .map(|binding| {
+                    default_expr_to_string(&binding.expr)
+                        .map(|expr| format!("{} = {expr}", binding.name))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join("; ");
+            Some(format!(
+                "let {bindings} in {}",
+                default_expr_to_string(body)?
+            ))
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            let else_body = else_body.as_ref()?;
+            Some(format!(
+                "if {} {{ {} }} else {{ {} }}",
+                default_expr_to_string(cond)?,
+                default_expr_to_string(then_body)?,
+                default_expr_to_string(else_body)?
+            ))
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            let arms = arms
+                .iter()
+                .map(default_match_arm_to_string)
+                .collect::<Option<Vec<_>>>()?
+                .join("; ");
+            Some(format!(
+                "match {} {{ {arms} }}",
+                default_expr_to_string(scrutinee)?
+            ))
+        }
+        IRExpr::SetLit { elements, .. } => {
+            default_expr_list_to_string(elements).map(|elements| format!("Set({elements})"))
+        }
+        IRExpr::SeqLit { elements, .. } => {
+            default_expr_list_to_string(elements).map(|elements| format!("[{elements}]"))
+        }
+        IRExpr::MapLit { entries, .. } => entries
+            .iter()
+            .map(|(key, value)| {
+                Some(format!(
+                    "{}: {}",
+                    default_expr_to_string(key)?,
+                    default_expr_to_string(value)?
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|entries| format!("Map({})", entries.join(", "))),
         _ => None,
+    }
+}
+
+fn default_expr_list_to_string(elements: &[IRExpr]) -> Option<String> {
+    elements
+        .iter()
+        .map(default_expr_to_string)
+        .collect::<Option<Vec<_>>>()
+        .map(|elements| elements.join(", "))
+}
+
+fn default_match_arm_to_string(arm: &IRMatchArm) -> Option<String> {
+    let pattern = default_pattern_to_string(&arm.pattern)?;
+    let guard = match &arm.guard {
+        Some(guard) => format!(" if {}", default_expr_to_string(guard)?),
+        None => String::new(),
+    };
+    Some(format!(
+        "{pattern}{guard} => {}",
+        default_expr_to_string(&arm.body)?
+    ))
+}
+
+fn default_pattern_to_string(pattern: &IRPattern) -> Option<String> {
+    match pattern {
+        IRPattern::PVar { name } => Some(name.clone()),
+        IRPattern::PWild => Some("_".to_owned()),
+        IRPattern::PCtor { name, fields } => {
+            if fields.is_empty() {
+                return Some(name.clone());
+            }
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    default_pattern_to_string(&field.pattern)
+                        .map(|pattern| format!("{}: {pattern}", field.name))
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!("{name} {{ {fields} }}"))
+        }
+        IRPattern::POr { left, right } => Some(format!(
+            "{} | {}",
+            default_pattern_to_string(left)?,
+            default_pattern_to_string(right)?
+        )),
     }
 }
 
@@ -449,7 +553,7 @@ mod default_tests {
             default_expr_to_string(&IRExpr::BinOp {
                 op: "OpAnd".to_owned(),
                 left: Box::new(bool_lit.clone()),
-                right: Box::new(bool_lit),
+                right: Box::new(bool_lit.clone()),
                 ty: IRType::Bool,
                 span: None,
             }),
@@ -457,12 +561,88 @@ mod default_tests {
         );
         assert_eq!(
             default_expr_to_string(&IRExpr::Let {
-                bindings: vec![],
-                body: Box::new(IRExpr::Lit {
+                bindings: vec![crate::ir::types::LetBinding {
+                    name: "ok".to_owned(),
+                    ty: IRType::Bool,
+                    expr: bool_lit.clone(),
+                }],
+                body: Box::new(IRExpr::Var {
+                    name: "ok".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                span: None,
+            }),
+            Some("let ok = true in ok".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::IfElse {
+                cond: Box::new(bool_lit.clone()),
+                then_body: Box::new(bool_lit.clone()),
+                else_body: Some(Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: false },
+                    span: None,
+                })),
+                span: None,
+            }),
+            Some("if true { true } else { false }".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::Match {
+                scrutinee: Box::new(IRExpr::Ctor {
+                    enum_name: "Decision".to_owned(),
+                    ctor: "Accept".to_owned(),
+                    args: vec![("allowed".to_owned(), bool_lit.clone())],
+                    span: None,
+                }),
+                arms: vec![
+                    IRMatchArm {
+                        pattern: IRPattern::PCtor {
+                            name: "Accept".to_owned(),
+                            fields: vec![crate::ir::types::IRFieldPat {
+                                name: "allowed".to_owned(),
+                                pattern: IRPattern::PVar {
+                                    name: "accepted".to_owned(),
+                                },
+                            }],
+                        },
+                        guard: None,
+                        body: IRExpr::Var {
+                            name: "accepted".to_owned(),
+                            ty: IRType::Bool,
+                            span: None,
+                        },
+                    },
+                    IRMatchArm {
+                        pattern: IRPattern::PCtor {
+                            name: "Reject".to_owned(),
+                            fields: vec![],
+                        },
+                        guard: None,
+                        body: IRExpr::Lit {
+                            ty: IRType::Bool,
+                            value: LitVal::Bool { value: false },
+                            span: None,
+                        },
+                    },
+                ],
+                span: None,
+            }),
+            Some(
+                "match @Accept { allowed: true } { Accept { allowed: accepted } => accepted; Reject => false }"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::IfElse {
+                cond: Box::new(bool_lit.clone()),
+                then_body: Box::new(IRExpr::Lit {
                     ty: IRType::Bool,
                     value: LitVal::Bool { value: true },
                     span: None,
                 }),
+                else_body: None,
                 span: None,
             }),
             None
