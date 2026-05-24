@@ -22219,6 +22219,27 @@ fn verify_routes_static_relation_cardinality_to_rustsat() {
 }
 
 #[test]
+fn verify_routes_static_relation_cardinality_comparison_to_rustsat() {
+    let ir = lower_source_file(
+        "static_relation_cardinality_comparison.ab",
+        "module StaticRelation\n\n\
+         verify relation_cardinality_upper_bound {\n\
+           assert #Rel::join(Set((1, 2)), Set((2, 3))) <= 1\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Checked { name, depth, .. }
+                if name == "relation_cardinality_upper_bound" && *depth == 0)
+        ),
+        "relation cardinality comparison should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
 fn verify_routes_static_relation_closure_equality_to_rustsat() {
     let ir = lower_source_file(
         "static_relation_closure.ab",

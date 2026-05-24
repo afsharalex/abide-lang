@@ -248,6 +248,26 @@ impl RelationSatEncoder {
         Ok(())
     }
 
+    fn require_cardinality_cmp(
+        &mut self,
+        expr: &IRRelationExpr,
+        cmp: &RelationCardinalityCmp,
+    ) -> Result<(), RelationSatError> {
+        let lits = self.membership_lits(expr)?;
+        match cmp {
+            RelationCardinalityCmp::Eq(expected) => self
+                .sat
+                .add_card_constr(CardConstraint::new_eq(lits, *expected)),
+            RelationCardinalityCmp::Le(bound) => self
+                .sat
+                .add_card_constr(CardConstraint::new_ub(lits, *bound)),
+            RelationCardinalityCmp::Ge(bound) => self
+                .sat
+                .add_card_constr(CardConstraint::new_lb(lits, *bound)),
+        }
+        Ok(())
+    }
+
     fn membership_lits(&mut self, expr: &IRRelationExpr) -> Result<Vec<Lit>, RelationSatError> {
         let ty = expr.relation_type()?;
         let tuples = self.universe.tuples_for_type(&ty)?;
@@ -614,6 +634,11 @@ fn check_static_relation_assertions(
                         .require_cardinality_eq(expr, *expected)
                         .map_err(|err| format!("RustSAT relation cardinality failed: {err:?}"))?;
                 }
+                StaticRelationObligation::CardinalityCmp(expr, cmp) => {
+                    encoder
+                        .require_cardinality_cmp(expr, cmp)
+                        .map_err(|err| format!("RustSAT relation cardinality failed: {err:?}"))?;
+                }
             }
         }
         if !matches!(solve_static_relation(encoder)?, SolverResult::Sat) {
@@ -635,6 +660,14 @@ enum StaticRelationObligation {
     Subset(IRRelationExpr, IRRelationExpr),
     Equal(IRRelationExpr, IRRelationExpr),
     CardinalityEq(IRRelationExpr, usize),
+    CardinalityCmp(IRRelationExpr, RelationCardinalityCmp),
+}
+
+#[derive(Clone)]
+enum RelationCardinalityCmp {
+    Eq(usize),
+    Le(usize),
+    Ge(usize),
 }
 
 fn encode_static_relation_assertion(
@@ -681,6 +714,19 @@ fn encode_static_relation_assertion(
                 "unsupported static relation assertion `{assertion:?}`"
             ))
         }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(op.as_str(), "OpLe" | "OpLt" | "OpGe" | "OpGt") => {
+            if let Some((relation, cmp)) =
+                parse_relation_cardinality_cmp(op, left, right, universe)?
+            {
+                obligations.push(StaticRelationObligation::CardinalityCmp(relation, cmp));
+                return Ok(());
+            }
+            Err(format!(
+                "unsupported static relation assertion `{assertion:?}`"
+            ))
+        }
         _ if contains_relation_surface(assertion) => Err(format!(
             "unsupported static relation assertion `{assertion:?}`"
         )),
@@ -720,6 +766,75 @@ fn parse_relation_cardinality_eq(
                 .map_err(|_| format!("relation cardinality bound `{value}` cannot fit in usize"))?,
         ))),
         _ => Ok(None),
+    }
+}
+
+fn parse_relation_cardinality_cmp(
+    op: &str,
+    left: &IRExpr,
+    right: &IRExpr,
+    universe: &mut RelationUniverse,
+) -> Result<Option<(IRRelationExpr, RelationCardinalityCmp)>, String> {
+    match (left, right) {
+        (
+            IRExpr::Card {
+                expr: relation_expr,
+                ..
+            },
+            IRExpr::Lit {
+                value: LitVal::Int { value },
+                ..
+            },
+        ) if *value >= 0 && contains_relation_surface(relation_expr) => Ok(Some((
+            lower_static_relation_expr(relation_expr, universe)?,
+            relation_cardinality_cmp_from_op(op, *value)?,
+        ))),
+        (
+            IRExpr::Lit {
+                value: LitVal::Int { value },
+                ..
+            },
+            IRExpr::Card {
+                expr: relation_expr,
+                ..
+            },
+        ) if *value >= 0 && contains_relation_surface(relation_expr) => Ok(Some((
+            lower_static_relation_expr(relation_expr, universe)?,
+            relation_cardinality_cmp_from_op(invert_cardinality_cmp_op(op), *value)?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn invert_cardinality_cmp_op(op: &str) -> &str {
+    match op {
+        "OpLe" => "OpGe",
+        "OpLt" => "OpGt",
+        "OpGe" => "OpLe",
+        "OpGt" => "OpLt",
+        other => other,
+    }
+}
+
+fn relation_cardinality_cmp_from_op(
+    op: &str,
+    value: i64,
+) -> Result<RelationCardinalityCmp, String> {
+    let bound: usize = value
+        .try_into()
+        .map_err(|_| format!("relation cardinality bound `{value}` cannot fit in usize"))?;
+    match op {
+        "OpLe" => Ok(RelationCardinalityCmp::Le(bound)),
+        "OpGe" => Ok(RelationCardinalityCmp::Ge(bound)),
+        "OpLt" if bound == 0 => Ok(RelationCardinalityCmp::Eq(usize::MAX)),
+        "OpLt" => Ok(RelationCardinalityCmp::Le(bound - 1)),
+        "OpGt" => bound
+            .checked_add(1)
+            .map(RelationCardinalityCmp::Ge)
+            .ok_or_else(|| format!("relation cardinality bound `{value}` is too large")),
+        other => Err(format!(
+            "unsupported relation cardinality comparison op `{other}`"
+        )),
     }
 }
 
@@ -1000,7 +1115,8 @@ fn static_relation_witness_data(
             let violated = match obligation {
                 StaticRelationObligation::Subset(_, _) => !left_tuples.is_subset(&right_tuples),
                 StaticRelationObligation::Equal(_, _) => left_tuples != right_tuples,
-                StaticRelationObligation::CardinalityEq(_, _) => unreachable!(),
+                StaticRelationObligation::CardinalityEq(_, _)
+                | StaticRelationObligation::CardinalityCmp(_, _) => unreachable!(),
             };
             if !violated {
                 return Ok(None);
@@ -1009,7 +1125,8 @@ fn static_relation_witness_data(
                 kind: match obligation {
                     StaticRelationObligation::Subset(_, _) => "subset",
                     StaticRelationObligation::Equal(_, _) => "equality",
-                    StaticRelationObligation::CardinalityEq(_, _) => unreachable!(),
+                    StaticRelationObligation::CardinalityEq(_, _)
+                    | StaticRelationObligation::CardinalityCmp(_, _) => unreachable!(),
                 },
                 left: (left.relation_type()?, left_tuples),
                 right: (right.relation_type()?, right_tuples),
@@ -1025,6 +1142,29 @@ fn static_relation_witness_data(
                 relation_type: expr.relation_type()?,
                 tuples,
                 expected: *expected,
+                actual,
+            }))
+        }
+        StaticRelationObligation::CardinalityCmp(expr, cmp) => {
+            let tuples = concrete_relation_tuples(expr, universe)?;
+            let actual = tuples.len();
+            let violated = match cmp {
+                RelationCardinalityCmp::Eq(expected) => actual != *expected,
+                RelationCardinalityCmp::Le(bound) => actual > *bound,
+                RelationCardinalityCmp::Ge(bound) => actual < *bound,
+            };
+            if !violated {
+                return Ok(None);
+            }
+            let expected = match cmp {
+                RelationCardinalityCmp::Eq(expected)
+                | RelationCardinalityCmp::Le(expected)
+                | RelationCardinalityCmp::Ge(expected) => *expected,
+            };
+            Ok(Some(StaticRelationWitnessData::Cardinality {
+                relation_type: expr.relation_type()?,
+                tuples,
+                expected,
                 actual,
             }))
         }
