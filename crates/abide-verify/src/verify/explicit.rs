@@ -253,6 +253,25 @@ fn infer_fieldless_enum_return_type(expr: Option<&IRExpr>, vctx: &VerifyContext)
     })
 }
 
+fn infer_fieldless_enum_return_type_from_entity_specs(
+    expr: Option<&IRExpr>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+) -> Option<IRType> {
+    let Some(IRExpr::Ctor { enum_name, .. }) = expr else {
+        return None;
+    };
+    entity_specs
+        .iter()
+        .flat_map(|spec| spec.fields.iter())
+        .find_map(|field| {
+            let IRType::Enum { name, variants } = &field.ty else {
+                return None;
+            };
+            (name == enum_name && variants.iter().all(|variant| variant.fields.is_empty()))
+                .then(|| field.ty.clone())
+        })
+}
+
 impl<'a> ExplicitModel<'a> {
     fn system_is_scheduled(&self, system: &str) -> bool {
         self.roots.iter().any(|root| root == system)
@@ -330,7 +349,13 @@ impl<'a> ExplicitModel<'a> {
                     .iter()
                     .find(|command| command.name == step.name)
                     .and_then(|command| command.return_type.clone())
-                    .or_else(|| infer_fieldless_enum_return_type(step.return_expr.as_ref(), vctx));
+                    .or_else(|| infer_fieldless_enum_return_type(step.return_expr.as_ref(), vctx))
+                    .or_else(|| {
+                        infer_fieldless_enum_return_type_from_entity_specs(
+                            step.return_expr.as_ref(),
+                            &entity_specs,
+                        )
+                    });
                 steps.push(ExplicitStepRef {
                     system: sys.name.clone(),
                     store_param_count: sys.store_params.len(),

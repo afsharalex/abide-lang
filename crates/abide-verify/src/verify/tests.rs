@@ -20374,6 +20374,29 @@ fn verify_all_explicit_state_proves_ref_result_cross_call_entity_store_liveness_
 }
 
 #[test]
+fn explicit_state_explores_ref_result_cross_call_entity_store_liveness_fragment() {
+    let ir = make_explicit_entity_store_ref_result_cross_call_weak_fair_liveness_ir();
+    let verify = ir
+        .verifies
+        .iter()
+        .find(|verify| {
+            verify.name == "tickets_eventually_finish_under_weak_fair_ref_result_relay_finish"
+        })
+        .expect("verify block should exist");
+
+    super::explicit::explore_verify_state_space(
+        &ir,
+        verify,
+        &VerifyConfig {
+            no_ic3: true,
+            ..VerifyConfig::default()
+        },
+    )
+    .expect("explicit ref-result cross-call fragment should not error")
+    .expect("explicit ref-result cross-call state space should be available");
+}
+
+#[test]
 fn verify_all_explicit_state_proves_ref_result_cross_call_entity_store_liveness_under_strong_fairness(
 ) {
     let ir = make_explicit_entity_store_ref_result_cross_call_strong_fair_liveness_ir();
