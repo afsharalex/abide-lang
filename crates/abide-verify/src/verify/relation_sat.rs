@@ -703,6 +703,21 @@ fn encode_static_relation_assertion(
         }
         IRExpr::BinOp {
             op, left, right, ..
+        } if op == "OpDisjoint"
+            && ir_expr_ty(left).is_some_and(is_ir_relation_type)
+            && ir_expr_ty(right).is_some_and(is_ir_relation_type) =>
+        {
+            obligations.push(StaticRelationObligation::CardinalityEq(
+                IRRelationExpr::Intersection(
+                    Box::new(lower_static_relation_expr(left, universe)?),
+                    Box::new(lower_static_relation_expr(right, universe)?),
+                ),
+                0,
+            ));
+            Ok(())
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
         } if op == "OpEq" => {
             if let Some((relation, expected)) =
                 parse_relation_cardinality_eq(left, right, universe)?
@@ -1445,7 +1460,12 @@ fn contains_relation_surface(expr: &IRExpr) -> bool {
             is_any_relation_op(op)
                 || (matches!(
                     op.as_str(),
-                    "OpSetSubset" | "OpSetUnion" | "OpSetIntersect" | "OpSetDiff" | "OpEq"
+                    "OpSetSubset"
+                        | "OpSetUnion"
+                        | "OpSetIntersect"
+                        | "OpSetDiff"
+                        | "OpEq"
+                        | "OpDisjoint"
                 ) && (ir_expr_ty(left).is_some_and(is_ir_relation_type)
                     || ir_expr_ty(right).is_some_and(is_ir_relation_type)))
                 || contains_relation_surface(left)

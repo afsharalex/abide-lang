@@ -22240,6 +22240,27 @@ fn verify_routes_static_relation_cardinality_comparison_to_rustsat() {
 }
 
 #[test]
+fn verify_routes_static_relation_disjoint_to_rustsat() {
+    let ir = lower_source_file(
+        "static_relation_disjoint.ab",
+        "module StaticRelation\n\n\
+         verify relation_disjoint {\n\
+           assert Set((1, 2)) !* Set((2, 3))\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::Checked { name, depth, .. }
+                if name == "relation_disjoint" && *depth == 0)
+        ),
+        "relation disjointness should be checked by RustSAT: {results:?}"
+    );
+}
+
+#[test]
 fn verify_routes_static_relation_closure_equality_to_rustsat() {
     let ir = lower_source_file(
         "static_relation_closure.ab",
