@@ -354,6 +354,12 @@ fn expr_for_slot(
         ])),
         IRExpr::BinOp {
             op, left, right, ..
+        } if is_implies_op(op) => Ok(RelTemporalFormula::Or(vec![
+            RelTemporalFormula::not(expr_for_slot(left, var, store, slot)?),
+            expr_for_slot(right, var, store, slot)?,
+        ])),
+        IRExpr::BinOp {
+            op, left, right, ..
         } if is_eq_op(op) || is_neq_op(op) => {
             let atom = field_equality_atom(left, right, var, store, slot)
                 .or_else(|| field_equality_atom(right, left, var, store, slot))
@@ -382,6 +388,10 @@ fn is_and_op(op: &str) -> bool {
 
 fn is_or_op(op: &str) -> bool {
     matches!(op, "||" | "or" | "OpOr")
+}
+
+fn is_implies_op(op: &str) -> bool {
+    matches!(op, "implies" | "OpImplies")
 }
 
 fn is_eq_op(op: &str) -> bool {
@@ -1990,6 +2000,26 @@ mod tests {
             .expect("lowered boolean/equality ops should encode");
 
         assert!(matches!(formula, RelTemporalFormula::Not(_)));
+    }
+
+    #[test]
+    fn expr_for_slot_accepts_lowered_implication() {
+        let ir = program(entity_with_fields(vec![bool_field("paid")]));
+        let verify = verify(1);
+        let model = TemporalRelationalModel::from_verify(&ir, &verify).expect("model");
+        let slot = model.universe("orders").expect("orders").atoms[0].clone();
+        let expr = IRExpr::BinOp {
+            op: "OpImplies".to_owned(),
+            left: Box::new(field_eq_bool("o", "paid", false)),
+            right: Box::new(field_eq_bool("o", "paid", false)),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let formula = expr_for_slot(&expr, "o", &verify.stores[0], &slot)
+            .expect("lowered implication should encode");
+
+        assert!(matches!(formula, RelTemporalFormula::Or(_)));
     }
 
     #[test]
