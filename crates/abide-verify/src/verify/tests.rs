@@ -23638,6 +23638,47 @@ fn scene_relational_precheck_supports_pure_pred_call() {
 }
 
 #[test]
+fn scene_command_guard_supports_entity_arg_pure_pred_call() {
+    let ir = lower_source_file(
+        "scene_command_guard_entity_pred.ab",
+        "module SceneCommandGuardEntityPred\n\n\
+         enum CopyStatus = Available | CheckedOut\n\n\
+         entity Copy {\n\
+           status: CopyStatus = @Available\n\
+           action checkout() requires status == @Available { status' = @CheckedOut }\n\
+         }\n\n\
+         pred can_checkout(c: Copy) = c.status == @Available\n\n\
+         system Library(copies: Store<Copy>) {\n\
+           command checkout(c: Copy) requires can_checkout(c) {\n\
+             c.checkout()\n\
+           }\n\
+         }\n\n\
+         scene guarded_checkout {\n\
+           given {\n\
+             store copies: Copy[0..1]\n\
+             let library = Library { copies: copies }\n\
+             let copy = one Copy in copies where copy.status == @Available\n\
+           }\n\
+           when {\n\
+             library.checkout(copy)\n\
+           }\n\
+           then {\n\
+             assert copy.status == @CheckedOut\n\
+           }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "guarded_checkout")
+        ),
+        "scene command guards should support pure pred calls over entity-valued args: {results:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_supports_one_create_only_assertions() {
     let ir = lower_source_file(
         "rel_scene_one_assertion.ab",

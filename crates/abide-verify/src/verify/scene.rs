@@ -338,6 +338,24 @@ pub(super) fn build_scene_event_params(
     // params — validated by collect.rs).
     let step_ir = re.steps[0];
     for (param, arg) in step_ir.params.iter().zip(re.scene_event.args.iter()) {
+        if let (
+            crate::ir::types::IRType::Entity { name: param_entity },
+            IRExpr::Var { name: arg_name, .. },
+        ) = (&param.ty, arg)
+        {
+            if let Some((arg_entity, slot)) = given_bindings.get(arg_name) {
+                if arg_entity != param_entity {
+                    return Err(format!(
+                        "entity type mismatch in scene event arg for {}::{}: \
+                         `{arg_name}` is `{arg_entity}` but parameter `{}` expects `{param_entity}`",
+                        re.scene_event.system, re.scene_event.event, param.name,
+                    ));
+                }
+                override_params.insert(param.name.clone(), smt::int_val(*slot as i64));
+                continue;
+            }
+        }
+
         let arg_ctx = PropertyCtx::new().with_store_ranges(store_ranges.clone());
         let arg_ctx = given_bindings
             .iter()
@@ -2254,6 +2272,74 @@ mod tests {
             VerificationResult::SceneFail { reason, .. }
                 if reason.contains("unsupported expression kind in scene then assertion")
         ));
+    }
+
+    #[test]
+    fn build_scene_event_params_resolves_given_entity_args_to_slots() {
+        let entity = crate::ir::types::IREntity {
+            name: "Copy".to_owned(),
+            fields: vec![],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let mut ir = empty_ir();
+        ir.entities.push(entity.clone());
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = create_slot_pool_with_systems(
+            std::slice::from_ref(&entity),
+            &HashMap::from([("Copy".to_owned(), 1)]),
+            1,
+            &[],
+        );
+        let action = IRSystemAction {
+            name: "checkout".to_owned(),
+            params: vec![crate::ir::types::IRTransParam {
+                name: "copy".to_owned(),
+                ty: crate::ir::types::IRType::Entity {
+                    name: "Copy".to_owned(),
+                },
+            }],
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: None,
+        };
+        let scene_event = IRSceneEvent {
+            var: "checkout".to_owned(),
+            system: "Library".to_owned(),
+            event: "checkout".to_owned(),
+            args: vec![IRExpr::Var {
+                name: "given_copy".to_owned(),
+                ty: crate::ir::types::IRType::Entity {
+                    name: "Copy".to_owned(),
+                },
+                span: None,
+            }],
+            cardinality: crate::ir::types::Cardinality::Named("one".to_owned()),
+        };
+        let resolved = ResolvedSceneEvent {
+            scene_event: &scene_event,
+            steps: vec![&action],
+        };
+        let params = build_scene_event_params(
+            &resolved,
+            &pool,
+            &vctx,
+            &defs,
+            &HashMap::from([("given_copy".to_owned(), ("Copy".to_owned(), 0usize))]),
+            &HashMap::new(),
+            0,
+            "entity_arg_scene",
+        )
+        .expect("given-bound entity scene arg should encode as slot id");
+
+        let value = params.get("copy").expect("entity param should be bound");
+        assert_eq!(
+            value.as_int().expect("slot id should be Int").to_string(),
+            "0"
+        );
     }
 
     #[test]
