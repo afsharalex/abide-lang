@@ -6542,6 +6542,30 @@ verify explicit_payload_enum {
 }
 
 #[test]
+fn verifier_property_supports_aggregates_over_finite_payload_enums() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  command tick() {}
+}
+
+verify finite_payload_enum_aggregate {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (count d: Decision | d == @Reject) == 1
+}
+";
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "finite_payload_enum_aggregate");
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 

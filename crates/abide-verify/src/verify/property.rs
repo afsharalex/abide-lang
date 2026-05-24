@@ -113,6 +113,60 @@ fn finite_domain_values(domain: &IRType) -> Option<Vec<SmtValue>> {
     }
 }
 
+fn finite_domain_values_with_payloads(
+    vctx: &VerifyContext,
+    domain: &IRType,
+) -> Option<Vec<SmtValue>> {
+    finite_domain_values(domain).or_else(|| finite_payload_enum_values(vctx, domain))
+}
+
+fn finite_payload_enum_values(vctx: &VerifyContext, domain: &IRType) -> Option<Vec<SmtValue>> {
+    let IRType::Enum { name, variants } = domain else {
+        return None;
+    };
+    if !domain.has_variant_fields() {
+        return None;
+    }
+    let dt = vctx.adt_sorts.get(name)?;
+    let mut values = Vec::new();
+    for variant in variants {
+        let constructor = dt
+            .variants
+            .iter()
+            .find(|candidate| smt::func_decl_name(&candidate.constructor) == variant.name)?;
+        let field_values = enumerate_finite_smt_field_values(vctx, &variant.fields)?;
+        for fields in field_values {
+            let args: Vec<Dynamic> = fields.iter().map(SmtValue::to_dynamic).collect();
+            let arg_refs: Vec<&Dynamic> = args.iter().collect();
+            values.push(dynamic_to_smt_value(smt::func_decl_apply(
+                &constructor.constructor,
+                &arg_refs,
+            )));
+        }
+    }
+    Some(values)
+}
+
+fn enumerate_finite_smt_field_values(
+    vctx: &VerifyContext,
+    fields: &[crate::ir::types::IRVariantField],
+) -> Option<Vec<Vec<SmtValue>>> {
+    let mut out = vec![Vec::new()];
+    for field in fields {
+        let values = finite_domain_values_with_payloads(vctx, &field.ty)?;
+        let mut next = Vec::new();
+        for prefix in &out {
+            for value in &values {
+                let mut extended = prefix.clone();
+                extended.push(value.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Some(out)
+}
+
 pub(super) fn clear_path_guard_stack() {
     PROP_PATH_GUARD.with(|v| v.borrow_mut().clear());
 }
@@ -3000,6 +3054,33 @@ pub(super) fn encode_prop_value(
                 step,
             )
         }
+        IRExpr::Aggregate {
+            kind,
+            var,
+            domain: domain @ crate::ir::types::IRType::Enum { name, .. },
+            body,
+            in_filter,
+            ..
+        } if domain.has_variant_fields() => {
+            let Some(values) = finite_payload_enum_values(vctx, domain) else {
+                return Err(format!(
+                    "{kind:?} aggregator over ADT enum `{name}` is not supported — \
+                     constructor fields must themselves have finite Bool/enum domains"
+                ));
+            };
+            encode_aggregate_finite_values(
+                pool,
+                vctx,
+                defs,
+                ctx,
+                *kind,
+                var,
+                body,
+                in_filter.as_deref(),
+                &values,
+                step,
+            )
+        }
         // Bool domain: unfold over {false, true} with proper Bool binding
         IRExpr::Aggregate {
             kind,
@@ -3019,16 +3100,6 @@ pub(super) fn encode_prop_value(
             in_filter.as_deref(),
             step,
         ),
-        // ADT enums with constructor fields: unbounded (can't enumerate)
-        IRExpr::Aggregate {
-            kind,
-            domain: crate::ir::types::IRType::Enum { name, .. },
-            ..
-        } => Err(format!(
-            "{kind:?} aggregator over ADT enum `{name}` is not supported — \
-             ADT constructors carry data fields, making the domain unbounded; \
-             use a fieldless enum or an entity pool"
-        )),
         // Int, Real, String, refinement, and other unbounded domains:
         // Z3 has no native aggregator theory here, so reject with a
         // clear diagnostic suggesting a bounded domain form.
@@ -3314,6 +3385,90 @@ pub(super) fn encode_aggregate_bool(
             };
             acc = ite_value(&any_active, &acc, &undef);
             Ok(acc)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_aggregate_finite_values(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    kind: crate::ir::types::IRAggKind,
+    var: &str,
+    body: &IRExpr,
+    in_filter: Option<&IRExpr>,
+    values: &[SmtValue],
+    step: usize,
+) -> Result<SmtValue, String> {
+    use crate::ir::types::IRAggKind;
+
+    let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
+    for value in values {
+        let inner_ctx = ctx.with_local(var, value.clone());
+        let mut flag = smt::bool_const(true);
+        if let Some(filter_expr) = in_filter {
+            flag = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter_expr, step)?;
+        }
+        if kind == IRAggKind::Count {
+            let pred = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            slot_data.push((smt::bool_and(&[&flag, &pred]), smt::int_val(1)));
+        } else {
+            let val = encode_prop_value(pool, vctx, defs, &inner_ctx, body, step)?;
+            slot_data.push((flag, val));
+        }
+    }
+
+    match kind {
+        IRAggKind::Sum | IRAggKind::Count => {
+            let zero = slot_data
+                .first()
+                .map_or_else(|| agg_zero_from_ir(body), |(_, v)| agg_zero(v));
+            let mut acc = zero;
+            for (cond, val) in &slot_data {
+                let z = agg_zero(val);
+                acc = smt::binop("OpAdd", &acc, &ite_value(cond, val, &z))?;
+            }
+            Ok(acc)
+        }
+        IRAggKind::Product => {
+            let one = slot_data
+                .first()
+                .map_or_else(|| agg_one_from_ir(body), |(_, v)| agg_one(v));
+            let mut acc = one;
+            for (cond, val) in &slot_data {
+                let o = agg_one(val);
+                acc = smt::binop("OpMul", &acc, &ite_value(cond, val, &o))?;
+            }
+            Ok(acc)
+        }
+        IRAggKind::Min | IRAggKind::Max => {
+            if slot_data.is_empty() {
+                return Err(format!("{kind:?} over empty finite domain"));
+            }
+            let is_min = kind == IRAggKind::Min;
+            let op = if is_min { "OpLt" } else { "OpGt" };
+            let mut acc = slot_data[0].1.clone();
+            let mut any_active = slot_data[0].0.clone();
+            for (cond, val) in slot_data.iter().skip(1) {
+                let better = smt::binop(op, val, &acc)?.to_bool()?;
+                let take = smt::bool_and(&[cond, &better]);
+                acc = ite_value(&take, val, &acc);
+                let first_active = smt::bool_and(&[cond, &smt::bool_not(&any_active)]);
+                acc = ite_value(&first_active, val, &acc);
+                any_active = smt::bool_or(&[&any_active, cond]);
+            }
+            let undef_name = format!(
+                "__agg_{}_finite_{var}_undef_t{step}",
+                if is_min { "min" } else { "max" }
+            );
+            let undef = if ir_expr_is_real(body) {
+                smt::real_var(&undef_name)
+            } else {
+                smt::int_var(&undef_name)
+            };
+            Ok(ite_value(&any_active, &acc, &undef))
         }
     }
 }
@@ -3660,7 +3815,7 @@ mod tests {
     use super::*;
     use crate::ir::types::{
         IREntity, IRField, IRMatchArm, IRPattern, IRProgram, IRSystem, IRType, IRTypeEntry,
-        IRVariant, LitVal,
+        IRVariant, IRVariantField, LitVal,
     };
     use crate::verify::harness::create_slot_pool;
 
@@ -3903,6 +4058,73 @@ mod tests {
             bool_max.as_int().expect("max int"),
             &smt::int_lit(2),
         )));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_finite_payload_enum_aggregates() {
+        let decision_ty = IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                IRVariant::simple("Reject"),
+            ],
+        };
+        let ir = IRProgram {
+            types: vec![IRTypeEntry {
+                name: "Decision".to_owned(),
+                ty: decision_ty.clone(),
+            }],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Aggregate {
+                kind: crate::ir::types::IRAggKind::Count,
+                var: "d".to_owned(),
+                domain: decision_ty.clone(),
+                body: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "d".to_owned(),
+                        ty: decision_ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Decision".to_owned(),
+                        ctor: "Reject".to_owned(),
+                        args: vec![],
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                in_filter: None,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("finite payload enum aggregate should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
     }
 
