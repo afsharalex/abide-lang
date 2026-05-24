@@ -6591,6 +6591,53 @@ verify finite_payload_enum_setcomp {
 }
 
 #[test]
+fn ic3_supports_finite_payload_enum_quantifier_domains() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+entity Gate {
+  decision: Decision = @Reject
+  score: int = 0
+}
+
+system Gates(gates: Store<Gate>) {
+  command tick() {}
+}
+
+verify ic3_payload_enum_quantifier {
+  assume {
+    store gates: Gate[0..1]
+    let gates_sys = Gates { gates: gates }
+    stutter
+  }
+
+  assert always all gate: Gate |
+    gate.score >= 0 and exists d: Decision | d == gate.decision
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: false,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "ic3_payload_enum_quantifier"
+                    && method.contains("IC3")
+        )),
+        "finite payload enum quantifier should prove through IC3, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 

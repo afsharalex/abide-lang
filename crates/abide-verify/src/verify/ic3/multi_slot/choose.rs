@@ -12,8 +12,41 @@ pub(in crate::verify::ic3) fn ic3_finite_choose_candidates(
             let (min_id, max_id) = vctx.enum_ranges.get(name).copied()?;
             Some((min_id..=max_id).map(|id| id.to_string()).collect())
         }
+        IRType::Enum { variants, .. } => {
+            let mut candidates = Vec::new();
+            for variant in variants {
+                for fields in ic3_enumerate_variant_field_candidates(&variant.fields, vctx)? {
+                    if fields.is_empty() {
+                        candidates.push(variant.name.clone());
+                    } else {
+                        candidates.push(format!("({} {})", variant.name, fields.join(" ")));
+                    }
+                }
+            }
+            Some(candidates)
+        }
         _ => None,
     }
+}
+
+fn ic3_enumerate_variant_field_candidates(
+    fields: &[crate::ir::types::IRVariantField],
+    vctx: &VerifyContext,
+) -> Option<Vec<Vec<String>>> {
+    let mut out = vec![Vec::new()];
+    for field in fields {
+        let values = ic3_finite_choose_candidates(&field.ty, vctx)?;
+        let mut next = Vec::new();
+        for prefix in &out {
+            for value in &values {
+                let mut extended = prefix.clone();
+                extended.push(value.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Some(out)
 }
 
 pub(in crate::verify::ic3) fn ic3_finite_quantifier_formula<F>(
