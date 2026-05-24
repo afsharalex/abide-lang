@@ -14768,6 +14768,34 @@ fn set_comprehension_maps_over_inferred_set_source() {
 }
 
 #[test]
+fn verifier_property_supports_dependent_choose_in_set_comprehension_projection() {
+    let ir = lower_source_file(
+        "dependent_choose_projection.ab",
+        "module DependentChooseProjection\n\n\
+         entity Dummy { id: identity }\n\n\
+         system S(dummies: Store<Dummy>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify dependent_choose_projection {\n\
+           assume {\n\
+             store dummies: Dummy[0..1]\n\
+             let s = S { dummies: dummies }\n\
+           }\n\
+           assert ({ (choose y: int where y == x + 1) | x in Set(1, 2) where true })[2]\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|result| matches!(result, VerificationResult::Proved { name, .. } if name == "dependent_choose_projection")),
+        "dependent choose in set-comprehension projection should prove membership: {results:?}"
+    );
+}
+
+#[test]
 fn set_comprehension_maps_over_inferred_seq_source() {
     let ir = lower_source_file(
         "sourced_seq_comprehension.ab",

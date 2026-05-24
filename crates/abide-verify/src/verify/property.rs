@@ -974,6 +974,15 @@ pub(super) fn encode_prop_expr(
                 Ok(smt::bool_or(&refs))
             }
         }
+        IRExpr::Index { map, key, .. } => {
+            if let Some(member) =
+                encode_setcomp_projection_membership(pool, vctx, defs, ctx, map, key, step)?
+            {
+                return Ok(member);
+            }
+            let val = encode_prop_value(pool, vctx, defs, ctx, expr, step)?;
+            Ok(val.to_bool()?)
+        }
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpMapHas" => {
@@ -1745,12 +1754,6 @@ fn normalize_verifier_choose_term(
                     matches!(binding.expr, IRExpr::Choose { .. })
                         && !property_expr_mentions_var(&binding.expr, var)
                 });
-            if bindings_contain_choose(&projection_bindings) && !hoist_projection_bindings {
-                return Err(
-                    "bare choose inside set comprehension projections is not yet supported in verifier properties"
-                        .to_owned(),
-                );
-            }
             let projection = projection.map(|expr| {
                 if hoist_projection_bindings {
                     expr
@@ -1866,6 +1869,191 @@ fn narrow_entity_quantifier_slots<'a>(
         return (start..end, guarded_body);
     }
     (0..n_slots, body)
+}
+
+fn encode_prop_value_with_choose_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    expr: &IRExpr,
+    step: usize,
+) -> Result<(SmtValue, Vec<Bool>), String> {
+    let IRExpr::Let { bindings, body, .. } = expr else {
+        return encode_prop_value(pool, vctx, defs, ctx, expr, step).map(|value| (value, vec![]));
+    };
+
+    let mut locals = ctx.locals.clone();
+    let mut constraints = Vec::new();
+    for binding in bindings {
+        match &binding.expr {
+            IRExpr::Choose {
+                var,
+                domain,
+                predicate,
+                ..
+            } => {
+                if matches!(domain, IRType::Entity { .. }) {
+                    return Err(
+                        "entity choose in set-comprehension projection is not yet supported"
+                            .to_owned(),
+                    );
+                }
+                let fresh = format!(
+                    "__abide_projection_choose_{}_{}",
+                    binding.name,
+                    PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
+                let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+                let base_ctx = property_ctx_with_locals(ctx, locals.clone());
+                let pred_ctx = base_ctx.with_local(var, witness.clone());
+                if let Some(domain_pred) =
+                    prop_domain_predicate(domain, &witness, &pred_ctx, vctx, defs)?
+                {
+                    constraints.push(domain_pred);
+                }
+                if let Some(predicate) = predicate {
+                    constraints.push(encode_prop_expr(
+                        pool, vctx, defs, &pred_ctx, predicate, step,
+                    )?);
+                }
+                locals.insert(binding.name.clone(), witness);
+            }
+            _ => {
+                let binding_ctx = property_ctx_with_locals(ctx, locals.clone());
+                let val = encode_prop_value(pool, vctx, defs, &binding_ctx, &binding.expr, step)?;
+                locals.insert(binding.name.clone(), val);
+            }
+        }
+    }
+
+    let body_ctx = property_ctx_with_locals(ctx, locals);
+    let value = encode_prop_value(pool, vctx, defs, &body_ctx, body, step)?;
+    Ok((value, constraints))
+}
+
+fn projection_has_local_choose(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Let { bindings, .. }
+            if bindings.iter().any(|binding| matches!(binding.expr, IRExpr::Choose { .. }))
+    )
+}
+
+fn encode_projection_membership_with_choose(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    projection: &IRExpr,
+    key: &SmtValue,
+    step: usize,
+) -> Result<Bool, String> {
+    let IRExpr::Let { bindings, body, .. } = projection else {
+        let value = encode_prop_value(pool, vctx, defs, ctx, projection, step)?;
+        return smt::smt_eq(&value, key);
+    };
+
+    let mut locals = ctx.locals.clone();
+    let mut constraints = Vec::new();
+    let mut witnesses: Vec<(String, SmtValue, IRType)> = Vec::new();
+
+    for binding in bindings {
+        match &binding.expr {
+            IRExpr::Choose {
+                var,
+                domain,
+                predicate,
+                ..
+            } => {
+                if matches!(domain, IRType::Entity { .. }) {
+                    return Err(
+                        "entity choose in set-comprehension projection is not yet supported"
+                            .to_owned(),
+                    );
+                }
+                let fresh = format!(
+                    "__abide_projection_member_choose_{}_{}",
+                    binding.name,
+                    PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
+                let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+                let base_ctx = property_ctx_with_locals(ctx, locals.clone());
+                let pred_ctx = base_ctx.with_local(var, witness.clone());
+                if let Some(domain_pred) =
+                    prop_domain_predicate(domain, &witness, &pred_ctx, vctx, defs)?
+                {
+                    constraints.push(domain_pred);
+                }
+                if let Some(predicate) = predicate {
+                    constraints.push(encode_prop_expr(
+                        pool, vctx, defs, &pred_ctx, predicate, step,
+                    )?);
+                }
+                locals.insert(binding.name.clone(), witness.clone());
+                witnesses.push((fresh, witness, domain.clone()));
+            }
+            _ => {
+                let binding_ctx = property_ctx_with_locals(ctx, locals.clone());
+                let val = encode_prop_value(pool, vctx, defs, &binding_ctx, &binding.expr, step)?;
+                locals.insert(binding.name.clone(), val);
+            }
+        }
+    }
+
+    let body_ctx = property_ctx_with_locals(ctx, locals);
+    let value = encode_prop_value(pool, vctx, defs, &body_ctx, body, step)?;
+    constraints.push(smt::smt_eq(&value, key)?);
+    let refs: Vec<&Bool> = constraints.iter().collect();
+    let mut member = smt::bool_and(&refs);
+    for (fresh, witness, domain) in witnesses.into_iter().rev() {
+        member = build_z3_quantifier(false, &witness, &member, &fresh, &domain)?;
+    }
+    Ok(member)
+}
+
+fn encode_setcomp_projection_membership(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    map: &IRExpr,
+    key: &IRExpr,
+    step: usize,
+) -> Result<Option<Bool>, String> {
+    let IRExpr::SetComp {
+        var,
+        source: Some(source),
+        filter,
+        projection: Some(projection),
+        ..
+    } = map
+    else {
+        return Ok(None);
+    };
+    if !projection_has_local_choose(projection) {
+        return Ok(None);
+    }
+    let elements = match source.as_ref() {
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+        _ => return Ok(None),
+    };
+    let key_value = encode_prop_value(pool, vctx, defs, ctx, key, step)?;
+    let mut disjuncts = Vec::new();
+    for element_expr in elements {
+        let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
+        let inner_ctx = ctx.with_local(var, value);
+        let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
+        let member = encode_projection_membership_with_choose(
+            pool, vctx, defs, &inner_ctx, projection, &key_value, step,
+        )?;
+        disjuncts.push(smt::bool_and(&[&filter_val, &member]));
+    }
+    if disjuncts.is_empty() {
+        return Ok(Some(smt::bool_const(false)));
+    }
+    let refs: Vec<&Bool> = disjuncts.iter().collect();
+    Ok(Some(smt::bool_or(&refs)))
 }
 
 fn extract_store_scoped_quantifier_body<'a>(
@@ -2355,13 +2543,24 @@ pub(super) fn encode_prop_value(
                 let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let key = if let Some(proj_expr) = projection {
-                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)?.to_dynamic()
+                let (key, projection_constraints) = if let Some(proj_expr) = projection {
+                    let (key, constraints) = encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, proj_expr, step,
+                    )?;
+                    (key.to_dynamic(), constraints)
                 } else {
-                    value.to_dynamic()
+                    (value.to_dynamic(), vec![])
+                };
+                let cond = if projection_constraints.is_empty() {
+                    filter_val
+                } else {
+                    let mut conjuncts = vec![filter_val];
+                    conjuncts.extend(projection_constraints);
+                    let refs: Vec<&Bool> = conjuncts.iter().collect();
+                    smt::bool_and(&refs)
                 };
                 let stored = arr.store(&key, &true_val);
-                arr = smt::array_ite(&filter_val, &stored, &arr);
+                arr = smt::array_ite(&cond, &stored, &arr);
             }
 
             Ok(SmtValue::Array(arr))
@@ -2400,16 +2599,25 @@ pub(super) fn encode_prop_value(
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
                 // Condition: slot is active AND filter holds
-                let cond = smt::bool_and(&[&is_active, &filter_val]);
 
                 // Key: what to store true at
-                let key = if let Some(proj_expr) = projection {
+                let (key, projection_constraints) = if let Some(proj_expr) = projection {
                     // Projection: store true at the projected value
-                    encode_prop_value(pool, vctx, defs, &inner_ctx, proj_expr, step)?.to_dynamic()
+                    let (key, constraints) = encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, proj_expr, step,
+                    )?;
+                    (key.to_dynamic(), constraints)
                 } else {
                     // Simple: store true at the slot index
-                    smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic()
+                    (
+                        smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic(),
+                        vec![],
+                    )
                 };
+                let mut cond_parts = vec![is_active, filter_val];
+                cond_parts.extend(projection_constraints);
+                let refs: Vec<&Bool> = cond_parts.iter().collect();
+                let cond = smt::bool_and(&refs);
 
                 // Conditional store: ite(cond, store(arr, key, true), arr)
                 let stored = arr.store(&key, &true_val);
@@ -2998,12 +3206,21 @@ pub(super) fn encode_card(
                 let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let key = if let Some(projection) = projection {
-                    encode_prop_value(pool, vctx, defs, &inner_ctx, projection, step)?
+                let (key, projection_constraints) = if let Some(projection) = projection {
+                    encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, projection, step,
+                    )?
                 } else {
-                    value
+                    (value, vec![])
                 };
-                let mut include_once = filter_val.clone();
+                let mut include_once = if projection_constraints.is_empty() {
+                    filter_val.clone()
+                } else {
+                    let mut conjuncts = vec![filter_val.clone()];
+                    conjuncts.extend(projection_constraints);
+                    let refs: Vec<&Bool> = conjuncts.iter().collect();
+                    smt::bool_and(&refs)
+                };
                 for (prior_key, prior_filter) in &prior_keys {
                     let same_key = smt::smt_eq(&key, prior_key)?;
                     let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
@@ -4000,6 +4217,86 @@ mod tests {
 
         let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
             .expect("independent choose in set-comprehension projection should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_dependent_choose_in_setcomp_projection() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let set_int_ty = IRType::Set {
+            element: Box::new(int_ty.clone()),
+        };
+        let set_comp = IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: int_ty.clone(),
+            source: Some(Box::new(IRExpr::SetLit {
+                elements: vec![IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 1 },
+                    span: None,
+                }],
+                ty: set_int_ty.clone(),
+                span: None,
+            })),
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Choose {
+                var: "candidate".to_owned(),
+                domain: int_ty.clone(),
+                predicate: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "candidate".to_owned(),
+                        ty: int_ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::BinOp {
+                        op: "OpAdd".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "x".to_owned(),
+                            ty: int_ty.clone(),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Lit {
+                            ty: int_ty.clone(),
+                            value: LitVal::Int { value: 1 },
+                            span: None,
+                        }),
+                        ty: int_ty.clone(),
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                })),
+                ty: int_ty.clone(),
+                span: None,
+            })),
+            ty: set_int_ty,
+            span: None,
+        };
+        let property = IRExpr::Index {
+            map: Box::new(set_comp),
+            key: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 2 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("dependent choose in set-comprehension projection should encode");
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
