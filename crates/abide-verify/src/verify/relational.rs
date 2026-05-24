@@ -1851,7 +1851,7 @@ fn supports_assertion_expr(expr: &IRExpr) -> bool {
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => supports_assertion_expr(operand),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpAnd" || op == "OpOr" => {
+        } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
             supports_assertion_expr(left) && supports_assertion_expr(right)
         }
         IRExpr::Lit {
@@ -1900,9 +1900,12 @@ fn encode_assertion_into(
         }
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpAnd" || op == "OpOr" => {
+        } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
             let left_lit = encode_assertion_into(left, instances, sat)?;
             let right_lit = encode_assertion_into(right, instances, sat)?;
+            if op == "OpImplies" {
+                return or_lit(sat, &[!left_lit, right_lit]);
+            }
             let out = sat.new_lit();
             if op == "OpAnd" {
                 sat.add_binary(!out, left_lit);
@@ -5708,6 +5711,31 @@ mod tests {
         let mut sat = SatInstance::new();
         let lit =
             encode_assertion_into(&assertion, &[], &mut sat).expect("top-level not should encode");
+        sat.add_unit(lit);
+
+        assert!(matches!(solve_instance(sat), SolverResult::Sat));
+    }
+
+    #[test]
+    fn assertion_encoder_supports_top_level_implies() {
+        let assertion = IRExpr::BinOp {
+            op: "OpImplies".to_owned(),
+            left: Box::new(IRExpr::Lit {
+                value: LitVal::Bool { value: true },
+                ty: IRType::Bool,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                value: LitVal::Bool { value: true },
+                ty: IRType::Bool,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let mut sat = SatInstance::new();
+        let lit = encode_assertion_into(&assertion, &[], &mut sat)
+            .expect("top-level implies should encode");
         sat.add_unit(lit);
 
         assert!(matches!(solve_instance(sat), SolverResult::Sat));

@@ -23298,6 +23298,43 @@ fn relational_scene_fragment_supports_negated_create_only_assertions() {
 }
 
 #[test]
+fn relational_scene_fragment_supports_implied_create_only_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_implied_assertion.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n\
+           status: Status = @Pending\n\
+         }\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_pending() { create Order {} }\n\
+         }\n\n\
+         scene pending_implies_no_confirmed_orders {\n\
+           given {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_pending()\n\
+           }\n\
+           then {\n\
+             assert (exists o: Order | o.status == @Pending) implies not (exists c: Order | c.status == @Confirmed)\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "implied create-only assertion should stay inside the relational fragment"
+    );
+    let routed = relational::try_check_scene_block_relational(&ir, scene);
+    assert!(
+        matches!(routed, Some(VerificationResult::ScenePass { .. })),
+        "implied create-only assertion should be owned by the relational backend: {routed:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_supports_ref_alias_args() {
     let ir = lower_source_file(
         "rel_scene_ref_args.ab",
