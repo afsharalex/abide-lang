@@ -2071,6 +2071,135 @@ fn build_multi_slot_chc_supports_finite_payload_enum_quantifier_domains() {
 }
 
 #[test]
+fn build_multi_slot_chc_supports_finite_payload_enum_setcomp_cardinality() {
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let entity = IREntity {
+        name: "Gate".to_owned(),
+        fields: vec![
+            IRField {
+                name: "decision".to_owned(),
+                ty: decision_ty.clone(),
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Decision".to_owned(),
+                    ctor: "Reject".to_owned(),
+                    args: vec![],
+                    span: None,
+                }),
+                initial_constraint: None,
+            },
+            IRField {
+                name: "score".to_owned(),
+                ty: IRType::Int,
+                default: Some(ic3_int_lit(0)),
+                initial_constraint: None,
+            },
+        ],
+        transitions: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+    let ir = make_ir_for_entity(
+        &entity,
+        vec![IRTypeEntry {
+            name: "Decision".to_owned(),
+            ty: decision_ty.clone(),
+        }],
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let gate_ty = IRType::Entity {
+        name: "Gate".to_owned(),
+    };
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "gate".to_owned(),
+            domain: gate_ty.clone(),
+            body: Box::new(IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "gate".to_owned(),
+                            ty: gate_ty,
+                            span: None,
+                        }),
+                        field: "score".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(ic3_int_lit(0)),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Card {
+                        expr: Box::new(IRExpr::SetComp {
+                            var: "d".to_owned(),
+                            domain: decision_ty.clone(),
+                            source: None,
+                            filter: Box::new(IRExpr::BinOp {
+                                op: "OpEq".to_owned(),
+                                left: Box::new(IRExpr::Var {
+                                    name: "d".to_owned(),
+                                    ty: decision_ty.clone(),
+                                    span: None,
+                                }),
+                                right: Box::new(IRExpr::Ctor {
+                                    enum_name: "Decision".to_owned(),
+                                    ctor: "Reject".to_owned(),
+                                    args: vec![],
+                                    span: None,
+                                }),
+                                ty: IRType::Bool,
+                                span: None,
+                            }),
+                            projection: Some(Box::new(IRExpr::Var {
+                                name: "d".to_owned(),
+                                ty: decision_ty.clone(),
+                                span: None,
+                            })),
+                            ty: IRType::Set {
+                                element: Box::new(decision_ty),
+                            },
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                    right: Box::new(ic3_int_lit(1)),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_multi_slot_chc(&entity, &vctx, &property, 1)
+        .expect("finite payload enum set-comprehension cardinality should encode in IC3 CHC");
+    assert!(chc.contains("(Accept false)"));
+    assert!(chc.contains("(Accept true)"));
+    assert!(chc.contains("Reject"));
+    assert!(chc.contains("(ite"));
+}
+
+#[test]
 fn ic3_supports_one_and_lone_quantifier_expressions() {
     require_unbounded_proof_tests!();
 
@@ -7721,7 +7850,7 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
         0,
     )
     .expect_err("system value unsupported shape")
-    .contains("unsupported expression"));
+    .contains("cardinality (#) not supported"));
     assert!(guard_to_smt_sys(
         &IRExpr::Match {
             scrutinee: Box::new(ic3_status_ctor("Pending")),

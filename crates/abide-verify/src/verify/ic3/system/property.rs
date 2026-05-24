@@ -819,6 +819,42 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             locals,
             entity_locals,
         ),
+        IRExpr::Card { expr: inner, .. } => {
+            if let IRExpr::SetComp {
+                var,
+                domain,
+                source: None,
+                filter,
+                projection,
+                ..
+            } = inner.as_ref()
+            {
+                if let Some(cardinality) = ic3_finite_setcomp_cardinality(
+                    var,
+                    domain,
+                    filter,
+                    projection.as_deref(),
+                    vctx,
+                    locals,
+                    |body, scope| {
+                        guard_to_smt_sys_prop_scoped(
+                            body,
+                            entities,
+                            slots_per_entity,
+                            current_entity,
+                            vctx,
+                            current_ent_name,
+                            current_slot,
+                            scope,
+                            entity_locals,
+                        )
+                    },
+                )? {
+                    return Ok(cardinality);
+                }
+            }
+            Err("cardinality (#) not supported in system IC3 property value encoding".to_owned())
+        }
         IRExpr::Lit { .. } | IRExpr::Ctor { .. } => expr_to_smt(expr, current_entity, vctx),
         _ => Err(format!(
             "unsupported expression in system IC3 property value encoding: {:?}",

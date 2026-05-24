@@ -187,6 +187,51 @@ where
     Ok(Some((existence, witness)))
 }
 
+pub(in crate::verify::ic3) fn ic3_finite_setcomp_cardinality<F>(
+    var: &str,
+    domain: &IRType,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    vctx: &VerifyContext,
+    locals: &HashSet<String>,
+    mut encode_filter: F,
+) -> Result<Option<String>, String>
+where
+    F: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+{
+    let identity_projection = match projection {
+        None => true,
+        Some(IRExpr::Var { name, .. }) => name == var,
+        Some(_) => false,
+    };
+    if !identity_projection {
+        return Ok(None);
+    }
+
+    let Some(candidates) = ic3_finite_choose_candidates(domain, vctx) else {
+        return Ok(None);
+    };
+
+    let mut scope = locals.clone();
+    scope.insert(var.to_owned());
+    let terms = candidates
+        .iter()
+        .map(|candidate| {
+            let raw = encode_filter(filter, &scope)?;
+            Ok(format!("(ite (let (({var} {candidate})) {raw}) 1 0)"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(Some(match terms.len() {
+        0 => "0".to_owned(),
+        1 => terms
+            .into_iter()
+            .next()
+            .expect("single cardinality term checked"),
+        _ => format!("(+ {})", terms.join(" ")),
+    }))
+}
+
 pub(in crate::verify::ic3) fn ic3_quantified_choose_sort(domain: &IRType) -> Option<String> {
     match domain {
         IRType::Int | IRType::Identity => Some("Int".to_owned()),

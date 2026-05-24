@@ -258,7 +258,30 @@ pub(in crate::verify::ic3) fn expr_to_smt_scoped(
         IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
             expr_to_smt_scoped(expr, entity, vctx, locals)
         }
-        IRExpr::Card { .. } => Err("cardinality (#) not supported in IC3 CHC encoding".to_owned()),
+        IRExpr::Card { expr: inner, .. } => {
+            if let IRExpr::SetComp {
+                var,
+                domain,
+                source: None,
+                filter,
+                projection,
+                ..
+            } = inner.as_ref()
+            {
+                if let Some(cardinality) = ic3_finite_setcomp_cardinality(
+                    var,
+                    domain,
+                    filter,
+                    projection.as_deref(),
+                    vctx,
+                    locals,
+                    |body, scope| guard_to_smt_scoped(body, entity, vctx, scope),
+                )? {
+                    return Ok(cardinality);
+                }
+            }
+            Err("cardinality (#) not supported in IC3 CHC encoding".to_owned())
+        }
         _ => Err(format!(
             "unsupported expression in IC3 value encoding: {:?}",
             std::mem::discriminant(expr)

@@ -7,7 +7,11 @@ pub(in crate::verify::ic3) fn build_chc_string(
     property: &IRExpr,
 ) -> Result<String, String> {
     let mut chc = String::new();
-    emit_ic3_datatype_decls(entity.fields.iter().map(|field| &field.ty), &mut chc);
+    emit_ic3_datatype_decls_with_expr(
+        entity.fields.iter().map(|field| &field.ty),
+        property,
+        &mut chc,
+    );
 
     // Field sorts for State relation
     let field_sorts: Vec<String> = entity
@@ -185,14 +189,194 @@ pub(in crate::verify::ic3) fn collect_ic3_datatype_enums<'a>(
     }
 }
 
-pub(in crate::verify::ic3) fn emit_ic3_datatype_decls<'a, I>(types: I, chc: &mut String)
-where
+pub(in crate::verify::ic3) fn collect_ic3_expr_datatype_enums<'a>(
+    expr: &'a IRExpr,
+    out: &mut HashMap<String, &'a IRType>,
+) {
+    if let Some(ty) = ic3_expr_type(expr) {
+        collect_ic3_datatype_enums(ty, out);
+    }
+
+    match expr {
+        IRExpr::Prime { expr, .. }
+        | IRExpr::UnOp { operand: expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. }
+        | IRExpr::Card { expr, .. } => collect_ic3_expr_datatype_enums(expr, out),
+        IRExpr::BinOp { left, right, .. }
+        | IRExpr::Until { left, right, .. }
+        | IRExpr::Since { left, right, .. } => {
+            collect_ic3_expr_datatype_enums(left, out);
+            collect_ic3_expr_datatype_enums(right, out);
+        }
+        IRExpr::Field { expr, .. } => collect_ic3_expr_datatype_enums(expr, out),
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_ic3_expr_datatype_enums(cond, out);
+            collect_ic3_expr_datatype_enums(then_body, out);
+            if let Some(else_body) = else_body {
+                collect_ic3_expr_datatype_enums(else_body, out);
+            }
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            for binding in bindings {
+                collect_ic3_datatype_enums(&binding.ty, out);
+                collect_ic3_expr_datatype_enums(&binding.expr, out);
+            }
+            collect_ic3_expr_datatype_enums(body, out);
+        }
+        IRExpr::Forall { domain, body, .. }
+        | IRExpr::Exists { domain, body, .. }
+        | IRExpr::One { domain, body, .. }
+        | IRExpr::Lone { domain, body, .. }
+        | IRExpr::Aggregate { domain, body, .. } => {
+            collect_ic3_datatype_enums(domain, out);
+            collect_ic3_expr_datatype_enums(body, out);
+            if let IRExpr::Aggregate {
+                in_filter: Some(in_filter),
+                ..
+            } = expr
+            {
+                collect_ic3_expr_datatype_enums(in_filter, out);
+            }
+        }
+        IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. }
+        | IRExpr::Historically { body, .. }
+        | IRExpr::Once { body, .. }
+        | IRExpr::Previously { body, .. } => collect_ic3_expr_datatype_enums(body, out),
+        IRExpr::Choose {
+            domain, predicate, ..
+        } => {
+            collect_ic3_datatype_enums(domain, out);
+            if let Some(predicate) = predicate {
+                collect_ic3_expr_datatype_enums(predicate, out);
+            }
+        }
+        IRExpr::SetComp {
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            collect_ic3_datatype_enums(domain, out);
+            if let Some(source) = source {
+                collect_ic3_expr_datatype_enums(source, out);
+            }
+            collect_ic3_expr_datatype_enums(filter, out);
+            if let Some(projection) = projection {
+                collect_ic3_expr_datatype_enums(projection, out);
+            }
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            collect_ic3_expr_datatype_enums(projection, out);
+            for binding in bindings {
+                collect_ic3_datatype_enums(&binding.domain, out);
+                if let Some(source) = &binding.source {
+                    collect_ic3_expr_datatype_enums(source, out);
+                }
+            }
+            collect_ic3_expr_datatype_enums(filter, out);
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            collect_ic3_expr_datatype_enums(map, out);
+            collect_ic3_expr_datatype_enums(key, out);
+            collect_ic3_expr_datatype_enums(value, out);
+        }
+        IRExpr::Index { map, key, .. } => {
+            collect_ic3_expr_datatype_enums(map, out);
+            collect_ic3_expr_datatype_enums(key, out);
+        }
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            for element in elements {
+                collect_ic3_expr_datatype_enums(element, out);
+            }
+        }
+        IRExpr::MapLit { entries, .. } => {
+            for (key, value) in entries {
+                collect_ic3_expr_datatype_enums(key, out);
+                collect_ic3_expr_datatype_enums(value, out);
+            }
+        }
+        IRExpr::Ctor { args, .. } => {
+            for (_, arg) in args {
+                collect_ic3_expr_datatype_enums(arg, out);
+            }
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_ic3_expr_datatype_enums(scrutinee, out);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_ic3_expr_datatype_enums(guard, out);
+                }
+                collect_ic3_expr_datatype_enums(&arm.body, out);
+            }
+        }
+        IRExpr::App { func, arg, .. } => {
+            collect_ic3_expr_datatype_enums(func, out);
+            collect_ic3_expr_datatype_enums(arg, out);
+        }
+        IRExpr::Block { exprs, .. } => {
+            for expr in exprs {
+                collect_ic3_expr_datatype_enums(expr, out);
+            }
+        }
+        IRExpr::VarDecl { ty, init, rest, .. } => {
+            collect_ic3_datatype_enums(ty, out);
+            collect_ic3_expr_datatype_enums(init, out);
+            collect_ic3_expr_datatype_enums(rest, out);
+        }
+        IRExpr::While {
+            cond,
+            invariants,
+            body,
+            ..
+        } => {
+            collect_ic3_expr_datatype_enums(cond, out);
+            for invariant in invariants {
+                collect_ic3_expr_datatype_enums(invariant, out);
+            }
+            collect_ic3_expr_datatype_enums(body, out);
+        }
+        IRExpr::Saw { args, .. } => {
+            for arg in args.iter().flatten() {
+                collect_ic3_expr_datatype_enums(arg, out);
+            }
+        }
+        IRExpr::Lit { .. }
+        | IRExpr::Var { .. }
+        | IRExpr::Lam { .. }
+        | IRExpr::Sorry { .. }
+        | IRExpr::Todo { .. } => {}
+    }
+}
+
+pub(in crate::verify::ic3) fn emit_ic3_datatype_decls_with_expr<'a, I>(
+    types: I,
+    expr: &'a IRExpr,
+    chc: &mut String,
+) where
     I: IntoIterator<Item = &'a IRType>,
 {
     let mut enums = HashMap::new();
     for ty in types {
         collect_ic3_datatype_enums(ty, &mut enums);
     }
+    collect_ic3_expr_datatype_enums(expr, &mut enums);
 
     let mut enums: Vec<_> = enums.into_iter().collect();
     enums.sort_by(|(left, _), (right, _)| left.cmp(right));

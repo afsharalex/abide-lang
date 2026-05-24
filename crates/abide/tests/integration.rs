@@ -6638,6 +6638,60 @@ verify ic3_payload_enum_quantifier {
 }
 
 #[test]
+fn ic3_supports_finite_payload_enum_setcomp_cardinality() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+entity Counter {
+  x: int = 0
+  y: int = 0
+
+  action bump() requires x < 10 {
+    x' = x + 1
+    y' = y + 1
+  }
+}
+
+system S(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.bump() }
+  }
+}
+
+verify ic3_payload_enum_cardinality {
+  assume {
+    store counters: Counter[0..20]
+    let s = S { counters: counters }
+    stutter
+  }
+
+  assert always all c: Counter |
+    c.y <= 10 and #{ d | d: Decision where d == @Reject } == 1
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: false,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "ic3_payload_enum_cardinality"
+                    && method.contains("IC3")
+        )),
+        "finite payload enum set-comprehension cardinality should prove through IC3, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 

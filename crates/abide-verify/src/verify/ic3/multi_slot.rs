@@ -24,7 +24,11 @@ pub(super) fn build_multi_slot_chc(
     let n_fields = entity.fields.len();
 
     let mut chc = String::new();
-    emit_ic3_datatype_decls(entity.fields.iter().map(|field| &field.ty), &mut chc);
+    emit_ic3_datatype_decls_with_expr(
+        entity.fields.iter().map(|field| &field.ty),
+        property,
+        &mut chc,
+    );
 
     // Declare State relation with all slot columns
     chc.push_str("(declare-rel State (");

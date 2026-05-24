@@ -20,10 +20,11 @@ pub(super) fn build_system_chc(
     slots_per_entity: &HashMap<String, usize>,
 ) -> Result<String, String> {
     let mut chc = String::new();
-    emit_ic3_datatype_decls(
+    emit_ic3_datatype_decls_with_expr(
         entities
             .iter()
             .flat_map(|entity| entity.fields.iter().map(|field| &field.ty)),
+        property,
         &mut chc,
     );
 
