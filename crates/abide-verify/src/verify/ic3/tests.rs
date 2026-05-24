@@ -3928,6 +3928,123 @@ fn build_system_chc_supports_payload_field_projection_in_transition_updates() {
 }
 
 #[test]
+fn build_system_chc_supports_div_mod_in_transition_updates() {
+    let (mut entity, tys) = make_simple_entity();
+    entity.transitions.push(IRTransition {
+        name: "rebalance".to_owned(),
+        refs: vec![],
+        params: vec![],
+        guard: ic3_bool_lit(true),
+        updates: vec![IRUpdate {
+            field: "total".to_owned(),
+            value: ic3_bin(
+                "OpAdd",
+                IRExpr::UnOp {
+                    op: "OpNeg".to_owned(),
+                    operand: Box::new(ic3_bin(
+                        "OpDiv",
+                        ic3_field(
+                            "self",
+                            "total",
+                            IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                            IRType::Int,
+                        ),
+                        ic3_int_lit(2),
+                        IRType::Int,
+                    )),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                ic3_bin(
+                    "OpMod",
+                    ic3_field(
+                        "self",
+                        "total",
+                        IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        IRType::Int,
+                    ),
+                    ic3_int_lit(2),
+                    IRType::Int,
+                ),
+                IRType::Int,
+            ),
+        }],
+        postcondition: None,
+    });
+
+    let system = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "tick".to_owned(),
+            params: vec![],
+            guard: ic3_bool_lit(true),
+            body: vec![IRAction::Choose {
+                var: "order".to_owned(),
+                entity: "Order".to_owned(),
+                filter: Box::new(ic3_bool_lit(true)),
+                ops: vec![IRAction::Apply {
+                    target: "order".to_owned(),
+                    transition: "rebalance".to_owned(),
+                    refs: vec![],
+                    args: vec![],
+                }],
+            }],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(ic3_bool_lit(true)),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_system_chc(
+        &[&ir.entities[0]],
+        &[&ir.systems[0]],
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+    )
+    .expect("system CHC should encode div/mod in transition update values");
+    assert!(chc.contains("(+ (- (div Order_0_f2 2)) (mod Order_0_f2 2))"));
+}
+
+#[test]
 fn system_value_encoder_supports_payload_field_projection() {
     let (entity, tys) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, tys.clone());
@@ -3948,6 +4065,42 @@ fn system_value_encoder_supports_payload_field_projection() {
         .expect("system value encoder should project payload fields through datatype selectors");
 
     assert_eq!(smt, "(code Order_0_f0)");
+}
+
+#[test]
+fn system_value_encoder_supports_div_mod_ops() {
+    let (entity, tys) = make_simple_entity();
+    let ir = make_ir_for_entity(&entity, tys);
+    let vctx = VerifyContext::from_ir(&ir);
+    let expr = ic3_bin(
+        "OpSub",
+        ic3_bin("OpDiv", ic3_int_lit(9), ic3_int_lit(2), IRType::Int),
+        ic3_bin("OpMod", ic3_int_lit(9), ic3_int_lit(2), IRType::Int),
+        IRType::Int,
+    );
+
+    let smt = expr_to_smt_sys_scoped(&expr, &entity, &vctx, "Order", 0, &HashSet::new())
+        .expect("system value encoder should match other IC3 value encoders for div/mod");
+
+    assert_eq!(smt, "(- (div 9 2) (mod 9 2))");
+}
+
+#[test]
+fn system_value_encoder_supports_unary_numeric_negation() {
+    let (entity, tys) = make_simple_entity();
+    let ir = make_ir_for_entity(&entity, tys);
+    let vctx = VerifyContext::from_ir(&ir);
+    let expr = IRExpr::UnOp {
+        op: "OpNeg".to_owned(),
+        operand: Box::new(ic3_int_lit(9)),
+        ty: IRType::Int,
+        span: None,
+    };
+
+    let smt = expr_to_smt_sys_scoped(&expr, &entity, &vctx, "Order", 0, &HashSet::new())
+        .expect("system value encoder should match other IC3 value encoders for numeric negation");
+
+    assert_eq!(smt, "(- 9)");
 }
 
 #[test]

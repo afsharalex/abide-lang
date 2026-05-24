@@ -154,8 +154,14 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_scoped(
                 "OpAdd" => Ok(format!("(+ {l} {r})")),
                 "OpSub" => Ok(format!("(- {l} {r})")),
                 "OpMul" => Ok(format!("(* {l} {r})")),
+                "OpDiv" => Ok(format!("(div {l} {r})")),
+                "OpMod" => Ok(format!("(mod {l} {r})")),
                 _ => Err(format!("unsupported op in system IC3 value: {op}")),
             }
+        }
+        IRExpr::UnOp { op, operand, .. } if op == "OpNeg" => {
+            let inner = expr_to_smt_sys_scoped(operand, entity, vctx, ent_name, slot, locals)?;
+            Ok(format!("(- {inner})"))
         }
         IRExpr::MapUpdate {
             map, key, value, ..
