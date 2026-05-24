@@ -337,30 +337,30 @@ fn expr_for_slot(
         } else {
             RelTemporalFormula::False
         }),
-        IRExpr::UnOp { op, operand, .. } if op == "!" || op == "not" => Ok(
-            RelTemporalFormula::not(expr_for_slot(operand, var, store, slot)?),
-        ),
+        IRExpr::UnOp { op, operand, .. } if is_not_op(op) => Ok(RelTemporalFormula::not(
+            expr_for_slot(operand, var, store, slot)?,
+        )),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "&&" || op == "and" => Ok(RelTemporalFormula::And(vec![
+        } if is_and_op(op) => Ok(RelTemporalFormula::And(vec![
             expr_for_slot(left, var, store, slot)?,
             expr_for_slot(right, var, store, slot)?,
         ])),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "||" || op == "or" => Ok(RelTemporalFormula::Or(vec![
+        } if is_or_op(op) => Ok(RelTemporalFormula::Or(vec![
             expr_for_slot(left, var, store, slot)?,
             expr_for_slot(right, var, store, slot)?,
         ])),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "==" || op == "!=" => {
+        } if is_eq_op(op) || is_neq_op(op) => {
             let atom = field_equality_atom(left, right, var, store, slot)
                 .or_else(|| field_equality_atom(right, left, var, store, slot))
                 .ok_or_else(|| RelCoreError::Unsupported {
                     reason: "unsupported temporal relational equality guard".to_owned(),
                 })??;
-            if op == "==" {
+            if is_eq_op(op) {
                 Ok(atom)
             } else {
                 Ok(RelTemporalFormula::not(atom))
@@ -370,6 +370,26 @@ fn expr_for_slot(
             reason: format!("unsupported temporal relational expression `{expr:?}`"),
         }),
     }
+}
+
+fn is_not_op(op: &str) -> bool {
+    matches!(op, "!" | "not" | "OpNot")
+}
+
+fn is_and_op(op: &str) -> bool {
+    matches!(op, "&&" | "and" | "OpAnd")
+}
+
+fn is_or_op(op: &str) -> bool {
+    matches!(op, "||" | "or" | "OpOr")
+}
+
+fn is_eq_op(op: &str) -> bool {
+    matches!(op, "==" | "OpEq")
+}
+
+fn is_neq_op(op: &str) -> bool {
+    matches!(op, "!=" | "OpNEq")
 }
 
 fn field_equality_atom(
@@ -1370,6 +1390,27 @@ mod tests {
         }
     }
 
+    fn field_eq_bool(var: &str, field: &str, value: bool) -> IRExpr {
+        IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: var.to_owned(),
+                    ty: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    span: None,
+                }),
+                field: field.to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            right: Box::new(bool_expr(value)),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
     fn bool_field(name: &str) -> IRField {
         IRField {
             name: name.to_owned(),
@@ -1884,6 +1925,71 @@ mod tests {
         .expect("solve");
 
         assert!(witness.is_some());
+    }
+
+    #[test]
+    fn temporal_transition_system_accepts_lowered_op_guards() {
+        let mut order = payable_entity();
+        order.transitions[0].guard = field_eq_bool("o", "paid", false);
+        let mut system = commerce_system();
+        let IRAction::Choose { filter, .. } = &mut system.actions[1].body[0] else {
+            panic!("pay action should choose an order")
+        };
+        *filter = Box::new(field_eq_bool("o", "paid", false));
+
+        let ir = program_with_system(order, system);
+        let verify = verify_for_system(2);
+        let model = TemporalRelationalModel::from_verify(&ir, &verify).expect("model");
+        let transition_system = transition_system_from_verify(&ir, &verify, &model)
+            .expect("transition system")
+            .expect("lowered OpEq guards should be supported");
+
+        assert!(transition_system
+            .transitions
+            .iter()
+            .any(|transition| transition.name.starts_with("pay:pay")));
+    }
+
+    #[test]
+    fn expr_for_slot_accepts_lowered_eq_and_bool_ops() {
+        let ir = program(entity_with_fields(vec![bool_field("paid")]));
+        let verify = verify(1);
+        let model = TemporalRelationalModel::from_verify(&ir, &verify).expect("model");
+        let slot = model.universe("orders").expect("orders").atoms[0].clone();
+        let expr = IRExpr::UnOp {
+            op: "OpNot".to_owned(),
+            operand: Box::new(IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(field_eq_bool("o", "paid", false)),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpNEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                            span: None,
+                        }),
+                        field: "paid".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    right: Box::new(bool_expr(true)),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let formula = expr_for_slot(&expr, "o", &verify.stores[0], &slot)
+            .expect("lowered boolean/equality ops should encode");
+
+        assert!(matches!(formula, RelTemporalFormula::Not(_)));
     }
 
     #[test]
