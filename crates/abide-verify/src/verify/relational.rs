@@ -390,6 +390,12 @@ fn build_create_only_scene_sat(
 
     let store_slots = build_store_slots(scene);
     let mut create_instances = Vec::new();
+    create_instances.extend(build_initial_store_instances(
+        &mut sat,
+        scene,
+        &store_slots,
+        &entities_by_name,
+    )?);
     let some_budget = scene.events.len().max(2);
     let mut event_instance_ranges = Vec::with_capacity(scene.events.len());
     let horizon: usize = scene
@@ -505,6 +511,54 @@ fn build_create_only_scene_sat(
     }
 
     Ok(Some(sat))
+}
+
+fn build_initial_store_instances(
+    sat: &mut SatInstance,
+    scene: &IRScene,
+    store_slots: &HashMap<String, usize>,
+    entities_by_name: &HashMap<String, &IREntity>,
+) -> Result<Vec<CreateInstance>, String> {
+    let mut instances = Vec::new();
+    let mut next_slot_by_entity: HashMap<String, usize> = HashMap::new();
+
+    for store in &scene.stores {
+        let slot_count = store_slots.get(&store.entity_type).copied().unwrap_or(0);
+        let start_slot = next_slot_by_entity
+            .get(&store.entity_type)
+            .copied()
+            .unwrap_or(0);
+        let store_capacity = usize::try_from(store.hi.max(1)).unwrap_or(1);
+        next_slot_by_entity.insert(store.entity_type.clone(), start_slot + store_capacity);
+
+        let min_active = usize::try_from(store.lo.max(0)).unwrap_or(0);
+        if min_active == 0 {
+            continue;
+        }
+        let Some(entity_ir) = entities_by_name.get(&store.entity_type) else {
+            return Err(format!("unknown entity `{}`", store.entity_type));
+        };
+        let Some(field_values) = build_default_field_map(entity_ir)? else {
+            return Err(format!(
+                "unsupported default field values for initial `{}` store slots",
+                store.entity_type
+            ));
+        };
+        for slot in start_slot..start_slot + min_active {
+            let assigns = (0..slot_count)
+                .map(|idx| const_lit(sat, idx == slot))
+                .collect();
+            instances.push(CreateInstance {
+                entity: store.entity_type.clone(),
+                fire: const_lit(sat, true),
+                assigns,
+                positions: Vec::new(),
+                field_values: field_values.clone(),
+            });
+        }
+    }
+
+    Ok(instances)
 }
 
 fn build_stateful_scene_sat(
@@ -5952,6 +6006,116 @@ mod tests {
 
         assert!(supports_slot_predicate(&predicate));
         assert!(slot_predicate_matches(&predicate, "o", &values));
+    }
+
+    #[test]
+    fn create_only_scene_seeds_store_lower_bound_default_instances() {
+        let status_ty = IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![crate::ir::types::IRVariant::simple("Pending")],
+        };
+        let order = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![crate::ir::types::IRField {
+                name: "status".to_owned(),
+                ty: status_ty.clone(),
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Pending".to_owned(),
+                    args: Vec::new(),
+                    span: None,
+                }),
+                initial_constraint: None,
+            }],
+            transitions: Vec::new(),
+            derived_fields: Vec::new(),
+            invariants: Vec::new(),
+            fsm_decls: Vec::new(),
+        };
+        let store_slots = HashMap::from([("Order".to_owned(), 1)]);
+        let entities_by_name = HashMap::from([("Order".to_owned(), &order)]);
+        let scene = IRScene {
+            name: "lower_bound_active".to_owned(),
+            systems: vec!["Commerce".to_owned()],
+            stores: vec![IRStoreDecl {
+                name: "orders".to_owned(),
+                entity_type: "Order".to_owned(),
+                lo: 1,
+                hi: 1,
+            }],
+            givens: Vec::new(),
+            activations: Vec::new(),
+            given_constraints: Vec::new(),
+            events: Vec::new(),
+            ordering: Vec::new(),
+            assertions: Vec::new(),
+            span: None,
+            file: None,
+        };
+        let assertion = IRExpr::Exists {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(IRExpr::Index {
+                    map: Box::new(IRExpr::Var {
+                        name: "orders".to_owned(),
+                        ty: IRType::Set {
+                            element: Box::new(IRType::Entity {
+                                name: "Order".to_owned(),
+                            }),
+                        },
+                        span: None,
+                    }),
+                    key: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                            span: None,
+                        }),
+                        field: "status".to_owned(),
+                        ty: status_ty,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "Status".to_owned(),
+                        ctor: "Pending".to_owned(),
+                        args: Vec::new(),
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+        let mut sat = SatInstance::new();
+        let instances =
+            build_initial_store_instances(&mut sat, &scene, &store_slots, &entities_by_name)
+                .expect("initial lower-bound slots should encode");
+        let lit = encode_assertion_into(&assertion, &instances, &mut sat)
+            .expect("lower-bound instance should satisfy store-scoped assertion");
+        sat.add_unit(lit);
+
+        assert!(matches!(solve_instance(sat), SolverResult::Sat));
     }
 
     #[test]
