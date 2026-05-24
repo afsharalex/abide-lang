@@ -751,55 +751,215 @@ pub(crate) fn try_encode_step_inner_legacy(
 
                     let mut op_conjuncts = Vec::new();
 
-                    for op in ops {
-                        match op {
-                            IRAction::Apply {
-                                target: _,
-                                transition,
-                                args,
-                                refs: apply_refs,
-                            } => {
-                                if let Some(ent) = entity_ir {
-                                    if let Some(trans) =
-                                        ent.transitions.iter().find(|t| t.name == *transition)
-                                    {
-                                        let action_params = try_build_apply_params(
-                                            &ctx, trans, args, apply_refs, step,
-                                        )?;
-                                        let action_formula = try_encode_action(
+                    if let Some(ent) = entity_ir {
+                        let same_entity_applies: Vec<_> = ops
+                            .iter()
+                            .filter_map(|op| {
+                                if let IRAction::Apply {
+                                    target,
+                                    transition,
+                                    args,
+                                    refs: apply_refs,
+                                } = op
+                                {
+                                    if target == var {
+                                        return Some((transition, args, apply_refs));
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+
+                        if same_entity_applies.len() <= 1 {
+                            for op in ops {
+                                match op {
+                                    IRAction::Apply {
+                                        target,
+                                        transition,
+                                        args,
+                                        refs: apply_refs,
+                                    } if target == var => {
+                                        if let Some(trans) =
+                                            ent.transitions.iter().find(|t| t.name == *transition)
+                                        {
+                                            let action_params = try_build_apply_params(
+                                                &ctx, trans, args, apply_refs, step,
+                                            )?;
+                                            let action_formula = try_encode_action(
+                                                pool,
+                                                vctx,
+                                                ent,
+                                                trans,
+                                                slot,
+                                                step,
+                                                &action_params,
+                                            )?;
+                                            op_conjuncts.push(action_formula);
+                                        }
+                                    }
+                                    _ => {
+                                        let (nested_f, nested_t) = try_encode_nested_op(
                                             pool,
                                             vctx,
+                                            entities,
+                                            all_systems,
+                                            op,
+                                            var,
+                                            ent_name,
                                             ent,
-                                            trans,
                                             slot,
                                             step,
-                                            &action_params,
+                                            &forall_base_params,
+                                            depth,
+                                            &[],
                                         )?;
-                                        op_conjuncts.push(action_formula);
+                                        op_conjuncts.extend(nested_f);
+                                        nested_touched.extend(nested_t);
                                     }
                                 }
                             }
-                            _ => {
-                                if let Some(ent) = entity_ir {
-                                    let (nested_f, nested_t) = try_encode_nested_op(
-                                        pool,
-                                        vctx,
-                                        entities,
-                                        all_systems,
-                                        op,
-                                        var,
-                                        ent_name,
-                                        ent,
-                                        slot,
-                                        step,
-                                        &forall_base_params,
-                                        depth,
-                                        &[],
-                                    )?;
-                                    op_conjuncts.extend(nested_f);
-                                    nested_touched.extend(nested_t);
+                        } else {
+                            let n_applies = same_entity_applies.len();
+                            let read_step_k: HashMap<String, SmtValue> = ent
+                                .fields
+                                .iter()
+                                .filter_map(|f| {
+                                    pool.field_at(ent_name, slot, &f.name, step)
+                                        .map(|v| (f.name.clone(), v.clone()))
+                                })
+                                .collect();
+                            let write_step_k1: HashMap<String, SmtValue> = ent
+                                .fields
+                                .iter()
+                                .filter_map(|f| {
+                                    pool.field_at(ent_name, slot, &f.name, step + 1)
+                                        .map(|v| (f.name.clone(), v.clone()))
+                                })
+                                .collect();
+                            let intermediates: Vec<HashMap<String, SmtValue>> = (0..n_applies - 1)
+                                .map(|i| {
+                                    ent.fields
+                                        .iter()
+                                        .map(|f| {
+                                            let name = format!(
+                                                "{}_s{}_{}_t{step}_forall_ch{chain_id}_inter{i}",
+                                                ent_name, slot, f.name
+                                            );
+                                            let var = match &f.ty {
+                                                IRType::Bool => smt::bool_var(&name),
+                                                IRType::Real | IRType::Float => {
+                                                    smt::real_var(&name)
+                                                }
+                                                IRType::Map { .. } | IRType::Set { .. } => {
+                                                    smt::array_var(&name, &f.ty).expect(
+                                                        "internal: array sort expected for Map/Set field",
+                                                    )
+                                                }
+                                                IRType::Seq { element } => SmtValue::Dynamic(
+                                                    smt::dynamic_const(
+                                                        &name,
+                                                        &smt::seq_sort(element).sort(),
+                                                    ),
+                                                ),
+                                                _ => smt::int_var(&name),
+                                            };
+                                            (f.name.clone(), var)
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+
+                            for (i, (transition, args, apply_refs)) in
+                                same_entity_applies.iter().enumerate()
+                            {
+                                let Some(trans) =
+                                    ent.transitions.iter().find(|t| t.name == **transition)
+                                else {
+                                    continue;
+                                };
+                                let read_from = if i == 0 {
+                                    &read_step_k
+                                } else {
+                                    &intermediates[i - 1]
+                                };
+                                let action_params = if i == 0 {
+                                    try_build_apply_params(&ctx, trans, args, apply_refs, step)?
+                                } else {
+                                    let mut params = HashMap::new();
+                                    for (pi, param) in trans.params.iter().enumerate() {
+                                        if let Some(arg_expr) = args.get(pi) {
+                                            let val = try_eval_expr_with_vars(
+                                                arg_expr,
+                                                ent,
+                                                read_from,
+                                                vctx,
+                                                &ctx.params,
+                                            )?;
+                                            params.insert(param.name.clone(), val);
+                                        }
+                                    }
+                                    for (ri, tref) in trans.refs.iter().enumerate() {
+                                        if let Some(ref_name) = apply_refs.get(ri) {
+                                            if let Some(val) = read_from.get(ref_name) {
+                                                params.insert(tref.name.clone(), val.clone());
+                                            }
+                                        }
+                                    }
+                                    params
+                                };
+                                let write_to = if i == n_applies - 1 {
+                                    &write_step_k1
+                                } else {
+                                    &intermediates[i]
+                                };
+                                let formula = try_encode_action_with_vars(
+                                    ent,
+                                    trans,
+                                    slot,
+                                    read_from,
+                                    write_to,
+                                    vctx,
+                                    &action_params,
+                                )?;
+                                op_conjuncts.push(formula);
+                            }
+
+                            if let (
+                                Some(SmtValue::Bool(act_curr)),
+                                Some(SmtValue::Bool(act_next)),
+                            ) = (
+                                pool.active_at(ent_name, slot, step),
+                                pool.active_at(ent_name, slot, step + 1),
+                            ) {
+                                op_conjuncts.push(act_curr.clone());
+                                op_conjuncts.push(act_next.clone());
+                            }
+
+                            for op in ops {
+                                match op {
+                                    IRAction::Apply { target, .. } if target == var => {}
+                                    _ => {
+                                        let (nested_f, nested_t) = try_encode_nested_op(
+                                            pool,
+                                            vctx,
+                                            entities,
+                                            all_systems,
+                                            op,
+                                            var,
+                                            ent_name,
+                                            ent,
+                                            slot,
+                                            step,
+                                            &forall_base_params,
+                                            depth,
+                                            &[],
+                                        )?;
+                                        op_conjuncts.extend(nested_f);
+                                        nested_touched.extend(nested_t);
+                                    }
                                 }
                             }
+                            chain_id += 1;
                         }
                     }
 

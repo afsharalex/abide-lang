@@ -2627,7 +2627,8 @@ fn check_static_verify_assertions(
     verify_block: &IRVerify,
     config: &VerifyConfig,
 ) -> VerificationResult {
-    let assumptions = build_assumptions_for_system_scope(ir, &[], &verify_block.assumption_set, &[]);
+    let assumptions =
+        build_assumptions_for_system_scope(ir, &[], &verify_block.assumption_set, &[]);
     if verify_block.asserts.is_empty() {
         return VerificationResult::Checked {
             name: verify_block.name.clone(),
@@ -4823,17 +4824,7 @@ pub(super) fn find_unsupported_in_actions(actions: &[IRAction]) -> Option<&'stat
                     return Some(kind);
                 }
             }
-            IRAction::ForAll { var, ops, .. } => {
-                let apply_count = ops
-                    .iter()
-                    .filter(|op| matches!(op, IRAction::Apply { target, .. } if target == var))
-                    .count();
-                if apply_count > 1 {
-                    return Some(
-                        "multiple Apply actions on the same entity in one ForAll block \
-                         (sequential composition not yet supported — split into separate events)",
-                    );
-                }
+            IRAction::ForAll { ops, .. } => {
                 if let Some(kind) = find_unsupported_in_actions(ops) {
                     return Some(kind);
                 }

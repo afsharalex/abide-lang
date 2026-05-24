@@ -915,6 +915,73 @@ mod tests {
     }
 
     #[test]
+    fn try_encode_step_inner_handles_forall_sequential_apply_chain() {
+        let entity = make_step_test_entity();
+        let vctx = make_step_test_vctx();
+        let event = IRSystemAction {
+            name: "ship_all".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![IRAction::ForAll {
+                var: "order".to_owned(),
+                entity: "Order".to_owned(),
+                ops: vec![
+                    IRAction::Apply {
+                        target: "order".to_owned(),
+                        transition: "set_total".to_owned(),
+                        args: vec![int_lit(1)],
+                        refs: vec![],
+                    },
+                    IRAction::Apply {
+                        target: "order".to_owned(),
+                        transition: "set_total".to_owned(),
+                        args: vec![int_lit(2)],
+                        refs: vec![],
+                    },
+                ],
+            }],
+            return_expr: None,
+        };
+        let system = make_shop_system(event);
+        let pool = create_slot_pool(
+            std::slice::from_ref(&entity),
+            &HashMap::from([(entity.name.clone(), 1_usize)]),
+            1,
+        );
+
+        let (formula, touched) = try_encode_step_inner(
+            &pool,
+            &vctx,
+            std::slice::from_ref(&entity),
+            std::slice::from_ref(&system),
+            &system.actions[0],
+            0,
+            0,
+            None,
+        )
+        .expect("forall sequential apply step");
+
+        let solver = AbideSolver::new();
+        if let Some(SmtValue::Bool(active)) = pool.active_at("Order", 0, 0) {
+            solver.assert(active);
+        }
+        solver.assert(&formula);
+        solver.assert(
+            &smt::smt_eq(
+                pool.field_at("Order", 0, "total", 1).expect("next total"),
+                &smt::int_val(2),
+            )
+            .expect("next total eq"),
+        );
+        assert_eq!(solver.check(), SatResult::Sat);
+        assert!(touched.contains(&("Order".to_owned(), 0)));
+    }
+
+    #[test]
     fn try_encode_step_inner_macro_handles_let_crosscall_match_apply() {
         let entity = make_step_test_entity();
         let vctx = make_step_test_vctx();

@@ -17599,10 +17599,33 @@ fn multi_apply_second_apply_args_depend_on_first_update() {
 }
 
 #[test]
-fn multi_apply_forall_rejected_in_scene() {
-    // Regression: a scene whose event uses ForAll with multiple Apply actions
-    // on the same entity must be rejected via find_unsupported_in_actions,
-    // not silently encoded incorrectly.
+fn action_precheck_allows_forall_sequential_apply_to_bound_entity() {
+    let actions = vec![IRAction::ForAll {
+        var: "f".to_owned(),
+        entity: "F".to_owned(),
+        ops: vec![
+            IRAction::Apply {
+                target: "f".to_owned(),
+                transition: "pack".to_owned(),
+                refs: vec![],
+                args: vec![],
+            },
+            IRAction::Apply {
+                target: "f".to_owned(),
+                transition: "ship".to_owned(),
+                refs: vec![],
+                args: vec![],
+            },
+        ],
+    }];
+
+    assert_eq!(find_unsupported_in_actions(&actions), None);
+}
+
+#[test]
+fn multi_apply_forall_scene_checks_final_state() {
+    // ForAll bodies compose sequentially for each selected entity, so a scene
+    // should observe the final state after both transition applications.
     use crate::ir::types::{Cardinality, IRScene, IRSceneEvent, IRSceneGiven};
 
     let entity = IREntity {
@@ -17706,7 +17729,7 @@ fn multi_apply_forall_rejected_in_scene() {
 
                 span: None,
             },
-            // ForAll with two Applies on same entity — NOT supported
+            // ForAll with two Applies on the same entity is sequential.
             body: vec![IRAction::ForAll {
                 var: "f".to_owned(),
                 entity: "F".to_owned(),
@@ -17826,17 +17849,11 @@ fn multi_apply_forall_rejected_in_scene() {
 
     let results = verify_all(&ir, &VerifyConfig::default());
     assert_eq!(results.len(), 1);
-    // Must be rejected as SceneFail with "multiple Apply" message,
-    // NOT silently encoded incorrectly.
-    match &results[0] {
-        VerificationResult::SceneFail { reason, .. } => {
-            assert!(
-                reason.contains("multiple Apply"),
-                "ForAll multi-apply rejection should mention 'multiple Apply': got {reason}"
-            );
-        }
-        other => panic!("ForAll multi-apply in scene should produce SceneFail, got: {other}"),
-    }
+    assert!(
+        matches!(&results[0], VerificationResult::ScenePass { .. }),
+        "ForAll multi-apply scene should PASS after pack then ship, got {}",
+        results[0]
+    );
 }
 
 // ── Function contract verification tests ────────────────────────
