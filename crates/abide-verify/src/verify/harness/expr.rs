@@ -440,6 +440,72 @@ pub fn try_encode_slot_expr(
                     entries.iter().map(|(k, _)| format!("{k:?}")).collect();
                 smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0))
             }
+            IRExpr::SetComp {
+                var,
+                domain: IRType::Bool,
+                source: None,
+                filter,
+                projection: None,
+                ..
+            } => {
+                let one = smt::int_lit(1);
+                let zero = smt::int_lit(0);
+                let mut terms = Vec::new();
+                for value in [false, true] {
+                    let mut params = ctx.params.clone();
+                    params.insert(var.clone(), smt::bool_val(value));
+                    let inner_ctx = SlotEncodeCtx {
+                        pool: ctx.pool,
+                        vctx: ctx.vctx,
+                        entity: ctx.entity,
+                        slot: ctx.slot,
+                        params,
+                        bindings: ctx.bindings.clone(),
+                        system_name: ctx.system_name,
+                        entity_param_types: ctx.entity_param_types,
+                        store_param_types: ctx.store_param_types,
+                    };
+                    let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
+                    terms.push(smt::int_ite(&filter_val, &one, &zero));
+                }
+                let refs: Vec<&smt::Int> = terms.iter().collect();
+                SmtValue::Int(smt::int_add(&refs))
+            }
+            IRExpr::SetComp {
+                var,
+                domain: domain @ IRType::Enum { variants, .. },
+                source: None,
+                filter,
+                projection: None,
+                ..
+            } if !domain.has_variant_fields() => {
+                let one = smt::int_lit(1);
+                let zero = smt::int_lit(0);
+                let mut terms = Vec::new();
+                for idx in 0..variants.len() {
+                    let mut params = ctx.params.clone();
+                    params.insert(var.clone(), smt::int_val(idx as i64));
+                    let inner_ctx = SlotEncodeCtx {
+                        pool: ctx.pool,
+                        vctx: ctx.vctx,
+                        entity: ctx.entity,
+                        slot: ctx.slot,
+                        params,
+                        bindings: ctx.bindings.clone(),
+                        system_name: ctx.system_name,
+                        entity_param_types: ctx.entity_param_types,
+                        store_param_types: ctx.store_param_types,
+                    };
+                    let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
+                    terms.push(smt::int_ite(&filter_val, &one, &zero));
+                }
+                if terms.is_empty() {
+                    smt::int_val(0)
+                } else {
+                    let refs: Vec<&smt::Int> = terms.iter().collect();
+                    SmtValue::Int(smt::int_add(&refs))
+                }
+            }
             _ => {
                 if let Some(IRType::Seq { element }) = expr_type(inner) {
                     let seq = try_encode_slot_expr(ctx, inner, step)?;

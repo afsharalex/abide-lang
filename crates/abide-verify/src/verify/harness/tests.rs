@@ -2169,6 +2169,31 @@ fn try_encode_slot_expr_supports_collections_bindings_and_store_quantifiers() {
     .expect("set card");
     assert_value_eq(&set_card, &smt::int_val(2));
 
+    let bool_setcomp_card = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "b".to_owned(),
+                domain: IRType::Bool,
+                source: None,
+                filter: Box::new(IRExpr::Var {
+                    name: "b".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            span: None,
+        },
+        0,
+    )
+    .expect("bool set comprehension card");
+    assert_value_eq(&bool_setcomp_card, &smt::int_val(1));
+
     let map_card = super::expr::try_encode_slot_expr(
         &ctx,
         &IRExpr::Card {
