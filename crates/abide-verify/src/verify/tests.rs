@@ -14796,6 +14796,66 @@ fn verifier_property_supports_dependent_choose_in_set_comprehension_projection()
 }
 
 #[test]
+fn verifier_property_supports_dependent_choose_in_match_binding_arm() {
+    let ir = lower_source_file(
+        "dependent_choose_match_arm.ab",
+        "module DependentChooseMatchArm\n\n\
+         enum Decision = Accept { allowed: bool } | Reject\n\n\
+         entity Dummy { id: identity }\n\n\
+         system S(dummies: Store<Dummy>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify dependent_choose_match_arm {\n\
+           assume {\n\
+             store dummies: Dummy[0..1]\n\
+             let s = S { dummies: dummies }\n\
+           }\n\
+           assert (match @Accept { allowed: true } {\n\
+             Accept { allowed: accepted } => choose y: bool where y == accepted\n\
+             Reject => false\n\
+           }) == true\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|result| matches!(result, VerificationResult::Proved { name, .. } if name == "dependent_choose_match_arm")),
+        "dependent choose in match binding arm should prove through verifier property encoding: {results:?}"
+    );
+}
+
+#[test]
+fn verifier_property_supports_dependent_choose_in_value_binding_match_arm() {
+    let ir = lower_source_file(
+        "dependent_choose_value_match_arm.ab",
+        "module DependentChooseValueMatchArm\n\n\
+         entity Dummy { id: identity }\n\n\
+         system S(dummies: Store<Dummy>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify dependent_choose_value_match_arm {\n\
+           assume {\n\
+             store dummies: Dummy[0..1]\n\
+             let s = S { dummies: dummies }\n\
+           }\n\
+           assert (match 1 { value => choose y: int where y == value + 1 }) == 2\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|result| matches!(result, VerificationResult::Proved { name, .. } if name == "dependent_choose_value_match_arm")),
+        "dependent choose in value-binding match arm should prove through verifier property encoding: {results:?}"
+    );
+}
+
+#[test]
 fn verifier_property_counts_distinct_entity_set_comprehension_projection_values() {
     let ir = lower_source_file(
         "entity_projection_cardinality.ab",

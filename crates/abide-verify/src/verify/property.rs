@@ -985,6 +985,23 @@ pub(super) fn encode_prop_expr(
         }
         IRExpr::BinOp {
             op, left, right, ..
+        } if !logical_binop(op) && op != "OpMapHas" => {
+            if let Some(encoded) = encode_match_relation_with_local_choose(
+                pool, vctx, defs, ctx, left, right, op, true, step,
+            )? {
+                return Ok(encoded);
+            }
+            if let Some(encoded) = encode_match_relation_with_local_choose(
+                pool, vctx, defs, ctx, right, left, op, false, step,
+            )? {
+                return Ok(encoded);
+            }
+            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
+            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
+            Ok(smt::binop(op, &l, &r)?.to_bool()?)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
         } if op == "OpMapHas" => {
             let map_val = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
             let key_val = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
@@ -1819,17 +1836,16 @@ fn normalize_verifier_choose_term(
             let mut new_arms = Vec::with_capacity(arms.len());
             for arm in arms {
                 let (body_bindings, body) = normalize_verifier_choose_term(&arm.body)?;
-                if bindings_contain_choose(&body_bindings)
+                let has_pattern_dependent_choose = bindings_contain_choose(&body_bindings)
                     && pattern_binds_vars(&arm.pattern)
-                    && bindings_mention_any_pattern_var(&body_bindings, &arm.pattern)
-                {
-                    return Err(
-                        "bare choose inside value match arms with binding patterns is not yet supported in verifier properties"
-                            .to_owned(),
-                    );
-                }
-                let guard = match_arm_condition_expr(scrutinee.clone(), arm);
-                hoisted_bindings.extend(guard_branch_choose_bindings(body_bindings, &guard));
+                    && bindings_mention_any_pattern_var(&body_bindings, &arm.pattern);
+                let body = if has_pattern_dependent_choose {
+                    wrap_let_expr(body_bindings, body)
+                } else {
+                    let guard = match_arm_condition_expr(scrutinee.clone(), arm);
+                    hoisted_bindings.extend(guard_branch_choose_bindings(body_bindings, &guard));
+                    body
+                };
                 new_arms.push(crate::ir::types::IRMatchArm {
                     pattern: arm.pattern.clone(),
                     guard: arm
@@ -1879,12 +1895,37 @@ fn encode_prop_value_with_choose_constraints(
     expr: &IRExpr,
     step: usize,
 ) -> Result<(SmtValue, Vec<Bool>), String> {
+    encode_prop_value_with_choose_witnesses(pool, vctx, defs, ctx, expr, step)
+        .map(|encoded| (encoded.value, encoded.constraints))
+}
+
+struct ChooseEncodedValue {
+    value: SmtValue,
+    constraints: Vec<Bool>,
+    witnesses: Vec<(String, SmtValue, IRType)>,
+}
+
+fn encode_prop_value_with_choose_witnesses(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    expr: &IRExpr,
+    step: usize,
+) -> Result<ChooseEncodedValue, String> {
     let IRExpr::Let { bindings, body, .. } = expr else {
-        return encode_prop_value(pool, vctx, defs, ctx, expr, step).map(|value| (value, vec![]));
+        return encode_prop_value(pool, vctx, defs, ctx, expr, step).map(|value| {
+            ChooseEncodedValue {
+                value,
+                constraints: vec![],
+                witnesses: vec![],
+            }
+        });
     };
 
     let mut locals = ctx.locals.clone();
     let mut constraints = Vec::new();
+    let mut witnesses = Vec::new();
     for binding in bindings {
         match &binding.expr {
             IRExpr::Choose {
@@ -1917,7 +1958,8 @@ fn encode_prop_value_with_choose_constraints(
                         pool, vctx, defs, &pred_ctx, predicate, step,
                     )?);
                 }
-                locals.insert(binding.name.clone(), witness);
+                locals.insert(binding.name.clone(), witness.clone());
+                witnesses.push((fresh, witness, domain.clone()));
             }
             _ => {
                 let binding_ctx = property_ctx_with_locals(ctx, locals.clone());
@@ -1929,10 +1971,22 @@ fn encode_prop_value_with_choose_constraints(
 
     let body_ctx = property_ctx_with_locals(ctx, locals);
     let value = encode_prop_value(pool, vctx, defs, &body_ctx, body, step)?;
-    Ok((value, constraints))
+    Ok(ChooseEncodedValue {
+        value,
+        constraints,
+        witnesses,
+    })
 }
 
 fn projection_has_local_choose(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Let { bindings, .. }
+            if bindings.iter().any(|binding| matches!(binding.expr, IRExpr::Choose { .. }))
+    )
+}
+
+fn match_arm_has_local_choose(expr: &IRExpr) -> bool {
     matches!(
         expr,
         IRExpr::Let { bindings, .. }
@@ -2049,6 +2103,67 @@ fn encode_setcomp_projection_membership(
         )?;
         disjuncts.push(smt::bool_and(&[&filter_val, &member]));
     }
+    if disjuncts.is_empty() {
+        return Ok(Some(smt::bool_const(false)));
+    }
+    let refs: Vec<&Bool> = disjuncts.iter().collect();
+    Ok(Some(smt::bool_or(&refs)))
+}
+
+fn encode_match_relation_with_local_choose(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    match_expr: &IRExpr,
+    other: &IRExpr,
+    op: &str,
+    match_on_left: bool,
+    step: usize,
+) -> Result<Option<Bool>, String> {
+    let IRExpr::Match {
+        scrutinee, arms, ..
+    } = match_expr
+    else {
+        return Ok(None);
+    };
+    if !arms.iter().any(|arm| match_arm_has_local_choose(&arm.body)) {
+        return Ok(None);
+    }
+
+    let scrut = encode_prop_value(pool, vctx, defs, ctx, scrutinee, step)?;
+    let other_value = encode_prop_value(pool, vctx, defs, ctx, other, step)?;
+    let mut disjuncts = Vec::new();
+
+    for arm in arms {
+        let arm_cond = encode_pattern_cond(&scrut, &arm.pattern, &ctx.locals, vctx)?;
+        let mut arm_locals = ctx.locals.clone();
+        bind_pattern_vars(&arm.pattern, &scrut, &mut arm_locals, vctx)?;
+        let arm_ctx = property_ctx_with_locals(ctx, arm_locals);
+        let full_cond = if let Some(guard) = &arm.guard {
+            let guard_bool = encode_prop_expr(pool, vctx, defs, &arm_ctx, guard, step)?;
+            smt::bool_and(&[&arm_cond, &guard_bool])
+        } else {
+            arm_cond
+        };
+
+        let encoded =
+            encode_prop_value_with_choose_witnesses(pool, vctx, defs, &arm_ctx, &arm.body, step)?;
+        let relation = if match_on_left {
+            smt::binop(op, &encoded.value, &other_value)?.to_bool()?
+        } else {
+            smt::binop(op, &other_value, &encoded.value)?.to_bool()?
+        };
+        let mut conjuncts = vec![full_cond, relation];
+        conjuncts.extend(encoded.constraints);
+        let refs: Vec<&Bool> = conjuncts.iter().collect();
+        let mut branch = smt::bool_and(&refs);
+        for (fresh, witness, domain) in encoded.witnesses.into_iter().rev() {
+            branch = build_z3_quantifier(false, &witness, &branch, &fresh, &domain)?;
+        }
+        disjuncts.push(branch);
+    }
+
     if disjuncts.is_empty() {
         return Ok(Some(smt::bool_const(false)));
     }
@@ -4135,6 +4250,78 @@ mod tests {
 
         let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
             .expect("independent choose in binding match arm should encode");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_dependent_choose_in_binding_match_arms() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let match_expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Lit {
+                ty: int_ty.clone(),
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            arms: vec![IRMatchArm {
+                pattern: IRPattern::PVar {
+                    name: "scrutinee_value".to_owned(),
+                },
+                guard: None,
+                body: IRExpr::Choose {
+                    var: "candidate".to_owned(),
+                    domain: int_ty.clone(),
+                    predicate: Some(Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "candidate".to_owned(),
+                            ty: int_ty.clone(),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "scrutinee_value".to_owned(),
+                                ty: int_ty.clone(),
+                                span: None,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: int_ty.clone(),
+                                value: LitVal::Int { value: 1 },
+                                span: None,
+                            }),
+                            ty: int_ty.clone(),
+                            span: None,
+                        }),
+                        ty: IRType::Bool,
+                        span: None,
+                    })),
+                    ty: int_ty.clone(),
+                    span: None,
+                },
+            }],
+            span: None,
+        };
+        let property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(match_expr),
+            right: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 2 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("dependent choose in binding match arm should encode");
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
