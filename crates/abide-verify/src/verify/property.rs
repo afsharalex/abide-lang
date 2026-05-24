@@ -3228,7 +3228,7 @@ pub(super) fn encode_card(
                         smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
                 }
                 terms.push(smt::int_ite(&include_once, &one, &zero));
-                prior_keys.push((key, filter_val));
+                prior_keys.push((key, include_once));
             }
             if terms.is_empty() {
                 return Ok(smt::int_val(0));
@@ -3282,10 +3282,12 @@ pub(super) fn encode_card(
             var,
             domain: IRType::Entity { name: entity_name },
             filter,
+            projection,
             ..
         } => {
             let n_slots = pool.slots_for(entity_name);
             let mut sum_terms: Vec<Int> = Vec::new();
+            let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
             let one = smt::int_lit(1);
             let zero = smt::int_lit(0);
 
@@ -3296,8 +3298,26 @@ pub(super) fn encode_card(
                 };
                 let inner_ctx = ctx.with_binding(var, entity_name, slot);
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let cond = smt::bool_and(&[&is_active, &filter_val]);
-                sum_terms.push(smt::int_ite(&cond, &one, &zero));
+                let (key, projection_constraints) = if let Some(projection) = projection {
+                    encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, projection, step,
+                    )?
+                } else {
+                    (smt::int_val(i64::try_from(slot).unwrap_or(0)), vec![])
+                };
+                let mut cond_parts = vec![is_active, filter_val];
+                cond_parts.extend(projection_constraints);
+                let refs: Vec<&Bool> = cond_parts.iter().collect();
+                let include_raw = smt::bool_and(&refs);
+                let mut include_once = include_raw.clone();
+                for (prior_key, prior_filter) in &prior_keys {
+                    let same_key = smt::smt_eq(&key, prior_key)?;
+                    let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
+                    include_once =
+                        smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
+                }
+                sum_terms.push(smt::int_ite(&include_once, &one, &zero));
+                prior_keys.push((key, include_raw));
             }
 
             if sum_terms.is_empty() {
@@ -4411,6 +4431,73 @@ mod tests {
             .expect("fieldless enum set-comprehension cardinality should encode");
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_card_counts_distinct_entity_projection_values() {
+        let entity = make_order_entity();
+        let ir = IRProgram {
+            entities: vec![entity.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let mut scopes = HashMap::new();
+        scopes.insert("Order".to_owned(), 2usize);
+        let pool = create_slot_pool(&[entity], &scopes, 0);
+        let ctx = PropertyCtx::new();
+        let projected = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            source: None,
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "o".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    span: None,
+                }),
+                field: "status".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            })),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        };
+
+        let count = encode_card(&pool, &vctx, &defs, &ctx, &projected, 0)
+            .expect("entity projection cardinality should encode");
+        let solver = AbideSolver::new();
+        solver.assert(pool.active_at("Order", 0, 0).unwrap().to_bool().unwrap());
+        solver.assert(pool.active_at("Order", 1, 0).unwrap().to_bool().unwrap());
+        solver.assert(
+            smt::smt_eq(
+                pool.field_at("Order", 0, "status", 0).unwrap(),
+                &smt::int_val(7),
+            )
+            .unwrap(),
+        );
+        solver.assert(
+            smt::smt_eq(
+                pool.field_at("Order", 1, "status", 0).unwrap(),
+                &smt::int_val(7),
+            )
+            .unwrap(),
+        );
+        solver.assert(smt::bool_not(
+            &smt::smt_eq(&count, &smt::int_val(1)).unwrap(),
+        ));
         assert_eq!(solver.check(), SatResult::Unsat);
     }
 

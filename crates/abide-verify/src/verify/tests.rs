@@ -14796,6 +14796,39 @@ fn verifier_property_supports_dependent_choose_in_set_comprehension_projection()
 }
 
 #[test]
+fn verifier_property_counts_distinct_entity_set_comprehension_projection_values() {
+    let ir = lower_source_file(
+        "entity_projection_cardinality.ab",
+        "module EntityProjectionCardinality\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n\
+           status: Status = @Pending\n\
+         }\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         verify distinct_status_count {\n\
+           assume {\n\
+             store orders: Order[0..2]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always #({ o.status | o: Order where true }) <= 1\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }
+                if name == "distinct_status_count"
+        )),
+        "entity projection cardinality should count distinct projected values, not active entities: {results:?}"
+    );
+}
+
+#[test]
 fn set_comprehension_maps_over_inferred_seq_source() {
     let ir = lower_source_file(
         "sourced_seq_comprehension.ab",
