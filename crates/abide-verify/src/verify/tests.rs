@@ -4363,6 +4363,146 @@ fn make_explicit_multi_entity_store_counterexample_ir() -> IRProgram {
     }
 }
 
+fn make_explicit_bare_entity_apply_counterexample_ir() -> IRProgram {
+    let status_ty = IRType::Enum {
+        name: "TaskStatus".to_owned(),
+        variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+    };
+    let task_ty = IRType::Entity {
+        name: "Task".to_owned(),
+    };
+    let open = IRExpr::Ctor {
+        enum_name: "TaskStatus".to_owned(),
+        ctor: "Open".to_owned(),
+        args: vec![],
+        span: None,
+    };
+    let closed = IRExpr::Ctor {
+        enum_name: "TaskStatus".to_owned(),
+        ctor: "Closed".to_owned(),
+        args: vec![],
+        span: None,
+    };
+    let task = IREntity {
+        name: "Task".to_owned(),
+        fields: vec![IRField {
+            name: "status".to_owned(),
+            ty: status_ty.clone(),
+            default: Some(open.clone()),
+            initial_constraint: None,
+        }],
+        transitions: vec![IRTransition {
+            name: "close".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "status".to_owned(),
+                    ty: status_ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(open.clone()),
+                ty: IRType::Bool,
+                span: None,
+            },
+            updates: vec![IRUpdate {
+                field: "status".to_owned(),
+                value: closed,
+            }],
+            postcondition: None,
+        }],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+    let system = IRSystem {
+        name: "Tasks".to_owned(),
+        store_params: vec![IRStoreParam {
+            name: "tasks".to_owned(),
+            entity_type: "Task".to_owned(),
+        }],
+        fields: vec![],
+        entities: vec!["Task".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "close_any".to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body: vec![IRAction::Apply {
+                target: "Task".to_owned(),
+                transition: "close".to_owned(),
+                refs: vec![],
+                args: vec![],
+            }],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let property = IRExpr::Forall {
+        var: "task".to_owned(),
+        domain: task_ty.clone(),
+        body: Box::new(IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "task".to_owned(),
+                    ty: task_ty,
+                    span: None,
+                }),
+                field: "status".to_owned(),
+                ty: status_ty.clone(),
+                span: None,
+            }),
+            right: Box::new(open),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        span: None,
+    };
+    let verify = IRVerify {
+        name: "all_tasks_stay_open".to_owned(),
+        depth: None,
+        systems: vec![IRVerifySystem {
+            name: "Tasks".to_owned(),
+            lo: 0,
+            hi: 1,
+        }],
+        stores: vec![IRStoreDecl {
+            name: "tasks".to_owned(),
+            entity_type: "Task".to_owned(),
+            lo: 1,
+            hi: 1,
+        }],
+        assumption_set: IRAssumptionSet::default_for_verify(),
+        asserts: vec![property],
+        span: None,
+        file: None,
+    };
+
+    IRProgram {
+        types: vec![IRTypeEntry {
+            name: "TaskStatus".to_owned(),
+            ty: status_ty,
+        }],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![task],
+        systems: vec![system],
+        verifies: vec![verify],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    }
+}
+
 fn make_explicit_system_cross_call_counterexample_ir() -> IRProgram {
     let target = IRSystem {
         name: "Target".to_owned(),
@@ -20529,6 +20669,23 @@ fn verify_all_explicit_state_supports_multi_entity_choose_apply_systems() {
             VerificationResult::Counterexample { .. }
         ),
         "expected explicit-state counterexample on multi-entity choose/apply system, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_all_explicit_state_supports_bare_entity_apply_targets() {
+    let ir = make_explicit_bare_entity_apply_counterexample_ir();
+    let config = VerifyConfig {
+        unbounded_only: true,
+        no_ic3: true,
+        ..VerifyConfig::default()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(&results[0], VerificationResult::Counterexample { .. }),
+        "expected explicit-state counterexample from bare entity Apply target, got: {results:?}"
     );
 }
 

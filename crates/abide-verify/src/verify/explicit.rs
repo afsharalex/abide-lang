@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ir::types::{
     IRAction, IRCreateField, IREntity, IRExpr, IRField, IRFsm, IRProgram, IRSystemAction,
-    IRTransParam, IRTransition, IRType, IRVerify, LitVal,
+    IRTransParam, IRTransition, IRType, IRVariant, IRVerify, LitVal,
 };
 
 use super::context::{EntityInfo, VerifyContext};
@@ -79,6 +79,7 @@ struct ExplicitEntitySpec<'a> {
 struct ExplicitStepRef<'a> {
     system: String,
     store_param_count: usize,
+    return_type: Option<IRType>,
     step: &'a IRSystemAction,
 }
 
@@ -219,8 +220,37 @@ fn field_types_with_params_and_fields(
     fields: &[IRField],
 ) -> HashMap<String, IRType> {
     let mut out = field_types_with_params(base, params);
-    out.extend(fields.iter().map(|field| (field.name.clone(), field.ty.clone())));
+    out.extend(
+        fields
+            .iter()
+            .map(|field| (field.name.clone(), field.ty.clone())),
+    );
     out
+}
+
+fn infer_fieldless_enum_return_type(expr: Option<&IRExpr>, vctx: &VerifyContext) -> Option<IRType> {
+    let Some(IRExpr::Ctor { enum_name, .. }) = expr else {
+        return None;
+    };
+    let mut variants = vctx
+        .variants
+        .to_id
+        .iter()
+        .filter_map(|((candidate_enum, variant), id)| {
+            (candidate_enum == enum_name).then_some((*id, IRVariant::simple(variant.clone())))
+        })
+        .collect::<Vec<_>>();
+    if variants.is_empty() || !vctx.enum_ranges.contains_key(enum_name) {
+        return None;
+    }
+    variants.sort_by_key(|(id, _)| *id);
+    Some(IRType::Enum {
+        name: enum_name.clone(),
+        variants: variants
+            .into_iter()
+            .map(|(_, variant)| variant)
+            .collect::<Vec<_>>(),
+    })
 }
 
 impl<'a> ExplicitModel<'a> {
@@ -295,9 +325,16 @@ impl<'a> ExplicitModel<'a> {
                 for param in &step.params {
                     ensure_supported_explicit_param_type(&param.ty)?;
                 }
+                let return_type = sys
+                    .commands
+                    .iter()
+                    .find(|command| command.name == step.name)
+                    .and_then(|command| command.return_type.clone())
+                    .or_else(|| infer_fieldless_enum_return_type(step.return_expr.as_ref(), vctx));
                 steps.push(ExplicitStepRef {
                     system: sys.name.clone(),
                     store_param_count: sys.store_params.len(),
+                    return_type,
                     step,
                 });
             }
@@ -2173,7 +2210,12 @@ fn validate_action(
                 system_field_types,
                 value_locals,
                 target,
-            ) else {
+            )
+            .or_else(|| {
+                entity_specs
+                    .iter()
+                    .find(|candidate| candidate.name == *target)
+            }) else {
                 return Err("unsupported apply in explicit-state fragment".to_owned());
             };
             let Some(trans) = spec.transitions.get(transition) else {
@@ -2455,7 +2497,10 @@ fn validate_cross_call_like(
             active_calls.remove(&call_key);
             return Err("unsupported cross-call return in explicit-state fragment".to_owned());
         }
-        let Some(return_ty) = explicit_expr_type(return_expr).cloned() else {
+        let Some(return_ty) = explicit_expr_type(return_expr)
+            .cloned()
+            .or_else(|| callee.return_type.clone())
+        else {
             active_calls.remove(&call_key);
             return Err("unsupported cross-call return in explicit-state fragment".to_owned());
         };
@@ -2766,133 +2811,157 @@ fn execute_action(
                     slot_locals,
                 );
             }
-            let binding = if let Some(binding) = slot_locals.get(target) {
-                *binding
+            let target_bindings = if let Some(binding) = slot_locals.get(target) {
+                vec![(*binding, Vec::new())]
             } else if let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(target) {
-                explicit_slot_binding_for_ref(&model.entity_specs, selected)?
+                vec![(
+                    explicit_slot_binding_for_ref(&model.entity_specs, selected)?,
+                    Vec::new(),
+                )]
+            } else if let Some(&entity_index) = model.entity_indices.get(target) {
+                let spec = &model.entity_specs[entity_index];
+                (0..spec.slot_count)
+                    .filter(|slot| state.entity_slots[entity_index][*slot].active)
+                    .map(|slot| {
+                        (
+                            ExplicitSlotBinding { entity_index, slot },
+                            vec![op::Choice::Choose {
+                                binder: target.clone(),
+                                selected: op::EntitySlotRef::new(target.clone(), slot),
+                            }],
+                        )
+                    })
+                    .collect::<Vec<_>>()
             } else {
                 return Err("unsupported apply in explicit-state fragment".to_owned());
             };
-            let spec = &model.entity_specs[binding.entity_index];
-            let Some(trans) = spec.transitions.get(transition) else {
-                return Err(format!(
-                    "unknown explicit-state transition `{}::{transition}`",
-                    spec.name
-                ));
-            };
-            if args.len() != trans.params.len() || refs.len() != trans.refs.len() {
-                return Err("unsupported apply in explicit-state fragment".to_owned());
-            }
-            let mut transition_slot_locals = slot_locals.clone();
-            for (ref_name, decl) in refs.iter().zip(&trans.refs) {
-                let Some(ref_binding) = slot_locals.get(ref_name) else {
-                    let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(ref_name) else {
-                        return Err("unsupported apply in explicit-state fragment".to_owned());
+
+            let mut out = Vec::new();
+            for (binding, choices) in target_bindings {
+                let spec = &model.entity_specs[binding.entity_index];
+                let Some(trans) = spec.transitions.get(transition) else {
+                    return Err(format!(
+                        "unknown explicit-state transition `{}::{transition}`",
+                        spec.name
+                    ));
+                };
+                if args.len() != trans.params.len() || refs.len() != trans.refs.len() {
+                    return Err("unsupported apply in explicit-state fragment".to_owned());
+                }
+                let mut transition_slot_locals = slot_locals.clone();
+                for (ref_name, decl) in refs.iter().zip(&trans.refs) {
+                    let Some(ref_binding) = slot_locals.get(ref_name) else {
+                        let Some(ExplicitValue::SlotRef(selected)) = value_locals.get(ref_name)
+                        else {
+                            return Err("unsupported apply in explicit-state fragment".to_owned());
+                        };
+                        let ref_binding =
+                            explicit_slot_binding_for_ref(&model.entity_specs, selected)?;
+                        if model.entity_specs[ref_binding.entity_index].name != decl.entity {
+                            return Err("unsupported apply in explicit-state fragment".to_owned());
+                        }
+                        transition_slot_locals.insert(decl.name.clone(), ref_binding);
+                        continue;
                     };
-                    let ref_binding = explicit_slot_binding_for_ref(&model.entity_specs, selected)?;
                     if model.entity_specs[ref_binding.entity_index].name != decl.entity {
                         return Err("unsupported apply in explicit-state fragment".to_owned());
                     }
-                    transition_slot_locals.insert(decl.name.clone(), ref_binding);
-                    continue;
-                };
-                if model.entity_specs[ref_binding.entity_index].name != decl.entity {
-                    return Err("unsupported apply in explicit-state fragment".to_owned());
+                    transition_slot_locals.insert(decl.name.clone(), *ref_binding);
                 }
-                transition_slot_locals.insert(decl.name.clone(), *ref_binding);
-            }
-            let transition_args = trans
-                .params
-                .iter()
-                .zip(args.iter())
-                .map(|(param, arg)| {
-                    Ok::<_, String>((
-                        param.name.clone(),
-                        eval_expr(
-                            &state,
-                            arg,
-                            Some(current_system),
-                            &model.system_field_indices,
-                            &model.entity_specs,
-                            value_locals,
-                            &transition_slot_locals,
-                        )?,
-                    ))
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?;
-            let transition_locals = transition_value_locals(
-                value_locals,
-                state.entity_slots[binding.entity_index][binding.slot]
-                    .values
-                    .as_slice(),
-                spec,
-                &transition_args,
-            );
-            if !eval_bool_with_locals(
-                &state,
-                &trans.guard,
-                Some(current_system),
-                &model.system_field_indices,
-                &model.entity_specs,
-                &transition_locals,
-                &transition_slot_locals,
-            )? {
-                return Ok(Vec::new());
-            }
-            let mut next = state;
-            let update_values = trans
-                .updates
-                .iter()
-                .map(|update| {
-                    let index = *spec.field_indices.get(&update.field).ok_or_else(|| {
-                        format!("unknown explicit-state field `{}`", update.field)
-                    })?;
-                    let value = eval_expr(
-                        &next,
-                        &update.value,
-                        Some(current_system),
-                        &model.system_field_indices,
-                        &model.entity_specs,
-                        &transition_locals,
-                        &transition_slot_locals,
-                    )?;
-                    Ok::<_, String>((index, value))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if !fsm_updates_are_allowed(
-                spec,
-                next.entity_slots[binding.entity_index][binding.slot]
-                    .values
-                    .as_slice(),
-                &update_values,
-            ) {
-                return Ok(Vec::new());
-            }
-            for (index, value) in update_values {
-                next.entity_slots[binding.entity_index][binding.slot].values[index] = value;
-            }
-            if let Some(postcondition) = &trans.postcondition {
-                let post_locals = transition_value_locals(
+                let transition_args = trans
+                    .params
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(param, arg)| {
+                        Ok::<_, String>((
+                            param.name.clone(),
+                            eval_expr(
+                                &state,
+                                arg,
+                                Some(current_system),
+                                &model.system_field_indices,
+                                &model.entity_specs,
+                                value_locals,
+                                &transition_slot_locals,
+                            )?,
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?;
+                let transition_locals = transition_value_locals(
                     value_locals,
-                    next.entity_slots[binding.entity_index][binding.slot]
+                    state.entity_slots[binding.entity_index][binding.slot]
                         .values
                         .as_slice(),
                     spec,
                     &transition_args,
                 );
                 if !eval_bool_with_locals(
-                    &next,
-                    postcondition,
+                    &state,
+                    &trans.guard,
                     Some(current_system),
                     &model.system_field_indices,
                     &model.entity_specs,
-                    &post_locals,
+                    &transition_locals,
                     &transition_slot_locals,
                 )? {
-                    return Ok(Vec::new());
+                    continue;
                 }
+                let mut next = state.clone();
+                let update_values = trans
+                    .updates
+                    .iter()
+                    .map(|update| {
+                        let index = *spec.field_indices.get(&update.field).ok_or_else(|| {
+                            format!("unknown explicit-state field `{}`", update.field)
+                        })?;
+                        let value = eval_expr(
+                            &next,
+                            &update.value,
+                            Some(current_system),
+                            &model.system_field_indices,
+                            &model.entity_specs,
+                            &transition_locals,
+                            &transition_slot_locals,
+                        )?;
+                        Ok::<_, String>((index, value))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !fsm_updates_are_allowed(
+                    spec,
+                    next.entity_slots[binding.entity_index][binding.slot]
+                        .values
+                        .as_slice(),
+                    &update_values,
+                ) {
+                    continue;
+                }
+                for (index, value) in update_values {
+                    next.entity_slots[binding.entity_index][binding.slot].values[index] = value;
+                }
+                if let Some(postcondition) = &trans.postcondition {
+                    let post_locals = transition_value_locals(
+                        value_locals,
+                        next.entity_slots[binding.entity_index][binding.slot]
+                            .values
+                            .as_slice(),
+                        spec,
+                        &transition_args,
+                    );
+                    if !eval_bool_with_locals(
+                        &next,
+                        postcondition,
+                        Some(current_system),
+                        &model.system_field_indices,
+                        &model.entity_specs,
+                        &post_locals,
+                        &transition_slot_locals,
+                    )? {
+                        continue;
+                    }
+                }
+                out.push((next, value_locals.clone(), choices));
             }
-            Ok(vec![(next, value_locals.clone(), Vec::new())])
+            Ok(out)
         }
         IRAction::CrossCall {
             system,
@@ -3421,7 +3490,9 @@ fn explicit_expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::App { ty, .. }
         | IRExpr::Choose { ty, .. }
         | IRExpr::Lam { param_type: ty, .. } => Some(ty),
-        IRExpr::IfElse { then_body: body, .. }
+        IRExpr::IfElse {
+            then_body: body, ..
+        }
         | IRExpr::Let { body, .. }
         | IRExpr::Prime { expr: body, .. } => explicit_expr_type(body),
         IRExpr::Match { arms, .. } => arms.first().and_then(|arm| explicit_expr_type(&arm.body)),
@@ -3507,6 +3578,7 @@ fn supports_state_expr(
             resolve_system_field_index(name, current_system, system_fields).is_some()
                 || value_locals.contains(name)
                 || fieldless_enum_variant_value(name, entity_specs).is_some()
+                || fieldless_enum_variant_value_for_type(name, explicit_expr_type(expr)).is_some()
         }
         IRExpr::Field { expr, field, .. } => match expr.as_ref() {
             IRExpr::Var { name, .. } => {
@@ -3812,6 +3884,7 @@ fn eval_expr(
                 return Ok(state.system_values[index].clone());
             }
             fieldless_enum_variant_value(name, entity_specs)
+                .or_else(|| fieldless_enum_variant_value_for_type(name, explicit_expr_type(expr)))
                 .ok_or_else(|| format!("unknown explicit-state field `{name}`"))
         }
         IRExpr::Field { expr, field, .. } => {
@@ -4498,12 +4571,10 @@ fn eval_static_finite_expr_with_locals(
                 _ => Err("unsupported field projection in explicit-state fragment".to_owned()),
             }
         }
-        IRExpr::UnOp { op, operand, .. } => {
-            eval_unop(
-                op,
-                eval_static_finite_expr_with_locals(operand, value_locals, None)?,
-            )
-        }
+        IRExpr::UnOp { op, operand, .. } => eval_unop(
+            op,
+            eval_static_finite_expr_with_locals(operand, value_locals, None)?,
+        ),
         IRExpr::BinOp {
             op, left, right, ..
         } => eval_binop(
@@ -4571,10 +4642,7 @@ fn ensure_supported_explicit_param_type(ty: &IRType) -> Result<(), String> {
     if supports_explicit_param_type(ty) {
         Ok(())
     } else {
-        Err(
-            "explicit-state only supports Bool, finite-enum, and entity step parameters"
-                .to_owned(),
-        )
+        Err("explicit-state only supports Bool, finite-enum, and entity step parameters".to_owned())
     }
 }
 
@@ -4948,6 +5016,7 @@ mod tests {
             steps: vec![ExplicitStepRef {
                 system: "Sys".to_owned(),
                 store_param_count: 0,
+                return_type: None,
                 step,
             }],
             step_indices: HashMap::from([(("Sys".to_owned(), step.name.clone()), 0usize)]),
@@ -5563,6 +5632,75 @@ mod tests {
     }
 
     #[test]
+    fn explicit_state_bare_entity_apply_targets_active_slots() {
+        let close: &'static IRTransition = Box::leak(Box::new(IRTransition {
+            name: "close".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: var("active", IRType::Bool),
+            updates: vec![IRUpdate {
+                field: "active".to_owned(),
+                value: bool_lit(false),
+            }],
+            postcondition: None,
+        }));
+        let mut spec = entity_spec();
+        spec.transitions = HashMap::from([("close".to_owned(), close)]);
+        let model = ExplicitModel {
+            roots: vec!["Sys".to_owned()],
+            system_fields: vec![],
+            system_field_indices: HashMap::new(),
+            entity_specs: vec![spec],
+            entity_indices: HashMap::from([("Task".to_owned(), 0)]),
+            steps: vec![],
+            step_indices: HashMap::new(),
+            safety_properties: vec![],
+            liveness_monitors: vec![],
+            extern_assume_exprs: vec![],
+            stutter: true,
+            weak_fair: vec![],
+            strong_fair: vec![],
+            per_tuple_fair: vec![],
+        };
+        let action = IRAction::Apply {
+            target: "Task".to_owned(),
+            transition: "close".to_owned(),
+            refs: vec![],
+            args: vec![],
+        };
+
+        validate_actions(
+            std::slice::from_ref(&action),
+            "Sys",
+            &HashMap::new(),
+            &HashMap::new(),
+            &model.entity_specs,
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut HashSet::new(),
+        )
+        .expect("bare entity Apply targets should validate for explicit-state");
+
+        let outcomes = execute_actions(
+            &model,
+            sample_state(),
+            "Sys",
+            &[action],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("bare entity Apply targets should execute over active slots");
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].0.entity_slots[0][0].values[0],
+            ExplicitValue::Bool(false)
+        );
+    }
+
+    #[test]
     fn explicit_state_empty_choose_body_validates_and_records_choice() {
         let state = sample_state();
         let spec = entity_spec();
@@ -5761,6 +5899,7 @@ mod tests {
         let steps = vec![ExplicitStepRef {
             system: "Audit".to_owned(),
             store_param_count: 0,
+            return_type: None,
             step: record_step,
         }];
         let step_indices = HashMap::from([(("Audit".to_owned(), "record".to_owned()), 0usize)]);
@@ -6151,6 +6290,7 @@ mod tests {
         let steps = vec![ExplicitStepRef {
             system: "Picker".to_owned(),
             store_param_count: 0,
+            return_type: Some(ticket_ty.clone()),
             step: pick_open,
         }];
         let step_indices = HashMap::from([(("Picker".to_owned(), "pick_open".to_owned()), 0usize)]);
@@ -6802,6 +6942,46 @@ mod tests {
         assert_eq!(
             finite_values_for_type(&payload_enum_type()).unwrap().len(),
             3
+        );
+    }
+
+    #[test]
+    fn explicit_state_typed_fieldless_enum_atoms_do_not_require_entity_fields() {
+        let state = empty_state();
+        let specs = vec![];
+        let system_fields = HashMap::new();
+        let system_field_types = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let atom = var("Closed", enum_type());
+
+        assert!(supports_state_expr(
+            &atom,
+            Some("Gateway"),
+            &system_fields,
+            &system_field_types,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &atom,
+                Some("Gateway"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned(),
+                fields: vec![],
+            }
         );
     }
 
