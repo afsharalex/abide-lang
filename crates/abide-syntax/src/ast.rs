@@ -988,6 +988,10 @@ pub enum InvocArg {
         name: String,
         span: Span,
     },
+    Expr {
+        expr: Expr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]

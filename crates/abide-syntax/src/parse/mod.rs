@@ -2172,6 +2172,13 @@ impl Parser {
                     })
                 }
             }
+            Some(Token::LParen | Token::Choose | Token::If | Token::Match | Token::Let) => {
+                let expr = self.expr()?;
+                Ok(InvocArg::Expr {
+                    span: expr.span,
+                    expr,
+                })
+            }
             Some(tok) => Err(ParseError::expected(
                 "invocation argument",
                 &format!("`{tok}`"),

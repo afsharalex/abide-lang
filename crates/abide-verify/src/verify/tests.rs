@@ -24614,6 +24614,46 @@ fn relational_scene_fragment_rejects_event_arg_scenes_and_leaves_them_on_smt_pat
 }
 
 #[test]
+fn scene_event_arg_supports_direct_choose_witness() {
+    let ir = lower_source_file(
+        "scene_choose_event_arg.ab",
+        "module SceneChooseArg\n\n\
+         entity Counter {\n\
+           value: int = 0\n\
+           action set(next: int) { value' = next }\n\
+         }\n\n\
+         system App(counters: Store<Counter>) {\n\
+           command set_one(next: int) {\n\
+             choose c: Counter where true { c.set(next) }\n\
+           }\n\
+         }\n\n\
+         scene choose_arg_sets_value {\n\
+           given {\n\
+             store counters: Counter[1..1]\n\
+             let app = App { counters: counters }\n\
+             let c = one Counter in counters where c.value == 0\n\
+           }\n\
+           when {\n\
+             app.set_one(choose n: int where n == 1)\n\
+           }\n\
+           then {\n\
+             assert c.value == 1\n\
+           }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::ScenePass { name, .. } if name == "choose_arg_sets_value"
+        )),
+        "scene event arg should accept a direct choose equality witness: {results:?}"
+    );
+}
+
+#[test]
 fn relational_verify_fragment_detects_create_only_bounded_verify() {
     let ir = lower_source_file(
         "rel_verify_detect.ab",

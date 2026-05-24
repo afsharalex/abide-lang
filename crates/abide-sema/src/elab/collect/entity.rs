@@ -1317,5 +1317,6 @@ pub(super) fn collect_invoc_arg(arg: &ast::InvocArg) -> EExpr {
             Literal::Str(value.clone()),
             None,
         ),
+        ast::InvocArg::Expr { expr, .. } => collect_expr(expr),
     }
 }

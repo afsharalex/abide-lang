@@ -362,6 +362,17 @@ pub(super) fn build_scene_event_params(
             .fold(arg_ctx, |ctx, (var, (ent, slot))| {
                 ctx.with_binding(var, ent, *slot)
             });
+        if let Some(val) = encode_scene_direct_choose_arg(pool, vctx, defs, &arg_ctx, arg, step)
+            .map_err(|msg| {
+                format!(
+                    "encoding error in scene event arg for {}::{}: {msg}",
+                    re.scene_event.system, re.scene_event.event
+                )
+            })?
+        {
+            override_params.insert(param.name.clone(), val);
+            continue;
+        }
         let (val, constraints) = encode_prop_value_with_ctx(pool, vctx, defs, &arg_ctx, arg, step)
             .map_err(|msg| {
                 format!(
@@ -378,6 +389,54 @@ pub(super) fn build_scene_event_params(
         override_params.insert(param.name.clone(), val);
     }
     Ok(override_params)
+}
+
+fn direct_choose_equality_witness<'a>(var: &str, predicate: &'a IRExpr) -> Option<&'a IRExpr> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = predicate
+    else {
+        return None;
+    };
+    if op != "OpEq" {
+        return None;
+    }
+    if matches!(left.as_ref(), IRExpr::Var { name, .. } if name == var) {
+        return Some(right);
+    }
+    if matches!(right.as_ref(), IRExpr::Var { name, .. } if name == var) {
+        return Some(left);
+    }
+    None
+}
+
+fn encode_scene_direct_choose_arg(
+    pool: &harness::SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    arg: &IRExpr,
+    step: usize,
+) -> Result<Option<SmtValue>, String> {
+    let IRExpr::Choose {
+        var,
+        predicate: Some(predicate),
+        ..
+    } = arg
+    else {
+        return Ok(None);
+    };
+    let Some(witness_expr) = direct_choose_equality_witness(var, predicate) else {
+        return Ok(None);
+    };
+    let (value, constraints) =
+        encode_prop_value_with_ctx(pool, vctx, defs, ctx, witness_expr, step)?;
+    if !constraints.is_empty() {
+        return Err(
+            "direct choose witness expression produced nested witness constraints".to_owned(),
+        );
+    }
+    Ok(Some(value))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2339,6 +2398,72 @@ mod tests {
         assert_eq!(
             value.as_int().expect("slot id should be Int").to_string(),
             "0"
+        );
+    }
+
+    #[test]
+    fn build_scene_event_params_supports_direct_choose_arg_witness() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = create_slot_pool_with_systems(&[], &HashMap::new(), 1, &[]);
+        let action = IRSystemAction {
+            name: "set_one".to_owned(),
+            params: vec![crate::ir::types::IRTransParam {
+                name: "next".to_owned(),
+                ty: crate::ir::types::IRType::Int,
+            }],
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: None,
+        };
+        let scene_event = IRSceneEvent {
+            var: "set_one".to_owned(),
+            system: "App".to_owned(),
+            event: "set_one".to_owned(),
+            args: vec![IRExpr::Choose {
+                var: "n".to_owned(),
+                domain: crate::ir::types::IRType::Int,
+                predicate: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "n".to_owned(),
+                        ty: crate::ir::types::IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: crate::ir::types::IRType::Int,
+                        value: crate::ir::types::LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: crate::ir::types::IRType::Bool,
+                    span: None,
+                })),
+                ty: crate::ir::types::IRType::Int,
+                span: None,
+            }],
+            cardinality: crate::ir::types::Cardinality::Named("one".to_owned()),
+        };
+        let resolved = ResolvedSceneEvent {
+            scene_event: &scene_event,
+            steps: vec![&action],
+        };
+        let params = build_scene_event_params(
+            &resolved,
+            &pool,
+            &vctx,
+            &defs,
+            &HashMap::new(),
+            &HashMap::new(),
+            0,
+            "choose_arg_scene",
+        )
+        .expect("direct choose equality scene arg should encode");
+
+        let value = params.get("next").expect("param should be bound");
+        assert_eq!(
+            value.as_int().expect("witness should be Int").to_string(),
+            "1"
         );
     }
 
