@@ -1848,6 +1848,7 @@ fn simple_value_with_params(
 fn supports_assertion_expr(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Exists { body, .. } | IRExpr::Forall { body, .. } => supports_slot_predicate(body),
+        IRExpr::UnOp { op, operand, .. } if op == "OpNot" => supports_assertion_expr(operand),
         IRExpr::BinOp {
             op, left, right, ..
         } if op == "OpAnd" || op == "OpOr" => {
@@ -1913,6 +1914,9 @@ fn encode_assertion_into(
                 sat.add_clause([!out, left_lit, right_lit].into());
             }
             Ok(out)
+        }
+        IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
+            Ok(!encode_assertion_into(operand, instances, sat)?)
         }
         IRExpr::Exists {
             var, domain, body, ..
@@ -5687,6 +5691,26 @@ mod tests {
         let mut solver = BasicSolver::default();
         solver.add_cnf(cnf).expect("test CNF should load");
         solver.solve().expect("test solve should complete")
+    }
+
+    #[test]
+    fn assertion_encoder_supports_top_level_not() {
+        let assertion = IRExpr::UnOp {
+            op: "OpNot".to_owned(),
+            operand: Box::new(IRExpr::Lit {
+                value: LitVal::Bool { value: false },
+                ty: IRType::Bool,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let mut sat = SatInstance::new();
+        let lit =
+            encode_assertion_into(&assertion, &[], &mut sat).expect("top-level not should encode");
+        sat.add_unit(lit);
+
+        assert!(matches!(solve_instance(sat), SolverResult::Sat));
     }
 
     #[test]
