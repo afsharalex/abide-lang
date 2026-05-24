@@ -6317,6 +6317,41 @@ theorem t for Sys {
 }
 
 #[test]
+fn verifier_supports_finite_domain_setcomp_values_and_projected_cardinality() {
+    let src = r"module T
+
+enum State = Open | Closed
+
+entity E {
+  x: int = 0
+}
+
+system Sys(es: Store<E>) {
+  command init() {
+    create E {}
+  }
+}
+
+verify finite_projected_setcomp {
+  assume {
+    store es: E[0..1]
+    let sys = Sys { es: es }
+    stutter
+  }
+
+  assert always (#{ true | b: bool where true } == 1)
+  assert always (#{ s == @Open | s: State where true } == 2)
+  assert always (true in { true | b: bool where true })
+  assert always (not (false in { true | b: bool where true }))
+  assert always (@Open in { s | s: State where s == @Open })
+}
+";
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "finite_projected_setcomp");
+}
+
+#[test]
 fn explicit_state_verifier_supports_match_expression_guards() {
     let src = r"module T
 

@@ -1235,6 +1235,21 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
                         .and_then(|p| find_unsupported_scene_expr(p))
                 })
         }
+        IRExpr::SetComp {
+            domain,
+            source: None,
+            filter,
+            projection,
+            ..
+        } if matches!(domain, IRType::Bool)
+            || (matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields()) =>
+        {
+            find_unsupported_scene_expr(filter).or_else(|| {
+                projection
+                    .as_ref()
+                    .and_then(|p| find_unsupported_scene_expr(p))
+            })
+        }
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
         IRExpr::RelComp {
             projection,
@@ -1271,20 +1286,19 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
                     })
             }
             IRExpr::SetComp {
-                domain: IRType::Bool,
-                source: None,
-                filter,
-                projection: None,
-                ..
-            } => find_unsupported_scene_expr(filter),
-            IRExpr::SetComp {
                 domain,
                 source: None,
                 filter,
-                projection: None,
+                projection,
                 ..
-            } if matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields() => {
-                find_unsupported_scene_expr(filter)
+            } if matches!(domain, IRType::Bool)
+                || (matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields()) =>
+            {
+                find_unsupported_scene_expr(filter).or_else(|| {
+                    projection
+                        .as_ref()
+                        .and_then(|p| find_unsupported_scene_expr(p))
+                })
             }
             // Entity-domain set comprehension — bounded sum over slots
             IRExpr::SetComp {

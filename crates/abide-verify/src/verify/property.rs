@@ -101,6 +101,18 @@ fn expr_type(expr: &IRExpr) -> Option<&IRType> {
     }
 }
 
+fn finite_domain_values(domain: &IRType) -> Option<Vec<SmtValue>> {
+    match domain {
+        IRType::Bool => Some(vec![smt::bool_val(false), smt::bool_val(true)]),
+        domain @ IRType::Enum { .. } if !domain.has_variant_fields() => Some(
+            (0..enum_variant_count(domain))
+                .map(|idx| smt::int_val(idx as i64))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 pub(super) fn clear_path_guard_stack() {
     PROP_PATH_GUARD.with(|v| v.borrow_mut().clear());
 }
@@ -2882,6 +2894,49 @@ pub(super) fn encode_prop_value(
             }
             Ok(SmtValue::Array(arr))
         }
+        IRExpr::SetComp {
+            var,
+            domain,
+            source: None,
+            filter,
+            projection,
+            ty,
+            ..
+        } if finite_domain_values(domain).is_some() => {
+            let IRType::Set { element } = ty else {
+                return Err(format!("SetComp with non-Set result type: {ty:?}"));
+            };
+            let result_elem_sort = smt::ir_type_to_sort(element);
+            let false_val = smt::bool_val(false).to_dynamic();
+            let true_val = smt::bool_val(true).to_dynamic();
+            let mut arr = smt::const_array(&result_elem_sort, &false_val);
+
+            let values = finite_domain_values(domain).unwrap_or_default();
+            for value in values {
+                let inner_ctx = ctx.with_local(var, value.clone());
+                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
+                let (key, projection_constraints) = if let Some(proj_expr) = projection {
+                    let (key, constraints) = encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, proj_expr, step,
+                    )?;
+                    (key.to_dynamic(), constraints)
+                } else {
+                    (value.to_dynamic(), vec![])
+                };
+                let cond = if projection_constraints.is_empty() {
+                    filter_val
+                } else {
+                    let mut conjuncts = vec![filter_val];
+                    conjuncts.extend(projection_constraints);
+                    let refs: Vec<&Bool> = conjuncts.iter().collect();
+                    smt::bool_and(&refs)
+                };
+                let stored = arr.store(&key, &true_val);
+                arr = smt::array_ite(&cond, &stored, &arr);
+            }
+
+            Ok(SmtValue::Array(arr))
+        }
         IRExpr::SetComp { domain, .. } => {
             // Non-entity domain — should be caught by find_unsupported_scene_expr,
             // but if reached (e.g., manually constructed IR), return a fresh
@@ -3495,38 +3550,43 @@ pub(super) fn encode_card(
         }
         IRExpr::SetComp {
             var,
-            domain: IRType::Bool,
+            domain,
             source: None,
             filter,
-            projection: None,
+            projection,
             ..
-        } => {
+        } if finite_domain_values(domain).is_some() => {
             let one = smt::int_lit(1);
             let zero = smt::int_lit(0);
             let mut terms = Vec::new();
-            for value in [false, true] {
-                let inner_ctx = ctx.with_local(var, smt::bool_val(value));
+            let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
+            for value in finite_domain_values(domain).unwrap_or_default() {
+                let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                terms.push(smt::int_ite(&filter_val, &one, &zero));
-            }
-            let refs: Vec<&Int> = terms.iter().collect();
-            Ok(SmtValue::Int(smt::int_add(&refs)))
-        }
-        IRExpr::SetComp {
-            var,
-            domain: domain @ IRType::Enum { .. },
-            source: None,
-            filter,
-            projection: None,
-            ..
-        } if !domain.has_variant_fields() => {
-            let one = smt::int_lit(1);
-            let zero = smt::int_lit(0);
-            let mut terms = Vec::new();
-            for idx in 0..enum_variant_count(domain) {
-                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                terms.push(smt::int_ite(&filter_val, &one, &zero));
+                let (key, projection_constraints) = if let Some(projection) = projection {
+                    encode_prop_value_with_choose_constraints(
+                        pool, vctx, defs, &inner_ctx, projection, step,
+                    )?
+                } else {
+                    (value, vec![])
+                };
+                let include_raw = if projection_constraints.is_empty() {
+                    filter_val
+                } else {
+                    let mut conjuncts = vec![filter_val];
+                    conjuncts.extend(projection_constraints);
+                    let refs: Vec<&Bool> = conjuncts.iter().collect();
+                    smt::bool_and(&refs)
+                };
+                let mut include_once = include_raw.clone();
+                for (prior_key, prior_filter) in &prior_keys {
+                    let same_key = smt::smt_eq(&key, prior_key)?;
+                    let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
+                    include_once =
+                        smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
+                }
+                terms.push(smt::int_ite(&include_once, &one, &zero));
+                prior_keys.push((key, include_raw));
             }
             if terms.is_empty() {
                 return Ok(smt::int_val(0));
@@ -4985,6 +5045,203 @@ mod tests {
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_finite_domain_setcomp_values() {
+        let enum_ty = IRType::Enum {
+            name: "State".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        };
+        let mut ir = empty_ir();
+        ir.types.push(IRTypeEntry {
+            name: "State".to_owned(),
+            ty: enum_ty.clone(),
+        });
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+
+        let bool_set = IRExpr::SetComp {
+            var: "b".to_owned(),
+            domain: IRType::Bool,
+            source: None,
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            })),
+            ty: IRType::Set {
+                element: Box::new(IRType::Bool),
+            },
+            span: None,
+        };
+        let true_member = IRExpr::Index {
+            map: Box::new(bool_set),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let enum_set = IRExpr::SetComp {
+            var: "state".to_owned(),
+            domain: enum_ty.clone(),
+            source: None,
+            filter: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "state".to_owned(),
+                    ty: enum_ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "State".to_owned(),
+                    ctor: "Open".to_owned(),
+                    args: vec![],
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(enum_ty),
+            },
+            span: None,
+        };
+        let open_member = IRExpr::Index {
+            map: Box::new(enum_set),
+            key: Box::new(IRExpr::Ctor {
+                enum_name: "State".to_owned(),
+                ctor: "Open".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        for property in [true_member, open_member] {
+            let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+                .expect("finite-domain set-comprehension value should encode");
+            let solver = AbideSolver::new();
+            solver.assert(smt::bool_not(&encoded));
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_counts_projected_finite_domain_setcomp_cardinality() {
+        let enum_ty = IRType::Enum {
+            name: "State".to_owned(),
+            variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
+        };
+        let mut ir = empty_ir();
+        ir.types.push(IRTypeEntry {
+            name: "State".to_owned(),
+            ty: enum_ty.clone(),
+        });
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+
+        let bool_card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "b".to_owned(),
+                domain: IRType::Bool,
+                source: None,
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                projection: Some(Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                })),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+        let bool_property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(bool_card),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let enum_card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "state".to_owned(),
+                domain: enum_ty.clone(),
+                source: None,
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                projection: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "state".to_owned(),
+                        ty: enum_ty,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "State".to_owned(),
+                        ctor: "Open".to_owned(),
+                        args: vec![],
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                })),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+        let enum_property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(enum_card),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 2 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        for property in [bool_property, enum_property] {
+            let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+                .expect("projected finite-domain set-comprehension cardinality should encode");
+            let solver = AbideSolver::new();
+            solver.assert(smt::bool_not(&encoded));
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
     }
 
     #[test]
