@@ -23335,6 +23335,80 @@ fn relational_scene_fragment_supports_implied_create_only_assertions() {
 }
 
 #[test]
+fn relational_scene_fragment_supports_one_create_only_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_one_assertion.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n\
+           status: Status = @Pending\n\
+         }\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_pending() { create Order {} }\n\
+         }\n\n\
+         scene exactly_one_pending_order {\n\
+           given {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_pending()\n\
+           }\n\
+           then {\n\
+             assert one o: Order | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "one create-only assertion should stay inside the relational fragment"
+    );
+    let routed = relational::try_check_scene_block_relational(&ir, scene);
+    assert!(
+        matches!(routed, Some(VerificationResult::ScenePass { .. })),
+        "one create-only assertion should be owned by the relational backend: {routed:?}"
+    );
+}
+
+#[test]
+fn relational_scene_fragment_supports_lone_create_only_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_lone_assertion.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n\
+           status: Status = @Pending\n\
+         }\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_pending() { create Order {} }\n\
+         }\n\n\
+         scene at_most_one_confirmed_order {\n\
+           given {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_pending()\n\
+           }\n\
+           then {\n\
+             assert lone o: Order | o.status == @Confirmed\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "lone create-only assertion should stay inside the relational fragment"
+    );
+    let routed = relational::try_check_scene_block_relational(&ir, scene);
+    assert!(
+        matches!(routed, Some(VerificationResult::ScenePass { .. })),
+        "lone create-only assertion should be owned by the relational backend: {routed:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_supports_ref_alias_args() {
     let ir = lower_source_file(
         "rel_scene_ref_args.ab",

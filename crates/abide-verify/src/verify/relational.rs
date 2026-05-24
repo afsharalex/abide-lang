@@ -1847,7 +1847,10 @@ fn simple_value_with_params(
 
 fn supports_assertion_expr(expr: &IRExpr) -> bool {
     match expr {
-        IRExpr::Exists { body, .. } | IRExpr::Forall { body, .. } => supports_slot_predicate(body),
+        IRExpr::Exists { body, .. }
+        | IRExpr::Forall { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. } => supports_slot_predicate(body),
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => supports_assertion_expr(operand),
         IRExpr::BinOp {
             op, left, right, ..
@@ -1974,8 +1977,45 @@ fn encode_assertion_into(
             }
             and_lit(sat, &clauses)
         }
+        IRExpr::One {
+            var, domain, body, ..
+        } => {
+            let matches = matching_assertion_assignments(var, domain, body, instances, "one")?;
+            exactly_one_lit(sat, &matches)
+        }
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => {
+            let matches = matching_assertion_assignments(var, domain, body, instances, "lone")?;
+            at_most_one_lit(sat, &matches)
+        }
         _ => Err("unsupported relational scene assertion".to_owned()),
     }
+}
+
+fn matching_assertion_assignments(
+    var: &str,
+    domain: &IRType,
+    body: &IRExpr,
+    instances: &[CreateInstance],
+    quantifier: &str,
+) -> Result<Vec<rustsat::types::Lit>, String> {
+    let entity_name = match domain {
+        IRType::Entity { name } => name.as_str(),
+        _ => {
+            return Err(format!(
+                "unsupported {quantifier} domain in relational scene"
+            ));
+        }
+    };
+    Ok(instances
+        .iter()
+        .flat_map(|inst| {
+            inst.assigns.iter().copied().filter(|_| {
+                inst.entity == entity_name && slot_predicate_matches(body, var, &inst.field_values)
+            })
+        })
+        .collect())
 }
 
 fn relational_verify_spec(
@@ -5546,6 +5586,28 @@ fn or_lit(
     Ok(out)
 }
 
+fn at_most_one_lit(
+    sat: &mut SatInstance,
+    lits: &[rustsat::types::Lit],
+) -> Result<rustsat::types::Lit, String> {
+    let mut violations = Vec::new();
+    for i in 0..lits.len() {
+        for j in (i + 1)..lits.len() {
+            violations.push(and_lit(sat, &[lits[i], lits[j]])?);
+        }
+    }
+    Ok(!or_lit(sat, &violations)?)
+}
+
+fn exactly_one_lit(
+    sat: &mut SatInstance,
+    lits: &[rustsat::types::Lit],
+) -> Result<rustsat::types::Lit, String> {
+    let some = or_lit(sat, lits)?;
+    let at_most = at_most_one_lit(sat, lits)?;
+    and_lit(sat, &[some, at_most])
+}
+
 fn simple_witness_value(value: &SimpleValue) -> WitnessValue {
     match value {
         SimpleValue::Bool(value) => WitnessValue::Bool(*value),
@@ -5736,6 +5798,61 @@ mod tests {
         let mut sat = SatInstance::new();
         let lit = encode_assertion_into(&assertion, &[], &mut sat)
             .expect("top-level implies should encode");
+        sat.add_unit(lit);
+
+        assert!(matches!(solve_instance(sat), SolverResult::Sat));
+    }
+
+    #[test]
+    fn assertion_encoder_supports_one_quantifier() {
+        let mut sat = SatInstance::new();
+        let assign = sat.new_lit();
+        sat.add_unit(assign);
+        let instances = vec![CreateInstance {
+            entity: "Order".to_owned(),
+            fire: sat.new_lit(),
+            assigns: vec![assign],
+            positions: Vec::new(),
+            field_values: HashMap::from([(
+                "status".to_owned(),
+                SimpleValue::Ctor("Status".to_owned(), "Pending".to_owned()),
+            )]),
+        }];
+        let assertion = IRExpr::One {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        variants: vec![crate::ir::types::IRVariant::simple("Pending")],
+                    },
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Pending".to_owned(),
+                    args: Vec::new(),
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+        let lit = encode_assertion_into(&assertion, &instances, &mut sat)
+            .expect("one quantifier should encode");
         sat.add_unit(lit);
 
         assert!(matches!(solve_instance(sat), SolverResult::Sat));
