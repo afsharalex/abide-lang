@@ -2194,6 +2194,63 @@ fn try_encode_slot_expr_supports_collections_bindings_and_store_quantifiers() {
     .expect("bool set comprehension card");
     assert_value_eq(&bool_setcomp_card, &smt::int_val(1));
 
+    let sourced_setcomp_card = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "i".to_owned(),
+                domain: IRType::Int,
+                source: Some(Box::new(IRExpr::SetLit {
+                    elements: vec![
+                        IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 1 },
+                            span: None,
+                        },
+                        IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 2 },
+                            span: None,
+                        },
+                        IRExpr::Lit {
+                            ty: IRType::Int,
+                            value: LitVal::Int { value: 3 },
+                            span: None,
+                        },
+                    ],
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                })),
+                filter: Box::new(IRExpr::BinOp {
+                    op: "OpGt".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "i".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            }),
+            span: None,
+        },
+        0,
+    )
+    .expect("sourced set comprehension card");
+    assert_value_eq(&sourced_setcomp_card, &smt::int_val(2));
+
     let map_card = super::expr::try_encode_slot_expr(
         &ctx,
         &IRExpr::Card {

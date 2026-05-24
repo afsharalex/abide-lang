@@ -442,6 +442,65 @@ pub fn try_encode_slot_expr(
             }
             IRExpr::SetComp {
                 var,
+                source: Some(source),
+                filter,
+                projection,
+                ..
+            } => {
+                let elements = match source.as_ref() {
+                    IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+                    _ => {
+                        return Err(format!(
+                            "unsupported cardinality in action context: {inner:?}"
+                        ));
+                    }
+                };
+                let one = smt::int_lit(1);
+                let zero = smt::int_lit(0);
+                let mut terms = Vec::new();
+                let mut prior_keys: Vec<(SmtValue, smt::Bool)> = Vec::new();
+                for element_expr in elements {
+                    let value = try_encode_slot_expr(ctx, element_expr, step)?;
+                    let mut params = ctx.params.clone();
+                    params.insert(var.clone(), value.clone());
+                    let inner_ctx = SlotEncodeCtx {
+                        pool: ctx.pool,
+                        vctx: ctx.vctx,
+                        entity: ctx.entity,
+                        slot: ctx.slot,
+                        params,
+                        bindings: ctx.bindings.clone(),
+                        system_name: ctx.system_name,
+                        entity_param_types: ctx.entity_param_types,
+                        store_param_types: ctx.store_param_types,
+                    };
+                    let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
+                    let key = if let Some(projection) = projection {
+                        try_encode_slot_expr(&inner_ctx, projection, step)?
+                    } else {
+                        value
+                    };
+                    let mut include_once = filter_val.clone();
+                    for (prior_key, prior_filter) in &prior_keys {
+                        let same_key = smt::smt_eq(&key, prior_key)?;
+                        let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
+                        include_once = smt::bool_and(&[
+                            &include_once,
+                            &smt::bool_not(&prior_included_same_key),
+                        ]);
+                    }
+                    terms.push(smt::int_ite(&include_once, &one, &zero));
+                    prior_keys.push((key, filter_val));
+                }
+                if terms.is_empty() {
+                    smt::int_val(0)
+                } else {
+                    let refs: Vec<&smt::Int> = terms.iter().collect();
+                    SmtValue::Int(smt::int_add(&refs))
+                }
+            }
+            IRExpr::SetComp {
+                var,
                 domain: IRType::Bool,
                 source: None,
                 filter,
