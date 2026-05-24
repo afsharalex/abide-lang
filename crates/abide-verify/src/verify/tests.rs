@@ -23585,6 +23585,59 @@ fn relational_scene_fragment_supports_implied_create_only_assertions() {
 }
 
 #[test]
+fn scene_relational_precheck_supports_pure_pred_call() {
+    let ir = lower_source_file(
+        "scene_pred_assertion.ab",
+        "module ScenePredAssertion\n\n\
+         enum Status = Pending | Confirmed | Shipped\n\n\
+         entity Order {\n\
+           id: identity\n\
+           status: Status = @Pending\n\
+           action confirm() requires status == @Pending { status' = @Confirmed }\n\
+           action ship() requires status == @Confirmed { status' = @Shipped }\n\
+         }\n\n\
+         pred is_shipped(o: Order) = o.status == @Shipped\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command confirm_order(order_id: identity) {\n\
+             choose o: Order where o.id == order_id and o.status == @Pending { o.confirm() }\n\
+           }\n\
+           command ship_order(order_id: identity) {\n\
+             choose o: Order where o.id == order_id and o.status == @Confirmed { o.ship() }\n\
+           }\n\
+         }\n\n\
+         scene pred_assertion {\n\
+           given {\n\
+             store orders: Order[0..2]\n\
+             let commerce = Commerce { orders: orders }\n\
+             let o = one Order in orders where o.status == @Pending\n\
+           }\n\
+           when {\n\
+             let first = commerce.confirm_order(o.id)\n\
+             let second = commerce.ship_order(o.id)\n\
+             assume first -> second\n\
+           }\n\
+           then {\n\
+             assert is_shipped(o)\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "relational scene support should expand pure pred calls in supported assertions"
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "pred_assertion")
+        ),
+        "scene assertions should expand pure pred calls instead of rejecting App: {results:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_supports_one_create_only_assertions() {
     let ir = lower_source_file(
         "rel_scene_one_assertion.ab",

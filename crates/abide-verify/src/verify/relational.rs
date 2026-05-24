@@ -23,7 +23,7 @@ use crate::ir::types::{
 };
 
 use super::scene::collect_ordering_leaf_vars;
-use super::{VerificationResult, WitnessSemantics};
+use super::{defenv, expand_through_defs, VerificationResult, WitnessSemantics};
 
 const STATEFUL_SCENE_SOME_EVENT_BUDGET: usize = 3;
 const STATEFUL_SCENE_MAX_TOTAL_EVENT_INSTANCES: usize = 6;
@@ -289,7 +289,8 @@ pub(super) fn try_check_scene_block_relational(
     ir: &IRProgram,
     scene: &IRScene,
 ) -> Option<VerificationResult> {
-    let obligation = RelationalSceneObligation::build(ir, scene).ok()??;
+    let defs = defenv::DefEnv::from_ir(ir);
+    let obligation = RelationalSceneObligation::build(ir, scene, &defs).ok()??;
     Some(obligation.solve())
 }
 
@@ -318,11 +319,15 @@ struct RelationalVerifyObligation<'a> {
 }
 
 impl<'a> RelationalSceneObligation<'a> {
-    fn build(ir: &'a IRProgram, scene: &'a IRScene) -> Result<Option<Self>, String> {
+    fn build(
+        ir: &'a IRProgram,
+        scene: &'a IRScene,
+        defs: &defenv::DefEnv,
+    ) -> Result<Option<Self>, String> {
         if let Some(sat) = build_create_only_scene_sat(ir, scene)? {
             return Ok(Some(Self { scene, sat }));
         }
-        if let Some(sat) = build_stateful_scene_sat(ir, scene)? {
+        if let Some(sat) = build_stateful_scene_sat(ir, scene, defs)? {
             return Ok(Some(Self { scene, sat }));
         }
         Ok(None)
@@ -505,8 +510,9 @@ fn build_create_only_scene_sat(
 fn build_stateful_scene_sat(
     ir: &IRProgram,
     scene: &IRScene,
+    defs: &defenv::DefEnv,
 ) -> Result<Option<SatInstance>, String> {
-    let Some(spec) = relational_stateful_scene_spec(ir, scene)? else {
+    let Some(spec) = relational_stateful_scene_spec(ir, scene, defs)? else {
         return Ok(None);
     };
     let RelationalStatefulSceneSpec {
@@ -920,8 +926,9 @@ pub(super) fn supports_verify_fragment(ir: &IRProgram, verify: &IRVerify) -> Res
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn supports_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Result<bool, String> {
+    let defs = defenv::DefEnv::from_ir(ir);
     Ok(supports_create_only_scene_fragment(ir, scene)?
-        || relational_stateful_scene_spec(ir, scene)?.is_some())
+        || relational_stateful_scene_spec(ir, scene, &defs)?.is_some())
 }
 
 fn supports_create_only_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Result<bool, String> {
@@ -1003,6 +1010,7 @@ fn supports_create_only_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Resul
 fn relational_stateful_scene_spec(
     ir: &IRProgram,
     scene: &IRScene,
+    defs: &defenv::DefEnv,
 ) -> Result<Option<RelationalStatefulSceneSpec>, String> {
     if scene.systems.len() != 1
         || scene.givens.is_empty()
@@ -1077,8 +1085,9 @@ fn relational_stateful_scene_spec(
                 return Ok(None);
             }
         }
+        let expanded_constraint = expand_through_defs(&given.constraint, defs);
         let Some(predicate) = parse_slot_predicate_expr(
-            &given.constraint,
+            &expanded_constraint,
             Some(given.var.as_str()),
             Some(entity_ir),
             &HashMap::new(),
@@ -1133,6 +1142,7 @@ fn relational_stateful_scene_spec(
                     &entities_by_name,
                     &entities,
                     &given_binding_map,
+                    defs,
                 )?
                 else {
                     return Ok(None);
@@ -1156,8 +1166,14 @@ fn relational_stateful_scene_spec(
     let binding_entities_map: HashMap<_, _> = binding_entities.into_iter().collect();
     let mut assertions = Vec::with_capacity(scene.assertions.len());
     for assertion in &scene.assertions {
-        let Some(pred) =
-            parse_scoped_predicate_expr(assertion, None, None, &HashMap::new(), &allowed_bindings)?
+        let expanded_assertion = expand_through_defs(assertion, defs);
+        let Some(pred) = parse_scoped_predicate_expr(
+            &expanded_assertion,
+            None,
+            None,
+            &HashMap::new(),
+            &allowed_bindings,
+        )?
         else {
             return Ok(None);
         };
@@ -2188,6 +2204,7 @@ fn parse_relational_scene_step(
     entities_by_name: &HashMap<String, &IREntity>,
     entity_specs: &HashMap<String, RelationalEntitySpec>,
     given_bindings: &HashMap<&str, &str>,
+    defs: &defenv::DefEnv,
 ) -> Result<Option<RelationalSystemStepSpec>, String> {
     if args.is_empty() {
         return parse_relational_step(step, entities_by_name, entity_specs);
@@ -2229,6 +2246,7 @@ fn parse_relational_scene_step(
         &param_values,
         Vec::new(),
         None,
+        defs,
     )?
     else {
         return Ok(None);
@@ -2248,6 +2266,7 @@ fn parse_relational_scene_action_with_bindings(
     param_values: &HashMap<String, SimpleValue>,
     bindings: Vec<RelActionBinding>,
     target_context: Option<(String, String, String)>,
+    defs: &defenv::DefEnv,
 ) -> Result<Option<RelationalActionSpec>, String> {
     match action {
         IRAction::Create { entity, fields } => {
@@ -2283,9 +2302,10 @@ fn parse_relational_scene_action_with_bindings(
                 .collect();
             let available_bindings: Vec<_> =
                 available_binding_names.iter().map(String::as_str).collect();
+            let expanded_filter = expand_through_defs(filter, defs);
             let current_target_context = if target_context.is_none() {
                 let Some(target_binding) =
-                    extract_scene_target_binding(filter, var.as_str(), param_binding_map)
+                    extract_scene_target_binding(&expanded_filter, var.as_str(), param_binding_map)
                 else {
                     return Ok(None);
                 };
@@ -2301,7 +2321,7 @@ fn parse_relational_scene_action_with_bindings(
             let mut next_bindings = bindings;
             if is_target_choose {
                 let filter_pred = parse_scene_target_filter_predicate(
-                    filter,
+                    &expanded_filter,
                     var.as_str(),
                     param_binding_map,
                     param_values,
@@ -2319,7 +2339,7 @@ fn parse_relational_scene_action_with_bindings(
                 }
             } else {
                 let Some((alias_of, filter_pred)) = parse_scene_binding_filter_predicate(
-                    filter,
+                    &expanded_filter,
                     var.as_str(),
                     param_binding_map,
                     &available_bindings,
@@ -2345,6 +2365,7 @@ fn parse_relational_scene_action_with_bindings(
                 param_values,
                 next_bindings,
                 current_target_context,
+                defs,
             )
         }
         IRAction::Apply {
@@ -2415,8 +2436,9 @@ fn parse_relational_scene_action_with_bindings(
                 .map(|(alias, _)| alias.as_str())
                 .collect();
             allowed_bindings.extend(bindings.iter().map(|binding| binding.name.as_str()));
+            let expanded_guard = expand_through_defs(&transition_ir.guard, defs);
             let transition_pred = parse_scoped_predicate_expr(
-                &transition_ir.guard,
+                &expanded_guard,
                 Some(target.as_str()),
                 Some(entity_ir),
                 &transition_param_values,
