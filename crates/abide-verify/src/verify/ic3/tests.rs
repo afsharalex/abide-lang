@@ -2200,6 +2200,115 @@ fn build_multi_slot_chc_supports_finite_payload_enum_setcomp_cardinality() {
 }
 
 #[test]
+fn build_system_chc_supports_top_level_pure_finite_payload_enum_cardinality() {
+    let (entity, tys) = make_simple_entity();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let system = IRSystem {
+        name: "Shop".to_owned(),
+        store_params: vec![IRStoreParam {
+            name: "orders".to_owned(),
+            entity_type: "Order".to_owned(),
+        }],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let mut all_types = tys;
+    all_types.push(IRTypeEntry {
+        name: "Decision".to_owned(),
+        ty: decision_ty.clone(),
+    });
+    let ir = IRProgram {
+        types: all_types,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Card {
+                expr: Box::new(IRExpr::SetComp {
+                    var: "d".to_owned(),
+                    domain: decision_ty.clone(),
+                    source: None,
+                    filter: Box::new(IRExpr::BinOp {
+                        op: "OpEq".to_owned(),
+                        left: Box::new(IRExpr::Var {
+                            name: "d".to_owned(),
+                            ty: decision_ty.clone(),
+                            span: None,
+                        }),
+                        right: Box::new(IRExpr::Ctor {
+                            enum_name: "Decision".to_owned(),
+                            ctor: "Reject".to_owned(),
+                            args: vec![],
+                            span: None,
+                        }),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    projection: Some(Box::new(IRExpr::Var {
+                        name: "d".to_owned(),
+                        ty: decision_ty.clone(),
+                        span: None,
+                    })),
+                    ty: IRType::Set {
+                        element: Box::new(decision_ty),
+                    },
+                    span: None,
+                }),
+                span: None,
+            }),
+            right: Box::new(ic3_int_lit(1)),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        span: None,
+    };
+
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+    let chc = build_system_chc(
+        &[&ir.entities[0]],
+        &[&ir.systems[0]],
+        &vctx,
+        &property,
+        &slots,
+    )
+    .expect("system CHC should encode top-level pure finite payload enum cardinality");
+    assert!(chc.contains("declare-datatypes () ((Decision"));
+    assert!(chc.contains("(Accept false)"));
+    assert!(chc.contains("Reject"));
+}
+
+#[test]
 fn ic3_supports_one_and_lone_quantifier_expressions() {
     require_unbounded_proof_tests!();
 
@@ -9333,18 +9442,22 @@ fn system_expr_and_property_translators_cover_misc_paths_and_errors() {
     .expect_err("bare entity local must be rejected");
     assert!(bare_entity_err.contains("bare entity local"));
 
-    let non_quant_err = negate_property_smt_system(
-        &IRExpr::Lit {
-            ty: IRType::Bool,
-            value: LitVal::Bool { value: true },
+    let top_level_pure = negate_property_smt_system(&ic3_bool_lit(true), &entities, &vctx, &slots)
+        .expect("top-level pure system property should encode");
+    assert_eq!(top_level_pure, "(not true)");
+
+    let missing_context_err = negate_property_smt_system(
+        &IRExpr::Var {
+            name: "total".to_owned(),
+            ty: IRType::Int,
             span: None,
         },
         &entities,
         &vctx,
         &slots,
     )
-    .expect_err("non-quantified system property unsupported");
-    assert!(non_quant_err.contains("non-quantified"));
+    .expect_err("top-level field-like variable should require entity context");
+    assert!(missing_context_err.contains("unknown variable"));
 }
 
 #[test]

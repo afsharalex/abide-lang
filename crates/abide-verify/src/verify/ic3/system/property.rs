@@ -79,9 +79,26 @@ pub(in crate::verify::ic3) fn negate_property_smt_system(
             Ok(format!("(or {})", disjuncts.join(" ")))
         }
         _ => {
-            // Non-quantified: try encoding directly
-            // For simplicity, check against all active entities
-            Err("non-quantified system-level properties require entity context".to_owned())
+            let pure_entity = IREntity {
+                name: "__PureProperty".to_owned(),
+                fields: vec![],
+                transitions: vec![],
+                derived_fields: vec![],
+                invariants: vec![],
+                fsm_decls: vec![],
+            };
+            let pos = guard_to_smt_sys_prop_scoped(
+                property,
+                entities,
+                slots_per_entity,
+                &pure_entity,
+                vctx,
+                "__PureProperty",
+                0,
+                &HashSet::new(),
+                &Ic3SystemEntityLocals::new(),
+            )?;
+            Ok(format!("(not {pos})"))
         }
     }
 }

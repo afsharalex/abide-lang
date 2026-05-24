@@ -6692,6 +6692,60 @@ verify ic3_payload_enum_cardinality {
 }
 
 #[test]
+fn ic3_supports_top_level_pure_finite_payload_enum_cardinality() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+entity Counter {
+  x: int = 0
+  y: int = 0
+
+  action bump() requires x < 10 {
+    x' = x + 1
+    y' = y + 1
+  }
+}
+
+system S(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.bump() }
+  }
+}
+
+verify ic3_top_level_pure_cardinality {
+  assume {
+    store counters: Counter[0..20]
+    let s = S { counters: counters }
+    stutter
+  }
+
+  assert always all c: Counter | c.y <= 10
+  assert always #{ d | d: Decision where d == @Reject } == 1
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: false,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "ic3_top_level_pure_cardinality"
+                    && method.contains("IC3")
+        )),
+        "top-level pure finite payload enum cardinality should prove through IC3, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 
