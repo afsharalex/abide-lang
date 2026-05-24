@@ -1,6 +1,25 @@
 use super::*;
 use crate::verify::walkers;
 
+fn finite_slot_domain_values(ctx: &SlotEncodeCtx<'_>, domain: &IRType) -> Option<Vec<SmtValue>> {
+    match domain {
+        IRType::Bool => Some(vec![smt::bool_val(false), smt::bool_val(true)]),
+        IRType::Enum { name, variants } if !domain.has_variant_fields() => Some(
+            variants
+                .iter()
+                .enumerate()
+                .map(|(idx, variant)| {
+                    ctx.vctx
+                        .variants
+                        .try_id_of(name, &variant.name)
+                        .map_or_else(|_| smt::int_val(idx as i64), smt::int_val)
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
     try_encode_slot_expr(ctx, expr, step).unwrap_or_else(|msg| panic!("{msg}"))
@@ -426,6 +445,50 @@ pub fn try_encode_slot_expr(
             Ok(smt::seq_literal(elem_ty, &elems))
         }
 
+        IRExpr::SetComp {
+            var,
+            domain,
+            source: None,
+            filter,
+            projection,
+            ty,
+            ..
+        } if finite_slot_domain_values(ctx, domain).is_some() => {
+            let IRType::Set { element } = ty else {
+                return Err(format!("SetComp with non-Set result type: {ty:?}"));
+            };
+            let elem_sort = smt::ir_type_to_sort(element);
+            let false_val = smt::bool_val(false).to_dynamic();
+            let true_val = smt::bool_val(true).to_dynamic();
+            let mut arr = smt::const_array(&elem_sort, &false_val);
+
+            for value in finite_slot_domain_values(ctx, domain).unwrap_or_default() {
+                let mut params = ctx.params.clone();
+                params.insert(var.clone(), value.clone());
+                let inner_ctx = SlotEncodeCtx {
+                    pool: ctx.pool,
+                    vctx: ctx.vctx,
+                    entity: ctx.entity,
+                    slot: ctx.slot,
+                    params,
+                    bindings: ctx.bindings.clone(),
+                    system_name: ctx.system_name,
+                    entity_param_types: ctx.entity_param_types,
+                    store_param_types: ctx.store_param_types,
+                };
+                let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
+                let key = if let Some(projection) = projection {
+                    try_encode_slot_expr(&inner_ctx, projection, step)?
+                } else {
+                    value
+                };
+                let stored = arr.store(&key.to_dynamic(), &true_val);
+                arr = smt::array_ite(&filter_val, &stored, &arr);
+            }
+
+            Ok(SmtValue::Array(arr))
+        }
+
         IRExpr::Card { expr: inner, .. } => Ok(match inner.as_ref() {
             IRExpr::SetLit { elements, .. } => {
                 let unique: std::collections::HashSet<String> =
@@ -501,18 +564,19 @@ pub fn try_encode_slot_expr(
             }
             IRExpr::SetComp {
                 var,
-                domain: IRType::Bool,
+                domain,
                 source: None,
                 filter,
-                projection: None,
+                projection,
                 ..
-            } => {
+            } if finite_slot_domain_values(ctx, domain).is_some() => {
                 let one = smt::int_lit(1);
                 let zero = smt::int_lit(0);
                 let mut terms = Vec::new();
-                for value in [false, true] {
+                let mut prior_keys: Vec<(SmtValue, smt::Bool)> = Vec::new();
+                for value in finite_slot_domain_values(ctx, domain).unwrap_or_default() {
                     let mut params = ctx.params.clone();
-                    params.insert(var.clone(), smt::bool_val(value));
+                    params.insert(var.clone(), value.clone());
                     let inner_ctx = SlotEncodeCtx {
                         pool: ctx.pool,
                         vctx: ctx.vctx,
@@ -525,38 +589,22 @@ pub fn try_encode_slot_expr(
                         store_param_types: ctx.store_param_types,
                     };
                     let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
-                    terms.push(smt::int_ite(&filter_val, &one, &zero));
-                }
-                let refs: Vec<&smt::Int> = terms.iter().collect();
-                SmtValue::Int(smt::int_add(&refs))
-            }
-            IRExpr::SetComp {
-                var,
-                domain: domain @ IRType::Enum { variants, .. },
-                source: None,
-                filter,
-                projection: None,
-                ..
-            } if !domain.has_variant_fields() => {
-                let one = smt::int_lit(1);
-                let zero = smt::int_lit(0);
-                let mut terms = Vec::new();
-                for idx in 0..variants.len() {
-                    let mut params = ctx.params.clone();
-                    params.insert(var.clone(), smt::int_val(idx as i64));
-                    let inner_ctx = SlotEncodeCtx {
-                        pool: ctx.pool,
-                        vctx: ctx.vctx,
-                        entity: ctx.entity,
-                        slot: ctx.slot,
-                        params,
-                        bindings: ctx.bindings.clone(),
-                        system_name: ctx.system_name,
-                        entity_param_types: ctx.entity_param_types,
-                        store_param_types: ctx.store_param_types,
+                    let key = if let Some(projection) = projection {
+                        try_encode_slot_expr(&inner_ctx, projection, step)?
+                    } else {
+                        value
                     };
-                    let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
-                    terms.push(smt::int_ite(&filter_val, &one, &zero));
+                    let mut include_once = filter_val.clone();
+                    for (prior_key, prior_filter) in &prior_keys {
+                        let same_key = smt::smt_eq(&key, prior_key)?;
+                        let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
+                        include_once = smt::bool_and(&[
+                            &include_once,
+                            &smt::bool_not(&prior_included_same_key),
+                        ]);
+                    }
+                    terms.push(smt::int_ite(&include_once, &one, &zero));
+                    prior_keys.push((key, filter_val));
                 }
                 if terms.is_empty() {
                     smt::int_val(0)

@@ -2194,6 +2194,95 @@ fn try_encode_slot_expr_supports_collections_bindings_and_store_quantifiers() {
     .expect("bool set comprehension card");
     assert_value_eq(&bool_setcomp_card, &smt::int_val(1));
 
+    let bool_setcomp_value = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::SetComp {
+                var: "b".to_owned(),
+                domain: IRType::Bool,
+                source: None,
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                projection: Some(Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                })),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        },
+        0,
+    )
+    .expect("bool set comprehension value");
+    let bool_setcomp_solver = AbideSolver::new();
+    bool_setcomp_solver.assert(smt::bool_not(
+        &bool_setcomp_value
+            .to_bool()
+            .expect("set membership should be bool"),
+    ));
+    assert_eq!(bool_setcomp_solver.check(), SatResult::Unsat);
+
+    let enum_ty = IRType::Enum {
+        name: "OrderStatus".to_owned(),
+        variants: vec![
+            IRVariant::simple("Pending"),
+            IRVariant::simple("Confirmed"),
+            IRVariant::simple("Shipped"),
+        ],
+    };
+    let enum_projected_card = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "status".to_owned(),
+                domain: enum_ty.clone(),
+                source: None,
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                projection: Some(Box::new(IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "status".to_owned(),
+                        ty: enum_ty,
+                        span: None,
+                    }),
+                    right: Box::new(IRExpr::Ctor {
+                        enum_name: "OrderStatus".to_owned(),
+                        ctor: "Pending".to_owned(),
+                        args: vec![],
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                })),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            span: None,
+        },
+        0,
+    )
+    .expect("enum projected set comprehension card");
+    assert_value_eq(&enum_projected_card, &smt::int_val(2));
+
     let sourced_setcomp_card = super::expr::try_encode_slot_expr(
         &ctx,
         &IRExpr::Card {

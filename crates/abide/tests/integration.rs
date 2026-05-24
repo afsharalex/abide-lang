@@ -6352,6 +6352,47 @@ verify finite_projected_setcomp {
 }
 
 #[test]
+fn verifier_action_context_supports_finite_domain_setcomp_values_and_projected_cardinality() {
+    let src = r"module T
+
+enum State = Open | Closed
+
+entity E {
+  ok: bool = false
+
+  action mark() requires true in { true | b: bool where true } {
+    ok' = (#{ true | b: bool where true } == 1)
+      and (#{ s == @Open | s: State where true } == 2)
+      and (@Open in { s | s: State where s == @Open })
+  }
+}
+
+system Sys(es: Store<E>) {
+  command init() {
+    create E {}
+  }
+
+  command mark() {
+    choose e: E where true { e.mark() }
+  }
+}
+
+verify finite_action_setcomp {
+  assume {
+    store es: E[0..1]
+    let sys = Sys { es: es }
+    stutter
+  }
+
+  assert always true
+}
+";
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "finite_action_setcomp");
+}
+
+#[test]
 fn explicit_state_verifier_supports_match_expression_guards() {
     let src = r"module T
 
