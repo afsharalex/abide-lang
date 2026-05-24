@@ -2008,62 +2008,102 @@ fn encode_projection_membership_with_choose(
         return smt::smt_eq(&value, key);
     };
 
-    let mut locals = ctx.locals.clone();
-    let mut constraints = Vec::new();
-    let mut witnesses: Vec<(String, SmtValue, IRType)> = Vec::new();
+    encode_projection_membership_bindings(pool, vctx, defs, ctx, bindings, body, key, step)
+}
 
-    for binding in bindings {
-        match &binding.expr {
-            IRExpr::Choose {
-                var,
-                domain,
-                predicate,
-                ..
-            } => {
-                if matches!(domain, IRType::Entity { .. }) {
-                    return Err(
-                        "entity choose in set-comprehension projection is not yet supported"
-                            .to_owned(),
+fn encode_projection_membership_bindings(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    bindings: &[crate::ir::types::LetBinding],
+    body: &IRExpr,
+    key: &SmtValue,
+    step: usize,
+) -> Result<Bool, String> {
+    let Some((binding, rest)) = bindings.split_first() else {
+        let value = encode_prop_value(pool, vctx, defs, ctx, body, step)?;
+        return smt::smt_eq(&value, key);
+    };
+
+    match &binding.expr {
+        IRExpr::Choose {
+            var,
+            domain: IRType::Entity { name: entity_name },
+            predicate,
+            ..
+        } => {
+            let mut disjuncts = Vec::new();
+            for slot in 0..pool.slots_for(entity_name) {
+                let Some(SmtValue::Bool(active)) = pool.active_at(entity_name, slot, step) else {
+                    continue;
+                };
+                let choose_ctx = ctx.with_binding(var, entity_name, slot);
+                let predicate_bool = if let Some(predicate) = predicate {
+                    encode_prop_expr(pool, vctx, defs, &choose_ctx, predicate, step)?
+                } else {
+                    smt::bool_const(true)
+                };
+                let body_ctx = ctx.with_binding(&binding.name, entity_name, slot);
+                let rest_bool = encode_projection_membership_bindings(
+                    pool, vctx, defs, &body_ctx, rest, body, key, step,
+                )?;
+                disjuncts.push(smt::bool_and(&[active, &predicate_bool, &rest_bool]));
+            }
+            if disjuncts.is_empty() {
+                return Ok(smt::bool_const(false));
+            }
+            let refs: Vec<&Bool> = disjuncts.iter().collect();
+            Ok(smt::bool_or(&refs))
+        }
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => {
+            let fresh = format!(
+                "__abide_projection_member_choose_{}_{}",
+                binding.name,
+                PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+            let pred_ctx = ctx.with_local(var, witness.clone());
+            let mut constraints = Vec::new();
+            if let Some(domain_pred) =
+                prop_domain_predicate(domain, &witness, &pred_ctx, vctx, defs)?
+            {
+                constraints.push(domain_pred);
+            }
+            if let Some(predicate) = predicate {
+                constraints.push(encode_prop_expr(
+                    pool, vctx, defs, &pred_ctx, predicate, step,
+                )?);
+            }
+            let body_ctx = ctx.with_local(&binding.name, witness.clone());
+            constraints.push(encode_projection_membership_bindings(
+                pool, vctx, defs, &body_ctx, rest, body, key, step,
+            )?);
+            let refs: Vec<&Bool> = constraints.iter().collect();
+            let member = smt::bool_and(&refs);
+            build_z3_quantifier(false, &witness, &member, &fresh, domain)
+        }
+        _ => {
+            if let IRExpr::Var { name, .. } = &binding.expr {
+                if let Some((entity, slot)) = ctx.bindings.get(name) {
+                    let body_ctx = ctx.with_binding(&binding.name, entity, *slot);
+                    return encode_projection_membership_bindings(
+                        pool, vctx, defs, &body_ctx, rest, body, key, step,
                     );
                 }
-                let fresh = format!(
-                    "__abide_projection_member_choose_{}_{}",
-                    binding.name,
-                    PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
-                );
-                let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
-                let base_ctx = property_ctx_with_locals(ctx, locals.clone());
-                let pred_ctx = base_ctx.with_local(var, witness.clone());
-                if let Some(domain_pred) =
-                    prop_domain_predicate(domain, &witness, &pred_ctx, vctx, defs)?
-                {
-                    constraints.push(domain_pred);
-                }
-                if let Some(predicate) = predicate {
-                    constraints.push(encode_prop_expr(
-                        pool, vctx, defs, &pred_ctx, predicate, step,
-                    )?);
-                }
-                locals.insert(binding.name.clone(), witness.clone());
-                witnesses.push((fresh, witness, domain.clone()));
             }
-            _ => {
-                let binding_ctx = property_ctx_with_locals(ctx, locals.clone());
-                let val = encode_prop_value(pool, vctx, defs, &binding_ctx, &binding.expr, step)?;
-                locals.insert(binding.name.clone(), val);
-            }
+            let val = encode_prop_value(pool, vctx, defs, ctx, &binding.expr, step)?;
+            let body_ctx = ctx.with_local(&binding.name, val);
+            encode_projection_membership_bindings(
+                pool, vctx, defs, &body_ctx, rest, body, key, step,
+            )
         }
     }
-
-    let body_ctx = property_ctx_with_locals(ctx, locals);
-    let value = encode_prop_value(pool, vctx, defs, &body_ctx, body, step)?;
-    constraints.push(smt::smt_eq(&value, key)?);
-    let refs: Vec<&Bool> = constraints.iter().collect();
-    let mut member = smt::bool_and(&refs);
-    for (fresh, witness, domain) in witnesses.into_iter().rev() {
-        member = build_z3_quantifier(false, &witness, &member, &fresh, &domain)?;
-    }
-    Ok(member)
 }
 
 fn encode_setcomp_projection_membership(
@@ -4505,6 +4545,116 @@ mod tests {
         let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
             .expect("dependent choose in set-comprehension projection should encode");
         let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_entity_choose_in_setcomp_projection() {
+        let order = make_order_entity();
+        let scopes = HashMap::from([("Order".to_owned(), 1usize)]);
+        let pool = create_slot_pool(&[order], &scopes, 0);
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let int_ty = IRType::Int;
+        let set_int_ty = IRType::Set {
+            element: Box::new(int_ty.clone()),
+        };
+        let set_comp = IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: int_ty.clone(),
+            source: Some(Box::new(IRExpr::SetLit {
+                elements: vec![IRExpr::Lit {
+                    ty: int_ty.clone(),
+                    value: LitVal::Int { value: 1 },
+                    span: None,
+                }],
+                ty: set_int_ty.clone(),
+                span: None,
+            })),
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Let {
+                bindings: vec![crate::ir::types::LetBinding {
+                    name: "picked".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    expr: IRExpr::Choose {
+                        var: "candidate".to_owned(),
+                        domain: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        predicate: Some(Box::new(IRExpr::BinOp {
+                            op: "OpEq".to_owned(),
+                            left: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "candidate".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Order".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "status".to_owned(),
+                                ty: int_ty.clone(),
+                                span: None,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: int_ty.clone(),
+                                value: LitVal::Int { value: 7 },
+                                span: None,
+                            }),
+                            ty: IRType::Bool,
+                            span: None,
+                        })),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    },
+                }],
+                body: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "picked".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    field: "status".to_owned(),
+                    ty: int_ty.clone(),
+                    span: None,
+                }),
+                span: None,
+            })),
+            ty: set_int_ty,
+            span: None,
+        };
+        let property = IRExpr::Index {
+            map: Box::new(set_comp),
+            key: Box::new(IRExpr::Lit {
+                ty: int_ty,
+                value: LitVal::Int { value: 7 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("entity choose in set-comprehension projection should encode");
+        let solver = AbideSolver::new();
+        if let Some(SmtValue::Bool(active)) = pool.active_at("Order", 0, 0) {
+            solver.assert(active);
+        }
+        if let Some(SmtValue::Int(status)) = pool.field_at("Order", 0, "status", 0) {
+            solver.assert(smt::int_eq(status, &smt::int_lit(7)));
+        }
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
     }

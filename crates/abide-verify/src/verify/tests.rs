@@ -14796,6 +14796,35 @@ fn verifier_property_supports_dependent_choose_in_set_comprehension_projection()
 }
 
 #[test]
+fn verifier_property_supports_entity_choose_in_set_comprehension_projection() {
+    let ir = lower_source_file(
+        "entity_choose_projection.ab",
+        "module EntityChooseProjection\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command noop() { }\n\
+         }\n\n\
+         verify entity_choose_projection {\n\
+           assume {\n\
+             store orders: Order[1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert ({ (choose o: Order where o.status == @Pending).status | x in Set(1) where true })[@Pending]\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(
+            |result| matches!(result, VerificationResult::Proved { name, .. } if name == "entity_choose_projection")
+        ),
+        "entity choose in set-comprehension projection should prove membership: {results:?}"
+    );
+}
+
+#[test]
 fn verifier_property_supports_dependent_choose_in_match_binding_arm() {
     let ir = lower_source_file(
         "dependent_choose_match_arm.ab",
