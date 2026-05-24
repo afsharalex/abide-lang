@@ -408,7 +408,7 @@ fn build_create_only_scene_sat(
                     scene.name, scene_event.event, scene_event.system
                 )
             })?;
-        let (entity_name, field_values) = create_spec(step, &entities_by_name)?;
+        let (entity_name, field_values) = create_spec(step, &scene_event.args, &entities_by_name)?;
         let slot_count = store_slots.get(entity_name.as_str()).copied().unwrap_or(0);
         let potential_count = cardinality_budget(&scene_event.cardinality, some_budget);
         let mut fire_lits = Vec::new();
@@ -945,7 +945,7 @@ fn supports_create_only_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Resul
 
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     for scene_event in &scene.events {
-        if !scene_event.args.is_empty() || scene_event.system != *system_name {
+        if scene_event.system != *system_name {
             return Ok(false);
         }
         let Some(step) = system
@@ -970,18 +970,23 @@ fn supports_create_only_scene_fragment(ir: &IRProgram, scene: &IRScene) -> Resul
         if step.body.len() != 1 {
             return Ok(false);
         }
-        let body = &step.body;
-        let params = &step.params;
-        if !params.is_empty() {
+        if step.params.len() != scene_event.args.len() {
             return Ok(false);
         }
-        let crate::ir::types::IRAction::Create { entity, fields } = &body[0] else {
+        let mut param_values = HashMap::new();
+        for (param, arg) in step.params.iter().zip(&scene_event.args) {
+            let Some(value) = simple_value(arg) else {
+                return Ok(false);
+            };
+            param_values.insert(param.name.clone(), value);
+        }
+        let crate::ir::types::IRAction::Create { entity, fields } = &step.body[0] else {
             return Ok(false);
         };
         let Some(entity_ir) = entities_by_name.get(entity.as_str()) else {
             return Err(format!("unknown entity `{entity}`"));
         };
-        if build_field_value_map(entity_ir, fields)?.is_none() {
+        if build_field_value_map_with_params(entity_ir, fields, &param_values)?.is_none() {
             return Ok(false);
         }
     }
@@ -1175,15 +1180,35 @@ fn relational_stateful_scene_spec(
 
 fn create_spec(
     step: &IRSystemAction,
+    args: &[IRExpr],
     entities_by_name: &HashMap<String, &IREntity>,
 ) -> Result<(String, HashMap<String, SimpleValue>), String> {
+    if step.params.len() != args.len() {
+        return Err(format!(
+            "scene event supplies {} args for `{}` but command expects {}",
+            args.len(),
+            step.name,
+            step.params.len()
+        ));
+    }
+    let mut param_values = HashMap::new();
+    for (param, arg) in step.params.iter().zip(args) {
+        let Some(value) = simple_value(arg) else {
+            return Err(format!(
+                "unsupported create argument for `{}` parameter `{}`",
+                step.name, param.name
+            ));
+        };
+        param_values.insert(param.name.clone(), value);
+    }
     let crate::ir::types::IRAction::Create { entity, fields } = &step.body[0] else {
         return Err(format!("step `{}` is not create-only", step.name));
     };
     let Some(entity_ir) = entities_by_name.get(entity) else {
         return Err(format!("unknown entity `{entity}`"));
     };
-    let Some(field_values) = build_field_value_map(entity_ir, fields)? else {
+    let Some(field_values) = build_field_value_map_with_params(entity_ir, fields, &param_values)?
+    else {
         return Err(format!(
             "unsupported create field values in `{}`",
             step.name
@@ -1766,17 +1791,25 @@ fn build_field_value_map(
     entity: &IREntity,
     fields: &[crate::ir::types::IRCreateField],
 ) -> Result<Option<HashMap<String, SimpleValue>>, String> {
+    build_field_value_map_with_params(entity, fields, &HashMap::new())
+}
+
+fn build_field_value_map_with_params(
+    entity: &IREntity,
+    fields: &[crate::ir::types::IRCreateField],
+    params: &HashMap<String, SimpleValue>,
+) -> Result<Option<HashMap<String, SimpleValue>>, String> {
     let mut out = HashMap::new();
     for field in &entity.fields {
         if let Some(default) = &field.default {
-            let Some(value) = simple_value(default) else {
+            let Some(value) = simple_value_with_params(default, params) else {
                 return Ok(None);
             };
             out.insert(field.name.clone(), value);
         }
     }
     for field in fields {
-        let Some(value) = simple_value(&field.value) else {
+        let Some(value) = simple_value_with_params(&field.value, params) else {
             return Ok(None);
         };
         out.insert(field.name.clone(), value);
@@ -2167,6 +2200,26 @@ fn parse_relational_scene_action_with_bindings(
     target_context: Option<(String, String, String)>,
 ) -> Result<Option<RelationalActionSpec>, String> {
     match action {
+        IRAction::Create { entity, fields } => {
+            if !bindings.is_empty() || target_context.is_some() {
+                return Ok(None);
+            }
+            if !entity_specs.contains_key(entity) {
+                return Ok(None);
+            }
+            let Some(entity_ir) = entities_by_name.get(entity) else {
+                return Err(format!("unknown entity `{entity}`"));
+            };
+            let Some(field_values) =
+                build_field_value_map_with_params(entity_ir, fields, param_values)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(RelationalActionSpec::Create {
+                entity: entity.clone(),
+                field_values,
+            }))
+        }
         IRAction::Choose {
             var,
             entity,
@@ -5634,6 +5687,64 @@ mod tests {
         let mut solver = BasicSolver::default();
         solver.add_cnf(cnf).expect("test CNF should load");
         solver.solve().expect("test solve should complete")
+    }
+
+    #[test]
+    fn field_value_map_accepts_finite_param_values() {
+        let entity = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![crate::ir::types::IRField {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    variants: vec![
+                        crate::ir::types::IRVariant::simple("Pending"),
+                        crate::ir::types::IRVariant::simple("Confirmed"),
+                    ],
+                },
+                default: Some(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Pending".to_owned(),
+                    args: Vec::new(),
+                    span: None,
+                }),
+                initial_constraint: None,
+            }],
+            transitions: Vec::new(),
+            derived_fields: Vec::new(),
+            invariants: Vec::new(),
+            fsm_decls: Vec::new(),
+        };
+        let fields = vec![crate::ir::types::IRCreateField {
+            name: "status".to_owned(),
+            value: IRExpr::Var {
+                name: "status".to_owned(),
+                ty: IRType::Enum {
+                    name: "Status".to_owned(),
+                    variants: vec![
+                        crate::ir::types::IRVariant::simple("Pending"),
+                        crate::ir::types::IRVariant::simple("Confirmed"),
+                    ],
+                },
+                span: None,
+            },
+        }];
+        let params = HashMap::from([(
+            "status".to_owned(),
+            SimpleValue::Ctor("Status".to_owned(), "Confirmed".to_owned()),
+        )]);
+
+        let values = build_field_value_map_with_params(&entity, &fields, &params)
+            .expect("field map should not error")
+            .expect("finite param-backed create values should be supported");
+
+        assert_eq!(
+            values.get("status"),
+            Some(&SimpleValue::Ctor(
+                "Status".to_owned(),
+                "Confirmed".to_owned()
+            ))
+        );
     }
 
     #[test]
