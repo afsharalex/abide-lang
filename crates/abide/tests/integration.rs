@@ -6566,6 +6566,31 @@ verify finite_payload_enum_aggregate {
 }
 
 #[test]
+fn verifier_supports_finite_payload_enum_setcomp_values_and_cardinality() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+
+system Gate {
+  command tick() {}
+}
+
+verify finite_payload_enum_setcomp {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always (@Reject in { d | d: Decision where d == @Reject })
+  assert always (#{ d | d: Decision where d == @Reject } == 1)
+}
+";
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "finite_payload_enum_setcomp");
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 

@@ -120,6 +120,18 @@ fn finite_domain_values_with_payloads(
     finite_domain_values(domain).or_else(|| finite_payload_enum_values(vctx, domain))
 }
 
+fn ir_type_to_prop_sort(vctx: &VerifyContext, ty: &IRType) -> smt::Sort {
+    match ty {
+        IRType::Enum { name, .. } => vctx
+            .adt_sorts
+            .get(name)
+            .map(smt::DatatypeSort::sort)
+            .unwrap_or_else(|| smt::ir_type_to_sort(ty)),
+        IRType::Refinement { base, .. } => ir_type_to_prop_sort(vctx, base),
+        _ => smt::ir_type_to_sort(ty),
+    }
+}
+
 fn finite_payload_enum_values(vctx: &VerifyContext, domain: &IRType) -> Option<Vec<SmtValue>> {
     let IRType::Enum { name, variants } = domain else {
         return None;
@@ -2816,7 +2828,7 @@ pub(super) fn encode_prop_value(
                 IRType::Set { element } => element.as_ref(),
                 _ => return Err(format!("SetLit with non-Set type: {ty:?}")),
             };
-            let elem_sort = smt::ir_type_to_sort(elem_ty);
+            let elem_sort = ir_type_to_prop_sort(vctx, elem_ty);
             let false_val = smt::bool_val(false).to_dynamic();
             let true_val = smt::bool_val(true).to_dynamic();
             let mut arr = smt::const_array(&elem_sort, &false_val);
@@ -2857,7 +2869,7 @@ pub(super) fn encode_prop_value(
             let IRType::Set { element } = ty else {
                 return Err(format!("SetComp with non-Set result type: {ty:?}"));
             };
-            let result_elem_sort = smt::ir_type_to_sort(element);
+            let result_elem_sort = ir_type_to_prop_sort(vctx, element);
             let false_val = smt::bool_val(false).to_dynamic();
             let true_val = smt::bool_val(true).to_dynamic();
             let mut arr = smt::const_array(&result_elem_sort, &false_val);
@@ -2901,7 +2913,7 @@ pub(super) fn encode_prop_value(
             // Projection: { f(a) | a: E where P(a) } → Array<T, Bool> (value → member)
             let n_slots = pool.slots_for(entity_name);
             let result_elem_sort = match (projection.as_ref(), ty) {
-                (Some(_), IRType::Set { element }) => smt::ir_type_to_sort(element),
+                (Some(_), IRType::Set { element }) => ir_type_to_prop_sort(vctx, element),
                 (Some(_), _) => {
                     return Err(format!(
                         "projection SetComp with non-Set result type: {ty:?}"
@@ -2956,16 +2968,16 @@ pub(super) fn encode_prop_value(
             projection,
             ty,
             ..
-        } if finite_domain_values(domain).is_some() => {
+        } if finite_domain_values_with_payloads(vctx, domain).is_some() => {
             let IRType::Set { element } = ty else {
                 return Err(format!("SetComp with non-Set result type: {ty:?}"));
             };
-            let result_elem_sort = smt::ir_type_to_sort(element);
+            let result_elem_sort = ir_type_to_prop_sort(vctx, element);
             let false_val = smt::bool_val(false).to_dynamic();
             let true_val = smt::bool_val(true).to_dynamic();
             let mut arr = smt::const_array(&result_elem_sort, &false_val);
 
-            let values = finite_domain_values(domain).unwrap_or_default();
+            let values = finite_domain_values_with_payloads(vctx, domain).unwrap_or_default();
             for value in values {
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
@@ -2995,7 +3007,7 @@ pub(super) fn encode_prop_value(
             // Non-entity domain — should be caught by find_unsupported_scene_expr,
             // but if reached (e.g., manually constructed IR), return a fresh
             // unconstrained array rather than panicking.
-            let sort = smt::ir_type_to_sort(domain);
+            let sort = ir_type_to_prop_sort(vctx, domain);
             let false_val = smt::bool_val(false).to_dynamic();
             Ok(SmtValue::Array(smt::const_array(&sort, &false_val)))
         }
@@ -3710,12 +3722,12 @@ pub(super) fn encode_card(
             filter,
             projection,
             ..
-        } if finite_domain_values(domain).is_some() => {
+        } if finite_domain_values_with_payloads(vctx, domain).is_some() => {
             let one = smt::int_lit(1);
             let zero = smt::int_lit(0);
             let mut terms = Vec::new();
             let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
-            for value in finite_domain_values(domain).unwrap_or_default() {
+            for value in finite_domain_values_with_payloads(vctx, domain).unwrap_or_default() {
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
                 let (key, projection_constraints) = if let Some(projection) = projection {
@@ -4126,6 +4138,89 @@ mod tests {
         let solver = AbideSolver::new();
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_finite_payload_enum_setcomp_values_and_cardinality() {
+        let decision_ty = IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                IRVariant::simple("Reject"),
+            ],
+        };
+        let ir = IRProgram {
+            types: vec![IRTypeEntry {
+                name: "Decision".to_owned(),
+                ty: decision_ty.clone(),
+            }],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let reject = IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Reject".to_owned(),
+            args: vec![],
+            span: None,
+        };
+        let reject_set = IRExpr::SetComp {
+            var: "d".to_owned(),
+            domain: decision_ty.clone(),
+            source: None,
+            filter: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "d".to_owned(),
+                    ty: decision_ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(reject.clone()),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(decision_ty),
+            },
+            span: None,
+        };
+        let member_property = IRExpr::Index {
+            map: Box::new(reject_set.clone()),
+            key: Box::new(reject),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let card_property = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Card {
+                expr: Box::new(reject_set),
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        for property in [member_property, card_property] {
+            let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+                .expect("finite payload enum set-comprehension should encode");
+            let solver = AbideSolver::new();
+            solver.assert(smt::bool_not(&encoded));
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
     }
 
     #[test]

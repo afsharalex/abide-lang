@@ -38,6 +38,19 @@ fn is_extern_boundary_system(system: &IRSystem) -> bool {
         .any(|pred| pred.name == "__abide_extern__marker")
 }
 
+fn is_finite_scene_domain(domain: &IRType) -> bool {
+    match domain {
+        IRType::Bool => true,
+        IRType::Enum { variants, .. } => variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .all(|field| is_finite_scene_domain(&field.ty))
+        }),
+        _ => false,
+    }
+}
+
 fn render_observation_witness_value(value: &op::WitnessValue) -> String {
     match value {
         op::WitnessValue::Unknown => "?".to_owned(),
@@ -51,12 +64,9 @@ fn render_observation_witness_value(value: &op::WitnessValue) -> String {
             enum_name,
             variant,
             fields,
-        } => render_enum_witness_value(
-            enum_name,
-            variant,
-            fields,
-            render_observation_witness_value,
-        ),
+        } => {
+            render_enum_witness_value(enum_name, variant, fields, render_observation_witness_value)
+        }
         op::WitnessValue::SlotRef(slot) => format!("{}[{}]", slot.entity(), slot.slot()),
         op::WitnessValue::Tuple(values) => format!(
             "({})",
@@ -1241,15 +1251,11 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             filter,
             projection,
             ..
-        } if matches!(domain, IRType::Bool)
-            || (matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields()) =>
-        {
-            find_unsupported_scene_expr(filter).or_else(|| {
-                projection
-                    .as_ref()
-                    .and_then(|p| find_unsupported_scene_expr(p))
-            })
-        }
+        } if is_finite_scene_domain(domain) => find_unsupported_scene_expr(filter).or_else(|| {
+            projection
+                .as_ref()
+                .and_then(|p| find_unsupported_scene_expr(p))
+        }),
         IRExpr::SetComp { .. } => Some("SetComp with non-entity domain"),
         IRExpr::RelComp {
             projection,
@@ -1291,9 +1297,7 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
                 filter,
                 projection,
                 ..
-            } if matches!(domain, IRType::Bool)
-                || (matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields()) =>
-            {
+            } if is_finite_scene_domain(domain) => {
                 find_unsupported_scene_expr(filter).or_else(|| {
                     projection
                         .as_ref()
@@ -2796,6 +2800,19 @@ mod tests {
 
     #[test]
     fn scene_precheck_reports_supported_and_unsupported_shapes() {
+        let payload_enum = IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                crate::ir::types::IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![crate::ir::types::IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                crate::ir::types::IRVariant::simple("Reject"),
+            ],
+        };
         let entity_card = IRExpr::Card {
             expr: Box::new(IRExpr::SetComp {
                 var: "o".to_owned(),
@@ -2815,6 +2832,26 @@ mod tests {
             span: None,
         };
         assert_eq!(find_unsupported_scene_expr(&entity_card), None);
+
+        let payload_set = IRExpr::SetComp {
+            var: "d".to_owned(),
+            domain: payload_enum.clone(),
+            source: None,
+            filter: Box::new(bool_lit(true)),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(payload_enum),
+            },
+            span: None,
+        };
+        assert_eq!(find_unsupported_scene_expr(&payload_set), None);
+        assert_eq!(
+            find_unsupported_scene_expr(&IRExpr::Card {
+                expr: Box::new(payload_set),
+                span: None,
+            }),
+            None
+        );
 
         let unsupported_card = IRExpr::Card {
             expr: Box::new(field(
