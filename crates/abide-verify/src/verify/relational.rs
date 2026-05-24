@@ -1869,8 +1869,11 @@ fn supports_slot_predicate(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpAnd" || op == "OpOr" => {
+        } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
             supports_slot_predicate(left) && supports_slot_predicate(right)
+        }
+        IRExpr::Index { map, key, .. } => {
+            matches!((&**map, &**key), (IRExpr::Var { .. }, IRExpr::Var { .. }))
         }
         IRExpr::BinOp {
             op, left, right, ..
@@ -5728,6 +5731,15 @@ fn slot_predicate_matches(
         }
         IRExpr::BinOp {
             op, left, right, ..
+        } if op == "OpImplies" => {
+            !slot_predicate_matches(left, var, field_values)
+                || slot_predicate_matches(right, var, field_values)
+        }
+        IRExpr::Index { map, key, .. } => {
+            matches!((&**map, &**key), (IRExpr::Var { .. }, IRExpr::Var { name, .. }) if var.is_empty() || name == var)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
         } if op == "OpEq" => {
             let (IRExpr::Field { expr, field, .. }, value_expr) = (&**left, &**right) else {
                 return false;
@@ -5856,6 +5868,68 @@ mod tests {
         sat.add_unit(lit);
 
         assert!(matches!(solve_instance(sat), SolverResult::Sat));
+    }
+
+    #[test]
+    fn slot_predicate_supports_store_membership_guards() {
+        let predicate = IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(IRExpr::Index {
+                map: Box::new(IRExpr::Var {
+                    name: "orders".to_owned(),
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Entity {
+                            name: "Order".to_owned(),
+                        }),
+                    },
+                    span: None,
+                }),
+                key: Box::new(IRExpr::Var {
+                    name: "o".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            right: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        variants: vec![crate::ir::types::IRVariant::simple("Pending")],
+                    },
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: "Pending".to_owned(),
+                    args: Vec::new(),
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let values = HashMap::from([(
+            "status".to_owned(),
+            SimpleValue::Ctor("Status".to_owned(), "Pending".to_owned()),
+        )]);
+
+        assert!(supports_slot_predicate(&predicate));
+        assert!(slot_predicate_matches(&predicate, "o", &values));
     }
 
     #[test]

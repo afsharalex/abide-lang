@@ -22626,6 +22626,82 @@ fn relational_scene_fragment_passes_exact_two_creates() {
 }
 
 #[test]
+fn relational_scene_fragment_supports_store_scoped_exists_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_store_scoped_exists.ab",
+        "module RelScene\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         scene created_order_in_store {\n\
+           given {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_order()\n\
+           }\n\
+           then {\n\
+             assert exists o: Order in orders | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "store-scoped exists assertion should stay inside the relational fragment"
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "created_order_in_store")),
+        "store-scoped exists assertion should pass through the relational backend: {results:?}"
+    );
+}
+
+#[test]
+fn relational_scene_fragment_supports_store_scoped_forall_assertions() {
+    let ir = lower_source_file(
+        "rel_scene_store_scoped_forall.ab",
+        "module RelScene\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         scene all_created_orders_in_store_pending {\n\
+           given {\n\
+             store orders: Order[0..1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           when {\n\
+             commerce.create_order()\n\
+           }\n\
+           then {\n\
+             assert all o: Order in orders | o.status == @Pending\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    assert!(
+        relational::supports_scene_fragment(&ir, scene).expect("support detection should succeed"),
+        "store-scoped forall assertion should stay inside the relational fragment"
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "all_created_orders_in_store_pending")),
+        "store-scoped forall assertion should pass through the relational backend: {results:?}"
+    );
+}
+
+#[test]
 fn relational_scene_fragment_supports_create_only_forall_assertions() {
     let ir = lower_source_file(
         "rel_scene_forall_pass.ab",
