@@ -24,6 +24,7 @@ use super::{
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ExplicitValue {
+    Int(i64),
     Bool(bool),
     Enum {
         enum_name: String,
@@ -3515,6 +3516,7 @@ fn explicit_expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::App { ty, .. }
         | IRExpr::Choose { ty, .. }
         | IRExpr::Lam { param_type: ty, .. } => Some(ty),
+        IRExpr::Card { .. } => Some(&IRType::Int),
         IRExpr::IfElse {
             then_body: body, ..
         }
@@ -3587,7 +3589,7 @@ fn supports_state_expr(
     slot_locals: &HashMap<String, usize>,
 ) -> bool {
     match expr {
-        IRExpr::Lit { value, .. } => matches!(value, LitVal::Bool { .. }),
+        IRExpr::Lit { value, .. } => matches!(value, LitVal::Bool { .. } | LitVal::Int { .. }),
         IRExpr::Ctor { args, .. } => args.iter().all(|(_, arg)| {
             supports_state_expr(
                 arg,
@@ -3602,6 +3604,7 @@ fn supports_state_expr(
         IRExpr::Var { name, .. } => {
             resolve_system_field_index(name, current_system, system_fields).is_some()
                 || value_locals.contains(name)
+                || slot_locals.contains_key(name)
                 || fieldless_enum_variant_value(name, entity_specs).is_some()
                 || fieldless_enum_variant_value_for_type(name, explicit_expr_type(expr)).is_some()
         }
@@ -3641,6 +3644,24 @@ fn supports_state_expr(
                 "==" | "OpEq"
                     | "!="
                     | "OpNEq"
+                    | "<"
+                    | "OpLt"
+                    | "<="
+                    | "OpLe"
+                    | ">"
+                    | "OpGt"
+                    | ">="
+                    | "OpGe"
+                    | "+"
+                    | "OpAdd"
+                    | "-"
+                    | "OpSub"
+                    | "*"
+                    | "OpMul"
+                    | "/"
+                    | "OpDiv"
+                    | "%"
+                    | "OpMod"
                     | "and"
                     | "&&"
                     | "OpAnd"
@@ -3680,6 +3701,15 @@ fn supports_state_expr(
                     slot_locals,
                 )
         }
+        IRExpr::Card { expr, .. } => supports_cardinality_expr(
+            expr,
+            current_system,
+            system_fields,
+            system_field_types,
+            entity_specs,
+            value_locals,
+            slot_locals,
+        ),
         IRExpr::Let { bindings, body, .. } => {
             let mut nested_value_locals = value_locals.clone();
             for binding in bindings {
@@ -3871,6 +3901,116 @@ fn supports_state_expr(
     }
 }
 
+fn supports_cardinality_expr(
+    expr: &IRExpr,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashSet<String>,
+    slot_locals: &HashMap<String, usize>,
+) -> bool {
+    match expr {
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
+            elements.iter().all(|element| {
+                supports_state_expr(
+                    element,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+            })
+        }
+        IRExpr::MapLit { entries, .. } => entries.iter().all(|(key, value)| {
+            supports_state_expr(
+                key,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            ) && supports_state_expr(
+                value,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )
+        }),
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            let mut nested_value_locals = value_locals.clone();
+            let mut nested_slot_locals = slot_locals.clone();
+            let domain_supported = match (domain, source.as_deref()) {
+                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
+                    nested_value_locals.insert(var.clone());
+                    elements.iter().all(|element| {
+                        supports_state_expr(
+                            element,
+                            current_system,
+                            system_fields,
+                            system_field_types,
+                            entity_specs,
+                            value_locals,
+                            slot_locals,
+                        )
+                    })
+                }
+                (IRType::Entity { name }, None) => {
+                    let Some((entity_index, _)) = entity_specs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, spec)| spec.name == *name)
+                    else {
+                        return false;
+                    };
+                    nested_slot_locals.insert(var.clone(), entity_index);
+                    true
+                }
+                (_, None) if finite_values_for_type(domain).is_ok() => {
+                    nested_value_locals.insert(var.clone());
+                    true
+                }
+                _ => false,
+            };
+            domain_supported
+                && supports_state_expr(
+                    filter,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    &nested_value_locals,
+                    &nested_slot_locals,
+                )
+                && projection.as_ref().is_none_or(|projection| {
+                    supports_state_expr(
+                        projection,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        &nested_value_locals,
+                        &nested_slot_locals,
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
 fn eval_expr(
     state: &ExplicitState,
     expr: &IRExpr,
@@ -3882,6 +4022,7 @@ fn eval_expr(
 ) -> Result<ExplicitValue, String> {
     match expr {
         IRExpr::Lit { value, .. } => match value {
+            LitVal::Int { value } => Ok(ExplicitValue::Int(*value)),
             LitVal::Bool { value } => Ok(ExplicitValue::Bool(*value)),
             _ => Err("explicit-state only supports bool literals".to_owned()),
         },
@@ -3904,6 +4045,12 @@ fn eval_expr(
         IRExpr::Var { name, .. } => {
             if let Some(value) = value_locals.get(name) {
                 return Ok(value.clone());
+            }
+            if let Some(binding) = slot_locals.get(name) {
+                return Ok(ExplicitValue::SlotRef(op::EntitySlotRef::new(
+                    entity_specs[binding.entity_index].name.clone(),
+                    binding.slot,
+                )));
             }
             if let Some(index) = resolve_system_field_index(name, current_system, system_fields) {
                 return Ok(state.system_values[index].clone());
@@ -4117,6 +4264,15 @@ fn eval_expr(
             value_locals,
             slot_locals,
         ),
+        IRExpr::Card { expr, .. } => Ok(ExplicitValue::Int(eval_cardinality_expr(
+            state,
+            expr,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+        )?)),
         IRExpr::Match {
             scrutinee, arms, ..
         } => {
@@ -4161,6 +4317,181 @@ fn eval_expr(
             Err("non-exhaustive match in explicit-state fragment".to_owned())
         }
         _ => Err("unsupported expression in explicit-state fragment".to_owned()),
+    }
+}
+
+fn eval_cardinality_expr(
+    state: &ExplicitState,
+    expr: &IRExpr,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashMap<String, ExplicitValue>,
+    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+) -> Result<i64, String> {
+    match expr {
+        IRExpr::SetLit { elements, .. } => {
+            let mut unique = HashSet::new();
+            for element in elements {
+                unique.insert(eval_expr(
+                    state,
+                    element,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?);
+            }
+            Ok(i64::try_from(unique.len()).unwrap_or(0))
+        }
+        IRExpr::SeqLit { elements, .. } => Ok(i64::try_from(elements.len()).unwrap_or(0)),
+        IRExpr::MapLit { entries, .. } => {
+            let mut unique = HashSet::new();
+            for (key, _) in entries {
+                unique.insert(eval_expr(
+                    state,
+                    key,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?);
+            }
+            Ok(i64::try_from(unique.len()).unwrap_or(0))
+        }
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            let mut unique = HashSet::new();
+            match (domain, source.as_deref()) {
+                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
+                    for element in elements {
+                        let value = eval_expr(
+                            state,
+                            element,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            value_locals,
+                            slot_locals,
+                        )?;
+                        let mut nested_values = value_locals.clone();
+                        nested_values.insert(var.clone(), value.clone());
+                        if eval_bool_with_locals(
+                            state,
+                            filter,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            &nested_values,
+                            slot_locals,
+                        )? {
+                            let key = if let Some(projection) = projection {
+                                eval_expr(
+                                    state,
+                                    projection,
+                                    current_system,
+                                    system_fields,
+                                    entity_specs,
+                                    &nested_values,
+                                    slot_locals,
+                                )?
+                            } else {
+                                value
+                            };
+                            unique.insert(key);
+                        }
+                    }
+                }
+                (IRType::Entity { name }, None) => {
+                    let Some((entity_index, spec)) = entity_specs
+                        .iter()
+                        .enumerate()
+                        .find(|(_, spec)| spec.name == *name)
+                    else {
+                        return Err("unknown explicit-state cardinality entity".to_owned());
+                    };
+                    for slot in 0..spec.slot_count {
+                        if !state.entity_slots[entity_index][slot].active {
+                            continue;
+                        }
+                        let mut nested_slots = slot_locals.clone();
+                        nested_slots
+                            .insert(var.clone(), ExplicitSlotBinding { entity_index, slot });
+                        if eval_bool_with_locals(
+                            state,
+                            filter,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            value_locals,
+                            &nested_slots,
+                        )? {
+                            let key = if let Some(projection) = projection {
+                                eval_expr(
+                                    state,
+                                    projection,
+                                    current_system,
+                                    system_fields,
+                                    entity_specs,
+                                    value_locals,
+                                    &nested_slots,
+                                )?
+                            } else {
+                                ExplicitValue::SlotRef(op::EntitySlotRef::new(name.clone(), slot))
+                            };
+                            unique.insert(key);
+                        }
+                    }
+                }
+                (_, None) => {
+                    for value in finite_values_for_type(domain).map_err(|_| {
+                        "unsupported cardinality expression in explicit-state fragment".to_owned()
+                    })? {
+                        let mut nested_values = value_locals.clone();
+                        nested_values.insert(var.clone(), value.clone());
+                        if eval_bool_with_locals(
+                            state,
+                            filter,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            &nested_values,
+                            slot_locals,
+                        )? {
+                            let key = if let Some(projection) = projection {
+                                eval_expr(
+                                    state,
+                                    projection,
+                                    current_system,
+                                    system_fields,
+                                    entity_specs,
+                                    &nested_values,
+                                    slot_locals,
+                                )?
+                            } else {
+                                value
+                            };
+                            unique.insert(key);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(
+                        "unsupported cardinality expression in explicit-state fragment".to_owned(),
+                    )
+                }
+            }
+            Ok(i64::try_from(unique.len()).unwrap_or(0))
+        }
+        _ => Err("unsupported cardinality expression in explicit-state fragment".to_owned()),
     }
 }
 
@@ -4372,6 +4703,27 @@ fn eval_binop(
     match op {
         "==" | "OpEq" => Ok(ExplicitValue::Bool(left == right)),
         "!=" | "OpNEq" => Ok(ExplicitValue::Bool(left != right)),
+        "<" | "OpLt" => Ok(ExplicitValue::Bool(expect_int(left)? < expect_int(right)?)),
+        "<=" | "OpLe" => Ok(ExplicitValue::Bool(expect_int(left)? <= expect_int(right)?)),
+        ">" | "OpGt" => Ok(ExplicitValue::Bool(expect_int(left)? > expect_int(right)?)),
+        ">=" | "OpGe" => Ok(ExplicitValue::Bool(expect_int(left)? >= expect_int(right)?)),
+        "+" | "OpAdd" => Ok(ExplicitValue::Int(expect_int(left)? + expect_int(right)?)),
+        "-" | "OpSub" => Ok(ExplicitValue::Int(expect_int(left)? - expect_int(right)?)),
+        "*" | "OpMul" => Ok(ExplicitValue::Int(expect_int(left)? * expect_int(right)?)),
+        "/" | "OpDiv" => {
+            let rhs = expect_int(right)?;
+            if rhs == 0 {
+                return Err("division by zero in explicit-state fragment".to_owned());
+            }
+            Ok(ExplicitValue::Int(expect_int(left)? / rhs))
+        }
+        "%" | "OpMod" => {
+            let rhs = expect_int(right)?;
+            if rhs == 0 {
+                return Err("modulo by zero in explicit-state fragment".to_owned());
+            }
+            Ok(ExplicitValue::Int(expect_int(left)? % rhs))
+        }
         "and" | "&&" | "OpAnd" => Ok(ExplicitValue::Bool(
             expect_bool(left)? && expect_bool(right)?,
         )),
@@ -4382,6 +4734,13 @@ fn eval_binop(
             !expect_bool(left)? || expect_bool(right)?,
         )),
         _ => Err(format!("unsupported explicit-state operator `{op}`")),
+    }
+}
+
+fn expect_int(value: ExplicitValue) -> Result<i64, String> {
+    match value {
+        ExplicitValue::Int(value) => Ok(value),
+        other => Err(format!("expected int, found {other:?}")),
     }
 }
 
@@ -4738,6 +5097,7 @@ fn enumerate_param_bindings_for_state(
 
 fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
     match value {
+        ExplicitValue::Int(value) => op::WitnessValue::Int(*value),
         ExplicitValue::Bool(value) => op::WitnessValue::Bool(*value),
         ExplicitValue::Enum {
             enum_name,
@@ -4788,6 +5148,7 @@ fn render_choice_suffix(tuple: &[ExplicitChoiceBinding]) -> String {
 
 fn render_explicit_value(value: &ExplicitValue) -> String {
     match value {
+        ExplicitValue::Int(value) => value.to_string(),
         ExplicitValue::Bool(value) => value.to_string(),
         ExplicitValue::Enum { variant, .. } => variant.clone(),
         ExplicitValue::Identity(value) => value.clone(),
@@ -4975,12 +5336,24 @@ mod tests {
         }
     }
 
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
     fn bin(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
+        bin_typed(op, left, right, IRType::Bool)
+    }
+
+    fn bin_typed(op: &str, left: IRExpr, right: IRExpr, ty: IRType) -> IRExpr {
         IRExpr::BinOp {
             op: op.to_owned(),
             left: Box::new(left),
             right: Box::new(right),
-            ty: IRType::Bool,
+            ty,
             span: None,
         }
     }
@@ -5168,12 +5541,8 @@ mod tests {
             &value_names,
             &slot_names,
         ));
-        assert!(!supports_state_expr(
-            &IRExpr::Lit {
-                ty: IRType::Int,
-                value: LitVal::Int { value: 1 },
-                span: None,
-            },
+        assert!(supports_state_expr(
+            &int_lit(1),
             Some("Orders"),
             &system_fields,
             &system_field_types,
@@ -5181,6 +5550,19 @@ mod tests {
             &value_names,
             &slot_names,
         ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &int_lit(1),
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Int(1)
+        );
 
         let field_value = eval_expr(
             &state,
@@ -6643,6 +7025,126 @@ mod tests {
             )
             .unwrap(),
             ExplicitValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn explicit_state_expr_support_and_eval_cover_cardinality_and_numeric_ops() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::new();
+        let system_field_types = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+
+        let bool_card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "b".to_owned(),
+                domain: IRType::Bool,
+                source: None,
+                filter: Box::new(var("b", IRType::Bool)),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+        let entity_card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "task".to_owned(),
+                domain: IRType::Entity {
+                    name: "Task".to_owned(),
+                },
+                source: None,
+                filter: Box::new(IRExpr::Field {
+                    expr: Box::new(var(
+                        "task",
+                        IRType::Entity {
+                            name: "Task".to_owned(),
+                        },
+                    )),
+                    field: "active".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                projection: Some(Box::new(var(
+                    "task",
+                    IRType::Entity {
+                        name: "Task".to_owned(),
+                    },
+                ))),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Entity {
+                        name: "Task".to_owned(),
+                    }),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+        let numeric_expr = bin(
+            "OpAnd",
+            bin(
+                "OpEq",
+                bin_typed("OpAdd", bool_card.clone(), int_lit(1), IRType::Int),
+                int_lit(2),
+            ),
+            bin("OpGe", entity_card.clone(), int_lit(1)),
+        );
+
+        for expr in [&bool_card, &entity_card, &numeric_expr] {
+            assert!(supports_state_expr(
+                expr,
+                Some("Orders"),
+                &system_fields,
+                &system_field_types,
+                &specs,
+                &value_names,
+                &slot_names,
+            ));
+        }
+        assert_eq!(
+            eval_expr(
+                &state,
+                &bool_card,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &entity_card,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Int(1)
+        );
+        assert_eq!(
+            eval_expr(
+                &state,
+                &numeric_expr,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
         );
     }
 

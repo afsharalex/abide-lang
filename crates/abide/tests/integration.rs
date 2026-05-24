@@ -6787,6 +6787,53 @@ verify explicit_payload_enum_domains {
 }
 
 #[test]
+fn explicit_state_verifier_supports_finite_cardinality_and_numeric_ops() {
+    let src = r"module T
+
+enum Flag = Off | On
+
+entity Marker {
+  active: bool = true
+}
+
+system S(markers: Store<Marker>) {}
+
+verify explicit_finite_cardinality_numeric_ops {
+  assume {
+    store markers: Marker[1]
+    let s = S { markers: markers }
+    stutter
+  }
+
+  assert always (
+    (#{ b | b: bool where b } + 1 == 2)
+    and (#{ f | f: Flag where f == @On } >= 1)
+    and (#{ m | m: Marker where m.active } == 1)
+  )
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "explicit_finite_cardinality_numeric_ops"
+                    && method == "explicit-state exhaustive search"
+        )),
+        "explicit-state finite cardinality and numeric operators should prove, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_step_params() {
     let src = r"module T
 
