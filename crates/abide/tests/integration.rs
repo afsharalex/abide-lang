@@ -15858,6 +15858,62 @@ verify submit_binds_result {
 }
 
 #[test]
+fn macro_step_fairness_enabledness_handles_let_call_match() {
+    let src = r"module T
+
+enum Outcome = ok | err
+
+entity Marker {
+  id: int = 0
+
+  action mark() {
+    id' = 1
+  }
+}
+
+system Provider {
+  command charge() -> Outcome {
+    return @ok
+  }
+}
+
+system Billing(markers: Store<Marker>) {
+  command submit() {
+    let result = Provider::charge()
+    match result {
+      ok => {
+        choose marker: Marker where true {
+          marker.mark()
+        }
+      }
+      err => { }
+    }
+  }
+}
+
+verify submit_eventually_charges {
+  assume {
+    store ms: Marker[1..1]
+    let billing = Billing { markers: ms }
+    stutter
+    fair Billing::submit
+  }
+  assert eventually false
+}
+";
+
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
+                if name == "submit_eventually_charges"
+        )),
+        "macro-action let-call/match fairness should reach lasso BMC instead of unsupported enabledness, got: {results:?}"
+    );
+}
+
+#[test]
 fn macro_step_direct_match_on_crosscall_updates_state() {
     let src = r"module T
 

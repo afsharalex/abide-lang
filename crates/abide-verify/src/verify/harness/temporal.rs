@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
+use crate::verify::encode;
 
 pub fn transition_constraints(
     pool: &SlotPool,
@@ -310,6 +311,447 @@ pub fn try_encode_step_enabled_with_params(
     try_encode_step_enabled_inner(pool, vctx, entities, systems, event, step, Some(params), 0)
 }
 
+#[derive(Clone)]
+struct EnabledBranch {
+    formula: Bool,
+    locals: HashMap<String, SmtValue>,
+    return_value: Option<SmtValue>,
+}
+
+fn enabled_body_contains_macro(actions: &[IRAction]) -> bool {
+    actions.iter().any(|action| match action {
+        IRAction::LetCrossCall { .. } | IRAction::Match { .. } => true,
+        IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+            enabled_body_contains_macro(ops)
+        }
+        _ => false,
+    })
+}
+
+fn enabled_step_scope_metadata(
+    systems: &[IRSystem],
+    event: &IRSystemAction,
+) -> (String, HashMap<String, String>, HashMap<String, String>) {
+    let owner = systems.iter().find(|system| {
+        system
+            .actions
+            .iter()
+            .any(|step| std::ptr::eq(step, event) || step.name == event.name)
+    });
+    let system_name = owner.map(|system| system.name.clone()).unwrap_or_default();
+    let store_param_types = owner
+        .map(|system| {
+            system
+                .store_params
+                .iter()
+                .map(|param| (param.name.clone(), param.entity_type.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let entity_param_types = event
+        .params
+        .iter()
+        .filter_map(|param| match &param.ty {
+            IRType::Entity { name } => Some((param.name.clone(), name.clone())),
+            _ => None,
+        })
+        .collect();
+    (system_name, entity_param_types, store_param_types)
+}
+
+fn merged_enabled_params(
+    params: &HashMap<String, SmtValue>,
+    locals: &HashMap<String, SmtValue>,
+) -> HashMap<String, SmtValue> {
+    let mut merged = params.clone();
+    merged.extend(locals.clone());
+    merged
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_enabled_nonmacro_action(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    event: &IRSystemAction,
+    action: &IRAction,
+    params: HashMap<String, SmtValue>,
+    step: usize,
+    depth: usize,
+) -> Result<Bool, String> {
+    let temp_event = IRSystemAction {
+        name: event.name.clone(),
+        params: event.params.clone(),
+        guard: IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        },
+        body: vec![action.clone()],
+        return_expr: None,
+    };
+    try_encode_step_enabled_inner(
+        pool,
+        vctx,
+        entities,
+        systems,
+        &temp_event,
+        step,
+        Some(params),
+        depth + 1,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn try_encode_enabled_cross_call_branches(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    target_system: &str,
+    command_name: &str,
+    cross_args: &[IRExpr],
+    params: &HashMap<String, SmtValue>,
+    owning_system_name: &str,
+    entity_param_types: &HashMap<String, String>,
+    store_param_types: &HashMap<String, String>,
+    step: usize,
+    depth: usize,
+) -> Result<Vec<EnabledBranch>, String> {
+    if depth >= 5 {
+        return Ok(vec![]);
+    }
+    let Some(target_sys) = systems.iter().find(|system| system.name == *target_system) else {
+        return Ok(vec![]);
+    };
+    let arg_ctx = SlotEncodeCtx {
+        pool,
+        vctx,
+        entity: "",
+        slot: 0,
+        params: params.clone(),
+        bindings: HashMap::new(),
+        system_name: owning_system_name,
+        entity_param_types,
+        store_param_types,
+    };
+    let mut branches = Vec::new();
+    for target_step in target_sys
+        .actions
+        .iter()
+        .filter(|target_step| target_step.name == *command_name)
+    {
+        if target_step.params.len() != cross_args.len() {
+            continue;
+        }
+        let mut cross_params = HashMap::new();
+        for (target_param, arg_expr) in target_step.params.iter().zip(cross_args.iter()) {
+            let val = try_encode_slot_expr(&arg_ctx, arg_expr, step)?;
+            cross_params.insert(target_param.name.clone(), val);
+        }
+        branches.extend(try_encode_enabled_branches_for_event(
+            pool,
+            vctx,
+            entities,
+            systems,
+            target_step,
+            step,
+            cross_params,
+            depth + 1,
+        )?);
+    }
+    Ok(branches)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn try_apply_enabled_macro_action(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    event: &IRSystemAction,
+    action: &IRAction,
+    step_params: &HashMap<String, SmtValue>,
+    owning_system_name: &str,
+    entity_param_types: &HashMap<String, String>,
+    store_param_types: &HashMap<String, String>,
+    step: usize,
+    depth: usize,
+    branches: Vec<EnabledBranch>,
+) -> Result<Vec<EnabledBranch>, String> {
+    let mut next = Vec::new();
+    for branch in branches {
+        let params = merged_enabled_params(step_params, &branch.locals);
+        match action {
+            IRAction::LetCrossCall {
+                name,
+                system,
+                command,
+                args,
+            } => {
+                let call_branches = try_encode_enabled_cross_call_branches(
+                    pool,
+                    vctx,
+                    entities,
+                    systems,
+                    system,
+                    command,
+                    args,
+                    &params,
+                    owning_system_name,
+                    entity_param_types,
+                    store_param_types,
+                    step,
+                    depth,
+                )?;
+                for call_branch in call_branches {
+                    let Some(value) = call_branch.return_value.clone() else {
+                        return Err(format!(
+                            "macro-step binding requires `{system}::{command}` to return a value"
+                        ));
+                    };
+                    let mut locals = branch.locals.clone();
+                    locals.insert(name.clone(), value);
+                    next.push(EnabledBranch {
+                        formula: smt::bool_and(&[&branch.formula, &call_branch.formula]),
+                        locals,
+                        return_value: branch.return_value.clone(),
+                    });
+                }
+            }
+            IRAction::Match { scrutinee, arms } => {
+                let call_branches = match scrutinee {
+                    crate::ir::types::IRActionMatchScrutinee::Var { name } => {
+                        let Some(value) = branch.locals.get(name).cloned() else {
+                            return Err(format!(
+                                "macro-step match references unknown local `{name}`"
+                            ));
+                        };
+                        vec![EnabledBranch {
+                            formula: smt::bool_const(true),
+                            locals: HashMap::new(),
+                            return_value: Some(value),
+                        }]
+                    }
+                    crate::ir::types::IRActionMatchScrutinee::CrossCall {
+                        system,
+                        command,
+                        args,
+                    } => try_encode_enabled_cross_call_branches(
+                        pool,
+                        vctx,
+                        entities,
+                        systems,
+                        system,
+                        command,
+                        args,
+                        &params,
+                        owning_system_name,
+                        entity_param_types,
+                        store_param_types,
+                        step,
+                        depth,
+                    )?,
+                };
+                for call_branch in call_branches {
+                    let Some(scrut) = call_branch.return_value.clone() else {
+                        return Err(
+                            "macro-step match requires a returned command outcome".to_owned()
+                        );
+                    };
+                    for arm in arms {
+                        let mut arm_cond = encode::encode_pattern_cond(
+                            &scrut,
+                            &arm.pattern,
+                            &HashMap::new(),
+                            vctx,
+                        )?;
+                        let mut arm_locals = branch.locals.clone();
+                        encode::bind_pattern_vars(&arm.pattern, &scrut, &mut arm_locals, vctx)?;
+                        if let Some(guard) = &arm.guard {
+                            let guard_ctx = SlotEncodeCtx {
+                                pool,
+                                vctx,
+                                entity: "",
+                                slot: 0,
+                                params: merged_enabled_params(step_params, &arm_locals),
+                                bindings: HashMap::new(),
+                                system_name: owning_system_name,
+                                entity_param_types,
+                                store_param_types,
+                            };
+                            arm_cond = smt::bool_and(&[
+                                &arm_cond,
+                                &try_encode_slot_expr(&guard_ctx, guard, step)?.to_bool()?,
+                            ]);
+                        }
+                        let mut arm_branches = vec![EnabledBranch {
+                            formula: smt::bool_and(&[
+                                &branch.formula,
+                                &call_branch.formula,
+                                &arm_cond,
+                            ]),
+                            locals: arm_locals,
+                            return_value: branch.return_value.clone(),
+                        }];
+                        for nested in &arm.body {
+                            arm_branches = try_apply_enabled_macro_action(
+                                pool,
+                                vctx,
+                                entities,
+                                systems,
+                                event,
+                                nested,
+                                step_params,
+                                owning_system_name,
+                                entity_param_types,
+                                store_param_types,
+                                step,
+                                depth,
+                                arm_branches,
+                            )?;
+                        }
+                        next.extend(arm_branches);
+                    }
+                }
+            }
+            IRAction::CrossCall {
+                system,
+                command,
+                args,
+            } => {
+                let call_branches = try_encode_enabled_cross_call_branches(
+                    pool,
+                    vctx,
+                    entities,
+                    systems,
+                    system,
+                    command,
+                    args,
+                    &params,
+                    owning_system_name,
+                    entity_param_types,
+                    store_param_types,
+                    step,
+                    depth,
+                )?;
+                for call_branch in call_branches {
+                    next.push(EnabledBranch {
+                        formula: smt::bool_and(&[&branch.formula, &call_branch.formula]),
+                        locals: branch.locals.clone(),
+                        return_value: branch.return_value.clone(),
+                    });
+                }
+            }
+            IRAction::ExprStmt { expr } => {
+                let ctx = SlotEncodeCtx {
+                    pool,
+                    vctx,
+                    entity: "",
+                    slot: 0,
+                    params,
+                    bindings: HashMap::new(),
+                    system_name: owning_system_name,
+                    entity_param_types,
+                    store_param_types,
+                };
+                let formula = try_encode_slot_expr(&ctx, expr, step)?.to_bool()?;
+                next.push(EnabledBranch {
+                    formula: smt::bool_and(&[&branch.formula, &formula]),
+                    locals: branch.locals.clone(),
+                    return_value: branch.return_value.clone(),
+                });
+            }
+            _ => {
+                let formula = try_encode_enabled_nonmacro_action(
+                    pool, vctx, entities, systems, event, action, params, step, depth,
+                )?;
+                next.push(EnabledBranch {
+                    formula: smt::bool_and(&[&branch.formula, &formula]),
+                    locals: branch.locals.clone(),
+                    return_value: branch.return_value.clone(),
+                });
+            }
+        }
+    }
+    Ok(next)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_encode_enabled_branches_for_event(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    event: &IRSystemAction,
+    step: usize,
+    step_params: HashMap<String, SmtValue>,
+    depth: usize,
+) -> Result<Vec<EnabledBranch>, String> {
+    let (owning_system_name, entity_param_types, store_param_types) =
+        enabled_step_scope_metadata(systems, event);
+    let initial_formula = if matches!(
+        &event.guard,
+        IRExpr::Lit {
+            value: LitVal::Bool { value: true },
+            ..
+        }
+    ) {
+        smt::bool_const(true)
+    } else {
+        try_encode_guard_expr_for_system(
+            pool,
+            vctx,
+            &event.guard,
+            &step_params,
+            step,
+            &owning_system_name,
+            &entity_param_types,
+            &store_param_types,
+        )?
+    };
+    let mut branches = vec![EnabledBranch {
+        formula: initial_formula,
+        locals: HashMap::new(),
+        return_value: None,
+    }];
+    for action in &event.body {
+        branches = try_apply_enabled_macro_action(
+            pool,
+            vctx,
+            entities,
+            systems,
+            event,
+            action,
+            &step_params,
+            &owning_system_name,
+            &entity_param_types,
+            &store_param_types,
+            step,
+            depth,
+            branches,
+        )?;
+    }
+    if let Some(ret) = &event.return_expr {
+        for branch in &mut branches {
+            let ctx = SlotEncodeCtx {
+                pool,
+                vctx,
+                entity: "",
+                slot: 0,
+                params: merged_enabled_params(&step_params, &branch.locals),
+                bindings: HashMap::new(),
+                system_name: &owning_system_name,
+                entity_param_types: &entity_param_types,
+                store_param_types: &store_param_types,
+            };
+            branch.return_value = Some(try_encode_slot_expr(&ctx, ret, step)?);
+        }
+    }
+    Ok(branches)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn encode_step_enabled_inner(
@@ -350,6 +792,17 @@ fn try_encode_step_enabled_inner(
     let mut conditions = Vec::new();
 
     let params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
+    if enabled_body_contains_macro(&event.body) {
+        let branches = try_encode_enabled_branches_for_event(
+            pool, vctx, entities, systems, event, step, params, depth,
+        )?;
+        if branches.is_empty() {
+            return Ok(smt::bool_const(false));
+        }
+        let formulas: Vec<Bool> = branches.into_iter().map(|branch| branch.formula).collect();
+        let refs: Vec<&Bool> = formulas.iter().collect();
+        return Ok(smt::bool_or(&refs));
+    }
     let store_param_types: HashMap<String, String> = systems
         .iter()
         .find(|s| {
@@ -418,11 +871,7 @@ fn try_encode_step_enabled_inner(
                 let refs: Vec<&Bool> = slot_disjuncts.iter().collect();
                 conditions.push(smt::bool_or(&refs));
             }
-            IRAction::LetCrossCall { .. } | IRAction::Match { .. } => {
-                return Err(
-                    "macro-step let/match is not yet supported in step-enabled checks".to_owned(),
-                );
-            }
+            IRAction::LetCrossCall { .. } | IRAction::Match { .. } => unreachable!(),
             IRAction::Create {
                 entity: ent_name, ..
             } => {

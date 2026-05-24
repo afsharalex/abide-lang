@@ -1073,6 +1073,75 @@ mod tests {
     }
 
     #[test]
+    fn step_enabled_macro_handles_let_crosscall_match_apply() {
+        let entity = make_step_test_entity();
+        let vctx = make_step_test_vctx();
+        let decision = decision_system(Some(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Set".to_owned(),
+            args: vec![],
+            span: None,
+        }));
+        let relay = make_shop_system(IRSystemAction {
+            name: "relay".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![
+                IRAction::LetCrossCall {
+                    name: "decision".to_owned(),
+                    system: "DecisionWorker".to_owned(),
+                    command: "decide".to_owned(),
+                    args: vec![],
+                },
+                IRAction::Match {
+                    scrutinee: IRActionMatchScrutinee::Var {
+                        name: "decision".to_owned(),
+                    },
+                    arms: vec![IRActionMatchArm {
+                        pattern: IRPattern::PCtor {
+                            name: "Set".to_owned(),
+                            fields: vec![],
+                        },
+                        guard: None,
+                        body: vec![IRAction::Apply {
+                            target: "Order".to_owned(),
+                            transition: "set_total".to_owned(),
+                            args: vec![int_lit(7)],
+                            refs: vec![],
+                        }],
+                    }],
+                },
+            ],
+            return_expr: None,
+        });
+        let pool = create_slot_pool(
+            std::slice::from_ref(&entity),
+            &HashMap::from([(entity.name.clone(), 1_usize)]),
+            1,
+        );
+        let systems = vec![relay.clone(), decision];
+        let enabled = super::super::try_encode_step_enabled(
+            &pool,
+            &vctx,
+            std::slice::from_ref(&entity),
+            &systems,
+            &relay.actions[0],
+            0,
+        )
+        .expect("macro enabledness");
+        let solver = AbideSolver::new();
+        if let Some(SmtValue::Bool(active)) = pool.active_at("Order", 0, 0) {
+            solver.assert(active);
+        }
+        solver.assert(&enabled);
+        assert_eq!(solver.check(), SatResult::Sat);
+    }
+
+    #[test]
     fn try_encode_step_inner_macro_rejects_choose_scoped_crosscall_match() {
         let entity = make_step_test_entity();
         let vctx = make_step_test_vctx();
