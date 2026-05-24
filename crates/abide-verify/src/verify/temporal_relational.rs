@@ -34,7 +34,7 @@ impl TemporalRelationalModel {
         verify: &IRVerify,
         loop_start: usize,
     ) -> Result<Self, RelCoreError> {
-        let depth = verify.depth.unwrap_or(0).max(0) as usize;
+        let depth = verify.depth.unwrap_or(0);
         let trace = RelTrace::new(depth, loop_start)?;
         let entity_by_name = ir
             .entities
@@ -1945,7 +1945,7 @@ mod tests {
         let IRAction::Choose { filter, .. } = &mut system.actions[1].body[0] else {
             panic!("pay action should choose an order")
         };
-        *filter = Box::new(field_eq_bool("o", "paid", false));
+        **filter = field_eq_bool("o", "paid", false);
 
         let ir = program_with_system(order, system);
         let verify = verify_for_system(2);

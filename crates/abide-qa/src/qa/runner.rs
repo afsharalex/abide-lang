@@ -1,5 +1,7 @@
 //! QA script runner — executes `.qa` scripts against loaded specs.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::path::{Path, PathBuf};
 
 use crate::ir;

@@ -6,6 +6,8 @@
 //! - bounded relational verify fragments over one pooled entity type with
 //!   finite field domains and narrow create / choose-apply operational steps
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
@@ -2967,7 +2969,7 @@ fn parse_scene_binding_filter_predicate(
     Ok(Some((alias_of, predicate)))
 }
 
-fn scene_filter_terms<'a>(expr: &'a IRExpr) -> Vec<&'a IRExpr> {
+fn scene_filter_terms(expr: &IRExpr) -> Vec<&IRExpr> {
     let mut out = Vec::new();
     collect_scene_filter_terms(expr, &mut out);
     out

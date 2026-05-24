@@ -2069,7 +2069,7 @@ mod tests {
         assert_eq!(last_ordering_var(&expr, &var_to_idx), Some(3));
 
         let mut pairs = Vec::new();
-        collect_same_step_event_pairs(&[expr.clone()], &var_to_idx, &mut pairs);
+        collect_same_step_event_pairs(std::slice::from_ref(&expr), &var_to_idx, &mut pairs);
         assert_eq!(pairs, vec![(0, 1)]);
 
         let mut xor_events = HashSet::new();

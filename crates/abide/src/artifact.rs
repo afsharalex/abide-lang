@@ -140,6 +140,7 @@ impl ArtifactProvenance {
         }
     }
 
+    #[must_use]
     pub fn option(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
         self.options.insert(
             key.into(),
@@ -242,6 +243,7 @@ pub struct TraceChange {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VerifyArtifactConfig<'a> {
     pub solver: &'a str,
     pub chc_solver: &'a str,
@@ -994,9 +996,7 @@ fn fact_map(frame: &TraceFrame) -> BTreeMap<String, String> {
 }
 
 fn render_optional_trace_value(value: Option<&WitnessValue>) -> String {
-    value
-        .map(render_trace_value)
-        .unwrap_or_else(|| "<absent>".to_owned())
+    value.map_or_else(|| "<absent>".to_owned(), render_trace_value)
 }
 
 fn render_choice(choice: &op::Choice) -> String {

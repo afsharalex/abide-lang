@@ -1,5 +1,7 @@
 //! Scope computation — entity slot counts, system selection, invariant collection.
 
+#![allow(clippy::collapsible_match)]
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{
@@ -72,7 +74,7 @@ pub(super) fn compute_verify_scope(
     let mut bound: usize = if let Some(depth) = verify_block.depth {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         {
-            (depth as usize).max(1)
+            depth.max(1)
         }
     } else {
         3

@@ -1,6 +1,8 @@
 //! Function contract verification — ensures/requires, Hoare-logic loops,
 //! termination, recursive call encoding.
 
+#![allow(clippy::collapsible_match)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};

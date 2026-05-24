@@ -317,14 +317,11 @@ pub fn initial_state_constraints(
 ) -> Vec<Bool> {
     let mut constraints = Vec::new();
     let mut explicit_initial_active: HashSet<(String, usize)> = HashSet::new();
-    let mut explicit_initial_inactive: HashSet<(String, usize)> = HashSet::new();
     for range in store_ranges.values() {
         for slot in range.start_slot..range.start_slot + range.slot_count {
             let key = (range.entity_type.clone(), slot);
             if slot < range.start_slot + range.min_active {
                 explicit_initial_active.insert(key);
-            } else {
-                explicit_initial_inactive.insert(key);
             }
         }
     }
@@ -334,8 +331,6 @@ pub fn initial_state_constraints(
             let key = (entity.clone(), *slot);
             if explicit_initial_active.contains(&key) {
                 constraints.push(active_t0.clone());
-            } else if explicit_initial_inactive.contains(&key) {
-                constraints.push(smt::bool_not(active_t0));
             } else {
                 constraints.push(smt::bool_not(active_t0));
             }
@@ -435,53 +430,14 @@ pub(super) fn build_step_params(params: &[IRTransParam], step: usize) -> HashMap
 
 // ── Transition relation ─────────────────────────────────────────────
 
-/// Generate the full transition relation at a given step.
-///
-/// At each step, exactly one of the following happens:
-/// - One of the system events fires (disjunction over all events)
-/// - Stutter (idle — nothing changes), only if `assumption_set.stutter` is on
-///
-/// Returns: `event_1(step) OR event_2(step) OR... [OR stutter(step)]`
-///
-/// Stutter is **conditional** on the verification site's
-/// assumption set. `verify`, `theorem`, and `lemma` default to stutter on;
-/// use `assume { no stutter }` when a blocked state should be reported as
-/// deadlock rather than treated as an idle behavior.
-/// The construct defaults are:
-/// * `verify` → stutter on (TLA+-style idle steps)
-/// * `theorem`/`lemma` → stutter on (refinement-friendly, TLA+-style)
-///   The caller passes the verification site's `IRAssumptionSet` so each
-///   site sees the trace model it actually opted into.
-
-/// Build fairness constraints on a lasso loop.
-///
-/// Reads the verification site's `IRAssumptionSet` (populated by )
-/// to decide which `(system, event)` pairs are weakly or strongly fair.
-/// Events not present in `assumption_set.weak_fair` or `strong_fair` get
-/// no fairness constraints (default = unfair, per ).
-///
-/// Supports both weak and strong fairness per event:
-///
-/// **Weak fairness** (TLA+ WF): if action A is enabled at EVERY step in
-/// the loop, then A must fire at SOME step in the loop.
-/// `loop_l → ( (∀ step∈[l,bound-1]. enabled(e,step)) → (∃ step∈[l,bound-1]. fire_e(step)) )`
-///
-/// **Strong fairness** (TLA+ SF): if action A is enabled at SOME step in
-/// the loop, then A must fire at SOME step in the loop.
-/// `loop_l → ( (∃ step∈[l,bound-1]. enabled(e,step)) → (∃ step∈[l,bound-1]. fire_e(step)) )`
-///
-/// Strong fairness is strictly stronger than weak: it constrains actions that
-/// are even intermittently enabled, not just continuously enabled.
-///
-/// **Per-tuple fairness ().** For events listed in
-/// `assumption_set.per_tuple` (i.e. parameterized fair events), the
-/// obligation is split per parameter tuple over the entity slot space:
-/// "for each tuple t, if event(t) is enabled in the loop, event must
-/// fire with params=t in the loop." This catches starvation
-/// counterexamples where one slot is never serviced even though the
-/// per-event obligation is technically satisfied. Per-tuple expansion
-/// is supported only when all event params are entity-typed; events
-/// with non-entity params (Int/String/etc.) fall back to per-event.
+// Generate the full transition relation at a given step.
+//
+// At each step, exactly one of the following happens:
+// - One of the system events fires (disjunction over all events)
+// - Stutter (idle — nothing changes), only if `assumption_set.stutter` is on
+//
+// Build fairness constraints on a lasso loop. Supports weak fairness,
+// strong fairness, and per-tuple fairness for entity-typed event params.
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

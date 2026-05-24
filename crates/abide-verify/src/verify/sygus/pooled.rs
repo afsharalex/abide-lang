@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::*;
 
 struct PooledSyGuSCtx<'a> {
@@ -408,7 +410,7 @@ fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 &slot_curr,
                 &slot_next,
                 &enum_catalog,
-                &[root_system.name.clone()],
+                std::slice::from_ref(&root_system.name),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2165,9 +2167,10 @@ fn encode_pooled_expr(
                                 let mut conjuncts = vec![bodies[i].clone()];
                                 for (j, body_j) in bodies.iter().enumerate() {
                                     if i != j {
-                                        conjuncts.push(
-                                            tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[body_j.clone()]),
-                                        );
+                                        conjuncts.push(tm.mk_term(
+                                            Cvc5Kind::CVC5_KIND_NOT,
+                                            std::slice::from_ref(body_j),
+                                        ));
                                     }
                                 }
                                 disjuncts.push(mk_and(tm, &conjuncts));
@@ -2235,9 +2238,10 @@ fn encode_pooled_expr(
                                 let mut conjuncts = vec![bodies[i].clone()];
                                 for (j, body_j) in bodies.iter().enumerate() {
                                     if i != j {
-                                        conjuncts.push(
-                                            tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[body_j.clone()]),
-                                        );
+                                        conjuncts.push(tm.mk_term(
+                                            Cvc5Kind::CVC5_KIND_NOT,
+                                            std::slice::from_ref(body_j),
+                                        ));
                                     }
                                 }
                                 disjuncts.push(mk_and(tm, &conjuncts));
@@ -2296,9 +2300,10 @@ fn encode_pooled_expr(
                             let mut conjuncts = vec![bodies[i].clone()];
                             for (j, body_j) in bodies.iter().enumerate() {
                                 if i != j {
-                                    conjuncts.push(
-                                        tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[body_j.clone()]),
-                                    );
+                                    conjuncts.push(tm.mk_term(
+                                        Cvc5Kind::CVC5_KIND_NOT,
+                                        std::slice::from_ref(body_j),
+                                    ));
                                 }
                             }
                             disjuncts.push(mk_and(tm, &conjuncts));

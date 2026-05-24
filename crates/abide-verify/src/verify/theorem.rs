@@ -1076,11 +1076,7 @@ fn try_ic3_on_theorem(
 ) -> Option<VerificationResult> {
     let start = Instant::now();
 
-    let Some(safety) =
-        super::transition::TransitionSafetySpec::for_theorem(ir, vctx, theorem, defs)
-    else {
-        return None;
-    };
+    let safety = super::transition::TransitionSafetySpec::for_theorem(ir, vctx, theorem, defs)?;
     let system = safety.system();
 
     // trace-validity guard for the IC3 path.
@@ -1924,8 +1920,10 @@ mod tests {
                 if hint.contains("unsupported expression kind in theorem show: Block")
         ));
 
-        let mut bounded_only_config = VerifyConfig::default();
-        bounded_only_config.bounded_only = true;
+        let bounded_only_config = VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        };
         let bounded_only = check_theorem_block(
             &ir,
             &vctx,

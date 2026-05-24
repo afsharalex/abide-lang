@@ -270,11 +270,8 @@ impl ArtifactStore {
         name: String,
         result: &VerificationResult,
     ) -> Option<usize> {
-        let Some((name, result_kind, payload, extraction_error)) =
-            artifact_parts_from_result_with_name(result, Some(name))
-        else {
-            return None;
-        };
+        let (name, result_kind, payload, extraction_error) =
+            artifact_parts_from_result_with_name(result, Some(name))?;
         self.next_id += 1;
         let id = self.next_id;
         self.artifacts.push(Artifact {

@@ -4,6 +4,8 @@
 //! backend path, but callers should depend on this obligation shape rather than
 //! reaching directly into solver-specific entry points.
 
+#![allow(clippy::large_enum_variant, clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{

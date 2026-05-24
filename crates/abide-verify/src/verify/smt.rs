@@ -5,6 +5,8 @@
 //! (implemented by `Z3Backend` in `solver.rs`), ensuring a future backend swap
 //! only touches solver.rs.
 
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

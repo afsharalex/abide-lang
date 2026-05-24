@@ -10,6 +10,8 @@
 //! - `defenv`: Definition environment for pred/prop/fn expansion
 //! - `mod`: Tiered dispatch (`verify_all`), property encoding, counterexample extraction
 
+#![allow(clippy::too_many_arguments)]
+
 pub mod chc;
 pub mod context;
 pub mod defenv;
@@ -2429,13 +2431,23 @@ fn check_verify_block_tiered(
     if let Some(result) =
         explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
     {
-        if config.bounded_only
-            || has_liveness
-            || !matches!(result, VerificationResult::Checked { .. })
+        let explicit_result_has_witness = matches!(
+            result,
+            VerificationResult::Counterexample { .. }
+                | VerificationResult::Deadlock { .. }
+                | VerificationResult::LivenessViolation { .. }
+        );
+        if !(config.witness_semantics == WitnessSemantics::Relational
+            && explicit_result_has_witness)
         {
-            return result;
+            if config.bounded_only
+                || has_liveness
+                || !matches!(result, VerificationResult::Checked { .. })
+            {
+                return result;
+            }
+            bounded_checked_result = Some(result);
         }
-        bounded_checked_result = Some(result);
     }
 
     if effective_block.assumption_set.stutter && !has_liveness && !config.unbounded_only {
@@ -2787,11 +2799,8 @@ fn try_induction_on_verify(
 ) -> Option<VerificationResult> {
     let start = Instant::now();
 
-    let Some(obligation) =
-        transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)
-    else {
-        return None;
-    };
+    let obligation =
+        transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
     let safety = obligation.safety();
     let system = safety.system();
 
@@ -2891,7 +2900,7 @@ fn try_induction_on_verify(
         // Assume P at step 0
         for expr in safety.step_properties() {
             let Ok(prop) = encode_property_at_step(
-                &pool,
+                pool,
                 vctx,
                 defs,
                 expr,
@@ -2928,7 +2937,7 @@ fn try_induction_on_verify(
         let mut negated = Vec::new();
         for expr in safety.step_properties() {
             let Ok(prop) = encode_property_at_step(
-                &pool,
+                pool,
                 vctx,
                 defs,
                 expr,
@@ -3066,14 +3075,9 @@ pub(super) fn try_liveness_reduction(
         return None;
     }
 
-    let Some(obligation) =
-        transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)
-    else {
-        return None;
-    };
-    let Some(liveness) = obligation.liveness() else {
-        return None;
-    };
+    let obligation =
+        transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
+    let liveness = obligation.liveness()?;
     let system = obligation.system();
     let fair_event_keys = obligation.fair_event_keys();
     let patterns = liveness.patterns();
@@ -3192,9 +3196,8 @@ pub(super) fn try_liveness_reduction(
             };
 
             let trigger_0 =
-                encode_prop_expr(&pool, vctx, defs, &ctx, recipe.trigger(&true_lit), 0).ok()?;
-            let response_0 =
-                encode_prop_expr(&pool, vctx, defs, &ctx, recipe.response(), 0).ok()?;
+                encode_prop_expr(pool, vctx, defs, &ctx, recipe.trigger(&true_lit), 0).ok()?;
+            let response_0 = encode_prop_expr(pool, vctx, defs, &ctx, recipe.response(), 0).ok()?;
 
             // Monitor transition: step 0 → step 1
             //
@@ -3405,7 +3408,7 @@ pub(super) fn try_liveness_reduction(
             &safety_obligations,
             system.system_names(),
             system.slots_per_entity(),
-            &fair_event_keys,
+            fair_event_keys,
             system.relevant_systems(),
             config,
             &start,
@@ -3530,10 +3533,7 @@ fn try_ic3_on_verify(
 
     // shared scope helper. IC3 also widens
     // slots based on quantifier depth, layered on top of the canonical scope.
-    let Some(safety) = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
-    else {
-        return None;
-    };
+    let safety = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)?;
     if config.progress {
         eprint!(" (trying IC3/PDR)");
     }
@@ -3828,7 +3828,7 @@ fn check_verify_block(
     // If UNSAT → property holds at all steps (CHECKED).
     // If SAT → counterexample found.
     let property_at_all_steps = match encode_step_properties_all_steps(
-        &pool,
+        pool,
         vctx,
         defs,
         safety.step_properties(),
@@ -3875,17 +3875,17 @@ fn check_verify_block(
             let evidence = match config.witness_semantics {
                 WitnessSemantics::Operational => extract_operational_counterexample_with_fire(
                     &solver,
-                    &pool,
+                    pool,
                     vctx,
                     system.relevant_entities(),
                     system.relevant_systems(),
-                    &fire_tracking,
+                    fire_tracking,
                     bound,
                 )
                 .and_then(operational_evidence),
                 WitnessSemantics::Relational => extract_relational_counterexample(
                     &solver,
-                    &pool,
+                    pool,
                     vctx,
                     system.relevant_entities(),
                     system.relevant_systems(),
@@ -4053,7 +4053,7 @@ fn check_verify_block_lasso(
     for assert_expr in &verify_block.asserts {
         let expanded = expand_through_defs(assert_expr, defs);
         let violation = match encode_lasso_liveness_violation(
-            &pool,
+            pool,
             vctx,
             defs,
             &expanded,
@@ -4100,18 +4100,18 @@ fn check_verify_block_lasso(
                 let evidence = match config.witness_semantics {
                     WitnessSemantics::Operational => extract_operational_liveness_with_fire(
                         &solver,
-                        &pool,
+                        pool,
                         vctx,
                         system.relevant_entities(),
                         system.relevant_systems(),
-                        &fire_tracking,
+                        fire_tracking,
                         bound,
                         loop_start,
                     )
                     .and_then(operational_evidence),
                     WitnessSemantics::Relational => extract_relational_liveness(
                         &solver,
-                        &pool,
+                        pool,
                         vctx,
                         system.relevant_entities(),
                         system.relevant_systems(),
@@ -4126,11 +4126,11 @@ fn check_verify_block_lasso(
                 };
                 let fairness_analysis = extract_fairness_analysis(
                     &solver,
-                    &pool,
+                    pool,
                     vctx,
                     system.relevant_entities(),
                     system.relevant_systems(),
-                    &fire_tracking,
+                    fire_tracking,
                     loop_start,
                     bound,
                     &verify_block.assumption_set,
@@ -4224,39 +4224,37 @@ fn encode_lasso_violation_inner(
     bound: usize,
     ctx: &PropertyCtx,
 ) -> Result<Bool, String> {
-    match expr {
-        // Entity quantifier: `all o: Entity | body` — expand over active slots
-        // and check each for liveness violations (disjunction: ANY slot violated).
-        // The active guard per step is handled inside the inner encoding
-        // (response pattern guards P(t) with active(slot, t)).
-        IRExpr::Forall {
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            let mut slot_violations = Vec::new();
-            for slot in 0..n_slots {
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let v = encode_lasso_violation_inner(
-                    pool,
-                    vctx,
-                    defs,
-                    body,
-                    loop_indicators,
-                    bound,
-                    &inner_ctx,
-                )?;
-                slot_violations.push(v);
-            }
-            if slot_violations.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            let refs: Vec<&Bool> = slot_violations.iter().collect();
-            return Ok(smt::bool_or(&refs));
+    // Entity quantifier: `all o: Entity | body` — expand over active slots
+    // and check each for liveness violations (disjunction: ANY slot violated).
+    // The active guard per step is handled inside the inner encoding
+    // (response pattern guards P(t) with active(slot, t)).
+    if let IRExpr::Forall {
+        var,
+        domain: crate::ir::types::IRType::Entity { name: entity_name },
+        body,
+        ..
+    } = expr
+    {
+        let n_slots = pool.slots_for(entity_name);
+        let mut slot_violations = Vec::new();
+        for slot in 0..n_slots {
+            let inner_ctx = ctx.with_binding(var, entity_name, slot);
+            let v = encode_lasso_violation_inner(
+                pool,
+                vctx,
+                defs,
+                body,
+                loop_indicators,
+                bound,
+                &inner_ctx,
+            )?;
+            slot_violations.push(v);
         }
-        _ => {}
+        if slot_violations.is_empty() {
+            return Ok(smt::bool_const(false));
+        }
+        let refs: Vec<&Bool> = slot_violations.iter().collect();
+        return Ok(smt::bool_or(&refs));
     }
 
     if contains_liveness(expr) {

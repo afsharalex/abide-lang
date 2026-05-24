@@ -10,9 +10,9 @@ pub(super) fn system_store_param_types(system: &IRSystem) -> HashMap<String, Str
         .collect()
 }
 
-pub(super) fn collect_unique_system_fields<'a>(
-    systems: &'a [IRSystem],
-) -> Result<Vec<(&'a str, &'a IRField)>, String> {
+pub(super) fn collect_unique_system_fields(
+    systems: &[IRSystem],
+) -> Result<Vec<(&str, &IRField)>, String> {
     let mut seen = HashMap::<String, String>::new();
     let mut ordered = Vec::new();
     for system in systems {
@@ -657,7 +657,9 @@ pub(super) fn encode_finite_quantifier_expr(
                 let mut conjuncts = vec![bodies[i].clone()];
                 for (j, body_j) in bodies.iter().enumerate() {
                     if i != j {
-                        conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[body_j.clone()]));
+                        conjuncts.push(
+                            tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, std::slice::from_ref(body_j)),
+                        );
                     }
                 }
                 disjuncts.push(mk_and(tm, &conjuncts));

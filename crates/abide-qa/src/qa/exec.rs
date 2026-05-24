@@ -2851,22 +2851,18 @@ fn eval_block_predicate(
                 && lookup_graph(model, &args[0], &args[1])
                     .is_some_and(|sg| sg.states.contains(&args[2]))
         }
-        "transition" => {
-            if args.len() >= 2 {
-                let from_val = get_named_arg(&pred.args, "from", env);
-                let to_val = get_named_arg(&pred.args, "to", env);
-                lookup_graph(model, &args[0], &args[1]).is_some_and(|sg| {
-                    sg.transitions.iter().any(|t| {
-                        let from_ok = from_val
-                            .as_ref()
-                            .is_none_or(|f| t.from.as_deref() == Some(f.as_str()));
-                        let to_ok = to_val.as_ref().is_none_or(|v| t.to == *v);
-                        from_ok && to_ok
-                    })
+        "transition" if args.len() >= 2 => {
+            let from_val = get_named_arg(&pred.args, "from", env);
+            let to_val = get_named_arg(&pred.args, "to", env);
+            lookup_graph(model, &args[0], &args[1]).is_some_and(|sg| {
+                sg.transitions.iter().any(|t| {
+                    let from_ok = from_val
+                        .as_ref()
+                        .is_none_or(|f| t.from.as_deref() == Some(f.as_str()));
+                    let to_ok = to_val.as_ref().is_none_or(|v| t.to == *v);
+                    from_ok && to_ok
                 })
-            } else {
-                false
-            }
+            })
         }
         "initial" => {
             args.len() >= 3

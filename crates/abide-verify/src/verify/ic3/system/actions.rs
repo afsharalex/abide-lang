@@ -228,8 +228,7 @@ fn encode_step_chc_scoped(
                 command: target_evt,
                 ..
             } => {
-                let call_guards =
-                    top_level_action_guards(extra_guards, event_guard, &local_terms)?;
+                let call_guards = top_level_action_guards(extra_guards, event_guard, &local_terms)?;
                 let return_value = encode_macro_call_chc(
                     chc,
                     entities,

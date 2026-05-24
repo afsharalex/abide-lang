@@ -1,3 +1,5 @@
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 use super::super::smt::{self, AbideSolver, SatResult};
 use super::*;
 use crate::ir::types::{

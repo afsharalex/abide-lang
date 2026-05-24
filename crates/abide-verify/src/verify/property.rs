@@ -11,6 +11,8 @@
 //!   fieldless enums, and Bool domains
 //! - Thread-local state for precondition obligation tracking and path guards
 
+#![allow(clippy::too_many_arguments)]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

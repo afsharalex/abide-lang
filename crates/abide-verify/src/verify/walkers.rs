@@ -1,5 +1,7 @@
 //! Expression analysis predicates and counterexample extraction.
 
+#![allow(clippy::collapsible_match)]
+
 use abide_witness::{op, rel};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;

@@ -3574,8 +3574,8 @@ mod tests {
         let bool_sort = B::bool_sort(&ctx);
         let real_sort = B::real_sort(&ctx);
         let array_sort = B::array_sort(&ctx, &int_sort, &bool_sort);
-        assert_eq!(B::sort_array_domain(&ctx, &array_sort).is_some(), true);
-        assert_eq!(B::sort_array_range(&ctx, &array_sort).is_some(), true);
+        assert!(B::sort_array_domain(&ctx, &array_sort).is_some());
+        assert!(B::sort_array_range(&ctx, &array_sort).is_some());
         assert!(!B::sort_to_string(&ctx, &real_sort).is_empty());
 
         let dx = B::dynamic_from_int(&ctx, &x);

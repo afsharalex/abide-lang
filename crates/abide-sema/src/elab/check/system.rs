@@ -957,12 +957,7 @@ fn validate_crosscalls_in_actions(
         match action {
             EEventAction::Choose(_, _, _, body) | EEventAction::ForAll(_, _, body) => {
                 let mut scoped_return_types = local_return_types.clone();
-                validate_crosscalls_in_actions(
-                    ctx,
-                    body,
-                    errors,
-                    &mut scoped_return_types,
-                );
+                validate_crosscalls_in_actions(ctx, body, errors, &mut scoped_return_types);
             }
             EEventAction::LetCrossCall(name, target, command, args) => {
                 validate_crosscall_target(

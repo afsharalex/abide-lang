@@ -394,7 +394,7 @@ fn merge_overlay(dst: &mut Env, src: &Env) {
 }
 
 /// Run the interactive REPL.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::single_match_else, clippy::too_many_lines)]
 pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
     let startup_targets = determine_startup_targets(load_path, scratch);
     let (loaded_targets, base_env) = match startup_targets {
@@ -971,28 +971,28 @@ fn parse_run_command(cmd: &str) -> Result<SimulateConfig, String> {
     while index < tokens.len() {
         match tokens[index] {
             "--steps" => {
-                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let value = tokens.get(index + 1).ok_or_else(|| usage.clone())?;
                 config.steps = value.parse::<usize>().map_err(|_| {
                     format!("invalid `{command} --steps {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--seed" => {
-                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let value = tokens.get(index + 1).ok_or_else(|| usage.clone())?;
                 config.seed = value.parse::<u64>().map_err(|_| {
                     format!("invalid `{command} --seed {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let value = tokens.get(index + 1).ok_or_else(|| usage.clone())?;
                 config.slots_per_entity = value.parse::<usize>().map_err(|_| {
                     format!("invalid `{command} --slots {value}`; expected a non-negative integer")
                 })?;
                 index += 2;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let value = tokens.get(index + 1).ok_or_else(|| usage.clone())?;
                 let (entity, slots_text) = value.split_once('=').ok_or_else(|| {
                     format!("invalid `{command} --scope {value}`; expected `Entity=N`")
                 })?;
@@ -1012,7 +1012,7 @@ fn parse_run_command(cmd: &str) -> Result<SimulateConfig, String> {
                 index += 2;
             }
             "--system" => {
-                let value = tokens.get(index + 1).ok_or_else(|| usage.to_owned())?;
+                let value = tokens.get(index + 1).ok_or_else(|| usage.clone())?;
                 config.system = Some((*value).to_owned());
                 index += 2;
             }

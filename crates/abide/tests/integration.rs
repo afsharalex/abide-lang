@@ -842,7 +842,7 @@ entity Ticket {
             .fields
             .iter()
             .find(|field| field.name == field_name)
-            .and_then(|field| field.default_display())
+            .and_then(abide::verify::context::FieldInfo::default_display)
     };
 
     assert_eq!(default_for("status"), Some("@Open".to_owned()));
@@ -4458,7 +4458,8 @@ fn verify_liveness_multi_assert_independent() {
 /// cannot find a counterexample to `eventually all j: Job | j.active`.
 ///
 /// Without per-tuple encoding the verifier returns LIVENESS_VIOLATION
-/// (false positive). With per-tuple it returns CHECKED.
+/// (false positive). With per-tuple the explicit-state path proves the
+/// finite-state liveness obligation.
 #[test]
 fn verify_liveness_per_tuple_fairness() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -4499,18 +4500,9 @@ fn verify_liveness_per_tuple_fairness() {
 
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
 
-    // With per-tuple lasso encoding, every Job slot must eventually be
-    // active under fairness. Without per-tuple (or without the encoder
-    // tying `param_<target>_<step>` to the slot index that the Apply
-    // actually mutated), the verifier finds a slot-starvation lasso
-    // and returns LIVENESS_VIOLATION (false positive).
-    //
-    // The result must be Checked, not Proved. The
-    // unbounded reduction path cannot soundly discharge per-tuple
-    // fairness without k-liveness (), so verify blocks with
-    // parameterized fair events should fall through to bounded lasso
-    // BMC and report CHECKED. Allowing Proved here would mask the
-    // single-justice-counter encoding gap in `try_liveness_reduction`.
+    // With per-tuple explicit-state search, every Job slot must eventually be
+    // active under fairness. Without per-tuple, the verifier finds a
+    // slot-starvation lasso and returns LIVENESS_VIOLATION (false positive).
     let result_for = results
         .iter()
         .find(|r| match r {
@@ -4523,19 +4515,9 @@ fn verify_liveness_per_tuple_fairness() {
         })
         .expect("per_tuple_liveness result");
 
-    // The result must be Checked, not Proved. The
-    // unbounded reduction path cannot soundly discharge per-tuple
-    // fairness without k-liveness (), so verify blocks with
-    // parameterized fair events must fall through to bounded lasso
-    // BMC and report CHECKED. Allowing Proved here would mask the
-    // single-justice-counter encoding gap in `try_liveness_reduction`.
-    //
-    // The encoder fix that ties `param_<target>_<step>` to the actual
-    // slot index has its own focused unit test in
-    // `verify::harness::tests::apply_on_entity_param_ties_param_to_slot`.
     assert!(
-        matches!(result_for, abide::verify::VerificationResult::Checked { .. }),
-        "per_tuple_liveness should be CHECKED (per-tuple fairness rules out the slot-starvation lasso, and the reduction path must fall through pending k-liveness): got {result_for:?}"
+        matches!(result_for, abide::verify::VerificationResult::Proved { method, .. } if method == "explicit-state exhaustive search"),
+        "per_tuple_liveness should be PROVED by explicit-state exhaustive search: got {result_for:?}"
     );
 }
 

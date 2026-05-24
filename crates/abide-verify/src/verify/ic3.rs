@@ -259,10 +259,8 @@ pub fn try_ic3_system(
 fn collect_crosscall_targets(actions: &[IRAction], targets: &mut Vec<String>) {
     for action in actions {
         match action {
-            IRAction::CrossCall { system, .. } => {
-                if !targets.contains(system) {
-                    targets.push(system.clone());
-                }
+            IRAction::CrossCall { system, .. } if !targets.contains(system) => {
+                targets.push(system.clone());
             }
             IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
                 collect_crosscall_targets(ops, targets);

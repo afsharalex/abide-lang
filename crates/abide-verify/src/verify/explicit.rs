@@ -1,5 +1,7 @@
 //! Narrow explicit-state backend for finite transition fragments.
 
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
@@ -1070,7 +1072,6 @@ impl<'a> ExplicitModel<'a> {
         for (system, command) in &self.weak_fair {
             if let Some(tuples) = self.fair_param_tuples(system, command)? {
                 for tuple in &tuples {
-                    let mut enabled_somewhere = false;
                     let mut enabled_everywhere = true;
                     for node_index in cycle_nodes {
                         let enabled = self.step_enabled_by_binding(
@@ -1079,7 +1080,6 @@ impl<'a> ExplicitModel<'a> {
                             command,
                             tuple,
                         )?;
-                        enabled_somewhere |= enabled;
                         enabled_everywhere &= enabled;
                     }
                     let fired = cycle_edges
@@ -1095,8 +1095,6 @@ impl<'a> ExplicitModel<'a> {
                         kind: FairnessKind::Weak,
                         status: if fired {
                             FairnessStatus::EnabledAndFired
-                        } else if enabled_somewhere {
-                            FairnessStatus::NeverEnabled
                         } else {
                             FairnessStatus::NeverEnabled
                         },
@@ -5118,7 +5116,7 @@ fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
 
 fn render_tuple_suffix(tuple: &HashMap<String, ExplicitValue>) -> String {
     let mut fields = tuple.iter().collect::<Vec<_>>();
-    fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+    fields.sort_by_key(|(field, _)| *field);
     let rendered = fields
         .into_iter()
         .map(|(name, value)| format!("{name}={}", render_explicit_value(value)))

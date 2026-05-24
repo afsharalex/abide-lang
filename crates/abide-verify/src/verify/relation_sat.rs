@@ -621,12 +621,12 @@ fn check_static_relation_assertions(
             match obligation {
                 StaticRelationObligation::Subset(left, right) => {
                     encoder
-                        .require_subset(&left, &right)
+                        .require_subset(left, right)
                         .map_err(|err| format!("RustSAT relation subset failed: {err:?}"))?;
                 }
                 StaticRelationObligation::Equal(left, right) => {
                     encoder
-                        .require_equal(&left, &right)
+                        .require_equal(left, right)
                         .map_err(|err| format!("RustSAT relation equality failed: {err:?}"))?;
                 }
                 StaticRelationObligation::CardinalityEq(expr, expected) => {
@@ -1064,10 +1064,7 @@ fn register_tuple_domains(
 
 fn register_empty_relation_domains(universe: &mut RelationUniverse, relation_ty: &IRRelationType) {
     for column in &relation_ty.columns {
-        universe
-            .domains
-            .entry(type_key(&column.ty))
-            .or_insert_with(Vec::new);
+        universe.domains.entry(type_key(&column.ty)).or_default();
     }
 }
 
