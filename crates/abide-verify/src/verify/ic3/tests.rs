@@ -3752,6 +3752,83 @@ fn build_system_chc_supports_payload_field_projection_in_properties() {
 }
 
 #[test]
+fn build_system_chc_supports_unary_negation_in_properties() {
+    let (entity, tys) = make_simple_entity();
+    let system = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpLe".to_owned(),
+                left: Box::new(IRExpr::UnOp {
+                    op: "OpNeg".to_owned(),
+                    operand: Box::new(IRExpr::Field {
+                        expr: Box::new(IRExpr::Var {
+                            name: "o".to_owned(),
+                            ty: IRType::Entity {
+                                name: "Order".to_owned(),
+                            },
+                            span: None,
+                        }),
+                        field: "total".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(ic3_int_lit(0)),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        }),
+        span: None,
+    };
+
+    let chc = build_system_chc(
+        &[&ir.entities[0]],
+        &[&ir.systems[0]],
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+    )
+    .expect("system CHC should encode numeric negation in property values");
+
+    assert!(chc.contains("(<= (- Order_0_f2) 0)"));
+}
+
+#[test]
 fn system_property_encoder_supports_payload_field_projection() {
     let (entity, tys) = make_result_entity_with_payload();
     let ir = make_ir_for_entity(&entity, tys.clone());
@@ -3795,6 +3872,42 @@ fn system_property_encoder_supports_payload_field_projection() {
     .expect("payload field projection should encode through the datatype selector");
 
     assert_eq!(smt, "(code Order_0_f0)");
+}
+
+#[test]
+fn system_property_encoder_supports_unary_numeric_negation() {
+    let (entity, tys) = make_simple_entity();
+    let ir = make_ir_for_entity(&entity, tys);
+    let vctx = VerifyContext::from_ir(&ir);
+    let entity_ty = IRType::Entity {
+        name: "Order".to_owned(),
+    };
+    let entities = vec![&entity];
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+    let mut entity_locals = Ic3SystemEntityLocals::new();
+    entity_locals.insert("o".to_owned(), ("Order".to_owned(), 0));
+
+    let expr = IRExpr::UnOp {
+        op: "OpNeg".to_owned(),
+        operand: Box::new(ic3_field("o", "total", entity_ty, IRType::Int)),
+        ty: IRType::Int,
+        span: None,
+    };
+
+    let smt = expr_to_smt_sys_prop_scoped(
+        &expr,
+        &entities,
+        &slots,
+        &entity,
+        &vctx,
+        "Order",
+        0,
+        &HashSet::new(),
+        &entity_locals,
+    )
+    .expect("system property value encoder should match other IC3 value encoders for negation");
+
+    assert_eq!(smt, "(- Order_0_f2)");
 }
 
 #[test]

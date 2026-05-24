@@ -557,6 +557,20 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                 _ => Err(format!("unsupported op in system IC3 property value: {op}")),
             }
         }
+        IRExpr::UnOp { op, operand, .. } if op == "OpNeg" => {
+            let inner = expr_to_smt_sys_prop_scoped(
+                operand,
+                entities,
+                slots_per_entity,
+                current_entity,
+                vctx,
+                current_ent_name,
+                current_slot,
+                locals,
+                entity_locals,
+            )?;
+            Ok(format!("(- {inner})"))
+        }
         IRExpr::MapUpdate {
             map, key, value, ..
         } => {
