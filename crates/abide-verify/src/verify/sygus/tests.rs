@@ -229,6 +229,22 @@ fn bool_setcomp_membership() -> IRExpr {
     }
 }
 
+fn bool_map_literal_lookup() -> IRExpr {
+    IRExpr::Index {
+        map: Box::new(IRExpr::MapLit {
+            entries: vec![(bool_lit(true), bool_lit(true))],
+            ty: IRType::Map {
+                key: Box::new(IRType::Bool),
+                value: Box::new(IRType::Bool),
+            },
+            span: None,
+        }),
+        key: Box::new(bool_lit(true)),
+        ty: IRType::Bool,
+        span: None,
+    }
+}
+
 fn pending_to_done_fsm(field: &str) -> crate::ir::types::IRFsm {
     crate::ir::types::IRFsm {
         field: field.to_owned(),
@@ -1380,6 +1396,35 @@ fn sygus_system_step_supports_finite_setcomp_membership_guards() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("finite set-comprehension membership guard should encode: {err}"));
+}
+
+#[test]
+fn sygus_system_step_supports_finite_map_literal_lookup_guards() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions[0].guard = bool_map_literal_lookup();
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("finite map literal lookup guard should encode: {err}"));
 }
 
 #[test]
@@ -2558,6 +2603,26 @@ fn sygus_pooled_system_step_supports_finite_setcomp_membership_guards() {
     .unwrap_or_else(|err| {
         panic!("pooled finite set-comprehension membership guard should encode: {err}")
     });
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_finite_map_literal_lookup_guards() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.actions[0].guard = bool_map_literal_lookup();
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled finite map literal lookup guard should encode: {err}"));
 }
 
 #[test]

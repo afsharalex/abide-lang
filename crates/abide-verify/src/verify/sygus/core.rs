@@ -1658,6 +1658,66 @@ where
     }
 }
 
+fn default_term_for_type(
+    tm: &Cvc5Tm,
+    ty: &IRType,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    match ty {
+        IRType::Bool => Ok(tm.mk_boolean(false)),
+        IRType::Int => Ok(tm.mk_integer(0)),
+        IRType::Real => Ok(tm.mk_real_from_rational(0, 1)),
+        IRType::Enum { .. } => finite_domain_values(tm, ty, enum_catalog)
+            .and_then(|values| values.into_iter().next())
+            .ok_or_else(|| {
+                "cvc5 SyGuS map literal lookup requires a non-empty finite enum value type"
+                    .to_owned()
+            }),
+        other => Err(format!(
+            "cvc5 SyGuS map literal lookup does not support default value for type {other:?}"
+        )),
+    }
+}
+
+pub(super) fn encode_finite_map_lookup_expr<F>(
+    tm: &Cvc5Tm,
+    map_expr: &IRExpr,
+    key_expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    mut encode_with_vars: F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    let IRExpr::MapLit {
+        entries,
+        ty: IRType::Map { value, .. },
+        ..
+    } = map_expr
+    else {
+        return Ok(None);
+    };
+
+    let key_term = encode_with_vars(key_expr, vars)?;
+    let mut choice = default_term_for_type(tm, value, enum_catalog)?;
+    for (entry_key, entry_value) in entries {
+        let entry_key_term = encode_with_vars(entry_key, vars)?;
+        let entry_value_term = encode_with_vars(entry_value, vars)?;
+        if entry_value_term.sort() != choice.sort() {
+            return Err(
+                "cvc5 SyGuS map literal lookup entry value has incompatible sort".to_owned(),
+            );
+        }
+        let key_eq = tm.mk_term(
+            Cvc5Kind::CVC5_KIND_EQUAL,
+            &[entry_key_term, key_term.clone()],
+        );
+        choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[key_eq, entry_value_term, choice]);
+    }
+    Ok(Some(choice))
+}
+
 pub(super) fn sygus_expr_type(expr: &IRExpr) -> Option<&IRType> {
     match expr {
         IRExpr::Lit { ty, .. }
@@ -2292,6 +2352,13 @@ pub(super) fn encode_expr(
             })
         }
         IRExpr::Index { map, key, .. } => {
+            if let Some(term) =
+                encode_finite_map_lookup_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
+                    encode_expr(tm, expr, scoped, enum_catalog)
+                })?
+            {
+                return Ok(term);
+            }
             encode_finite_set_membership_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
                 encode_expr(tm, expr, scoped, enum_catalog)
             })
