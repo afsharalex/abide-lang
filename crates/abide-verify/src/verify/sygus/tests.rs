@@ -1,5 +1,5 @@
 use super::*;
-use crate::ir::types::{IRProgram, IRTransition, IRUpdate, IRVariant, LitVal};
+use crate::ir::types::{IRAggKind, IRProgram, IRTransition, IRUpdate, IRVariant, LitVal};
 use crate::verify::context::VerifyContext;
 use crate::verify::ic3;
 use crate::verify::solver::{active_solver_family, set_active_solver_family, SolverFamily};
@@ -553,6 +553,74 @@ fn sygus_expr_encoder_supports_finite_payload_enum_quantifiers() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_finite_aggregate_kinds() {
+    let tm = Cvc5Tm::new();
+    let status_field = IRField {
+        name: "status".to_owned(),
+        ty: status_ty(),
+        default: Some(status_ctor("Pending")),
+        initial_constraint: None,
+    };
+    let enum_catalog = build_enum_catalog(&tm, &[status_field]).expect("enum catalog should build");
+
+    let count_true = IRExpr::Aggregate {
+        kind: IRAggKind::Count,
+        var: "b".to_owned(),
+        domain: IRType::Bool,
+        body: Box::new(IRExpr::Var {
+            name: "b".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        in_filter: None,
+        span: None,
+    };
+    encode_expr(&tm, &count_true, &HashMap::new(), &enum_catalog)
+        .unwrap_or_else(|err| panic!("finite Count aggregate should encode: {err}"));
+
+    let product_with_filter = IRExpr::Aggregate {
+        kind: IRAggKind::Product,
+        var: "b".to_owned(),
+        domain: IRType::Bool,
+        body: Box::new(IRExpr::IfElse {
+            cond: Box::new(IRExpr::Var {
+                name: "b".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            then_body: Box::new(int_lit(2)),
+            else_body: Some(Box::new(int_lit(3))),
+            span: None,
+        }),
+        in_filter: Some(Box::new(IRExpr::Var {
+            name: "b".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        })),
+        span: None,
+    };
+    encode_expr(&tm, &product_with_filter, &HashMap::new(), &enum_catalog)
+        .unwrap_or_else(|err| panic!("finite Product aggregate should encode: {err}"));
+
+    for kind in [IRAggKind::Min, IRAggKind::Max] {
+        let aggregate = IRExpr::Aggregate {
+            kind,
+            var: "s".to_owned(),
+            domain: status_ty(),
+            body: Box::new(IRExpr::Var {
+                name: "s".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            in_filter: None,
+            span: None,
+        };
+        encode_expr(&tm, &aggregate, &HashMap::new(), &enum_catalog)
+            .unwrap_or_else(|err| panic!("finite {kind:?} aggregate should encode: {err}"));
+    }
+}
+
+#[test]
 fn sygus_expr_encoder_supports_prime_wrappers() {
     let tm = Cvc5Tm::new();
     let vars = HashMap::from([("x".to_owned(), tm.mk_var(tm.integer_sort(), "x"))]);
@@ -893,6 +961,71 @@ fn sygus_system_step_supports_block_and_vardecl_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("block/vardecl RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_system_step_supports_finite_aggregate_rhs() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions = vec![IRSystemAction {
+        name: "aggregate_update".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![crate::ir::types::IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Aggregate {
+                    kind: IRAggKind::Sum,
+                    var: "b".to_owned(),
+                    domain: IRType::Bool,
+                    body: Box::new(IRExpr::IfElse {
+                        cond: Box::new(IRExpr::Var {
+                            name: "b".to_owned(),
+                            ty: IRType::Bool,
+                            span: None,
+                        }),
+                        then_body: Box::new(int_lit(2)),
+                        else_body: Some(Box::new(int_lit(1))),
+                        span: None,
+                    }),
+                    in_filter: None,
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("finite aggregate RHS should encode: {err}"));
 }
 
 #[test]
@@ -1826,6 +1959,74 @@ fn sygus_pooled_system_step_supports_block_and_vardecl_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("pooled block/vardecl RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_finite_aggregate_rhs() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "total".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "aggregate_update".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "total".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Aggregate {
+                    kind: IRAggKind::Sum,
+                    var: "b".to_owned(),
+                    domain: IRType::Bool,
+                    body: Box::new(IRExpr::IfElse {
+                        cond: Box::new(IRExpr::Var {
+                            name: "b".to_owned(),
+                            ty: IRType::Bool,
+                            span: None,
+                        }),
+                        then_body: Box::new(int_lit(2)),
+                        else_body: Some(Box::new(int_lit(1))),
+                        span: None,
+                    }),
+                    in_filter: None,
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled finite aggregate RHS should encode: {err}"));
 }
 
 #[test]

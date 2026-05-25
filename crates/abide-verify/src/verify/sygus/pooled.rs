@@ -2827,6 +2827,112 @@ fn encode_pooled_finite_choose_expr(
     Ok(choice)
 }
 
+fn encode_pooled_finite_aggregate_expr(
+    tm: &Cvc5Tm,
+    kind: crate::ir::types::IRAggKind,
+    var: &str,
+    domain: &IRType,
+    body: &IRExpr,
+    in_filter: Option<&IRExpr>,
+    vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
+        return Err(
+            "cvc5 SyGuS pooled system safety only supports finite Bool/enum domains for finite aggregates"
+                .to_owned(),
+        );
+    };
+    if candidates.is_empty() {
+        return match kind {
+            crate::ir::types::IRAggKind::Sum | crate::ir::types::IRAggKind::Count => {
+                Ok(tm.mk_integer(0))
+            }
+            crate::ir::types::IRAggKind::Product => Ok(tm.mk_integer(1)),
+            crate::ir::types::IRAggKind::Min | crate::ir::types::IRAggKind::Max => Err(format!(
+                "cvc5 SyGuS pooled {kind:?} aggregate requires a non-empty finite domain"
+            )),
+        };
+    }
+
+    let mut slot_data = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let mut scoped = vars.clone();
+        scoped.insert(var.to_owned(), candidate);
+        let mut active = tm.mk_boolean(true);
+        if let Some(filter) = in_filter {
+            active =
+                encode_pooled_expr(tm, filter, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
+        }
+        if kind == crate::ir::types::IRAggKind::Count {
+            let pred =
+                encode_pooled_expr(tm, body, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
+            active = mk_and(tm, &[active, pred]);
+            slot_data.push((active, tm.mk_integer(1)));
+        } else {
+            let value =
+                encode_pooled_expr(tm, body, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
+            slot_data.push((active, value));
+        }
+    }
+
+    match kind {
+        crate::ir::types::IRAggKind::Sum | crate::ir::types::IRAggKind::Count => {
+            let sample = &slot_data[0].1;
+            let zero = zero_like(tm, sample);
+            let mut acc = zero.clone();
+            for (active, value) in &slot_data {
+                let contribution = tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_ITE,
+                    &[active.clone(), value.clone(), zero.clone()],
+                );
+                acc = tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[acc, contribution]);
+            }
+            Ok(acc)
+        }
+        crate::ir::types::IRAggKind::Product => {
+            let sample = &slot_data[0].1;
+            let one = one_like(tm, sample);
+            let mut acc = one.clone();
+            for (active, value) in &slot_data {
+                let contribution = tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_ITE,
+                    &[active.clone(), value.clone(), one.clone()],
+                );
+                acc = tm.mk_term(Cvc5Kind::CVC5_KIND_MULT, &[acc, contribution]);
+            }
+            Ok(acc)
+        }
+        crate::ir::types::IRAggKind::Min | crate::ir::types::IRAggKind::Max => {
+            let is_min = kind == crate::ir::types::IRAggKind::Min;
+            let mut acc = slot_data[0].1.clone();
+            let mut any_active = slot_data[0].0.clone();
+            for (active, value) in slot_data.iter().skip(1) {
+                let better_kind = if is_min {
+                    Cvc5Kind::CVC5_KIND_LT
+                } else {
+                    Cvc5Kind::CVC5_KIND_GT
+                };
+                let better = tm.mk_term(better_kind, &[value.clone(), acc.clone()]);
+                let first_active = mk_and(
+                    tm,
+                    &[
+                        active.clone(),
+                        tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[any_active.clone()]),
+                    ],
+                );
+                let take = mk_or(tm, &[first_active, mk_and(tm, &[active.clone(), better])]);
+                acc = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[take, value.clone(), acc]);
+                any_active = mk_or(tm, &[any_active, active.clone()]);
+            }
+            let undef = tm.mk_var(acc.sort(), &format!("__sygus_pooled_{kind:?}_{var}_undef"));
+            Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[any_active, acc, undef]))
+        }
+    }
+}
+
 fn infer_pooled_store_quant_entity(
     var: &str,
     body: &IRExpr,
@@ -3126,6 +3232,25 @@ fn encode_pooled_expr(
             var,
             domain,
             predicate.as_deref(),
+            vars,
+            entity_bindings,
+            pool_ctx,
+            enum_catalog,
+        ),
+        IRExpr::Aggregate {
+            kind,
+            var,
+            domain,
+            body,
+            in_filter,
+            ..
+        } => encode_pooled_finite_aggregate_expr(
+            tm,
+            *kind,
+            var,
+            domain,
+            body,
+            in_filter.as_deref(),
             vars,
             entity_bindings,
             pool_ctx,
