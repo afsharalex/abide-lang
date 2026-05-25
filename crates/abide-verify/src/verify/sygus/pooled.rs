@@ -1176,6 +1176,32 @@ fn encode_pooled_ops_for_target(
             }
             Ok(mk_or(tm, &branches))
         }
+        IRAction::ForAll {
+            var,
+            entity: forall_entity,
+            ops: inner_ops,
+        } => encode_pooled_ops_forall_for_target(
+            tm,
+            target_var,
+            target_entity,
+            target_slot,
+            var,
+            forall_entity,
+            inner_ops,
+            _system,
+            _systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            vars,
+            entity_bindings,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+            _call_stack,
+        ),
         IRAction::Match { scrutinee, arms } => encode_pooled_ops_match_for_target(
             tm,
             target_var,
@@ -1215,6 +1241,71 @@ fn encode_pooled_ops_for_target(
             "cvc5 SyGuS pooled system safety does not support nested op `{other:?}` yet"
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_pooled_ops_forall_for_target(
+    tm: &Cvc5Tm,
+    target_var: &str,
+    target_entity: &IREntity,
+    target_slot: usize,
+    var: &str,
+    forall_entity: &str,
+    ops: &[IRAction],
+    system: &IRSystem,
+    systems_by_name: &HashMap<String, &IRSystem>,
+    entities_by_name: &HashMap<String, &IREntity>,
+    slots_per_entity: &HashMap<String, usize>,
+    vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
+    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    slot_curr: &HashMap<String, Cvc5Term>,
+    slot_next: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    call_stack: &[String],
+) -> Result<Cvc5Term, String> {
+    entities_by_name
+        .get(forall_entity)
+        .ok_or_else(|| format!("unknown pooled entity `{forall_entity}`"))?;
+    let n_slots = *slots_per_entity
+        .get(forall_entity)
+        .ok_or_else(|| format!("missing slot scope for `{forall_entity}`"))?;
+    let mut conjuncts = Vec::with_capacity(n_slots);
+    for slot in 0..n_slots {
+        let active = active_curr
+            .get(forall_entity)
+            .and_then(|slots| slots.get(&slot))
+            .ok_or_else(|| {
+                format!("missing current active variable for {forall_entity} slot {slot}")
+            })?
+            .clone();
+        let mut bindings = entity_bindings.clone();
+        bindings.insert(var.to_owned(), (forall_entity.to_owned(), slot));
+        let body = encode_pooled_ops_for_target(
+            tm,
+            target_var,
+            target_entity,
+            target_slot,
+            ops,
+            system,
+            systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            vars,
+            &bindings,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+            call_stack,
+        )?;
+        conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[active, body]));
+    }
+    Ok(mk_and(tm, &conjuncts))
 }
 
 fn pooled_target_scoped_vars(
