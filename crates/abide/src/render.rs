@@ -1699,7 +1699,7 @@ fn render_markdown_proof_artifact_evidence(
     out.push_str(if proof_artifact.is_checked() {
         "yes"
     } else {
-        "no"
+        "no (unchecked trusted reference; not verified by Abide)"
     });
     out.push_str("\n\n");
     out
@@ -2319,7 +2319,7 @@ fn render_proof_artifact_text(proof_artifact: &abide_witness::ProofArtifactRef) 
         if proof_artifact.is_checked() {
             "yes"
         } else {
-            "no"
+            "no (unchecked trusted reference; not verified by Abide)"
         }
     ));
     lines.join("\n")
@@ -2345,7 +2345,7 @@ fn render_proof_artifact_html(proof_artifact: &abide_witness::ProofArtifactRef) 
     out.push_str(if proof_artifact.is_checked() {
         "yes"
     } else {
-        "no"
+        "no (unchecked trusted reference; not verified by Abide)"
     });
     out.push_str("</li></ul></section>");
     out
@@ -2903,13 +2903,20 @@ fn result_secondary_summary(result: &verify::VerificationResult) -> String {
         ),
         verify::VerificationResult::Checked {
             depth,
+            method,
             time_ms,
             assumptions,
             ..
-        } => format!(
-            "checked to depth {depth} in {time_ms}ms{}",
-            render_assumption_suffix(assumptions)
-        ),
+        } => {
+            let method = method
+                .as_deref()
+                .map(|method| format!(" by {method}"))
+                .unwrap_or_default();
+            format!(
+                "checked to depth {depth}{method} in {time_ms}ms{}",
+                render_assumption_suffix(assumptions)
+            )
+        }
         verify::VerificationResult::Counterexample { assumptions, .. } => {
             format!(
                 "counterexample witness{}",

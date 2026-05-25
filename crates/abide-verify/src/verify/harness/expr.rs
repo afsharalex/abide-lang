@@ -349,7 +349,38 @@ pub fn try_encode_slot_expr(
                 entity_param_types: &entity_param_types,
                 store_param_types: ctx.store_param_types,
             };
-            try_encode_slot_expr(&inner_ctx, &query.body, step)
+            let value = try_encode_slot_expr(&inner_ctx, &query.body, step)?;
+            if query.requires.is_empty() {
+                return Ok(value);
+            }
+
+            let mut requirements = Vec::new();
+            for req in &query.requires {
+                requirements.push(
+                    try_encode_slot_expr(&inner_ctx, req, step)?
+                        .as_bool()
+                        .map_err(|msg| {
+                            format!(
+                                "query refinement precondition for `{query_system}::{query_name}` \
+                                 is not boolean: {msg}"
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+
+            match value {
+                SmtValue::Bool(body) => {
+                    let mut parts: Vec<&Bool> = requirements.iter().collect();
+                    parts.push(&body);
+                    Ok(SmtValue::Bool(smt::bool_and(&parts)))
+                }
+                other => Err(format!(
+                    "query `{query_system}::{query_name}` has parameter refinements, \
+                     but non-boolean query values with preconditions are not yet supported \
+                     in executable guard encoding: {other:?}"
+                )),
+            }
         }
 
         IRExpr::Prime { expr, .. } => try_encode_slot_expr(ctx, expr, step + 1),

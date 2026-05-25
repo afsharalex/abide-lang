@@ -5,7 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{
-    IRAction, IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRType, IRVerify,
+    IRAction, IREntity, IRExpr, IRField, IRProgram, IRSystem, IRTheorem, IRType, IRVerify,
+    LetBinding,
 };
 
 use super::defenv;
@@ -298,6 +299,34 @@ pub(super) fn collect_in_scope_invariants(
 
     // Entity invariants travel with the entity type.
     for ent in relevant_entities {
+        for field in &ent.fields {
+            let receiver = IRExpr::Var {
+                name: "__inv_self".to_owned(),
+                ty: IRType::Entity {
+                    name: ent.name.clone(),
+                },
+                span: None,
+            };
+            let field_expr = IRExpr::Field {
+                expr: Box::new(receiver),
+                field: field.name.clone(),
+                ty: unrefined_field_type(&field.ty).clone(),
+                span: None,
+            };
+            if let Some(refinement) = field_refinement_obligation(field, field_expr) {
+                wrapped.push(IRExpr::Always {
+                    body: Box::new(IRExpr::Forall {
+                        var: "__inv_self".to_owned(),
+                        domain: IRType::Entity {
+                            name: ent.name.clone(),
+                        },
+                        body: Box::new(refinement),
+                        span: None,
+                    }),
+                    span: None,
+                });
+            }
+        }
         for inv in &ent.invariants {
             // Build a fresh `__inv_self` Var of the entity type. The
             // name has a leading `__` so it cannot collide with any
@@ -331,6 +360,19 @@ pub(super) fn collect_in_scope_invariants(
     // crosscall-reachable systems do not, because that would silently
     // import a callee's safety claims into the caller's verify.
     for sys in target_systems {
+        for field in &sys.fields {
+            let field_expr = IRExpr::Var {
+                name: field.name.clone(),
+                ty: unrefined_field_type(&field.ty).clone(),
+                span: None,
+            };
+            if let Some(refinement) = field_refinement_obligation(field, field_expr) {
+                wrapped.push(IRExpr::Always {
+                    body: Box::new(refinement),
+                    span: None,
+                });
+            }
+        }
         for inv in &sys.invariants {
             wrapped.push(IRExpr::Always {
                 body: Box::new(inv.body.clone()),
@@ -340,6 +382,37 @@ pub(super) fn collect_in_scope_invariants(
     }
 
     wrapped
+}
+
+fn unrefined_field_type(ty: &IRType) -> &IRType {
+    match ty {
+        IRType::Refinement { base, .. } => unrefined_field_type(base),
+        other => other,
+    }
+}
+
+fn field_refinement_obligation(field: &IRField, value_expr: IRExpr) -> Option<IRExpr> {
+    let IRType::Refinement { base, predicate } = &field.ty else {
+        return None;
+    };
+    let value_ty = (**base).clone();
+    let mut bindings = vec![LetBinding {
+        name: "$".to_owned(),
+        ty: value_ty.clone(),
+        expr: value_expr.clone(),
+    }];
+    if !field.name.contains('.') {
+        bindings.push(LetBinding {
+            name: field.name.clone(),
+            ty: value_ty,
+            expr: value_expr,
+        });
+    }
+    Some(IRExpr::Let {
+        bindings,
+        body: predicate.clone(),
+        span: None,
+    })
 }
 
 // ── Symmetry reduction for quantified liveness () ────────────
@@ -889,6 +962,14 @@ mod tests {
         }
     }
 
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
     fn entity(name: &str) -> IREntity {
         IREntity {
             name: name.to_owned(),
@@ -1042,6 +1123,44 @@ mod tests {
         assert_eq!(invariants.len(), 2);
         assert!(matches!(invariants[0], IRExpr::Always { .. }));
         assert!(matches!(invariants[1], IRExpr::Always { .. }));
+    }
+
+    #[test]
+    fn collect_in_scope_invariants_adds_entity_field_refinement_obligations() {
+        let mut account = entity("Account");
+        account.fields = vec![IRField {
+            name: "balance".to_owned(),
+            ty: IRType::Refinement {
+                base: Box::new(IRType::Int),
+                predicate: Box::new(IRExpr::BinOp {
+                    op: "OpGe".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "$".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(int_lit(0)),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+            },
+            default: Some(int_lit(0)),
+            initial_constraint: None,
+        }];
+        let defs = defenv::DefEnv::from_ir(&program(vec![account.clone()], vec![]));
+
+        let invariants = collect_in_scope_invariants(&defs, &[account], &[]);
+
+        assert_eq!(invariants.len(), 1);
+        assert!(
+            matches!(
+                &invariants[0],
+                IRExpr::Always { body, .. }
+                    if matches!(body.as_ref(), IRExpr::Forall { body, .. }
+                        if matches!(body.as_ref(), IRExpr::Let { .. }))
+            ),
+            "field refinement should be wrapped as an always forall let obligation: {invariants:#?}"
+        );
     }
 
     #[test]

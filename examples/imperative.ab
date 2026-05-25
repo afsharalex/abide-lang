@@ -14,6 +14,9 @@ fn sum_to(n: int): int
   var i = 0
   while i <= n
     invariant total >= 0
+    invariant i >= 0
+    invariant i <= n + 1
+    invariant 2 * total == i * (i - 1)
     decreases n - i
   {
     total = total + i
@@ -64,6 +67,7 @@ fn gcd_imperative(a: int, b: int): int
   var y = b
   while y != 0
     invariant x > 0
+    invariant y >= 0
     decreases y
   {
     var temp = y
@@ -82,7 +86,9 @@ fn checked_divide(a: int, b: int): int
   a / b
 }
 
-fn with_assertion(x: int): int {
+fn with_assertion(x: int): int
+  requires x > 0
+{
   assert x > 0
   x + 1
 }

@@ -123,7 +123,7 @@ impl DefEnv {
                         .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect(),
                     body: q.body.clone(),
-                    requires: vec![],
+                    requires: q.requires.clone(),
                 };
                 defs.insert(format!("{}::{}", sys.name, q.name), entry);
             }
@@ -2604,6 +2604,7 @@ mod tests {
                 name: "x".to_owned(),
                 ty: IRType::Int,
             }],
+            requires: vec![],
             body: IRExpr::Lit {
                 ty: IRType::Bool,
                 value: LitVal::Bool { value: true },

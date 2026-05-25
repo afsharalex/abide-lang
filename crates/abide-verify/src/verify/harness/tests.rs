@@ -266,6 +266,7 @@ fn make_billing_query_program() -> (IRProgram, IRSystem) {
                 name: "amount".to_owned(),
                 ty: IRType::Int,
             }],
+            requires: vec![],
             body: IRExpr::BinOp {
                 op: "OpGe".to_owned(),
                 left: Box::new(IRExpr::Var {

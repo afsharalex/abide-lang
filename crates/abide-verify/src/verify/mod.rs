@@ -72,7 +72,10 @@ use serde::{Deserialize, Serialize};
 
 use self::smt::{AbideSolver, Bool, SatResult};
 
-use crate::ir::types::{IRAction, IRExpr, IRProgram, IRSystem, IRType, IRVerify};
+use crate::ir::types::{
+    IRAction, IRAssumptionSet, IRExpr, IRFunction, IRProgram, IRSystem, IRTheorem, IRType,
+    IRVerify, IRVerifySystem,
+};
 
 pub use self::chc::ChcSelection;
 use self::context::VerifyContext;
@@ -291,6 +294,7 @@ fn materialize_relational_verify_outcome(
         relational::RelationalVerifyOutcome::Checked { time_ms } => VerificationResult::Checked {
             name: verify_block.name.clone(),
             depth: bound,
+            method: Some("relational RustSAT".to_owned()),
             time_ms,
             assumptions: build_assumptions_for_system_scope(
                 ir,
@@ -375,6 +379,8 @@ pub enum VerificationResult {
     Checked {
         name: String,
         depth: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
         time_ms: u64,
         assumptions: Vec<TrustedAssumption>,
         span: Option<crate::span::Span>,
@@ -511,6 +517,7 @@ impl VerificationResult {
             Self::Checked {
                 name,
                 depth,
+                method,
                 time_ms,
                 assumptions,
                 span,
@@ -518,6 +525,7 @@ impl VerificationResult {
             } => Self::Checked {
                 name,
                 depth,
+                method,
                 time_ms,
                 assumptions,
                 span: span.or(block_span),
@@ -954,6 +962,8 @@ pub struct VerifyConfig {
     pub overall_timeout_ms: u64,
     /// Default BMC depth for auto-verified props (which lack explicit `[0..N]`).
     pub prop_bmc_depth: usize,
+    /// Opt cvc5 solver runs into in-process SyGuS invariant synthesis.
+    pub cvc5_sygus: bool,
     /// Timeout for IC3/PDR attempts, in milliseconds.
     pub ic3_timeout_ms: u64,
     /// Skip IC3/PDR for ordinary verify blocks.
@@ -986,6 +996,7 @@ impl Default for VerifyConfig {
             bmc_timeout_ms: 1_200_000,
             overall_timeout_ms: 1_200_000,
             prop_bmc_depth: 10,
+            cvc5_sygus: false,
             ic3_timeout_ms: 1_200_000,
             no_ic3: true,
             no_prop_verify: false,
@@ -1336,6 +1347,81 @@ where
             file,
         },
     }
+}
+
+fn synthetic_prop_name(func: &IRFunction) -> String {
+    format!("prop_{}", func.name)
+}
+
+fn synthetic_prop_theorem(func: &IRFunction, target_system: &str) -> IRTheorem {
+    IRTheorem {
+        name: synthetic_prop_name(func),
+        systems: vec![target_system.to_owned()],
+        // Synthetic theorem for a top-level prop. Props verified through the
+        // theorem path keep theorem/lemma defaults (stutter on).
+        assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        invariants: vec![],
+        shows: vec![IRExpr::Always {
+            body: Box::new(func.body.clone()),
+            span: None,
+        }],
+        by_file: None,
+        by_lemmas: vec![],
+        span: func.span,
+        file: func.file.clone(),
+    }
+}
+
+fn synthetic_prop_verify(
+    func: &IRFunction,
+    target_system: &str,
+    prop_bmc_depth: usize,
+) -> IRVerify {
+    let depth = prop_bmc_depth.max(1);
+    let bound = depth.min(i64::MAX as usize) as i64;
+    IRVerify {
+        name: synthetic_prop_name(func),
+        depth: Some(depth),
+        systems: vec![IRVerifySystem {
+            name: target_system.to_owned(),
+            lo: 0,
+            hi: bound,
+        }],
+        stores: vec![],
+        // Props verified through the bounded verify fallback still represent
+        // top-level proof obligations, so keep theorem/lemma defaults.
+        assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        asserts: vec![IRExpr::Always {
+            body: Box::new(func.body.clone()),
+            span: None,
+        }],
+        span: func.span,
+        file: func.file.clone(),
+    }
+}
+
+fn check_prop_bmc_fallback(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    func: &IRFunction,
+    target_system: &str,
+    config: &VerifyConfig,
+    deadline: Option<Instant>,
+) -> VerificationResult {
+    let synthetic_verify = synthetic_prop_verify(func, target_system, config.prop_bmc_depth);
+    let mut prop_bmc_config = config.clone();
+    prop_bmc_config.bounded_only = true;
+    prop_bmc_config.unbounded_only = false;
+    check_verify_block_tiered(
+        ir,
+        vctx,
+        defs,
+        &synthetic_verify,
+        &prop_bmc_config,
+        deadline,
+    )
+    .with_source(func.span, func.file.clone())
 }
 
 // ── Top-level verification entry point ──────────────────────────────
@@ -1827,26 +1913,20 @@ fn verify_all_single_impl(
                 func.file.clone(),
                 "verifying prop",
                 || {
-                    let synthetic_theorem = crate::ir::types::IRTheorem {
-                        name: format!("prop_{}", func.name),
-                        systems: vec![target_system.clone()],
-                        // Synthetic theorem for a top-level prop. Props are
-                        // verified via the theorem path, so they get the
-                        // theorem construct default (stutter on). Backends
-                        // should treat this like any other theorem assumption set.
-                        assumption_set:
-                            crate::ir::types::IRAssumptionSet::default_for_theorem_or_lemma(),
-                        invariants: vec![],
-                        shows: vec![IRExpr::Always {
-                            body: Box::new(func.body.clone()),
-                            span: None,
-                        }],
-                        by_file: None,
-                        by_lemmas: vec![],
-                        span: func.span,
-                        file: func.file.clone(),
-                    };
-                    check_theorem_block(
+                    if effective_config.bounded_only {
+                        return check_prop_bmc_fallback(
+                            ir,
+                            &vctx,
+                            &defs,
+                            func,
+                            target_system,
+                            &effective_config,
+                            deadline,
+                        );
+                    }
+
+                    let synthetic_theorem = synthetic_prop_theorem(func, target_system);
+                    let theorem_result = check_theorem_block(
                         ir,
                         &vctx,
                         &defs,
@@ -1854,7 +1934,24 @@ fn verify_all_single_impl(
                         &effective_config,
                         deadline,
                     )
-                    .with_source(func.span, func.file.clone())
+                    .with_source(func.span, func.file.clone());
+
+                    if effective_config.unbounded_only {
+                        return theorem_result;
+                    }
+
+                    match theorem_result {
+                        VerificationResult::Unprovable { .. } => check_prop_bmc_fallback(
+                            ir,
+                            &vctx,
+                            &defs,
+                            func,
+                            target_system,
+                            &effective_config,
+                            deadline,
+                        ),
+                        result => result,
+                    }
                 },
             );
             if config.progress {
@@ -2358,6 +2455,7 @@ fn check_verify_block_tiered(
                 Ok(relation_sat::StaticRelationOutcome::Checked) => VerificationResult::Checked {
                     name: effective_block.name.clone(),
                     depth: 0,
+                    method: Some("relational RustSAT".to_owned()),
                     time_ms: 0,
                     assumptions: build_assumptions_for_system_scope(
                         ir,
@@ -2645,6 +2743,7 @@ fn check_static_verify_assertions(
         return VerificationResult::Checked {
             name: verify_block.name.clone(),
             depth: 0,
+            method: None,
             time_ms: 0,
             assumptions,
             span: verify_block.span,
@@ -2693,6 +2792,7 @@ fn check_static_verify_assertions(
         SatResult::Unsat => VerificationResult::Checked {
             name: verify_block.name.clone(),
             depth: 0,
+            method: None,
             time_ms: 0,
             assumptions,
             span: verify_block.span,
@@ -2715,6 +2815,9 @@ fn try_cvc5_sygus_on_verify(
     config: &VerifyConfig,
 ) -> Option<VerificationResult> {
     if active_solver_family() != SolverFamily::Cvc5 {
+        return None;
+    }
+    if !config.cvc5_sygus {
         return None;
     }
     if verify_block.asserts.is_empty() {
@@ -2740,7 +2843,7 @@ fn try_cvc5_sygus_on_verify(
     }
     root_system.invariants.clear();
     let sygus_result = if system.relevant_entities().is_empty() {
-        sygus::try_cvc5_sygus_system_safety(
+        sygus::try_cvc5_sygus_system_safety_opted_in(
             &root_system,
             &combined_property,
             config.induction_timeout_ms,
@@ -2750,7 +2853,7 @@ fn try_cvc5_sygus_on_verify(
         for entity in &mut entities {
             entity.invariants.clear();
         }
-        sygus::try_cvc5_sygus_multi_system_pooled_safety(
+        sygus::try_cvc5_sygus_multi_system_pooled_safety_opted_in(
             &root_system,
             &sygus_systems,
             &entities,
@@ -2779,9 +2882,16 @@ fn try_cvc5_sygus_on_verify(
             span: None,
             file: None,
         }),
-        transition::TransitionResult::Violated(_) | transition::TransitionResult::Unknown(_) => {
-            None
+        transition::TransitionResult::Violated(_) => None,
+        transition::TransitionResult::Unknown(hint) if config.unbounded_only => {
+            Some(VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: format!("cvc5 SyGuS opt-in could not prove this verify block: {hint}"),
+                span: verify_block.span,
+                file: verify_block.file.clone(),
+            })
         }
+        transition::TransitionResult::Unknown(_) => None,
     }
 }
 
@@ -3857,6 +3967,7 @@ fn check_verify_block(
         SatResult::Unsat => VerificationResult::Checked {
             name: verify_block.name.clone(),
             depth: bound,
+            method: None,
             time_ms: elapsed,
             assumptions: build_assumptions_for_system_scope(
                 ir,
@@ -4177,6 +4288,7 @@ fn check_verify_block_lasso(
     VerificationResult::Checked {
         name: verify_block.name.clone(),
         depth: bound,
+        method: None,
         time_ms: elapsed,
         assumptions: build_assumptions_for_system_scope(
             ir,
@@ -4935,9 +5047,16 @@ fn format_assumptions(assumptions: &[TrustedAssumption]) -> String {
                 name,
                 proof_artifact,
             } => Some(match proof_artifact {
-                Some(proof_artifact) => {
-                    format!("axiom {name} by \"{}\"", proof_artifact.locator())
+                Some(proof_artifact) if proof_artifact.is_checked() => {
+                    format!(
+                        "axiom {name} by \"{}\" (checked proof artifact)",
+                        proof_artifact.locator()
+                    )
                 }
+                Some(proof_artifact) => format!(
+                    "axiom {name} by \"{}\" (unchecked trusted reference)",
+                    proof_artifact.locator()
+                ),
                 None => format!("axiom {name}"),
             }),
             _ => None,
@@ -5093,7 +5212,14 @@ fn write_counterexample_evidence(
                 if let Some(label) = proof_artifact_ref.label_text() {
                     writeln!(f, "  label: {label}")?;
                 }
-                writeln!(f, "  checked: {}", proof_artifact_ref.is_checked())?;
+                if proof_artifact_ref.is_checked() {
+                    writeln!(f, "  checked: true")?;
+                } else {
+                    writeln!(
+                        f,
+                        "  checked: false (unchecked trusted proof artifact reference)"
+                    )?;
+                }
                 return Ok(());
             }
             if let Some(witness) = evidence.as_witness() {
@@ -5165,19 +5291,34 @@ impl std::fmt::Display for VerificationResult {
                     if let Some(label) = proof_artifact_ref.label_text() {
                         writeln!(f, "  label: {label}")?;
                     }
-                    writeln!(f, "  checked: {}", proof_artifact_ref.is_checked())?;
+                    if proof_artifact_ref.is_checked() {
+                        writeln!(f, "  checked: true")?;
+                    } else {
+                        writeln!(
+                            f,
+                            "  checked: false (unchecked trusted proof artifact reference)"
+                        )?;
+                    }
                 }
                 Ok(())
             }
             VerificationResult::Checked {
                 name,
                 depth,
+                method,
                 time_ms,
                 assumptions,
                 ..
             } => {
                 let under = format_assumptions(assumptions);
-                write!(f, "CHECKED {name} (depth: {depth}, {time_ms}ms{under})")
+                if let Some(method) = method {
+                    write!(
+                        f,
+                        "CHECKED {name} (method: {method}, depth: {depth}, {time_ms}ms{under})"
+                    )
+                } else {
+                    write!(f, "CHECKED {name} (depth: {depth}, {time_ms}ms{under})")
+                }
             }
             VerificationResult::Counterexample {
                 name,

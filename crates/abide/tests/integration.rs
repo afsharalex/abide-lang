@@ -240,6 +240,16 @@ fn lower_logistics() {
 }
 
 #[test]
+fn lower_matching_example_accepts_recursive_enum_payloads() {
+    let result = elaborate_file("../../examples/matching.ab");
+    let (_ir_program, lower_diag) = ir::lower(&result);
+    assert!(
+        !lower_diag.has_errors(),
+        "recursive enum payloads should not leak named types into IR lowering: {lower_diag:?}"
+    );
+}
+
+#[test]
 fn verify_logistics_fixture() {
     let prog = lower_loaded_files(LOGISTICS_FIXTURE);
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
@@ -943,6 +953,41 @@ fn verify_file(path: &str) -> Vec<abide::verify::VerificationResult> {
 }
 
 #[test]
+fn public_examples_verify_with_documented_bounded_command() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let examples = [
+        "examples/algorithms.ab",
+        "examples/banking.ab",
+        "examples/collections.ab",
+        "examples/commerce.ab",
+        "examples/contracts.ab",
+        "examples/healthcare.ab",
+        "examples/imperative.ab",
+        "examples/matching.ab",
+        "examples/order.ab",
+        "examples/orchestration.ab",
+        "examples/proofs_and_boundaries.ab",
+        "examples/relations.ab",
+    ];
+
+    for example in examples {
+        let output = std::process::Command::new(binary)
+            .args(["verify", example, "--bounded-only", "--timeout", "30"])
+            .current_dir(&workspace_root)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run verifier for {example}: {error}"));
+
+        assert!(
+            output.status.success(),
+            "{example} should verify with documented bounded command\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn verify_auth_fixture() {
     let results = verify_file("tests/fixtures/auth.ab");
     assert!(!results.is_empty(), "auth should have verification results");
@@ -1049,6 +1094,36 @@ fn verify_relations_fixture() {
                 if name == "relation_join_passes" && *depth == 0
         )),
         "relation join should be routed to RustSAT"
+    );
+    let relation_join = results
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Checked { name, .. }
+                    if name == "relation_join_passes"
+            )
+        })
+        .expect("relation join result");
+    assert!(
+        matches!(
+            relation_join,
+            abide::verify::VerificationResult::Checked { method, .. }
+                if method.as_deref() == Some("relational RustSAT")
+        ),
+        "relation join should disclose relational RustSAT method metadata: {relation_join:?}"
+    );
+    let rendered_relation_join = relation_join.to_string();
+    assert!(
+        rendered_relation_join.contains("method: relational RustSAT"),
+        "relation join display should disclose relational RustSAT method: {rendered_relation_join}"
+    );
+    let relation_join_json =
+        serde_json::to_value(relation_join).expect("serialize relation join result");
+    assert_eq!(
+        relation_join_json.get("method").and_then(serde_json::Value::as_str),
+        Some("relational RustSAT"),
+        "structured relation result should disclose relational RustSAT method: {relation_join_json}"
     );
     assert!(
         results.iter().any(|r| matches!(
@@ -1199,6 +1274,118 @@ fn verify_commerce_fixture() {
                 if name == "order_total_non_negative"
         )),
         "order_total_non_negative should be PROVED"
+    );
+}
+
+#[test]
+fn verify_supports_mixed_real_int_literals_in_properties_and_scenes() {
+    use std::io::Write;
+
+    let src = r"
+module MixedNumeric
+
+entity Item {
+  id: identity
+  price: real = 0
+}
+
+system Shop(items: Store<Item>) {
+  command create_item(price: real)
+    requires price >= 0 {
+    create Item {
+      price = price
+    }
+  }
+}
+
+verify item_prices_non_negative {
+  assume {
+    store items: Item[0..2]
+    let shop = Shop { items: items }
+  }
+  assert always all i: Item | i.price >= 0
+}
+
+scene item_price_witness {
+  given {
+    store items: Item[1]
+    let shop = Shop { items: items }
+    let i = one Item in items where i.price == 1
+  }
+  then {
+    assert i.price == 1
+  }
+}
+";
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("mixed_numeric.ab");
+    let mut file = std::fs::File::create(&path).expect("create fixture");
+    file.write_all(src.as_bytes()).expect("write fixture");
+    let path = path.to_string_lossy().to_string();
+
+    let results = verify_file(&path);
+    assert!(
+        results
+            .iter()
+            .all(|result| !result.to_string().contains("unsupported binop")),
+        "mixed real/int literals should not hit unsupported SMT binops: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+                if name == "item_prices_non_negative"
+        )),
+        "mixed real/int verify block should be checked or proved: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                if name == "item_price_witness"
+        )),
+        "mixed real/int scene should pass: {results:#?}"
+    );
+}
+
+#[test]
+fn verify_enforces_entity_field_refinements_as_implicit_invariants() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("field_refinement.ab");
+    std::fs::write(
+        &file,
+        "module FieldRefinement\n\n\
+         entity Account {\n\
+           id: identity\n\
+           balance: int { $ >= 0 } = 0\n\n\
+           action overdraw() {\n\
+             balance' = -1\n\
+           }\n\
+         }\n\n\
+         system Bank(accounts: Store<Account>) {\n\
+           command overdraw(a: Account) {\n\
+             a.overdraw()\n\
+           }\n\
+         }\n\n\
+         verify field_refinement_preserved {\n\
+           assume {\n\
+             store accounts: Account[1]\n\
+             let bank = Bank { accounts: accounts }\n\
+           }\n\
+           assert always true\n\
+         }\n",
+    )
+    .expect("write spec");
+
+    let results = verify_file(file.to_str().unwrap());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Counterexample { name, .. }
+                if name == "field_refinement_preserved"
+        )),
+        "invalid refined field update should violate the implicit field invariant: {results:?}"
     );
 }
 
@@ -11605,6 +11792,34 @@ verify v {
     );
 }
 
+#[test]
+fn extern_fairness_multi_segment_path_is_rejected() {
+    let src = r"module T
+
+extern Stripe {
+  command charge(order_id: int)
+
+  may charge { }
+
+  assume {
+    fair Stripe::charge
+    strong fair Stripe::charge
+  }
+}
+";
+    let (_result, errors) = elab_with_errors(src);
+    let real_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    assert!(
+        real_errors.iter().any(|error| error
+            .message
+            .contains("fairness assumptions must reference a local command name")),
+        "expected local-command diagnostic for qualified extern fairness, got: {real_errors:?}"
+    );
+}
+
 /// `saw Extern::command()` with wildcard args.
 #[test]
 fn saw_wildcard_args_parse() {
@@ -13833,6 +14048,79 @@ program Shop(orders: Store<Order>) {
 }
 
 #[test]
+fn proc_parameter_refinement_contributes_to_start_guard() {
+    let result = elaborate_source(
+        r"module T
+
+entity Order { status: int = 0 }
+
+system Billing(orders: Store<Order>) {
+  command charge(order: Order, amount: int) requires amount > 0 { }
+}
+
+program Shop(orders: Store<Order>) {
+  let billing = Billing { orders: orders }
+
+  proc fulfill(order: Order, amount: int { $ > 0 }) {
+    charge = billing.charge(order, amount)
+  }
+}
+",
+    );
+    let (prog, _lower_diag) = ir::lower(&result);
+
+    let shop = prog
+        .systems
+        .iter()
+        .find(|system| system.name == "Shop")
+        .expect("program system should lower");
+    let start_step = shop
+        .actions
+        .iter()
+        .find(|step| step.name == "fulfill")
+        .expect("expected workflow-start step");
+
+    assert!(
+        matches!(
+            &start_step.guard,
+            abide::ir::types::IRExpr::BinOp { op, .. } if op == "OpGt"
+        ),
+        "expected proc parameter refinement to lower into start guard, got: {:?}",
+        start_step.guard
+    );
+}
+
+#[test]
+fn query_parameter_refinement_constrains_bool_query_guard_calls() {
+    let result = elaborate_source(
+        r"module T
+
+entity Sig { flag: bool = false }
+
+system Metrics(sigs: Store<Sig>) {
+  query positive(x: int { $ > 0 }) = true
+
+  command impossible(amount: int) requires positive(amount) and amount < 0 {
+    create Sig { flag = true }
+  }
+}
+
+verify refined_query_guard {
+  assume {
+    store sigs: Sig[0..1]
+    let metrics = Metrics { sigs: sigs }
+  }
+  assert always all s: Sig | s.flag == false
+}
+",
+    );
+    let (prog, _lower_diag) = ir::lower(&result);
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert_verify_result_success(&results, "refined_query_guard");
+}
+
+#[test]
 fn verify_proc_bounds_lower_to_hidden_proc_instance_stores() {
     let result = elaborate_source(
         r"module T
@@ -15937,6 +16225,33 @@ system Billing(orders: Store<Order>) {
             .iter()
             .any(|e| e.message.contains("without declaring `dep Stripe`")),
         "expected missing-dep extern diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn dep_unknown_extern_diagnostic_explains_validation_only_semantics() {
+    let src = r"module T
+
+entity Order {
+  id: int = 0
+}
+
+system Billing(orders: Store<Order>) {
+  dep Stripe
+}
+";
+
+    let (_result, errors) = elab_with_errors(src);
+    let error = errors
+        .iter()
+        .find(|error| error.message.contains("unknown extern dep `Stripe`"))
+        .unwrap_or_else(|| panic!("expected unknown dep diagnostic, got: {errors:?}"));
+    let help = error.help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("validation-only")
+            && help.contains("does not import")
+            && help.contains("does not instantiate"),
+        "dep diagnostic should explain validation-only semantics, got help: {help:?}"
     );
 }
 

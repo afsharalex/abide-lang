@@ -620,6 +620,8 @@ pub struct IRUpdate {
 pub struct IRQuery {
     pub name: std::string::String,
     pub params: Vec<IRTransParam>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<IRExpr>,
     pub body: IRExpr,
 }
 

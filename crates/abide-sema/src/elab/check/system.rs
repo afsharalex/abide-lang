@@ -77,17 +77,24 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
             ));
         }
         if !env.externs.contains_key(dep) {
-            errors.push(ElabError::with_span(
-                ErrorKind::UndefinedRef,
-                format!(
-                    "system `{}` declares unknown extern dep `{dep}`",
-                    system.name
+            errors.push(
+                ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!(
+                        "system `{}` declares unknown extern dep `{dep}`",
+                        system.name
+                    ),
+                    &sys_ctx,
+                    system
+                        .span
+                        .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                )
+                .with_help(
+                    "`dep` declarations are validation-only metadata for authorizing calls to \
+                 declared `extern` blocks; a `dep` does not import, does not instantiate, \
+                 and does not add verifier semantics for the named extern.",
                 ),
-                &sys_ctx,
-                system
-                    .span
-                    .unwrap_or(crate::span::Span { start: 0, end: 0 }),
-            ));
+            );
         }
     }
 

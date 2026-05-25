@@ -83,6 +83,69 @@ fn non_negative_property() -> IRExpr {
     }
 }
 
+fn int_lit(value: i64) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Int,
+        value: LitVal::Int { value },
+        span: None,
+    }
+}
+
+fn bool_lit(value: bool) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value },
+        span: None,
+    }
+}
+
+fn bin_expr(op: &str, left: IRExpr, right: IRExpr, ty: IRType) -> IRExpr {
+    IRExpr::BinOp {
+        op: op.to_owned(),
+        left: Box::new(left),
+        right: Box::new(right),
+        ty,
+        span: None,
+    }
+}
+
+#[test]
+fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+
+    for expr in [
+        bin_expr("OpDiv", int_lit(9), int_lit(3), IRType::Int),
+        bin_expr("OpMod", int_lit(9), int_lit(4), IRType::Int),
+        bin_expr("OpXor", bool_lit(true), bool_lit(false), IRType::Bool),
+    ] {
+        encode_expr(&tm, &expr, &vars, &enum_catalog)
+            .unwrap_or_else(|err| panic!("finite SyGuS expression should encode: {err}"));
+    }
+}
+
+#[test]
+fn sygus_expr_encoder_accepts_qualified_enum_constructor_names() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let mut enum_catalog = EnumCatalog::new();
+    enum_catalog.insert(
+        "Status".to_owned(),
+        HashMap::from([("Pending".to_owned(), 0), ("Done".to_owned(), 1)]),
+    );
+
+    let expr = IRExpr::Ctor {
+        enum_name: "Status".to_owned(),
+        ctor: "Status::Pending".to_owned(),
+        args: vec![],
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("qualified enum constructor should encode: {err}"));
+}
+
 #[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};

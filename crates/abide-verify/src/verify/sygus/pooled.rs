@@ -53,6 +53,7 @@ pub(super) fn try_cvc5_sygus_multi_pooled_system_safety(
     }
 }
 
+#[cfg(test)]
 pub fn try_cvc5_sygus_multi_system_pooled_safety(
     root_system: &IRSystem,
     systems: &[IRSystem],
@@ -114,7 +115,7 @@ pub(super) fn try_cvc5_sygus_multi_pooled_system_safety_inner(
     )
 }
 
-fn try_cvc5_sygus_multi_system_pooled_safety_inner(
+pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     root_system: &IRSystem,
     systems: &[IRSystem],
     entities: &[IREntity],
@@ -1949,14 +1950,9 @@ fn encode_pooled_expr(
                     "cvc5 SyGuS pooled system safety does not support payload constructors yet (`{enum_name}::{ctor}`)"
                 ));
             }
-            let idx = enum_catalog
-                .get(enum_name)
-                .and_then(|mapping| mapping.get(ctor))
-                .ok_or_else(|| {
-                    format!(
-                        "unsupported enum constructor `{enum_name}::{ctor}` in pooled SyGuS slice"
-                    )
-                })?;
+            let idx = lookup_enum_ctor_index(enum_catalog, enum_name, ctor).ok_or_else(|| {
+                format!("unsupported enum constructor `{enum_name}::{ctor}` in pooled SyGuS slice")
+            })?;
             Ok(tm.mk_integer(*idx))
         }
         IRExpr::Var { name, .. } => vars.get(name).cloned().ok_or_else(|| {
@@ -2040,6 +2036,7 @@ fn encode_pooled_expr(
                 "OpAnd" | "and" => Ok(mk_and(tm, &[lhs, rhs])),
                 "OpOr" | "or" => Ok(mk_or(tm, &[lhs, rhs])),
                 "OpImplies" | "implies" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs])),
+                "OpXor" | "xor" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_XOR, &[lhs, rhs])),
                 "OpEq" | "==" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[lhs, rhs])),
                 "OpNEq" | "!=" => Ok(tm.mk_term(
                     Cvc5Kind::CVC5_KIND_NOT,
@@ -2052,6 +2049,8 @@ fn encode_pooled_expr(
                 "OpAdd" | "+" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[lhs, rhs])),
                 "OpSub" | "-" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_SUB, &[lhs, rhs])),
                 "OpMul" | "*" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_MULT, &[lhs, rhs])),
+                "OpDiv" | "/" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_DIVISION, &[lhs, rhs])),
+                "OpMod" | "%" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_MODULUS, &[lhs, rhs])),
                 _ => Err(format!(
                     "unsupported binary op `{op}` in pooled cvc5 SyGuS slice"
                 )),

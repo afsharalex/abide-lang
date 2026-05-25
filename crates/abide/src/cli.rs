@@ -146,6 +146,10 @@ enum Command {
         #[arg(long)]
         ic3: bool,
 
+        /// Opt cvc5 solver runs into in-process SyGuS invariant synthesis
+        #[arg(long = "cvc5-sygus", requires = "solver")]
+        cvc5_sygus: bool,
+
         /// Skip automatic prop verification
         #[arg(long)]
         no_prop_verify: bool,
@@ -301,8 +305,6 @@ const DEFAULT_INDUCTION_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
 ///
 /// Props don't have an explicit `[0..N]` scope like verify blocks.
 /// When induction fails for a prop, the BMC fallback uses this depth.
-/// Not yet wired to a CLI flag — will be exposed when prop auto-verification
-/// is implemented ( deferred item).
 const DEFAULT_PROP_BMC_DEPTH: usize = 10;
 
 /// Default timeout for IC3/PDR attempts, in seconds.
@@ -393,6 +395,7 @@ pub fn run() -> miette::Result<()> {
             bmc_timeout,
             ic3_timeout,
             ic3,
+            cvc5_sygus,
             no_prop_verify,
             no_fn_verify,
             progress,
@@ -415,6 +418,11 @@ pub fn run() -> miette::Result<()> {
                 VerifyChcSolver::Cvc5 => crate::verify::ChcSelection::Cvc5,
                 VerifyChcSolver::Auto => crate::verify::ChcSelection::Auto,
             };
+            if cvc5_sygus && !matches!(solver, VerifySolver::Cvc5 | VerifySolver::Both) {
+                return Err(miette::miette!(
+                    "--cvc5-sygus requires `--solver cvc5` or `--solver both`"
+                ));
+            }
             match solver {
                 VerifySolver::Cvc5 | VerifySolver::Both
                     if !crate::verify::solver::is_solver_family_available(
@@ -469,6 +477,7 @@ pub fn run() -> miette::Result<()> {
                 induction_timeout_ms: induction_timeout.saturating_mul(1000),
                 bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
                 prop_bmc_depth: DEFAULT_PROP_BMC_DEPTH,
+                cvc5_sygus,
                 ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
                 no_ic3,
                 no_prop_verify,

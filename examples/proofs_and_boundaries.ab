@@ -1,0 +1,76 @@
+module ProofsAndBoundaries
+
+// Proof/reporting and boundary examples.
+// This file is intended to pass under:
+//   abide verify examples/proofs_and_boundaries.ab --bounded-only
+
+type Positive = int { $ > 0 }
+
+enum TicketStatus = Open | Closed
+enum AuditOutcome = Accepted | Rejected
+
+fn bump_positive(n: Positive): int
+  ensures result > n
+{
+  n + 1
+}
+
+lemma identity_is_reflexive {
+  all x: int | x == x
+}
+
+axiom external_audit_policy = true by "proofs/external-audit.agda"
+
+theorem external_policy_review =
+  always true by "proofs/external-policy.agda"
+
+entity Ticket {
+  id: identity
+  status: TicketStatus = @Open
+
+  action close()
+    requires status == @Open {
+    status' = @Closed
+  }
+}
+
+extern Auditor {
+  command record(ticket_id: identity) -> AuditOutcome
+  may record {
+    return @Accepted
+    return @Rejected
+  }
+  assume {
+    fair record
+    true
+  }
+}
+
+system Support(tickets: Store<Ticket>) {
+  dep Auditor
+
+  command close_any_open_ticket() {
+    choose t: Ticket where t.status == @Open {
+      t.close()
+      Auditor::record(t.id)
+    }
+  }
+}
+
+verify closed_tickets_stay_closed {
+  assume {
+    store tickets: Ticket[0..3]
+    let support = Support { tickets: tickets }
+    fair Support::close_any_open_ticket
+  }
+  assert always all t: Ticket | t.status == @Closed implies t.status == @Closed
+}
+
+verify open_tickets_eventually_close {
+  assume {
+    store tickets: Ticket[1]
+    let support = Support { tickets: tickets }
+    fair Support::close_any_open_ticket
+  }
+  assert eventually all t: Ticket | t.status == @Closed
+}

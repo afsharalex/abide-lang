@@ -77,6 +77,7 @@ Selected flags:
 - `--bmc-timeout <secs>`
 - `--ic3-timeout <secs>`
 - `--ic3`
+- `--cvc5-sygus`
 - `--no-prop-verify`
 - `--no-fn-verify`
 - `--no-relational-symmetry-breaking`
@@ -90,9 +91,10 @@ Selected flags:
 
 `--solver cvc5` can use cvc5 for supported SMT checks. In-process cvc5
 SyGuS invariant synthesis is disabled by default because the cvc5 Rust API
-does not provide a hard cancellation hook; unsupported or disabled SyGuS paths
-report `Unknown`/`Unprovable` diagnostics rather than hanging or claiming a
-proof. Set `ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1` only for isolated opt-in runs.
+does not provide a hard cancellation hook. Use `--solver cvc5 --cvc5-sygus`
+or `--solver both --cvc5-sygus` only for isolated proof experiments. Unsupported
+SyGuS fragments report `Unprovable` under `--unbounded-only`; otherwise the
+verifier falls back to the ordinary bounded tiers instead of claiming a proof.
 
 Relation counterexamples use the normal verify result path. With relational
 witness evidence available, human output shows derived tuple sets and JSON

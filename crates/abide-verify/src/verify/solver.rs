@@ -442,6 +442,7 @@ pub trait SolverBackend {
     fn int_gt(ctx: &Self::Context, a: &Self::Int, b: &Self::Int) -> Self::Bool;
     fn int_ge(ctx: &Self::Context, a: &Self::Int, b: &Self::Int) -> Self::Bool;
     fn int_ite(ctx: &Self::Context, cond: &Self::Bool, t: &Self::Int, e: &Self::Int) -> Self::Int;
+    fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real;
 
     // ── Real operations ─────────────────────────────────────────────
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real;
@@ -759,6 +760,10 @@ impl SolverBackend for Z3Backend {
 
     fn int_ite(_ctx: &Self::Context, cond: &Z3Bool, t: &Z3Int, e: &Z3Int) -> Z3Int {
         cond.ite(t, e)
+    }
+
+    fn int_to_real(_ctx: &Self::Context, a: &Z3Int) -> Z3Real {
+        a.to_real()
     }
 
     // ── Real operations ─────────────────────────────────────────────
@@ -1340,6 +1345,10 @@ impl SolverBackend for Cvc5Backend {
             Cvc5Kind::CVC5_KIND_ITE,
             &[cond.clone(), t.clone(), e.clone()],
         )
+    }
+
+    fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real {
+        ctx.tm.mk_term(Cvc5Kind::CVC5_KIND_TO_REAL, &[a.clone()])
     }
 
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real {
@@ -2443,6 +2452,19 @@ impl SolverBackend for RuntimeBackend {
             ) => RuntimeInt::Cvc5(Cvc5Backend::int_ite(ctx, cond, t, e)),
             (RuntimeContext::Z3(_), _, _, _) => panic_mixed_solver_terms(SolverFamily::Z3),
             (RuntimeContext::Cvc5(_), _, _, _) => panic_mixed_solver_terms(SolverFamily::Cvc5),
+        }
+    }
+
+    fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real {
+        match (ctx, a) {
+            (RuntimeContext::Z3(ctx), RuntimeInt::Z3(a)) => {
+                RuntimeReal::Z3(Z3Backend::int_to_real(ctx, a))
+            }
+            (RuntimeContext::Cvc5(ctx), RuntimeInt::Cvc5(a)) => {
+                RuntimeReal::Cvc5(Cvc5Backend::int_to_real(ctx, a))
+            }
+            (RuntimeContext::Z3(_), _) => panic_mixed_solver_terms(SolverFamily::Z3),
+            (RuntimeContext::Cvc5(_), _) => panic_mixed_solver_terms(SolverFamily::Cvc5),
         }
     }
 

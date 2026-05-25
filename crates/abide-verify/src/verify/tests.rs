@@ -35,6 +35,14 @@ fn bool_lit(value: bool) -> IRExpr {
     }
 }
 
+fn int_lit(value: i64) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Int,
+        value: LitVal::Int { value },
+        span: None,
+    }
+}
+
 macro_rules! require_unbounded_proof_tests {
     () => {
         if !should_run_unbounded_proof_tests() {
@@ -224,6 +232,7 @@ fn verification_panic_boundary_preserves_success_result() {
         VerificationResult::Checked {
             name: "ok_case".to_owned(),
             depth: 1,
+            method: None,
             time_ms: 0,
             assumptions: vec![],
             span: None,
@@ -11052,6 +11061,7 @@ fn theorem_by_file_is_admitted_with_proof_artifact_evidence() {
     let rendered = format!("{}", results[0]);
     assert!(rendered.contains("ADMITTED crypto_safe"));
     assert!(rendered.contains("proof artifact: proofs/crypto.agda"));
+    assert!(rendered.contains("unchecked trusted proof artifact reference"));
 }
 
 #[test]
@@ -11099,6 +11109,14 @@ fn axiom_by_file_is_disclosed_in_result_assumptions() {
     assert_eq!(proof_artifact.locator(), "proofs/crypto.agda");
     assert_eq!(proof_artifact.backend_name(), Some("agda"));
     assert_eq!(proof_artifact.label_text(), Some("crypto_safe"));
+    assert!(!proof_artifact.is_checked());
+
+    let rendered = format!("{}", results[0]);
+    assert!(
+        rendered
+            .contains("axiom crypto_safe by \"proofs/crypto.agda\" (unchecked trusted reference)"),
+        "axiom by-file assumption should disclose unchecked trust boundary: {rendered}"
+    );
 }
 
 #[test]
@@ -16205,6 +16223,191 @@ fn prop_auto_verified_when_false() {
     );
 }
 
+fn make_delayed_prop_failure_ir() -> IRProgram {
+    let counter_ty = IRType::Entity {
+        name: "Counter".to_owned(),
+    };
+    let counter_var = IRExpr::Var {
+        name: "c".to_owned(),
+        ty: counter_ty.clone(),
+        span: None,
+    };
+    let counter_n = IRExpr::Field {
+        expr: Box::new(counter_var),
+        field: "n".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let entity = IREntity {
+        name: "Counter".to_owned(),
+        fields: vec![IRField {
+            name: "n".to_owned(),
+            ty: IRType::Int,
+            default: Some(int_lit(0)),
+            initial_constraint: None,
+        }],
+        transitions: vec![IRTransition {
+            name: "inc".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: IRExpr::BinOp {
+                op: "OpLt".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name: "n".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(int_lit(4)),
+                ty: IRType::Bool,
+                span: None,
+            },
+            updates: vec![IRUpdate {
+                field: "n".to_owned(),
+                value: IRExpr::BinOp {
+                    op: "OpAdd".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: "n".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    right: Box::new(int_lit(1)),
+                    ty: IRType::Int,
+                    span: None,
+                },
+            }],
+            postcondition: None,
+        }],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+    let system = IRSystem {
+        name: "S".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Counter".to_owned()],
+        commands: vec![],
+        actions: vec![
+            IRSystemAction {
+                name: "create_counter".to_owned(),
+                params: vec![],
+                guard: bool_lit(true),
+                body: vec![IRAction::Create {
+                    entity: "Counter".to_owned(),
+                    fields: vec![],
+                }],
+                return_expr: None,
+            },
+            IRSystemAction {
+                name: "inc_counter".to_owned(),
+                params: vec![],
+                guard: bool_lit(true),
+                body: vec![IRAction::Choose {
+                    var: "c".to_owned(),
+                    entity: "Counter".to_owned(),
+                    filter: Box::new(bool_lit(true)),
+                    ops: vec![IRAction::Apply {
+                        target: "c".to_owned(),
+                        transition: "inc".to_owned(),
+                        refs: vec![],
+                        args: vec![],
+                    }],
+                }],
+                return_expr: None,
+            },
+        ],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let prop_body = IRExpr::Forall {
+        var: "c".to_owned(),
+        domain: counter_ty,
+        body: Box::new(IRExpr::BinOp {
+            op: "OpLt".to_owned(),
+            left: Box::new(counter_n),
+            right: Box::new(int_lit(3)),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        span: None,
+    };
+
+    IRProgram {
+        types: vec![],
+        constants: vec![],
+        functions: vec![IRFunction {
+            name: "counter_below_three".to_owned(),
+            ty: IRType::Bool,
+            body: prop_body,
+            prop_target: Some("S".to_owned()),
+            requires: vec![],
+            ensures: vec![],
+            decreases: None,
+            span: None,
+            file: None,
+        }],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    }
+}
+
+#[test]
+fn prop_bmc_depth_controls_bounded_prop_verification() {
+    let ir = make_delayed_prop_failure_ir();
+    let shallow = verify_all(
+        &ir,
+        &VerifyConfig {
+            bounded_only: true,
+            prop_bmc_depth: 3,
+            ..VerifyConfig::default()
+        },
+    );
+    assert_eq!(shallow.len(), 1);
+    assert!(
+        matches!(
+            &shallow[0],
+            VerificationResult::Checked { name, depth, .. }
+                if name == "prop_counter_below_three" && *depth == 3
+        ),
+        "shallow prop BMC should report CHECKED at configured depth 3: got {}",
+        shallow[0]
+    );
+    assert!(
+        shallow[0].to_string().contains("depth: 3"),
+        "user-facing report should disclose configured prop BMC depth: got {}",
+        shallow[0]
+    );
+
+    let deep = verify_all(
+        &ir,
+        &VerifyConfig {
+            bounded_only: true,
+            prop_bmc_depth: 4,
+            ..VerifyConfig::default()
+        },
+    );
+    assert_eq!(deep.len(), 1);
+    assert!(
+        matches!(
+            &deep[0],
+            VerificationResult::Counterexample { name, .. }
+                if name == "prop_counter_below_three"
+        ),
+        "deeper prop BMC should find the delayed failure: got {}",
+        deep[0]
+    );
+}
+
 // ── Multi-apply sequential composition tests ──────────────────
 
 #[test]
@@ -18929,6 +19132,59 @@ fn verify_all_with_cvc5_chc_selection_is_honest_about_current_chc_limit() {
 }
 
 #[test]
+fn verify_all_with_cvc5_selection_does_not_use_sygus_without_opt_in() {
+    let ir = make_system_field_counter_ir();
+    let config = VerifyConfig {
+        solver_selection: SolverSelection::Cvc5,
+        unbounded_only: true,
+        no_ic3: true,
+        cvc5_sygus: false,
+        ..short_solver_regression_config()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        results.iter().all(|result| !matches!(
+            result,
+            VerificationResult::Proved { method, .. }
+                if method == "CVC5 SyGuS invariant synthesis"
+        )),
+        "default cvc5 verify path should not use SyGuS without explicit opt-in: {results:?}"
+    );
+}
+
+#[test]
+fn verify_all_with_cvc5_sygus_opt_in_reports_unsupported_fragments() {
+    let mut ir = make_system_field_counter_ir();
+    ir.systems[0].queries.push(IRQuery {
+        name: "is_non_negative".to_owned(),
+        params: vec![],
+        requires: vec![],
+        body: bool_lit(true),
+    });
+    let config = VerifyConfig {
+        solver_selection: SolverSelection::Cvc5,
+        unbounded_only: true,
+        no_ic3: true,
+        cvc5_sygus: true,
+        ..short_solver_regression_config()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("cvc5 SyGuS opt-in")
+                    && hint.contains("does not support queries/preds/let-bindings")
+        ),
+        "explicit cvc5 SyGuS opt-in should report unsupported fragments honestly: {results:?}"
+    );
+}
+
+#[test]
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_supported_system_field_safety_via_sygus() {
     let ir = make_system_field_counter_ir();
@@ -18936,6 +19192,7 @@ fn verify_all_with_cvc5_selection_proves_supported_system_field_safety_via_sygus
         solver_selection: SolverSelection::Cvc5,
         unbounded_only: true,
         no_ic3: true,
+        cvc5_sygus: true,
         ..short_solver_regression_config()
     };
 

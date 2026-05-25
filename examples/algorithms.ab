@@ -50,14 +50,13 @@ fn ack(m: int, n: int): int
 
 // --- Decreases * escape hatch ---
 
-fn collatz_steps(n: int): int
+fn countdown_unchecked(n: int): int
   requires n > 0
   decreases *
 {
   match n {
     _ if n == 1 => 0
-    _ if n % 2 == 0 => 1 + collatz_steps(n / 2)
-    _ => 1 + collatz_steps(3 * n + 1)
+    _ => 1 + countdown_unchecked(n - 1)
   }
 }
 

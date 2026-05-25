@@ -3005,14 +3005,9 @@ pub(super) fn encode_prop_value(
 
             Ok(SmtValue::Array(arr))
         }
-        IRExpr::SetComp { domain, .. } => {
-            // Non-entity domain — should be caught by find_unsupported_scene_expr,
-            // but if reached (e.g., manually constructed IR), return a fresh
-            // unconstrained array rather than panicking.
-            let sort = ir_type_to_prop_sort(vctx, domain);
-            let false_val = smt::bool_val(false).to_dynamic();
-            Ok(SmtValue::Array(smt::const_array(&sort, &false_val)))
-        }
+        IRExpr::SetComp { domain, .. } => Err(format!(
+            "unsupported SetComp domain in verifier property encoding: {domain:?}"
+        )),
         // arithmetic aggregators over entity pools.
         //
         // For entity domains, unfold over all slots:
@@ -4223,6 +4218,37 @@ mod tests {
             solver.assert(smt::bool_not(&encoded));
             assert_eq!(solver.check(), SatResult::Unsat);
         }
+    }
+
+    #[test]
+    fn encode_prop_value_rejects_unsupported_setcomp_domain_instead_of_empty_set() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let real_set = IRExpr::SetComp {
+            var: "x".to_owned(),
+            domain: IRType::Real,
+            source: None,
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(IRType::Real),
+            },
+            span: None,
+        };
+
+        let err = encode_prop_value_with_ctx(&pool, &vctx, &defs, &ctx, &real_set, 0)
+            .expect_err("unsupported set-comprehension domains must not encode as empty sets");
+        assert!(
+            err.contains("unsupported SetComp domain"),
+            "diagnostic should name the unsupported SetComp domain, got: {err}"
+        );
     }
 
     #[test]

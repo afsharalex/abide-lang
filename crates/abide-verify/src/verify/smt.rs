@@ -368,6 +368,11 @@ pub fn real_ge(a: &Real, b: &Real) -> Bool {
     backend!(real_ge, a, b)
 }
 
+/// Lift an integer SMT term into the real sort.
+pub fn int_to_real(i: &Int) -> Real {
+    backend!(int_to_real, i)
+}
+
 // ── Quantifiers ─────────────────────────────────────────────────────
 
 /// Universal quantifier: forall bound. body.
@@ -1010,6 +1015,12 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
         (SmtValue::Int(x), SmtValue::Int(y)) => Ok(backend!(int_eq, x, y)),
         (SmtValue::Bool(x), SmtValue::Bool(y)) => Ok(backend!(bool_eq, x, y)),
         (SmtValue::Real(x), SmtValue::Real(y)) => Ok(backend!(real_eq, x, y)),
+        (SmtValue::Real(x), SmtValue::Int(y)) => {
+            Ok(backend!(real_eq, x, &backend!(int_to_real, y)))
+        }
+        (SmtValue::Int(x), SmtValue::Real(y)) => {
+            Ok(backend!(real_eq, &backend!(int_to_real, x), y))
+        }
         (SmtValue::Array(x), SmtValue::Array(y)) => Ok(backend!(array_eq, x, y.clone())),
         (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => Ok(backend!(dynamic_eq, x, y)),
         // Cross-variant: coerce both to Dynamic for generic equality
@@ -1051,6 +1062,14 @@ pub fn smt_ite(cond: &Bool, then_val: &SmtValue, else_val: &SmtValue) -> SmtValu
 
 // ── Binary operations ───────────────────────────────────────────────
 
+fn mixed_numeric_reals(lhs: &SmtValue, rhs: &SmtValue) -> Option<(Real, Real)> {
+    match (lhs, rhs) {
+        (SmtValue::Real(a), SmtValue::Int(b)) => Some((a.clone(), backend!(int_to_real, b))),
+        (SmtValue::Int(a), SmtValue::Real(b)) => Some((backend!(int_to_real, a), b.clone())),
+        _ => None,
+    }
+}
+
 /// Apply a binary operation to two `SmtValue`s.
 ///
 /// Returns the result as an `SmtValue`. Operand types must match.
@@ -1086,6 +1105,27 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
             Ok(SmtValue::Real(backend!(real_div, a, b)))
         }
 
+        // Arithmetic (mixed Int/Real): lift Int to Real.
+        (
+            "OpAdd" | "OpSub" | "OpMul" | "OpDiv",
+            SmtValue::Real(_) | SmtValue::Int(_),
+            SmtValue::Real(_) | SmtValue::Int(_),
+        ) if matches!(
+            (lhs, rhs),
+            (SmtValue::Real(_), SmtValue::Int(_)) | (SmtValue::Int(_), SmtValue::Real(_))
+        ) =>
+        {
+            let (a, b) = mixed_numeric_reals(lhs, rhs).expect("guard ensures mixed numeric pair");
+            let result = match op {
+                "OpAdd" => backend!(real_add, &[&a, &b]),
+                "OpSub" => backend!(real_sub, &[&a, &b]),
+                "OpMul" => backend!(real_mul, &[&a, &b]),
+                "OpDiv" => backend!(real_div, &a, &b),
+                _ => unreachable!("guard restricts mixed numeric arithmetic ops"),
+            };
+            Ok(SmtValue::Real(result))
+        }
+
         // Comparison (Int)
         ("OpEq", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_eq, a, b))),
         ("OpNEq", SmtValue::Int(a), SmtValue::Int(b)) => {
@@ -1114,6 +1154,29 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
         }
         ("OpGe", SmtValue::Real(a), SmtValue::Real(b)) => {
             Ok(SmtValue::Bool(backend!(real_ge, a, b)))
+        }
+
+        // Comparison (mixed Int/Real): lift Int to Real.
+        (
+            "OpEq" | "OpNEq" | "OpLt" | "OpLe" | "OpGt" | "OpGe",
+            SmtValue::Real(_) | SmtValue::Int(_),
+            SmtValue::Real(_) | SmtValue::Int(_),
+        ) if matches!(
+            (lhs, rhs),
+            (SmtValue::Real(_), SmtValue::Int(_)) | (SmtValue::Int(_), SmtValue::Real(_))
+        ) =>
+        {
+            let (a, b) = mixed_numeric_reals(lhs, rhs).expect("guard ensures mixed numeric pair");
+            let result = match op {
+                "OpEq" => backend!(real_eq, &a, &b),
+                "OpNEq" => backend!(bool_not, &backend!(real_eq, &a, &b)),
+                "OpLt" => backend!(real_lt, &a, &b),
+                "OpLe" => backend!(real_le, &a, &b),
+                "OpGt" => backend!(real_gt, &a, &b),
+                "OpGe" => backend!(real_ge, &a, &b),
+                _ => unreachable!("guard restricts mixed numeric comparison ops"),
+            };
+            Ok(SmtValue::Bool(result))
         }
 
         // Boolean (Bool)
@@ -1442,5 +1505,39 @@ mod tests {
             solver.assert(constraint);
         }
         assert_eq!(solver.check(), SatResult::Sat);
+    }
+
+    #[test]
+    fn binop_coerces_int_operands_for_mixed_real_comparisons() {
+        let result = binop("OpGe", &real_var("mixed_cmp_real"), &int_val(0))
+            .expect("real >= int should encode");
+        assert!(
+            matches!(result, SmtValue::Bool(_)),
+            "mixed real/int comparison should return Bool: {result:?}"
+        );
+
+        let result = binop("OpLt", &int_val(0), &real_var("mixed_cmp_real_rhs"))
+            .expect("int < real should encode");
+        assert!(
+            matches!(result, SmtValue::Bool(_)),
+            "mixed int/real comparison should return Bool: {result:?}"
+        );
+    }
+
+    #[test]
+    fn binop_coerces_int_operands_for_mixed_real_arithmetic() {
+        let result = binop("OpAdd", &real_var("mixed_arith_real"), &int_val(2))
+            .expect("real + int should encode");
+        assert!(
+            matches!(result, SmtValue::Real(_)),
+            "mixed real/int arithmetic should return Real: {result:?}"
+        );
+
+        let result = binop("OpMul", &int_val(3), &real_var("mixed_arith_real_rhs"))
+            .expect("int * real should encode");
+        assert!(
+            matches!(result, SmtValue::Real(_)),
+            "mixed int/real arithmetic should return Real: {result:?}"
+        );
     }
 }

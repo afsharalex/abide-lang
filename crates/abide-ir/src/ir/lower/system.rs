@@ -326,7 +326,17 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
                     lower_expr(expr, ctx),
                 ));
             }
-            _ => {}
+            E::EExternAssume::Fair(path, span) | E::EExternAssume::StrongFair(path, span) => {
+                ctx.push_error(
+                    format!(
+                        "extern `{}` fairness assumptions must reference a local command name; \
+                         got `{}`",
+                        ext.name,
+                        path.join("::")
+                    ),
+                    *span,
+                );
+            }
         }
     }
 
@@ -374,6 +384,7 @@ fn hidden_extern_pred_with_body(name: &str, body: IRExpr) -> IRFunction {
 
 /// lower an elaborated proc to its IR form.
 pub(super) fn lower_proc(p: &E::EProc, ctx: &LowerCtx<'_>) -> crate::ir::types::IRProc {
+    let requires = proc_requires_guard(p, ctx);
     crate::ir::types::IRProc {
         name: p.name.clone(),
         params: p
@@ -390,7 +401,7 @@ pub(super) fn lower_proc(p: &E::EProc, ctx: &LowerCtx<'_>) -> crate::ir::types::
                 }
             })
             .collect(),
-        requires: p.requires.as_ref().map(|expr| lower_expr(expr, ctx)),
+        requires,
         nodes: p
             .nodes
             .iter()
@@ -794,11 +805,21 @@ fn bool_or(left: IRExpr, right: IRExpr) -> IRExpr {
     }
 }
 
+fn proc_requires_guard(proc: &E::EProc, ctx: &LowerCtx<'_>) -> Option<IRExpr> {
+    let refinement_reqs = extract_param_refinements(&proc.params);
+    let mut all_requires: Vec<&E::EExpr> = refinement_reqs.iter().collect();
+    if let Some(req) = &proc.requires {
+        all_requires.push(req);
+    }
+    if all_requires.is_empty() {
+        None
+    } else {
+        Some(lower_guard_refs(&all_requires, ctx))
+    }
+}
+
 fn proc_start_guard(proc: &E::EProc, ctx: &LowerCtx<'_>) -> IRExpr {
-    proc.requires.as_ref().map_or_else(
-        || bool_lit_expr(true, proc.span),
-        |req| lower_expr(req, ctx),
-    )
+    proc_requires_guard(proc, ctx).unwrap_or_else(|| bool_lit_expr(true, proc.span))
 }
 
 fn entity_field_expr(field_name: &str, ty: IRType, span: Option<crate::span::Span>) -> IRExpr {
@@ -966,6 +987,10 @@ pub(super) fn lower_query(q: &E::EQuery, ctx: &LowerCtx<'_>) -> super::super::ty
                     ty: lower_ty(base_ty, ctx),
                 }
             })
+            .collect(),
+        requires: extract_param_refinements(&q.params)
+            .iter()
+            .map(|req| lower_expr(req, ctx))
             .collect(),
         body: lower_expr(&q.body, ctx),
     }

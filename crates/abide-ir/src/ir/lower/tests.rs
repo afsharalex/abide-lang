@@ -57,6 +57,169 @@ fn lower_expr_binop_propagates_span() {
 }
 
 #[test]
+fn lower_ty_treats_resolved_named_enum_as_enum_reference() {
+    let expr_variants = vec![
+        E::EVariant::Record(
+            "Lit".to_owned(),
+            vec![("value".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
+        ),
+        E::EVariant::Record(
+            "Neg".to_owned(),
+            vec![("inner".to_owned(), E::Ty::Named("Expr".to_owned()))],
+        ),
+    ];
+    let mut variants = VariantInfo::new();
+    variants.insert("Expr".to_owned(), expr_variants.as_slice());
+    let ctx = LowerCtx::new(&variants, std::collections::HashSet::new());
+
+    let lowered = lower_ty(&E::Ty::Named("Expr".to_owned()), &ctx);
+
+    let IRType::Enum { name, variants } = lowered else {
+        panic!("resolved named enum should lower to an enum reference");
+    };
+    assert_eq!(name, "Expr");
+    assert_eq!(variants.len(), 2);
+    assert!(
+        variants.iter().all(|variant| variant.fields.is_empty()),
+        "enum references should be shallow to avoid recursive type expansion"
+    );
+    assert!(
+        !ctx.diagnostics.borrow().has_errors(),
+        "resolved named enum references should not emit lower diagnostics"
+    );
+}
+
+#[test]
+fn lower_proc_and_query_preserve_parameter_refinement_predicates() {
+    let refinement_ty = E::Ty::Refinement(
+        Box::new(E::Ty::Builtin(E::BuiltinTy::Int)),
+        Box::new(E::EExpr::BinOp(
+            E::Ty::Builtin(E::BuiltinTy::Bool),
+            E::BinOp::Gt,
+            Box::new(E::EExpr::Var(
+                E::Ty::Builtin(E::BuiltinTy::Int),
+                "$".to_owned(),
+                None,
+            )),
+            Box::new(E::EExpr::Lit(
+                E::Ty::Builtin(E::BuiltinTy::Int),
+                E::Literal::Int(0),
+                None,
+            )),
+            None,
+        )),
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let proc = E::EProc {
+        name: "fulfill".to_owned(),
+        params: vec![("amount".to_owned(), refinement_ty.clone())],
+        requires: None,
+        nodes: vec![],
+        edges: vec![],
+        proc_uses: vec![],
+        span: None,
+    };
+    let lowered_proc = super::system::lower_proc(&proc, &ctx);
+
+    assert_eq!(lowered_proc.params[0].ty, IRType::Int);
+    assert!(
+        matches!(
+            lowered_proc.requires,
+            Some(IRExpr::BinOp { ref op, ref left, .. })
+                if op == "OpGt"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "proc parameter refinement should lower into requires guard: {:?}",
+        lowered_proc.requires
+    );
+
+    let query = E::EQuery {
+        name: "positive".to_owned(),
+        params: vec![("amount".to_owned(), refinement_ty)],
+        body: E::EExpr::Lit(
+            E::Ty::Builtin(E::BuiltinTy::Bool),
+            E::Literal::Bool(true),
+            None,
+        ),
+        span: None,
+    };
+    let lowered_query = super::system::lower_query(&query, &ctx);
+
+    assert_eq!(lowered_query.params[0].ty, IRType::Int);
+    assert!(
+        matches!(
+            lowered_query.requires.as_slice(),
+            [IRExpr::BinOp { op, left, .. }]
+                if op == "OpGt"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "query parameter refinement should lower into query preconditions: {:?}",
+        lowered_query.requires
+    );
+}
+
+#[test]
+fn lower_extern_reports_multi_segment_fairness_instead_of_dropping_it() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let span = Span { start: 10, end: 25 };
+    let ext = E::EExtern {
+        name: "Gateway".to_owned(),
+        commands: vec![
+            E::ECommand {
+                name: "authorize".to_owned(),
+                params: vec![],
+                return_type: None,
+                span: None,
+            },
+            E::ECommand {
+                name: "settle".to_owned(),
+                params: vec![],
+                return_type: None,
+                span: None,
+            },
+        ],
+        mays: vec![],
+        assumes: vec![
+            E::EExternAssume::Fair(
+                vec!["Gateway".to_owned(), "authorize".to_owned()],
+                Some(span),
+            ),
+            E::EExternAssume::StrongFair(
+                vec!["Gateway".to_owned(), "settle".to_owned()],
+                Some(span),
+            ),
+        ],
+        span: None,
+    };
+
+    let lowered = super::system::lower_extern(&ext, &ctx);
+    let diagnostics = ctx.take_diagnostics();
+
+    assert!(
+        diagnostics.has_errors(),
+        "multi-segment extern fairness must produce a lower diagnostic"
+    );
+    assert!(
+        diagnostics.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("fairness assumptions must reference a local command name")),
+        "expected actionable local-command diagnostic, got: {:?}",
+        diagnostics.diagnostics
+    );
+    assert!(
+        lowered
+            .preds
+            .iter()
+            .all(|pred| !pred.name.contains("Gateway")),
+        "multi-segment fairness should not synthesize misleading hidden preds: {:?}",
+        lowered.preds
+    );
+}
+
+#[test]
 fn lower_relation_join_uses_relation_ir() {
     let relation_ty =
         |left: E::Ty, right: E::Ty| E::Ty::Set(Box::new(E::Ty::Tuple(vec![left, right])));

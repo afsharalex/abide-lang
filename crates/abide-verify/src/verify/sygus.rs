@@ -9,8 +9,11 @@ use crate::ir::types::{
 };
 mod core;
 mod pooled;
+pub use self::core::try_cvc5_sygus_single_entity;
+#[cfg(test)]
+pub use self::core::try_cvc5_sygus_system_safety;
 use self::core::*;
-pub use self::core::{try_cvc5_sygus_single_entity, try_cvc5_sygus_system_safety};
+#[cfg(test)]
 pub use self::pooled::try_cvc5_sygus_multi_system_pooled_safety;
 #[cfg(test)]
 use self::pooled::*;
@@ -30,4 +33,36 @@ fn cvc5_sygus_disabled_reason() -> String {
     format!(
         "cvc5 SyGuS is disabled by default because the in-process cvc5 API does not provide a hard cancellation hook; set {CVC5_SYGUS_ENABLE_ENV}=1 to opt in"
     )
+}
+
+pub(super) fn try_cvc5_sygus_system_safety_opted_in(
+    system: &IRSystem,
+    property: &IRExpr,
+    timeout_ms: u64,
+) -> Ic3Result {
+    match core::try_cvc5_sygus_system_safety_inner(system, property, timeout_ms) {
+        Ok(()) => Ic3Result::Proved,
+        Err(err) => Ic3Result::Unknown(err),
+    }
+}
+
+pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_opted_in(
+    root_system: &IRSystem,
+    systems: &[IRSystem],
+    entities: &[IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+    property: &IRExpr,
+    timeout_ms: u64,
+) -> Ic3Result {
+    match pooled::try_cvc5_sygus_multi_system_pooled_safety_inner(
+        root_system,
+        systems,
+        entities,
+        slots_per_entity,
+        property,
+        timeout_ms,
+    ) {
+        Ok(()) => Ic3Result::Proved,
+        Err(err) => Ic3Result::Unknown(err),
+    }
 }

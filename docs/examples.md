@@ -1,6 +1,10 @@
 # Examples
 
-Curated examples live in [`abide-lang/examples/`](../examples/). Every example listed here parses on current `master`.
+Curated examples live in [`abide-lang/examples/`](../examples/). Every example listed here is intended to run under:
+
+```bash
+abide verify examples/<name>.ab --bounded-only
+```
 
 ## Minimal order lifecycle
 
@@ -127,6 +131,17 @@ Highlights:
 - `requires`, `ensures`, `decreases`
 - recursion and termination
 - imperative `var` / `while` / invariants
+
+## Proofs and external boundaries
+
+See: [`examples/proofs_and_boundaries.ab`](../examples/proofs_and_boundaries.ab)
+
+Highlights:
+- refinement type aliases and contract checking
+- lemma, axiom, and theorem result reporting
+- `by "..."` proof-artifact references as unchecked trusted references
+- liveness/fairness in bounded verification
+- extern `dep` declarations and disclosed extern assumptions
 
 ## Pattern matching
 

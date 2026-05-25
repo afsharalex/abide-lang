@@ -91,6 +91,33 @@ theorem shipped_orders_have_value =
 axiom external_fact = true by "proofs/external.agda"
 ```
 
+`by "..."` is a trusted proof-artifact reference. Abide records and reports the
+locator and inferred backend, but it does not check the external proof file in
+the current verifier pipeline; results disclose these as unchecked trusted
+references.
+
+## Extern Dependencies
+
+```abide
+extern Stripe {
+  command charge(order_id: int) -> Outcome
+  may charge { return @ok }
+}
+
+system Billing(orders: Store<Order>) {
+  dep Stripe
+
+  command submit(order: Order) {
+    Stripe::charge(order.id)
+  }
+}
+```
+
+`dep` declarations are validation-only metadata. They authorize calls from a
+system to a declared `extern`, but they do not import names, instantiate runtime
+objects, or add verifier assumptions by themselves. Extern behavior comes from
+the extern block's `may` clauses and from actual calls that appear in commands.
+
 ## Scenes
 
 ```abide

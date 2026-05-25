@@ -231,6 +231,20 @@ fn lower_ty(ty: &E::Ty, ctx: &LowerCtx<'_>) -> IRType {
         },
         E::Ty::Entity(n) => IRType::Entity { name: n.clone() },
         E::Ty::Named(n) => {
+            if let Some(elab_variants) = ctx.variants.get(n.as_str()) {
+                let variants = elab_variants
+                    .iter()
+                    .map(|variant| match variant {
+                        E::EVariant::Simple(name)
+                        | E::EVariant::Record(name, _)
+                        | E::EVariant::Param(name, _) => super::types::IRVariant::simple(name),
+                    })
+                    .collect();
+                return IRType::Enum {
+                    name: n.clone(),
+                    variants,
+                };
+            }
             ctx.push_error(format!("named type `{n}` reached IR lowering"), None);
             IRType::Int
         }
