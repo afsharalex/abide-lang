@@ -6,6 +6,9 @@ Curated examples live in [`abide-lang/examples/`](../examples/). Every example l
 abide verify examples/<name>.ab --bounded-only
 ```
 
+Intentional failure examples are listed separately at the end. Run them by
+target name because the expected outcome is a verifier failure.
+
 ## Minimal order lifecycle
 
 See: [`examples/order.ab`](../examples/order.ab)
@@ -143,6 +146,26 @@ Highlights:
 - liveness/fairness in bounded verification
 - extern `dep` declarations and disclosed extern assumptions
 
+## Advanced temporal operators
+
+See: [`examples/advanced_temporal.ab`](../examples/advanced_temporal.ab)
+
+Highlights:
+- `under { ... }` shared assumptions
+- `until`, `historically`, and `since`
+- extern-boundary `saw`
+- scene checking with observed extern calls
+
+## State modeling surface
+
+See: [`examples/state_modeling.ab`](../examples/state_modeling.ab)
+
+Highlights:
+- `interface` conformance
+- entity and system `invariant` declarations
+- `fsm` transition tables
+- `derived` fields
+
 ## Pattern matching
 
 See: [`examples/matching.ab`](../examples/matching.ab)
@@ -151,3 +174,22 @@ Highlights:
 - ADTs with payloads
 - guarded match arms
 - wildcard and rest patterns
+
+## Intentional failures
+
+See:
+- [`examples/intentional_failures.ab`](../examples/intentional_failures.ab)
+- [`examples/intentional_timeout.ab`](../examples/intentional_timeout.ab)
+
+Expected failure commands:
+
+```bash
+abide verify examples/intentional_failures.ab --target verify:violated_claim --bounded-only
+abide verify examples/intentional_failures.ab --target verify:violated_invariant --bounded-only
+abide verify examples/intentional_failures.ab --target verify:deadlocked_without_stutter --bounded-only
+abide verify examples/intentional_timeout.ab --target verify:large_scope_search --bounded-only --timeout 1
+```
+
+The first two commands demonstrate counterexamples, the third demonstrates
+deadlock reporting under explicit `no stutter`, and the timeout example is a
+budget-stress demo whose exact outcome depends on local solver speed.

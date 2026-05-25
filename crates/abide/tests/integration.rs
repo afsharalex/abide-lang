@@ -957,6 +957,7 @@ fn public_examples_verify_with_documented_bounded_command() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let examples = [
+        "examples/advanced_temporal.ab",
         "examples/algorithms.ab",
         "examples/banking.ab",
         "examples/collections.ab",
@@ -969,6 +970,7 @@ fn public_examples_verify_with_documented_bounded_command() {
         "examples/orchestration.ab",
         "examples/proofs_and_boundaries.ab",
         "examples/relations.ab",
+        "examples/state_modeling.ab",
     ];
 
     for example in examples {
@@ -983,6 +985,115 @@ fn public_examples_verify_with_documented_bounded_command() {
             "{example} should verify with documented bounded command\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn public_intentional_failure_examples_report_expected_outcomes() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let examples = [
+        (
+            "verify:violated_claim",
+            "examples/intentional_failures.ab",
+            "COUNTEREXAMPLE",
+        ),
+        (
+            "verify:violated_invariant",
+            "examples/intentional_failures.ab",
+            "COUNTEREXAMPLE",
+        ),
+        (
+            "verify:deadlocked_without_stutter",
+            "examples/intentional_failures.ab",
+            "DEADLOCK",
+        ),
+    ];
+
+    for (target, example, expected) in examples {
+        let output = std::process::Command::new(binary)
+            .args([
+                "verify",
+                example,
+                "--target",
+                target,
+                "--bounded-only",
+                "--timeout",
+                "30",
+            ])
+            .current_dir(&workspace_root)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run verifier for {example}: {error}"));
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !output.status.success(),
+            "{example} {target} is intentional and should fail\n{combined}"
+        );
+        assert!(
+            combined.contains(expected),
+            "{example} {target} should report {expected}\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn public_examples_cover_remaining_audit_constructs() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read_example = |path: &str| {
+        std::fs::read_to_string(workspace_root.join(path))
+            .unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+    };
+
+    let temporal = read_example("examples/advanced_temporal.ab");
+    let state = read_example("examples/state_modeling.ab");
+    let failures = read_example("examples/intentional_failures.ab");
+    let timeout = read_example("examples/intentional_timeout.ab");
+
+    for (label, haystack, needle) in [
+        ("under block", temporal.as_str(), "under {"),
+        ("until", temporal.as_str(), "until"),
+        ("historically", temporal.as_str(), "historically"),
+        ("since", temporal.as_str(), "since"),
+        ("saw", temporal.as_str(), "saw AuditLog::record"),
+        ("fsm", state.as_str(), "fsm status"),
+        ("derived", state.as_str(), "derived ready_to_ship"),
+        (
+            "entity invariant",
+            state.as_str(),
+            "invariant non_negative_sequence",
+        ),
+        (
+            "system invariant",
+            state.as_str(),
+            "invariant non_negative_sent",
+        ),
+        ("interface", state.as_str(), "interface NotificationBackend"),
+        (
+            "intentional violated claim",
+            failures.as_str(),
+            "verify violated_claim",
+        ),
+        (
+            "intentional invariant violation",
+            failures.as_str(),
+            "verify violated_invariant",
+        ),
+        (
+            "intentional deadlock",
+            failures.as_str(),
+            "verify deadlocked_without_stutter",
+        ),
+        ("intentional timeout", timeout.as_str(), "--timeout 1"),
+    ] {
+        assert!(
+            haystack.contains(needle),
+            "missing public example coverage for {label}: expected `{needle}`"
         );
     }
 }

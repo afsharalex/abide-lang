@@ -1,0 +1,72 @@
+module StateModeling
+
+// FSM, derived field, invariant, and interface examples.
+// This file is intended to pass under:
+//   abide verify examples/state_modeling.ab --bounded-only
+
+enum OrderStatus = Cart | Placed | Delivered
+
+interface NotificationBackend {
+  command send(recipient: string, body: string) -> string
+  query delivery_count() -> int
+}
+
+system SlackAdapter implements NotificationBackend {
+  sent: int = 0
+  invariant non_negative_sent { sent >= 0 }
+
+  command send(recipient: string, body: string) -> string {
+    sent' = sent + 1
+  }
+
+  query delivery_count() = sent
+}
+
+entity Order {
+  id: identity
+  sequence: int = 0
+  status: OrderStatus = @Cart
+  derived ready_to_ship = status == @Placed
+  invariant non_negative_sequence {
+    sequence >= 0
+  }
+
+  fsm status {
+    @Cart -> @Placed
+    @Placed -> @Delivered
+    @Delivered ->
+  }
+
+  action place()
+    requires status == @Cart {
+    status' = @Placed
+  }
+
+  action deliver()
+    requires status == @Placed {
+    status' = @Delivered
+  }
+}
+
+system Fulfillment(orders: Store<Order>) {
+  command place_one() {
+    choose o: Order where o.status == @Cart {
+      o.place()
+    }
+  }
+
+  command deliver_one() {
+    choose o: Order where o.status == @Placed {
+      o.deliver()
+    }
+  }
+}
+
+verify state_modeling_smoke {
+  assume {
+    store orders: Order[0..3]
+    let fulfillment = Fulfillment { orders: orders }
+    let slack = SlackAdapter {}
+  }
+  assert always all o: Order | o.status == @Delivered implies o.status != @Cart
+}

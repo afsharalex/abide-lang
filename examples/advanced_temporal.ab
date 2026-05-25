@@ -1,0 +1,80 @@
+module AdvancedTemporal
+
+// Temporal and shared-assumption examples.
+// This file is intended to pass under:
+//   abide verify examples/advanced_temporal.ab --bounded-only
+
+enum Phase = Start | Middle | Done
+enum Outcome = ok
+
+entity Job {
+  id: identity
+  phase: Phase = @Start
+
+  action advance()
+    requires phase == @Start {
+    phase' = @Middle
+  }
+
+  action finish()
+    requires phase == @Middle {
+    phase' = @Done
+  }
+}
+
+extern AuditLog {
+  command record(job_id: identity) -> Outcome
+  may record { return @ok }
+}
+
+system Workflow(jobs: Store<Job>) {
+  dep AuditLog
+
+  command advance_one() {
+    choose j: Job where j.phase == @Start {
+      j.advance()
+    }
+  }
+
+  command finish_one() {
+    choose j: Job where j.phase == @Middle {
+      j.finish()
+      AuditLog::record(j.id)
+    }
+  }
+}
+
+under {
+  fair Workflow::advance_one
+  fair Workflow::finish_one
+
+  lemma temporal_tautology {
+    true
+  }
+}
+
+verify until_and_history {
+  assume {
+    store jobs: Job[0..2]
+    let workflow = Workflow { jobs: jobs }
+    fair Workflow::advance_one
+    fair Workflow::finish_one
+  }
+  assert always (true until true)
+  assert historically true
+  assert always (true since true)
+}
+
+scene finish_records_audit {
+  given {
+    store jobs: Job[1]
+    let workflow = Workflow { jobs: jobs }
+    let j = one Job in jobs where j.phase == @Middle
+  }
+  when {
+    workflow.finish_one()
+  }
+  then {
+    assert saw AuditLog::record(j.id)
+  }
+}

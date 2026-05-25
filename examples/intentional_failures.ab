@@ -1,0 +1,63 @@
+module IntentionalFailures
+
+// Negative examples. These are not part of the green example corpus.
+// Run individual targets to see the expected failure class:
+//   abide verify examples/intentional_failures.ab --target verify:violated_claim --bounded-only
+//   abide verify examples/intentional_failures.ab --target verify:violated_invariant --bounded-only
+//   abide verify examples/intentional_failures.ab --target verify:deadlocked_without_stutter --bounded-only
+
+entity Account {
+  id: identity
+  balance: int = 0
+  invariant non_negative { balance >= 0 }
+
+  action overdraw()
+    requires balance == 0 {
+    balance' = -1
+  }
+}
+
+entity Marker {
+  id: identity
+  flag: bool = false
+}
+
+system Bank(accounts: Store<Account>) {
+  command break_invariant() {
+    choose a: Account where a.balance == 0 {
+      a.overdraw()
+    }
+  }
+}
+
+system Stuck(markers: Store<Marker>) {
+  command impossible()
+    requires false {
+    create Marker {}
+  }
+}
+
+verify violated_claim {
+  assume {
+    store markers: Marker[0..1]
+    let stuck = Stuck { markers: markers }
+  }
+  assert always false
+}
+
+verify violated_invariant {
+  assume {
+    store accounts: Account[1]
+    let bank = Bank { accounts: accounts }
+  }
+  assert always true
+}
+
+verify deadlocked_without_stutter {
+  assume {
+    store markers: Marker[0..1]
+    let stuck = Stuck { markers: markers }
+    no stutter
+  }
+  assert always all m: Marker | m.flag == false
+}

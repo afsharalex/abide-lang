@@ -1,0 +1,34 @@
+module IntentionalTimeout
+
+// Timeout demonstration. This file is intentionally not part of the green
+// corpus because timeout behavior depends on the machine and solver budget.
+// To force a timeout-style report for documentation or UI testing, run with
+// an intentionally tiny budget:
+//   abide verify examples/intentional_timeout.ab --target verify:large_scope_search --bounded-only --timeout 1
+//
+// If the local solver still finishes inside that budget, increase the store
+// bound below or lower the process-level timeout used by the surrounding test
+// harness. The specification itself is ordinary Abide; the timeout is caused
+// by the deliberately hostile command budget.
+
+entity Node {
+  id: identity
+  value: int = 0
+}
+
+system Graph(nodes: Store<Node>) {
+  command bump_all() {
+    for n: Node {
+      n.value' = n.value + 1
+    }
+  }
+}
+
+verify large_scope_search {
+  assume {
+    store nodes: Node[0..32]
+    let graph = Graph { nodes: nodes }
+  }
+  assert always all a: Node | all b: Node | all c: Node |
+    a.value + b.value + c.value >= -1000000
+}
