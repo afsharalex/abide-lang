@@ -19026,7 +19026,10 @@ fn format_assumptions_includes_axiom_proof_artifact_locator() {
         ),
     }];
     let result = super::format_assumptions(&a);
-    assert_eq!(result, " under axiom crypto_safe by \"proofs/crypto.agda\"");
+    assert_eq!(
+        result,
+        " under axiom crypto_safe by \"proofs/crypto.agda\" (unchecked trusted reference)"
+    );
 }
 
 #[test]
