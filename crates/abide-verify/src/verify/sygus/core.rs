@@ -1412,6 +1412,7 @@ pub(super) fn encode_expr(
             }
             encode_expr(tm, body, &local, enum_catalog)
         }
+        IRExpr::Prime { expr, .. } => encode_expr(tm, expr, vars, enum_catalog),
         IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
             encode_expr(tm, expr, vars, enum_catalog)
         }

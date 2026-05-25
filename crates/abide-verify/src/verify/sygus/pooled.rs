@@ -485,6 +485,62 @@ fn pool_slot_field_key(entity: &str, slot: usize, field: &str) -> String {
     format!("{entity}:{slot}:{field}")
 }
 
+#[cfg(test)]
+pub(super) fn encode_pooled_transition_at_slot_for_test(
+    tm: &Cvc5Tm,
+    trans: &IRTransition,
+    entity: &IREntity,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let mut active_curr = HashMap::new();
+    let mut active_next = HashMap::new();
+    active_curr.insert(
+        entity.name.clone(),
+        HashMap::from([(0usize, tm.mk_boolean(true))]),
+    );
+    active_next.insert(
+        entity.name.clone(),
+        HashMap::from([(0usize, tm.mk_boolean(true))]),
+    );
+
+    let mut slot_curr = HashMap::new();
+    let mut slot_next = HashMap::new();
+    for field in &entity.fields {
+        let sort = sort_for_field(tm, field, enum_catalog)?;
+        slot_curr.insert(
+            pool_slot_field_key(&entity.name, 0, &field.name),
+            tm.mk_var(sort.clone(), &format!("{}_0_{}", entity.name, field.name)),
+        );
+        slot_next.insert(
+            pool_slot_field_key(&entity.name, 0, &field.name),
+            tm.mk_var(sort, &format!("{}_0_{}_next", entity.name, field.name)),
+        );
+    }
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+    let store_param_types = HashMap::new();
+    let pool_ctx = PooledSyGuSCtx {
+        slots_per_entity: &slots_per_entity,
+        active_vars: &active_curr,
+        slot_fields: &slot_curr,
+        store_param_types: &store_param_types,
+    };
+
+    encode_pooled_transition_at_slot(
+        tm,
+        trans,
+        entity,
+        0,
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        &active_next,
+        &slot_curr,
+        &slot_next,
+        enum_catalog,
+        &pool_ctx,
+    )
+}
+
 fn frame_pooled_slot(
     tm: &Cvc5Tm,
     entity: &IREntity,
@@ -971,13 +1027,6 @@ fn encode_pooled_transition_at_slot(
             apply_args.len()
         ));
     }
-    if trans.postcondition.is_some() {
-        return Err(format!(
-            "cvc5 SyGuS pooled system safety does not support transition postconditions yet (`{}`)",
-            trans.name
-        ));
-    }
-
     let mut scoped = vars.clone();
     for field in &entity.fields {
         scoped.insert(
@@ -1040,6 +1089,32 @@ fn encode_pooled_transition_at_slot(
                 ],
             ),
         );
+    }
+    if let Some(postcondition) = &trans.postcondition {
+        let mut post_scoped = scoped.clone();
+        for field in &entity.fields {
+            post_scoped.insert(
+                field.name.clone(),
+                slot_next
+                    .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                    .ok_or_else(|| format!("missing next pooled field `{}`", field.name))?
+                    .clone(),
+            );
+        }
+        let next_pool_ctx = PooledSyGuSCtx {
+            slots_per_entity: pool_ctx.slots_per_entity,
+            active_vars: active_next,
+            slot_fields: slot_next,
+            store_param_types: pool_ctx.store_param_types,
+        };
+        conjuncts.push(encode_pooled_expr(
+            tm,
+            postcondition,
+            &post_scoped,
+            entity_bindings,
+            &next_pool_ctx,
+            enum_catalog,
+        )?);
     }
 
     Ok(mk_and(tm, &conjuncts))
@@ -2097,6 +2172,9 @@ fn encode_pooled_expr(
                 local.insert(binding.name.clone(), value);
             }
             encode_pooled_expr(tm, body, &local, entity_bindings, pool_ctx, enum_catalog)
+        }
+        IRExpr::Prime { expr, .. } => {
+            encode_pooled_expr(tm, expr, vars, entity_bindings, pool_ctx, enum_catalog)
         }
         IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
             encode_pooled_expr(tm, expr, vars, entity_bindings, pool_ctx, enum_catalog)

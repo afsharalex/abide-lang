@@ -436,6 +436,24 @@ fn sygus_expr_encoder_supports_finite_payload_enum_quantifiers() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_prime_wrappers() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::from([("x".to_owned(), tm.mk_var(tm.integer_sort(), "x"))]);
+    let enum_catalog = EnumCatalog::new();
+    let expr = IRExpr::Prime {
+        expr: Box::new(IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("prime wrapper should encode: {err}"));
+}
+
+#[test]
 fn sygus_param_enumerator_supports_finite_payload_enum_params() {
     let tm = Cvc5Tm::new();
     let decision_ty = IRType::Enum {
@@ -558,6 +576,26 @@ fn sygus_single_entity_transition_supports_postconditions() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("single-entity transition postcondition should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_transition_supports_postconditions() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_counter_entity();
+    entity.transitions[0].postcondition = Some(bin_expr(
+        "OpGe",
+        IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        },
+        int_lit(1),
+        IRType::Bool,
+    ));
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+
+    encode_pooled_transition_at_slot_for_test(&tm, &entity.transitions[0], &entity, &enum_catalog)
+        .unwrap_or_else(|err| panic!("pooled transition postcondition should encode: {err}"));
 }
 
 #[test]
