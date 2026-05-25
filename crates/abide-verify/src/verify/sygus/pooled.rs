@@ -1861,6 +1861,34 @@ fn encode_pooled_system_action(
             .map(|(name, binding)| (name.clone(), binding.term.clone())),
     );
     match action {
+        IRAction::ExprStmt { expr } => {
+            let store_param_types = system_store_param_types(system);
+            let pool_ctx = PooledSyGuSCtx {
+                slots_per_entity,
+                active_vars: active_curr,
+                slot_fields: slot_curr,
+                store_param_types: &store_param_types,
+            };
+            Ok(PooledActionResult {
+                formula: encode_pooled_system_exprstmt_formula(
+                    tm,
+                    expr,
+                    system,
+                    systems_by_name,
+                    entities_by_name,
+                    slots_per_entity,
+                    &merged_vars,
+                    next_vars,
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                    &pool_ctx,
+                    enum_catalog,
+                )?,
+                locals: local_bindings.clone(),
+            })
+        }
         IRAction::Create {
             entity: create_entity,
             fields,
@@ -3202,16 +3230,32 @@ fn encode_pooled_action_match(
     }
     let (prefix_formula, scrut_term, scrut_ty) = match scrutinee {
         crate::ir::types::IRActionMatchScrutinee::Var { name } => {
-            let binding = local_bindings.get(name).ok_or_else(|| {
-                format!(
-                    "cvc5 SyGuS pooled action match only supports var scrutinees from local cross-call results today (`{name}`)"
+            if let Some(binding) = local_bindings.get(name) {
+                (
+                    tm.mk_boolean(true),
+                    binding.term.clone(),
+                    binding.ty.clone(),
                 )
-            })?;
-            (
-                tm.mk_boolean(true),
-                binding.term.clone(),
-                binding.ty.clone(),
-            )
+            } else {
+                let scrut_term = vars.get(name).cloned().ok_or_else(|| {
+                    format!(
+                        "cvc5 SyGuS pooled action match only supports bound var scrutinees today (`{name}`)"
+                    )
+                })?;
+                let scrut_ty = system
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .map(|field| field.ty.clone())
+                    .or_else(|| {
+                        system
+                            .derived_fields
+                            .iter()
+                            .find(|field| field.name == *name)
+                            .map(|field| field.ty.clone())
+                    });
+                (tm.mk_boolean(true), scrut_term, scrut_ty)
+            }
         }
         crate::ir::types::IRActionMatchScrutinee::CrossCall {
             system: target_system_name,

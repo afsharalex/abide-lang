@@ -1262,6 +1262,97 @@ fn sygus_pooled_system_step_supports_inline_lambda_application_rhs() {
 }
 
 #[test]
+fn sygus_pooled_system_step_supports_action_match_on_system_field() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "status".to_owned(),
+        ty: status_ty(),
+        default: Some(status_ctor("Pending")),
+        initial_constraint: None,
+    });
+    system.fields.push(IRField {
+        name: "flag".to_owned(),
+        ty: IRType::Bool,
+        default: Some(bool_lit(false)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "match_status".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::Match {
+            scrutinee: crate::ir::types::IRActionMatchScrutinee::Var {
+                name: "status".to_owned(),
+            },
+            arms: vec![
+                crate::ir::types::IRActionMatchArm {
+                    pattern: crate::ir::types::IRPattern::PCtor {
+                        name: "Done".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: None,
+                    body: vec![IRAction::ExprStmt {
+                        expr: bin_expr(
+                            "OpEq",
+                            IRExpr::Prime {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "flag".to_owned(),
+                                    ty: IRType::Bool,
+                                    span: None,
+                                }),
+                                span: None,
+                            },
+                            bool_lit(true),
+                            IRType::Bool,
+                        ),
+                    }],
+                },
+                crate::ir::types::IRActionMatchArm {
+                    pattern: crate::ir::types::IRPattern::PWild,
+                    guard: None,
+                    body: vec![IRAction::ExprStmt {
+                        expr: bin_expr(
+                            "OpEq",
+                            IRExpr::Prime {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "flag".to_owned(),
+                                    ty: IRType::Bool,
+                                    span: None,
+                                }),
+                                span: None,
+                            },
+                            bool_lit(false),
+                            IRType::Bool,
+                        ),
+                    }],
+                },
+            ],
+        }],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled action match on system field should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_accepts_command_metadata_before_solver_setup() {
     let mut system = make_counter_system();
     system.commands.push(crate::ir::types::IRCommand {
