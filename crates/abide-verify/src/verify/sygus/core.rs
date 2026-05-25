@@ -818,15 +818,20 @@ pub(super) fn collect_system_updates(
     enum_catalog: &EnumCatalog,
 ) -> Result<HashMap<String, Cvc5Term>, String> {
     let mut updates = HashMap::new();
+    let mut staged_vars = curr_vars.clone();
     for action in &step.body {
-        updates.extend(collect_system_action_updates(
+        let action_updates = collect_system_action_updates(
             tm,
             action,
             fields,
-            curr_vars,
+            &staged_vars,
             enum_catalog,
             &step.name,
-        )?);
+        )?;
+        for (field, value) in action_updates {
+            staged_vars.insert(field.clone(), value.clone());
+            updates.insert(field, value);
+        }
     }
     Ok(updates)
 }

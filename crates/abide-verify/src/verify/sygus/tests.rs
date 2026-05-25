@@ -644,6 +644,103 @@ fn sygus_system_step_allows_unused_action_return_expr() {
 }
 
 #[test]
+fn sygus_system_step_stages_top_level_exprstmt_updates() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.fields.push(IRField {
+        name: "flag".to_owned(),
+        ty: IRType::Bool,
+        default: Some(bool_lit(false)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "stage_root".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![
+            crate::ir::types::IRAction::ExprStmt {
+                expr: bin_expr(
+                    "OpEq",
+                    IRExpr::Prime {
+                        expr: Box::new(IRExpr::Var {
+                            name: "x".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        }),
+                        span: None,
+                    },
+                    int_lit(1),
+                    IRType::Bool,
+                ),
+            },
+            crate::ir::types::IRAction::ExprStmt {
+                expr: bin_expr(
+                    "OpEq",
+                    IRExpr::Prime {
+                        expr: Box::new(IRExpr::Var {
+                            name: "flag".to_owned(),
+                            ty: IRType::Bool,
+                            span: None,
+                        }),
+                        span: None,
+                    },
+                    bin_expr(
+                        "OpEq",
+                        IRExpr::Var {
+                            name: "x".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                        int_lit(1),
+                        IRType::Bool,
+                    ),
+                    IRType::Bool,
+                ),
+            },
+        ],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("system ExprStmt sequence should encode: {err}"));
+    let updates = collect_system_updates(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &curr_vars,
+        &enum_catalog,
+    )
+    .expect("system ExprStmt sequence updates should collect");
+    let flag_rhs = updates
+        .get("flag")
+        .expect("flag should be updated")
+        .to_string();
+    assert!(
+        !flag_rhs.contains("x"),
+        "second top-level ExprStmt should read the staged x update, not current x: {flag_rhs}"
+    );
+}
+
+#[test]
 fn sygus_system_step_supports_action_match_on_system_field() {
     let tm = Cvc5Tm::new();
     let mut system = make_status_system();
