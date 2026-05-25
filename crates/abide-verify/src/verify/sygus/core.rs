@@ -63,6 +63,7 @@ impl EnumCatalog {
             })
     }
 
+    #[cfg(test)]
     pub(super) fn from_types(tm: &Cvc5Tm, types: &[IRType]) -> Result<Self, String> {
         let mut catalog = Self::new();
         for ty in types {
@@ -698,9 +699,12 @@ pub(super) fn encode_transition(
         if let Some(postcondition) = &trans.postcondition {
             let mut post_scoped = next_vars.clone();
             extend_with_derived_fields(tm, &mut post_scoped, derived_fields, enum_catalog)?;
-            post_scoped.extend(scoped.iter().filter_map(|(name, term)| {
-                (!curr_vars.contains_key(name)).then(|| (name.clone(), term.clone()))
-            }));
+            post_scoped.extend(
+                scoped
+                    .iter()
+                    .filter(|(name, _)| !curr_vars.contains_key(*name))
+                    .map(|(name, term)| (name.clone(), term.clone())),
+            );
             conjuncts.push(encode_expr(tm, postcondition, &post_scoped, enum_catalog)?);
         }
         param_branches.push(mk_and(tm, &conjuncts));

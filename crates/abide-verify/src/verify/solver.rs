@@ -1348,7 +1348,8 @@ impl SolverBackend for Cvc5Backend {
     }
 
     fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real {
-        ctx.tm.mk_term(Cvc5Kind::CVC5_KIND_TO_REAL, &[a.clone()])
+        ctx.tm
+            .mk_term(Cvc5Kind::CVC5_KIND_TO_REAL, std::slice::from_ref(a))
     }
 
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real {

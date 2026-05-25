@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashSet;
+
 use super::*;
 
 struct PooledSyGuSCtx<'a> {
@@ -553,6 +555,100 @@ pub(super) fn encode_pooled_transition_at_slot_for_test(
     )
 }
 
+#[cfg(test)]
+pub(super) fn encode_pooled_system_step_for_test(
+    tm: &Cvc5Tm,
+    step: &IRSystemAction,
+    system: &IRSystem,
+    entities: &[IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let systems_by_name = HashMap::from([(system.name.clone(), system)]);
+    let entities_by_name: HashMap<_, _> = entities
+        .iter()
+        .map(|entity| (entity.name.clone(), entity))
+        .collect();
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(tm, field, enum_catalog)?;
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+    extend_with_derived_fields(tm, &mut curr_vars, &system.derived_fields, enum_catalog)?;
+    extend_with_derived_fields(tm, &mut next_vars, &system.derived_fields, enum_catalog)?;
+
+    let mut active_curr = HashMap::new();
+    let mut active_next = HashMap::new();
+    let mut slot_curr = HashMap::new();
+    let mut slot_next = HashMap::new();
+    for entity in entities {
+        let n_slots = *slots_per_entity
+            .get(&entity.name)
+            .ok_or_else(|| format!("missing slot scope for `{}`", entity.name))?;
+        let mut per_active_curr = HashMap::new();
+        let mut per_active_next = HashMap::new();
+        for slot in 0..n_slots {
+            per_active_curr.insert(
+                slot,
+                tm.mk_var(
+                    tm.boolean_sort(),
+                    &format!("{}_{}_active", entity.name, slot),
+                ),
+            );
+            per_active_next.insert(
+                slot,
+                tm.mk_var(
+                    tm.boolean_sort(),
+                    &format!("{}_{}_active_next", entity.name, slot),
+                ),
+            );
+            for field in &entity.fields {
+                let sort = sort_for_field(tm, field, enum_catalog)?;
+                slot_curr.insert(
+                    pool_slot_field_key(&entity.name, slot, &field.name),
+                    tm.mk_var(
+                        sort.clone(),
+                        &format!("{}_{}_{}", entity.name, slot, field.name),
+                    ),
+                );
+                slot_next.insert(
+                    pool_slot_field_key(&entity.name, slot, &field.name),
+                    tm.mk_var(
+                        sort,
+                        &format!("{}_{}_{}_next", entity.name, slot, field.name),
+                    ),
+                );
+            }
+            extend_pooled_slot_with_derived_fields(tm, entity, slot, &mut slot_curr, enum_catalog)?;
+            extend_pooled_slot_with_derived_fields(tm, entity, slot, &mut slot_next, enum_catalog)?;
+        }
+        active_curr.insert(entity.name.clone(), per_active_curr);
+        active_next.insert(entity.name.clone(), per_active_next);
+    }
+
+    encode_pooled_system_step(
+        tm,
+        step,
+        system,
+        &systems_by_name,
+        &entities_by_name,
+        slots_per_entity,
+        &curr_vars,
+        &next_vars,
+        &active_curr,
+        &active_next,
+        &slot_curr,
+        &slot_next,
+        enum_catalog,
+        std::slice::from_ref(&system.name),
+    )
+}
+
 fn frame_pooled_slot(
     tm: &Cvc5Tm,
     entity: &IREntity,
@@ -677,6 +773,37 @@ fn frame_all_system_fields(
     let mut frames = Vec::new();
     for system in systems_by_name.values() {
         for field in &system.fields {
+            let curr = curr_vars.get(&field.name).ok_or_else(|| {
+                format!(
+                    "missing current system field `{}` for `{}`",
+                    field.name, system.name
+                )
+            })?;
+            let next = next_vars.get(&field.name).ok_or_else(|| {
+                format!(
+                    "missing next system field `{}` for `{}`",
+                    field.name, system.name
+                )
+            })?;
+            frames.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), curr.clone()]));
+        }
+    }
+    Ok(frames)
+}
+
+fn frame_system_fields_except(
+    tm: &Cvc5Tm,
+    systems_by_name: &HashMap<String, &IRSystem>,
+    curr_vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    touched: &HashSet<String>,
+) -> Result<Vec<Cvc5Term>, String> {
+    let mut frames = Vec::new();
+    for system in systems_by_name.values() {
+        for field in &system.fields {
+            if touched.contains(&field.name) {
+                continue;
+            }
             let curr = curr_vars.get(&field.name).ok_or_else(|| {
                 format!(
                     "missing current system field `{}` for `{}`",
@@ -1455,6 +1582,58 @@ fn encode_pooled_forall_action(
     Ok(mk_and(tm, &conjuncts))
 }
 
+fn encode_pooled_system_exprstmt_update(
+    tm: &Cvc5Tm,
+    expr: &IRExpr,
+    system: &IRSystem,
+    vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    enum_catalog: &EnumCatalog,
+) -> Result<(String, Cvc5Term), String> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = expr
+    else {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety expects primed equality statements (`{}`)",
+            system.name
+        ));
+    };
+    if op != "OpEq" && op != "==" {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety expects primed equality statements (`{}`)",
+            system.name
+        ));
+    }
+    let IRExpr::Prime { expr: primed, .. } = left.as_ref() else {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety expects a primed lhs in ExprStmt (`{}`)",
+            system.name
+        ));
+    };
+    let IRExpr::Var { name, .. } = primed.as_ref() else {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety only supports primed system field vars on the lhs (`{}`)",
+            system.name
+        ));
+    };
+    if !system.fields.iter().any(|field| field.name == *name) {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety can only update root system fields in `{}` (`{name}`)",
+            system.name
+        ));
+    }
+    let next = next_vars
+        .get(name)
+        .ok_or_else(|| format!("missing next system field `{name}` for `{}`", system.name))?;
+    let rhs = encode_pooled_expr(tm, right, vars, &HashMap::new(), pool_ctx, enum_catalog)?;
+    Ok((
+        name.clone(),
+        tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), rhs]),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_action(
     tm: &Cvc5Tm,
@@ -1816,13 +1995,13 @@ fn encode_pooled_system_step_with_param_envs(
             &pool_ctx,
             enum_catalog,
         )?];
-        conjuncts.extend(frame_all_system_fields(
-            tm,
-            systems_by_name,
-            curr_vars,
-            next_vars,
-        )?);
         let body_term = if step.body.is_empty() {
+            conjuncts.extend(frame_all_system_fields(
+                tm,
+                systems_by_name,
+                curr_vars,
+                next_vars,
+            )?);
             mk_and(
                 tm,
                 &frame_all_pooled_entities(
@@ -1836,25 +2015,76 @@ fn encode_pooled_system_step_with_param_envs(
                 )?,
             )
         } else if step.body.len() == 1 {
-            encode_pooled_system_action(
-                tm,
-                &step.body[0],
-                system,
-                systems_by_name,
-                entities_by_name,
-                slots_per_entity,
-                &vars,
-                next_vars,
-                &HashMap::new(),
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                call_stack,
-            )?
-            .formula
+            if let IRAction::ExprStmt { expr } = &step.body[0] {
+                let (field_name, update) = encode_pooled_system_exprstmt_update(
+                    tm,
+                    expr,
+                    system,
+                    &vars,
+                    next_vars,
+                    &pool_ctx,
+                    enum_catalog,
+                )?;
+                let touched = HashSet::from([field_name]);
+                let mut expr_conjuncts = vec![update];
+                expr_conjuncts.extend(frame_system_fields_except(
+                    tm,
+                    systems_by_name,
+                    curr_vars,
+                    next_vars,
+                    &touched,
+                )?);
+                expr_conjuncts.extend(encode_fsm_constraints(
+                    tm,
+                    &system.fsm_decls,
+                    |field| touched.contains(field),
+                    &vars,
+                    next_vars,
+                    enum_catalog,
+                )?);
+                expr_conjuncts.extend(frame_all_pooled_entities(
+                    tm,
+                    entities_by_name,
+                    slots_per_entity,
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                )?);
+                mk_and(tm, &expr_conjuncts)
+            } else {
+                conjuncts.extend(frame_all_system_fields(
+                    tm,
+                    systems_by_name,
+                    curr_vars,
+                    next_vars,
+                )?);
+                encode_pooled_system_action(
+                    tm,
+                    &step.body[0],
+                    system,
+                    systems_by_name,
+                    entities_by_name,
+                    slots_per_entity,
+                    &vars,
+                    next_vars,
+                    &HashMap::new(),
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                    enum_catalog,
+                    call_stack,
+                )?
+                .formula
+            }
         } else {
+            conjuncts.extend(frame_all_system_fields(
+                tm,
+                systems_by_name,
+                curr_vars,
+                next_vars,
+            )?);
             let mut intermediate_active = Vec::new();
             let mut intermediate_slots = Vec::new();
             let mut bound = Vec::new();
