@@ -1419,6 +1419,45 @@ fn sum_bool_terms(tm: &Cvc5Tm, predicates: &[Cvc5Term]) -> Cvc5Term {
     acc
 }
 
+fn encode_finite_map_key_membership_expr<F>(
+    tm: &Cvc5Tm,
+    map_expr: &IRExpr,
+    candidate: &Cvc5Term,
+    vars: &HashMap<String, Cvc5Term>,
+    encode_with_vars: &mut F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    match map_expr {
+        IRExpr::MapLit { entries, .. } => {
+            let mut matches = Vec::with_capacity(entries.len());
+            for (key, _) in entries {
+                let key_term = encode_with_vars(key, vars)?;
+                matches.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[key_term, candidate.clone()]));
+            }
+            Ok(Some(mk_or(tm, &matches)))
+        }
+        IRExpr::MapUpdate { map, key, .. } => {
+            let prior = encode_finite_map_key_membership_expr(
+                tm,
+                map,
+                candidate,
+                vars,
+                encode_with_vars,
+            )?
+            .ok_or_else(|| {
+                "cvc5 SyGuS map update cardinality only supports finite MapLit/MapUpdate bases"
+                    .to_owned()
+            })?;
+            let key_term = encode_with_vars(key, vars)?;
+            let updated_key = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[key_term, candidate.clone()]);
+            Ok(Some(mk_or(tm, &[updated_key, prior])))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn encode_finite_source_membership<F>(
     tm: &Cvc5Tm,
     source: Option<&IRExpr>,
@@ -1512,6 +1551,33 @@ where
                     );
                 }
                 memberships.push(mk_or(tm, &matches));
+            }
+            Ok(sum_bool_terms(tm, &memberships))
+        }
+        IRExpr::MapUpdate {
+            ty: IRType::Map { key: key_ty, .. },
+            ..
+        } => {
+            let Some(candidates) = finite_domain_values(tm, key_ty, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS cardinality only supports finite Bool/enum map update keys today"
+                        .to_owned(),
+                );
+            };
+            let mut memberships = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let key_member = encode_finite_map_key_membership_expr(
+                    tm,
+                    expr,
+                    &candidate,
+                    vars,
+                    &mut encode_with_vars,
+                )?
+                .ok_or_else(|| {
+                    "cvc5 SyGuS cardinality only supports finite MapLit/MapUpdate expressions"
+                        .to_owned()
+                })?;
+                memberships.push(key_member);
             }
             Ok(sum_bool_terms(tm, &memberships))
         }
