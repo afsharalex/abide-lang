@@ -701,6 +701,44 @@ fn sygus_pooled_accepts_derived_fields_before_solver_setup() {
 }
 
 #[test]
+fn sygus_core_accepts_command_metadata_before_solver_setup() {
+    let mut system = make_counter_system();
+    system.commands.push(crate::ir::types::IRCommand {
+        name: "inc".to_owned(),
+        params: vec![],
+        return_type: None,
+    });
+    system.actions.clear();
+    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
+        .expect_err("empty system should still be rejected after command metadata setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "command metadata should pass setup before empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn sygus_pooled_accepts_command_metadata_before_solver_setup() {
+    let entity = make_counter_entity();
+    let mut system = make_pooled_store_counter_system();
+    system.commands.push(crate::ir::types::IRCommand {
+        name: "create_counter".to_owned(),
+        params: vec![],
+        return_type: None,
+    });
+    system.actions.clear();
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&system, &entity, 2, &non_negative_property(), 0)
+            .expect_err(
+                "empty pooled system should still be rejected after command metadata setup",
+            );
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled command metadata should pass setup before empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
 fn sygus_core_accepts_derived_fields_before_solver_setup() {
     let mut derived_entity = make_counter_entity();
     derived_entity
@@ -729,7 +767,7 @@ fn sygus_core_accepts_derived_fields_before_solver_setup() {
 
 #[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
-    use crate::ir::types::{IRCommand, IRFsm, IRStoreParam};
+    use crate::ir::types::{IRFsm, IRStoreParam};
 
     let mut fsm_entity = make_counter_entity();
     fsm_entity.fsm_decls.push(IRFsm {
@@ -761,16 +799,6 @@ fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
         .expect_err("entity pools unsupported");
     assert!(err.contains("entity pools"));
-
-    let mut system = make_counter_system();
-    system.commands.push(IRCommand {
-        name: "inc".to_owned(),
-        params: vec![],
-        return_type: None,
-    });
-    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
-        .expect_err("commands unsupported");
-    assert!(err.contains("command declarations"));
 
     let mut left = make_counter_system();
     left.name = "Left".to_owned();

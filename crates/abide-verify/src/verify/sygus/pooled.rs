@@ -158,11 +158,6 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             }
         }
     }
-    if !root_system.commands.is_empty() {
-        return Err(
-            "cvc5 SyGuS pooled system safety does not support command declarations yet".to_owned(),
-        );
-    }
     if !root_system.fsm_decls.is_empty()
         || entities.iter().any(|entity| !entity.fsm_decls.is_empty())
     {
@@ -180,12 +175,6 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
         );
     }
     for system in systems {
-        if !system.commands.is_empty() {
-            return Err(format!(
-                "cvc5 SyGuS pooled system safety does not support command declarations yet (`{}`)",
-                system.name
-            ));
-        }
         if !system.fsm_decls.is_empty() {
             return Err(format!(
                 "cvc5 SyGuS pooled system safety does not support FSM declarations yet (`{}`)",

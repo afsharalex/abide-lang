@@ -405,11 +405,6 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if !system.entities.is_empty() {
         return Err("cvc5 SyGuS system safety does not support entity pools yet".to_owned());
     }
-    if !system.commands.is_empty() {
-        return Err(
-            "cvc5 SyGuS system safety does not support command declarations yet".to_owned(),
-        );
-    }
     if !system.fsm_decls.is_empty() {
         return Err("cvc5 SyGuS system safety does not support FSM declarations yet".to_owned());
     }
