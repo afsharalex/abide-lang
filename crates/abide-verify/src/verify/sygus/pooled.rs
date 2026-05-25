@@ -1138,6 +1138,20 @@ fn encode_pooled_ops_for_target(
             }
             Ok(mk_or(tm, &branches))
         }
+        IRAction::ExprStmt { expr } => encode_pooled_entity_exprstmt_at_slot(
+            tm,
+            expr,
+            target_var,
+            target_entity,
+            target_slot,
+            vars,
+            entity_bindings,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+        ),
         other => Err(format!(
             "cvc5 SyGuS pooled system safety does not support nested op `{other:?}` yet"
         )),
@@ -1292,6 +1306,139 @@ fn encode_pooled_transition_at_slot(
         )?);
     }
 
+    Ok(mk_and(tm, &conjuncts))
+}
+
+fn exprstmt_target_field<'a>(expr: &'a IRExpr, target_var: &str) -> Result<&'a str, String> {
+    let IRExpr::BinOp {
+        op, left, right: _, ..
+    } = expr
+    else {
+        return Err(
+            "cvc5 SyGuS pooled system safety expects primed equality statements in nested ExprStmt"
+                .to_owned(),
+        );
+    };
+    if op != "OpEq" && op != "==" {
+        return Err(
+            "cvc5 SyGuS pooled system safety expects primed equality statements in nested ExprStmt"
+                .to_owned(),
+        );
+    }
+    let IRExpr::Prime { expr: primed, .. } = left.as_ref() else {
+        return Err(
+            "cvc5 SyGuS pooled system safety expects a primed lhs in nested ExprStmt".to_owned(),
+        );
+    };
+    match primed.as_ref() {
+        IRExpr::Field {
+            expr: receiver,
+            field,
+            ..
+        } => {
+            let IRExpr::Var { name, .. } = receiver.as_ref() else {
+                return Err(
+                    "cvc5 SyGuS pooled system safety only supports field updates on the selected entity variable"
+                        .to_owned(),
+                );
+            };
+            if name != target_var {
+                return Err(format!(
+                    "cvc5 SyGuS pooled system safety only supports nested ExprStmt updates on selected target `{target_var}`"
+                ));
+            }
+            Ok(field)
+        }
+        IRExpr::Var { name, .. } => Ok(name),
+        _ => Err(
+            "cvc5 SyGuS pooled system safety only supports primed entity fields in nested ExprStmt"
+                .to_owned(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_pooled_entity_exprstmt_at_slot(
+    tm: &Cvc5Tm,
+    expr: &IRExpr,
+    target_var: &str,
+    entity: &IREntity,
+    slot: usize,
+    vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
+    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    slot_curr: &HashMap<String, Cvc5Term>,
+    slot_next: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+) -> Result<Cvc5Term, String> {
+    let update_field = exprstmt_target_field(expr, target_var)?;
+    if !entity.fields.iter().any(|field| field.name == update_field) {
+        return Err(format!(
+            "cvc5 SyGuS pooled system safety cannot update unknown field `{update_field}` on `{}`",
+            entity.name
+        ));
+    }
+    let IRExpr::BinOp { right, .. } = expr else {
+        unreachable!("exprstmt_target_field checked nested ExprStmt shape");
+    };
+
+    let mut scoped = vars.clone();
+    for field in &entity.fields {
+        scoped.insert(
+            field.name.clone(),
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                .ok_or_else(|| format!("missing current pooled field `{}`", field.name))?
+                .clone(),
+        );
+    }
+    for derived in &entity.derived_fields {
+        scoped.insert(
+            derived.name.clone(),
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &derived.name))
+                .ok_or_else(|| format!("missing current pooled derived field `{}`", derived.name))?
+                .clone(),
+        );
+    }
+
+    let rhs = encode_pooled_expr(tm, right, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
+    let mut conjuncts = vec![active_next
+        .get(&entity.name)
+        .and_then(|slots| slots.get(&slot))
+        .ok_or_else(|| {
+            format!(
+                "missing next active variable for {} slot {slot}",
+                entity.name
+            )
+        })?
+        .clone()];
+    let mut next_scoped = HashMap::new();
+    for field in &entity.fields {
+        let next = slot_next
+            .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+            .ok_or_else(|| format!("missing next pooled field `{}`", field.name))?
+            .clone();
+        let value = if field.name == update_field {
+            rhs.clone()
+        } else {
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                .ok_or_else(|| format!("missing current pooled field `{}`", field.name))?
+                .clone()
+        };
+        conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), value]));
+        next_scoped.insert(field.name.clone(), next);
+    }
+    conjuncts.extend(encode_fsm_constraints(
+        tm,
+        &entity.fsm_decls,
+        |field| field == update_field,
+        &scoped,
+        &next_scoped,
+        enum_catalog,
+    )?);
     Ok(mk_and(tm, &conjuncts))
 }
 
