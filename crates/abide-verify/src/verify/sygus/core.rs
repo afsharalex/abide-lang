@@ -1419,6 +1419,39 @@ fn sum_bool_terms(tm: &Cvc5Tm, predicates: &[Cvc5Term]) -> Cvc5Term {
     acc
 }
 
+fn encode_finite_source_membership<F>(
+    tm: &Cvc5Tm,
+    source: Option<&IRExpr>,
+    candidate: &Cvc5Term,
+    vars: &HashMap<String, Cvc5Term>,
+    encode_with_vars: &mut F,
+) -> Result<Cvc5Term, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    let Some(source) = source else {
+        return Ok(tm.mk_boolean(true));
+    };
+    let elements = match source {
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+        _ => {
+            return Err(
+                "cvc5 SyGuS cardinality only supports finite literal sources for set comprehensions"
+                    .to_owned(),
+            );
+        }
+    };
+    let mut matches = Vec::with_capacity(elements.len());
+    for element in elements {
+        let element_term = encode_with_vars(element, vars)?;
+        matches.push(tm.mk_term(
+            Cvc5Kind::CVC5_KIND_EQUAL,
+            &[element_term, candidate.clone()],
+        ));
+    }
+    Ok(mk_or(tm, &matches))
+}
+
 pub(super) fn encode_finite_card_expr<F>(
     tm: &Cvc5Tm,
     expr: &IRExpr,
@@ -1490,12 +1523,6 @@ where
             projection,
             ..
         } => {
-            if source.is_some() {
-                return Err(
-                    "cvc5 SyGuS cardinality does not support sourced set comprehensions yet"
-                        .to_owned(),
-                );
-            }
             let Some(domain_values) = finite_domain_values(tm, domain, enum_catalog) else {
                 return Err(
                     "cvc5 SyGuS cardinality only supports finite Bool/enum set-comprehension domains"
@@ -1522,13 +1549,20 @@ where
                     for domain_value in &domain_values {
                         let mut scoped = vars.clone();
                         scoped.insert(var.clone(), domain_value.clone());
+                        let source_member = encode_finite_source_membership(
+                            tm,
+                            source.as_deref(),
+                            domain_value,
+                            vars,
+                            &mut encode_with_vars,
+                        )?;
                         let filter_term = encode_with_vars(filter, &scoped)?;
                         let projection_term = encode_with_vars(projection, &scoped)?;
                         let projection_eq = tm.mk_term(
                             Cvc5Kind::CVC5_KIND_EQUAL,
                             &[projection_term, projected_value.clone()],
                         );
-                        witnesses.push(mk_and(tm, &[filter_term, projection_eq]));
+                        witnesses.push(mk_and(tm, &[source_member, filter_term, projection_eq]));
                     }
                     memberships.push(mk_or(tm, &witnesses));
                 }
@@ -1538,8 +1572,16 @@ where
             let mut memberships = Vec::with_capacity(domain_values.len());
             for domain_value in domain_values {
                 let mut scoped = vars.clone();
+                let source_member = encode_finite_source_membership(
+                    tm,
+                    source.as_deref(),
+                    &domain_value,
+                    vars,
+                    &mut encode_with_vars,
+                )?;
                 scoped.insert(var.clone(), domain_value);
-                memberships.push(encode_with_vars(filter, &scoped)?);
+                let filter_term = encode_with_vars(filter, &scoped)?;
+                memberships.push(mk_and(tm, &[source_member, filter_term]));
             }
             Ok(sum_bool_terms(tm, &memberships))
         }
