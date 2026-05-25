@@ -2618,6 +2618,98 @@ fn sygus_pooled_system_step_supports_action_match_on_system_field() {
 }
 
 #[test]
+fn sygus_pooled_nested_ops_support_match_on_selected_entity_field() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_status_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.actions = vec![IRSystemAction {
+        name: "match_selected_counter".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::Choose {
+            var: "c".to_owned(),
+            entity: "Counter".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![IRAction::Match {
+                scrutinee: crate::ir::types::IRActionMatchScrutinee::Var {
+                    name: "status".to_owned(),
+                },
+                arms: vec![
+                    crate::ir::types::IRActionMatchArm {
+                        pattern: crate::ir::types::IRPattern::PCtor {
+                            name: "Done".to_owned(),
+                            fields: vec![],
+                        },
+                        guard: None,
+                        body: vec![IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Field {
+                                        expr: Box::new(IRExpr::Var {
+                                            name: "c".to_owned(),
+                                            ty: IRType::Entity {
+                                                name: "Counter".to_owned(),
+                                            },
+                                            span: None,
+                                        }),
+                                        field: "x".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    span: None,
+                                },
+                                int_lit(2),
+                                IRType::Bool,
+                            ),
+                        }],
+                    },
+                    crate::ir::types::IRActionMatchArm {
+                        pattern: crate::ir::types::IRPattern::PWild,
+                        guard: None,
+                        body: vec![IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Field {
+                                        expr: Box::new(IRExpr::Var {
+                                            name: "c".to_owned(),
+                                            ty: IRType::Entity {
+                                                name: "Counter".to_owned(),
+                                            },
+                                            span: None,
+                                        }),
+                                        field: "x".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    span: None,
+                                },
+                                int_lit(1),
+                                IRType::Bool,
+                            ),
+                        }],
+                    },
+                ],
+            }],
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled nested selected-entity match should encode: {err}"));
+}
+
+#[test]
 fn sygus_pooled_action_match_guards_can_read_let_crosscall_locals() {
     let tm = Cvc5Tm::new();
     let decision_ty = IRType::Enum {
@@ -3393,6 +3485,17 @@ fn make_pooled_counter_entity() -> IREntity {
         invariants: vec![],
         fsm_decls: vec![],
     }
+}
+
+fn make_pooled_status_counter_entity() -> IREntity {
+    let mut entity = make_pooled_counter_entity();
+    entity.fields.push(IRField {
+        name: "status".to_owned(),
+        ty: status_ty(),
+        default: Some(status_ctor("Pending")),
+        initial_constraint: None,
+    });
+    entity
 }
 
 fn make_pooled_counter_system() -> IRSystem {

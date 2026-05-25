@@ -1176,6 +1176,27 @@ fn encode_pooled_ops_for_target(
             }
             Ok(mk_or(tm, &branches))
         }
+        IRAction::Match { scrutinee, arms } => encode_pooled_ops_match_for_target(
+            tm,
+            target_var,
+            target_entity,
+            target_slot,
+            scrutinee,
+            arms,
+            _system,
+            _systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            vars,
+            entity_bindings,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+            _call_stack,
+        ),
         IRAction::ExprStmt { expr } => encode_pooled_entity_exprstmt_at_slot(
             tm,
             expr,
@@ -1194,6 +1215,170 @@ fn encode_pooled_ops_for_target(
             "cvc5 SyGuS pooled system safety does not support nested op `{other:?}` yet"
         )),
     }
+}
+
+fn pooled_target_scoped_vars(
+    entity: &IREntity,
+    slot: usize,
+    vars: &HashMap<String, Cvc5Term>,
+    slot_curr: &HashMap<String, Cvc5Term>,
+) -> Result<HashMap<String, Cvc5Term>, String> {
+    let mut scoped = vars.clone();
+    for field in &entity.fields {
+        scoped.insert(
+            field.name.clone(),
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                .ok_or_else(|| format!("missing current pooled field `{}`", field.name))?
+                .clone(),
+        );
+    }
+    for derived in &entity.derived_fields {
+        scoped.insert(
+            derived.name.clone(),
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &derived.name))
+                .ok_or_else(|| format!("missing current pooled derived field `{}`", derived.name))?
+                .clone(),
+        );
+    }
+    Ok(scoped)
+}
+
+fn pooled_target_var_type(entity: &IREntity, name: &str) -> Option<IRType> {
+    entity
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| field.ty.clone())
+        .or_else(|| {
+            entity
+                .derived_fields
+                .iter()
+                .find(|field| field.name == name)
+                .map(|field| field.ty.clone())
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_pooled_ops_match_for_target(
+    tm: &Cvc5Tm,
+    target_var: &str,
+    target_entity: &IREntity,
+    target_slot: usize,
+    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
+    arms: &[crate::ir::types::IRActionMatchArm],
+    system: &IRSystem,
+    systems_by_name: &HashMap<String, &IRSystem>,
+    entities_by_name: &HashMap<String, &IREntity>,
+    slots_per_entity: &HashMap<String, usize>,
+    vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
+    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    slot_curr: &HashMap<String, Cvc5Term>,
+    slot_next: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    call_stack: &[String],
+) -> Result<Cvc5Term, String> {
+    if arms.is_empty() {
+        return Err("cvc5 SyGuS pooled nested action match requires at least one arm".to_owned());
+    }
+    let base_vars = pooled_target_scoped_vars(target_entity, target_slot, vars, slot_curr)?;
+    let (scrut_term, scrut_ty) = match scrutinee {
+        crate::ir::types::IRActionMatchScrutinee::Var { name } => {
+            let term = base_vars.get(name).cloned().ok_or_else(|| {
+                format!(
+                    "cvc5 SyGuS pooled nested action match requires a bound scrutinee (`{name}`)"
+                )
+            })?;
+            (term, pooled_target_var_type(target_entity, name))
+        }
+        crate::ir::types::IRActionMatchScrutinee::CrossCall { .. } => {
+            return Err(
+                "cvc5 SyGuS pooled nested action match does not support cross-call scrutinees yet"
+                    .to_owned(),
+            );
+        }
+    };
+
+    let mut fallback = None;
+    for arm in arms.iter().rev() {
+        let mut arm_vars = base_vars.clone();
+        bind_pattern_vars(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            &mut arm_vars,
+            enum_catalog,
+        )?;
+        let pat_cond = encode_pattern_cond(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            enum_catalog,
+        )?;
+        let guard_cond = if let Some(guard) = &arm.guard {
+            encode_pooled_expr(
+                tm,
+                guard,
+                &arm_vars,
+                entity_bindings,
+                pool_ctx,
+                enum_catalog,
+            )?
+        } else {
+            tm.mk_boolean(true)
+        };
+        let arm_cond = mk_and(tm, &[pat_cond, guard_cond]);
+        let arm_body = encode_pooled_ops_for_target(
+            tm,
+            target_var,
+            target_entity,
+            target_slot,
+            &arm.body,
+            system,
+            systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            &arm_vars,
+            entity_bindings,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+            call_stack,
+        )?;
+        fallback = Some(match fallback {
+            None => {
+                if arm.guard.is_none()
+                    && matches!(
+                        arm.pattern,
+                        crate::ir::types::IRPattern::PWild
+                            | crate::ir::types::IRPattern::PVar { .. }
+                    )
+                {
+                    arm_body
+                } else {
+                    return Err(
+                        "cvc5 SyGuS pooled nested action match requires a final wildcard or var fallback arm"
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(else_term) => {
+                tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[arm_cond, arm_body, else_term])
+            }
+        });
+    }
+
+    fallback
+        .ok_or_else(|| "cvc5 SyGuS pooled nested action match required at least one arm".to_owned())
 }
 
 fn encode_pooled_transition_at_slot(
