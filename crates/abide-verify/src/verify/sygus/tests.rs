@@ -91,6 +91,14 @@ fn int_lit(value: i64) -> IRExpr {
     }
 }
 
+fn real_lit(value: f64) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Real,
+        value: LitVal::Real { value },
+        span: None,
+    }
+}
+
 fn bool_lit(value: bool) -> IRExpr {
     IRExpr::Lit {
         ty: IRType::Bool,
@@ -175,6 +183,17 @@ fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
         encode_expr(&tm, &expr, &vars, &enum_catalog)
             .unwrap_or_else(|err| panic!("finite SyGuS expression should encode: {err}"));
     }
+}
+
+#[test]
+fn sygus_expr_encoder_supports_real_literals_and_arithmetic() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+    let expr = bin_expr("OpDiv", real_lit(3.0), real_lit(2.0), IRType::Real);
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("real literal arithmetic should encode: {err}"));
 }
 
 #[test]
@@ -738,6 +757,72 @@ fn sygus_system_step_stages_top_level_exprstmt_updates() {
         !flag_rhs.contains("x"),
         "second top-level ExprStmt should read the staged x update, not current x: {flag_rhs}"
     );
+}
+
+#[test]
+fn sygus_system_step_supports_real_fields_and_arithmetic() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.fields = vec![IRField {
+        name: "balance".to_owned(),
+        ty: IRType::Real,
+        default: Some(real_lit(0.0)),
+        initial_constraint: None,
+    }];
+    system.actions = vec![IRSystemAction {
+        name: "deposit".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![crate::ir::types::IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "balance".to_owned(),
+                        ty: IRType::Real,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                bin_expr(
+                    "OpAdd",
+                    IRExpr::Var {
+                        name: "balance".to_owned(),
+                        ty: IRType::Real,
+                        span: None,
+                    },
+                    real_lit(1.5),
+                    IRType::Real,
+                ),
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_initial_field(&tm, &system.fields[0], &curr_vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("real field default should encode: {err}"));
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("real field action should encode: {err}"));
 }
 
 #[test]

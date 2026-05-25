@@ -229,7 +229,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             enum_catalog.register_type(&tm, &derived.ty)?;
         }
     }
-    solver.set_logic(if enum_catalog.has_payload_enums() {
+    solver.set_logic(if requires_all_logic(&enum_catalog, &all_fields, &[]) {
         "ALL"
     } else {
         "LIA"
@@ -2879,9 +2879,10 @@ fn encode_pooled_expr(
     match expr {
         IRExpr::Lit { value, .. } => match value {
             LitVal::Int { value } => Ok(tm.mk_integer(*value)),
+            LitVal::Real { value } => real_lit_term(tm, *value),
             LitVal::Bool { value } => Ok(tm.mk_boolean(*value)),
-            LitVal::Real { .. } | LitVal::Float { .. } | LitVal::Str { .. } => Err(
-                "cvc5 SyGuS pooled system safety only supports integer and boolean literals today"
+            LitVal::Float { .. } | LitVal::Str { .. } => Err(
+                "cvc5 SyGuS pooled system safety only supports integer, real, and boolean literals today"
                     .to_owned(),
             ),
         },
@@ -2998,7 +2999,11 @@ fn encode_pooled_expr(
             }
         }
         IRExpr::BinOp {
-            op, left, right, ..
+            op,
+            left,
+            right,
+            ty,
+            ..
         } => {
             let lhs = encode_pooled_expr(tm, left, vars, entity_bindings, pool_ctx, enum_catalog)?;
             let rhs = encode_pooled_expr(tm, right, vars, entity_bindings, pool_ctx, enum_catalog)?;
@@ -3019,6 +3024,9 @@ fn encode_pooled_expr(
                 "OpAdd" | "+" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[lhs, rhs])),
                 "OpSub" | "-" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_SUB, &[lhs, rhs])),
                 "OpMul" | "*" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_MULT, &[lhs, rhs])),
+                "OpDiv" | "/" if matches!(ty, IRType::Real) => {
+                    Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_DIVISION, &[lhs, rhs]))
+                }
                 "OpDiv" | "/" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_DIVISION, &[lhs, rhs])),
                 "OpMod" | "%" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_MODULUS, &[lhs, rhs])),
                 _ => Err(format!(

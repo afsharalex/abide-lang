@@ -154,6 +154,7 @@ impl EnumCatalog {
     fn sort_for_payload_field(&self, tm: &Cvc5Tm, ty: &IRType) -> Result<Cvc5Sort, String> {
         match ty {
             IRType::Int => Ok(tm.integer_sort()),
+            IRType::Real => Ok(tm.real_sort()),
             IRType::Bool => Ok(tm.boolean_sort()),
             IRType::Enum { name, variants }
                 if variants.iter().all(|variant| variant.fields.is_empty()) =>
@@ -170,6 +171,36 @@ impl EnumCatalog {
             )),
         }
     }
+}
+
+fn type_uses_real(ty: &IRType) -> bool {
+    match ty {
+        IRType::Real => true,
+        IRType::Enum { variants, .. } => variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .any(|field| type_uses_real(&field.ty)),
+        _ => false,
+    }
+}
+
+pub(super) fn requires_all_logic(
+    enum_catalog: &EnumCatalog,
+    fields: &[IRField],
+    derived_fields: &[IRDerivedField],
+) -> bool {
+    enum_catalog.has_payload_enums()
+        || fields.iter().any(|field| type_uses_real(&field.ty))
+        || derived_fields.iter().any(|field| type_uses_real(&field.ty))
+}
+
+pub(super) fn real_lit_term(tm: &Cvc5Tm, value: f64) -> Result<Cvc5Term, String> {
+    if !value.is_finite() {
+        return Err("cvc5 SyGuS real literals must be finite".to_owned());
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = (value * 1_000_000.0) as i64;
+    Ok(tm.mk_real_from_rational(scaled, 1_000_000))
 }
 
 pub(super) fn lookup_enum_ctor_index<'a>(
@@ -288,11 +319,13 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     }
     let enum_catalog =
         build_enum_catalog_with_derived(&tm, &entity.fields, &entity.derived_fields)?;
-    solver.set_logic(if enum_catalog.has_payload_enums() {
-        "ALL"
-    } else {
-        "LIA"
-    });
+    solver.set_logic(
+        if requires_all_logic(&enum_catalog, &entity.fields, &entity.derived_fields) {
+            "ALL"
+        } else {
+            "LIA"
+        },
+    );
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -414,11 +447,13 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     }
     let enum_catalog =
         build_enum_catalog_with_derived(&tm, &system.fields, &system.derived_fields)?;
-    solver.set_logic(if enum_catalog.has_payload_enums() {
-        "ALL"
-    } else {
-        "LIA"
-    });
+    solver.set_logic(
+        if requires_all_logic(&enum_catalog, &system.fields, &system.derived_fields) {
+            "ALL"
+        } else {
+            "LIA"
+        },
+    );
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -600,6 +635,7 @@ pub(super) fn sort_for_field(
 ) -> Result<Cvc5Sort, String> {
     match &field.ty {
         IRType::Int => Ok(tm.integer_sort()),
+        IRType::Real => Ok(tm.real_sort()),
         IRType::Bool => Ok(tm.boolean_sort()),
         IRType::Enum { variants, .. }
             if variants.iter().all(|variant| variant.fields.is_empty()) =>
@@ -613,7 +649,7 @@ pub(super) fn sort_for_field(
             )
         }),
         _ => Err(format!(
-            "cvc5 SyGuS safety only supports Int/Bool/enum fields today (field `{}`)",
+            "cvc5 SyGuS safety only supports Int/Real/Bool/enum fields today (field `{}`)",
             field.name
         )),
     }
@@ -1639,9 +1675,10 @@ pub(super) fn encode_expr(
     match expr {
         IRExpr::Lit { value, .. } => match value {
             LitVal::Int { value } => Ok(tm.mk_integer(*value)),
+            LitVal::Real { value } => real_lit_term(tm, *value),
             LitVal::Bool { value } => Ok(tm.mk_boolean(*value)),
-            LitVal::Real { .. } | LitVal::Float { .. } | LitVal::Str { .. } => Err(
-                "cvc5 SyGuS single-entity safety only supports integer and boolean literals today"
+            LitVal::Float { .. } | LitVal::Str { .. } => Err(
+                "cvc5 SyGuS single-entity safety only supports integer, real, and boolean literals today"
                     .to_owned(),
             ),
         },
@@ -1691,7 +1728,11 @@ pub(super) fn encode_expr(
             }
         }
         IRExpr::BinOp {
-            op, left, right, ..
+            op,
+            left,
+            right,
+            ty,
+            ..
         } => {
             let lhs = encode_expr(tm, left, vars, enum_catalog)?;
             let rhs = encode_expr(tm, right, vars, enum_catalog)?;
@@ -1712,6 +1753,9 @@ pub(super) fn encode_expr(
                 "OpAdd" | "+" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[lhs, rhs])),
                 "OpSub" | "-" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_SUB, &[lhs, rhs])),
                 "OpMul" | "*" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_MULT, &[lhs, rhs])),
+                "OpDiv" | "/" if matches!(ty, IRType::Real) => {
+                    Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_DIVISION, &[lhs, rhs]))
+                }
                 "OpDiv" | "/" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_DIVISION, &[lhs, rhs])),
                 "OpMod" | "%" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_INTS_MODULUS, &[lhs, rhs])),
                 _ => Err(format!("unsupported binary op `{op}` in cvc5 SyGuS slice")),
