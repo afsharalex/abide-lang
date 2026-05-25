@@ -1769,6 +1769,21 @@ pub(super) fn encode_expr(
             }
             encode_expr(tm, body, &local, enum_catalog)
         }
+        IRExpr::Block { exprs, .. } => {
+            let mut last = tm.mk_boolean(true);
+            for expr in exprs {
+                last = encode_expr(tm, expr, vars, enum_catalog)?;
+            }
+            Ok(last)
+        }
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            let value = encode_expr(tm, init, vars, enum_catalog)?;
+            let mut local = vars.clone();
+            local.insert(name.clone(), value);
+            encode_expr(tm, rest, &local, enum_catalog)
+        }
         IRExpr::Prime { expr, .. } => encode_expr(tm, expr, vars, enum_catalog),
         IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
             encode_expr(tm, expr, vars, enum_catalog)

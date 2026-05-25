@@ -3049,6 +3049,35 @@ fn encode_pooled_expr(
             }
             encode_pooled_expr(tm, body, &local, entity_bindings, pool_ctx, enum_catalog)
         }
+        IRExpr::Block { exprs, .. } => {
+            let mut last = tm.mk_boolean(true);
+            for expr in exprs {
+                last = encode_pooled_expr(
+                    tm,
+                    expr,
+                    vars,
+                    entity_bindings,
+                    pool_ctx,
+                    enum_catalog,
+                )?;
+            }
+            Ok(last)
+        }
+        IRExpr::VarDecl {
+            name, init, rest, ..
+        } => {
+            let value = encode_pooled_expr(
+                tm,
+                init,
+                vars,
+                entity_bindings,
+                pool_ctx,
+                enum_catalog,
+            )?;
+            let mut local = vars.clone();
+            local.insert(name.clone(), value);
+            encode_pooled_expr(tm, rest, &local, entity_bindings, pool_ctx, enum_catalog)
+        }
         IRExpr::Prime { expr, .. } => {
             encode_pooled_expr(tm, expr, vars, entity_bindings, pool_ctx, enum_catalog)
         }

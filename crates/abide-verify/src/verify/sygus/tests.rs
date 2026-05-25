@@ -826,6 +826,76 @@ fn sygus_system_step_supports_real_fields_and_arithmetic() {
 }
 
 #[test]
+fn sygus_system_step_supports_block_and_vardecl_rhs() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions = vec![IRSystemAction {
+        name: "bind_then_update".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![crate::ir::types::IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Block {
+                    exprs: vec![
+                        bool_lit(true),
+                        IRExpr::VarDecl {
+                            name: "tmp".to_owned(),
+                            ty: IRType::Int,
+                            init: Box::new(int_lit(1)),
+                            rest: Box::new(bin_expr(
+                                "OpAdd",
+                                IRExpr::Var {
+                                    name: "tmp".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                },
+                                int_lit(1),
+                                IRType::Int,
+                            )),
+                            span: None,
+                        },
+                    ],
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("block/vardecl RHS should encode: {err}"));
+}
+
+#[test]
 fn sygus_system_step_supports_action_match_on_system_field() {
     let tm = Cvc5Tm::new();
     let mut system = make_status_system();
@@ -1683,6 +1753,79 @@ fn sygus_pooled_system_step_supports_inline_lambda_application_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("pooled inline lambda application RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_block_and_vardecl_rhs() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "total".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "bind_then_update".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "total".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Block {
+                    exprs: vec![
+                        bool_lit(true),
+                        IRExpr::VarDecl {
+                            name: "tmp".to_owned(),
+                            ty: IRType::Int,
+                            init: Box::new(int_lit(1)),
+                            rest: Box::new(bin_expr(
+                                "OpAdd",
+                                IRExpr::Var {
+                                    name: "tmp".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                },
+                                int_lit(1),
+                                IRType::Int,
+                            )),
+                            span: None,
+                        },
+                    ],
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled block/vardecl RHS should encode: {err}"));
 }
 
 #[test]
