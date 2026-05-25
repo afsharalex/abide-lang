@@ -1782,6 +1782,61 @@ fn encode_pooled_system_exprstmt_update(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_pooled_system_exprstmt_formula(
+    tm: &Cvc5Tm,
+    expr: &IRExpr,
+    system: &IRSystem,
+    systems_by_name: &HashMap<String, &IRSystem>,
+    entities_by_name: &HashMap<String, &IREntity>,
+    slots_per_entity: &HashMap<String, usize>,
+    curr_vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    slot_curr: &HashMap<String, Cvc5Term>,
+    slot_next: &HashMap<String, Cvc5Term>,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let (field_name, update) = encode_pooled_system_exprstmt_update(
+        tm,
+        expr,
+        system,
+        curr_vars,
+        next_vars,
+        pool_ctx,
+        enum_catalog,
+    )?;
+    let touched = HashSet::from([field_name]);
+    let mut conjuncts = vec![update];
+    conjuncts.extend(frame_system_fields_except(
+        tm,
+        systems_by_name,
+        curr_vars,
+        next_vars,
+        &touched,
+    )?);
+    conjuncts.extend(encode_fsm_constraints(
+        tm,
+        &system.fsm_decls,
+        |field| touched.contains(field),
+        curr_vars,
+        next_vars,
+        enum_catalog,
+    )?);
+    conjuncts.extend(frame_all_pooled_entities(
+        tm,
+        entities_by_name,
+        slots_per_entity,
+        active_curr,
+        active_next,
+        slot_curr,
+        slot_next,
+    )?);
+    Ok(mk_and(tm, &conjuncts))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_action(
     tm: &Cvc5Tm,
     action: &IRAction,
@@ -2163,42 +2218,22 @@ fn encode_pooled_system_step_with_param_envs(
             )
         } else if step.body.len() == 1 {
             if let IRAction::ExprStmt { expr } = &step.body[0] {
-                let (field_name, update) = encode_pooled_system_exprstmt_update(
+                encode_pooled_system_exprstmt_formula(
                     tm,
                     expr,
                     system,
-                    &vars,
-                    next_vars,
-                    &pool_ctx,
-                    enum_catalog,
-                )?;
-                let touched = HashSet::from([field_name]);
-                let mut expr_conjuncts = vec![update];
-                expr_conjuncts.extend(frame_system_fields_except(
-                    tm,
                     systems_by_name,
-                    curr_vars,
-                    next_vars,
-                    &touched,
-                )?);
-                expr_conjuncts.extend(encode_fsm_constraints(
-                    tm,
-                    &system.fsm_decls,
-                    |field| touched.contains(field),
-                    &vars,
-                    next_vars,
-                    enum_catalog,
-                )?);
-                expr_conjuncts.extend(frame_all_pooled_entities(
-                    tm,
                     entities_by_name,
                     slots_per_entity,
+                    &vars,
+                    next_vars,
                     active_curr,
                     active_next,
                     slot_curr,
                     slot_next,
-                )?);
-                mk_and(tm, &expr_conjuncts)
+                    &pool_ctx,
+                    enum_catalog,
+                )?
             } else {
                 conjuncts.extend(frame_all_system_fields(
                     tm,
@@ -2226,16 +2261,37 @@ fn encode_pooled_system_step_with_param_envs(
                 .formula
             }
         } else {
-            conjuncts.extend(frame_all_system_fields(
-                tm,
-                systems_by_name,
-                curr_vars,
-                next_vars,
-            )?);
+            let param_only_vars: HashMap<_, _> = vars
+                .iter()
+                .filter(|(name, _)| !curr_vars.contains_key(*name))
+                .map(|(name, term)| (name.clone(), term.clone()))
+                .collect();
             let mut intermediate_active = Vec::new();
             let mut intermediate_slots = Vec::new();
+            let mut intermediate_system_vars = Vec::new();
             let mut bound = Vec::new();
             for stage in 0..(step.body.len() - 1) {
+                let mut system_vars = HashMap::new();
+                for system in systems_by_name.values() {
+                    for field in &system.fields {
+                        let sort = sort_for_field(tm, field, enum_catalog)?;
+                        let name = format!(
+                            "__abide_sygus_{}_{}_inter{}",
+                            system.name, field.name, stage
+                        );
+                        let term = tm.mk_var(sort, &name);
+                        bound.push(term.clone());
+                        system_vars.insert(field.name.clone(), term);
+                    }
+                }
+                for system in systems_by_name.values() {
+                    extend_with_derived_fields(
+                        tm,
+                        &mut system_vars,
+                        &system.derived_fields,
+                        enum_catalog,
+                    )?;
+                }
                 let mut active_map = HashMap::new();
                 let mut slot_map = HashMap::new();
                 for (entity_name, n_slots) in slots_per_entity {
@@ -2265,11 +2321,12 @@ fn encode_pooled_system_step_with_param_envs(
                     }
                     active_map.insert(entity_name.clone(), per_slot);
                 }
+                intermediate_system_vars.push(system_vars);
                 intermediate_active.push(active_map);
                 intermediate_slots.push(slot_map);
             }
             let mut action_terms = Vec::new();
-            let mut locals = HashMap::new();
+            let mut locals: PooledLocalBindings = HashMap::new();
             for (idx, action) in step.body.iter().enumerate() {
                 let stage_active_curr = if idx == 0 {
                     active_curr
@@ -2291,25 +2348,78 @@ fn encode_pooled_system_step_with_param_envs(
                 } else {
                     &intermediate_slots[idx]
                 };
-                let action_result = encode_pooled_system_action(
-                    tm,
-                    action,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &vars,
-                    next_vars,
-                    &locals,
-                    stage_active_curr,
-                    stage_active_next,
-                    stage_slot_curr,
-                    stage_slot_next,
-                    enum_catalog,
-                    call_stack,
-                )?;
-                action_terms.push(action_result.formula);
-                locals = action_result.locals;
+                let stage_system_curr = if idx == 0 {
+                    curr_vars
+                } else {
+                    &intermediate_system_vars[idx - 1]
+                };
+                let stage_system_next = if idx + 1 == step.body.len() {
+                    next_vars
+                } else {
+                    &intermediate_system_vars[idx]
+                };
+                let mut stage_vars = stage_system_curr.clone();
+                stage_vars.extend(param_only_vars.clone());
+                match action {
+                    IRAction::ExprStmt { expr } => {
+                        stage_vars.extend(
+                            locals
+                                .iter()
+                                .map(|(name, binding)| (name.clone(), binding.term.clone())),
+                        );
+                        let stage_store_param_types = system_store_param_types(system);
+                        let stage_pool_ctx = PooledSyGuSCtx {
+                            slots_per_entity,
+                            active_vars: stage_active_curr,
+                            slot_fields: stage_slot_curr,
+                            store_param_types: &stage_store_param_types,
+                        };
+                        action_terms.push(encode_pooled_system_exprstmt_formula(
+                            tm,
+                            expr,
+                            system,
+                            systems_by_name,
+                            entities_by_name,
+                            slots_per_entity,
+                            &stage_vars,
+                            stage_system_next,
+                            stage_active_curr,
+                            stage_active_next,
+                            stage_slot_curr,
+                            stage_slot_next,
+                            &stage_pool_ctx,
+                            enum_catalog,
+                        )?);
+                    }
+                    _ => {
+                        let action_result = encode_pooled_system_action(
+                            tm,
+                            action,
+                            system,
+                            systems_by_name,
+                            entities_by_name,
+                            slots_per_entity,
+                            &stage_vars,
+                            stage_system_next,
+                            &locals,
+                            stage_active_curr,
+                            stage_active_next,
+                            stage_slot_curr,
+                            stage_slot_next,
+                            enum_catalog,
+                            call_stack,
+                        )?;
+                        let mut framed = frame_all_system_fields(
+                            tm,
+                            systems_by_name,
+                            &stage_vars,
+                            stage_system_next,
+                        )?;
+                        framed.push(action_result.formula);
+                        action_terms.push(mk_and(tm, &framed));
+                        locals = action_result.locals;
+                    }
+                }
             }
             mk_exists(tm, &bound, mk_and(tm, &action_terms))
         };

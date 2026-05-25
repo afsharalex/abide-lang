@@ -992,6 +992,102 @@ fn sygus_pooled_nested_exprstmt_updates_selected_entity_field() {
 }
 
 #[test]
+fn sygus_pooled_multi_action_tracks_root_field_intermediates() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "total".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "bump_total_then_counter".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![
+            IRAction::ExprStmt {
+                expr: bin_expr(
+                    "OpEq",
+                    IRExpr::Prime {
+                        expr: Box::new(IRExpr::Var {
+                            name: "total".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        }),
+                        span: None,
+                    },
+                    bin_expr(
+                        "OpAdd",
+                        IRExpr::Var {
+                            name: "total".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                        int_lit(1),
+                        IRType::Int,
+                    ),
+                    IRType::Bool,
+                ),
+            },
+            IRAction::Choose {
+                var: "c".to_owned(),
+                entity: "Counter".to_owned(),
+                filter: Box::new(bool_lit(true)),
+                ops: vec![IRAction::ExprStmt {
+                    expr: bin_expr(
+                        "OpEq",
+                        IRExpr::Prime {
+                            expr: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "c".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                        IRExpr::Var {
+                            name: "total".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                        IRType::Bool,
+                    ),
+                }],
+            },
+        ],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| {
+        panic!("pooled multi-action root-field intermediate should encode: {err}")
+    });
+}
+
+#[test]
 fn sygus_core_accepts_command_metadata_before_solver_setup() {
     let mut system = make_counter_system();
     system.commands.push(crate::ir::types::IRCommand {
