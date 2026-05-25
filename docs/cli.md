@@ -89,6 +89,11 @@ Selected flags:
 - `--target <target>`
 - `--trace-artifact <path>`
 
+`CHECKED` is the bounded trace-prefix result kind. It means no counterexample
+was found within the explored transition depth. The depth can include stutter
+steps, and it is not exhaustive reachable-state exploration or all-instance
+coverage.
+
 `--solver cvc5` can use cvc5 for supported SMT checks. In-process cvc5
 SyGuS invariant synthesis is disabled by default because the cvc5 Rust API
 does not provide a hard cancellation hook. Use `--solver cvc5 --cvc5-sygus`

@@ -1661,6 +1661,35 @@ fn cli_verify_success_only_renders_plain_text() {
 }
 
 #[test]
+fn cli_verify_checked_output_names_trace_prefix_contract() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .args(["verify", "tests/fixtures/workflow.ab"])
+        .output()
+        .expect("failed to run abide verify");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected zero exit: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("CHECKED: workflow_safety"),
+        "expected workflow_safety CHECKED result: {stdout}"
+    );
+    assert!(
+        stdout.contains("bounded trace-prefix"),
+        "expected CHECKED output to name bounded trace-prefix contract: {stdout}"
+    );
+    assert!(
+        stdout.contains("not exhaustive reachable-state or all-instance coverage"),
+        "expected CHECKED output to reject exhaustive coverage wording: {stdout}"
+    );
+}
+
+#[test]
 fn cli_verify_accepts_independent_chc_solver_flag() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let output = std::process::Command::new(binary)

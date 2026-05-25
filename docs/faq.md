@@ -67,7 +67,7 @@ entity Account {
 
 ### What's the verification backend?
 
-- **Bounded model checking:** Z3 (SMT solver) is connected today. `verify` lowers the current bounded fragment to Z3 and reports counterexamples or checked results.
+- **Bounded model checking:** Z3 (SMT solver) is connected today. `verify` lowers the current bounded fragment to Z3 and reports counterexamples or `CHECKED` trace-prefix results. `CHECKED` does not mean exhaustive reachable-state or all-instance coverage.
 - **Automated unbounded checking:** The current verifier already attempts induction and IC3/PDR before bounded fallback for the supported fragment.
 - **Manual / external proofs:** Theorem/lemma syntax exists, but the real proof-manager and external proof-backend integration are still future work.
 
