@@ -1766,6 +1766,48 @@ where
     )
 }
 
+pub(super) fn encode_finite_seq_index_expr<F>(
+    tm: &Cvc5Tm,
+    seq_expr: &IRExpr,
+    key_expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    mut encode_with_vars: F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    match seq_expr {
+        IRExpr::SeqLit {
+            elements,
+            ty: IRType::Seq { element },
+            ..
+        } => {
+            let key_term = encode_with_vars(key_expr, vars)?;
+            let mut choice = default_term_for_type(tm, element, enum_catalog)?;
+            for (index, element_expr) in elements.iter().enumerate() {
+                let element_term = encode_with_vars(element_expr, vars)?;
+                if element_term.sort() != choice.sort() {
+                    return Err(
+                        "cvc5 SyGuS sequence literal index element has incompatible sort"
+                            .to_owned(),
+                    );
+                }
+                let index_eq = tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_EQUAL,
+                    &[key_term.clone(), tm.mk_integer(index as i64)],
+                );
+                choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[index_eq, element_term, choice]);
+            }
+            Ok(Some(choice))
+        }
+        IRExpr::SeqLit { ty, .. } => Err(format!(
+            "cvc5 SyGuS sequence literal index requires Seq type, got {ty:?}"
+        )),
+        _ => Ok(None),
+    }
+}
+
 fn encode_finite_map_lookup_expr_inner<F>(
     tm: &Cvc5Tm,
     map_expr: &IRExpr,
@@ -2471,6 +2513,13 @@ pub(super) fn encode_expr(
         IRExpr::Index { map, key, .. } => {
             if let Some(term) =
                 encode_finite_map_lookup_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
+                    encode_expr(tm, expr, scoped, enum_catalog)
+                })?
+            {
+                return Ok(term);
+            }
+            if let Some(term) =
+                encode_finite_seq_index_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
                     encode_expr(tm, expr, scoped, enum_catalog)
                 })?
             {

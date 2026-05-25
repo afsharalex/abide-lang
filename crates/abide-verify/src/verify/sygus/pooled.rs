@@ -3388,6 +3388,20 @@ fn encode_pooled_expr(
             {
                 return Ok(term);
             }
+            if let Some(term) =
+                encode_finite_seq_index_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
+                    encode_pooled_expr(
+                        tm,
+                        expr,
+                        scoped,
+                        entity_bindings,
+                        pool_ctx,
+                        enum_catalog,
+                    )
+                })?
+            {
+                return Ok(term);
+            }
             if matches!(map.as_ref(), IRExpr::SetLit { .. } | IRExpr::SetComp { .. }) {
                 return encode_finite_set_membership_expr(
                     tm,
