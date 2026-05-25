@@ -1481,6 +1481,15 @@ pub(super) fn encode_expr(
             .cloned()
             .or_else(|| encode_enum_atom_var(tm, name, ty, enum_catalog))
             .ok_or_else(|| format!("unsupported free variable `{name}` in SyGuS slice")),
+        IRExpr::App { func, arg, .. } => {
+            let IRExpr::Lam { param, body, .. } = func.as_ref() else {
+                return Err("cvc5 SyGuS only supports inline lambda application today".to_owned());
+            };
+            let arg_term = encode_expr(tm, arg, vars, enum_catalog)?;
+            let mut scoped = vars.clone();
+            scoped.insert(param.clone(), arg_term);
+            encode_expr(tm, body, &scoped, enum_catalog)
+        }
         IRExpr::UnOp { op, operand, .. } => {
             let inner = encode_expr(tm, operand, vars, enum_catalog)?;
             match op.as_str() {

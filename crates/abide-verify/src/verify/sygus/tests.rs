@@ -199,6 +199,31 @@ fn sygus_expr_encoder_supports_finite_choose_expressions() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_inline_lambda_application() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+    let expr = IRExpr::App {
+        func: Box::new(IRExpr::Lam {
+            param: "b".to_owned(),
+            param_type: IRType::Bool,
+            body: Box::new(IRExpr::Var {
+                name: "b".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        }),
+        arg: Box::new(bool_lit(true)),
+        ty: IRType::Bool,
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("inline SyGuS lambda application should encode: {err}"));
+}
+
+#[test]
 fn sygus_expr_encoder_accepts_qualified_enum_constructor_names() {
     let tm = Cvc5Tm::new();
     let vars = HashMap::new();
@@ -1168,6 +1193,72 @@ fn sygus_pooled_system_step_supports_finite_choose_exprstmt_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("pooled finite choose RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_inline_lambda_application_rhs() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "flag".to_owned(),
+        ty: IRType::Bool,
+        default: Some(bool_lit(false)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "set_flag".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "flag".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::App {
+                    func: Box::new(IRExpr::Lam {
+                        param: "b".to_owned(),
+                        param_type: IRType::Bool,
+                        body: Box::new(IRExpr::Var {
+                            name: "b".to_owned(),
+                            ty: IRType::Bool,
+                            span: None,
+                        }),
+                        span: None,
+                    }),
+                    arg: Box::new(bool_lit(true)),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled inline lambda application RHS should encode: {err}"));
 }
 
 #[test]

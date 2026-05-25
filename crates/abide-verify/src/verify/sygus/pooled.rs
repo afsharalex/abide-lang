@@ -2640,6 +2640,19 @@ fn encode_pooled_expr(
                     format!("unsupported free variable `{name}` in pooled SyGuS slice")
                 }
             }),
+        IRExpr::App { func, arg, .. } => {
+            let IRExpr::Lam { param, body, .. } = func.as_ref() else {
+                return Err(
+                    "cvc5 SyGuS pooled system safety only supports inline lambda application today"
+                        .to_owned(),
+                );
+            };
+            let arg_term =
+                encode_pooled_expr(tm, arg, vars, entity_bindings, pool_ctx, enum_catalog)?;
+            let mut scoped = vars.clone();
+            scoped.insert(param.clone(), arg_term);
+            encode_pooled_expr(tm, body, &scoped, entity_bindings, pool_ctx, enum_catalog)
+        }
         IRExpr::Field {
             expr: recv, field, ..
         } => {
