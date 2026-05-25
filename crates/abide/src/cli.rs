@@ -138,6 +138,10 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_BMC_TIMEOUT_SECS)]
         bmc_timeout: u64,
 
+        /// BMC fallback depth for auto-verified props
+        #[arg(long = "prop-bmc-depth", default_value_t = DEFAULT_PROP_BMC_DEPTH)]
+        prop_bmc_depth: usize,
+
         /// IC3/PDR timeout in seconds (default: 1200, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
         ic3_timeout: u64,
@@ -393,6 +397,7 @@ pub fn run() -> miette::Result<()> {
             timeout,
             induction_timeout,
             bmc_timeout,
+            prop_bmc_depth,
             ic3_timeout,
             ic3,
             cvc5_sygus,
@@ -476,7 +481,7 @@ pub fn run() -> miette::Result<()> {
                 overall_timeout_ms: timeout.saturating_mul(1000),
                 induction_timeout_ms: induction_timeout.saturating_mul(1000),
                 bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
-                prop_bmc_depth: DEFAULT_PROP_BMC_DEPTH,
+                prop_bmc_depth,
                 cvc5_sygus,
                 ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
                 no_ic3,
@@ -502,6 +507,7 @@ pub fn run() -> miette::Result<()> {
                                 unbounded_only,
                                 induction_timeout,
                                 bmc_timeout,
+                                prop_bmc_depth,
                                 ic3_timeout,
                                 no_ic3,
                                 no_prop_verify,
@@ -531,6 +537,7 @@ pub fn run() -> miette::Result<()> {
                         unbounded_only,
                         induction_timeout,
                         bmc_timeout,
+                        prop_bmc_depth,
                         ic3_timeout,
                         no_ic3,
                         no_prop_verify,
@@ -555,6 +562,7 @@ pub fn run() -> miette::Result<()> {
                     unbounded_only,
                     induction_timeout,
                     bmc_timeout,
+                    prop_bmc_depth,
                     ic3_timeout,
                     no_ic3,
                     no_prop_verify,

@@ -1719,6 +1719,59 @@ fn cli_verify_accepts_independent_chc_solver_flag() {
 }
 
 #[test]
+fn cli_verify_prop_bmc_depth_controls_auto_prop_fallback() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let shallow = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/prop_bmc_depth.ab",
+            "--bounded-only",
+            "--prop-bmc-depth",
+            "3",
+            "--target",
+            "prop:counter_below_three",
+        ])
+        .output()
+        .expect("failed to run shallow prop verification");
+
+    let shallow_stdout = String::from_utf8_lossy(&shallow.stdout);
+    let shallow_stderr = String::from_utf8_lossy(&shallow.stderr);
+    assert!(
+        shallow.status.success(),
+        "expected shallow prop BMC to pass: stdout={shallow_stdout}, stderr={shallow_stderr}"
+    );
+    assert!(
+        shallow_stdout.contains("CHECKED: prop_counter_below_three")
+            && shallow_stdout.contains("bounded trace-prefix depth 3"),
+        "expected shallow prop BMC to disclose configured depth 3: {shallow_stdout}"
+    );
+
+    let deep = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/prop_bmc_depth.ab",
+            "--bounded-only",
+            "--prop-bmc-depth",
+            "4",
+            "--target",
+            "prop:counter_below_three",
+        ])
+        .output()
+        .expect("failed to run deep prop verification");
+
+    let deep_stdout = String::from_utf8_lossy(&deep.stdout);
+    let deep_stderr = String::from_utf8_lossy(&deep.stderr);
+    assert!(
+        !deep.status.success(),
+        "expected deeper prop BMC to find counterexample: stdout={deep_stdout}, stderr={deep_stderr}"
+    );
+    assert!(
+        deep_stderr.contains("COUNTEREXAMPLE: prop_counter_below_three"),
+        "expected deep prop BMC counterexample at configured depth 4: stderr={deep_stderr}"
+    );
+}
+
+#[test]
 fn cli_verify_verbose_prints_human_readable_details() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let output = std::process::Command::new(binary)
@@ -1834,6 +1887,12 @@ fn cli_verify_report_json_writes_machine_readable_report_file() {
             .pointer("/config/witness_semantics")
             .and_then(serde_json::Value::as_str),
         Some("relational")
+    );
+    assert_eq!(
+        value
+            .pointer("/config/prop_bmc_depth")
+            .and_then(serde_json::Value::as_u64),
+        Some(10)
     );
     let family = value
         .get("results")

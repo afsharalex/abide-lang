@@ -75,6 +75,7 @@ Selected flags:
 - `--timeout <secs>`
 - `--induction-timeout <secs>`
 - `--bmc-timeout <secs>`
+- `--prop-bmc-depth <depth>`
 - `--ic3-timeout <secs>`
 - `--ic3`
 - `--cvc5-sygus`
@@ -93,6 +94,9 @@ Selected flags:
 was found within the explored transition depth. The depth can include stutter
 steps, and it is not exhaustive reachable-state exploration or all-instance
 coverage.
+
+Props are first tried with the proof-oriented tiers. If a prop falls back to
+bounded checking, `--prop-bmc-depth` controls that fallback depth.
 
 `--solver cvc5` can use cvc5 for supported SMT checks. In-process cvc5
 SyGuS invariant synthesis is disabled by default because the cvc5 Rust API

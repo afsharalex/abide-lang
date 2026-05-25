@@ -1,0 +1,24 @@
+module PropBmcDepth
+
+entity Counter {
+  n: int = 0
+
+  action inc() requires n < 4 {
+    n' = n + 1
+  }
+}
+
+system S(counters: Store<Counter>) {
+  command create_counter() {
+    create Counter {}
+  }
+
+  command inc_counter() {
+    choose c: Counter where true {
+      c.inc()
+    }
+  }
+}
+
+prop counter_below_three for S =
+  all c: Counter | c.n < 3
