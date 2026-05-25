@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use cvc5_rs::{Kind as Cvc5Kind, Solver as Cvc5Solver, Term as Cvc5Term, TermManager as Cvc5Tm};
+use cvc5_rs::{
+    Kind as Cvc5Kind, Solver as Cvc5Solver, Sort as Cvc5Sort, Term as Cvc5Term,
+    TermManager as Cvc5Tm,
+};
 
 use crate::ir::types::{
     IRAction, IRCreateField, IREntity, IRExpr, IRField, IRSystem, IRSystemAction, IRTransParam,

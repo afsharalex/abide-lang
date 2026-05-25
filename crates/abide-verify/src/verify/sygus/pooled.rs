@@ -252,8 +252,6 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     if timeout_ms > 0 {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
-    solver.set_logic("LIA");
-
     let ordered_system_fields = collect_unique_system_fields(systems)?;
     let all_fields: Vec<IRField> = ordered_system_fields
         .iter()
@@ -264,7 +262,12 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 .flat_map(|entity| entity.fields.iter().cloned()),
         )
         .collect();
-    let enum_catalog = build_enum_catalog(&all_fields)?;
+    let enum_catalog = build_enum_catalog(&tm, &all_fields)?;
+    solver.set_logic(if enum_catalog.has_payload_enums() {
+        "ALL"
+    } else {
+        "LIA"
+    });
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -272,7 +275,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     let mut next_order = Vec::new();
 
     for (_, field) in &ordered_system_fields {
-        let sort = sort_for_field(&tm, field)?;
+        let sort = sort_for_field(&tm, field, &enum_catalog)?;
         let curr = tm.mk_var(sort.clone(), &field.name);
         let next = tm.mk_var(sort, &format!("{}_next", field.name));
         curr_vars.insert(field.name.clone(), curr.clone());
@@ -309,7 +312,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             next_order.push(active_n);
 
             for field in &entity.fields {
-                let sort = sort_for_field(&tm, field)?;
+                let sort = sort_for_field(&tm, field, &enum_catalog)?;
                 let curr = tm.mk_var(
                     sort.clone(),
                     &format!("{}_{}_{}", entity.name, slot, field.name),
@@ -755,7 +758,7 @@ fn encode_pooled_ops_for_target(
         for stage in 0..(ops.len() - 1) {
             let mut fields = HashMap::new();
             for field in &target_entity.fields {
-                let sort = sort_for_field(tm, field)?;
+                let sort = sort_for_field(tm, field, enum_catalog)?;
                 let name = format!(
                     "__abide_sygus_{}_slot{}_{}_inter{}",
                     target_entity.name, target_slot, field.name, stage
@@ -1749,7 +1752,7 @@ fn encode_pooled_system_step_with_param_envs(
                         bound.push(active_term.clone());
                         per_slot.insert(slot, active_term);
                         for field in &entity.fields {
-                            let sort = sort_for_field(tm, field)?;
+                            let sort = sort_for_field(tm, field, enum_catalog)?;
                             let name = format!(
                                 "__abide_sygus_{}_slot{}_{}_inter{}",
                                 entity_name, slot, field.name, stage
@@ -1830,12 +1833,25 @@ fn encode_pooled_match_expr(
     }
     let scrut_term =
         encode_pooled_expr(tm, scrutinee, vars, entity_bindings, pool_ctx, enum_catalog)?;
-    let scrut_ty = sygus_expr_type(scrutinee);
+    let scrut_ty = sygus_match_scrutinee_type(scrutinee);
     let mut fallback = None;
     for arm in arms.iter().rev() {
         let mut arm_vars = vars.clone();
-        bind_pattern_vars(&arm.pattern, &scrut_term, &mut arm_vars)?;
-        let pat_cond = encode_pattern_cond(tm, &arm.pattern, &scrut_term, scrut_ty, enum_catalog)?;
+        bind_pattern_vars(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            &mut arm_vars,
+            enum_catalog,
+        )?;
+        let pat_cond = encode_pattern_cond(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            enum_catalog,
+        )?;
         let guard_cond = if let Some(guard) = &arm.guard {
             encode_pooled_expr(
                 tm,
@@ -1945,6 +1961,13 @@ fn encode_pooled_expr(
             args,
             ..
         } => {
+            if let Some(term) =
+                encode_payload_ctor_expr(tm, enum_name, ctor, args, enum_catalog, |arg| {
+                    encode_pooled_expr(tm, arg, vars, entity_bindings, pool_ctx, enum_catalog)
+                })?
+            {
+                return Ok(term);
+            }
             if !args.is_empty() {
                 return Err(format!(
                     "cvc5 SyGuS pooled system safety does not support payload constructors yet (`{enum_name}::{ctor}`)"
@@ -2554,7 +2577,14 @@ fn encode_pooled_action_match(
             );
         }
         let mut arm_vars = vars.clone();
-        bind_pattern_vars(&arm.pattern, &scrut_term, &mut arm_vars)?;
+        bind_pattern_vars(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            &mut arm_vars,
+            enum_catalog,
+        )?;
         let pat_cond = encode_pattern_cond(
             tm,
             &arm.pattern,

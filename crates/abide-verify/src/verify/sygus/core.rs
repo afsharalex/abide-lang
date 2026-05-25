@@ -1,6 +1,174 @@
 use super::*;
 
-pub(super) type EnumCatalog = HashMap<String, HashMap<String, i64>>;
+#[derive(Clone, Default)]
+pub(super) struct EnumCatalog {
+    fieldless: HashMap<String, HashMap<String, i64>>,
+    payload: HashMap<String, PayloadEnumInfo>,
+}
+
+#[derive(Clone)]
+pub(super) struct PayloadEnumInfo {
+    sort: Cvc5Sort,
+    variants: Vec<PayloadVariantInfo>,
+}
+
+#[derive(Clone)]
+pub(super) struct PayloadVariantInfo {
+    name: String,
+    constructor: Cvc5Term,
+    tester: Cvc5Term,
+    field_order: Vec<String>,
+    accessors: HashMap<String, PayloadAccessorInfo>,
+}
+
+#[derive(Clone)]
+pub(super) struct PayloadAccessorInfo {
+    term: Cvc5Term,
+    ty: IRType,
+}
+
+impl EnumCatalog {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn insert(&mut self, enum_name: String, mapping: HashMap<String, i64>) {
+        self.fieldless.insert(enum_name, mapping);
+    }
+
+    pub(super) fn get(&self, enum_name: &str) -> Option<&HashMap<String, i64>> {
+        self.fieldless.get(enum_name)
+    }
+
+    pub(super) fn payload_sort(&self, enum_name: &str) -> Option<&Cvc5Sort> {
+        self.payload.get(enum_name).map(|info| &info.sort)
+    }
+
+    pub(super) fn has_payload_enums(&self) -> bool {
+        !self.payload.is_empty()
+    }
+
+    pub(super) fn payload_variant(
+        &self,
+        enum_name: &str,
+        ctor: &str,
+    ) -> Option<&PayloadVariantInfo> {
+        self.payload
+            .get(enum_name)?
+            .variants
+            .iter()
+            .find(|variant| {
+                ctor_name_matches(ctor, enum_name, &variant.name)
+                    || ctor_name_matches(&variant.name, enum_name, ctor)
+            })
+    }
+
+    pub(super) fn from_types(tm: &Cvc5Tm, types: &[IRType]) -> Result<Self, String> {
+        let mut catalog = Self::new();
+        for ty in types {
+            catalog.register_type(tm, ty)?;
+        }
+        Ok(catalog)
+    }
+
+    fn register_type(&mut self, tm: &Cvc5Tm, ty: &IRType) -> Result<(), String> {
+        let IRType::Enum { name, variants } = ty else {
+            return Ok(());
+        };
+        if variants.iter().any(|variant| !variant.fields.is_empty()) {
+            self.register_payload_enum(tm, name, variants)
+        } else {
+            self.register_fieldless_enum(name, variants);
+            Ok(())
+        }
+    }
+
+    fn register_fieldless_enum(&mut self, name: &str, variants: &[crate::ir::types::IRVariant]) {
+        self.fieldless.entry(name.to_owned()).or_insert_with(|| {
+            variants
+                .iter()
+                .enumerate()
+                .map(|(idx, variant)| (variant.name.clone(), idx as i64))
+                .collect()
+        });
+    }
+
+    fn register_payload_enum(
+        &mut self,
+        tm: &Cvc5Tm,
+        name: &str,
+        variants: &[crate::ir::types::IRVariant],
+    ) -> Result<(), String> {
+        if self.payload.contains_key(name) {
+            return Ok(());
+        }
+
+        let mut decl = tm.mk_dt_decl(name, false);
+        for variant in variants {
+            let mut ctor = tm.mk_dt_cons_decl(&variant.name);
+            for field in &variant.fields {
+                ctor.add_selector(&field.name, self.sort_for_payload_field(tm, &field.ty)?);
+            }
+            decl.add_constructor(&ctor);
+        }
+        let sort = tm.mk_dt_sort(&decl);
+        let datatype = sort.datatype();
+        let mut payload_variants = Vec::with_capacity(variants.len());
+        for (idx, variant) in variants.iter().enumerate() {
+            let cvc5_ctor = datatype.constructor(idx);
+            let mut accessors = HashMap::new();
+            for field in &variant.fields {
+                let selector = cvc5_ctor.selector_by_name(&field.name);
+                accessors.insert(
+                    field.name.clone(),
+                    PayloadAccessorInfo {
+                        term: selector.term(),
+                        ty: field.ty.clone(),
+                    },
+                );
+            }
+            payload_variants.push(PayloadVariantInfo {
+                name: variant.name.clone(),
+                constructor: cvc5_ctor.term(),
+                tester: cvc5_ctor.tester_term(),
+                field_order: variant
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+                accessors,
+            });
+        }
+        self.payload.insert(
+            name.to_owned(),
+            PayloadEnumInfo {
+                sort,
+                variants: payload_variants,
+            },
+        );
+        Ok(())
+    }
+
+    fn sort_for_payload_field(&self, tm: &Cvc5Tm, ty: &IRType) -> Result<Cvc5Sort, String> {
+        match ty {
+            IRType::Int => Ok(tm.integer_sort()),
+            IRType::Bool => Ok(tm.boolean_sort()),
+            IRType::Enum { name, variants }
+                if variants.iter().all(|variant| variant.fields.is_empty()) =>
+            {
+                Ok(tm.integer_sort())
+            }
+            IRType::Enum { name, .. } => self.payload_sort(name).cloned().ok_or_else(|| {
+                format!(
+                    "cvc5 SyGuS payload datatype fields cannot reference undeclared payload enum `{name}`"
+                )
+            }),
+            _ => Err(format!(
+                "cvc5 SyGuS payload datatype fields only support Int, Bool, and enum fields today (`{ty:?}`)"
+            )),
+        }
+    }
+}
 
 pub(super) fn lookup_enum_ctor_index<'a>(
     enum_catalog: &'a EnumCatalog,
@@ -127,16 +295,20 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     if timeout_ms > 0 {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
-    solver.set_logic("LIA");
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields)?;
+    solver.set_logic(if enum_catalog.has_payload_enums() {
+        "ALL"
+    } else {
+        "LIA"
+    });
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
     let mut curr_order = Vec::with_capacity(entity.fields.len());
     let mut next_order = Vec::with_capacity(entity.fields.len());
-    let enum_catalog = build_enum_catalog(&entity.fields)?;
 
     for field in &entity.fields {
-        let sort = sort_for_field(&tm, field)?;
+        let sort = sort_for_field(&tm, field, &enum_catalog)?;
         let curr = tm.mk_var(sort.clone(), &field.name);
         let next = tm.mk_var(sort, &format!("{}_next", field.name));
         curr_vars.insert(field.name.clone(), curr.clone());
@@ -258,16 +430,20 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if timeout_ms > 0 {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
-    solver.set_logic("LIA");
+    let enum_catalog = build_enum_catalog(&tm, &system.fields)?;
+    solver.set_logic(if enum_catalog.has_payload_enums() {
+        "ALL"
+    } else {
+        "LIA"
+    });
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
     let mut curr_order = Vec::with_capacity(system.fields.len());
     let mut next_order = Vec::with_capacity(system.fields.len());
-    let enum_catalog = build_enum_catalog(&system.fields)?;
 
     for field in &system.fields {
-        let sort = sort_for_field(&tm, field)?;
+        let sort = sort_for_field(&tm, field, &enum_catalog)?;
         let curr = tm.mk_var(sort.clone(), &field.name);
         let next = tm.mk_var(sort, &format!("{}_next", field.name));
         curr_vars.insert(field.name.clone(), curr.clone());
@@ -390,15 +566,13 @@ pub(super) fn fold_and(mut exprs: Vec<IRExpr>) -> IRExpr {
     })
 }
 
-pub(super) fn build_enum_catalog(fields: &[IRField]) -> Result<EnumCatalog, String> {
-    let mut catalog = HashMap::new();
+pub(super) fn build_enum_catalog(tm: &Cvc5Tm, fields: &[IRField]) -> Result<EnumCatalog, String> {
+    let mut catalog = EnumCatalog::new();
     for field in fields {
         if let IRType::Enum { name, variants } = &field.ty {
             if variants.iter().any(|variant| !variant.fields.is_empty()) {
-                return Err(format!(
-                    "cvc5 SyGuS safety only supports fieldless enums today (field `{}`)",
-                    field.name
-                ));
+                catalog.register_payload_enum(tm, name, variants)?;
+                continue;
             }
             let mut mapping = HashMap::new();
             for (idx, variant) in variants.iter().enumerate() {
@@ -410,7 +584,11 @@ pub(super) fn build_enum_catalog(fields: &[IRField]) -> Result<EnumCatalog, Stri
     Ok(catalog)
 }
 
-pub(super) fn sort_for_field(tm: &Cvc5Tm, field: &IRField) -> Result<cvc5_rs::Sort, String> {
+pub(super) fn sort_for_field(
+    tm: &Cvc5Tm,
+    field: &IRField,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Sort, String> {
     match &field.ty {
         IRType::Int => Ok(tm.integer_sort()),
         IRType::Bool => Ok(tm.boolean_sort()),
@@ -419,8 +597,14 @@ pub(super) fn sort_for_field(tm: &Cvc5Tm, field: &IRField) -> Result<cvc5_rs::So
         {
             Ok(tm.integer_sort())
         }
+        IRType::Enum { name, .. } => enum_catalog.payload_sort(name).cloned().ok_or_else(|| {
+            format!(
+                "cvc5 SyGuS safety could not build payload enum sort for field `{}`",
+                field.name
+            )
+        }),
         _ => Err(format!(
-            "cvc5 SyGuS safety only supports Int/Bool/fieldless-enum fields today (field `{}`)",
+            "cvc5 SyGuS safety only supports Int/Bool/enum fields today (field `{}`)",
             field.name
         )),
     }
@@ -763,9 +947,12 @@ pub(super) fn pattern_binders(pattern: &crate::ir::types::IRPattern, into: &mut 
 }
 
 pub(super) fn bind_pattern_vars(
+    tm: &Cvc5Tm,
     pattern: &crate::ir::types::IRPattern,
     scrut: &Cvc5Term,
+    scrut_ty: Option<&IRType>,
     env: &mut HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
 ) -> Result<(), String> {
     use crate::ir::types::IRPattern;
     match pattern {
@@ -775,6 +962,34 @@ pub(super) fn bind_pattern_vars(
             Ok(())
         }
         IRPattern::PCtor { name, fields } => {
+            if let Some(IRType::Enum {
+                name: enum_name, ..
+            }) = scrut_ty
+            {
+                if let Some(variant) = enum_catalog.payload_variant(enum_name, name) {
+                    for field in fields {
+                        let accessor = variant.accessors.get(&field.name).ok_or_else(|| {
+                            format!(
+                                "cvc5 SyGuS payload match cannot find constructor field `{}`",
+                                field.name
+                            )
+                        })?;
+                        let selected = tm.mk_term(
+                            Cvc5Kind::CVC5_KIND_APPLY_SELECTOR,
+                            &[accessor.term.clone(), scrut.clone()],
+                        );
+                        bind_pattern_vars(
+                            tm,
+                            &field.pattern,
+                            &selected,
+                            Some(&accessor.ty),
+                            env,
+                            enum_catalog,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
             if !fields.is_empty() {
                 return Err(format!(
                     "cvc5 SyGuS match does not support constructor-field destructuring yet (`{name}`)"
@@ -795,7 +1010,7 @@ pub(super) fn bind_pattern_vars(
                         .to_owned(),
                 );
             }
-            bind_pattern_vars(left, scrut, env)
+            bind_pattern_vars(tm, left, scrut, scrut_ty, env, enum_catalog)
         }
     }
 }
@@ -893,37 +1108,47 @@ pub(super) fn encode_pattern_cond(
     use crate::ir::types::IRPattern;
     match pattern {
         IRPattern::PWild | IRPattern::PVar { .. } => Ok(tm.mk_boolean(true)),
-        IRPattern::PCtor { name, fields } => {
-            if !fields.is_empty() {
-                return Err(format!(
-                    "cvc5 SyGuS match does not support constructor-field patterns yet (`{name}`)"
-                ));
+        IRPattern::PCtor { name, fields } => match scrut_ty {
+            Some(IRType::Enum {
+                name: enum_name, ..
+            }) if enum_catalog.payload_variant(enum_name, name).is_some() => {
+                let variant = enum_catalog
+                    .payload_variant(enum_name, name)
+                    .expect("payload variant checked above");
+                Ok(tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_APPLY_TESTER,
+                    &[variant.tester.clone(), scrutinee.clone()],
+                ))
             }
-            let idx = match scrut_ty {
-                Some(IRType::Enum { name: enum_name, .. }) => enum_catalog
+            Some(IRType::Enum {
+                name: enum_name, ..
+            }) => {
+                if !fields.is_empty() {
+                    return Err(format!(
+                            "cvc5 SyGuS match does not support constructor-field patterns for fieldless enum `{enum_name}` (`{name}`)"
+                        ));
+                }
+                let idx = enum_catalog
                     .get(enum_name)
                     .and_then(|mapping| {
-                        mapping
-                            .get(name)
-                            .or_else(|| name.split_once("::").and_then(|(_, ctor)| mapping.get(ctor)))
+                        mapping.get(name).or_else(|| {
+                            name.split_once("::")
+                                .and_then(|(_, ctor)| mapping.get(ctor))
+                        })
                     })
                     .copied()
                     .ok_or_else(|| {
-                        format!(
-                            "unsupported enum constructor pattern `{name}` in cvc5 SyGuS slice"
-                        )
-                    })?,
-                _ => {
-                    return Err(format!(
-                        "constructor pattern `{name}` requires a fieldless-enum scrutinee in cvc5 SyGuS"
-                    ))
-                }
-            };
-            Ok(tm.mk_term(
-                Cvc5Kind::CVC5_KIND_EQUAL,
-                &[scrutinee.clone(), tm.mk_integer(idx)],
-            ))
-        }
+                        format!("unsupported enum constructor pattern `{name}` in cvc5 SyGuS slice")
+                    })?;
+                Ok(tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_EQUAL,
+                    &[scrutinee.clone(), tm.mk_integer(idx)],
+                ))
+            }
+            _ => Err(format!(
+                "constructor pattern `{name}` requires a fieldless-enum scrutinee in cvc5 SyGuS"
+            )),
+        },
         IRPattern::POr { left, right } => {
             let lhs = encode_pattern_cond(tm, left, scrutinee, scrut_ty, enum_catalog)?;
             let rhs = encode_pattern_cond(tm, right, scrutinee, scrut_ty, enum_catalog)?;
@@ -954,7 +1179,7 @@ pub(super) fn encode_match_expr(
         }
         Err(err) => return Err(err),
     };
-    let scrut_ty = sygus_expr_type(scrutinee);
+    let scrut_ty = sygus_match_scrutinee_type(scrutinee);
 
     let mut fallback = None;
     for arm in arms.iter().rev() {
@@ -967,11 +1192,26 @@ pub(super) fn encode_match_expr(
             enum_catalog,
         )?;
         if !handled_static {
-            bind_pattern_vars(&arm.pattern, &scrut_term, &mut arm_env)?;
+            bind_pattern_vars(
+                tm,
+                &arm.pattern,
+                &scrut_term,
+                scrut_ty.as_ref(),
+                &mut arm_env,
+                enum_catalog,
+            )?;
         }
         let pat_cond = encode_static_payload_pattern_cond(tm, &arm.pattern, scrutinee)
             .map_or_else(
-                || encode_pattern_cond(tm, &arm.pattern, &scrut_term, scrut_ty, enum_catalog),
+                || {
+                    encode_pattern_cond(
+                        tm,
+                        &arm.pattern,
+                        &scrut_term,
+                        scrut_ty.as_ref(),
+                        enum_catalog,
+                    )
+                },
                 Ok,
             )?;
         let guard_cond = if let Some(guard) = &arm.guard {
@@ -1006,6 +1246,54 @@ pub(super) fn encode_match_expr(
     fallback.ok_or_else(|| "cvc5 SyGuS match required at least one arm".to_owned())
 }
 
+pub(super) fn encode_payload_ctor_expr<F>(
+    tm: &Cvc5Tm,
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+    enum_catalog: &EnumCatalog,
+    mut encode_arg: F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr) -> Result<Cvc5Term, String>,
+{
+    let Some(variant) = enum_catalog.payload_variant(enum_name, ctor) else {
+        return Ok(None);
+    };
+
+    let mut children = Vec::with_capacity(1 + variant.accessors.len());
+    children.push(variant.constructor.clone());
+    for field_name in &variant.field_order {
+        let accessor = variant
+            .accessors
+            .get(field_name)
+            .expect("field order must reference known payload accessor");
+        let (_, arg_expr) = args
+            .iter()
+            .find(|(arg_name, _)| arg_name == field_name)
+            .ok_or_else(|| {
+                format!(
+                    "cvc5 SyGuS payload constructor `{enum_name}::{ctor}` is missing field `{field_name}`"
+                )
+            })?;
+        let arg_term = encode_arg(arg_expr)?;
+        if arg_term.sort() != accessor.term.sort().dt_selector_codomain() {
+            return Err(format!(
+                "cvc5 SyGuS payload constructor `{enum_name}::{ctor}` field `{field_name}` has incompatible sort"
+            ));
+        }
+        children.push(arg_term);
+    }
+    if args.len() != variant.accessors.len() {
+        return Err(format!(
+            "cvc5 SyGuS payload constructor `{enum_name}::{ctor}` received unexpected fields"
+        ));
+    }
+    Ok(Some(
+        tm.mk_term(Cvc5Kind::CVC5_KIND_APPLY_CONSTRUCTOR, &children),
+    ))
+}
+
 pub(super) fn encode_expr(
     tm: &Cvc5Tm,
     expr: &IRExpr,
@@ -1027,6 +1315,13 @@ pub(super) fn encode_expr(
             args,
             ..
         } => {
+            if let Some(term) =
+                encode_payload_ctor_expr(tm, enum_name, ctor, args, enum_catalog, |arg| {
+                    encode_expr(tm, arg, vars, enum_catalog)
+                })?
+            {
+                return Ok(term);
+            }
             if !args.is_empty() {
                 return Err(format!(
                     "cvc5 SyGuS safety does not support payload constructors yet (`{enum_name}::{ctor}`)"

@@ -215,6 +215,167 @@ fn sygus_expr_encoder_supports_static_payload_constructor_destructuring() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_dynamic_payload_constructor_destructuring() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let enum_catalog = EnumCatalog::from_types(&tm, std::slice::from_ref(&decision_ty))
+        .expect("payload enum datatype catalog should build");
+    let decision_sort = enum_catalog
+        .payload_sort("Decision")
+        .expect("Decision datatype sort should be available");
+    let vars = HashMap::from([(
+        "decision".to_owned(),
+        tm.mk_var(decision_sort.clone(), "decision"),
+    )]);
+
+    let expr = IRExpr::Match {
+        scrutinee: Box::new(IRExpr::Var {
+            name: "decision".to_owned(),
+            ty: decision_ty,
+            span: None,
+        }),
+        arms: vec![
+            crate::ir::types::IRMatchArm {
+                pattern: crate::ir::types::IRPattern::PCtor {
+                    name: "Accept".to_owned(),
+                    fields: vec![crate::ir::types::IRFieldPat {
+                        name: "amount".to_owned(),
+                        pattern: crate::ir::types::IRPattern::PVar {
+                            name: "payload".to_owned(),
+                        },
+                    }],
+                },
+                guard: Some(bin_expr(
+                    "OpGe",
+                    IRExpr::Var {
+                        name: "payload".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    },
+                    int_lit(0),
+                    IRType::Bool,
+                )),
+                body: IRExpr::Var {
+                    name: "payload".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                },
+            },
+            crate::ir::types::IRMatchArm {
+                pattern: crate::ir::types::IRPattern::PWild,
+                guard: None,
+                body: int_lit(0),
+            },
+        ],
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("dynamic payload constructor match should encode: {err}"));
+}
+
+#[test]
+fn sygus_core_accepts_payload_enum_fields_before_solver_setup() {
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let system = IRSystem {
+        name: "PayloadSystem".to_owned(),
+        store_params: vec![],
+        fields: vec![IRField {
+            name: "decision".to_owned(),
+            ty: decision_ty.clone(),
+            default: Some(IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Accept".to_owned(),
+                args: vec![("amount".to_owned(), int_lit(0))],
+                span: None,
+            }),
+            initial_constraint: None,
+        }],
+        entities: vec![],
+        commands: vec![],
+        actions: vec![],
+        procs: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+    };
+    let property = IRExpr::Always {
+        body: Box::new(IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Var {
+                name: "decision".to_owned(),
+                ty: decision_ty,
+                span: None,
+            }),
+            arms: vec![
+                crate::ir::types::IRMatchArm {
+                    pattern: crate::ir::types::IRPattern::PCtor {
+                        name: "Accept".to_owned(),
+                        fields: vec![crate::ir::types::IRFieldPat {
+                            name: "amount".to_owned(),
+                            pattern: crate::ir::types::IRPattern::PVar {
+                                name: "payload".to_owned(),
+                            },
+                        }],
+                    },
+                    guard: None,
+                    body: bin_expr(
+                        "OpGe",
+                        IRExpr::Var {
+                            name: "payload".to_owned(),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                        int_lit(0),
+                        IRType::Bool,
+                    ),
+                },
+                crate::ir::types::IRMatchArm {
+                    pattern: crate::ir::types::IRPattern::PWild,
+                    guard: None,
+                    body: bool_lit(true),
+                },
+            ],
+            span: None,
+        }),
+        span: None,
+    };
+
+    let err = try_cvc5_sygus_system_safety_inner(&system, &property, 0)
+        .expect_err("empty system should still be rejected after payload setup succeeds");
+    assert!(
+        err.contains("requires at least one step"),
+        "payload enum fields should pass setup before the empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};
 
