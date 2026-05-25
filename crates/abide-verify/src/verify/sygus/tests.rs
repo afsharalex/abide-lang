@@ -482,6 +482,49 @@ fn sygus_expr_encoder_supports_finite_choose_expressions() {
 }
 
 #[test]
+fn sygus_expr_encoder_keeps_non_finite_domains_as_boundary() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+
+    let choose = IRExpr::Choose {
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        predicate: Some(Box::new(bin_expr(
+            "OpGe",
+            IRExpr::Var {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            },
+            int_lit(0),
+            IRType::Bool,
+        ))),
+        ty: IRType::Int,
+        span: None,
+    };
+    let err = encode_expr(&tm, &choose, &vars, &enum_catalog)
+        .expect_err("non-finite choose domain should stay outside SyGuS");
+    assert!(err.contains("finite Bool/enum domains for choose"));
+
+    let aggregate = IRExpr::Aggregate {
+        kind: IRAggKind::Sum,
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        body: Box::new(IRExpr::Var {
+            name: "n".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        in_filter: None,
+        span: None,
+    };
+    let err = encode_expr(&tm, &aggregate, &vars, &enum_catalog)
+        .expect_err("non-finite aggregate domain should stay outside SyGuS");
+    assert!(err.contains("finite Bool/enum domains for finite aggregates"));
+}
+
+#[test]
 fn sygus_expr_encoder_supports_inline_lambda_application() {
     let tm = Cvc5Tm::new();
     let vars = HashMap::new();
@@ -3830,7 +3873,7 @@ fn sygus_core_accepts_derived_fields_before_solver_setup() {
 
 #[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
-    use crate::ir::types::IRStoreParam;
+    use crate::ir::types::{IRStoreParam, IRTransRef};
 
     let mut no_transition = make_counter_entity();
     no_transition.transitions.clear();
@@ -3852,6 +3895,32 @@ fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
         .expect_err("entity pools unsupported");
     assert!(err.contains("entity pools"));
+
+    let mut string_field = make_counter_entity();
+    string_field.fields.push(IRField {
+        name: "label".to_owned(),
+        ty: IRType::String,
+        default: Some(IRExpr::Lit {
+            ty: IRType::String,
+            value: LitVal::Str {
+                value: "counter".to_owned(),
+            },
+            span: None,
+        }),
+        initial_constraint: None,
+    });
+    let err = try_cvc5_sygus_single_entity_inner(&string_field, &non_negative_property(), 0)
+        .expect_err("string fields should remain outside the SyGuS field fragment");
+    assert!(err.contains("Int/Real/Bool/enum fields"));
+
+    let mut ref_transition = make_counter_entity();
+    ref_transition.transitions[0].refs.push(IRTransRef {
+        name: "other".to_owned(),
+        entity: "Counter".to_owned(),
+    });
+    let err = try_cvc5_sygus_single_entity_inner(&ref_transition, &non_negative_property(), 0)
+        .expect_err("single-entity transition refs should remain topology boundary");
+    assert!(err.contains("transition refs"));
 
     let mut left = make_counter_system();
     left.name = "Left".to_owned();
