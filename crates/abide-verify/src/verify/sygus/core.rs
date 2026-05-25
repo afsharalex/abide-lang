@@ -1798,6 +1798,49 @@ where
     }
 }
 
+pub(super) fn encode_finite_set_subset_expr<F>(
+    tm: &Cvc5Tm,
+    left: &IRExpr,
+    right: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    mut encode_with_vars: F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    let element_ty = match sygus_expr_type(left).or_else(|| sygus_expr_type(right)) {
+        Some(IRType::Set { element }) => element.as_ref(),
+        _ => return Ok(None),
+    };
+    let Some(candidates) = finite_domain_values(tm, element_ty, enum_catalog) else {
+        return Err(
+            "cvc5 SyGuS set subset only supports finite Bool/enum element domains".to_owned(),
+        );
+    };
+    let mut constraints = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let lhs = encode_finite_set_membership_term(
+            tm,
+            left,
+            &candidate,
+            vars,
+            enum_catalog,
+            &mut encode_with_vars,
+        )?;
+        let rhs = encode_finite_set_membership_term(
+            tm,
+            right,
+            &candidate,
+            vars,
+            enum_catalog,
+            &mut encode_with_vars,
+        )?;
+        constraints.push(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs]));
+    }
+    Ok(Some(mk_and(tm, &constraints)))
+}
+
 fn default_term_for_type(
     tm: &Cvc5Tm,
     ty: &IRType,
@@ -2479,6 +2522,15 @@ pub(super) fn encode_expr(
             ty,
             ..
         } => {
+            if matches!(op.as_str(), "OpSetSubset") {
+                if let Some(term) =
+                    encode_finite_set_subset_expr(tm, left, right, vars, enum_catalog, |expr, scoped| {
+                        encode_expr(tm, expr, scoped, enum_catalog)
+                    })?
+                {
+                    return Ok(term);
+                }
+            }
             let lhs = encode_expr(tm, left, vars, enum_catalog)?;
             let rhs = encode_expr(tm, right, vars, enum_catalog)?;
             match op.as_str() {
