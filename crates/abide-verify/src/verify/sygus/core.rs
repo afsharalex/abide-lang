@@ -616,23 +616,26 @@ pub(super) fn encode_initial_field(
     curr_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
 ) -> Result<Cvc5Term, String> {
-    if field.initial_constraint.is_some() {
-        return Err(format!(
-            "cvc5 SyGuS single-entity safety does not support initial constraints yet (field `{}`)",
-            field.name
-        ));
-    }
     let current = curr_vars
         .get(&field.name)
         .ok_or_else(|| format!("missing current variable for field `{}`", field.name))?;
-    let default = field.default.as_ref().ok_or_else(|| {
-        format!(
-            "field `{}` needs a deterministic default for SyGuS",
+    let mut conjuncts = Vec::new();
+    if let Some(default) = &field.default {
+        let encoded = encode_expr(tm, default, curr_vars, enum_catalog)?;
+        conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[current.clone(), encoded]));
+    }
+    if let Some(initial_constraint) = &field.initial_constraint {
+        let mut scoped = curr_vars.clone();
+        scoped.insert("$".to_owned(), current.clone());
+        conjuncts.push(encode_expr(tm, initial_constraint, &scoped, enum_catalog)?);
+    }
+    if conjuncts.is_empty() {
+        return Err(format!(
+            "field `{}` needs a deterministic default or initial constraint for SyGuS",
             field.name
-        )
-    })?;
-    let encoded = encode_expr(tm, default, curr_vars, enum_catalog)?;
-    Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[current.clone(), encoded]))
+        ));
+    }
+    Ok(mk_and(tm, &conjuncts))
 }
 
 pub(super) fn encode_transition(
@@ -649,13 +652,6 @@ pub(super) fn encode_transition(
             trans.name
         ));
     }
-    if trans.postcondition.is_some() {
-        return Err(format!(
-            "cvc5 SyGuS single-entity safety does not support transition postconditions yet (`{}`)",
-            trans.name
-        ));
-    }
-
     let param_envs = enumerate_param_envs(tm, &trans.params, enum_catalog)?;
     let update_map: HashMap<_, _> = trans
         .updates
@@ -681,6 +677,13 @@ pub(super) fn encode_transition(
                     .clone()
             };
             conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), rhs]));
+        }
+        if let Some(postcondition) = &trans.postcondition {
+            let mut post_scoped = next_vars.clone();
+            post_scoped.extend(scoped.iter().filter_map(|(name, term)| {
+                (!curr_vars.contains_key(name)).then(|| (name.clone(), term.clone()))
+            }));
+            conjuncts.push(encode_expr(tm, postcondition, &post_scoped, enum_catalog)?);
         }
         param_branches.push(mk_and(tm, &conjuncts));
     }

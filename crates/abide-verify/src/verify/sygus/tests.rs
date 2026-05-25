@@ -500,6 +500,67 @@ fn sygus_system_step_allows_unused_action_return_expr() {
 }
 
 #[test]
+fn sygus_core_accepts_initial_field_constraints_before_solver_setup() {
+    let mut system = make_counter_system();
+    system.fields[0].default = None;
+    system.fields[0].initial_constraint = Some(bin_expr(
+        "OpGe",
+        IRExpr::Var {
+            name: "$".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        },
+        int_lit(0),
+        IRType::Bool,
+    ));
+    system.actions.clear();
+
+    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
+        .expect_err("empty system should still be rejected after initial constraint setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "initial constraints should pass setup before the empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn sygus_single_entity_transition_supports_postconditions() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_counter_entity();
+    entity.transitions[0].postcondition = Some(bin_expr(
+        "OpGe",
+        IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        },
+        int_lit(1),
+        IRType::Bool,
+    ));
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &entity.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_transition(
+        &tm,
+        &entity.transitions[0],
+        &entity.fields,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("single-entity transition postcondition should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};
 
