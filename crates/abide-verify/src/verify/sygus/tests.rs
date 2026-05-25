@@ -134,6 +134,33 @@ fn true_derived_field() -> crate::ir::types::IRDerivedField {
     }
 }
 
+fn status_ty() -> IRType {
+    IRType::Enum {
+        name: "Status".to_owned(),
+        variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
+    }
+}
+
+fn status_ctor(ctor: &str) -> IRExpr {
+    IRExpr::Ctor {
+        enum_name: "Status".to_owned(),
+        ctor: ctor.to_owned(),
+        args: vec![],
+        span: None,
+    }
+}
+
+fn pending_to_done_fsm(field: &str) -> crate::ir::types::IRFsm {
+    crate::ir::types::IRFsm {
+        field: field.to_owned(),
+        enum_name: "Status".to_owned(),
+        transitions: vec![crate::ir::types::IRFsmTransition {
+            from: "Pending".to_owned(),
+            to: "Done".to_owned(),
+        }],
+    }
+}
+
 #[test]
 fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
     let tm = Cvc5Tm::new();
@@ -562,6 +589,7 @@ fn sygus_system_step_allows_unused_action_return_expr() {
         &tm,
         &system.actions[0],
         &system.fields,
+        &system.fsm_decls,
         &curr_vars,
         &next_vars,
         &enum_catalog,
@@ -624,6 +652,7 @@ fn sygus_single_entity_transition_supports_postconditions() {
         &entity.transitions[0],
         &entity.fields,
         &entity.derived_fields,
+        &entity.fsm_decls,
         &curr_vars,
         &next_vars,
         &enum_catalog,
@@ -673,6 +702,139 @@ fn sygus_pooled_transition_supports_derived_field_guards_and_postconditions() {
         .unwrap_or_else(|err| {
             panic!("pooled transition derived guard/postcondition should encode: {err}")
         });
+}
+
+#[test]
+fn sygus_single_entity_transition_supports_fsm_constraints() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_status_entity();
+    entity.fsm_decls.push(pending_to_done_fsm("status"));
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &entity.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_transition(
+        &tm,
+        &entity.transitions[0],
+        &entity.fields,
+        &entity.derived_fields,
+        &entity.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("single-entity transition FSM constraint should encode: {err}"));
+}
+
+#[test]
+fn sygus_system_step_supports_fsm_constraints() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_status_system();
+    system.fsm_decls.push(pending_to_done_fsm("status"));
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("system step FSM constraint should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_transition_supports_fsm_constraints() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_status_entity();
+    entity.fsm_decls.push(pending_to_done_fsm("status"));
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+
+    encode_pooled_transition_at_slot_for_test(&tm, &entity.transitions[0], &entity, &enum_catalog)
+        .unwrap_or_else(|err| panic!("pooled transition FSM constraint should encode: {err}"));
+}
+
+#[test]
+fn sygus_accepts_fsm_decls_before_solver_setup() {
+    let mut entity = make_status_entity();
+    entity.fsm_decls.push(pending_to_done_fsm("status"));
+    entity.transitions.clear();
+    let err = try_cvc5_sygus_single_entity_inner(&entity, &non_negative_property(), 0)
+        .expect_err("empty entity should still be rejected after FSM setup");
+    assert!(
+        err.contains("requires at least one transition"),
+        "entity FSM declarations should pass setup before empty-transition diagnostic, got: {err}"
+    );
+
+    let mut system = make_status_system();
+    system.fsm_decls.push(pending_to_done_fsm("status"));
+    system.actions.clear();
+    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
+        .expect_err("empty system should still be rejected after FSM setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "system FSM declarations should pass setup before empty-step diagnostic, got: {err}"
+    );
+
+    let mut pooled_entity = make_status_entity();
+    pooled_entity.fsm_decls.push(pending_to_done_fsm("status"));
+    let mut pooled_system = make_pooled_store_counter_system();
+    pooled_system.entities = vec!["StatusEntity".to_owned()];
+    pooled_system.store_params[0].entity_type = "StatusEntity".to_owned();
+    pooled_system.actions.clear();
+    let err = try_cvc5_sygus_pooled_system_safety_inner(
+        &pooled_system,
+        &pooled_entity,
+        2,
+        &non_negative_property(),
+        0,
+    )
+    .expect_err("empty pooled system should still be rejected after entity FSM setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled entity FSM declarations should pass setup before empty-step diagnostic, got: {err}"
+    );
+
+    pooled_entity.fsm_decls.clear();
+    pooled_system.fields.push(IRField {
+        name: "status".to_owned(),
+        ty: status_ty(),
+        default: Some(status_ctor("Pending")),
+        initial_constraint: None,
+    });
+    pooled_system.fsm_decls.push(pending_to_done_fsm("status"));
+    let err = try_cvc5_sygus_pooled_system_safety_inner(
+        &pooled_system,
+        &pooled_entity,
+        2,
+        &non_negative_property(),
+        0,
+    )
+    .expect_err("empty pooled system should still be rejected after system FSM setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled system FSM declarations should pass setup before empty-step diagnostic, got: {err}"
+    );
 }
 
 #[test]
@@ -860,17 +1022,7 @@ fn sygus_core_accepts_derived_fields_before_solver_setup() {
 
 #[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
-    use crate::ir::types::{IRFsm, IRStoreParam};
-
-    let mut fsm_entity = make_counter_entity();
-    fsm_entity.fsm_decls.push(IRFsm {
-        field: "x".to_owned(),
-        enum_name: "CounterState".to_owned(),
-        transitions: vec![],
-    });
-    let err = try_cvc5_sygus_single_entity_inner(&fsm_entity, &non_negative_property(), 0)
-        .expect_err("fsm unsupported");
-    assert!(err.contains("FSM"));
+    use crate::ir::types::IRStoreParam;
 
     let mut no_transition = make_counter_entity();
     no_transition.transitions.clear();
@@ -968,22 +1120,14 @@ fn make_counter_system() -> IRSystem {
 }
 
 fn make_status_system() -> IRSystem {
-    let status_ty = IRType::Enum {
-        name: "Status".to_owned(),
-        variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
-    };
+    let status_ty = status_ty();
     IRSystem {
         name: "StatusSys".to_owned(),
         store_params: vec![],
         fields: vec![IRField {
             name: "status".to_owned(),
             ty: status_ty.clone(),
-            default: Some(IRExpr::Ctor {
-                enum_name: "Status".to_owned(),
-                ctor: "Pending".to_owned(),
-                args: vec![],
-                span: None,
-            }),
+            default: Some(status_ctor("Pending")),
             initial_constraint: None,
         }],
         entities: vec![],
@@ -1037,6 +1181,42 @@ fn make_status_system() -> IRSystem {
         preds: vec![],
         let_bindings: vec![],
         procs: vec![],
+    }
+}
+
+fn make_status_entity() -> IREntity {
+    let status_ty = status_ty();
+    IREntity {
+        name: "StatusEntity".to_owned(),
+        fields: vec![IRField {
+            name: "status".to_owned(),
+            ty: status_ty.clone(),
+            default: Some(status_ctor("Pending")),
+            initial_constraint: None,
+        }],
+        transitions: vec![IRTransition {
+            name: "finish".to_owned(),
+            refs: vec![],
+            params: vec![],
+            guard: bin_expr(
+                "OpEq",
+                IRExpr::Var {
+                    name: "status".to_owned(),
+                    ty: status_ty.clone(),
+                    span: None,
+                },
+                status_ctor("Pending"),
+                IRType::Bool,
+            ),
+            updates: vec![crate::ir::types::IRUpdate {
+                field: "status".to_owned(),
+                value: status_ctor("Done"),
+            }],
+            postcondition: None,
+        }],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
     }
 }
 

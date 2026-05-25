@@ -158,23 +158,10 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             }
         }
     }
-    if !root_system.fsm_decls.is_empty()
-        || entities.iter().any(|entity| !entity.fsm_decls.is_empty())
-    {
-        return Err(
-            "cvc5 SyGuS pooled system safety does not support FSM declarations yet".to_owned(),
-        );
-    }
     if !root_system.let_bindings.is_empty() {
         return Err("cvc5 SyGuS pooled system safety does not support let-bindings yet".to_owned());
     }
     for system in systems {
-        if !system.fsm_decls.is_empty() {
-            return Err(format!(
-                "cvc5 SyGuS pooled system safety does not support FSM declarations yet (`{}`)",
-                system.name
-            ));
-        }
         if !system.let_bindings.is_empty() {
             return Err(format!(
                 "cvc5 SyGuS pooled system safety does not support let-bindings yet (`{}`)",
@@ -1124,6 +1111,24 @@ fn encode_pooled_transition_at_slot(
             ),
         );
     }
+    let mut next_scoped = HashMap::new();
+    for field in &entity.fields {
+        next_scoped.insert(
+            field.name.clone(),
+            slot_next
+                .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                .ok_or_else(|| format!("missing next pooled field `{}`", field.name))?
+                .clone(),
+        );
+    }
+    conjuncts.extend(encode_fsm_constraints(
+        tm,
+        &entity.fsm_decls,
+        |field| update_map.contains_key(field),
+        &scoped,
+        &next_scoped,
+        enum_catalog,
+    )?);
     if let Some(postcondition) = &trans.postcondition {
         let mut post_scoped = scoped.clone();
         for field in &entity.fields {

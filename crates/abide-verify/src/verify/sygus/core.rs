@@ -276,12 +276,6 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    if !entity.fsm_decls.is_empty() {
-        return Err(
-            "cvc5 SyGuS single-entity safety does not support FSM declarations yet".to_owned(),
-        );
-    }
-
     let start = Instant::now();
     let tm = Cvc5Tm::new();
     let mut solver = Cvc5Solver::new(&tm);
@@ -332,6 +326,7 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
                 trans,
                 &entity.fields,
                 &entity.derived_fields,
+                &entity.fsm_decls,
                 &curr_vars,
                 &next_vars,
                 &enum_catalog,
@@ -405,9 +400,6 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if !system.entities.is_empty() {
         return Err("cvc5 SyGuS system safety does not support entity pools yet".to_owned());
     }
-    if !system.fsm_decls.is_empty() {
-        return Err("cvc5 SyGuS system safety does not support FSM declarations yet".to_owned());
-    }
     if !system.let_bindings.is_empty() {
         return Err("cvc5 SyGuS system safety does not support let-bindings yet".to_owned());
     }
@@ -459,6 +451,7 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
                 &tm,
                 step,
                 &system.fields,
+                &system.fsm_decls,
                 &curr_vars,
                 &next_vars,
                 &enum_catalog,
@@ -657,6 +650,7 @@ pub(super) fn encode_transition(
     trans: &IRTransition,
     fields: &[IRField],
     derived_fields: &[IRDerivedField],
+    fsm_decls: &[IRFsm],
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
@@ -693,6 +687,14 @@ pub(super) fn encode_transition(
             };
             conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), rhs]));
         }
+        conjuncts.extend(encode_fsm_constraints(
+            tm,
+            fsm_decls,
+            |field| update_map.contains_key(field),
+            &scoped,
+            next_vars,
+            enum_catalog,
+        )?);
         if let Some(postcondition) = &trans.postcondition {
             let mut post_scoped = next_vars.clone();
             extend_with_derived_fields(tm, &mut post_scoped, derived_fields, enum_catalog)?;
@@ -711,6 +713,7 @@ pub(super) fn encode_system_step(
     tm: &Cvc5Tm,
     step: &IRSystemAction,
     fields: &[IRField],
+    fsm_decls: &[IRFsm],
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
@@ -736,10 +739,70 @@ pub(super) fn encode_system_step(
             });
             conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), rhs]));
         }
+        conjuncts.extend(encode_fsm_constraints(
+            tm,
+            fsm_decls,
+            |field| update_map.contains_key(field),
+            &scoped,
+            next_vars,
+            enum_catalog,
+        )?);
         param_branches.push(mk_and(tm, &conjuncts));
     }
 
     Ok(mk_or(tm, &param_branches))
+}
+
+pub(super) fn encode_fsm_constraints(
+    tm: &Cvc5Tm,
+    fsm_decls: &[IRFsm],
+    mut is_touched: impl FnMut(&str) -> bool,
+    curr_vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Vec<Cvc5Term>, String> {
+    let mut constraints = Vec::new();
+    for fsm in fsm_decls {
+        if !is_touched(&fsm.field) {
+            continue;
+        }
+        let curr = curr_vars
+            .get(&fsm.field)
+            .ok_or_else(|| format!("missing current FSM field `{}`", fsm.field))?;
+        let next = next_vars
+            .get(&fsm.field)
+            .ok_or_else(|| format!("missing next FSM field `{}`", fsm.field))?;
+        let mut allowed =
+            vec![tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[curr.clone(), next.clone()])];
+        for edge in &fsm.transitions {
+            let from = lookup_enum_ctor_index(enum_catalog, &fsm.enum_name, &edge.from)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown FSM source `{}` for enum `{}` in cvc5 SyGuS slice",
+                        edge.from, fsm.enum_name
+                    )
+                })?;
+            let to = lookup_enum_ctor_index(enum_catalog, &fsm.enum_name, &edge.to).ok_or_else(
+                || {
+                    format!(
+                        "unknown FSM target `{}` for enum `{}` in cvc5 SyGuS slice",
+                        edge.to, fsm.enum_name
+                    )
+                },
+            )?;
+            let from_eq = tm.mk_term(
+                Cvc5Kind::CVC5_KIND_EQUAL,
+                &[curr.clone(), tm.mk_integer(*from)],
+            );
+            let to_eq = tm.mk_term(
+                Cvc5Kind::CVC5_KIND_EQUAL,
+                &[next.clone(), tm.mk_integer(*to)],
+            );
+            allowed.push(mk_and(tm, &[from_eq, to_eq]));
+        }
+        constraints.push(mk_or(tm, &allowed));
+    }
+    Ok(constraints)
 }
 
 pub(super) fn collect_system_updates(
