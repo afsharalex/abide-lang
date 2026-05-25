@@ -3,6 +3,8 @@ module StateModeling
 // FSM, derived field, invariant, and interface examples.
 // This file is intended to pass under:
 //   abide verify examples/state_modeling.ab --bounded-only
+// A CHECKED result is bounded trace-prefix coverage, not exhaustive
+// reachable-state or all-instance coverage.
 
 enum OrderStatus = Cart | Placed | Delivered
 

@@ -1823,6 +1823,62 @@ fn cli_verify_report_json_writes_machine_readable_report_file() {
 }
 
 #[test]
+fn cli_verify_report_json_discloses_checked_bounded_semantics() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let report = dir.path().join("fairness.report.json");
+
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/fairness.ab",
+            "--witness-semantics",
+            "relational",
+            "--report",
+            "json",
+            dir.path().to_str().expect("utf8 report dir"),
+        ])
+        .output()
+        .expect("failed to run abide verify --report json");
+
+    assert!(
+        report.exists(),
+        "expected verify report file to be written: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_json =
+        std::fs::read_to_string(&report).expect("should read generated verification report");
+    let value: serde_json::Value =
+        serde_json::from_str(&report_json).expect("report should be valid JSON");
+    assert_eq!(
+        value
+            .pointer("/checked_semantics/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("bounded_trace_prefix")
+    );
+    assert!(
+        value
+            .pointer("/checked_semantics/depth")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|depth| depth.contains("stutter")),
+        "expected CHECKED depth semantics to mention stutter steps: {report_json}"
+    );
+    assert!(
+        value
+            .pointer("/checked_semantics/coverage")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|coverage| {
+                coverage.contains("not exhaustive")
+                    && coverage.contains("reachable-state")
+                    && coverage.contains("all-instance")
+            }),
+        "expected CHECKED coverage limits in report JSON: {report_json}"
+    );
+}
+
+#[test]
 fn cli_verify_report_markdown_writes_markdown_file() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let dir = tempfile::tempdir().expect("tempdir");

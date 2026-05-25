@@ -63,6 +63,11 @@ The `assume` block establishes:
 - bare Boolean predicates over stores that must hold in the initial state
 - fairness, stutter, and related execution assumptions when needed
 
+A `CHECKED` result means Abide did not find a counterexample on the explored
+bounded trace prefixes. The reported depth is a transition bound and may include
+stutter steps when stutter is enabled. It is not a TLC-style exhaustive
+reachable-state result and not an Alloy-style all-instance result.
+
 ## Theorems and lemmas
 
 `theorem` and `lemma` express unbounded proof obligations and reusable facts:

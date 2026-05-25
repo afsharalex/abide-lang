@@ -5356,10 +5356,13 @@ impl std::fmt::Display for VerificationResult {
                 if let Some(method) = method {
                     write!(
                         f,
-                        "CHECKED {name} (method: {method}, depth: {depth}, {time_ms}ms{under})"
+                        "CHECKED {name} (method: {method}, bounded trace-prefix depth: {depth}, {time_ms}ms, depth may include stutter steps, not exhaustive reachable-state/all-instance coverage{under})"
                     )
                 } else {
-                    write!(f, "CHECKED {name} (depth: {depth}, {time_ms}ms{under})")
+                    write!(
+                        f,
+                        "CHECKED {name} (bounded trace-prefix depth: {depth}, {time_ms}ms, depth may include stutter steps, not exhaustive reachable-state/all-instance coverage{under})"
+                    )
                 }
             }
             VerificationResult::Counterexample {

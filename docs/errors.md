@@ -154,7 +154,7 @@ Verification is not an error — it produces results that indicate whether prope
 | Result | Meaning |
 |--------|---------|
 | **PROVED** | Property holds for all system sizes (unbounded proof via induction or IC3). |
-| **CHECKED** | No counterexample found within the bounded depth. |
+| **CHECKED** | No counterexample found on the explored bounded trace prefixes. The depth counts transitions and may include stutter steps; this is not exhaustive reachable-state coverage or all-instance coverage. |
 | **COUNTEREXAMPLE** | A trace of events was found that violates the property. |
 | **PASS** | Scene scenario is satisfiable and all assertions hold. |
 | **FAIL** | Scene scenario is unsatisfiable or assertions are violated. |

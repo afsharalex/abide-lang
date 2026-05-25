@@ -652,8 +652,18 @@ fn build_verification_report_json(
             "witness_semantics": witness_semantics_name,
             "target": target,
         },
+        "checked_semantics": checked_semantics_report_json(),
         "diagnostics": diagnostics,
         "results": results,
+    })
+}
+
+fn checked_semantics_report_json() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "bounded_trace_prefix",
+        "depth": "bounded transition depth; steps may include stutter transitions when stutter is enabled",
+        "coverage": "CHECKED means no counterexample was found on explored bounded trace prefixes; it is not exhaustive reachable-state coverage and not all-instance coverage",
+        "entity_initial_state": "entity field defaults and explicit assume/given predicates constrain the initial state",
     })
 }
 
@@ -2928,7 +2938,7 @@ fn result_secondary_summary(result: &verify::VerificationResult) -> String {
                 .map(|method| format!(" by {method}"))
                 .unwrap_or_default();
             format!(
-                "checked to depth {depth}{method} in {time_ms}ms{}",
+                "no counterexample on bounded trace-prefix depth {depth}{method} in {time_ms}ms; depth may include stutter steps; not exhaustive reachable-state or all-instance coverage{}",
                 render_assumption_suffix(assumptions)
             )
         }
@@ -3056,6 +3066,34 @@ mod tests {
         assert_eq!(
             render_terminal_summary(&result),
             "SCENE FAIL: eligible_patient_can_book - scenario is unsatisfiable"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_discloses_checked_bounded_semantics() {
+        let result = verify::VerificationResult::Checked {
+            name: "bounded_safety".to_owned(),
+            depth: 3,
+            method: Some("bounded model checking".to_owned()),
+            time_ms: 12,
+            assumptions: Vec::new(),
+            span: None,
+            file: None,
+        };
+
+        let summary = render_terminal_summary(&result);
+
+        assert!(
+            summary.contains("bounded trace-prefix"),
+            "expected CHECKED summary to describe trace-prefix semantics: {summary}"
+        );
+        assert!(
+            summary.contains("stutter"),
+            "expected CHECKED summary to disclose stutter depth semantics: {summary}"
+        );
+        assert!(
+            summary.contains("not exhaustive"),
+            "expected CHECKED summary to disclose coverage limits: {summary}"
         );
     }
 
