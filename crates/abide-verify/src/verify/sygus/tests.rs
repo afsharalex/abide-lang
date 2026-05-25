@@ -1732,6 +1732,166 @@ fn sygus_pooled_system_step_supports_action_match_on_system_field() {
 }
 
 #[test]
+fn sygus_pooled_action_match_guards_can_read_let_crosscall_locals() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![IRVariant::simple("Bump"), IRVariant::simple("Hold")],
+    };
+    let mut entity = make_pooled_counter_entity();
+    entity.fields.push(IRField {
+        name: "decision_seed".to_owned(),
+        ty: decision_ty.clone(),
+        default: Some(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Hold".to_owned(),
+            args: vec![],
+            span: None,
+        }),
+        initial_constraint: None,
+    });
+    let relay = IRSystem {
+        name: "CounterRelay".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Counter".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "relay_match_guard".to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body: vec![
+                IRAction::LetCrossCall {
+                    name: "decision".to_owned(),
+                    system: "DecisionWorker".to_owned(),
+                    command: "decide".to_owned(),
+                    args: vec![],
+                },
+                IRAction::Match {
+                    scrutinee: crate::ir::types::IRActionMatchScrutinee::Var {
+                        name: "decision".to_owned(),
+                    },
+                    arms: vec![
+                        crate::ir::types::IRActionMatchArm {
+                            pattern: crate::ir::types::IRPattern::PCtor {
+                                name: "Bump".to_owned(),
+                                fields: vec![],
+                            },
+                            guard: Some(bin_expr(
+                                "OpEq",
+                                IRExpr::Var {
+                                    name: "decision".to_owned(),
+                                    ty: decision_ty.clone(),
+                                    span: None,
+                                },
+                                IRExpr::Ctor {
+                                    enum_name: "Decision".to_owned(),
+                                    ctor: "Bump".to_owned(),
+                                    args: vec![],
+                                    span: None,
+                                },
+                                IRType::Bool,
+                            )),
+                            body: vec![IRAction::Match {
+                                scrutinee: crate::ir::types::IRActionMatchScrutinee::Var {
+                                    name: "decision".to_owned(),
+                                },
+                                arms: vec![
+                                    crate::ir::types::IRActionMatchArm {
+                                        pattern: crate::ir::types::IRPattern::PCtor {
+                                            name: "Bump".to_owned(),
+                                            fields: vec![],
+                                        },
+                                        guard: None,
+                                        body: vec![IRAction::Choose {
+                                            var: "c".to_owned(),
+                                            entity: "Counter".to_owned(),
+                                            filter: Box::new(bool_lit(true)),
+                                            ops: vec![IRAction::Apply {
+                                                target: "c".to_owned(),
+                                                transition: "inc".to_owned(),
+                                                refs: vec![],
+                                                args: vec![],
+                                            }],
+                                        }],
+                                    },
+                                    crate::ir::types::IRActionMatchArm {
+                                        pattern: crate::ir::types::IRPattern::PWild,
+                                        guard: None,
+                                        body: vec![],
+                                    },
+                                ],
+                            }],
+                        },
+                        crate::ir::types::IRActionMatchArm {
+                            pattern: crate::ir::types::IRPattern::PWild,
+                            guard: None,
+                            body: vec![],
+                        },
+                    ],
+                },
+            ],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let worker = IRSystem {
+        name: "DecisionWorker".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Counter".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "decide".to_owned(),
+            params: vec![],
+            guard: bool_lit(true),
+            body: vec![],
+            return_expr: Some(IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Bump".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let all_fields = relay
+        .fields
+        .iter()
+        .chain(worker.fields.iter())
+        .chain(entity.fields.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_systems_test(
+        &tm,
+        &relay.actions[0],
+        &relay,
+        &[relay.clone(), worker],
+        &[entity],
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| {
+        panic!("pooled action match guards should read LetCrossCall locals: {err}")
+    });
+}
+
+#[test]
 fn sygus_core_accepts_command_metadata_before_solver_setup() {
     let mut system = make_counter_system();
     system.commands.push(crate::ir::types::IRCommand {

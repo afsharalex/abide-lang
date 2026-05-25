@@ -564,7 +564,31 @@ pub(super) fn encode_pooled_system_step_for_test(
     slots_per_entity: &HashMap<String, usize>,
     enum_catalog: &EnumCatalog,
 ) -> Result<Cvc5Term, String> {
-    let systems_by_name = HashMap::from([(system.name.clone(), system)]);
+    encode_pooled_system_step_for_systems_test(
+        tm,
+        step,
+        system,
+        std::slice::from_ref(system),
+        entities,
+        slots_per_entity,
+        enum_catalog,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn encode_pooled_system_step_for_systems_test(
+    tm: &Cvc5Tm,
+    step: &IRSystemAction,
+    system: &IRSystem,
+    systems: &[IRSystem],
+    entities: &[IREntity],
+    slots_per_entity: &HashMap<String, usize>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let systems_by_name: HashMap<_, _> = systems
+        .iter()
+        .map(|system| (system.name.clone(), system))
+        .collect();
     let entities_by_name: HashMap<_, _> = entities
         .iter()
         .map(|entity| (entity.name.clone(), entity))
@@ -3525,6 +3549,11 @@ fn encode_pooled_action_match(
     let mut fallback = None;
     for arm in arms.iter().rev() {
         let mut arm_vars = vars.clone();
+        arm_vars.extend(
+            local_bindings
+                .iter()
+                .map(|(name, binding)| (name.clone(), binding.term.clone())),
+        );
         bind_pattern_vars(
             tm,
             &arm.pattern,
@@ -3562,7 +3591,7 @@ fn encode_pooled_action_match(
             slots_per_entity,
             &arm_vars,
             next_vars,
-            &HashMap::new(),
+            local_bindings,
             active_curr,
             active_next,
             slot_curr,
