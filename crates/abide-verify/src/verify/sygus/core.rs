@@ -1651,6 +1651,30 @@ where
             }
             Ok(sum_bool_terms(tm, &memberships))
         }
+        IRExpr::BinOp {
+            op,
+            ty: IRType::Set { element },
+            ..
+        } if matches!(op.as_str(), "OpSetUnion" | "OpSetIntersect" | "OpSetDiff") => {
+            let Some(candidates) = finite_domain_values(tm, element, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS cardinality only supports finite Bool/enum set algebra domains"
+                        .to_owned(),
+                );
+            };
+            let mut memberships = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                memberships.push(encode_finite_set_membership_term(
+                    tm,
+                    expr,
+                    &candidate,
+                    vars,
+                    enum_catalog,
+                    &mut encode_with_vars,
+                )?);
+            }
+            Ok(sum_bool_terms(tm, &memberships))
+        }
         _ => Err(format!(
             "cvc5 SyGuS cardinality does not support expression shape: {expr:?}"
         )),
@@ -1668,20 +1692,21 @@ pub(super) fn encode_finite_set_membership_expr<F>(
 where
     F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
 {
-    encode_finite_set_membership_expr_inner(
+    let key_term = encode_with_vars(key_expr, vars)?;
+    encode_finite_set_membership_term(
         tm,
         set_expr,
-        key_expr,
+        &key_term,
         vars,
         enum_catalog,
         &mut encode_with_vars,
     )
 }
 
-fn encode_finite_set_membership_expr_inner<F>(
+fn encode_finite_set_membership_term<F>(
     tm: &Cvc5Tm,
     set_expr: &IRExpr,
-    key_expr: &IRExpr,
+    key_term: &Cvc5Term,
     vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
     encode_with_vars: &mut F,
@@ -1689,7 +1714,6 @@ fn encode_finite_set_membership_expr_inner<F>(
 where
     F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
 {
-    let key_term = encode_with_vars(key_expr, vars)?;
     match set_expr {
         IRExpr::SetLit { elements, .. } => {
             let mut matches = Vec::with_capacity(elements.len());
@@ -1742,18 +1766,18 @@ where
         IRExpr::BinOp {
             op, left, right, ..
         } if matches!(op.as_str(), "OpSetUnion" | "OpSetIntersect" | "OpSetDiff") => {
-            let lhs = encode_finite_set_membership_expr_inner(
+            let lhs = encode_finite_set_membership_term(
                 tm,
                 left,
-                key_expr,
+                key_term,
                 vars,
                 enum_catalog,
                 encode_with_vars,
             )?;
-            let rhs = encode_finite_set_membership_expr_inner(
+            let rhs = encode_finite_set_membership_term(
                 tm,
                 right,
-                key_expr,
+                key_term,
                 vars,
                 enum_catalog,
                 encode_with_vars,
