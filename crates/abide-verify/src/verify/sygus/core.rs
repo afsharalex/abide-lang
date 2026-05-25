@@ -276,11 +276,6 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Result<(), String> {
-    if !entity.derived_fields.is_empty() {
-        return Err(
-            "cvc5 SyGuS single-entity safety does not support derived fields yet".to_owned(),
-        );
-    }
     if !entity.fsm_decls.is_empty() {
         return Err(
             "cvc5 SyGuS single-entity safety does not support FSM declarations yet".to_owned(),
@@ -295,7 +290,8 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     if timeout_ms > 0 {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
-    let enum_catalog = build_enum_catalog(&tm, &entity.fields)?;
+    let enum_catalog =
+        build_enum_catalog_with_derived(&tm, &entity.fields, &entity.derived_fields)?;
     solver.set_logic(if enum_catalog.has_payload_enums() {
         "ALL"
     } else {
@@ -316,6 +312,7 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
         curr_order.push(curr);
         next_order.push(next);
     }
+    extend_with_derived_fields(&tm, &mut curr_vars, &entity.derived_fields, &enum_catalog)?;
 
     let pre_body = mk_and(
         &tm,
@@ -334,6 +331,7 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
                 &tm,
                 trans,
                 &entity.fields,
+                &entity.derived_fields,
                 &curr_vars,
                 &next_vars,
                 &enum_catalog,
@@ -415,9 +413,6 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if !system.fsm_decls.is_empty() {
         return Err("cvc5 SyGuS system safety does not support FSM declarations yet".to_owned());
     }
-    if !system.derived_fields.is_empty() {
-        return Err("cvc5 SyGuS system safety does not support derived fields yet".to_owned());
-    }
     if !system.queries.is_empty() || !system.preds.is_empty() || !system.let_bindings.is_empty() {
         return Err(
             "cvc5 SyGuS system safety does not support queries/preds/let-bindings yet".to_owned(),
@@ -430,7 +425,8 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if timeout_ms > 0 {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
-    let enum_catalog = build_enum_catalog(&tm, &system.fields)?;
+    let enum_catalog =
+        build_enum_catalog_with_derived(&tm, &system.fields, &system.derived_fields)?;
     solver.set_logic(if enum_catalog.has_payload_enums() {
         "ALL"
     } else {
@@ -451,6 +447,7 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
         curr_order.push(curr);
         next_order.push(next);
     }
+    extend_with_derived_fields(&tm, &mut curr_vars, &system.derived_fields, &enum_catalog)?;
 
     let pre_body = mk_and(
         &tm,
@@ -567,6 +564,14 @@ pub(super) fn fold_and(mut exprs: Vec<IRExpr>) -> IRExpr {
 }
 
 pub(super) fn build_enum_catalog(tm: &Cvc5Tm, fields: &[IRField]) -> Result<EnumCatalog, String> {
+    build_enum_catalog_with_derived(tm, fields, &[])
+}
+
+pub(super) fn build_enum_catalog_with_derived(
+    tm: &Cvc5Tm,
+    fields: &[IRField],
+    derived_fields: &[IRDerivedField],
+) -> Result<EnumCatalog, String> {
     let mut catalog = EnumCatalog::new();
     for field in fields {
         if let IRType::Enum { name, variants } = &field.ty {
@@ -581,7 +586,23 @@ pub(super) fn build_enum_catalog(tm: &Cvc5Tm, fields: &[IRField]) -> Result<Enum
             catalog.insert(name.clone(), mapping);
         }
     }
+    for derived in derived_fields {
+        catalog.register_type(tm, &derived.ty)?;
+    }
     Ok(catalog)
+}
+
+pub(super) fn extend_with_derived_fields(
+    tm: &Cvc5Tm,
+    vars: &mut HashMap<String, Cvc5Term>,
+    derived_fields: &[IRDerivedField],
+    enum_catalog: &EnumCatalog,
+) -> Result<(), String> {
+    for derived in derived_fields {
+        let value = encode_expr(tm, &derived.body, vars, enum_catalog)?;
+        vars.insert(derived.name.clone(), value);
+    }
+    Ok(())
 }
 
 pub(super) fn sort_for_field(
@@ -642,6 +663,7 @@ pub(super) fn encode_transition(
     tm: &Cvc5Tm,
     trans: &IRTransition,
     fields: &[IRField],
+    derived_fields: &[IRDerivedField],
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
@@ -680,6 +702,7 @@ pub(super) fn encode_transition(
         }
         if let Some(postcondition) = &trans.postcondition {
             let mut post_scoped = next_vars.clone();
+            extend_with_derived_fields(tm, &mut post_scoped, derived_fields, enum_catalog)?;
             post_scoped.extend(scoped.iter().filter_map(|(name, term)| {
                 (!curr_vars.contains_key(name)).then(|| (name.clone(), term.clone()))
             }));

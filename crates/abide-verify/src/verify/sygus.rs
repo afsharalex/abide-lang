@@ -7,8 +7,8 @@ use cvc5_rs::{
 };
 
 use crate::ir::types::{
-    IRAction, IRCreateField, IREntity, IRExpr, IRField, IRSystem, IRSystemAction, IRTransParam,
-    IRTransition, IRType, LitVal,
+    IRAction, IRCreateField, IRDerivedField, IREntity, IRExpr, IRField, IRSystem, IRSystemAction,
+    IRTransParam, IRTransition, IRType, LitVal,
 };
 mod core;
 mod pooled;

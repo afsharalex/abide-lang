@@ -109,6 +109,23 @@ fn bin_expr(op: &str, left: IRExpr, right: IRExpr, ty: IRType) -> IRExpr {
     }
 }
 
+fn nonnegative_derived_field() -> crate::ir::types::IRDerivedField {
+    crate::ir::types::IRDerivedField {
+        name: "nonnegative".to_owned(),
+        body: bin_expr(
+            "OpGe",
+            IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            },
+            int_lit(0),
+            IRType::Bool,
+        ),
+        ty: IRType::Bool,
+    }
+}
+
 #[test]
 fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
     let tm = Cvc5Tm::new();
@@ -454,6 +471,33 @@ fn sygus_expr_encoder_supports_prime_wrappers() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_derived_field_bindings() {
+    let tm = Cvc5Tm::new();
+    let mut vars = HashMap::from([("x".to_owned(), tm.mk_var(tm.integer_sort(), "x"))]);
+    let enum_catalog = EnumCatalog::new();
+
+    extend_with_derived_fields(
+        &tm,
+        &mut vars,
+        &[nonnegative_derived_field()],
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("derived field should encode: {err}"));
+
+    encode_expr(
+        &tm,
+        &IRExpr::Var {
+            name: "nonnegative".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        },
+        &vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("derived field reference should encode: {err}"));
+}
+
+#[test]
 fn sygus_param_enumerator_supports_finite_payload_enum_params() {
     let tm = Cvc5Tm::new();
     let decision_ty = IRType::Enum {
@@ -571,6 +615,7 @@ fn sygus_single_entity_transition_supports_postconditions() {
         &tm,
         &entity.transitions[0],
         &entity.fields,
+        &entity.derived_fields,
         &curr_vars,
         &next_vars,
         &enum_catalog,
@@ -599,22 +644,35 @@ fn sygus_pooled_transition_supports_postconditions() {
 }
 
 #[test]
-fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
-    use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};
-
+fn sygus_core_accepts_derived_fields_before_solver_setup() {
     let mut derived_entity = make_counter_entity();
-    derived_entity.derived_fields.push(IRDerivedField {
-        name: "double".to_owned(),
-        body: IRExpr::Var {
-            name: "x".to_owned(),
-            ty: IRType::Int,
-            span: None,
-        },
-        ty: IRType::Int,
-    });
+    derived_entity
+        .derived_fields
+        .push(nonnegative_derived_field());
+    derived_entity.transitions.clear();
     let err = try_cvc5_sygus_single_entity_inner(&derived_entity, &non_negative_property(), 0)
-        .expect_err("derived fields unsupported");
-    assert!(err.contains("derived fields"));
+        .expect_err("empty entity should still be rejected after derived setup");
+    assert!(
+        err.contains("requires at least one transition"),
+        "derived fields should pass setup before the empty-transition diagnostic, got: {err}"
+    );
+
+    let mut derived_system = make_counter_system();
+    derived_system
+        .derived_fields
+        .push(nonnegative_derived_field());
+    derived_system.actions.clear();
+    let err = try_cvc5_sygus_system_safety_inner(&derived_system, &non_negative_property(), 0)
+        .expect_err("empty system should still be rejected after derived setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "derived fields should pass setup before the empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
+    use crate::ir::types::{IRCommand, IRFsm, IRStoreParam};
 
     let mut fsm_entity = make_counter_entity();
     fsm_entity.fsm_decls.push(IRFsm {
