@@ -1853,6 +1853,8 @@ pub(super) fn encode_expr(
                     .to_owned(),
             ),
         },
+        IRExpr::Sorry { .. } => Ok(tm.mk_boolean(true)),
+        IRExpr::Todo { .. } => Err("todo expression in cvc5 SyGuS slice".to_owned()),
         IRExpr::Ctor {
             enum_name,
             ctor,

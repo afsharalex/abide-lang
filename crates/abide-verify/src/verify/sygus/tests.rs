@@ -1186,6 +1186,35 @@ fn sygus_system_step_supports_payload_field_projection_rhs() {
 }
 
 #[test]
+fn sygus_system_step_supports_sorry_guards() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions[0].guard = IRExpr::Sorry { span: None };
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("sorry guard should encode: {err}"));
+}
+
+#[test]
 fn sygus_system_step_supports_action_match_on_system_field() {
     let tm = Cvc5Tm::new();
     let mut system = make_status_system();
@@ -2269,6 +2298,26 @@ fn sygus_pooled_system_step_supports_payload_field_projection_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("pooled payload field projection RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_sorry_guards() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.actions[0].guard = IRExpr::Sorry { span: None };
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled sorry guard should encode: {err}"));
 }
 
 #[test]
