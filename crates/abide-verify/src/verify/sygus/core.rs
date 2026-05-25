@@ -408,10 +408,8 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if !system.fsm_decls.is_empty() {
         return Err("cvc5 SyGuS system safety does not support FSM declarations yet".to_owned());
     }
-    if !system.queries.is_empty() || !system.preds.is_empty() || !system.let_bindings.is_empty() {
-        return Err(
-            "cvc5 SyGuS system safety does not support queries/preds/let-bindings yet".to_owned(),
-        );
+    if !system.let_bindings.is_empty() {
+        return Err("cvc5 SyGuS system safety does not support let-bindings yet".to_owned());
     }
     let tm = Cvc5Tm::new();
     let mut solver = Cvc5Solver::new(&tm);

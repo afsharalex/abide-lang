@@ -739,6 +739,99 @@ fn sygus_pooled_accepts_command_metadata_before_solver_setup() {
 }
 
 #[test]
+fn sygus_core_accepts_query_and_pred_metadata_before_solver_setup() {
+    let mut system = make_counter_system();
+    system.queries.push(crate::ir::types::IRQuery {
+        name: "is_nonnegative".to_owned(),
+        params: vec![],
+        requires: vec![],
+        body: IRExpr::Var {
+            name: "nonnegative".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        },
+    });
+    system.preds.push(crate::ir::types::IRFunction {
+        name: "always_ok".to_owned(),
+        ty: IRType::Bool,
+        body: bool_lit(true),
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
+        span: None,
+        file: None,
+    });
+    system.actions.clear();
+
+    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
+        .expect_err("empty system should still be rejected after query/pred metadata setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "query/pred metadata should pass setup before empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn sygus_pooled_accepts_query_and_pred_metadata_before_solver_setup() {
+    let entity = make_counter_entity();
+    let mut system = make_pooled_store_counter_system();
+    system.queries.push(crate::ir::types::IRQuery {
+        name: "any_counter".to_owned(),
+        params: vec![],
+        requires: vec![],
+        body: bool_lit(true),
+    });
+    system.preds.push(crate::ir::types::IRFunction {
+        name: "pool_ok".to_owned(),
+        ty: IRType::Bool,
+        body: bool_lit(true),
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
+        span: None,
+        file: None,
+    });
+    system.actions.clear();
+
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&system, &entity, 2, &non_negative_property(), 0)
+            .expect_err(
+                "empty pooled system should still be rejected after query/pred metadata setup",
+            );
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled query/pred metadata should pass setup before empty-step diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn sygus_keeps_let_bindings_as_topology_boundary() {
+    let mut system = make_counter_system();
+    system.let_bindings.push(crate::ir::types::IRLetBinding {
+        name: "child".to_owned(),
+        system_type: "CounterSys".to_owned(),
+        store_bindings: vec![],
+    });
+    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
+        .expect_err("let binding topology should remain unsupported");
+    assert!(err.contains("let-bindings"));
+
+    let entity = make_counter_entity();
+    let mut pooled = make_pooled_store_counter_system();
+    pooled.let_bindings.push(crate::ir::types::IRLetBinding {
+        name: "child".to_owned(),
+        system_type: "CounterStorePool".to_owned(),
+        store_bindings: vec![],
+    });
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&pooled, &entity, 2, &non_negative_property(), 0)
+            .expect_err("pooled let binding topology should remain unsupported");
+    assert!(err.contains("let-bindings"));
+}
+
+#[test]
 fn sygus_core_accepts_derived_fields_before_solver_setup() {
     let mut derived_entity = make_counter_entity();
     derived_entity

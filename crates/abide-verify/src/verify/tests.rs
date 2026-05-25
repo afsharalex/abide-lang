@@ -19157,11 +19157,10 @@ fn verify_all_with_cvc5_selection_does_not_use_sygus_without_opt_in() {
 #[test]
 fn verify_all_with_cvc5_sygus_opt_in_reports_unsupported_fragments() {
     let mut ir = make_system_field_counter_ir();
-    ir.systems[0].queries.push(IRQuery {
-        name: "is_non_negative".to_owned(),
-        params: vec![],
-        requires: vec![],
-        body: bool_lit(true),
+    ir.systems[0].let_bindings.push(IRLetBinding {
+        name: "child".to_owned(),
+        system_type: "CounterSys".to_owned(),
+        store_bindings: vec![],
     });
     let config = VerifyConfig {
         solver_selection: SolverSelection::Cvc5,
@@ -19178,7 +19177,7 @@ fn verify_all_with_cvc5_sygus_opt_in_reports_unsupported_fragments() {
             &results[0],
             VerificationResult::Unprovable { hint, .. }
                 if hint.contains("cvc5 SyGuS opt-in")
-                    && hint.contains("does not support queries/preds/let-bindings")
+                    && hint.contains("does not support let-bindings")
         ),
         "explicit cvc5 SyGuS opt-in should report unsupported fragments honestly: {results:?}"
     );

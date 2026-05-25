@@ -165,14 +165,8 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             "cvc5 SyGuS pooled system safety does not support FSM declarations yet".to_owned(),
         );
     }
-    if !root_system.queries.is_empty()
-        || !root_system.preds.is_empty()
-        || !root_system.let_bindings.is_empty()
-    {
-        return Err(
-            "cvc5 SyGuS pooled system safety does not support queries/preds/let-bindings yet"
-                .to_owned(),
-        );
+    if !root_system.let_bindings.is_empty() {
+        return Err("cvc5 SyGuS pooled system safety does not support let-bindings yet".to_owned());
     }
     for system in systems {
         if !system.fsm_decls.is_empty() {
@@ -181,10 +175,9 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 system.name
             ));
         }
-        if !system.queries.is_empty() || !system.preds.is_empty() || !system.let_bindings.is_empty()
-        {
+        if !system.let_bindings.is_empty() {
             return Err(format!(
-                "cvc5 SyGuS pooled system safety does not support queries/preds/let-bindings yet (`{}`)",
+                "cvc5 SyGuS pooled system safety does not support let-bindings yet (`{}`)",
                 system.name
             ));
         }
