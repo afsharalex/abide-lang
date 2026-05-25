@@ -65,6 +65,39 @@ pub(super) fn collect_xor_event_indices(
     }
 }
 
+fn scene_solver_result(
+    scene: &IRScene,
+    result: SatResult,
+    elapsed_ms: u64,
+    evidence: Option<EvidenceEnvelope>,
+) -> VerificationResult {
+    match result {
+        SatResult::Sat => VerificationResult::ScenePass {
+            name: scene.name.clone(),
+            time_ms: elapsed_ms,
+            evidence,
+            span: None,
+            file: None,
+        },
+        SatResult::Unsat => VerificationResult::SceneFail {
+            name: scene.name.clone(),
+            reason: crate::messages::SCENE_UNSATISFIABLE.to_owned(),
+            span: None,
+            file: None,
+        },
+        SatResult::Unknown(reason) => VerificationResult::SceneUnknown {
+            name: scene.name.clone(),
+            reason: if reason.is_empty() {
+                crate::messages::SCENE_UNKNOWN.to_owned()
+            } else {
+                format!("{}: {reason}", crate::messages::SCENE_UNKNOWN)
+            },
+            span: None,
+            file: None,
+        },
+    }
+}
+
 /// Collect event-level same-step pairs from `OpSameStep` ordering expressions.
 pub(super) fn collect_same_step_event_pairs(
     ordering: &[IRExpr],
@@ -1971,7 +2004,7 @@ pub(super) fn check_scene_block(
     let elapsed = elapsed_ms(&start);
 
     match solver.check() {
-        SatResult::Sat => {
+        result @ SatResult::Sat => {
             let evidence = scene_pass_evidence(
                 &solver,
                 &pool,
@@ -1986,26 +2019,11 @@ pub(super) fn check_scene_block(
                 bound,
             )
             .ok();
-            VerificationResult::ScenePass {
-                name: scene.name.clone(),
-                time_ms: elapsed,
-                evidence,
-                span: None,
-                file: None,
-            }
+            scene_solver_result(scene, result, elapsed, evidence)
         }
-        SatResult::Unsat => VerificationResult::SceneFail {
-            name: scene.name.clone(),
-            reason: crate::messages::SCENE_UNSATISFIABLE.to_owned(),
-            span: None,
-            file: None,
-        },
-        SatResult::Unknown(_) => VerificationResult::SceneFail {
-            name: scene.name.clone(),
-            reason: crate::messages::SCENE_UNKNOWN.to_owned(),
-            span: None,
-            file: None,
-        },
+        result @ (SatResult::Unsat | SatResult::Unknown(_)) => {
+            scene_solver_result(scene, result, elapsed, None)
+        }
     }
 }
 
@@ -2042,6 +2060,48 @@ mod tests {
             span: None,
             file: None,
         }
+    }
+
+    #[test]
+    fn scene_solver_result_distinguishes_sat_unsat_and_unknown() {
+        let scene = empty_scene();
+
+        let sat = scene_solver_result(&scene, SatResult::Sat, 7, None);
+        assert!(matches!(
+            sat,
+            VerificationResult::ScenePass {
+                ref name,
+                time_ms: 7,
+                ..
+            } if name == "empty_scene"
+        ));
+
+        let unsat = scene_solver_result(&scene, SatResult::Unsat, 7, None);
+        assert!(matches!(
+            unsat,
+            VerificationResult::SceneFail {
+                ref name,
+                ref reason,
+                ..
+            } if name == "empty_scene" && reason.contains("unsatisfiable")
+        ));
+
+        let unknown =
+            scene_solver_result(&scene, SatResult::Unknown("timeout".to_owned()), 7, None);
+        let unknown_json = serde_json::to_value(&unknown).expect("serialize scene unknown");
+        assert_eq!(unknown_json["kind"], "scene_unknown");
+        assert!(
+            format!("{unknown}").contains("UNKNOWN"),
+            "human display should distinguish scene unknown"
+        );
+        assert!(matches!(
+            unknown,
+            VerificationResult::SceneUnknown {
+                ref name,
+                ref reason,
+                ..
+            } if name == "empty_scene" && reason.contains("timeout")
+        ));
     }
 
     fn scene_with_unsupported_given() -> IRScene {

@@ -419,6 +419,13 @@ pub enum VerificationResult {
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
+    /// Scene could not be decided because the solver returned unknown.
+    SceneUnknown {
+        name: String,
+        reason: String,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    },
     /// Could not prove automatically — needs manual proof.
     Unprovable {
         name: String,
@@ -587,6 +594,17 @@ impl VerificationResult {
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
+            Self::SceneUnknown {
+                name,
+                reason,
+                span,
+                file,
+            } => Self::SceneUnknown {
+                name,
+                reason,
+                span: span.or(block_span),
+                file: file.or(block_file),
+            },
             Self::Unprovable {
                 name,
                 hint,
@@ -701,6 +719,7 @@ impl VerificationResult {
             self,
             Self::Counterexample { .. }
                 | Self::SceneFail { .. }
+                | Self::SceneUnknown { .. }
                 | Self::Unprovable { .. }
                 | Self::FnContractFailed { .. }
                 | Self::LivenessViolation { .. }
@@ -717,6 +736,7 @@ impl VerificationResult {
             | Self::Counterexample { span, .. }
             | Self::ScenePass { span, .. }
             | Self::SceneFail { span, .. }
+            | Self::SceneUnknown { span, .. }
             | Self::Unprovable { span, .. }
             | Self::FnContractProved { span, .. }
             | Self::FnContractAdmitted { span, .. }
@@ -735,6 +755,7 @@ impl VerificationResult {
             | Self::Counterexample { file, .. }
             | Self::ScenePass { file, .. }
             | Self::SceneFail { file, .. }
+            | Self::SceneUnknown { file, .. }
             | Self::Unprovable { file, .. }
             | Self::FnContractProved { file, .. }
             | Self::FnContractAdmitted { file, .. }
@@ -813,6 +834,7 @@ impl VerificationResult {
             | Self::Deadlock { assumptions, .. } => assumptions,
             Self::ScenePass { .. }
             | Self::SceneFail { .. }
+            | Self::SceneUnknown { .. }
             | Self::Unprovable { .. }
             | Self::FnContractProved { .. }
             | Self::FnContractAdmitted { .. }
@@ -1224,6 +1246,7 @@ fn result_name(result: &VerificationResult) -> &str {
         | VerificationResult::Counterexample { name, .. }
         | VerificationResult::ScenePass { name, .. }
         | VerificationResult::SceneFail { name, .. }
+        | VerificationResult::SceneUnknown { name, .. }
         | VerificationResult::Unprovable { name, .. }
         | VerificationResult::FnContractProved { name, .. }
         | VerificationResult::FnContractAdmitted { name, .. }
@@ -1241,6 +1264,7 @@ fn result_signature(result: &VerificationResult) -> String {
         VerificationResult::Counterexample { name, .. } => format!("counterexample:{name}"),
         VerificationResult::ScenePass { name, .. } => format!("scene-pass:{name}"),
         VerificationResult::SceneFail { name, .. } => format!("scene-fail:{name}"),
+        VerificationResult::SceneUnknown { name, .. } => format!("scene-unknown:{name}"),
         VerificationResult::Unprovable { name, .. } => format!("unprovable:{name}"),
         VerificationResult::FnContractProved { name, .. } => format!("fn-proved:{name}"),
         VerificationResult::FnContractAdmitted { name, .. } => format!("fn-admitted:{name}"),
@@ -5353,6 +5377,9 @@ impl std::fmt::Display for VerificationResult {
             }
             VerificationResult::SceneFail { name, reason, .. } => {
                 write!(f, "FAIL    {name}: {reason}")
+            }
+            VerificationResult::SceneUnknown { name, reason, .. } => {
+                write!(f, "UNKNOWN {name}: {reason}")
             }
             VerificationResult::Unprovable { name, hint, .. } => {
                 write!(f, "UNPROVABLE {name}: {hint}")

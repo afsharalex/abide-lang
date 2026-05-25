@@ -341,7 +341,7 @@ impl<'a> RelationalSceneObligation<'a> {
         let (cnf, _) = self.sat.into_cnf();
         let mut solver = BasicSolver::default();
         if let Err(err) = solver.add_cnf(cnf) {
-            return VerificationResult::SceneFail {
+            return VerificationResult::SceneUnknown {
                 name: self.scene.name.clone(),
                 reason: format!("RustSAT setup failed: {err}"),
                 span: None,
@@ -362,13 +362,13 @@ impl<'a> RelationalSceneObligation<'a> {
                 span: None,
                 file: None,
             },
-            Ok(SolverResult::Interrupted) => VerificationResult::SceneFail {
+            Ok(SolverResult::Interrupted) => VerificationResult::SceneUnknown {
                 name: self.scene.name.clone(),
                 reason: crate::messages::SCENE_UNKNOWN.to_owned(),
                 span: None,
                 file: None,
             },
-            Err(err) => VerificationResult::SceneFail {
+            Err(err) => VerificationResult::SceneUnknown {
                 name: self.scene.name.clone(),
                 reason: format!("RustSAT solve failed: {err}"),
                 span: None,

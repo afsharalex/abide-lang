@@ -465,6 +465,9 @@ pub(crate) fn report_verification_result(
                         VerificationResult::SceneFail { name, reason, .. } => {
                             crate::messages::label_scene_fail(name, reason)
                         }
+                        VerificationResult::SceneUnknown { name, reason, .. } => {
+                            crate::messages::label_unprovable(name, reason)
+                        }
                         VerificationResult::Unprovable { name, hint, .. } => {
                             crate::messages::label_unprovable(name, hint)
                         }
@@ -1167,6 +1170,9 @@ fn render_markdown_failure_explanation(
         verify::VerificationResult::SceneFail { reason, .. } => {
             Some(("Why This Scene Fails", format!("- {reason}\n")))
         }
+        verify::VerificationResult::SceneUnknown { reason, .. } => {
+            Some(("Why This Scene Is Unknown", format!("- {reason}\n")))
+        }
         verify::VerificationResult::FnContractFailed { .. } => {
             let mut out = String::new();
             if let Some(assertion) = result_source_excerpt(result) {
@@ -1324,6 +1330,13 @@ fn render_result_html_explanation(result: &verify::VerificationResult) -> Option
         verify::VerificationResult::SceneFail { reason, .. } => {
             let mut out = String::new();
             out.push_str("<section class=\"explanation-block\"><div class=\"trace-eyebrow\">Why this scene fails</div><p>");
+            out.push_str(&escape_html(reason));
+            out.push_str("</p></section>");
+            Some(out)
+        }
+        verify::VerificationResult::SceneUnknown { reason, .. } => {
+            let mut out = String::new();
+            out.push_str("<section class=\"explanation-block\"><div class=\"trace-eyebrow\">Why this scene is unknown</div><p>");
             out.push_str(&escape_html(reason));
             out.push_str("</p></section>");
             Some(out)
@@ -1547,6 +1560,7 @@ fn render_result_heading_kind(result: &verify::VerificationResult) -> &'static s
         verify::VerificationResult::Counterexample { .. } => "COUNTEREXAMPLE",
         verify::VerificationResult::ScenePass { .. } => "PASS",
         verify::VerificationResult::SceneFail { .. } => "SCENE FAIL",
+        verify::VerificationResult::SceneUnknown { .. } => "SCENE UNKNOWN",
         verify::VerificationResult::Unprovable { .. } => "UNPROVABLE",
         verify::VerificationResult::FnContractProved { .. } => "PROVED",
         verify::VerificationResult::FnContractAdmitted { .. } => "ADMITTED",
@@ -2872,6 +2886,7 @@ fn result_primary_name(result: &verify::VerificationResult) -> String {
         | verify::VerificationResult::Counterexample { name, .. }
         | verify::VerificationResult::ScenePass { name, .. }
         | verify::VerificationResult::SceneFail { name, .. }
+        | verify::VerificationResult::SceneUnknown { name, .. }
         | verify::VerificationResult::Unprovable { name, .. }
         | verify::VerificationResult::LivenessViolation { name, .. }
         | verify::VerificationResult::Deadlock { name, .. } => name.clone(),
@@ -2927,6 +2942,7 @@ fn result_secondary_summary(result: &verify::VerificationResult) -> String {
             format!("scene satisfied in {time_ms}ms")
         }
         verify::VerificationResult::SceneFail { reason, .. } => reason.clone(),
+        verify::VerificationResult::SceneUnknown { reason, .. } => reason.clone(),
         verify::VerificationResult::Unprovable { hint, .. } => hint.clone(),
         verify::VerificationResult::FnContractProved { time_ms, .. } => {
             format!("function contract proved in {time_ms}ms")
@@ -2964,6 +2980,7 @@ fn render_result_verdict_pill(result: &verify::VerificationResult) -> String {
         | verify::VerificationResult::FnContractAdmitted { .. } => ("Admitted", "verdict-neutral"),
         verify::VerificationResult::Counterexample { .. } => ("Counterexample", "verdict-failure"),
         verify::VerificationResult::SceneFail { .. } => ("Scene Fail", "verdict-failure"),
+        verify::VerificationResult::SceneUnknown { .. } => ("Scene Unknown", "verdict-failure"),
         verify::VerificationResult::Unprovable { .. } => ("Unprovable", "verdict-failure"),
         verify::VerificationResult::FnContractProved { .. } => ("Proved", "verdict-success"),
         verify::VerificationResult::FnContractFailed { .. } => ("Failed", "verdict-failure"),

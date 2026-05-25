@@ -2172,6 +2172,7 @@ fn semantic_result_name(result: &VerificationResult) -> &str {
         | VerificationResult::Counterexample { name, .. }
         | VerificationResult::ScenePass { name, .. }
         | VerificationResult::SceneFail { name, .. }
+        | VerificationResult::SceneUnknown { name, .. }
         | VerificationResult::Unprovable { name, .. }
         | VerificationResult::FnContractProved { name, .. }
         | VerificationResult::FnContractAdmitted { name, .. }
@@ -2229,6 +2230,7 @@ fn interpret_semantic_result(
         | VerificationResult::LivenessViolation { .. }
         | VerificationResult::Deadlock { .. }
         | VerificationResult::SceneFail { .. }
+        | VerificationResult::SceneUnknown { .. }
         | VerificationResult::FnContractFailed { .. } => Ok(TemporalQueryOutcome {
             value: false,
             mode: format!("semantic:counterexample{mode_suffix}"),
