@@ -25,7 +25,7 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::encode::{
     bind_pattern_vars, build_domain_predicate, build_z3_quantifier, encode_ite,
-    encode_pattern_cond, enum_variant_count, make_z3_var_ctx,
+    encode_pattern_cond, enum_variant_count, make_z3_bound_var_ctx,
 };
 use super::harness::SlotPool;
 use super::scope::VerifyStoreRange;
@@ -772,7 +772,7 @@ pub(super) fn encode_prop_expr(
         IRExpr::Forall {
             var, domain, body, ..
         } => {
-            let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
             let inner_ctx = ctx.with_local(var, bound_var.clone());
             let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
             let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
@@ -785,7 +785,7 @@ pub(super) fn encode_prop_expr(
         IRExpr::Exists {
             var, domain, body, ..
         } => {
-            let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
             let inner_ctx = ctx.with_local(var, bound_var.clone());
             let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
             let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
@@ -799,7 +799,7 @@ pub(super) fn encode_prop_expr(
             var, domain, body, ..
         } => {
             // Exactly one: ∃x. D(x) ∧ P(x) ∧ ∀y. D(y) ∧ P(y) → y = x
-            let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
             let x_ctx = ctx.with_local(var, x_var.clone());
             let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
             let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
@@ -809,7 +809,7 @@ pub(super) fn encode_prop_expr(
             };
 
             let y_name = format!("{var}__unique");
-            let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+            let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
             let y_ctx = ctx.with_local(var, y_var.clone());
             let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
             let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
@@ -833,13 +833,13 @@ pub(super) fn encode_prop_expr(
             var, domain, body, ..
         } => {
             // At most one: ∀x, y. D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
-            let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+            let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
             let x_ctx = ctx.with_local(var, x_var.clone());
             let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
             let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
 
             let y_name = format!("{var}__unique");
-            let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+            let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
             let y_ctx = ctx.with_local(var, y_var.clone());
             let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
             let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
@@ -1161,7 +1161,7 @@ fn encode_prop_let_expr(
                     binding.name,
                     PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
                 );
-                let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+                let witness = make_z3_bound_var_ctx(&fresh, domain, Some(vctx))?;
                 let pred_ctx = ctx.with_local(var, witness.clone());
                 let mut conjuncts = Vec::new();
                 if let Some(domain_pred) =
@@ -2100,7 +2100,7 @@ fn encode_prop_value_choose_bindings(
                 binding.name,
                 PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
-            let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+            let witness = make_z3_bound_var_ctx(&fresh, domain, Some(vctx))?;
             let pred_ctx = ctx.with_local(var, witness.clone());
             let mut constraints = Vec::new();
             if let Some(domain_pred) =
@@ -2249,7 +2249,7 @@ fn encode_projection_membership_bindings(
                 binding.name,
                 PROP_CHOOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
-            let witness = make_z3_var_ctx(&fresh, domain, Some(vctx))?;
+            let witness = make_z3_bound_var_ctx(&fresh, domain, Some(vctx))?;
             let pred_ctx = ctx.with_local(var, witness.clone());
             let mut constraints = Vec::new();
             if let Some(domain_pred) =

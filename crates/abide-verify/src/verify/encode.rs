@@ -39,6 +39,24 @@ pub(super) fn make_z3_var(name: &str, ty: &crate::ir::types::IRType) -> Result<S
     make_z3_var_ctx(name, ty, None)
 }
 
+pub(super) fn make_z3_bound_var_ctx(
+    name: &str,
+    ty: &crate::ir::types::IRType,
+    vctx: Option<&VerifyContext>,
+) -> Result<SmtValue, String> {
+    use crate::ir::types::IRType;
+    let sort = match ty {
+        IRType::Enum {
+            name: enum_name, ..
+        } => vctx
+            .and_then(|ctx| ctx.adt_sorts.get(enum_name))
+            .map_or_else(smt::sort_int, |dt| dt.sort()),
+        IRType::Refinement { base, .. } => return make_z3_bound_var_ctx(name, base, vctx),
+        _ => smt::ir_type_to_sort(ty),
+    };
+    Ok(dynamic_to_smt_value(smt::dynamic_bound_var(name, &sort)))
+}
+
 pub(super) fn make_z3_var_ctx(
     name: &str,
     ty: &crate::ir::types::IRType,
@@ -1138,8 +1156,8 @@ pub(super) fn encode_z3_quantifier(
     defs: &defenv::DefEnv,
     precheck: Option<&PrecheckCtx<'_>>,
 ) -> Result<SmtValue, String> {
-    // Create a fresh Z3 constant for the bound variable (ADT-aware via vctx)
-    let bound_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+    // Create a solver-native bound variable (ADT-aware via vctx).
+    let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
 
     // Extend environment with the bound variable
     let mut inner_env = env.clone();
@@ -1213,7 +1231,7 @@ pub(super) fn encode_z3_one(
     precheck: Option<&PrecheckCtx<'_>>,
 ) -> Result<SmtValue, String> {
     // Create bound variable x (ADT-aware via vctx)
-    let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+    let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
     let mut x_env = env.clone();
     x_env.insert(var.to_owned(), x_var.clone());
 
@@ -1231,7 +1249,7 @@ pub(super) fn encode_z3_one(
 
     // Create a fresh bound variable y (different Z3 name, ADT-aware)
     let y_name = format!("{var}__unique");
-    let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
     let mut y_env = env.clone();
     y_env.insert(var.to_owned(), y_var.clone());
 
@@ -1275,13 +1293,13 @@ pub(super) fn encode_z3_lone(
     precheck: Option<&PrecheckCtx<'_>>,
 ) -> Result<SmtValue, String> {
     // Create bound variable x (ADT-aware via vctx)
-    let x_var = make_z3_var_ctx(var, domain, Some(vctx))?;
+    let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
     let mut x_env = env.clone();
     x_env.insert(var.to_owned(), x_var.clone());
 
     // Create bound variable y (different Z3 name, ADT-aware)
     let y_name = format!("{var}__unique");
-    let y_var = make_z3_var_ctx(&y_name, domain, Some(vctx))?;
+    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
     let mut y_env = env.clone();
     y_env.insert(var.to_owned(), y_var.clone());
 
@@ -1365,7 +1383,7 @@ fn encode_lambda(
     let mut bound_vars: Vec<SmtValue> = Vec::new();
     let mut domain_sorts: Vec<Sort> = Vec::new();
     for (pname, pty) in &params {
-        let var = make_z3_var_ctx(pname, pty, Some(vctx))?;
+        let var = make_z3_bound_var_ctx(pname, pty, Some(vctx))?;
         // Extract the sort from the created variable
         let sort = smt::dynamic_sort(&var.to_dynamic());
         domain_sorts.push(sort);

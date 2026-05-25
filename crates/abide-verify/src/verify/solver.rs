@@ -475,6 +475,7 @@ pub trait SolverBackend {
     // ── Dynamic operations ──────────────────────────────────────────
     fn dynamic_fresh(ctx: &Self::Context, prefix: &str, sort: &Self::Sort) -> Self::Dynamic;
     fn dynamic_const(ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic;
+    fn dynamic_bound_var(ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic;
     fn dynamic_from_bool(ctx: &Self::Context, b: &Self::Bool) -> Self::Dynamic;
     fn dynamic_from_int(ctx: &Self::Context, i: &Self::Int) -> Self::Dynamic;
     fn dynamic_from_real(ctx: &Self::Context, r: &Self::Real) -> Self::Dynamic;
@@ -853,6 +854,10 @@ impl SolverBackend for Z3Backend {
     }
 
     fn dynamic_const(_ctx: &Self::Context, name: &str, sort: &Z3Sort) -> Z3Dynamic {
+        Z3Dynamic::new_const(name, sort)
+    }
+
+    fn dynamic_bound_var(_ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic {
         Z3Dynamic::new_const(name, sort)
     }
 
@@ -1458,6 +1463,10 @@ impl SolverBackend for Cvc5Backend {
 
     fn dynamic_const(ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic {
         ctx.tm.mk_const(sort.clone(), name)
+    }
+
+    fn dynamic_bound_var(ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic {
+        ctx.tm.mk_var(sort.clone(), name)
     }
 
     fn dynamic_from_bool(_ctx: &Self::Context, b: &Self::Bool) -> Self::Dynamic {
@@ -2751,6 +2760,19 @@ impl SolverBackend for RuntimeBackend {
             }
             (RuntimeContext::Cvc5(ctx), RuntimeSort::Cvc5(sort)) => {
                 RuntimeDynamic::Cvc5(Cvc5Backend::dynamic_const(ctx, name, sort))
+            }
+            (RuntimeContext::Z3(_), _) => panic_mixed_solver_terms(SolverFamily::Z3),
+            (RuntimeContext::Cvc5(_), _) => panic_mixed_solver_terms(SolverFamily::Cvc5),
+        }
+    }
+
+    fn dynamic_bound_var(ctx: &Self::Context, name: &str, sort: &Self::Sort) -> Self::Dynamic {
+        match (ctx, sort) {
+            (RuntimeContext::Z3(ctx), RuntimeSort::Z3(sort)) => {
+                RuntimeDynamic::Z3(Z3Backend::dynamic_bound_var(ctx, name, sort))
+            }
+            (RuntimeContext::Cvc5(ctx), RuntimeSort::Cvc5(sort)) => {
+                RuntimeDynamic::Cvc5(Cvc5Backend::dynamic_bound_var(ctx, name, sort))
             }
             (RuntimeContext::Z3(_), _) => panic_mixed_solver_terms(SolverFamily::Z3),
             (RuntimeContext::Cvc5(_), _) => panic_mixed_solver_terms(SolverFamily::Cvc5),

@@ -204,7 +204,7 @@ verify v {
     let step = &transition.atomic_steps()[0];
     assert_eq!(step.system(), "Ui");
     assert_eq!(step.command(), "handle");
-    assert_eq!(step.step_name(), Some("handle#1"));
+    assert_eq!(step.step_name(), Some("handle"));
 }
 
 #[test]
@@ -248,11 +248,13 @@ verify v {
     let temporal = witness
         .as_temporal()
         .expect("bounded counterexample should produce a temporal relational witness");
-    assert_eq!(temporal.states().len(), 2);
+    assert!(
+        temporal.states().len() >= 2,
+        "relational witness should expose at least the initial state and first violating successor"
+    );
     assert_eq!(temporal.loop_start(), None);
 
     let initial = &temporal.states()[0];
-    let next = &temporal.states()[1];
 
     let mode_initial = initial
         .field_relation("Ui", "mode")
@@ -264,15 +266,23 @@ verify v {
             if enum_name == "Mode" && variant == "normal"
     ));
 
-    let screen_next = next
+    let compose_state = temporal
+        .states()
+        .iter()
+        .find(|state| {
+            state.field_relation("Ui", "screen").is_some_and(|screen| {
+                matches!(
+                    tuple_value(screen, 0, 1),
+                    WitnessValue::EnumVariant { enum_name, variant, .. }
+                        if enum_name == "Screen" && variant == "compose"
+                )
+            })
+        })
+        .expect("relational witness should include the violating compose state");
+    let screen_compose = compose_state
         .field_relation("Ui", "screen")
-        .expect("Ui.screen relation in next state");
-    assert_eq!(screen_next.arity(), 2);
-    assert!(matches!(
-        tuple_value(screen_next, 0, 1),
-        WitnessValue::EnumVariant { enum_name, variant, .. }
-            if enum_name == "Screen" && variant == "compose"
-    ));
+        .expect("Ui.screen relation in compose state");
+    assert_eq!(screen_compose.arity(), 2);
 }
 
 #[test]

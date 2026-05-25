@@ -417,6 +417,11 @@ pub fn dynamic_const(name: &str, sort: &Sort) -> Dynamic {
     backend!(dynamic_const, name, sort)
 }
 
+/// Create a named Dynamic term suitable for solver quantifier/lambda binders.
+pub fn dynamic_bound_var(name: &str, sort: &Sort) -> Dynamic {
+    backend!(dynamic_bound_var, name, sort)
+}
+
 /// Wrap a Bool as Dynamic.
 pub fn bool_to_dynamic(b: &Bool) -> Dynamic {
     backend!(dynamic_from_bool, b)

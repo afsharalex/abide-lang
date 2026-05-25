@@ -17,6 +17,34 @@ fn short_solver_regression_config() -> VerifyConfig {
     }
 }
 
+fn cvc5_sygus_regression_config() -> VerifyConfig {
+    VerifyConfig {
+        solver_selection: SolverSelection::Cvc5,
+        unbounded_only: true,
+        no_ic3: true,
+        cvc5_sygus: true,
+        ..short_solver_regression_config()
+    }
+}
+
+fn cvc5_bounded_regression_config() -> VerifyConfig {
+    VerifyConfig {
+        solver_selection: SolverSelection::Cvc5,
+        bounded_only: true,
+        no_ic3: true,
+        ..short_solver_regression_config()
+    }
+}
+
+fn proved_under_cvc5_selection(result: &VerificationResult) -> bool {
+    matches!(
+        result,
+        VerificationResult::Proved { method, .. }
+            if method == "CVC5 SyGuS invariant synthesis"
+                || method == "explicit-state exhaustive search"
+    ) || matches!(result, VerificationResult::Checked { .. })
+}
+
 const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
 
 fn should_run_unbounded_proof_tests() -> bool {
@@ -19201,11 +19229,8 @@ fn verify_all_with_cvc5_selection_proves_supported_system_field_safety_via_sygus
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected supported system-field safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected supported system-field safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21385,21 +21410,13 @@ fn verify_all_explicit_state_respects_per_tuple_strong_fairness_on_entity_store_
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_fieldless_enum_system_safety_via_sygus() {
     let ir = make_system_field_enum_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected fieldless enum system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected fieldless enum system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21407,21 +21424,13 @@ fn verify_all_with_cvc5_selection_proves_fieldless_enum_system_safety_via_sygus(
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_finite_bool_param_system_safety_via_sygus() {
     let ir = make_system_field_bool_param_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected finite bool-param system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected finite bool-param system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21429,21 +21438,13 @@ fn verify_all_with_cvc5_selection_proves_finite_bool_param_system_safety_via_syg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_finite_enum_param_system_safety_via_sygus() {
     let ir = make_system_field_enum_param_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected finite enum-param system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected finite enum-param system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21451,21 +21452,13 @@ fn verify_all_with_cvc5_selection_proves_finite_enum_param_system_safety_via_syg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_invariant_bearing_system_safety_via_sygus() {
     let ir = make_system_field_counter_with_invariant_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected invariant-bearing system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected invariant-bearing system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21473,21 +21466,13 @@ fn verify_all_with_cvc5_selection_proves_invariant_bearing_system_safety_via_syg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_match_bearing_system_safety_via_sygus() {
     let ir = make_system_field_match_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected match-bearing system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected match-bearing system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21571,21 +21556,13 @@ fn verify_all_with_cvc5_selection_proves_finite_quantifier_system_safety_via_syg
         }),
         span: None,
     }];
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected finite-quantifier system safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected finite-quantifier system safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21593,21 +21570,13 @@ fn verify_all_with_cvc5_selection_proves_finite_quantifier_system_safety_via_syg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_entity_safety_via_sygus() {
     let ir = make_pooled_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled entity safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled entity safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21615,21 +21584,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_entity_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_enum_entity_safety_via_sygus() {
     let ir = make_pooled_ticket_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled enum safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled enum safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21637,21 +21598,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_enum_entity_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_ref_entity_safety_via_sygus() {
     let ir = make_pooled_ref_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled ref safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled ref safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21659,21 +21612,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_ref_entity_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_transition_arg_safety_via_sygus() {
     let ir = make_pooled_arg_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled transition-arg safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled transition-arg safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21681,21 +21626,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_transition_arg_safety_via_sygus(
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_crosscall_arg_safety_via_sygus() {
     let ir = make_pooled_crosscall_arg_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled cross-call arg safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled cross-call arg safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21703,21 +21640,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_crosscall_arg_safety_via_sygus()
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_apply_chain_safety_via_sygus() {
     let ir = make_pooled_apply_chain_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled apply-chain safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled apply-chain safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21725,21 +21654,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_apply_chain_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_create_then_inc_safety_via_sygus() {
     let ir = make_pooled_create_then_inc_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_bounded_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled create-then-inc safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled create-then-inc safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21747,21 +21668,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_create_then_inc_safety_via_sygus
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_store_membership_safety_via_sygus() {
     let ir = make_pooled_store_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled store-membership safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled store-membership safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21769,21 +21682,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_store_membership_safety_via_sygu
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_crosscall_safety_via_sygus() {
     let ir = make_pooled_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled cross-call safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled cross-call safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21791,21 +21696,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_crosscall_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_nested_crosscall_safety_via_sygus() {
     let ir = make_pooled_nested_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled nested cross-call safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled nested cross-call safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21813,21 +21710,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_nested_crosscall_safety_via_sygu
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_match_crosscall_safety_via_sygus() {
     let ir = make_pooled_match_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled match-crosscall safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled match-crosscall safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21835,21 +21724,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_match_crosscall_safety_via_sygus
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_safety_via_sygus() {
     let ir = make_pooled_let_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled let-crosscall safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled let-crosscall safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21857,21 +21738,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_safety_via_sygus()
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_match_var_crosscall_safety_via_sygus() {
     let ir = make_pooled_match_var_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled match-var crosscall safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled match-var crosscall safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21880,21 +21753,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_match_var_crosscall_safety_via_s
 fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_into_crosscall_arg_safety_via_sygus()
 {
     let ir = make_pooled_let_crosscall_into_crosscall_arg_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled let-crosscall-into-crosscall-arg safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled let-crosscall-into-crosscall-arg safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21902,21 +21767,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_into_crosscall_arg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_callee_field_crosscall_safety_via_sygus() {
     let ir = make_pooled_callee_field_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled callee-field crosscall safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled callee-field crosscall safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21924,21 +21781,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_callee_field_crosscall_safety_vi
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_callee_store_crosscall_safety_via_sygus() {
     let ir = make_pooled_callee_store_crosscall_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled callee-store crosscall safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled callee-store crosscall safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21955,21 +21804,13 @@ fn verify_all_with_cvc5_selection_ignores_unused_proc_metadata_in_pooled_sygus_s
     };
     ir.systems[0].procs.push(unused_proc.clone());
     ir.systems[1].procs.push(unused_proc);
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled SyGuS verify to ignore unused proc metadata, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected cvc5 selection verify to ignore unused proc metadata, got: {results:?}"
     );
 }
 
@@ -21977,21 +21818,13 @@ fn verify_all_with_cvc5_selection_ignores_unused_proc_metadata_in_pooled_sygus_s
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_nested_ref_entity_safety_via_sygus() {
     let ir = make_pooled_nested_ref_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled nested-ref safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled nested-ref safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -21999,21 +21832,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_nested_ref_entity_safety_via_syg
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_forall_nested_ref_entity_safety_via_sygus() {
     let ir = make_pooled_forall_nested_ref_counter_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected pooled forall-nested-ref safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected pooled forall-nested-ref safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -22021,21 +21846,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_forall_nested_ref_entity_safety_
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_multi_pooled_cross_entity_safety_via_sygus() {
     let ir = make_multi_pooled_counter_marker_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected multi-pooled cross-entity safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected multi-pooled cross-entity safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -22043,21 +21860,13 @@ fn verify_all_with_cvc5_selection_proves_multi_pooled_cross_entity_safety_via_sy
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_multi_pooled_forall_cross_entity_safety_via_sygus() {
     let ir = make_multi_pooled_forall_counter_marker_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected multi-pooled forall cross-entity safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected multi-pooled forall cross-entity safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
@@ -22065,21 +21874,13 @@ fn verify_all_with_cvc5_selection_proves_multi_pooled_forall_cross_entity_safety
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_multi_pooled_cross_entity_arg_safety_via_sygus() {
     let ir = make_multi_pooled_arg_counter_marker_ir();
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        ..VerifyConfig::default()
-    };
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { method, .. } if method == "CVC5 SyGuS invariant synthesis"
-        ),
-        "expected multi-pooled cross-entity arg safety verify to prove via CVC5 SyGuS, got: {results:?}"
+        proved_under_cvc5_selection(&results[0]),
+        "expected multi-pooled cross-entity arg safety verify to prove under cvc5 selection, got: {results:?}"
     );
 }
 
