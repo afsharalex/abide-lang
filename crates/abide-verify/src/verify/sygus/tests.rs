@@ -376,6 +376,130 @@ fn sygus_core_accepts_payload_enum_fields_before_solver_setup() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_finite_payload_enum_quantifiers() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let enum_catalog = EnumCatalog::from_types(&tm, std::slice::from_ref(&decision_ty))
+        .expect("finite payload enum datatype catalog should build");
+    let expr = IRExpr::Forall {
+        var: "decision".to_owned(),
+        domain: decision_ty.clone(),
+        body: Box::new(IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Var {
+                name: "decision".to_owned(),
+                ty: decision_ty,
+                span: None,
+            }),
+            arms: vec![
+                crate::ir::types::IRMatchArm {
+                    pattern: crate::ir::types::IRPattern::PCtor {
+                        name: "Accept".to_owned(),
+                        fields: vec![crate::ir::types::IRFieldPat {
+                            name: "allowed".to_owned(),
+                            pattern: crate::ir::types::IRPattern::PVar {
+                                name: "allowed".to_owned(),
+                            },
+                        }],
+                    },
+                    guard: None,
+                    body: IRExpr::Var {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    },
+                },
+                crate::ir::types::IRMatchArm {
+                    pattern: crate::ir::types::IRPattern::PWild,
+                    guard: None,
+                    body: bool_lit(true),
+                },
+            ],
+            span: None,
+        }),
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &HashMap::new(), &enum_catalog)
+        .unwrap_or_else(|err| panic!("finite payload enum quantifier should encode: {err}"));
+}
+
+#[test]
+fn sygus_param_enumerator_supports_finite_payload_enum_params() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let enum_catalog = EnumCatalog::from_types(&tm, std::slice::from_ref(&decision_ty))
+        .expect("finite payload enum datatype catalog should build");
+    let envs = enumerate_param_envs(
+        &tm,
+        &[crate::ir::types::IRTransParam {
+            name: "decision".to_owned(),
+            ty: decision_ty,
+        }],
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("finite payload enum params should enumerate: {err}"));
+
+    assert_eq!(envs.len(), 3);
+    assert!(envs.iter().all(|env| env.contains_key("decision")));
+}
+
+#[test]
+fn sygus_system_step_allows_unused_action_return_expr() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions[0].return_expr = Some(IRExpr::Var {
+        name: "x".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    });
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("unused system action return expression should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};
 
@@ -1853,7 +1977,7 @@ fn cvc5_sygus_single_entity_returns_unknown_for_unsupported_transition_params() 
 
     let result = try_cvc5_sygus_single_entity(&entity, &property, 5_000);
     assert!(
-        matches!(result, Ic3Result::Unknown(ref msg) if msg.contains("only supports Bool and fieldless-enum step params")),
+        matches!(result, Ic3Result::Unknown(ref msg) if msg.contains("only supports finite Bool/enum action params")),
         "expected honest Unknown for unsupported SyGuS shape, got: {result:?}"
     );
 }
@@ -4732,7 +4856,7 @@ fn cvc5_sygus_system_safety_returns_unknown_for_int_step_params() {
 
     let result = try_cvc5_sygus_system_safety(&system, &property, 5_000);
     assert!(
-        matches!(result, Ic3Result::Unknown(ref msg) if msg.contains("only supports Bool and fieldless-enum step params")),
+        matches!(result, Ic3Result::Unknown(ref msg) if msg.contains("only supports finite Bool/enum action params")),
         "expected honest Unknown for unsupported int step params, got: {result:?}"
     );
 }

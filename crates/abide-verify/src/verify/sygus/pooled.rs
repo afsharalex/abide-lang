@@ -2297,7 +2297,7 @@ fn encode_pooled_expr(
 
             let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
                 return Err(
-                    "cvc5 SyGuS pooled system safety only supports Bool and fieldless-enum domains for finite quantifiers"
+                    "cvc5 SyGuS pooled system safety only supports finite Bool/enum domains for finite quantifiers"
                         .to_owned(),
                 );
             };

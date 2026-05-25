@@ -696,13 +696,6 @@ pub(super) fn encode_system_step(
     next_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
 ) -> Result<Cvc5Term, String> {
-    if step.return_expr.is_some() {
-        return Err(format!(
-            "cvc5 SyGuS system safety does not support action return expressions yet (`{}`)",
-            step.name
-        ));
-    }
-
     let param_envs = enumerate_param_envs(tm, &step.params, enum_catalog)?;
     let mut param_branches = Vec::with_capacity(param_envs.len());
     for param_env in param_envs {
@@ -805,7 +798,7 @@ pub(super) fn finite_param_values(
 ) -> Result<Vec<Cvc5Term>, String> {
     finite_domain_values(tm, &param.ty, enum_catalog).ok_or_else(|| {
         format!(
-            "cvc5 SyGuS system safety only supports Bool and fieldless-enum action params today (`{}`)",
+            "cvc5 SyGuS system safety only supports finite Bool/enum action params today (`{}`)",
             param.name
         )
     })
@@ -831,8 +824,45 @@ pub(super) fn finite_domain_values(
             }
             Some(std::mem::take(&mut values))
         }
+        IRType::Enum { name, variants } => {
+            let mut values = Vec::new();
+            for variant in variants {
+                let payload_variant = enum_catalog.payload_variant(name, &variant.name)?;
+                let field_values = variant
+                    .fields
+                    .iter()
+                    .map(|field| finite_domain_values(tm, &field.ty, enum_catalog))
+                    .collect::<Option<Vec<_>>>()?;
+                for args in cartesian_product_terms(&field_values) {
+                    let mut children = Vec::with_capacity(1 + args.len());
+                    children.push(payload_variant.constructor.clone());
+                    children.extend(args);
+                    values.push(tm.mk_term(Cvc5Kind::CVC5_KIND_APPLY_CONSTRUCTOR, &children));
+                }
+            }
+            (!values.is_empty()).then_some(values)
+        }
         _ => None,
     }
+}
+
+fn cartesian_product_terms(groups: &[Vec<Cvc5Term>]) -> Vec<Vec<Cvc5Term>> {
+    let mut products = vec![Vec::new()];
+    for group in groups {
+        if group.is_empty() {
+            return Vec::new();
+        }
+        let mut next = Vec::with_capacity(products.len() * group.len());
+        for product in &products {
+            for item in group {
+                let mut extended = product.clone();
+                extended.push(item.clone());
+                next.push(extended);
+            }
+        }
+        products = next;
+    }
+    products
 }
 
 pub(super) fn encode_finite_quantifier_expr(
@@ -846,8 +876,7 @@ pub(super) fn encode_finite_quantifier_expr(
 ) -> Result<Cvc5Term, String> {
     let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
         return Err(
-            "cvc5 SyGuS only supports Bool and fieldless-enum domains for finite quantifiers"
-                .to_owned(),
+            "cvc5 SyGuS only supports finite Bool/enum domains for finite quantifiers".to_owned(),
         );
     };
 
