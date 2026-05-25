@@ -71,7 +71,7 @@ impl EnumCatalog {
         Ok(catalog)
     }
 
-    fn register_type(&mut self, tm: &Cvc5Tm, ty: &IRType) -> Result<(), String> {
+    pub(super) fn register_type(&mut self, tm: &Cvc5Tm, ty: &IRType) -> Result<(), String> {
         let IRType::Enum { name, variants } = ty else {
             return Ok(());
         };

@@ -170,15 +170,6 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             "cvc5 SyGuS pooled system safety does not support FSM declarations yet".to_owned(),
         );
     }
-    if !root_system.derived_fields.is_empty()
-        || entities
-            .iter()
-            .any(|entity| !entity.derived_fields.is_empty())
-    {
-        return Err(
-            "cvc5 SyGuS pooled system safety does not support derived fields yet".to_owned(),
-        );
-    }
     if !root_system.queries.is_empty()
         || !root_system.preds.is_empty()
         || !root_system.let_bindings.is_empty()
@@ -198,12 +189,6 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
         if !system.fsm_decls.is_empty() {
             return Err(format!(
                 "cvc5 SyGuS pooled system safety does not support FSM declarations yet (`{}`)",
-                system.name
-            ));
-        }
-        if !system.derived_fields.is_empty() {
-            return Err(format!(
-                "cvc5 SyGuS pooled system safety does not support derived fields yet (`{}`)",
                 system.name
             ));
         }
@@ -262,7 +247,17 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 .flat_map(|entity| entity.fields.iter().cloned()),
         )
         .collect();
-    let enum_catalog = build_enum_catalog(&tm, &all_fields)?;
+    let mut enum_catalog = build_enum_catalog(&tm, &all_fields)?;
+    for system in systems {
+        for derived in &system.derived_fields {
+            enum_catalog.register_type(&tm, &derived.ty)?;
+        }
+    }
+    for entity in entities {
+        for derived in &entity.derived_fields {
+            enum_catalog.register_type(&tm, &derived.ty)?;
+        }
+    }
     solver.set_logic(if enum_catalog.has_payload_enums() {
         "ALL"
     } else {
@@ -282,6 +277,10 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
         next_vars.insert(field.name.clone(), next.clone());
         curr_order.push(curr);
         next_order.push(next);
+    }
+    for system in systems {
+        extend_with_derived_fields(&tm, &mut curr_vars, &system.derived_fields, &enum_catalog)?;
+        extend_with_derived_fields(&tm, &mut next_vars, &system.derived_fields, &enum_catalog)?;
     }
 
     let mut active_curr: HashMap<String, HashMap<usize, Cvc5Term>> = HashMap::new();
@@ -332,6 +331,20 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 curr_order.push(curr);
                 next_order.push(next);
             }
+            extend_pooled_slot_with_derived_fields(
+                &tm,
+                entity,
+                slot,
+                &mut slot_curr,
+                &enum_catalog,
+            )?;
+            extend_pooled_slot_with_derived_fields(
+                &tm,
+                entity,
+                slot,
+                &mut slot_next,
+                &enum_catalog,
+            )?;
         }
         active_curr.insert(entity.name.clone(), entity_active_curr);
         active_next.insert(entity.name.clone(), entity_active_next);
@@ -485,6 +498,34 @@ fn pool_slot_field_key(entity: &str, slot: usize, field: &str) -> String {
     format!("{entity}:{slot}:{field}")
 }
 
+fn extend_pooled_slot_with_derived_fields(
+    tm: &Cvc5Tm,
+    entity: &IREntity,
+    slot: usize,
+    slot_fields: &mut HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<(), String> {
+    let mut vars = HashMap::new();
+    for field in &entity.fields {
+        vars.insert(
+            field.name.clone(),
+            slot_fields
+                .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                .ok_or_else(|| format!("missing pooled field `{}`", field.name))?
+                .clone(),
+        );
+    }
+    for derived in &entity.derived_fields {
+        let value = encode_expr(tm, &derived.body, &vars, enum_catalog)?;
+        vars.insert(derived.name.clone(), value.clone());
+        slot_fields.insert(
+            pool_slot_field_key(&entity.name, slot, &derived.name),
+            value,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn encode_pooled_transition_at_slot_for_test(
     tm: &Cvc5Tm,
@@ -516,6 +557,8 @@ pub(super) fn encode_pooled_transition_at_slot_for_test(
             tm.mk_var(sort, &format!("{}_0_{}_next", entity.name, field.name)),
         );
     }
+    extend_pooled_slot_with_derived_fields(tm, entity, 0, &mut slot_curr, enum_catalog)?;
+    extend_pooled_slot_with_derived_fields(tm, entity, 0, &mut slot_next, enum_catalog)?;
     let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
     let store_param_types = HashMap::new();
     let pool_ctx = PooledSyGuSCtx {
@@ -1037,6 +1080,15 @@ fn encode_pooled_transition_at_slot(
                 .clone(),
         );
     }
+    for derived in &entity.derived_fields {
+        scoped.insert(
+            derived.name.clone(),
+            slot_curr
+                .get(&pool_slot_field_key(&entity.name, slot, &derived.name))
+                .ok_or_else(|| format!("missing current pooled derived field `{}`", derived.name))?
+                .clone(),
+        );
+    }
     for (param, arg) in trans.params.iter().zip(apply_args.iter()) {
         let arg_term =
             encode_pooled_expr(tm, arg, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
@@ -1098,6 +1150,15 @@ fn encode_pooled_transition_at_slot(
                 slot_next
                     .get(&pool_slot_field_key(&entity.name, slot, &field.name))
                     .ok_or_else(|| format!("missing next pooled field `{}`", field.name))?
+                    .clone(),
+            );
+        }
+        for derived in &entity.derived_fields {
+            post_scoped.insert(
+                derived.name.clone(),
+                slot_next
+                    .get(&pool_slot_field_key(&entity.name, slot, &derived.name))
+                    .ok_or_else(|| format!("missing next pooled derived field `{}`", derived.name))?
                     .clone(),
             );
         }

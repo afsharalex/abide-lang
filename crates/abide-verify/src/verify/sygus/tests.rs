@@ -126,6 +126,14 @@ fn nonnegative_derived_field() -> crate::ir::types::IRDerivedField {
     }
 }
 
+fn true_derived_field() -> crate::ir::types::IRDerivedField {
+    crate::ir::types::IRDerivedField {
+        name: "always_enabled".to_owned(),
+        body: bool_lit(true),
+        ty: IRType::Bool,
+    }
+}
+
 #[test]
 fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
     let tm = Cvc5Tm::new();
@@ -641,6 +649,55 @@ fn sygus_pooled_transition_supports_postconditions() {
 
     encode_pooled_transition_at_slot_for_test(&tm, &entity.transitions[0], &entity, &enum_catalog)
         .unwrap_or_else(|err| panic!("pooled transition postcondition should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_transition_supports_derived_field_guards_and_postconditions() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_counter_entity();
+    entity.derived_fields.push(nonnegative_derived_field());
+    entity.transitions[0].guard = IRExpr::Var {
+        name: "nonnegative".to_owned(),
+        ty: IRType::Bool,
+        span: None,
+    };
+    entity.transitions[0].postcondition = Some(IRExpr::Var {
+        name: "nonnegative".to_owned(),
+        ty: IRType::Bool,
+        span: None,
+    });
+    let enum_catalog = build_enum_catalog_with_derived(&tm, &entity.fields, &entity.derived_fields)
+        .expect("enum catalog should build");
+
+    encode_pooled_transition_at_slot_for_test(&tm, &entity.transitions[0], &entity, &enum_catalog)
+        .unwrap_or_else(|err| {
+            panic!("pooled transition derived guard/postcondition should encode: {err}")
+        });
+}
+
+#[test]
+fn sygus_pooled_accepts_derived_fields_before_solver_setup() {
+    let mut entity = make_counter_entity();
+    let mut system = make_pooled_store_counter_system();
+    system.actions.clear();
+    system.derived_fields.push(true_derived_field());
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&system, &entity, 2, &non_negative_property(), 0)
+            .expect_err("empty pooled system should still be rejected after system derived setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled system derived fields should pass setup before empty-step diagnostic, got: {err}"
+    );
+
+    entity.derived_fields.push(nonnegative_derived_field());
+    system.derived_fields.clear();
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&system, &entity, 2, &non_negative_property(), 0)
+            .expect_err("empty pooled system should still be rejected after entity derived setup");
+    assert!(
+        err.contains("requires at least one step"),
+        "pooled entity derived fields should pass setup before empty-step diagnostic, got: {err}"
+    );
 }
 
 #[test]
