@@ -1278,6 +1278,12 @@ fn sygus_pooled_system_step_supports_action_match_on_system_field() {
         default: Some(bool_lit(false)),
         initial_constraint: None,
     });
+    system.fields.push(IRField {
+        name: "count".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
     system.actions = vec![IRSystemAction {
         name: "match_status".to_owned(),
         params: vec![],
@@ -1293,40 +1299,74 @@ fn sygus_pooled_system_step_supports_action_match_on_system_field() {
                         fields: vec![],
                     },
                     guard: None,
-                    body: vec![IRAction::ExprStmt {
-                        expr: bin_expr(
-                            "OpEq",
-                            IRExpr::Prime {
-                                expr: Box::new(IRExpr::Var {
-                                    name: "flag".to_owned(),
-                                    ty: IRType::Bool,
+                    body: vec![
+                        IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "flag".to_owned(),
+                                        ty: IRType::Bool,
+                                        span: None,
+                                    }),
                                     span: None,
-                                }),
-                                span: None,
-                            },
-                            bool_lit(true),
-                            IRType::Bool,
-                        ),
-                    }],
+                                },
+                                bool_lit(true),
+                                IRType::Bool,
+                            ),
+                        },
+                        IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "count".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    span: None,
+                                },
+                                int_lit(1),
+                                IRType::Bool,
+                            ),
+                        },
+                    ],
                 },
                 crate::ir::types::IRActionMatchArm {
                     pattern: crate::ir::types::IRPattern::PWild,
                     guard: None,
-                    body: vec![IRAction::ExprStmt {
-                        expr: bin_expr(
-                            "OpEq",
-                            IRExpr::Prime {
-                                expr: Box::new(IRExpr::Var {
-                                    name: "flag".to_owned(),
-                                    ty: IRType::Bool,
+                    body: vec![
+                        IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "flag".to_owned(),
+                                        ty: IRType::Bool,
+                                        span: None,
+                                    }),
                                     span: None,
-                                }),
-                                span: None,
-                            },
-                            bool_lit(false),
-                            IRType::Bool,
-                        ),
-                    }],
+                                },
+                                bool_lit(false),
+                                IRType::Bool,
+                            ),
+                        },
+                        IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "count".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    span: None,
+                                },
+                                int_lit(0),
+                                IRType::Bool,
+                            ),
+                        },
+                    ],
                 },
             ],
         }],
