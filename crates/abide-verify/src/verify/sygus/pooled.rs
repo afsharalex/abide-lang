@@ -3502,6 +3502,27 @@ fn encode_pooled_expr(
                     return Ok(term);
                 }
             }
+            if matches!(op.as_str(), "OpDisjoint" | "disjoint") {
+                if let Some(term) = encode_finite_set_disjoint_expr(
+                    tm,
+                    left,
+                    right,
+                    vars,
+                    enum_catalog,
+                    |expr, scoped| {
+                        encode_pooled_expr(
+                            tm,
+                            expr,
+                            scoped,
+                            entity_bindings,
+                            pool_ctx,
+                            enum_catalog,
+                        )
+                    },
+                )? {
+                    return Ok(term);
+                }
+            }
             let lhs = encode_pooled_expr(tm, left, vars, entity_bindings, pool_ctx, enum_catalog)?;
             let rhs = encode_pooled_expr(tm, right, vars, entity_bindings, pool_ctx, enum_catalog)?;
             match op.as_str() {
