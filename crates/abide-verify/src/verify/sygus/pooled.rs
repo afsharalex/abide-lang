@@ -936,16 +936,10 @@ fn encode_pooled_ops_for_target(
         return Err("cvc5 SyGuS pooled system safety requires at least one nested op".to_owned());
     }
     if ops.len() > 1
-        && ops.iter().all(|op| {
-            matches!(
-                op,
-                IRAction::Apply {
-                    target,
-                    transition: _,
-                    refs: _,
-                    args: _,
-                } if target == target_var
-            )
+        && ops.iter().all(|op| match op {
+            IRAction::Apply { target, .. } => target == target_var,
+            IRAction::ExprStmt { expr } => exprstmt_target_field(expr, target_var).is_ok(),
+            _ => false,
         })
     {
         let mut intermediates = Vec::new();
@@ -967,34 +961,6 @@ fn encode_pooled_ops_for_target(
 
         let mut conjuncts = Vec::new();
         for (idx, op) in ops.iter().enumerate() {
-            let IRAction::Apply {
-                target,
-                transition,
-                refs,
-                args,
-            } = op
-            else {
-                unreachable!("checked apply-only chain above");
-            };
-            if target != target_var {
-                return Err(
-                    "cvc5 SyGuS pooled system safety only supports apply on the selected target variable"
-                        .to_owned(),
-                );
-            }
-            let trans = target_entity
-                .transitions
-                .iter()
-                .find(|trans| trans.name == *transition)
-                .ok_or_else(|| {
-                    format!(
-                        "unknown transition `{transition}` on `{}`",
-                        target_entity.name
-                    )
-                })?;
-            let mut resolved_bindings = entity_bindings.clone();
-            resolved_bindings.extend(resolve_pooled_ref_bindings(trans, refs, entity_bindings)?);
-
             let read_target_fields = if idx == 0 {
                 None
             } else {
@@ -1027,20 +993,68 @@ fn encode_pooled_ops_for_target(
             } else {
                 active_curr
             };
-            conjuncts.push(encode_pooled_transition_at_slot(
-                tm,
-                trans,
-                target_entity,
-                target_slot,
-                args,
-                vars,
-                &resolved_bindings,
-                stage_active_next,
-                &stage_read_fields,
-                &stage_write_fields,
-                enum_catalog,
-                &stage_pool_ctx,
-            )?);
+            match op {
+                IRAction::Apply {
+                    target,
+                    transition,
+                    refs,
+                    args,
+                } => {
+                    if target != target_var {
+                        return Err(
+                            "cvc5 SyGuS pooled system safety only supports apply on the selected target variable"
+                                .to_owned(),
+                        );
+                    }
+                    let trans = target_entity
+                        .transitions
+                        .iter()
+                        .find(|trans| trans.name == *transition)
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown transition `{transition}` on `{}`",
+                                target_entity.name
+                            )
+                        })?;
+                    let mut resolved_bindings = entity_bindings.clone();
+                    resolved_bindings.extend(resolve_pooled_ref_bindings(
+                        trans,
+                        refs,
+                        entity_bindings,
+                    )?);
+                    conjuncts.push(encode_pooled_transition_at_slot(
+                        tm,
+                        trans,
+                        target_entity,
+                        target_slot,
+                        args,
+                        vars,
+                        &resolved_bindings,
+                        stage_active_next,
+                        &stage_read_fields,
+                        &stage_write_fields,
+                        enum_catalog,
+                        &stage_pool_ctx,
+                    )?);
+                }
+                IRAction::ExprStmt { expr } => {
+                    conjuncts.push(encode_pooled_entity_exprstmt_at_slot(
+                        tm,
+                        expr,
+                        target_var,
+                        target_entity,
+                        target_slot,
+                        vars,
+                        entity_bindings,
+                        stage_active_next,
+                        &stage_read_fields,
+                        &stage_write_fields,
+                        enum_catalog,
+                        &stage_pool_ctx,
+                    )?);
+                }
+                _ => unreachable!("checked stageable nested ops above"),
+            }
         }
         return Ok(mk_exists(tm, &bound, mk_and(tm, &conjuncts)));
     }

@@ -1175,6 +1175,111 @@ fn sygus_pooled_nested_exprstmt_updates_selected_entity_field() {
 }
 
 #[test]
+fn sygus_pooled_nested_exprstmt_sequences_update_selected_entity_fields() {
+    let tm = Cvc5Tm::new();
+    let mut entity = make_pooled_counter_entity();
+    entity.fields.push(IRField {
+        name: "flag".to_owned(),
+        ty: IRType::Bool,
+        default: Some(bool_lit(false)),
+        initial_constraint: None,
+    });
+    let mut system = make_pooled_counter_system();
+    system.actions = vec![IRSystemAction {
+        name: "stage_selected".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::Choose {
+            var: "c".to_owned(),
+            entity: "Counter".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![
+                IRAction::ExprStmt {
+                    expr: bin_expr(
+                        "OpEq",
+                        IRExpr::Prime {
+                            expr: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "c".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                        int_lit(1),
+                        IRType::Bool,
+                    ),
+                },
+                IRAction::ExprStmt {
+                    expr: bin_expr(
+                        "OpEq",
+                        IRExpr::Prime {
+                            expr: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "c".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "flag".to_owned(),
+                                ty: IRType::Bool,
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                        bin_expr(
+                            "OpEq",
+                            IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "c".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            },
+                            int_lit(1),
+                            IRType::Bool,
+                        ),
+                        IRType::Bool,
+                    ),
+                },
+            ],
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    let formula = encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| {
+        panic!("pooled nested entity-field ExprStmt sequence should encode: {err}")
+    });
+    let formula = formula.to_string();
+    assert!(
+        !formula.contains("(= Counter_0_flag_next Counter_0_flag)"),
+        "second nested ExprStmt should update flag from staged x instead of framing it, got: {formula}"
+    );
+}
+
+#[test]
 fn sygus_pooled_multi_action_tracks_root_field_intermediates() {
     let tm = Cvc5Tm::new();
     let entity = make_pooled_counter_entity();
