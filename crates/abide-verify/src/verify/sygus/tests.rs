@@ -644,6 +644,94 @@ fn sygus_system_step_allows_unused_action_return_expr() {
 }
 
 #[test]
+fn sygus_system_step_supports_action_match_on_system_field() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_status_system();
+    system.fields.push(IRField {
+        name: "flag".to_owned(),
+        ty: IRType::Bool,
+        default: Some(bool_lit(false)),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "match_status".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![crate::ir::types::IRAction::Match {
+            scrutinee: crate::ir::types::IRActionMatchScrutinee::Var {
+                name: "status".to_owned(),
+            },
+            arms: vec![
+                crate::ir::types::IRActionMatchArm {
+                    pattern: crate::ir::types::IRPattern::PCtor {
+                        name: "Done".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: None,
+                    body: vec![crate::ir::types::IRAction::ExprStmt {
+                        expr: bin_expr(
+                            "OpEq",
+                            IRExpr::Prime {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "flag".to_owned(),
+                                    ty: IRType::Bool,
+                                    span: None,
+                                }),
+                                span: None,
+                            },
+                            bool_lit(true),
+                            IRType::Bool,
+                        ),
+                    }],
+                },
+                crate::ir::types::IRActionMatchArm {
+                    pattern: crate::ir::types::IRPattern::PWild,
+                    guard: None,
+                    body: vec![crate::ir::types::IRAction::ExprStmt {
+                        expr: bin_expr(
+                            "OpEq",
+                            IRExpr::Prime {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "flag".to_owned(),
+                                    ty: IRType::Bool,
+                                    span: None,
+                                }),
+                                span: None,
+                            },
+                            bool_lit(false),
+                            IRType::Bool,
+                        ),
+                    }],
+                },
+            ],
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("system action match should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_accepts_initial_field_constraints_before_solver_setup() {
     let mut system = make_counter_system();
     system.fields[0].default = None;

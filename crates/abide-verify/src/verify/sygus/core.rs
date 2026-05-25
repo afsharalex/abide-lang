@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Clone, Default)]
 pub(super) struct EnumCatalog {
@@ -729,7 +730,7 @@ pub(super) fn encode_system_step(
         scoped.extend(param_env);
 
         let mut conjuncts = vec![encode_expr(tm, &step.guard, &scoped, enum_catalog)?];
-        let update_map = collect_system_updates(tm, step, &scoped, enum_catalog)?;
+        let update_map = collect_system_updates(tm, step, fields, &scoped, enum_catalog)?;
 
         for field in fields {
             let next = next_vars
@@ -812,48 +813,229 @@ pub(super) fn encode_fsm_constraints(
 pub(super) fn collect_system_updates(
     tm: &Cvc5Tm,
     step: &IRSystemAction,
+    fields: &[IRField],
     curr_vars: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
 ) -> Result<HashMap<String, Cvc5Term>, String> {
     let mut updates = HashMap::new();
     for action in &step.body {
-        let crate::ir::types::IRAction::ExprStmt { expr } = action else {
-            return Err(format!(
-                "cvc5 SyGuS system safety only supports ExprStmt step bodies today (`{}`)",
-                step.name
-            ));
-        };
-        let IRExpr::BinOp {
-            op, left, right, ..
-        } = expr
-        else {
-            return Err(format!(
-                "cvc5 SyGuS system safety expects primed equality statements (`{}`)",
-                step.name
-            ));
-        };
-        if op != "OpEq" && op != "==" {
-            return Err(format!(
-                "cvc5 SyGuS system safety expects primed equality statements (`{}`)",
-                step.name
-            ));
-        }
-        let IRExpr::Prime { expr: primed, .. } = left.as_ref() else {
-            return Err(format!(
-                "cvc5 SyGuS system safety expects a primed lhs in ExprStmt (`{}`)",
-                step.name
-            ));
-        };
-        let IRExpr::Var { name, .. } = primed.as_ref() else {
-            return Err(format!(
-                "cvc5 SyGuS system safety only supports primed system field vars on the lhs (`{}`)",
-                step.name
-            ));
-        };
-        let rhs_term = encode_expr(tm, right, curr_vars, enum_catalog)?;
-        updates.insert(name.clone(), rhs_term);
+        updates.extend(collect_system_action_updates(
+            tm,
+            action,
+            fields,
+            curr_vars,
+            enum_catalog,
+            &step.name,
+        )?);
     }
     Ok(updates)
+}
+
+fn collect_system_action_updates(
+    tm: &Cvc5Tm,
+    action: &crate::ir::types::IRAction,
+    fields: &[IRField],
+    curr_vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    step_name: &str,
+) -> Result<HashMap<String, Cvc5Term>, String> {
+    match action {
+        crate::ir::types::IRAction::ExprStmt { expr } => {
+            let (name, rhs) =
+                collect_system_exprstmt_update(tm, expr, curr_vars, enum_catalog, step_name)?;
+            Ok(HashMap::from([(name, rhs)]))
+        }
+        crate::ir::types::IRAction::Match { scrutinee, arms } => {
+            collect_system_match_updates(tm, scrutinee, arms, fields, curr_vars, enum_catalog)
+        }
+        other => Err(format!(
+            "cvc5 SyGuS system safety does not support action `{other:?}` yet (`{step_name}`)"
+        )),
+    }
+}
+
+fn collect_system_exprstmt_update(
+    tm: &Cvc5Tm,
+    expr: &IRExpr,
+    curr_vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    step_name: &str,
+) -> Result<(String, Cvc5Term), String> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = expr
+    else {
+        return Err(format!(
+            "cvc5 SyGuS system safety expects primed equality statements (`{step_name}`)"
+        ));
+    };
+    if op != "OpEq" && op != "==" {
+        return Err(format!(
+            "cvc5 SyGuS system safety expects primed equality statements (`{step_name}`)"
+        ));
+    }
+    let IRExpr::Prime { expr: primed, .. } = left.as_ref() else {
+        return Err(format!(
+            "cvc5 SyGuS system safety expects a primed lhs in ExprStmt (`{step_name}`)"
+        ));
+    };
+    let IRExpr::Var { name, .. } = primed.as_ref() else {
+        return Err(format!(
+            "cvc5 SyGuS system safety only supports primed system field vars on the lhs (`{step_name}`)"
+        ));
+    };
+    Ok((
+        name.clone(),
+        encode_expr(tm, right, curr_vars, enum_catalog)?,
+    ))
+}
+
+fn collect_system_action_sequence_updates(
+    tm: &Cvc5Tm,
+    actions: &[crate::ir::types::IRAction],
+    fields: &[IRField],
+    curr_vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<HashMap<String, Cvc5Term>, String> {
+    let mut updates = HashMap::new();
+    for action in actions {
+        updates.extend(collect_system_action_updates(
+            tm,
+            action,
+            fields,
+            curr_vars,
+            enum_catalog,
+            "match arm",
+        )?);
+    }
+    Ok(updates)
+}
+
+fn merge_system_match_update_maps(
+    tm: &Cvc5Tm,
+    fields: &[IRField],
+    cond: &Cvc5Term,
+    then_updates: &HashMap<String, Cvc5Term>,
+    else_updates: &HashMap<String, Cvc5Term>,
+    curr_vars: &HashMap<String, Cvc5Term>,
+) -> Result<HashMap<String, Cvc5Term>, String> {
+    let mut touched: HashSet<String> = then_updates.keys().cloned().collect();
+    touched.extend(else_updates.keys().cloned());
+    let field_names: HashSet<_> = fields.iter().map(|field| field.name.as_str()).collect();
+    let mut merged = HashMap::new();
+    for field in touched {
+        if !field_names.contains(field.as_str()) {
+            return Err(format!(
+                "cvc5 SyGuS system safety cannot update unknown field `{field}` in match arm"
+            ));
+        }
+        let current = curr_vars
+            .get(&field)
+            .ok_or_else(|| format!("missing current variable for field `{field}`"))?;
+        let then_term = then_updates
+            .get(&field)
+            .cloned()
+            .unwrap_or_else(|| current.clone());
+        let else_term = else_updates
+            .get(&field)
+            .cloned()
+            .unwrap_or_else(|| current.clone());
+        merged.insert(
+            field,
+            tm.mk_term(
+                Cvc5Kind::CVC5_KIND_ITE,
+                &[cond.clone(), then_term, else_term],
+            ),
+        );
+    }
+    Ok(merged)
+}
+
+fn collect_system_match_updates(
+    tm: &Cvc5Tm,
+    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
+    arms: &[crate::ir::types::IRActionMatchArm],
+    fields: &[IRField],
+    curr_vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<HashMap<String, Cvc5Term>, String> {
+    if arms.is_empty() {
+        return Err("cvc5 SyGuS system action match requires at least one arm".to_owned());
+    }
+    let (scrut_term, scrut_ty) = match scrutinee {
+        crate::ir::types::IRActionMatchScrutinee::Var { name } => {
+            let term = curr_vars.get(name).cloned().ok_or_else(|| {
+                format!("cvc5 SyGuS system action match requires a bound scrutinee (`{name}`)")
+            })?;
+            let ty = fields
+                .iter()
+                .find(|field| field.name == *name)
+                .map(|field| field.ty.clone());
+            (term, ty)
+        }
+        crate::ir::types::IRActionMatchScrutinee::CrossCall { .. } => {
+            return Err(
+                "cvc5 SyGuS system action match does not support cross-call scrutinees yet"
+                    .to_owned(),
+            );
+        }
+    };
+
+    let mut fallback = None;
+    for arm in arms.iter().rev() {
+        let mut arm_vars = curr_vars.clone();
+        bind_pattern_vars(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            &mut arm_vars,
+            enum_catalog,
+        )?;
+        let pat_cond = encode_pattern_cond(
+            tm,
+            &arm.pattern,
+            &scrut_term,
+            scrut_ty.as_ref(),
+            enum_catalog,
+        )?;
+        let guard_cond = if let Some(guard) = &arm.guard {
+            encode_expr(tm, guard, &arm_vars, enum_catalog)?
+        } else {
+            tm.mk_boolean(true)
+        };
+        let arm_cond = mk_and(tm, &[pat_cond, guard_cond]);
+        let arm_updates =
+            collect_system_action_sequence_updates(tm, &arm.body, fields, &arm_vars, enum_catalog)?;
+        fallback = Some(match fallback {
+            None => {
+                if arm.guard.is_none()
+                    && matches!(
+                        arm.pattern,
+                        crate::ir::types::IRPattern::PWild
+                            | crate::ir::types::IRPattern::PVar { .. }
+                    )
+                {
+                    arm_updates
+                } else {
+                    return Err(
+                        "cvc5 SyGuS system action match requires a final wildcard or var fallback arm"
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(else_updates) => merge_system_match_update_maps(
+                tm,
+                fields,
+                &arm_cond,
+                &arm_updates,
+                &else_updates,
+                curr_vars,
+            )?,
+        });
+    }
+
+    fallback.ok_or_else(|| "cvc5 SyGuS system action match required at least one arm".to_owned())
 }
 
 pub(super) fn enumerate_param_envs(
