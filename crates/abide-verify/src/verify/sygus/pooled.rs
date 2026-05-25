@@ -3042,12 +3042,47 @@ fn encode_pooled_expr(
         IRExpr::Field {
             expr: recv, field, ..
         } => {
+            if let IRExpr::Ctor { args, .. } = recv.as_ref() {
+                if let Some(term) =
+                    encode_static_payload_field_projection(field, args, |arg| {
+                        encode_pooled_expr(
+                            tm,
+                            arg,
+                            vars,
+                            entity_bindings,
+                            pool_ctx,
+                            enum_catalog,
+                        )
+                    })?
+                {
+                    return Ok(term);
+                }
+            }
             let IRExpr::Var { name, .. } = recv.as_ref() else {
                 return Err(
                     "cvc5 SyGuS pooled system safety only supports field access on bound entity vars"
                         .to_owned(),
                 );
             };
+            if !entity_bindings.contains_key(name) {
+                let receiver = encode_pooled_expr(
+                    tm,
+                    recv,
+                    vars,
+                    entity_bindings,
+                    pool_ctx,
+                    enum_catalog,
+                )?;
+                if let Some(term) = encode_dynamic_payload_field_projection(
+                    tm,
+                    field,
+                    receiver,
+                    sygus_expr_type(recv),
+                    enum_catalog,
+                )? {
+                    return Ok(term);
+                }
+            }
             let slot = entity_bindings
                 .get(name)
                 .ok_or_else(|| format!("unknown entity binding `{name}` in pooled SyGuS slice"))?;

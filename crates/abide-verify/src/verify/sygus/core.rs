@@ -64,6 +64,27 @@ impl EnumCatalog {
             })
     }
 
+    pub(super) fn payload_accessor_for_field(
+        &self,
+        enum_name: &str,
+        field: &str,
+    ) -> Result<Option<&PayloadAccessorInfo>, String> {
+        let Some(info) = self.payload.get(enum_name) else {
+            return Ok(None);
+        };
+        let mut found = info
+            .variants
+            .iter()
+            .filter_map(|variant| variant.accessors.get(field));
+        let first = found.next();
+        if found.next().is_some() {
+            return Err(format!(
+                "cvc5 SyGuS payload field projection `{enum_name}.{field}` is ambiguous across constructors"
+            ));
+        }
+        Ok(first)
+    }
+
     #[cfg(test)]
     pub(super) fn from_types(tm: &Cvc5Tm, types: &[IRType]) -> Result<Self, String> {
         let mut catalog = Self::new();
@@ -1783,6 +1804,39 @@ where
     ))
 }
 
+pub(super) fn encode_static_payload_field_projection<F>(
+    field: &str,
+    args: &[(String, IRExpr)],
+    mut encode_arg: F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr) -> Result<Cvc5Term, String>,
+{
+    if let Some((_, arg_expr)) = args.iter().find(|(arg_name, _)| arg_name == field) {
+        return Ok(Some(encode_arg(arg_expr)?));
+    }
+    Ok(None)
+}
+
+pub(super) fn encode_dynamic_payload_field_projection(
+    tm: &Cvc5Tm,
+    field: &str,
+    receiver: Cvc5Term,
+    receiver_ty: Option<&IRType>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Option<Cvc5Term>, String> {
+    let Some(IRType::Enum { name, .. }) = receiver_ty else {
+        return Ok(None);
+    };
+    let Some(accessor) = enum_catalog.payload_accessor_for_field(name, field)? else {
+        return Ok(None);
+    };
+    Ok(Some(tm.mk_term(
+        Cvc5Kind::CVC5_KIND_APPLY_SELECTOR,
+        &[accessor.term.clone(), receiver],
+    )))
+}
+
 pub(super) fn encode_expr(
     tm: &Cvc5Tm,
     expr: &IRExpr,
@@ -1827,6 +1881,34 @@ pub(super) fn encode_expr(
             .cloned()
             .or_else(|| encode_enum_atom_var(tm, name, ty, enum_catalog))
             .ok_or_else(|| format!("unsupported free variable `{name}` in SyGuS slice")),
+        IRExpr::Field {
+            expr: receiver,
+            field,
+            ..
+        } => {
+            if let IRExpr::Ctor { args, .. } = receiver.as_ref() {
+                if let Some(term) =
+                    encode_static_payload_field_projection(field, args, |arg| {
+                        encode_expr(tm, arg, vars, enum_catalog)
+                    })?
+                {
+                    return Ok(term);
+                }
+            }
+            let receiver_term = encode_expr(tm, receiver, vars, enum_catalog)?;
+            if let Some(term) = encode_dynamic_payload_field_projection(
+                tm,
+                field,
+                receiver_term,
+                sygus_expr_type(receiver),
+                enum_catalog,
+            )? {
+                return Ok(term);
+            }
+            Err(format!(
+                "unsupported field projection `{field}` in cvc5 SyGuS single-entity safety slice"
+            ))
+        }
         IRExpr::App { func, arg, .. } => {
             let IRExpr::Lam { param, body, .. } = func.as_ref() else {
                 return Err("cvc5 SyGuS only supports inline lambda application today".to_owned());

@@ -404,6 +404,59 @@ fn sygus_expr_encoder_supports_dynamic_payload_constructor_destructuring() {
 }
 
 #[test]
+fn sygus_expr_encoder_supports_payload_field_projection() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let enum_catalog = EnumCatalog::from_types(&tm, std::slice::from_ref(&decision_ty))
+        .expect("payload enum datatype catalog should build");
+    let decision_sort = enum_catalog
+        .payload_sort("Decision")
+        .expect("Decision datatype sort should be available");
+    let vars = HashMap::from([(
+        "decision".to_owned(),
+        tm.mk_var(decision_sort.clone(), "decision"),
+    )]);
+    let dynamic_projection = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "decision".to_owned(),
+            ty: decision_ty.clone(),
+            span: None,
+        }),
+        field: "amount".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    encode_expr(&tm, &dynamic_projection, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("dynamic payload field projection should encode: {err}"));
+
+    let static_projection = IRExpr::Field {
+        expr: Box::new(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("amount".to_owned(), int_lit(7))],
+            span: None,
+        }),
+        field: "amount".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    encode_expr(&tm, &static_projection, &HashMap::new(), &enum_catalog)
+        .unwrap_or_else(|err| panic!("static payload field projection should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_accepts_payload_enum_fields_before_solver_setup() {
     let decision_ty = IRType::Enum {
         name: "Decision".to_owned(),
@@ -1026,6 +1079,88 @@ fn sygus_system_step_supports_finite_aggregate_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("finite aggregate RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_system_step_supports_payload_field_projection_rhs() {
+    let tm = Cvc5Tm::new();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let mut system = make_counter_system();
+    system.fields.push(IRField {
+        name: "decision".to_owned(),
+        ty: decision_ty.clone(),
+        default: Some(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("amount".to_owned(), int_lit(3))],
+            span: None,
+        }),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "copy_payload".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![crate::ir::types::IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "decision".to_owned(),
+                        ty: decision_ty,
+                        span: None,
+                    }),
+                    field: "amount".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("payload field projection RHS should encode: {err}"));
 }
 
 #[test]
@@ -2027,6 +2162,91 @@ fn sygus_pooled_system_step_supports_finite_aggregate_rhs() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("pooled finite aggregate RHS should encode: {err}"));
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_payload_field_projection_rhs() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![crate::ir::types::IRVariantField {
+                    name: "amount".to_owned(),
+                    ty: IRType::Int,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let mut system = make_pooled_counter_system();
+    system.fields.push(IRField {
+        name: "total".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
+    system.fields.push(IRField {
+        name: "decision".to_owned(),
+        ty: decision_ty.clone(),
+        default: Some(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("amount".to_owned(), int_lit(3))],
+            span: None,
+        }),
+        initial_constraint: None,
+    });
+    system.actions = vec![IRSystemAction {
+        name: "copy_payload".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::ExprStmt {
+            expr: bin_expr(
+                "OpEq",
+                IRExpr::Prime {
+                    expr: Box::new(IRExpr::Var {
+                        name: "total".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    }),
+                    span: None,
+                },
+                IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "decision".to_owned(),
+                        ty: decision_ty,
+                        span: None,
+                    }),
+                    field: "amount".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                },
+                IRType::Bool,
+            ),
+        }],
+        return_expr: None,
+    }];
+    let all_fields = system
+        .fields
+        .iter()
+        .cloned()
+        .chain(entity.fields.iter().cloned())
+        .collect::<Vec<_>>();
+    let enum_catalog = build_enum_catalog(&tm, &all_fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled payload field projection RHS should encode: {err}"));
 }
 
 #[test]
