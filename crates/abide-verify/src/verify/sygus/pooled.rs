@@ -3295,6 +3295,11 @@ fn encode_pooled_expr(
             pool_ctx,
             enum_catalog,
         ),
+        IRExpr::Card { expr: inner, .. } => {
+            encode_finite_card_expr(tm, inner, vars, enum_catalog, |expr, scoped| {
+                encode_pooled_expr(tm, expr, scoped, entity_bindings, pool_ctx, enum_catalog)
+            })
+        }
         IRExpr::Forall {
             var, domain, body, ..
         }

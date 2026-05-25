@@ -1407,6 +1407,148 @@ pub(super) fn encode_finite_aggregate_expr(
     }
 }
 
+fn sum_bool_terms(tm: &Cvc5Tm, predicates: &[Cvc5Term]) -> Cvc5Term {
+    let mut acc = tm.mk_integer(0);
+    for predicate in predicates {
+        let contribution = tm.mk_term(
+            Cvc5Kind::CVC5_KIND_ITE,
+            &[predicate.clone(), tm.mk_integer(1), tm.mk_integer(0)],
+        );
+        acc = tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[acc, contribution]);
+    }
+    acc
+}
+
+pub(super) fn encode_finite_card_expr<F>(
+    tm: &Cvc5Tm,
+    expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    mut encode_with_vars: F,
+) -> Result<Cvc5Term, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    match expr {
+        IRExpr::SeqLit { elements, .. } => Ok(tm.mk_integer(elements.len() as i64)),
+        IRExpr::SetLit {
+            elements,
+            ty: IRType::Set {
+                element: element_ty,
+            },
+            ..
+        } => {
+            let Some(candidates) = finite_domain_values(tm, element_ty, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS cardinality only supports finite Bool/enum set literals today"
+                        .to_owned(),
+                );
+            };
+            let mut memberships = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let mut matches = Vec::with_capacity(elements.len());
+                for element in elements {
+                    let element_term = encode_with_vars(element, vars)?;
+                    matches.push(tm.mk_term(
+                        Cvc5Kind::CVC5_KIND_EQUAL,
+                        &[element_term, candidate.clone()],
+                    ));
+                }
+                memberships.push(mk_or(tm, &matches));
+            }
+            Ok(sum_bool_terms(tm, &memberships))
+        }
+        IRExpr::MapLit {
+            entries,
+            ty: IRType::Map { key: key_ty, .. },
+            ..
+        } => {
+            let Some(candidates) = finite_domain_values(tm, key_ty, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS cardinality only supports finite Bool/enum map literal keys today"
+                        .to_owned(),
+                );
+            };
+            let mut memberships = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let mut matches = Vec::with_capacity(entries.len());
+                for (key, _) in entries {
+                    let key_term = encode_with_vars(key, vars)?;
+                    matches.push(
+                        tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[key_term, candidate.clone()]),
+                    );
+                }
+                memberships.push(mk_or(tm, &matches));
+            }
+            Ok(sum_bool_terms(tm, &memberships))
+        }
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            if source.is_some() {
+                return Err(
+                    "cvc5 SyGuS cardinality does not support sourced set comprehensions yet"
+                        .to_owned(),
+                );
+            }
+            let Some(domain_values) = finite_domain_values(tm, domain, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS cardinality only supports finite Bool/enum set-comprehension domains"
+                        .to_owned(),
+                );
+            };
+
+            if let Some(projection) = projection {
+                let Some(projection_ty) = sygus_expr_type(projection) else {
+                    return Err(
+                        "cvc5 SyGuS cardinality requires a finite projection type".to_owned()
+                    );
+                };
+                let Some(projected_values) = finite_domain_values(tm, projection_ty, enum_catalog)
+                else {
+                    return Err(
+                        "cvc5 SyGuS cardinality only supports finite Bool/enum set-comprehension projections"
+                            .to_owned(),
+                    );
+                };
+                let mut memberships = Vec::with_capacity(projected_values.len());
+                for projected_value in projected_values {
+                    let mut witnesses = Vec::with_capacity(domain_values.len());
+                    for domain_value in &domain_values {
+                        let mut scoped = vars.clone();
+                        scoped.insert(var.clone(), domain_value.clone());
+                        let filter_term = encode_with_vars(filter, &scoped)?;
+                        let projection_term = encode_with_vars(projection, &scoped)?;
+                        let projection_eq = tm.mk_term(
+                            Cvc5Kind::CVC5_KIND_EQUAL,
+                            &[projection_term, projected_value.clone()],
+                        );
+                        witnesses.push(mk_and(tm, &[filter_term, projection_eq]));
+                    }
+                    memberships.push(mk_or(tm, &witnesses));
+                }
+                return Ok(sum_bool_terms(tm, &memberships));
+            }
+
+            let mut memberships = Vec::with_capacity(domain_values.len());
+            for domain_value in domain_values {
+                let mut scoped = vars.clone();
+                scoped.insert(var.clone(), domain_value);
+                memberships.push(encode_with_vars(filter, &scoped)?);
+            }
+            Ok(sum_bool_terms(tm, &memberships))
+        }
+        _ => Err(format!(
+            "cvc5 SyGuS cardinality does not support expression shape: {expr:?}"
+        )),
+    }
+}
+
 pub(super) fn sygus_expr_type(expr: &IRExpr) -> Option<&IRType> {
     match expr {
         IRExpr::Lit { ty, .. }
@@ -2035,6 +2177,11 @@ pub(super) fn encode_expr(
             vars,
             enum_catalog,
         ),
+        IRExpr::Card { expr: inner, .. } => {
+            encode_finite_card_expr(tm, inner, vars, enum_catalog, |expr, scoped| {
+                encode_expr(tm, expr, scoped, enum_catalog)
+            })
+        }
         IRExpr::Forall {
             var, domain, body, ..
         } => encode_finite_quantifier_expr(tm, "forall", var, domain, body, vars, enum_catalog),
