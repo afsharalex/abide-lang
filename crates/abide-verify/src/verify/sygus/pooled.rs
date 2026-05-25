@@ -3283,6 +3283,25 @@ fn encode_pooled_expr(
                 })
         }
         IRExpr::Index { map, key, .. } => {
+            if matches!(map.as_ref(), IRExpr::SetLit { .. } | IRExpr::SetComp { .. }) {
+                return encode_finite_set_membership_expr(
+                    tm,
+                    map,
+                    key,
+                    vars,
+                    enum_catalog,
+                    |expr, scoped| {
+                        encode_pooled_expr(
+                            tm,
+                            expr,
+                            scoped,
+                            entity_bindings,
+                            pool_ctx,
+                            enum_catalog,
+                        )
+                    },
+                );
+            }
             if let IRExpr::Var {
                 name: store_name, ..
             } = map.as_ref()

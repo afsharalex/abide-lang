@@ -1591,6 +1591,73 @@ where
     }
 }
 
+pub(super) fn encode_finite_set_membership_expr<F>(
+    tm: &Cvc5Tm,
+    set_expr: &IRExpr,
+    key_expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    mut encode_with_vars: F,
+) -> Result<Cvc5Term, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
+    let key_term = encode_with_vars(key_expr, vars)?;
+    match set_expr {
+        IRExpr::SetLit { elements, .. } => {
+            let mut matches = Vec::with_capacity(elements.len());
+            for element in elements {
+                let element_term = encode_with_vars(element, vars)?;
+                matches
+                    .push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[element_term, key_term.clone()]));
+            }
+            Ok(mk_or(tm, &matches))
+        }
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            let Some(domain_values) = finite_domain_values(tm, domain, enum_catalog) else {
+                return Err(
+                    "cvc5 SyGuS set membership only supports finite Bool/enum set-comprehension domains"
+                        .to_owned(),
+                );
+            };
+            let mut witnesses = Vec::with_capacity(domain_values.len());
+            for domain_value in domain_values {
+                let source_member = encode_finite_source_membership(
+                    tm,
+                    source.as_deref(),
+                    &domain_value,
+                    vars,
+                    &mut encode_with_vars,
+                )?;
+                let mut scoped = vars.clone();
+                scoped.insert(var.clone(), domain_value.clone());
+                let filter_term = encode_with_vars(filter, &scoped)?;
+                let member_term = if let Some(projection) = projection {
+                    let projection_term = encode_with_vars(projection, &scoped)?;
+                    tm.mk_term(
+                        Cvc5Kind::CVC5_KIND_EQUAL,
+                        &[projection_term, key_term.clone()],
+                    )
+                } else {
+                    tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[domain_value, key_term.clone()])
+                };
+                witnesses.push(mk_and(tm, &[source_member, filter_term, member_term]));
+            }
+            Ok(mk_or(tm, &witnesses))
+        }
+        _ => Err(format!(
+            "cvc5 SyGuS set membership does not support expression shape: {set_expr:?}"
+        )),
+    }
+}
+
 pub(super) fn sygus_expr_type(expr: &IRExpr) -> Option<&IRType> {
     match expr {
         IRExpr::Lit { ty, .. }
@@ -2221,6 +2288,11 @@ pub(super) fn encode_expr(
         ),
         IRExpr::Card { expr: inner, .. } => {
             encode_finite_card_expr(tm, inner, vars, enum_catalog, |expr, scoped| {
+                encode_expr(tm, expr, scoped, enum_catalog)
+            })
+        }
+        IRExpr::Index { map, key, .. } => {
+            encode_finite_set_membership_expr(tm, map, key, vars, enum_catalog, |expr, scoped| {
                 encode_expr(tm, expr, scoped, enum_catalog)
             })
         }
