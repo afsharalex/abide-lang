@@ -1690,32 +1690,83 @@ pub(super) fn encode_finite_map_lookup_expr<F>(
 where
     F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
 {
-    let IRExpr::MapLit {
-        entries,
-        ty: IRType::Map { value, .. },
-        ..
-    } = map_expr
-    else {
-        return Ok(None);
-    };
+    encode_finite_map_lookup_expr_inner(
+        tm,
+        map_expr,
+        key_expr,
+        vars,
+        enum_catalog,
+        &mut encode_with_vars,
+    )
+}
 
+fn encode_finite_map_lookup_expr_inner<F>(
+    tm: &Cvc5Tm,
+    map_expr: &IRExpr,
+    key_expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    encode_with_vars: &mut F,
+) -> Result<Option<Cvc5Term>, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
     let key_term = encode_with_vars(key_expr, vars)?;
-    let mut choice = default_term_for_type(tm, value, enum_catalog)?;
-    for (entry_key, entry_value) in entries {
-        let entry_key_term = encode_with_vars(entry_key, vars)?;
-        let entry_value_term = encode_with_vars(entry_value, vars)?;
-        if entry_value_term.sort() != choice.sort() {
-            return Err(
-                "cvc5 SyGuS map literal lookup entry value has incompatible sort".to_owned(),
-            );
+    match map_expr {
+        IRExpr::MapLit {
+            entries,
+            ty: IRType::Map { value, .. },
+            ..
+        } => {
+            let mut choice = default_term_for_type(tm, value, enum_catalog)?;
+            for (entry_key, entry_value) in entries {
+                let entry_key_term = encode_with_vars(entry_key, vars)?;
+                let entry_value_term = encode_with_vars(entry_value, vars)?;
+                if entry_value_term.sort() != choice.sort() {
+                    return Err(
+                        "cvc5 SyGuS map literal lookup entry value has incompatible sort"
+                            .to_owned(),
+                    );
+                }
+                let key_eq = tm.mk_term(
+                    Cvc5Kind::CVC5_KIND_EQUAL,
+                    &[entry_key_term, key_term.clone()],
+                );
+                choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[key_eq, entry_value_term, choice]);
+            }
+            Ok(Some(choice))
         }
-        let key_eq = tm.mk_term(
-            Cvc5Kind::CVC5_KIND_EQUAL,
-            &[entry_key_term, key_term.clone()],
-        );
-        choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[key_eq, entry_value_term, choice]);
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => {
+            let prior = encode_finite_map_lookup_expr_inner(
+                tm,
+                map,
+                key_expr,
+                vars,
+                enum_catalog,
+                encode_with_vars,
+            )?
+            .ok_or_else(|| {
+                "cvc5 SyGuS map update lookup only supports finite MapLit/MapUpdate bases"
+                    .to_owned()
+            })?;
+            let update_key = encode_with_vars(key, vars)?;
+            let update_value = encode_with_vars(value, vars)?;
+            if update_value.sort() != prior.sort() {
+                return Err("cvc5 SyGuS map update lookup value has incompatible sort".to_owned());
+            }
+            let key_eq = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[update_key, key_term]);
+            Ok(Some(tm.mk_term(
+                Cvc5Kind::CVC5_KIND_ITE,
+                &[key_eq, update_value, prior],
+            )))
+        }
+        IRExpr::MapLit { ty, .. } => Err(format!(
+            "cvc5 SyGuS map literal lookup requires Map type, got {ty:?}"
+        )),
+        _ => Ok(None),
     }
-    Ok(Some(choice))
 }
 
 pub(super) fn sygus_expr_type(expr: &IRExpr) -> Option<&IRType> {
