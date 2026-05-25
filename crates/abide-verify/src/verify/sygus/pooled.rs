@@ -959,13 +959,7 @@ fn encode_pooled_ops_for_target(
     if ops.is_empty() {
         return Err("cvc5 SyGuS pooled system safety requires at least one nested op".to_owned());
     }
-    if ops.len() > 1
-        && ops.iter().all(|op| match op {
-            IRAction::Apply { target, .. } => target == target_var,
-            IRAction::ExprStmt { expr } => exprstmt_target_field(expr, target_var).is_ok(),
-            _ => false,
-        })
-    {
+    if ops.len() > 1 {
         let mut intermediates = Vec::new();
         let mut bound = Vec::new();
         for stage in 0..(ops.len() - 1) {
@@ -1017,68 +1011,26 @@ fn encode_pooled_ops_for_target(
             } else {
                 active_curr
             };
-            match op {
-                IRAction::Apply {
-                    target,
-                    transition,
-                    refs,
-                    args,
-                } => {
-                    if target != target_var {
-                        return Err(
-                            "cvc5 SyGuS pooled system safety only supports apply on the selected target variable"
-                                .to_owned(),
-                        );
-                    }
-                    let trans = target_entity
-                        .transitions
-                        .iter()
-                        .find(|trans| trans.name == *transition)
-                        .ok_or_else(|| {
-                            format!(
-                                "unknown transition `{transition}` on `{}`",
-                                target_entity.name
-                            )
-                        })?;
-                    let mut resolved_bindings = entity_bindings.clone();
-                    resolved_bindings.extend(resolve_pooled_ref_bindings(
-                        trans,
-                        refs,
-                        entity_bindings,
-                    )?);
-                    conjuncts.push(encode_pooled_transition_at_slot(
-                        tm,
-                        trans,
-                        target_entity,
-                        target_slot,
-                        args,
-                        vars,
-                        &resolved_bindings,
-                        stage_active_next,
-                        &stage_read_fields,
-                        &stage_write_fields,
-                        enum_catalog,
-                        &stage_pool_ctx,
-                    )?);
-                }
-                IRAction::ExprStmt { expr } => {
-                    conjuncts.push(encode_pooled_entity_exprstmt_at_slot(
-                        tm,
-                        expr,
-                        target_var,
-                        target_entity,
-                        target_slot,
-                        vars,
-                        entity_bindings,
-                        stage_active_next,
-                        &stage_read_fields,
-                        &stage_write_fields,
-                        enum_catalog,
-                        &stage_pool_ctx,
-                    )?);
-                }
-                _ => unreachable!("checked stageable nested ops above"),
-            }
+            conjuncts.push(encode_pooled_ops_for_target(
+                tm,
+                target_var,
+                target_entity,
+                target_slot,
+                std::slice::from_ref(op),
+                _system,
+                _systems_by_name,
+                entities_by_name,
+                slots_per_entity,
+                vars,
+                entity_bindings,
+                active_curr,
+                stage_active_next,
+                &stage_read_fields,
+                &stage_write_fields,
+                enum_catalog,
+                &stage_pool_ctx,
+                _call_stack,
+            )?);
         }
         return Ok(mk_exists(tm, &bound, mk_and(tm, &conjuncts)));
     }

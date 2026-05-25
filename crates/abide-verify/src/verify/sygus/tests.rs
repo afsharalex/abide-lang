@@ -2432,6 +2432,92 @@ fn sygus_pooled_nested_exprstmt_sequences_update_selected_entity_fields() {
 }
 
 #[test]
+fn sygus_pooled_nested_mixed_sequences_preserve_later_target_updates() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.actions = vec![IRSystemAction {
+        name: "nested_then_update".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::Choose {
+            var: "c".to_owned(),
+            entity: "Counter".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![
+                IRAction::Choose {
+                    var: "d".to_owned(),
+                    entity: "Counter".to_owned(),
+                    filter: Box::new(bool_lit(true)),
+                    ops: vec![IRAction::ExprStmt {
+                        expr: bin_expr(
+                            "OpEq",
+                            IRExpr::Prime {
+                                expr: Box::new(IRExpr::Field {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "c".to_owned(),
+                                        ty: IRType::Entity {
+                                            name: "Counter".to_owned(),
+                                        },
+                                        span: None,
+                                    }),
+                                    field: "x".to_owned(),
+                                    ty: IRType::Int,
+                                    span: None,
+                                }),
+                                span: None,
+                            },
+                            int_lit(1),
+                            IRType::Bool,
+                        ),
+                    }],
+                },
+                IRAction::ExprStmt {
+                    expr: bin_expr(
+                        "OpEq",
+                        IRExpr::Prime {
+                            expr: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "c".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            span: None,
+                        },
+                        int_lit(2),
+                        IRType::Bool,
+                    ),
+                },
+            ],
+        }],
+        return_expr: None,
+    }];
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    let formula = encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled mixed nested op sequence should encode: {err}"));
+    let formula = formula.to_string();
+    assert!(
+        formula.contains("(= Counter_0_x_next 2)"),
+        "later nested ExprStmt should still constrain the final selected slot value, got: {formula}"
+    );
+}
+
+#[test]
 fn sygus_pooled_multi_action_tracks_root_field_intermediates() {
     let tm = Cvc5Tm::new();
     let entity = make_pooled_counter_entity();
