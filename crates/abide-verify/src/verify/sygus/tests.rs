@@ -653,6 +653,12 @@ fn sygus_system_step_supports_action_match_on_system_field() {
         default: Some(bool_lit(false)),
         initial_constraint: None,
     });
+    system.fields.push(IRField {
+        name: "count".to_owned(),
+        ty: IRType::Int,
+        default: Some(int_lit(0)),
+        initial_constraint: None,
+    });
     system.actions = vec![IRSystemAction {
         name: "match_status".to_owned(),
         params: vec![],
@@ -668,21 +674,47 @@ fn sygus_system_step_supports_action_match_on_system_field() {
                         fields: vec![],
                     },
                     guard: None,
-                    body: vec![crate::ir::types::IRAction::ExprStmt {
-                        expr: bin_expr(
-                            "OpEq",
-                            IRExpr::Prime {
-                                expr: Box::new(IRExpr::Var {
-                                    name: "flag".to_owned(),
-                                    ty: IRType::Bool,
+                    body: vec![
+                        crate::ir::types::IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "flag".to_owned(),
+                                        ty: IRType::Bool,
+                                        span: None,
+                                    }),
                                     span: None,
-                                }),
-                                span: None,
-                            },
-                            bool_lit(true),
-                            IRType::Bool,
-                        ),
-                    }],
+                                },
+                                bool_lit(true),
+                                IRType::Bool,
+                            ),
+                        },
+                        crate::ir::types::IRAction::ExprStmt {
+                            expr: bin_expr(
+                                "OpEq",
+                                IRExpr::Prime {
+                                    expr: Box::new(IRExpr::Var {
+                                        name: "count".to_owned(),
+                                        ty: IRType::Int,
+                                        span: None,
+                                    }),
+                                    span: None,
+                                },
+                                IRExpr::IfElse {
+                                    cond: Box::new(IRExpr::Var {
+                                        name: "flag".to_owned(),
+                                        ty: IRType::Bool,
+                                        span: None,
+                                    }),
+                                    then_body: Box::new(int_lit(1)),
+                                    else_body: Some(Box::new(int_lit(0))),
+                                    span: None,
+                                },
+                                IRType::Bool,
+                            ),
+                        },
+                    ],
                 },
                 crate::ir::types::IRActionMatchArm {
                     pattern: crate::ir::types::IRPattern::PWild,
@@ -729,6 +761,23 @@ fn sygus_system_step_supports_action_match_on_system_field() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("system action match should encode: {err}"));
+
+    let updates = collect_system_updates(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &curr_vars,
+        &enum_catalog,
+    )
+    .expect("system action match updates should collect");
+    let count_rhs = updates
+        .get("count")
+        .expect("count should be updated")
+        .to_string();
+    assert!(
+        !count_rhs.contains("flag"),
+        "second match-arm update should read the staged flag update, not the current flag: {count_rhs}"
+    );
 }
 
 #[test]
