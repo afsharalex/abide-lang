@@ -1273,8 +1273,8 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
         IRExpr::Sorry { .. } => Some("Sorry"),
         IRExpr::Todo { .. } => Some("Todo"),
         IRExpr::Card { expr, .. } => match expr.as_ref() {
-            // Compile-time literal cardinality — always supported
-            IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => None,
+            // Compile-time literal/set-algebra cardinality — always supported
+            inner if is_finite_scene_cardinality_target(inner) => None,
             IRExpr::SetComp {
                 source: Some(source),
                 filter,
@@ -1403,6 +1403,22 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
                     .as_ref()
                     .and_then(|e| find_unsupported_scene_expr(e))
             }),
+    }
+}
+
+fn is_finite_scene_cardinality_target(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => true,
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(
+            op.as_str(),
+            "OpDiamond" | "OpSetUnion" | "OpSetIntersect" | "OpSetDiff"
+        ) =>
+        {
+            is_finite_scene_cardinality_target(left) && is_finite_scene_cardinality_target(right)
+        }
+        _ => false,
     }
 }
 
@@ -2854,6 +2870,26 @@ mod tests {
             }),
             None
         );
+
+        let set_lit = |values: Vec<i64>| IRExpr::SetLit {
+            elements: values.into_iter().map(int_lit).collect(),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        };
+        let set_union_card = IRExpr::Card {
+            expr: Box::new(bin(
+                "OpDiamond",
+                set_lit(vec![1, 2]),
+                set_lit(vec![2, 3]),
+                IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+            )),
+            span: None,
+        };
+        assert_eq!(find_unsupported_scene_expr(&set_union_card), None);
 
         let unsupported_card = IRExpr::Card {
             expr: Box::new(field(

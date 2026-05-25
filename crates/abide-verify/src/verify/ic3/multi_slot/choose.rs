@@ -232,6 +232,46 @@ where
     }))
 }
 
+pub(in crate::verify::ic3) fn ic3_finite_literal_cardinality(expr: &IRExpr) -> Option<String> {
+    match expr {
+        IRExpr::SeqLit { elements, .. } => Some(elements.len().to_string()),
+        IRExpr::MapLit { entries, .. } => {
+            let keys: std::collections::HashSet<String> =
+                entries.iter().map(|(key, _)| format!("{key:?}")).collect();
+            Some(keys.len().to_string())
+        }
+        _ => finite_set_literal_keys(expr).map(|keys| keys.len().to_string()),
+    }
+}
+
+fn finite_set_literal_keys(expr: &IRExpr) -> Option<std::collections::HashSet<String>> {
+    match expr {
+        IRExpr::SetLit { elements, .. } => Some(
+            elements
+                .iter()
+                .map(|element| format!("{element:?}"))
+                .collect(),
+        ),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(
+            op.as_str(),
+            "OpDiamond" | "OpSetUnion" | "OpSetIntersect" | "OpSetDiff"
+        ) =>
+        {
+            let left_keys = finite_set_literal_keys(left)?;
+            let right_keys = finite_set_literal_keys(right)?;
+            match op.as_str() {
+                "OpDiamond" | "OpSetUnion" => Some(left_keys.union(&right_keys).cloned().collect()),
+                "OpSetIntersect" => Some(left_keys.intersection(&right_keys).cloned().collect()),
+                "OpSetDiff" => Some(left_keys.difference(&right_keys).cloned().collect()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(in crate::verify::ic3) fn ic3_quantified_choose_sort(domain: &IRType) -> Option<String> {
     match domain {
         IRType::Int | IRType::Identity => Some("Int".to_owned()),

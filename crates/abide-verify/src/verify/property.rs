@@ -14,7 +14,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::smt::{AbideSolver, Bool, Dynamic, Int, SatResult};
@@ -3649,6 +3649,10 @@ pub(super) fn encode_card(
     inner: &IRExpr,
     step: usize,
 ) -> Result<SmtValue, String> {
+    if let Some(keys) = finite_set_algebra_keys(inner) {
+        return Ok(smt::int_val(i64::try_from(keys.len()).unwrap_or(0)));
+    }
+
     match inner {
         IRExpr::SetLit { elements, .. } => {
             let unique: std::collections::HashSet<String> =
@@ -3815,6 +3819,34 @@ pub(super) fn encode_card(
                 Err(format!("unsupported cardinality expression: {inner:?}"))
             }
         }
+    }
+}
+
+fn finite_set_algebra_keys(expr: &IRExpr) -> Option<HashSet<String>> {
+    match expr {
+        IRExpr::SetLit { elements, .. } => Some(
+            elements
+                .iter()
+                .map(|element| format!("{element:?}"))
+                .collect(),
+        ),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(
+            op.as_str(),
+            "OpDiamond" | "OpSetUnion" | "OpSetIntersect" | "OpSetDiff"
+        ) =>
+        {
+            let left_keys = finite_set_algebra_keys(left)?;
+            let right_keys = finite_set_algebra_keys(right)?;
+            match op.as_str() {
+                "OpDiamond" | "OpSetUnion" => Some(left_keys.union(&right_keys).cloned().collect()),
+                "OpSetIntersect" => Some(left_keys.intersection(&right_keys).cloned().collect()),
+                "OpSetDiff" => Some(left_keys.difference(&right_keys).cloned().collect()),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -4398,6 +4430,65 @@ mod tests {
             &smt::int_lit(1),
         )));
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_card_covers_finite_set_algebra() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let int_lit = |value| IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        };
+        let set_lit = |values: Vec<i64>| IRExpr::SetLit {
+            elements: values.into_iter().map(int_lit).collect(),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        };
+        let bin = |op: &str, left: IRExpr, right: IRExpr| IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        };
+
+        let cases = [
+            (
+                bin("OpDiamond", set_lit(vec![1, 2]), set_lit(vec![2, 3])),
+                3,
+            ),
+            (
+                bin(
+                    "OpSetIntersect",
+                    set_lit(vec![1, 2, 3]),
+                    set_lit(vec![2, 3, 4]),
+                ),
+                2,
+            ),
+            (
+                bin("OpSetDiff", set_lit(vec![1, 2, 3]), set_lit(vec![2])),
+                2,
+            ),
+        ];
+
+        for (expr, expected) in cases {
+            let card = encode_card(&pool, &vctx, &defs, &ctx, &expr, 0).expect("set algebra card");
+            let solver = AbideSolver::new();
+            solver.assert(&smt::bool_not(&smt::int_eq(
+                card.as_int().expect("card int"),
+                &smt::int_lit(expected),
+            )));
+            assert_eq!(solver.check(), SatResult::Unsat);
+        }
     }
 
     #[test]

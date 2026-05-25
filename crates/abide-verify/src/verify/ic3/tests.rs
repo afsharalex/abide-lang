@@ -8798,6 +8798,21 @@ fn multi_slot_value_expr_translator_covers_scalar_collection_and_error_paths() {
     )
     .expect_err("cardinality unsupported")
     .contains("cardinality"));
+
+    let literal_cardinality = IRExpr::Card {
+        expr: Box::new(IRExpr::SetLit {
+            elements: vec![ic3_int_lit(1), ic3_int_lit(2), ic3_int_lit(2)],
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        }),
+        span: None,
+    };
+    assert_eq!(
+        expr_to_smt(&literal_cardinality, &entity, &vctx).unwrap(),
+        "2"
+    );
 }
 
 #[test]

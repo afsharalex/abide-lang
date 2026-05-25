@@ -6310,6 +6310,22 @@ fn collection_ops_all_proved() {
 }
 
 #[test]
+fn collection_set_operator_cardinality_all_proved() {
+    let src = r#"
+module CollectionSetOperatorCardinality
+
+verify finite_set_operator_cardinality {
+  assert #(Set(1, 2) <> Set(2, 3)) == 3
+  assert #(Set(1, 2, 3) * Set(2, 3, 4)) == 2
+  assert #(Set(1, 2, 3) - Set(2)) == 2
+}
+"#;
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "finite_set_operator_cardinality");
+}
+
+#[test]
 fn collection_comprehensions_all_proved() {
     let results = verify_file("tests/fixtures/collection_comprehensions.ab");
     let expected = [
@@ -7026,6 +7042,57 @@ verify ic3_top_level_pure_cardinality {
 }
 
 #[test]
+fn ic3_supports_literal_set_cardinality_in_entity_properties() {
+    let src = r"module T
+
+entity Counter {
+  x: int = 0
+  y: int = 0
+
+  action tick() requires x < 10 {
+    x' = x + 1
+    y' = y + 1
+  }
+}
+
+system S(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where c.x < 4 { c.tick() }
+  }
+}
+
+verify ic3_literal_set_cardinality {
+  assume {
+    store counters: Counter[0..20]
+    let s = S { counters: counters }
+    stutter
+  }
+
+  assert always all c: Counter | c.y <= 10 and #(Set(1, 2)) == 2
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            no_ic3: false,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "ic3_literal_set_cardinality"
+                    && method.contains("IC3")
+        )),
+        "literal set cardinality in entity property should prove through IC3, got: {results:?}"
+    );
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 
@@ -7087,6 +7154,10 @@ verify explicit_finite_cardinality_numeric_ops {
 
   assert always (
     (#{ b | b: bool where b } + 1 == 2)
+    and (-(#{ b | b: bool where b }) == -1)
+    and (true in { true | b: bool where true })
+    and (Set(true) <= Set(false, true))
+    and (Set(true) !* Set(false))
     and (#{ f | f: Flag where f == @On } >= 1)
     and (#{ m | m: Marker where m.active } == 1)
   )

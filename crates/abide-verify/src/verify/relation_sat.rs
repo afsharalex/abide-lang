@@ -898,7 +898,7 @@ fn lower_static_relation_expr(
         }),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpSetUnion" => Ok(IRRelationExpr::Union(
+        } if matches!(op.as_str(), "OpDiamond" | "OpSetUnion") => Ok(IRRelationExpr::Union(
             Box::new(lower_static_relation_expr(left, universe)?),
             Box::new(lower_static_relation_expr(right, universe)?),
         )),
@@ -1633,6 +1633,36 @@ mod tests {
         solver.solve().expect("test solve should complete")
     }
 
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: crate::ir::types::LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn int_set(values: Vec<i64>) -> IRExpr {
+        IRExpr::SetLit {
+            elements: values.into_iter().map(int_lit).collect(),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        }
+    }
+
+    fn set_bin(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        }
+    }
+
     #[test]
     fn join_membership_follows_matching_middle_atom() {
         let order_customer = binary_symbol("order_customer", "Order", "Customer");
@@ -1713,6 +1743,29 @@ mod tests {
             .require_not_member(&difference, tuple(&["c1"]))
             .expect("difference non-member encodes");
         assert!(matches!(solve(encoder), SolverResult::Sat));
+    }
+
+    #[test]
+    fn static_relation_cardinality_accepts_diamond_set_union() {
+        let assertion = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Card {
+                expr: Box::new(set_bin(
+                    "OpDiamond",
+                    int_set(vec![1, 2]),
+                    int_set(vec![2, 3]),
+                )),
+                span: None,
+            }),
+            right: Box::new(int_lit(3)),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        assert_eq!(
+            try_check_static_relation_assertions(&[assertion]),
+            Some(Ok(StaticRelationOutcome::Checked))
+        );
     }
 
     #[test]

@@ -837,6 +837,9 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             entity_locals,
         ),
         IRExpr::Card { expr: inner, .. } => {
+            if let Some(cardinality) = ic3_finite_literal_cardinality(inner) {
+                return Ok(cardinality);
+            }
             if let IRExpr::SetComp {
                 var,
                 domain,

@@ -1509,6 +1509,9 @@ pub(in crate::verify::ic3) fn expr_to_smt_slot_scoped(
             expr_to_smt_slot_scoped(expr, entity, vctx, slot, n_slots, locals, entity_locals)
         }
         IRExpr::Card { expr: inner, .. } => {
+            if let Some(cardinality) = ic3_finite_literal_cardinality(inner) {
+                return Ok(cardinality);
+            }
             if let IRExpr::SetComp {
                 var,
                 domain,
