@@ -1245,8 +1245,9 @@ impl Parser {
     // ── Verify / Theorem / Lemma ──────────────────────────────────────
 
     /// Parse an `assume {... }` block on a verify/theorem/lemma construct.
-    /// Items inside the block are separated by newlines or `;`. Each item is
-    /// one of: `fair PATH`, `strong fair PATH`, `stutter`, `no stutter`.
+    /// Items inside the block are separated by newlines or `;`. Items can be
+    /// setup declarations, fairness/stutter declarations, or bare Boolean
+    /// expressions interpreted as initial-state predicates by verify blocks.
     ///
     /// only stores the parsed items; normalizes them into an
     /// `AssumptionSet`. wires them into the verifier.
@@ -1315,12 +1316,10 @@ impl Parser {
                 Some(Token::Proc) => AssumeItem::Proc(self.proc_bound_decl()?),
                 // `let name = SystemType { field: store }`
                 Some(Token::Let) => AssumeItem::Let(self.let_binding_decl()?),
-                Some(tok) => {
-                    return Err(ParseError::expected(
-                        "`store`, `proc`, `let`, `fair`, `strong fair`, `stutter`, `no stutter`, or `}`",
-                        &format!("`{tok}`"),
-                        self.cur_span(),
-                    ));
+                Some(_) => {
+                    let expr = self.expr()?;
+                    let span = expr.span;
+                    AssumeItem::Constraint { expr, span }
                 }
                 None => return Err(ParseError::eof(self.cur_span())),
             };

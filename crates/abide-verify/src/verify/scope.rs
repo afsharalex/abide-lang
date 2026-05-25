@@ -1077,6 +1077,7 @@ mod tests {
                 },
             ],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            initial_constraints: vec![],
             asserts: vec![IRExpr::Saw {
                 system_name: "Audit".to_owned(),
                 event_name: "record".to_owned(),

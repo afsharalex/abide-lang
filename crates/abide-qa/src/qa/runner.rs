@@ -714,6 +714,7 @@ fn build_state_space_verify(
         systems: systems_bound,
         stores,
         assumption_set: IRAssumptionSet::default_for_verify(),
+        initial_constraints: vec![],
         asserts: vec![IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },

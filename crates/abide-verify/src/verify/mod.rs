@@ -1391,6 +1391,7 @@ fn synthetic_prop_verify(
         // Props verified through the bounded verify fallback still represent
         // top-level proof obligations, so keep theorem/lemma defaults.
         assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(func.body.clone()),
             span: None,
@@ -2429,6 +2430,7 @@ fn check_verify_block_tiered(
             systems: verify_block.systems.clone(),
             stores: verify_block.stores.clone(),
             assumption_set: verify_block.assumption_set.clone(),
+            initial_constraints: vec![],
             asserts: merged_asserts,
             span: verify_block.span,
             file: verify_block.file.clone(),
@@ -2535,12 +2537,18 @@ fn check_verify_block_tiered(
                 | VerificationResult::Deadlock { .. }
                 | VerificationResult::LivenessViolation { .. }
         );
+        let explicit_hit_temporal_fallback = matches!(
+            &result,
+            VerificationResult::Unprovable { hint, .. }
+                if has_liveness && hint.contains("future-time temporal")
+        );
         if !(config.witness_semantics == WitnessSemantics::Relational
             && explicit_result_has_witness)
         {
-            if config.bounded_only
-                || has_liveness
-                || !matches!(result, VerificationResult::Checked { .. })
+            if !explicit_hit_temporal_fallback
+                && (config.bounded_only
+                    || has_liveness
+                    || !matches!(result, VerificationResult::Checked { .. }))
             {
                 return result;
             }
@@ -2674,49 +2682,43 @@ fn check_verify_block_tiered(
         // `verify_block.systems`.
         let has_fair_events = effective_block.assumption_set.has_fair_events();
 
-        if has_fair_events {
-            // Tier 2a: Try lasso BMC first — finds violations quickly
-            let Some(bmc_config) = clamp_config_to_deadline(config, deadline) else {
-                return VerificationResult::Unprovable {
-                    name: effective_block.name.clone(),
-                    hint: verification_timeout_hint(config),
-                    span: effective_block.span,
-                    file: effective_block.file.clone(),
-                };
+        // Tier 2a: Try lasso BMC first — future-time temporal operators must
+        // not fall through to the single-step safety encoder, even when no
+        // fairness assumptions are present.
+        let Some(bmc_config) = clamp_config_to_deadline(config, deadline) else {
+            return VerificationResult::Unprovable {
+                name: effective_block.name.clone(),
+                hint: verification_timeout_hint(config),
+                span: effective_block.span,
+                file: effective_block.file.clone(),
             };
-            let lasso_result =
-                check_verify_block_lasso(ir, vctx, defs, effective_block, &bmc_config);
-            match &lasso_result {
-                VerificationResult::LivenessViolation { .. } => return lasso_result,
-                VerificationResult::Checked { .. } => {
-                    // No violation found at this depth. Try reduction for PROVED.
-                    if !config.bounded_only {
-                        let Some(reduction_config) = clamp_config_to_deadline(config, deadline)
-                        else {
-                            return VerificationResult::Unprovable {
-                                name: effective_block.name.clone(),
-                                hint: verification_timeout_hint(config),
-                                span: effective_block.span,
-                                file: effective_block.file.clone(),
-                            };
+        };
+        let lasso_result = check_verify_block_lasso(ir, vctx, defs, effective_block, &bmc_config);
+        match &lasso_result {
+            VerificationResult::LivenessViolation { .. } => return lasso_result,
+            VerificationResult::Checked { .. } => {
+                // No violation found at this depth. Try reduction for PROVED
+                // only when fairness assumptions provide a reduction target.
+                if has_fair_events && !config.bounded_only {
+                    let Some(reduction_config) = clamp_config_to_deadline(config, deadline) else {
+                        return VerificationResult::Unprovable {
+                            name: effective_block.name.clone(),
+                            hint: verification_timeout_hint(config),
+                            span: effective_block.span,
+                            file: effective_block.file.clone(),
                         };
-                        if let Some(proved) = try_liveness_reduction(
-                            ir,
-                            vctx,
-                            defs,
-                            effective_block,
-                            &reduction_config,
-                        ) {
-                            return proved;
-                        }
+                    };
+                    if let Some(proved) =
+                        try_liveness_reduction(ir, vctx, defs, effective_block, &reduction_config)
+                    {
+                        return proved;
                     }
-                    // Reduction failed — return CHECKED from lasso
-                    return lasso_result;
                 }
-                _ => return lasso_result,
+                // Reduction failed or is not applicable — return CHECKED from lasso.
+                return lasso_result;
             }
+            _ => return lasso_result,
         }
-        // No fair events — fall through to linear BMC.
     }
 
     let Some(bmc_config) = clamp_config_to_deadline(config, deadline) else {
@@ -3459,6 +3461,7 @@ pub(super) fn try_liveness_reduction(
             // Inherit the parent verify's assumption set so safety checks
             // see the same fairness/stutter context.
             assumption_set: verify_block.assumption_set.clone(),
+            initial_constraints: vec![],
             asserts: safety_obligations.clone(),
             span: verify_block.span,
             file: verify_block.file.clone(),
@@ -3566,6 +3569,7 @@ pub(super) fn try_liveness_reduction(
                 stores: verify_block.stores.clone(),
                 // Inherit the parent verify's assumption set.
                 assumption_set: verify_block.assumption_set.clone(),
+                initial_constraints: vec![],
                 asserts: safety_obligations,
                 span: verify_block.span,
                 file: verify_block.file.clone(),
@@ -4360,7 +4364,21 @@ fn encode_lasso_violation_inner(
                 bound,
                 &inner_ctx,
             )?;
-            slot_violations.push(v);
+            let active_somewhere = {
+                let mut active_terms = Vec::new();
+                for step in 0..=bound {
+                    if let Some(SmtValue::Bool(active)) = pool.active_at(entity_name, slot, step) {
+                        active_terms.push(active.clone());
+                    }
+                }
+                if active_terms.is_empty() {
+                    smt::bool_const(false)
+                } else {
+                    let refs: Vec<&Bool> = active_terms.iter().collect();
+                    smt::bool_or(&refs)
+                }
+            };
+            slot_violations.push(smt::bool_and(&[&active_somewhere, &v]));
         }
         if slot_violations.is_empty() {
             return Ok(smt::bool_const(false));

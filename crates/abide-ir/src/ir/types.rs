@@ -855,6 +855,9 @@ pub struct IRVerify {
     /// Normalized assumption set populated during elaboration.
     /// Verifier backends read fairness and stutter semantics from this field.
     pub assumption_set: IRAssumptionSet,
+    /// Initial-state predicates from bare expressions in `assume { ... }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_constraints: Vec<IRExpr>,
     pub asserts: Vec<IRExpr>,
     /// Source span of the verify block (not serialized — diagnostic use only).
     #[serde(skip)]

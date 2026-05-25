@@ -422,6 +422,7 @@ pub(super) fn check_theorem_block(
             // Inherit the theorem's assumption set so the synthetic verify
             // sees the same fairness/stutter context.
             assumption_set: theorem.assumption_set.clone(),
+            initial_constraints: vec![],
             asserts: virtual_asserts,
             span: theorem.span,
             file: theorem.file.clone(),

@@ -316,15 +316,7 @@ pub fn initial_state_constraints(
     store_ranges: &HashMap<String, VerifyStoreRange>,
 ) -> Vec<Bool> {
     let mut constraints = Vec::new();
-    let mut explicit_initial_active: HashSet<(String, usize)> = HashSet::new();
-    for range in store_ranges.values() {
-        for slot in range.start_slot..range.start_slot + range.slot_count {
-            let key = (range.entity_type.clone(), slot);
-            if slot < range.start_slot + range.min_active {
-                explicit_initial_active.insert(key);
-            }
-        }
-    }
+    let explicit_initial_active = explicit_initial_active_slots(store_ranges);
 
     for ((entity, slot), actives) in &pool.active_vars {
         if let SmtValue::Bool(active_t0) = &actives[0] {
@@ -338,6 +330,71 @@ pub fn initial_state_constraints(
     }
 
     constraints
+}
+
+pub fn entity_field_initial_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> Vec<Bool> {
+    try_entity_field_initial_constraints(pool, vctx, entities, store_ranges)
+        .unwrap_or_else(|msg| panic!("{msg}"))
+}
+
+pub fn try_entity_field_initial_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> Result<Vec<Bool>, String> {
+    let explicit_initial_active = explicit_initial_active_slots(store_ranges);
+    let empty_entity_param_types: HashMap<String, String> = HashMap::new();
+    let empty_store_param_types: HashMap<String, String> = HashMap::new();
+    let mut constraints = Vec::new();
+
+    for entity in entities {
+        for slot in 0..pool.slots_for(&entity.name) {
+            if !explicit_initial_active.contains(&(entity.name.clone(), slot)) {
+                continue;
+            }
+            for field in &entity.fields {
+                let Some(default_expr) = field.default.as_ref() else {
+                    continue;
+                };
+                let Some(field_at_0) = pool.field_at(&entity.name, slot, &field.name, 0) else {
+                    continue;
+                };
+                let ctx = SlotEncodeCtx {
+                    pool,
+                    vctx,
+                    entity: &entity.name,
+                    slot,
+                    params: HashMap::new(),
+                    bindings: HashMap::new(),
+                    system_name: "",
+                    entity_param_types: &empty_entity_param_types,
+                    store_param_types: &empty_store_param_types,
+                };
+                let value = try_encode_slot_expr(&ctx, default_expr, 0)?;
+                constraints.push(smt::smt_eq(field_at_0, &value)?);
+            }
+        }
+    }
+
+    Ok(constraints)
+}
+
+fn explicit_initial_active_slots(
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> HashSet<(String, usize)> {
+    let mut active = HashSet::new();
+    for range in store_ranges.values() {
+        for slot in range.start_slot..range.start_slot + range.min_active {
+            active.insert((range.entity_type.clone(), slot));
+        }
+    }
+    active
 }
 
 /// Constrain each explicit store's active population at every encoded step.

@@ -12,7 +12,7 @@ use abide_witness::{op, EvidenceEnvelope, WitnessEnvelope};
 
 use super::smt::{self, AbideSolver, Bool, Int, SatResult};
 
-use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSystemAction};
+use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSceneGiven, IRSystemAction};
 
 use super::context::VerifyContext;
 use super::defenv;
@@ -607,6 +607,60 @@ pub(super) fn first_ordering_var(
     }
 }
 
+fn encode_scene_one_binding_uniqueness(
+    pool: &harness::SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    scene_store_ranges: &HashMap<String, (String, usize, usize)>,
+    scene_property_store_ranges: &HashMap<String, VerifyStoreRange>,
+    prior_given_bindings: &HashMap<String, (String, usize)>,
+    given: &IRSceneGiven,
+    step: usize,
+) -> Result<Bool, String> {
+    let candidate_slots: Vec<usize> = if let Some(store_name) = &given.store_name {
+        let Some((store_entity, start, count)) = scene_store_ranges.get(store_name) else {
+            return Err(format!(
+                "unknown store '{store_name}' in given for {}",
+                given.var
+            ));
+        };
+        if store_entity != &given.entity {
+            return Err(format!(
+                "entity type mismatch in given uniqueness for {}: store '{}' holds '{}', not '{}'",
+                given.var, store_name, store_entity, given.entity
+            ));
+        }
+        (*start..*start + *count).collect()
+    } else {
+        (0..pool.slots_for(&given.entity)).collect()
+    };
+
+    let base_ctx = PropertyCtx::new()
+        .with_store_ranges(scene_property_store_ranges.clone())
+        .with_given_bindings(prior_given_bindings);
+    let zero = smt::int_lit(0);
+    let one = smt::int_lit(1);
+    let mut terms = Vec::new();
+
+    for slot in candidate_slots {
+        let Some(SmtValue::Bool(active)) = pool.active_at(&given.entity, slot, step) else {
+            continue;
+        };
+        let slot_ctx = base_ctx.with_binding(&given.var, &given.entity, slot);
+        let predicate =
+            encode_prop_expr_with_ctx(pool, vctx, defs, &slot_ctx, &given.constraint, step)?;
+        let matches = smt::bool_and(&[active, &predicate]);
+        terms.push(smt::int_ite(&matches, &one, &zero));
+    }
+
+    let count = if terms.is_empty() {
+        zero
+    } else {
+        smt::int_add(&terms.iter().collect::<Vec<_>>())
+    };
+    Ok(smt::int_eq(&count, &one))
+}
+
 /// 1. Build scope and pool from scene systems
 /// 2. Given: activate one slot per binding, constrain fields at step 0
 /// 3. When: encode each event at its step (ordering from assume)
@@ -915,12 +969,45 @@ pub(super) fn check_scene_block(
             };
         solver.assert(&constraint);
 
+        let uniqueness = match encode_scene_one_binding_uniqueness(
+            &pool,
+            vctx,
+            defs,
+            &scene_store_ranges,
+            &scene_property_store_ranges,
+            &given_bindings,
+            given,
+            0,
+        ) {
+            Ok(uniqueness) => uniqueness,
+            Err(msg) => {
+                return VerificationResult::SceneFail {
+                    name: scene.name.clone(),
+                    reason: format!(
+                        "encoding error in given uniqueness for {}: {msg}",
+                        given.var
+                    ),
+                    span: None,
+                    file: None,
+                };
+            }
+        };
+        solver.assert(&uniqueness);
+
         // Apply entity defaults for fields NOT explicitly constrained by the given block.
         // Expand the constraint through DefEnv first so that pred/prop references
         // are resolved, then collect field names to avoid default conflicts.
         let expanded_constraint = expand_through_defs(&given.constraint, defs);
         let mut constrained_fields = HashSet::new();
         collect_field_refs_in_expr(&expanded_constraint, &given.var, &mut constrained_fields);
+        for given_constraint in &scene.given_constraints {
+            let expanded_given_constraint = expand_through_defs(given_constraint, defs);
+            collect_field_refs_in_expr(
+                &expanded_given_constraint,
+                &given.var,
+                &mut constrained_fields,
+            );
+        }
         if let Some(entity_ir) = relevant_entities.iter().find(|e| e.name == given.entity) {
             for field in &entity_ir.fields {
                 if constrained_fields.contains(field.name.as_str()) {
@@ -2027,6 +2114,31 @@ mod tests {
         }
     }
 
+    fn bool_field(var_name: &str, entity_name: &str, field: &str) -> IRExpr {
+        IRExpr::Field {
+            expr: Box::new(IRExpr::Var {
+                name: var_name.to_owned(),
+                ty: crate::ir::types::IRType::Entity {
+                    name: entity_name.to_owned(),
+                },
+                span: None,
+            }),
+            field: field.to_owned(),
+            ty: crate::ir::types::IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn bool_field_eq(var_name: &str, entity_name: &str, field: &str, value: bool) -> IRExpr {
+        IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(bool_field(var_name, entity_name, field)),
+            right: Box::new(bool_lit(value)),
+            ty: crate::ir::types::IRType::Bool,
+            span: None,
+        }
+    }
+
     fn var(name: &str) -> IRExpr {
         IRExpr::Var {
             name: name.to_owned(),
@@ -2258,6 +2370,94 @@ mod tests {
             full_store,
             VerificationResult::SceneFail { reason, .. } if reason.contains("store 'tasks' is full")
         ));
+    }
+
+    #[test]
+    fn check_scene_block_suppresses_defaults_from_raw_given_constraints() {
+        let mut ir = empty_ir();
+        ir.entities.push(crate::ir::types::IREntity {
+            name: "Door".to_owned(),
+            fields: vec![crate::ir::types::IRField {
+                name: "locked".to_owned(),
+                ty: crate::ir::types::IRType::Bool,
+                default: Some(bool_lit(false)),
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        });
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let result = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "raw_given_constraint_overrides_default",
+                vec![store_decl("doors", "Door", 1)],
+                vec![given("d", "Door", Some("doors"))],
+                vec![bool_field_eq("d", "Door", "locked", true)],
+                vec![bool_field_eq("d", "Door", "locked", true)],
+                vec![],
+            ),
+            &VerifyConfig::default(),
+            None,
+        );
+        assert!(
+            matches!(
+                result,
+                VerificationResult::ScenePass { ref name, .. }
+                    if name == "raw_given_constraint_overrides_default"
+            ),
+            "raw given constraint should suppress conflicting entity default, got: {result}"
+        );
+    }
+
+    #[test]
+    fn check_scene_block_enforces_unique_match_for_one_bindings() {
+        let mut ir = empty_ir();
+        ir.entities.push(crate::ir::types::IREntity {
+            name: "Door".to_owned(),
+            fields: vec![crate::ir::types::IRField {
+                name: "locked".to_owned(),
+                ty: crate::ir::types::IRType::Bool,
+                default: Some(bool_lit(false)),
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        });
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let mut first = given("d1", "Door", Some("doors"));
+        first.constraint = bool_field_eq("d1", "Door", "locked", true);
+        let mut second = given("d2", "Door", Some("doors"));
+        second.constraint = bool_field_eq("d2", "Door", "locked", true);
+
+        let result = check_scene_block(
+            &ir,
+            &vctx,
+            &defs,
+            &store_scene(
+                "duplicate_one_matches",
+                vec![store_decl("doors", "Door", 2)],
+                vec![first, second],
+                vec![],
+                vec![bool_lit(true)],
+                vec![],
+            ),
+            &VerifyConfig::default(),
+            None,
+        );
+        assert!(
+            matches!(result, VerificationResult::SceneFail { ref name, ref reason, .. }
+                if name == "duplicate_one_matches" && reason == crate::messages::SCENE_UNSATISFIABLE),
+            "duplicate one bindings with the same matching predicate should be unsat, got: {result}"
+        );
     }
 
     #[test]

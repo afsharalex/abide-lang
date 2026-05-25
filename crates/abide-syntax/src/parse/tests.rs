@@ -1319,6 +1319,29 @@ strong fair Commerce::ship_order
 }
 
 #[test]
+fn verify_assume_block_accepts_bare_initial_constraints() {
+    let src = r"verify initial_predicate {
+  assume {
+    store counters: Counter[1]
+    all c: Counter | c.value == 5
+  }
+  assert true
+}";
+    let prog = parse_program(src);
+    let v = match &prog.decls[0] {
+        TopDecl::Verify(v) => v,
+        other => panic!("expected Verify, got {other:?}"),
+    };
+    let ab = v
+        .assume_block
+        .as_ref()
+        .expect("verify should have an assume block");
+    assert_eq!(ab.items.len(), 2);
+    assert!(matches!(&ab.items[0], AssumeItem::Store(_)));
+    assert!(matches!(&ab.items[1], AssumeItem::Constraint { .. }));
+}
+
+#[test]
 fn store_decls_accept_exact_and_at_most_bounds() {
     let src = r"verify bounded_stores {
   assume {

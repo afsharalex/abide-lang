@@ -782,6 +782,9 @@ pub enum AssumeItem {
     /// `let name = SystemType { field: store,... }`
     /// — system instantiation via let binding in assume/given blocks.
     Let(LetBindingDecl),
+    /// Bare Boolean expression inside `assume { ... }`.
+    /// Interpreted by verify blocks as an initial-state predicate.
+    Constraint { expr: Expr, span: Span },
 }
 
 /// A reference to an event in an `assume { }` block. stores the

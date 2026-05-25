@@ -1044,6 +1044,7 @@ fn build_semantic_verify(
             stores,
             proc_bounds: Vec::new(),
             let_bindings,
+            initial_constraints: Vec::new(),
             assume_block: None,
             assumption_set: AssumptionSet::default_for_verify(),
             asserts: vec![assertion],

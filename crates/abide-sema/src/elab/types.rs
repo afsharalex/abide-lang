@@ -655,6 +655,9 @@ pub struct EVerify {
     pub proc_bounds: Vec<EProcBoundDecl>,
     /// let bindings from assume block.
     pub let_bindings: Vec<ELetBinding>,
+    /// Bare Boolean expressions from the assume block. These constrain
+    /// the initial state of bounded verify checks.
+    pub initial_constraints: Vec<EExpr>,
     /// Parsed `assume {... }` block, retained from the AST so the resolve
     /// pass can populate `assumption_set` and so diagnostics can recover
     /// item spans.

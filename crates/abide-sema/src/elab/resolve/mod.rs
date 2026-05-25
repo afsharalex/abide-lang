@@ -1902,6 +1902,11 @@ fn resolve_verifies(env: &mut Env, ctx: &Ctx) {
             .iter()
             .map(|e| resolve_expr(ctx, &bound, e))
             .collect();
+        verify.initial_constraints = verify
+            .initial_constraints
+            .iter()
+            .map(|e| resolve_expr(ctx, &bound, e))
+            .collect();
     }
 }
 

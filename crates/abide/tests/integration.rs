@@ -7093,6 +7093,41 @@ verify ic3_literal_set_cardinality {
 }
 
 #[test]
+fn verify_enforces_entity_field_defaults_in_initial_state() {
+    let src = r"module T
+
+entity Counter {
+  value: int = 0
+}
+
+system Counters(counters: Store<Counter>) {
+  command tick() {}
+}
+
+verify entity_default_initial_state [depth: 1] {
+  assume {
+    store counters: Counter[1..1]
+    let counters_sys = Counters { counters: counters }
+    stutter
+  }
+
+  assert always all c: Counter | c.value >= 0
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert_verify_result_success(&results, "entity_default_initial_state");
+}
+
+#[test]
 fn explicit_state_verifier_supports_finite_enum_payload_domains() {
     let src = r"module T
 
@@ -8627,6 +8662,262 @@ scene s {
                 if name == "s"
         )),
         "scene using choose should pass, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_assume_block_initial_predicate_constrains_initial_store_state() {
+    let src = r"module T
+
+entity Counter {
+  value: int
+}
+
+system Counters(counters: Store<Counter>) {
+  command tick() {}
+}
+
+verify explicit_initial_predicate [depth: 1] {
+  assume {
+    store counters: Counter[1..1]
+    let counters_sys = Counters { counters: counters }
+    all c: Counter | c.value == 5
+    stutter
+  }
+
+  assert always all c: Counter | c.value == 5
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                if name == "explicit_initial_predicate"
+        )),
+        "initial predicate in assume block should constrain step 0 store state, got: {results:?}"
+    );
+}
+
+#[test]
+fn scene_raw_given_constraint_suppresses_entity_default_like_where_clause() {
+    let src = r"module T
+
+entity Door {
+  locked: bool = false
+}
+
+scene where_constraint_overrides_default {
+  given {
+    store doors: Door[0..1]
+    let d = one Door in doors where d.locked == true
+  }
+  when {
+  }
+  then {
+    assert d.locked == true
+  }
+}
+
+scene raw_given_constraint_overrides_default {
+  given {
+    store doors: Door[0..1]
+    let d = one Door in doors
+    d.locked == true
+  }
+  when {
+  }
+  then {
+    assert d.locked == true
+  }
+}
+";
+
+    let results = verify_source(src);
+
+    for expected in [
+        "where_constraint_overrides_default",
+        "raw_given_constraint_overrides_default",
+    ] {
+        assert!(
+            results.iter().any(|r| matches!(
+                r,
+                abide::verify::VerificationResult::ScenePass { name, .. }
+                    if name == expected
+            )),
+            "scene {expected} should pass, got: {results:?}"
+        );
+    }
+}
+
+#[test]
+fn scene_one_binding_requires_unique_matching_active_store_member() {
+    let src = r"module T
+
+entity Door {
+  locked: bool = false
+}
+
+scene existential_constraint_allows_multiple_matches {
+  given {
+    store doors: Door[2..2]
+  }
+  when {
+  }
+  then {
+    assert some d: Door | true
+  }
+}
+
+scene one_binding_rejects_multiple_matches {
+  given {
+    store doors: Door[0..2]
+    let d1 = one Door in doors where d1.locked == true
+    let d2 = one Door in doors where d2.locked == true
+  }
+  when {
+  }
+  then {
+    assert d1.locked == true
+    assert d2.locked == true
+  }
+}
+";
+
+    let results = verify_source(src);
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                if name == "existential_constraint_allows_multiple_matches"
+        )),
+        "existential scene should pass with multiple matches, got: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::SceneFail { name, reason, .. }
+                if name == "one_binding_rejects_multiple_matches"
+                    && reason.contains("scenario is unsatisfiable")
+        )),
+        "one-binding scene should fail when two active store members match, got: {results:?}"
+    );
+}
+
+#[test]
+fn scene_when_events_follow_textual_order_by_default() {
+    let src = r"module T
+
+entity Door {
+  open: bool = false
+
+  action open_it() requires open == false {
+    open' = true
+  }
+
+  action close_it() requires open == true {
+    open' = false
+  }
+}
+
+system Doors(doors: Store<Door>) {
+  command open_door(id: identity) {
+    choose d: Door where d.id == id and d.open == false {
+      d.open_it()
+    }
+  }
+
+  command close_door(id: identity) {
+    choose d: Door where d.id == id and d.open == true {
+      d.close_it()
+    }
+  }
+}
+
+scene textual_close_then_open_is_not_solver_permuted {
+  given {
+    store doors: Door[0..1]
+    let doors_sys = Doors { doors: doors }
+    let d = one Door in doors where d.open == false
+  }
+  when {
+    doors_sys.close_door(d.id)
+    doors_sys.open_door(d.id)
+  }
+  then {
+    assert d.open == false
+  }
+}
+";
+
+    let results = verify_source(src);
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::SceneFail { name, reason, .. }
+                if name == "textual_close_then_open_is_not_solver_permuted"
+                    && reason.contains("scenario is unsatisfiable")
+        )),
+        "textual close-then-open scene should fail instead of being solver-permuted, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_liveness_routing_avoids_single_step_temporal_fallback() {
+    let src = r"module T
+
+entity Flag {
+  done: bool = false
+}
+
+system Flags(flags: Store<Flag>) {
+  command tick() {}
+}
+
+verify impossible_eventually [depth: 2] {
+  assume {
+    store flags: Flag[1..1]
+    let flags_sys = Flags { flags: flags }
+    stutter
+  }
+
+  assert eventually false
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
+                if name == "impossible_eventually"
+        )),
+        "eventually false should route to lasso liveness checking, got: {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .all(|r| !format!("{r:?}").contains("future-time temporal")),
+        "liveness routing should not hit the single-step temporal fallback: {results:?}"
     );
 }
 

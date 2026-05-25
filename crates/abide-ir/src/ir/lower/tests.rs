@@ -663,6 +663,57 @@ fn lower_scene_action_stays_operational_not_app() {
 }
 
 #[test]
+fn lower_scene_records_textual_order_for_unordered_when_actions() {
+    let es = E::EScene {
+        name: "sc".to_owned(),
+        stores: vec![],
+        let_bindings: vec![E::ELetBinding {
+            name: "doors".to_owned(),
+            system_type: "Doors".to_owned(),
+            store_bindings: vec![],
+        }],
+        givens: vec![],
+        whens: vec![
+            E::ESceneWhen::Action {
+                var: "doors_close".to_owned(),
+                system: "Doors".to_owned(),
+                event: "close".to_owned(),
+                args: vec![],
+                card: Some("one".to_owned()),
+            },
+            E::ESceneWhen::Action {
+                var: "doors_open".to_owned(),
+                system: "Doors".to_owned(),
+                event: "open".to_owned(),
+                args: vec![],
+                card: Some("one".to_owned()),
+            },
+        ],
+        thens: vec![],
+        given_constraints: vec![],
+        activations: vec![],
+        span: None,
+        file: None,
+    };
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let ir = lower_scene(&es, &std::collections::HashMap::new(), &ctx);
+
+    assert_eq!(ir.ordering.len(), 1);
+    assert!(
+        matches!(
+            &ir.ordering[0],
+            IRExpr::BinOp { op, left, right, .. }
+                if op == "OpSeq"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "doors_close")
+                    && matches!(right.as_ref(), IRExpr::Var { name, .. } if name == "doors_open")
+        ),
+        "unordered when actions should lower with textual OpSeq ordering, got: {:?}",
+        ir.ordering
+    );
+}
+
+#[test]
 fn lower_axiom_propagates_span_and_file() {
     let sp = Span { start: 0, end: 25 };
     let ea = E::EAxiom {

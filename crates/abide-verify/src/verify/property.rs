@@ -891,21 +891,13 @@ pub(super) fn encode_prop_expr(
             let inner = encode_prop_expr(pool, vctx, defs, ctx, operand, step)?;
             Ok(smt::bool_not(&inner))
         }
-        // Nested temporal operators — in BMC, `always P` at a single step
-        // is just P (the outer loop iterates over steps), and `eventually P`
-        // is also just P at this step (the outer loop handles the disjunction).
-        IRExpr::Always { body, .. } | IRExpr::Eventually { body, .. } => {
-            encode_prop_expr(pool, vctx, defs, ctx, body, step)
-        }
-        // `P until Q` should not reach here from BMC (desugared at top level
-        // after def expansion). If it does arrive (e.g., from scene encoding or
-        // other non-BMC paths), use same-step: Q(s) ∨ P(s). This is an
-        // over-approximation but avoids unsound false proofs.
-        IRExpr::Until { left, right, .. } => {
-            let q = encode_prop_expr(pool, vctx, defs, ctx, right, step)?;
-            let p = encode_prop_expr(pool, vctx, defs, ctx, left, step)?;
-            Ok(smt::bool_or(&[&q, &p]))
-        }
+        // `always P` at a single BMC step is P; the caller supplies the
+        // universal step iteration. Future-time liveness forms must be routed
+        // to the lasso/Buchi encoders instead of weakened at a single step.
+        IRExpr::Always { body, .. } => encode_prop_expr(pool, vctx, defs, ctx, body, step),
+        IRExpr::Eventually { .. } | IRExpr::Until { .. } => Err(
+            "future-time temporal property reached single-step property encoder; route through lasso/Buchi temporal verification".to_owned(),
+        ),
         // / — past-time temporal operators.
         //
         // At step `n`, each past-time operator unfolds into a finite
@@ -2777,9 +2769,9 @@ pub(super) fn encode_prop_value(
         IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_expr(
             pool, vctx, defs, ctx, body, step,
         )?)),
-        IRExpr::Until { .. } => Ok(SmtValue::Bool(encode_prop_expr(
-            pool, vctx, defs, ctx, expr, step,
-        )?)),
+        IRExpr::Eventually { .. } | IRExpr::Until { .. } => Err(
+            "future-time temporal value reached single-step property encoder; route through lasso/Buchi temporal verification".to_owned(),
+        ),
         IRExpr::MapUpdate {
             map, key, value, ..
         } => {
@@ -3999,6 +3991,39 @@ mod tests {
             ctx.system_struct_bases.get("ui").map(String::as_str),
             Some("UI")
         );
+    }
+
+    #[test]
+    fn property_encoder_rejects_future_temporal_fallbacks() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let true_expr = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        };
+        let eventually = IRExpr::Eventually {
+            body: Box::new(true_expr.clone()),
+            span: None,
+        };
+        let until = IRExpr::Until {
+            left: Box::new(true_expr.clone()),
+            right: Box::new(true_expr),
+            span: None,
+        };
+
+        let eventual_err = encode_prop_expr(&pool, &vctx, &defs, &ctx, &eventually, 0)
+            .expect_err("eventually must not be weakened in property fallback");
+        assert!(
+            eventual_err.contains("future-time temporal"),
+            "{eventual_err}"
+        );
+        let until_err = encode_prop_expr(&pool, &vctx, &defs, &ctx, &until, 0)
+            .expect_err("until must not be weakened in property fallback");
+        assert!(until_err.contains("future-time temporal"), "{until_err}");
     }
 
     #[test]

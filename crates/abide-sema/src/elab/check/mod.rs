@@ -192,6 +192,35 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
         check_collection_homogeneity(&prop.body, &format!("prop {}", prop.name), &mut errors);
     }
     for verify in &env.verifies {
+        for constraint in &verify.initial_constraints {
+            check_verifier_surface_expr(
+                constraint,
+                &format!("verify {} assume constraint", verify.name),
+                &mut errors,
+            );
+            if !is_bool_expr(constraint) {
+                let mut err = ElabError::new(
+                    ErrorKind::TypeMismatch,
+                    "assume constraint must have type bool",
+                    verify.name.clone(),
+                );
+                err.span = expr_span(constraint);
+                err.help = Some("bare expressions in assume blocks constrain the initial state and must evaluate to bool".into());
+                errors.push(err);
+            }
+            check_match_exhaustiveness(
+                constraint,
+                &env.types,
+                &env.entities,
+                &env.variant_fields,
+                &mut errors,
+            );
+            check_collection_homogeneity(
+                constraint,
+                &format!("verify {}", verify.name),
+                &mut errors,
+            );
+        }
         for a in &verify.asserts {
             check_verifier_surface_expr(
                 a,

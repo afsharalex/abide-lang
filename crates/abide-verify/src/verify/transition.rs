@@ -17,10 +17,12 @@ use super::defenv;
 use super::harness::{
     create_slot_pool_with_systems, domain_constraints, initial_state_constraints, lasso_loopback,
     store_active_cardinality_constraints, symmetry_breaking_constraints, try_encode_guard_expr,
-    try_fairness_constraints, try_system_field_initial_constraints,
-    try_transition_constraints_with_fire, FireTracking, LassoLoop, SlotPool,
+    try_entity_field_initial_constraints, try_fairness_constraints,
+    try_system_field_initial_constraints, try_transition_constraints_with_fire, FireTracking,
+    LassoLoop, SlotPool,
 };
 use super::ic3;
+use super::property::{encode_prop_expr_with_ctx, PropertyCtx};
 use super::scope::{
     compute_theorem_scope, compute_verify_scope, select_verify_relevant, VerifyStoreRange,
 };
@@ -202,6 +204,7 @@ pub struct TransitionSystemSpec<'a> {
     bound: usize,
     store_ranges: HashMap<String, VerifyStoreRange>,
     assumptions: TransitionAssumptions,
+    initial_constraints: Vec<IRExpr>,
     relevant_entities: Vec<IREntity>,
     relevant_systems: Vec<IRSystem>,
 }
@@ -233,6 +236,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             assumptions,
+            initial_constraints: vec![],
             relevant_entities,
             relevant_systems,
         })
@@ -247,6 +251,7 @@ impl<'a> TransitionSystemSpec<'a> {
         bound: usize,
         store_ranges: HashMap<String, VerifyStoreRange>,
         assumptions: TransitionAssumptions,
+        initial_constraints: Vec<IRExpr>,
     ) -> Option<Self> {
         if system_names.is_empty() {
             return None;
@@ -263,6 +268,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             assumptions,
+            initial_constraints,
             relevant_entities,
             relevant_systems,
         })
@@ -303,6 +309,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             TransitionAssumptions::from_ir(&verify_block.assumption_set),
+            verify_block.initial_constraints.clone(),
         )
     }
 
@@ -326,6 +333,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             TransitionAssumptions::from_ir(&verify_block.assumption_set),
+            verify_block.initial_constraints.clone(),
         )
     }
 
@@ -355,6 +363,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound: 0,
             store_ranges: HashMap::new(),
             assumptions,
+            initial_constraints: vec![],
             relevant_entities,
             relevant_systems,
         })
@@ -382,6 +391,10 @@ impl<'a> TransitionSystemSpec<'a> {
 
     pub fn store_ranges(&self) -> &HashMap<String, VerifyStoreRange> {
         &self.store_ranges
+    }
+
+    pub fn initial_constraints(&self) -> &[IRExpr] {
+        &self.initial_constraints
     }
 
     pub fn relevant_entities(&self) -> &[IREntity] {
@@ -725,10 +738,30 @@ impl<'a> TransitionSmtEncoding<'a> {
             system.relevant_systems(),
         );
         let mut initial_constraints = initial_state_constraints(&pool, system.store_ranges());
+        initial_constraints.extend(try_entity_field_initial_constraints(
+            &pool,
+            system.vctx,
+            system.relevant_entities(),
+            system.store_ranges(),
+        )?);
         initial_constraints.extend(store_active_cardinality_constraints(
             &pool,
             system.store_ranges(),
         ));
+        if !system.initial_constraints().is_empty() {
+            let defs = defenv::DefEnv::from_ir(system.ir);
+            let ctx = PropertyCtx::new().with_store_ranges(system.store_ranges().clone());
+            for expr in system.initial_constraints() {
+                initial_constraints.push(encode_prop_expr_with_ctx(
+                    &pool,
+                    system.vctx,
+                    &defs,
+                    &ctx,
+                    expr,
+                    0,
+                )?);
+            }
+        }
         let system_initial_constraints = if plan.include_system_initial_constraints {
             let mut out = Vec::new();
             for sys in system.relevant_systems() {
@@ -1202,6 +1235,7 @@ mod tests {
         IRAssumptionSet, IRCommandRef, IRField, IRProgram, IRSystem, IRTransition, IRType,
         IRVariant, IRVerify, IRVerifySystem, LitVal,
     };
+    use crate::verify::smt::{self, AbideSolver, SatResult};
 
     #[test]
     fn transition_obligation_single_entity_preserves_current_ic3_behavior() {
@@ -1366,6 +1400,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Forall {
                     var: "o".to_owned(),
@@ -1407,6 +1442,120 @@ mod tests {
     }
 
     #[test]
+    fn transition_encoding_asserts_verify_initial_constraints_at_step_zero() {
+        let entity = IREntity {
+            name: "Counter".to_owned(),
+            fields: vec![IRField {
+                name: "value".to_owned(),
+                ty: IRType::Int,
+                default: None,
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let system = IRSystem {
+            name: "Counters".to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec!["Counter".to_owned()],
+            commands: vec![],
+            actions: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        };
+        let initial_constraint = IRExpr::Forall {
+            var: "c".to_owned(),
+            domain: IRType::Entity {
+                name: "Counter".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "c".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Counter".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    field: "value".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 5 },
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+        let verify = IRVerify {
+            name: "initial_constraints".to_owned(),
+            depth: Some(1),
+            systems: vec![IRVerifySystem {
+                name: "Counters".to_owned(),
+                lo: 0,
+                hi: 1,
+            }],
+            stores: vec![crate::ir::types::IRStoreDecl {
+                name: "counters".to_owned(),
+                entity_type: "Counter".to_owned(),
+                lo: 1,
+                hi: 1,
+            }],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            initial_constraints: vec![initial_constraint],
+            asserts: vec![IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }],
+            span: None,
+            file: None,
+        };
+        let ir = IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![verify.clone()],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let obligation = TransitionVerifyObligation::for_verify(&ir, &vctx, &verify, &defs)
+            .expect("transition obligation");
+        let encoding = TransitionSmtEncoding::from_plan(obligation.bmc_plan()).expect("encoding");
+        let solver = AbideSolver::new();
+        for constraint in encoding.initial_constraints() {
+            solver.assert(constraint);
+        }
+        let value = encoding
+            .pool()
+            .field_at("Counter", 0, "value", 0)
+            .expect("counter value field")
+            .as_int()
+            .expect("counter value should be int");
+        solver.assert(smt::bool_not(&smt::int_eq(value, &smt::int_lit(5))));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
     fn transition_safety_spec_normalizes_always_wrapped_asserts() {
         let verify = IRVerify {
             name: "safety".to_owned(),
@@ -1418,6 +1567,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Lit {
                     ty: IRType::Bool,
@@ -1508,6 +1658,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Forall {
                     var: "o".to_owned(),

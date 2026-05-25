@@ -610,6 +610,80 @@ fn initial_state_activates_store_lower_bound_prefix() {
 }
 
 #[test]
+fn entity_field_initial_constraints_apply_defaults_to_active_store_prefix() {
+    let mut entity = make_order_entity();
+    entity.fields[1].default = Some(IRExpr::Ctor {
+        enum_name: "OrderStatus".to_owned(),
+        ctor: "Pending".to_owned(),
+        args: vec![],
+        span: None,
+    });
+    entity.fields[2].default = Some(IRExpr::Lit {
+        ty: IRType::Int,
+        value: LitVal::Int { value: 0 },
+        span: None,
+    });
+    entity.fields.push(IRField {
+        name: "active".to_owned(),
+        ty: IRType::Bool,
+        default: Some(IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        }),
+        initial_constraint: None,
+    });
+    let vctx = make_vctx();
+    let mut scopes = HashMap::new();
+    scopes.insert("Order".to_owned(), 2);
+    let pool = create_slot_pool(&[entity.clone()], &scopes, 0);
+    let mut ranges = HashMap::new();
+    ranges.insert(
+        "orders".to_owned(),
+        crate::verify::scope::VerifyStoreRange {
+            entity_type: "Order".to_owned(),
+            start_slot: 0,
+            slot_count: 2,
+            min_active: 1,
+            max_active: 2,
+        },
+    );
+
+    let constraints = try_entity_field_initial_constraints(&pool, &vctx, &[entity], &ranges)
+        .expect("entity initial defaults should encode");
+    assert_eq!(constraints.len(), 3);
+
+    let solver = AbideSolver::new();
+    for constraint in &constraints {
+        solver.assert(constraint);
+    }
+    let Some(SmtValue::Int(slot_0_total)) = pool.field_at("Order", 0, "total", 0) else {
+        panic!("expected Order.total slot 0");
+    };
+    solver.assert(&smt::bool_not(&smt::int_eq(slot_0_total, &smt::int_lit(0))));
+    let Some(SmtValue::Int(slot_0_status)) = pool.field_at("Order", 0, "status", 0) else {
+        panic!("expected Order.status slot 0");
+    };
+    let pending_id = vctx
+        .variants
+        .try_id_of("OrderStatus", "Pending")
+        .expect("Pending variant id");
+    solver.assert(&smt::bool_not(&smt::int_eq(
+        slot_0_status,
+        &smt::int_lit(pending_id),
+    )));
+    let Some(SmtValue::Bool(slot_0_active_field)) = pool.field_at("Order", 0, "active", 0) else {
+        panic!("expected Order.active slot 0");
+    };
+    solver.assert(&smt::bool_not(slot_0_active_field));
+    assert_eq!(
+        solver.check(),
+        SatResult::Unsat,
+        "active initial store slots must satisfy entity field defaults"
+    );
+}
+
+#[test]
 fn store_active_cardinality_constraints_enforce_exact_store_population() {
     let entity = make_order_entity();
     let mut scopes = HashMap::new();

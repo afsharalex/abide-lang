@@ -277,9 +277,12 @@ pub(super) fn build_assume_delta_with_bindings(
                     delta.strong_fair.push((ev_ref, *span));
                 }
             }
-            // Store, Let, and Proc items are handled during
+            // Store, Let, Proc, and initial constraints are handled during
             // collection, not during assumption set resolution.
-            AssumeItem::Store(_) | AssumeItem::Let(_) | AssumeItem::Proc(_) => {}
+            AssumeItem::Store(_)
+            | AssumeItem::Let(_)
+            | AssumeItem::Proc(_)
+            | AssumeItem::Constraint { .. } => {}
         }
     }
     delta
@@ -642,8 +645,11 @@ pub(super) fn populate_assumption_set_from_items(
                     set.strong_fair.insert(ev_ref);
                 }
             }
-            // Store, Let, and Proc items handled during collection.
-            AssumeItem::Store(_) | AssumeItem::Let(_) | AssumeItem::Proc(_) => {}
+            // Store, Let, Proc, and initial constraints are handled during collection.
+            AssumeItem::Store(_)
+            | AssumeItem::Let(_)
+            | AssumeItem::Proc(_)
+            | AssumeItem::Constraint { .. } => {}
         }
     }
     set.normalize();

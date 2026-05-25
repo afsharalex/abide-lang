@@ -864,6 +864,11 @@ fn lower_verify(
         systems,
         stores,
         assumption_set: crate::ir::types::IRAssumptionSet::from_elab(&ev.assumption_set),
+        initial_constraints: ev
+            .initial_constraints
+            .iter()
+            .map(|e| lower_expr(e, ctx))
+            .collect(),
         asserts: ev.asserts.iter().map(|e| lower_expr(e, ctx)).collect(),
         span: ev.span,
         file: ev.file.clone(),
@@ -921,6 +926,22 @@ fn lower_scene(
         .whens
         .iter()
         .partition(|w| !matches!(w, E::ESceneWhen::Assume(_)));
+    let events: Vec<_> = actions
+        .iter()
+        .map(|w| lower_scene_action(w, aliases, ctx))
+        .collect();
+    let mut ordering: Vec<_> = assumes
+        .iter()
+        .filter_map(|w| match w {
+            E::ESceneWhen::Assume(e) => Some(lower_expr(e, ctx)),
+            E::ESceneWhen::Action { .. } => None,
+        })
+        .collect();
+    if ordering.is_empty() {
+        if let Some(textual_ordering) = lower_scene_textual_ordering(&events) {
+            ordering.push(textual_ordering);
+        }
+    }
 
     // derive systems from let bindings.
     let systems: Vec<String> = es
@@ -947,17 +968,8 @@ fn lower_scene(
             .iter()
             .map(|g| lower_given(g, aliases, ctx))
             .collect(),
-        events: actions
-            .iter()
-            .map(|w| lower_scene_action(w, aliases, ctx))
-            .collect(),
-        ordering: assumes
-            .iter()
-            .filter_map(|w| match w {
-                E::ESceneWhen::Assume(e) => Some(lower_expr(e, ctx)),
-                E::ESceneWhen::Action { .. } => None,
-            })
-            .collect(),
+        events,
+        ordering,
         assertions: es.thens.iter().map(|e| lower_expr(e, ctx)).collect(),
         given_constraints: es
             .given_constraints
@@ -975,6 +987,33 @@ fn lower_scene(
         span: es.span,
         file: es.file.clone(),
     }
+}
+
+fn lower_scene_textual_ordering(events: &[IRSceneEvent]) -> Option<IRExpr> {
+    let mut vars = events.iter().map(|event| IRExpr::Var {
+        ty: IRType::Bool,
+        name: event.var.clone(),
+        span: None,
+    });
+    let first = vars.next()?;
+    vars.next().map(|second| {
+        vars.fold(
+            IRExpr::BinOp {
+                ty: IRType::Bool,
+                op: "OpSeq".to_owned(),
+                left: Box::new(first),
+                right: Box::new(second),
+                span: None,
+            },
+            |left, right| IRExpr::BinOp {
+                ty: IRType::Bool,
+                op: "OpSeq".to_owned(),
+                left: Box::new(left),
+                right: Box::new(right),
+                span: None,
+            },
+        )
+    })
 }
 
 fn lower_given(

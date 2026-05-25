@@ -60,6 +60,7 @@ verify no_negative_balances {
 The `assume` block establishes:
 - finite store bounds
 - instantiated systems
+- bare Boolean predicates over stores that must hold in the initial state
 - fairness, stutter, and related execution assumptions when needed
 
 ## Theorems and lemmas
@@ -96,6 +97,7 @@ scene successful_payment {
 ```
 
 Use scenes when you want to show that some behavior is possible, not that it is universally required.
+Events listed in a `when` block run in textual order by default. To ask for a different shape, bind event calls with `let` and add an explicit `assume` using composition operators such as `->` for sequence, `&` for same-step, `||` for concurrent, or `|`/`^|` for choice.
 
 ## Temporal logic
 
