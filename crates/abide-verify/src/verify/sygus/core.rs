@@ -15,6 +15,21 @@ pub(super) fn lookup_enum_ctor_index<'a>(
     })
 }
 
+pub(super) fn encode_enum_atom_var(
+    tm: &Cvc5Tm,
+    name: &str,
+    ty: &IRType,
+    enum_catalog: &EnumCatalog,
+) -> Option<Cvc5Term> {
+    let IRType::Enum {
+        name: enum_name, ..
+    } = ty
+    else {
+        return None;
+    };
+    lookup_enum_ctor_index(enum_catalog, enum_name, name).map(|idx| tm.mk_integer(*idx))
+}
+
 pub(super) fn system_store_param_types(system: &IRSystem) -> HashMap<String, String> {
     system
         .store_params
@@ -785,6 +800,89 @@ pub(super) fn bind_pattern_vars(
     }
 }
 
+fn ctor_name_matches(pattern_name: &str, enum_name: &str, ctor: &str) -> bool {
+    pattern_name == ctor
+        || pattern_name == format!("{enum_name}::{ctor}")
+        || pattern_name
+            .split_once("::")
+            .is_some_and(|(_, bare)| bare == ctor)
+}
+
+fn bind_static_payload_pattern_vars(
+    tm: &Cvc5Tm,
+    pattern: &crate::ir::types::IRPattern,
+    scrutinee: &IRExpr,
+    env: &mut HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<bool, String> {
+    use crate::ir::types::IRPattern;
+    match pattern {
+        IRPattern::PWild => Ok(true),
+        IRPattern::PVar { name } => {
+            let value = encode_expr(tm, scrutinee, env, enum_catalog)?;
+            env.insert(name.clone(), value);
+            Ok(true)
+        }
+        IRPattern::PCtor { name, fields } if !fields.is_empty() => {
+            let IRExpr::Ctor {
+                enum_name,
+                ctor,
+                args,
+                ..
+            } = scrutinee
+            else {
+                return Ok(false);
+            };
+            if !ctor_name_matches(name, enum_name, ctor) {
+                return Ok(false);
+            }
+            for field in fields {
+                let Some((_, arg_expr)) = args.iter().find(|(arg_name, _)| arg_name == &field.name)
+                else {
+                    return Err(format!(
+                        "cvc5 SyGuS static payload match cannot find constructor field `{}`",
+                        field.name
+                    ));
+                };
+                bind_static_payload_pattern_vars(tm, &field.pattern, arg_expr, env, enum_catalog)?;
+            }
+            Ok(true)
+        }
+        IRPattern::PCtor { .. } => Ok(false),
+        IRPattern::POr { left, right } => {
+            let mut left_env = env.clone();
+            if bind_static_payload_pattern_vars(tm, left, scrutinee, &mut left_env, enum_catalog)? {
+                *env = left_env;
+                return Ok(true);
+            }
+            bind_static_payload_pattern_vars(tm, right, scrutinee, env, enum_catalog)
+        }
+    }
+}
+
+fn encode_static_payload_pattern_cond(
+    tm: &Cvc5Tm,
+    pattern: &crate::ir::types::IRPattern,
+    scrutinee: &IRExpr,
+) -> Option<Cvc5Term> {
+    use crate::ir::types::IRPattern;
+    match (pattern, scrutinee) {
+        (IRPattern::PWild | IRPattern::PVar { .. }, _) => Some(tm.mk_boolean(true)),
+        (
+            IRPattern::PCtor { name, fields },
+            IRExpr::Ctor {
+                enum_name, ctor, ..
+            },
+        ) if !fields.is_empty() => Some(tm.mk_boolean(ctor_name_matches(name, enum_name, ctor))),
+        (IRPattern::POr { left, right }, _) => {
+            let lhs = encode_static_payload_pattern_cond(tm, left, scrutinee)?;
+            let rhs = encode_static_payload_pattern_cond(tm, right, scrutinee)?;
+            Some(mk_or(tm, &[lhs, rhs]))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn encode_pattern_cond(
     tm: &Cvc5Tm,
     pattern: &crate::ir::types::IRPattern,
@@ -844,14 +942,38 @@ pub(super) fn encode_match_expr(
     if arms.is_empty() {
         return Err("cvc5 SyGuS match requires at least one arm".to_owned());
     }
-    let scrut_term = encode_expr(tm, scrutinee, vars, enum_catalog)?;
+    let scrut_term = match encode_expr(tm, scrutinee, vars, enum_catalog) {
+        Ok(term) => term,
+        Err(_)
+            if matches!(
+                scrutinee,
+                IRExpr::Ctor { args, .. } if !args.is_empty()
+            ) =>
+        {
+            tm.mk_integer(0)
+        }
+        Err(err) => return Err(err),
+    };
     let scrut_ty = sygus_expr_type(scrutinee);
 
     let mut fallback = None;
     for arm in arms.iter().rev() {
         let mut arm_env = vars.clone();
-        bind_pattern_vars(&arm.pattern, &scrut_term, &mut arm_env)?;
-        let pat_cond = encode_pattern_cond(tm, &arm.pattern, &scrut_term, scrut_ty, enum_catalog)?;
+        let handled_static = bind_static_payload_pattern_vars(
+            tm,
+            &arm.pattern,
+            scrutinee,
+            &mut arm_env,
+            enum_catalog,
+        )?;
+        if !handled_static {
+            bind_pattern_vars(&arm.pattern, &scrut_term, &mut arm_env)?;
+        }
+        let pat_cond = encode_static_payload_pattern_cond(tm, &arm.pattern, scrutinee)
+            .map_or_else(
+                || encode_pattern_cond(tm, &arm.pattern, &scrut_term, scrut_ty, enum_catalog),
+                Ok,
+            )?;
         let guard_cond = if let Some(guard) = &arm.guard {
             encode_expr(tm, guard, &arm_env, enum_catalog)?
         } else {
@@ -915,9 +1037,10 @@ pub(super) fn encode_expr(
             })?;
             Ok(tm.mk_integer(*idx))
         }
-        IRExpr::Var { name, .. } => vars
+        IRExpr::Var { name, ty, .. } => vars
             .get(name)
             .cloned()
+            .or_else(|| encode_enum_atom_var(tm, name, ty, enum_catalog))
             .ok_or_else(|| format!("unsupported free variable `{name}` in SyGuS slice")),
         IRExpr::UnOp { op, operand, .. } => {
             let inner = encode_expr(tm, operand, vars, enum_catalog)?;

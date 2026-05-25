@@ -1955,13 +1955,17 @@ fn encode_pooled_expr(
             })?;
             Ok(tm.mk_integer(*idx))
         }
-        IRExpr::Var { name, .. } => vars.get(name).cloned().ok_or_else(|| {
-            if entity_bindings.contains_key(name) {
-                format!("bare entity variable `{name}` is not supported in pooled SyGuS slice")
-            } else {
-                format!("unsupported free variable `{name}` in pooled SyGuS slice")
-            }
-        }),
+        IRExpr::Var { name, ty, .. } => vars
+            .get(name)
+            .cloned()
+            .or_else(|| encode_enum_atom_var(tm, name, ty, enum_catalog))
+            .ok_or_else(|| {
+                if entity_bindings.contains_key(name) {
+                    format!("bare entity variable `{name}` is not supported in pooled SyGuS slice")
+                } else {
+                    format!("unsupported free variable `{name}` in pooled SyGuS slice")
+                }
+            }),
         IRExpr::Field {
             expr: recv, field, ..
         } => {

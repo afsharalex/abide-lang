@@ -147,6 +147,74 @@ fn sygus_expr_encoder_accepts_qualified_enum_constructor_names() {
 }
 
 #[test]
+fn sygus_expr_encoder_accepts_constructor_atoms_lowered_as_vars() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let mut enum_catalog = EnumCatalog::new();
+    enum_catalog.insert(
+        "Status".to_owned(),
+        HashMap::from([("Pending".to_owned(), 0), ("Done".to_owned(), 1)]),
+    );
+    let status_ty = IRType::Enum {
+        name: "Status".to_owned(),
+        variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
+    };
+
+    let expr = IRExpr::Var {
+        name: "Pending".to_owned(),
+        ty: status_ty,
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("constructor atom lowered as Var should encode: {err}"));
+}
+
+#[test]
+fn sygus_expr_encoder_supports_static_payload_constructor_destructuring() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+
+    let expr = IRExpr::Match {
+        scrutinee: Box::new(IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("allowed".to_owned(), bool_lit(true))],
+            span: None,
+        }),
+        arms: vec![
+            crate::ir::types::IRMatchArm {
+                pattern: crate::ir::types::IRPattern::PCtor {
+                    name: "Accept".to_owned(),
+                    fields: vec![crate::ir::types::IRFieldPat {
+                        name: "allowed".to_owned(),
+                        pattern: crate::ir::types::IRPattern::PVar {
+                            name: "accepted".to_owned(),
+                        },
+                    }],
+                },
+                guard: None,
+                body: IRExpr::Var {
+                    name: "accepted".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                },
+            },
+            crate::ir::types::IRMatchArm {
+                pattern: crate::ir::types::IRPattern::PWild,
+                guard: None,
+                body: bool_lit(false),
+            },
+        ],
+        span: None,
+    };
+
+    encode_expr(&tm, &expr, &vars, &enum_catalog)
+        .unwrap_or_else(|err| panic!("static payload constructor match should encode: {err}"));
+}
+
+#[test]
 fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     use crate::ir::types::{IRCommand, IRDerivedField, IRFsm, IRStoreParam};
 
