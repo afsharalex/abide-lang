@@ -1013,6 +1013,35 @@ pub(super) fn encode_finite_quantifier_expr(
     }
 }
 
+pub(super) fn encode_finite_choose_expr(
+    tm: &Cvc5Tm,
+    var: &str,
+    domain: &IRType,
+    predicate: Option<&IRExpr>,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
+        return Err("cvc5 SyGuS only supports finite Bool/enum domains for choose".to_owned());
+    };
+    let Some(default) = candidates.first().cloned() else {
+        return Err("cvc5 SyGuS choose requires a non-empty finite domain".to_owned());
+    };
+
+    let mut choice = default;
+    for candidate in candidates.iter().rev() {
+        let mut scoped = vars.clone();
+        scoped.insert(var.to_owned(), candidate.clone());
+        let cond = if let Some(predicate) = predicate {
+            encode_expr(tm, predicate, &scoped, enum_catalog)?
+        } else {
+            tm.mk_boolean(true)
+        };
+        choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[cond, candidate.clone(), choice]);
+    }
+    Ok(choice)
+}
+
 pub(super) fn sygus_expr_type(expr: &IRExpr) -> Option<&IRType> {
     match expr {
         IRExpr::Lit { ty, .. }
@@ -1520,6 +1549,12 @@ pub(super) fn encode_expr(
         IRExpr::Match {
             scrutinee, arms, ..
         } => encode_match_expr(tm, scrutinee, arms, vars, enum_catalog),
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => encode_finite_choose_expr(tm, var, domain, predicate.as_deref(), vars, enum_catalog),
         IRExpr::Forall {
             var, domain, body, ..
         } => encode_finite_quantifier_expr(tm, "forall", var, domain, body, vars, enum_catalog),

@@ -2507,6 +2507,47 @@ fn encode_pooled_match_expr(
     fallback.ok_or_else(|| "cvc5 SyGuS match required at least one arm".to_owned())
 }
 
+fn encode_pooled_finite_choose_expr(
+    tm: &Cvc5Tm,
+    var: &str,
+    domain: &IRType,
+    predicate: Option<&IRExpr>,
+    vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
+    pool_ctx: &PooledSyGuSCtx<'_>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Cvc5Term, String> {
+    let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
+        return Err(
+            "cvc5 SyGuS pooled system safety only supports finite Bool/enum domains for choose"
+                .to_owned(),
+        );
+    };
+    let Some(default) = candidates.first().cloned() else {
+        return Err("cvc5 SyGuS pooled choose requires a non-empty finite domain".to_owned());
+    };
+
+    let mut choice = default;
+    for candidate in candidates.iter().rev() {
+        let mut scoped = vars.clone();
+        scoped.insert(var.to_owned(), candidate.clone());
+        let cond = if let Some(predicate) = predicate {
+            encode_pooled_expr(
+                tm,
+                predicate,
+                &scoped,
+                entity_bindings,
+                pool_ctx,
+                enum_catalog,
+            )?
+        } else {
+            tm.mk_boolean(true)
+        };
+        choice = tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[cond, candidate.clone(), choice]);
+    }
+    Ok(choice)
+}
+
 fn infer_pooled_store_quant_entity(
     var: &str,
     body: &IRExpr,
@@ -2741,6 +2782,21 @@ fn encode_pooled_expr(
             tm,
             scrutinee,
             arms,
+            vars,
+            entity_bindings,
+            pool_ctx,
+            enum_catalog,
+        ),
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => encode_pooled_finite_choose_expr(
+            tm,
+            var,
+            domain,
+            predicate.as_deref(),
             vars,
             entity_bindings,
             pool_ctx,
