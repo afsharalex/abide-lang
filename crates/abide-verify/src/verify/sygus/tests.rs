@@ -186,6 +186,28 @@ fn sygus_expr_encoder_supports_integer_div_mod_and_bool_xor() {
 }
 
 #[test]
+fn sygus_expr_encoder_accepts_operator_alias_spellings() {
+    let tm = Cvc5Tm::new();
+    let vars = HashMap::new();
+    let enum_catalog = EnumCatalog::new();
+
+    for expr in [
+        IRExpr::UnOp {
+            op: "!".to_owned(),
+            operand: Box::new(bool_lit(false)),
+            ty: IRType::Bool,
+            span: None,
+        },
+        bin_expr("&&", bool_lit(true), bool_lit(false), IRType::Bool),
+        bin_expr("||", bool_lit(true), bool_lit(false), IRType::Bool),
+        bin_expr("=>", bool_lit(true), bool_lit(false), IRType::Bool),
+    ] {
+        encode_expr(&tm, &expr, &vars, &enum_catalog)
+            .unwrap_or_else(|err| panic!("operator alias should encode: {err}"));
+    }
+}
+
+#[test]
 fn sygus_expr_encoder_supports_real_literals_and_arithmetic() {
     let tm = Cvc5Tm::new();
     let vars = HashMap::new();

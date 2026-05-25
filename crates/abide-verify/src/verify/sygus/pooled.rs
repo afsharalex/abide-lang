@@ -3132,7 +3132,7 @@ fn encode_pooled_expr(
             let inner =
                 encode_pooled_expr(tm, operand, vars, entity_bindings, pool_ctx, enum_catalog)?;
             match op.as_str() {
-                "OpNot" | "not" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[inner])),
+                "OpNot" | "not" | "!" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[inner])),
                 "OpNeg" | "-" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NEG, &[inner])),
                 _ => Err(format!(
                     "unsupported unary op `{op}` in pooled cvc5 SyGuS slice"
@@ -3149,9 +3149,11 @@ fn encode_pooled_expr(
             let lhs = encode_pooled_expr(tm, left, vars, entity_bindings, pool_ctx, enum_catalog)?;
             let rhs = encode_pooled_expr(tm, right, vars, entity_bindings, pool_ctx, enum_catalog)?;
             match op.as_str() {
-                "OpAnd" | "and" => Ok(mk_and(tm, &[lhs, rhs])),
-                "OpOr" | "or" => Ok(mk_or(tm, &[lhs, rhs])),
-                "OpImplies" | "implies" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs])),
+                "OpAnd" | "and" | "&&" => Ok(mk_and(tm, &[lhs, rhs])),
+                "OpOr" | "or" | "||" => Ok(mk_or(tm, &[lhs, rhs])),
+                "OpImplies" | "implies" | "=>" => {
+                    Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs]))
+                }
                 "OpXor" | "xor" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_XOR, &[lhs, rhs])),
                 "OpEq" | "==" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[lhs, rhs])),
                 "OpNEq" | "!=" => Ok(tm.mk_term(

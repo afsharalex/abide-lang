@@ -1921,7 +1921,7 @@ pub(super) fn encode_expr(
         IRExpr::UnOp { op, operand, .. } => {
             let inner = encode_expr(tm, operand, vars, enum_catalog)?;
             match op.as_str() {
-                "OpNot" | "not" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[inner])),
+                "OpNot" | "not" | "!" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[inner])),
                 "OpNeg" | "-" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_NEG, &[inner])),
                 _ => Err(format!("unsupported unary op `{op}` in cvc5 SyGuS slice")),
             }
@@ -1936,9 +1936,11 @@ pub(super) fn encode_expr(
             let lhs = encode_expr(tm, left, vars, enum_catalog)?;
             let rhs = encode_expr(tm, right, vars, enum_catalog)?;
             match op.as_str() {
-                "OpAnd" | "and" => Ok(mk_and(tm, &[lhs, rhs])),
-                "OpOr" | "or" => Ok(mk_or(tm, &[lhs, rhs])),
-                "OpImplies" | "implies" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs])),
+                "OpAnd" | "and" | "&&" => Ok(mk_and(tm, &[lhs, rhs])),
+                "OpOr" | "or" | "||" => Ok(mk_or(tm, &[lhs, rhs])),
+                "OpImplies" | "implies" | "=>" => {
+                    Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[lhs, rhs]))
+                }
                 "OpXor" | "xor" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_XOR, &[lhs, rhs])),
                 "OpEq" | "==" => Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[lhs, rhs])),
                 "OpNEq" | "!=" => Ok(tm.mk_term(
