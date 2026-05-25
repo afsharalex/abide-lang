@@ -1668,6 +1668,27 @@ pub(super) fn encode_finite_set_membership_expr<F>(
 where
     F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
 {
+    encode_finite_set_membership_expr_inner(
+        tm,
+        set_expr,
+        key_expr,
+        vars,
+        enum_catalog,
+        &mut encode_with_vars,
+    )
+}
+
+fn encode_finite_set_membership_expr_inner<F>(
+    tm: &Cvc5Tm,
+    set_expr: &IRExpr,
+    key_expr: &IRExpr,
+    vars: &HashMap<String, Cvc5Term>,
+    enum_catalog: &EnumCatalog,
+    encode_with_vars: &mut F,
+) -> Result<Cvc5Term, String>
+where
+    F: FnMut(&IRExpr, &HashMap<String, Cvc5Term>) -> Result<Cvc5Term, String>,
+{
     let key_term = encode_with_vars(key_expr, vars)?;
     match set_expr {
         IRExpr::SetLit { elements, .. } => {
@@ -1700,7 +1721,7 @@ where
                     source.as_deref(),
                     &domain_value,
                     vars,
-                    &mut encode_with_vars,
+                    encode_with_vars,
                 )?;
                 let mut scoped = vars.clone();
                 scoped.insert(var.clone(), domain_value.clone());
@@ -1717,6 +1738,35 @@ where
                 witnesses.push(mk_and(tm, &[source_member, filter_term, member_term]));
             }
             Ok(mk_or(tm, &witnesses))
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if matches!(op.as_str(), "OpSetUnion" | "OpSetIntersect" | "OpSetDiff") => {
+            let lhs = encode_finite_set_membership_expr_inner(
+                tm,
+                left,
+                key_expr,
+                vars,
+                enum_catalog,
+                encode_with_vars,
+            )?;
+            let rhs = encode_finite_set_membership_expr_inner(
+                tm,
+                right,
+                key_expr,
+                vars,
+                enum_catalog,
+                encode_with_vars,
+            )?;
+            match op.as_str() {
+                "OpSetUnion" => Ok(mk_or(tm, &[lhs, rhs])),
+                "OpSetIntersect" => Ok(mk_and(tm, &[lhs, rhs])),
+                "OpSetDiff" => Ok(mk_and(
+                    tm,
+                    &[lhs, tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[rhs])],
+                )),
+                _ => unreachable!(),
+            }
         }
         _ => Err(format!(
             "cvc5 SyGuS set membership does not support expression shape: {set_expr:?}"

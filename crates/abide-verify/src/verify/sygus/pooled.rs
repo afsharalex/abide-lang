@@ -3402,7 +3402,17 @@ fn encode_pooled_expr(
             {
                 return Ok(term);
             }
-            if matches!(map.as_ref(), IRExpr::SetLit { .. } | IRExpr::SetComp { .. }) {
+            let is_finite_set_membership_shape =
+                matches!(map.as_ref(), IRExpr::SetLit { .. } | IRExpr::SetComp { .. })
+                    || matches!(
+                        map.as_ref(),
+                        IRExpr::BinOp { op, .. }
+                            if matches!(
+                                op.as_str(),
+                                "OpSetUnion" | "OpSetIntersect" | "OpSetDiff"
+                            )
+                    );
+            if is_finite_set_membership_shape {
                 return encode_finite_set_membership_expr(
                     tm,
                     map,

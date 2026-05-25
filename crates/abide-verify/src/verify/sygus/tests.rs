@@ -229,6 +229,34 @@ fn bool_setcomp_membership() -> IRExpr {
     }
 }
 
+fn bool_set_union_membership() -> IRExpr {
+    let bool_set_ty = IRType::Set {
+        element: Box::new(IRType::Bool),
+    };
+    IRExpr::Index {
+        map: Box::new(IRExpr::BinOp {
+            op: "OpSetUnion".to_owned(),
+            left: Box::new(IRExpr::SetLit {
+                elements: vec![bool_lit(false)],
+                ty: bool_set_ty.clone(),
+                span: None,
+            }),
+            right: Box::new(IRExpr::SetLit {
+                elements: vec![bool_lit(true)],
+                ty: bool_set_ty,
+                span: None,
+            }),
+            ty: IRType::Set {
+                element: Box::new(IRType::Bool),
+            },
+            span: None,
+        }),
+        key: Box::new(bool_lit(true)),
+        ty: IRType::Bool,
+        span: None,
+    }
+}
+
 fn bool_map_literal_lookup() -> IRExpr {
     IRExpr::Index {
         map: Box::new(IRExpr::MapLit {
@@ -1455,6 +1483,35 @@ fn sygus_system_step_supports_finite_setcomp_membership_guards() {
         &enum_catalog,
     )
     .unwrap_or_else(|err| panic!("finite set-comprehension membership guard should encode: {err}"));
+}
+
+#[test]
+fn sygus_system_step_supports_finite_set_union_membership_guards() {
+    let tm = Cvc5Tm::new();
+    let mut system = make_counter_system();
+    system.actions[0].guard = bool_set_union_membership();
+    let enum_catalog = build_enum_catalog(&tm, &system.fields).expect("enum catalog should build");
+    let mut curr_vars = HashMap::new();
+    let mut next_vars = HashMap::new();
+    for field in &system.fields {
+        let sort = sort_for_field(&tm, field, &enum_catalog).expect("field sort should build");
+        curr_vars.insert(field.name.clone(), tm.mk_var(sort.clone(), &field.name));
+        next_vars.insert(
+            field.name.clone(),
+            tm.mk_var(sort, &format!("{}_next", field.name)),
+        );
+    }
+
+    encode_system_step(
+        &tm,
+        &system.actions[0],
+        &system.fields,
+        &system.fsm_decls,
+        &curr_vars,
+        &next_vars,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("finite set union membership guard should encode: {err}"));
 }
 
 #[test]
@@ -2754,6 +2811,26 @@ fn sygus_pooled_system_step_supports_finite_setcomp_membership_guards() {
     .unwrap_or_else(|err| {
         panic!("pooled finite set-comprehension membership guard should encode: {err}")
     });
+}
+
+#[test]
+fn sygus_pooled_system_step_supports_finite_set_union_membership_guards() {
+    let tm = Cvc5Tm::new();
+    let entity = make_pooled_counter_entity();
+    let mut system = make_pooled_counter_system();
+    system.actions[0].guard = bool_set_union_membership();
+    let enum_catalog = build_enum_catalog(&tm, &entity.fields).expect("enum catalog should build");
+    let slots_per_entity = HashMap::from([(entity.name.clone(), 1usize)]);
+
+    encode_pooled_system_step_for_test(
+        &tm,
+        &system.actions[0],
+        &system,
+        std::slice::from_ref(&entity),
+        &slots_per_entity,
+        &enum_catalog,
+    )
+    .unwrap_or_else(|err| panic!("pooled finite set union membership guard should encode: {err}"));
 }
 
 #[test]
