@@ -3135,6 +3135,7 @@ mod tests {
             name: "v".to_owned(),
             evidence: Some(evidence),
             evidence_extraction_error: None,
+            replay: None,
             assumptions: Vec::new(),
             span: None,
             file: None,

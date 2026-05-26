@@ -2047,6 +2047,60 @@ fn cli_verify_report_json_discloses_checked_bounded_semantics() {
 }
 
 #[test]
+fn cli_verify_report_json_discloses_counterexample_replay_result() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let report = dir.path().join("shortest_counterexample.report.json");
+
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/shortest_counterexample.ab",
+            "--bounded-only",
+            "--witness-semantics",
+            "operational",
+            "--report",
+            "json",
+            dir.path().to_str().expect("utf8 report dir"),
+        ])
+        .output()
+        .expect("failed to run abide verify --report json");
+
+    assert!(
+        report.exists(),
+        "expected verify report file to be written: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_json =
+        std::fs::read_to_string(&report).expect("should read generated verification report");
+    let value: serde_json::Value =
+        serde_json::from_str(&report_json).expect("report should be valid JSON");
+    assert_eq!(
+        value
+            .pointer("/results/0/replay/checked")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "expected replay verdict in report JSON: {report_json}"
+    );
+    assert_eq!(
+        value
+            .pointer("/results/0/replay/property_violated")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "expected replay to confirm property violation: {report_json}"
+    );
+    assert_eq!(
+        value
+            .pointer("/results/0/replay/steps")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "expected shortest replay step count in report JSON: {report_json}"
+    );
+}
+
+#[test]
 fn cli_verify_report_markdown_writes_markdown_file() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let dir = tempfile::tempdir().expect("tempdir");

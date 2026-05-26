@@ -277,6 +277,14 @@ fn operational_evidence(witness: op::OperationalWitness) -> Result<EvidenceEnvel
         .map_err(|err| format!("operational witness evidence validation failed: {err}"))
 }
 
+pub fn replay_counterexample_witness(
+    ir: &IRProgram,
+    verify_block: &IRVerify,
+    witness: &op::OperationalWitness,
+) -> CounterexampleReplayReport {
+    explicit::replay_counterexample_witness(ir, verify_block, witness)
+}
+
 fn relational_evidence(witness: rel::RelationalWitness) -> Result<EvidenceEnvelope, String> {
     let witness = WitnessEnvelope::relational(witness)
         .map_err(|err| format!("relational witness envelope validation failed: {err}"))?;
@@ -323,6 +331,7 @@ fn materialize_relational_verify_outcome(
             VerificationResult::Counterexample {
                 name: verify_block.name.clone(),
                 evidence,
+                replay: None,
                 evidence_extraction_error,
                 assumptions: build_assumptions_for_system_scope(
                     ir,
@@ -348,6 +357,38 @@ fn materialize_relational_verify_outcome(
 fn countermodel_evidence(countermodel: Countermodel) -> Result<EvidenceEnvelope, String> {
     EvidenceEnvelope::countermodel(countermodel)
         .map_err(|err| format!("countermodel evidence validation failed: {err}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterexampleReplayReport {
+    pub checked: bool,
+    pub steps: usize,
+    pub property_violated: bool,
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CounterexampleReplayReport {
+    fn checked(steps: usize, property_violated: bool, engine: impl Into<String>) -> Self {
+        Self {
+            checked: true,
+            steps,
+            property_violated,
+            engine: engine.into(),
+            error: None,
+        }
+    }
+
+    fn failed(steps: usize, engine: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            checked: false,
+            steps,
+            property_violated: false,
+            engine: engine.into(),
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// Result of checking a single verification target.
@@ -397,6 +438,8 @@ pub enum VerificationResult {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<EvidenceEnvelope>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replay: Option<CounterexampleReplayReport>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence_extraction_error: Option<String>,
         assumptions: Vec<TrustedAssumption>,
@@ -558,6 +601,7 @@ impl VerificationResult {
             Self::Counterexample {
                 name,
                 evidence,
+                replay,
                 evidence_extraction_error,
                 assumptions,
                 span,
@@ -565,6 +609,7 @@ impl VerificationResult {
             } => Self::Counterexample {
                 name,
                 evidence,
+                replay,
                 evidence_extraction_error,
                 assumptions,
                 span: span.or(block_span),
@@ -819,6 +864,13 @@ impl VerificationResult {
                 evidence_extraction_error,
                 ..
             } => evidence_extraction_error.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn counterexample_replay(&self) -> Option<&CounterexampleReplayReport> {
+        match self {
+            Self::Counterexample { replay, .. } => replay.as_ref(),
             _ => None,
         }
     }
@@ -2509,6 +2561,7 @@ fn check_verify_block_tiered(
                     VerificationResult::Counterexample {
                         name: effective_block.name.clone(),
                         evidence,
+                        replay: None,
                         evidence_extraction_error,
                         assumptions: build_assumptions_for_system_scope(
                             ir,
@@ -2813,6 +2866,7 @@ fn check_static_verify_assertions(
         SatResult::Sat => VerificationResult::Counterexample {
             name: verify_block.name.clone(),
             evidence: None,
+            replay: None,
             evidence_extraction_error: None,
             assumptions,
             span: verify_block.span,
@@ -4051,26 +4105,37 @@ fn check_verify_block(
             file: None,
         },
         SatResult::Sat => {
-            let evidence = match config.witness_semantics {
-                WitnessSemantics::Operational => extract_operational_counterexample_with_fire(
-                    &solver,
-                    pool,
-                    vctx,
-                    system.relevant_entities(),
-                    system.relevant_systems(),
-                    fire_tracking,
-                    bound,
-                )
-                .and_then(operational_evidence),
-                WitnessSemantics::Relational => extract_relational_counterexample(
-                    &solver,
-                    pool,
-                    vctx,
-                    system.relevant_entities(),
-                    system.relevant_systems(),
-                    bound,
-                )
-                .and_then(relational_evidence),
+            let (evidence, replay) = match config.witness_semantics {
+                WitnessSemantics::Operational => {
+                    match extract_operational_counterexample_with_fire(
+                        &solver,
+                        pool,
+                        vctx,
+                        system.relevant_entities(),
+                        system.relevant_systems(),
+                        fire_tracking,
+                        bound,
+                    ) {
+                        Ok(witness) => {
+                            let replay =
+                                Some(replay_counterexample_witness(ir, verify_block, &witness));
+                            (operational_evidence(witness), replay)
+                        }
+                        Err(err) => (Err(err), None),
+                    }
+                }
+                WitnessSemantics::Relational => (
+                    extract_relational_counterexample(
+                        &solver,
+                        pool,
+                        vctx,
+                        system.relevant_entities(),
+                        system.relevant_systems(),
+                        bound,
+                    )
+                    .and_then(relational_evidence),
+                    None,
+                ),
             };
             let (evidence, evidence_extraction_error) = match evidence {
                 Ok(evidence) => (Some(evidence), None),
@@ -4086,6 +4151,7 @@ fn check_verify_block(
             VerificationResult::Counterexample {
                 name: verify_block.name.clone(),
                 evidence,
+                replay,
                 evidence_extraction_error,
                 assumptions: build_assumptions_for_system_scope(
                     ir,

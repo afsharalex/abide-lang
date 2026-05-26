@@ -20,8 +20,8 @@ use super::context::{EntityInfo, VerifyContext};
 use super::defenv;
 use super::transition;
 use super::{
-    build_assumptions_for_system_scope, verification_timeout_hint, DeadlockEventDiag,
-    FairnessEventAnalysis, FairnessKind, FairnessStatus, VerificationResult,
+    build_assumptions_for_system_scope, verification_timeout_hint, CounterexampleReplayReport,
+    DeadlockEventDiag, FairnessEventAnalysis, FairnessKind, FairnessStatus, VerificationResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1539,6 +1539,169 @@ pub fn explore_verify_state_space(
     }))
 }
 
+pub(super) fn replay_counterexample_witness(
+    ir: &IRProgram,
+    verify_block: &IRVerify,
+    witness: &op::OperationalWitness,
+) -> CounterexampleReplayReport {
+    let behavior = match witness {
+        op::OperationalWitness::Counterexample { behavior } => behavior,
+        _ => {
+            return CounterexampleReplayReport::failed(
+                0,
+                "explicit-state",
+                "only counterexample operational witnesses can be replayed here",
+            );
+        }
+    };
+    let steps = behavior.transitions().len();
+    let vctx = VerifyContext::from_ir(ir);
+    let defs = defenv::DefEnv::from_ir(ir);
+    let Some(obligation) =
+        transition::TransitionVerifyObligation::for_verify(ir, &vctx, verify_block, &defs)
+    else {
+        return CounterexampleReplayReport::failed(
+            steps,
+            "explicit-state",
+            "verify block does not lower to a transition obligation",
+        );
+    };
+    let (model, initial_states) = match ExplicitModel::from_obligation(&obligation, &vctx) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            return CounterexampleReplayReport::failed(
+                steps,
+                "explicit-state",
+                "counterexample replay is not supported for this fragment",
+            );
+        }
+        Err(err) => {
+            return CounterexampleReplayReport::failed(
+                steps,
+                "explicit-state",
+                format!("counterexample replay setup failed: {err}"),
+            );
+        }
+    };
+
+    let Some(first_witness_state) = behavior.states().first() else {
+        return CounterexampleReplayReport::failed(0, "explicit-state", "witness has no states");
+    };
+    let Some(mut current_state) = initial_states
+        .into_iter()
+        .find(|state| model.witness_state(state) == *first_witness_state)
+    else {
+        return CounterexampleReplayReport::failed(
+            steps,
+            "explicit-state",
+            "initial witness state is not an allowed initial state",
+        );
+    };
+
+    let mut property_violated = model.property_holds(&current_state) == Ok(false);
+    for (index, transition) in behavior.transitions().iter().enumerate() {
+        let Some(expected_next) = behavior.state(index + 1) else {
+            return CounterexampleReplayReport::failed(
+                steps,
+                "explicit-state",
+                format!("missing witness state after transition {index}"),
+            );
+        };
+
+        let mut successors = match model.step_successors(&current_state) {
+            Ok(successors) => successors,
+            Err(err) => {
+                return CounterexampleReplayReport::failed(
+                    steps,
+                    "explicit-state",
+                    format!("could not enumerate successors at step {index}: {err}"),
+                );
+            }
+        };
+        if model.stutter {
+            successors.push((current_state.clone(), ExplicitEdge::Stutter));
+        }
+
+        let Some((next_state, _edge)) = successors.into_iter().find(|(next, edge)| {
+            edge_matches_transition(edge, transition) && model.witness_state(next) == *expected_next
+        }) else {
+            return CounterexampleReplayReport::failed(
+                steps,
+                "explicit-state",
+                format!("no matching operational successor for witness transition {index}"),
+            );
+        };
+        current_state = next_state;
+        if model.property_holds(&current_state) == Ok(false) {
+            property_violated = true;
+        }
+    }
+
+    CounterexampleReplayReport::checked(steps, property_violated, "explicit-state")
+}
+
+fn edge_matches_transition(edge: &ExplicitEdge, transition: &op::Transition) -> bool {
+    match edge {
+        ExplicitEdge::Stutter => {
+            transition.atomic_steps().is_empty()
+                && transition
+                    .observations()
+                    .iter()
+                    .any(|observation| observation.name() == "stutter")
+        }
+        ExplicitEdge::Step {
+            system,
+            step_name,
+            params,
+            choices,
+        } => {
+            let [atomic] = transition.atomic_steps() else {
+                return false;
+            };
+            atomic.system() == system
+                && atomic.command() == step_name
+                && params_match(params, atomic.params())
+                && choices.as_slice() == atomic.choices()
+        }
+    }
+}
+
+fn params_match(expected: &[ExplicitParamBinding], actual: &[op::Binding]) -> bool {
+    expected.len() == actual.len()
+        && expected.iter().all(|expected| {
+            actual.iter().any(|actual| {
+                actual.name() == expected.name
+                    && witness_to_explicit_value(actual.value())
+                        .is_some_and(|actual| actual == expected.value)
+            })
+        })
+}
+
+fn witness_to_explicit_value(value: &op::WitnessValue) -> Option<ExplicitValue> {
+    match value {
+        op::WitnessValue::Int(value) => Some(ExplicitValue::Int(*value)),
+        op::WitnessValue::Bool(value) => Some(ExplicitValue::Bool(*value)),
+        op::WitnessValue::Identity(value) => Some(ExplicitValue::Identity(value.clone())),
+        op::WitnessValue::SlotRef(slot) => Some(ExplicitValue::SlotRef(slot.clone())),
+        op::WitnessValue::EnumVariant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            let fields = fields
+                .iter()
+                .map(|(name, value)| Some((name.clone(), witness_to_explicit_value(value)?)))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ExplicitValue::Enum {
+                enum_name: enum_name.clone(),
+                variant: variant.clone(),
+                fields,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn try_check_verify_block_explicit(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -1611,6 +1774,11 @@ pub(super) fn try_check_verify_block_explicit(
             return Some(VerificationResult::Counterexample {
                 name: verify_block.name.clone(),
                 evidence,
+                replay: Some(CounterexampleReplayReport::checked(
+                    trace_edges.len(),
+                    true,
+                    "explicit-state",
+                )),
                 evidence_extraction_error: None,
                 assumptions,
                 span: verify_block.span,

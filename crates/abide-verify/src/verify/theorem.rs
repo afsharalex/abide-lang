@@ -1189,6 +1189,7 @@ fn try_ic3_on_theorem(
                 return Some(VerificationResult::Counterexample {
                     name: theorem.name.clone(),
                     evidence,
+                    replay: None,
                     evidence_extraction_error,
                     assumptions: super::build_assumptions_for_system_scope(
                         ir,
@@ -1329,6 +1330,7 @@ pub(super) fn check_lemma_block(
             VerificationResult::Counterexample {
                 name: lemma.name.clone(),
                 evidence,
+                replay: None,
                 evidence_extraction_error,
                 assumptions: super::build_assumptions(&lemma.assumption_set, &[]),
                 span: lemma.span,
