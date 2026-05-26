@@ -1,0 +1,39 @@
+module ShortestCounterexample
+
+enum Status = Ok | Bad
+
+entity Flag {
+  status: Status = @Ok
+
+  action fail() requires status == @Ok {
+    status' = @Bad
+  }
+
+  action churn() requires status == @Bad {
+    status' = @Bad
+  }
+}
+
+system Flags(flags: Store<Flag>) {
+  command fail_one() {
+    choose f: Flag where f.status == @Ok {
+      f.fail()
+    }
+  }
+
+  command churn_bad() {
+    choose f: Flag where f.status == @Bad {
+      f.churn()
+    }
+  }
+}
+
+verify shortest_counterexample [depth: 4] {
+  assume {
+    store flags: Flag[1..1]
+    let flags_sys = Flags { flags: flags }
+    no stutter
+  }
+
+  assert always all f: Flag | f.status == @Ok
+}

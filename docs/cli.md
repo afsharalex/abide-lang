@@ -76,6 +76,7 @@ Selected flags:
 - `--induction-timeout <secs>`
 - `--bmc-timeout <secs>`
 - `--prop-bmc-depth <depth>`
+- `--no-bmc-iterative-deepening`
 - `--ic3-timeout <secs>`
 - `--ic3`
 - `--cvc5-sygus`
@@ -94,6 +95,10 @@ Selected flags:
 was found within the explored transition depth. The depth can include stutter
 steps, and it is not exhaustive reachable-state exploration or all-instance
 coverage.
+
+Safety BMC searches depths incrementally by default so counterexamples stop at
+the first failing bound. Use `--no-bmc-iterative-deepening` to run the selected
+bound as one solver query.
 
 Props are first tried with the proof-oriented tiers. If a prop falls back to
 bounded checking, `--prop-bmc-depth` controls that fallback depth.

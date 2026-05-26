@@ -1772,6 +1772,80 @@ fn cli_verify_prop_bmc_depth_controls_auto_prop_fallback() {
 }
 
 #[test]
+fn cli_verify_trace_artifact_uses_shortest_bounded_counterexample() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifact_path = dir.path().join("shortest.trace.json");
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/shortest_counterexample.ab",
+            "--bounded-only",
+            "--trace-artifact",
+            artifact_path.to_str().expect("utf8 artifact path"),
+        ])
+        .output()
+        .expect("failed to run shortest counterexample verification");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected counterexample: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        artifact_path.exists(),
+        "expected trace artifact to be written: stdout={stdout}, stderr={stderr}"
+    );
+
+    let artifact_json =
+        std::fs::read_to_string(&artifact_path).expect("should read trace artifact JSON");
+    let value: serde_json::Value =
+        serde_json::from_str(&artifact_json).expect("trace artifact should be valid JSON");
+    let frames = value
+        .pointer("/artifacts/0/normalized_trace/frames")
+        .and_then(serde_json::Value::as_array)
+        .expect("counterexample artifact should include normalized frames");
+
+    assert_eq!(
+        frames.len(),
+        2,
+        "expected first-failing depth witness with initial+one successor frame, got: {artifact_json}"
+    );
+    assert_eq!(
+        value
+            .pointer("/artifacts/0/normalized_trace/frames/0/transition_to_next/label")
+            .and_then(serde_json::Value::as_str),
+        Some("Flags::fail_one")
+    );
+}
+
+#[test]
+fn cli_verify_accepts_bmc_iterative_deepening_opt_out() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/shortest_counterexample.ab",
+            "--bounded-only",
+            "--no-bmc-iterative-deepening",
+        ])
+        .output()
+        .expect("failed to run bounded verification with iterative deepening opt-out");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected counterexample despite opting out of iterative deepening: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("COUNTEREXAMPLE: shortest_counterexample"),
+        "expected ordinary counterexample output when iterative deepening is disabled: stderr={stderr}"
+    );
+}
+
+#[test]
 fn cli_verify_verbose_prints_human_readable_details() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let output = std::process::Command::new(binary)
@@ -1893,6 +1967,12 @@ fn cli_verify_report_json_writes_machine_readable_report_file() {
             .pointer("/config/prop_bmc_depth")
             .and_then(serde_json::Value::as_u64),
         Some(10)
+    );
+    assert_eq!(
+        value
+            .pointer("/config/bmc_iterative_deepening")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
     );
     let family = value
         .get("results")

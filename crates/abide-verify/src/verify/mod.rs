@@ -980,6 +980,8 @@ pub struct VerifyConfig {
     pub induction_timeout_ms: u64,
     /// Timeout for Tier 2 BMC attempts, in milliseconds.
     pub bmc_timeout_ms: u64,
+    /// Search bounded safety depths incrementally and stop at the first counterexample.
+    pub bmc_iterative_deepening: bool,
     /// End-to-end timeout for the full verification command, in milliseconds.
     pub overall_timeout_ms: u64,
     /// Default BMC depth for auto-verified props (which lack explicit `[0..N]`).
@@ -1016,6 +1018,7 @@ impl Default for VerifyConfig {
             unbounded_only: false,
             induction_timeout_ms: 1_200_000,
             bmc_timeout_ms: 1_200_000,
+            bmc_iterative_deepening: true,
             overall_timeout_ms: 1_200_000,
             prop_bmc_depth: 10,
             cvc5_sygus: false,
@@ -2753,7 +2756,7 @@ fn check_verify_block_tiered(
             file: effective_block.file.clone(),
         };
     };
-    check_verify_block(ir, vctx, defs, effective_block, &bmc_config)
+    check_verify_block_with_depth_search(ir, vctx, defs, effective_block, &bmc_config)
 }
 
 fn check_static_verify_assertions(
@@ -3725,6 +3728,43 @@ fn try_ic3_on_verify(
 /// 4. Encode properties at every step
 /// 5. Negate to search for counterexample
 /// 6. UNSAT → CHECKED, SAT → COUNTEREXAMPLE
+#[allow(clippy::too_many_lines)]
+fn check_verify_block_with_depth_search(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> VerificationResult {
+    if !config.bmc_iterative_deepening {
+        return check_verify_block(ir, vctx, defs, verify_block, config);
+    }
+
+    let Some(safety) = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
+    else {
+        return check_verify_block(ir, vctx, defs, verify_block, config);
+    };
+    let final_bound = safety.system().bound();
+    if final_bound <= 1 {
+        return check_verify_block(ir, vctx, defs, verify_block, config);
+    }
+
+    for depth in 1..final_bound {
+        let mut shallow_block = verify_block.clone();
+        shallow_block.depth = Some(depth);
+        let result = check_verify_block(ir, vctx, defs, &shallow_block, config);
+        match result {
+            VerificationResult::Counterexample { .. } | VerificationResult::Deadlock { .. } => {
+                return result;
+            }
+            VerificationResult::Checked { .. } => {}
+            _ => return result,
+        }
+    }
+
+    check_verify_block(ir, vctx, defs, verify_block, config)
+}
+
 #[allow(clippy::too_many_lines)]
 fn check_verify_block(
     ir: &IRProgram,

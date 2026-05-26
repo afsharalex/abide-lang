@@ -251,6 +251,7 @@ pub struct VerifyArtifactConfig<'a> {
     pub unbounded_only: bool,
     pub induction_timeout_ms: u64,
     pub bmc_timeout_ms: u64,
+    pub bmc_iterative_deepening: bool,
     pub ic3_timeout_ms: u64,
     pub no_ic3: bool,
     pub no_prop_verify: bool,
@@ -328,6 +329,7 @@ fn verification_artifact(
             .option("unbounded_only", config.unbounded_only)
             .option("induction_timeout_ms", config.induction_timeout_ms)
             .option("bmc_timeout_ms", config.bmc_timeout_ms)
+            .option("bmc_iterative_deepening", config.bmc_iterative_deepening)
             .option("ic3_timeout_ms", config.ic3_timeout_ms)
             .option("no_ic3", config.no_ic3)
             .option("no_prop_verify", config.no_prop_verify)
@@ -1179,6 +1181,7 @@ mod tests {
             unbounded_only: false,
             induction_timeout_ms: 1_000,
             bmc_timeout_ms: 2_000,
+            bmc_iterative_deepening: true,
             ic3_timeout_ms: 3_000,
             no_ic3: true,
             no_prop_verify: false,

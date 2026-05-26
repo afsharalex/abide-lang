@@ -142,6 +142,10 @@ enum Command {
         #[arg(long = "prop-bmc-depth", default_value_t = DEFAULT_PROP_BMC_DEPTH)]
         prop_bmc_depth: usize,
 
+        /// Disable iterative BMC depth search for shortest counterexamples
+        #[arg(long = "no-bmc-iterative-deepening")]
+        no_bmc_iterative_deepening: bool,
+
         /// IC3/PDR timeout in seconds (default: 1200, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
         ic3_timeout: u64,
@@ -398,6 +402,7 @@ pub fn run() -> miette::Result<()> {
             induction_timeout,
             bmc_timeout,
             prop_bmc_depth,
+            no_bmc_iterative_deepening,
             ic3_timeout,
             ic3,
             cvc5_sygus,
@@ -481,6 +486,7 @@ pub fn run() -> miette::Result<()> {
                 overall_timeout_ms: timeout.saturating_mul(1000),
                 induction_timeout_ms: induction_timeout.saturating_mul(1000),
                 bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
+                bmc_iterative_deepening: !no_bmc_iterative_deepening,
                 prop_bmc_depth,
                 cvc5_sygus,
                 ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
@@ -508,6 +514,7 @@ pub fn run() -> miette::Result<()> {
                                 induction_timeout,
                                 bmc_timeout,
                                 prop_bmc_depth,
+                                !no_bmc_iterative_deepening,
                                 ic3_timeout,
                                 no_ic3,
                                 no_prop_verify,
@@ -538,6 +545,7 @@ pub fn run() -> miette::Result<()> {
                         induction_timeout,
                         bmc_timeout,
                         prop_bmc_depth,
+                        !no_bmc_iterative_deepening,
                         ic3_timeout,
                         no_ic3,
                         no_prop_verify,
@@ -563,6 +571,7 @@ pub fn run() -> miette::Result<()> {
                     induction_timeout,
                     bmc_timeout,
                     prop_bmc_depth,
+                    !no_bmc_iterative_deepening,
                     ic3_timeout,
                     no_ic3,
                     no_prop_verify,
@@ -583,6 +592,7 @@ pub fn run() -> miette::Result<()> {
                     unbounded_only,
                     induction_timeout_ms: induction_timeout.saturating_mul(1000),
                     bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
+                    bmc_iterative_deepening: !no_bmc_iterative_deepening,
                     ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
                     no_ic3,
                     no_prop_verify,
