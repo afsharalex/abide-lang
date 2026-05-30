@@ -19342,6 +19342,68 @@ fn verify_all_with_cvc5_sygus_opt_in_reports_unsupported_fragments() {
 }
 
 #[test]
+fn verify_all_with_cvc5_sygus_opt_in_keeps_non_finite_step_params_as_boundary() {
+    let mut ir = make_system_field_counter_ir();
+    ir.systems[0].actions[0].params.push(IRTransParam {
+        name: "delta".to_owned(),
+        ty: IRType::Int,
+    });
+    let config = cvc5_sygus_regression_config();
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("cvc5 SyGuS opt-in")
+                    && hint.contains("finite Bool/enum action params")
+        ),
+        "non-finite SyGuS step params should stay an honest boundary, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_all_with_cvc5_sygus_opt_in_keeps_recursive_cross_calls_as_boundary() {
+    let mut ir = make_pooled_crosscall_counter_ir();
+    ir.systems[0].actions[1] = IRSystemAction {
+        name: "relay_inc".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::CrossCall {
+            system: "CounterWorker".to_owned(),
+            command: "relay_back".to_owned(),
+            args: vec![],
+        }],
+        return_expr: None,
+    };
+    ir.systems[1].actions[0] = IRSystemAction {
+        name: "relay_back".to_owned(),
+        params: vec![],
+        guard: bool_lit(true),
+        body: vec![IRAction::CrossCall {
+            system: "CounterRelayPool".to_owned(),
+            command: "relay_inc".to_owned(),
+            args: vec![],
+        }],
+        return_expr: None,
+    };
+    let config = cvc5_sygus_regression_config();
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("cvc5 SyGuS opt-in")
+                    && hint.contains("recursive cross-call cycles")
+        ),
+        "recursive SyGuS cross-calls should stay an honest boundary, got: {results:?}"
+    );
+}
+
+#[test]
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_supported_system_field_safety_via_sygus() {
     let ir = make_system_field_counter_ir();
