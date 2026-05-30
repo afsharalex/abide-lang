@@ -456,9 +456,6 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     if !system.entities.is_empty() {
         return Err("cvc5 SyGuS system safety does not support entity pools yet".to_owned());
     }
-    if !system.let_bindings.is_empty() {
-        return Err("cvc5 SyGuS system safety does not support let-bindings yet".to_owned());
-    }
     let tm = Cvc5Tm::new();
     let mut solver = Cvc5Solver::new(&tm);
     solver.set_option("sygus", "true");
@@ -468,6 +465,8 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     }
     let enum_catalog =
         build_enum_catalog_with_derived(&tm, &system.fields, &system.derived_fields)?;
+    let mut enum_catalog = enum_catalog;
+    register_system_signature_types(&tm, &mut enum_catalog, system)?;
     solver.set_logic(
         if requires_all_logic(&enum_catalog, &system.fields, &system.derived_fields) {
             "ALL"
@@ -636,6 +635,35 @@ pub(super) fn build_enum_catalog_with_derived(
     Ok(catalog)
 }
 
+pub(super) fn register_system_signature_types(
+    tm: &Cvc5Tm,
+    catalog: &mut EnumCatalog,
+    system: &IRSystem,
+) -> Result<(), String> {
+    for command in &system.commands {
+        for param in &command.params {
+            catalog.register_type(tm, &param.ty)?;
+        }
+        if let Some(return_type) = &command.return_type {
+            catalog.register_type(tm, return_type)?;
+        }
+    }
+    for action in &system.actions {
+        for param in &action.params {
+            catalog.register_type(tm, &param.ty)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn command_return_type(system: &IRSystem, command: &str) -> Option<IRType> {
+    system
+        .commands
+        .iter()
+        .find(|candidate| candidate.name == command)
+        .and_then(|candidate| candidate.return_type.clone())
+}
+
 pub(super) fn extend_with_derived_fields(
     tm: &Cvc5Tm,
     vars: &mut HashMap<String, Cvc5Term>,
@@ -658,6 +686,10 @@ pub(super) fn sort_for_field(
         IRType::Int => Ok(tm.integer_sort()),
         IRType::Real => Ok(tm.real_sort()),
         IRType::Bool => Ok(tm.boolean_sort()),
+        IRType::Entity { .. } => Ok(tm.integer_sort()),
+        IRType::Refinement { base, .. } if matches!(base.as_ref(), IRType::Entity { .. }) => {
+            Ok(tm.integer_sort())
+        }
         IRType::Enum { variants, .. }
             if variants.iter().all(|variant| variant.fields.is_empty()) =>
         {
@@ -1133,8 +1165,8 @@ pub(super) fn finite_param_values(
 ) -> Result<Vec<Cvc5Term>, String> {
     finite_domain_values(tm, &param.ty, enum_catalog).ok_or_else(|| {
         format!(
-            "cvc5 SyGuS system safety only supports finite Bool/enum action params today (`{}`)",
-            param.name
+            "cvc5 SyGuS system safety only supports finite Bool/enum action params today (`{}`: {:?})",
+            param.name, param.ty
         )
     })
 }

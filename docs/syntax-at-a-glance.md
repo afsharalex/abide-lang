@@ -44,9 +44,10 @@ entity Order {
 
 ```abide
 system Commerce(orders: Store<Order>) {
-  command pay(order: Order)
-    requires order.status == @Pending {
-    order.mark_paid()
+  command pay(order_id: identity) {
+    choose order: Order where order.id == order_id and order.status == @Pending {
+      order.mark_paid()
+    }
   }
 
   query payable(order: Order) =
@@ -63,7 +64,21 @@ Notes:
 - Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population: `[N]` starts with exactly `N` active entities, `[lo..hi]` starts with `lo`, and `[..hi]` starts with `0`; create actions may grow the active population up to the upper bound.
 - `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
+- `action` is private implementation behavior called by commands or other internal behavior.
 - `pred` is internal and pure.
+
+## Predicate-shaped choices
+
+| Need | Construct |
+| --- | --- |
+| Public read-only observation | `query` |
+| Private Boolean helper | `pred` |
+| Reusable pure computation | `fn` |
+| Computed entity/system field | `derived` |
+| Durable entity/system state fact | `invariant` |
+| Auto-verified system property | `prop` |
+| Reusable proof fact | `lemma` |
+| Proof-style obligation | `theorem` |
 
 ## Verification
 
@@ -107,8 +122,8 @@ extern Stripe {
 system Billing(orders: Store<Order>) {
   dep Stripe
 
-  command submit(order: Order) {
-    Stripe::charge(order.id)
+  command submit(order_id: identity) {
+    Stripe::charge(order_id)
   }
 }
 ```

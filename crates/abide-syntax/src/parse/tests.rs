@@ -45,6 +45,14 @@ fn parse_program_err(src: &str) -> ParseError {
         .expect_err("expected parse error, got successful parse")
 }
 
+fn parse_expr_err(src: &str) -> ParseError {
+    let tokens = lex::lex(src).expect("lex error");
+    let mut parser = Parser::new(tokens);
+    parser
+        .expr()
+        .expect_err("expected parse error, got successful parse")
+}
+
 // ── Expression precedence tests ──────────────────────────────────
 
 #[test]
@@ -624,6 +632,26 @@ fn eventually() {
         parse_expr("eventually p").kind,
         ExprKind::Eventually(_)
     ));
+}
+
+#[test]
+fn saw_arrow_forms_are_rejected_with_actionable_diagnostic() {
+    for src in [
+        "saw Stripe::charge(1) -> @ok",
+        "saw Stripe::charge(1) => @ok",
+    ] {
+        let err = parse_expr_err(src);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(crate::messages::SAW_RETURN_VALUE_FORBIDDEN),
+            "expected saw arrow diagnostic for {src}, got: {rendered}"
+        );
+        assert!(
+            extract_help(&err)
+                .is_some_and(|help| help.contains("only observes which command was called")),
+            "expected saw arrow help for {src}, got: {err:?}"
+        );
+    }
 }
 
 // ── Type reference tests ─────────────────────────────────────────

@@ -4,7 +4,8 @@ use super::super::smt::{self, AbideSolver, SatResult};
 use super::*;
 use crate::ir::types::{
     IRAction, IRAssumptionSet, IRCommand, IRCommandRef, IRField, IRFsm, IRFsmTransition, IRProgram,
-    IRQuery, IRSystem, IRSystemAction, IRTransRef, IRUpdate, IRVariant, LitVal,
+    IRQuery, IRStutterProvenance, IRSystem, IRSystemAction, IRTransRef, IRUpdate, IRVariant,
+    LitVal,
 };
 
 fn make_order_entity() -> IREntity {
@@ -1887,6 +1888,7 @@ fn fairness_constraints_expand_per_tuple_entity_events() {
     };
     let assumption_set = IRAssumptionSet {
         stutter: false,
+        stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
         weak_fair: vec![IRCommandRef {
             system: "Shop".to_owned(),
             command: "tick".to_owned(),

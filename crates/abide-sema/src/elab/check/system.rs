@@ -204,6 +204,20 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                 sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
                             ));
                         }
+                        (Some(sys_ret), None) if !matches!(sys_ret, Ty::Error) => {
+                            errors.push(ElabError::with_span(
+                                ErrorKind::TypeMismatch,
+                                format!(
+                                    "system `{}` command `{}` returns `{}` but interface `{}` declares no return value",
+                                    system.name,
+                                    iface_cmd.name,
+                                    sys_ret.name(),
+                                    interface.name
+                                ),
+                                &sys_ctx,
+                                sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                            ));
+                        }
                         _ => {}
                     }
                 }

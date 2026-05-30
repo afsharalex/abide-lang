@@ -15,11 +15,28 @@ pub(super) use self::expr::*;
 pub(super) use self::patterns::*;
 pub(super) use self::property::*;
 
+#[cfg(test)]
 pub(super) fn build_multi_slot_chc(
     entity: &IREntity,
     vctx: &VerifyContext,
     property: &IRExpr,
     n_slots: usize,
+) -> Result<String, String> {
+    build_multi_slot_chc_with_semantics(
+        entity,
+        vctx,
+        property,
+        n_slots,
+        Ic3TransitionSemantics::default(),
+    )
+}
+
+pub(super) fn build_multi_slot_chc_with_semantics(
+    entity: &IREntity,
+    vctx: &VerifyContext,
+    property: &IRExpr,
+    n_slots: usize,
+    semantics: Ic3TransitionSemantics,
 ) -> Result<String, String> {
     let n_fields = entity.fields.len();
 
@@ -79,9 +96,11 @@ pub(super) fn build_multi_slot_chc(
     chc.push_str(") init)\n");
 
     // ── Transition rules: for each slot × transition ───────────────
+    let mut enabled_steps = Vec::new();
     for slot in 0..n_slots {
         for transition in &entity.transitions {
             let guard = guard_to_smt_slot(&transition.guard, entity, vctx, slot, n_slots)?;
+            enabled_steps.push(format!("(and s{slot}_active {guard})"));
 
             // Build next-state: this slot gets updates, all other slots frame
             let mut next_vals: Vec<String> = Vec::new();
@@ -145,6 +164,7 @@ pub(super) fn build_multi_slot_chc(
         } else {
             format!("(and (not s{slot}_active) s{}_active)", slot - 1)
         };
+        enabled_steps.push(create_guard.clone());
 
         chc.push_str(&format!(
             "(rule (=> (and (State {all_vars_str}) {create_guard}) \
@@ -153,9 +173,21 @@ pub(super) fn build_multi_slot_chc(
     }
 
     // ── Stutter rule ───────────────────────────────────────────────
-    chc.push_str(&format!(
-        "(rule (=> (State {all_vars_str}) (State {all_vars_str})) stutter)\n"
-    ));
+    if semantics.allow_stutter {
+        chc.push_str(&format!(
+            "(rule (=> (State {all_vars_str}) (State {all_vars_str})) stutter)\n"
+        ));
+    } else {
+        let no_enabled = enabled_steps
+            .iter()
+            .map(|enabled| format!("(not {enabled})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        chc.push_str(&format!(
+            "(rule (=> (and (State {all_vars_str}) {no_enabled}) Error) \
+             deadlock_no_stutter)\n"
+        ));
+    }
 
     // ── Domain constraints for enum fields ─────────────────────────
     // Use VerifyContext enum_ranges for correct globally-allocated variant IDs

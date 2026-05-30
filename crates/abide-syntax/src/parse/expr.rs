@@ -378,9 +378,10 @@ impl Parser {
 
         // Reject arrow forms after `saw`.
         if self.peek() == Some(&Token::Arrow) || self.peek() == Some(&Token::FatArrow) {
-            return Err(ParseError::general(
+            return Err(ParseError::general_with_help(
                 crate::messages::SAW_RETURN_VALUE_FORBIDDEN,
                 start.merge(end),
+                crate::messages::HINT_SAW_RETURN_VALUE_FORBIDDEN,
             ));
         }
 

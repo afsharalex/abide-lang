@@ -4,7 +4,7 @@ This guide is about how to structure Abide models with the syntax and verificati
 
 ## Start with types and entities
 
-Types define vocabulary. Entities define persistent state and transitions.
+Types define vocabulary. Entities define persistent state and private transitions.
 
 ```abide
 enum OrderStatus = Pending | Confirmed | Shipped
@@ -43,12 +43,13 @@ system Commerce(orders: Store<Order>) {
 ```
 
 Model systems over explicit finite `Store<T>` pools and route behavior through commands and queries.
+Treat the system as the public boundary: callers use commands and queries; commands may call private entity or system actions to do the work.
 
 ## Commands, actions, queries, predicates
 
 Use the system surface deliberately:
 
-- `command` — public callable operation, with its body inline when needed
+- `command` — public callable mutation, with its body inline when needed
 - `action` — private executable behavior inside an entity or system
 - `query` — public pure observation
 - `pred` — internal pure helper
@@ -58,16 +59,23 @@ system Billing(orders: Store<Order>) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
-  command charge(order: Order)
-    requires payable(order) {
-    order.mark_paid()
+  command charge(order_id: identity) {
+    choose order: Order where order.id == order_id and order.status == @Pending and order.total > 0 {
+      order.mark_paid()
+    }
   }
 }
 ```
 
+Use `fn` instead of `pred` when the helper is general reusable computation, has
+contracts, is recursive, or belongs outside a particular system. Use `derived`
+when a computed fact should read like a field, `invariant` when a state fact must
+always hold, `prop` when a named system fact should be auto-verified, and
+`lemma`/`theorem` only for proof-layer facts and goals.
+
 ## Use identity params when selection matters
 
-For public APIs, identity-based command params are usually clearer than exposing unrestricted entity picks:
+For public application APIs, identity-based command params are usually clearer than exposing unrestricted entity picks:
 
 ```abide
 command ship_order(order_id: identity) {
@@ -78,6 +86,7 @@ command ship_order(order_id: identity) {
 ```
 
 This makes witness traces and cross-system routing easier to read.
+Entity-valued command parameters remain useful for concise formal examples and closed-world specs, but they are not the default shape for an application-facing API.
 
 ## Verification uses explicit assumptions
 

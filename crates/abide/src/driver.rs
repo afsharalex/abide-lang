@@ -172,6 +172,9 @@ pub fn verify_files(
     config: &VerifyConfig,
 ) -> Result<VerifiedFiles, Vec<Diagnostic>> {
     let lowered = lower_files(paths)?;
+    if has_error_diagnostics(&lowered.diagnostics) {
+        return Err(lowered.diagnostics);
+    }
     let results = verify::verify_all(&lowered.ir_program, config);
     Ok(VerifiedFiles { lowered, results })
 }
@@ -212,6 +215,10 @@ fn flatten_load_diagnostics(errors: &[crate::loader::LoadError]) -> Vec<Diagnost
         sink.extend(error.diagnostics());
     }
     sink.into_sorted_deduped()
+}
+
+fn has_error_diagnostics(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics.iter().any(Diagnostic::is_error)
 }
 
 #[cfg(test)]
@@ -261,6 +268,59 @@ mod tests {
                         && diagnostic.message.contains("missing.ab")
                 ),
             "expected shared load diagnostic for missing include, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn verify_files_rejects_unresolved_assumption_before_backend_execution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad_assumption.ab");
+        let mut file = std::fs::File::create(&path).expect("create file");
+        writeln!(
+            file,
+            "{}",
+            r"module T
+
+enum Flag = Ready | Done
+
+entity E {
+  flag: Flag = @Ready
+  action finish() requires flag == @Ready { flag' = @Done }
+}
+
+system Sys(es: Store<E>) {
+  command tick() { choose e: E where e.flag == @Ready { e.finish() } }
+}
+
+verify bad_assumption {
+  assume {
+    store es: E[1..1]
+    let sys = Sys { es: es }
+    fair Sys::missing
+  }
+  assert always true
+}
+"
+        )
+        .expect("write file");
+
+        let diagnostics = match verify_files(std::slice::from_ref(&path), &VerifyConfig::default())
+        {
+            Ok(_) => panic!("unresolved fair assumption must block verification"),
+            Err(diagnostics) => diagnostics,
+        };
+
+        assert!(
+            diagnostics.iter().any(Diagnostic::is_error),
+            "expected a fatal diagnostic, got: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("UNKNOWN_FAIR_EVENT")
+                    || diagnostic.message.contains("Sys::missing")
+                    || diagnostic.message.contains("missing")
+            }),
+            "expected unknown fair-event diagnostic, got: {diagnostics:?}"
         );
     }
 

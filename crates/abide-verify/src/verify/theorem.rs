@@ -12,7 +12,7 @@ use super::defenv;
 use super::encode::encode_pure_expr_inner;
 use super::harness::{
     create_slot_pool_with_systems, domain_constraints, initial_state_constraints,
-    transition_constraints,
+    try_transition_constraints,
 };
 use super::property::{encode_prop_expr_with_ctx, PropertyCtx};
 use super::smt::{self, AbideSolver, Bool, SatResult, SmtValue};
@@ -721,14 +721,24 @@ pub(super) fn check_theorem_block(
 
         // stutter is conditional on the theorem's
         // `assume { stutter }` (on by default for theorems per / revised).
-        let trans = transition_constraints(
+        let trans = match try_transition_constraints(
             &pool,
             vctx,
             &relevant_entities,
             &relevant_systems,
             0,
             &theorem.assumption_set,
-        );
+        ) {
+            Ok(trans) => trans,
+            Err(msg) => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!("transition encoding error: {msg}"),
+                    span: None,
+                    file: None,
+                };
+            }
+        };
         solver.assert(&trans);
 
         // when stutter is opted out, the
@@ -956,14 +966,24 @@ pub(super) fn check_theorem_block(
 
         // One transition step. stutter is conditional on the
         // theorem's `assume { stutter }`.
-        let trans = transition_constraints(
+        let trans = match try_transition_constraints(
             &pool,
             vctx,
             &relevant_entities,
             &relevant_systems,
             0,
             &theorem.assumption_set,
-        );
+        ) {
+            Ok(trans) => trans,
+            Err(msg) => {
+                return VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!("transition encoding error: {msg}"),
+                    span: None,
+                    file: None,
+                };
+            }
+        };
         solver.assert(&trans);
 
         // same trace-validity guard as the
@@ -1114,14 +1134,24 @@ fn try_ic3_on_theorem(
         for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
             probe_solver.assert(&c);
         }
-        let trans = transition_constraints(
+        let trans = match try_transition_constraints(
             &pool,
             vctx,
             system.relevant_entities(),
             system.relevant_systems(),
             0,
             &theorem.assumption_set,
-        );
+        ) {
+            Ok(trans) => trans,
+            Err(msg) => {
+                return Some(VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!("transition encoding error: {msg}"),
+                    span: None,
+                    file: None,
+                });
+            }
+        };
         probe_solver.assert(&trans);
 
         if matches!(probe_solver.check(), SatResult::Unsat) {

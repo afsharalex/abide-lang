@@ -2,9 +2,23 @@
 
 Abide models stateful systems, their public command surfaces, and the properties they must satisfy.
 
+## Modeling ladder
+
+The usual path is:
+
+1. Define durable state with `entity`.
+2. Put public behavior behind a `system`.
+3. Expose mutation with `command`.
+4. Expose read-only observations with `query`.
+5. Keep `action` as private implementation behavior called by commands.
+6. Use `verify` for universal checks.
+7. Use `scene` for concrete examples and witnesses.
+8. Reach for `theorem` and `lemma` only when you need proof-style obligations.
+9. Use QA, the REPL, `run`, and `explore` to inspect a model while you refine it.
+
 ## Entities
 
-Entities are stateful domain objects with identity, fields, and actions.
+Entities are stateful domain objects with identity, fields, and private actions.
 
 ```abide
 entity Account {
@@ -19,7 +33,7 @@ entity Account {
 ```
 
 - Fields describe persistent state.
-- `action` bodies describe guarded transitions.
+- `action` bodies describe guarded implementation transitions.
 - Primed fields such as `balance'` refer to post-state values.
 
 ## Systems
@@ -28,9 +42,11 @@ Systems operate over explicit entity pools:
 
 ```abide
 system Banking(accounts: Store<Account>) {
-  command deposit(account: Account, amount: real)
+  command deposit(account_id: identity, amount: real)
     requires amount > 0 {
-    account.deposit(amount)
+    choose account: Account where account.id == account_id {
+      account.deposit(amount)
+    }
   }
 }
 ```
@@ -41,7 +57,22 @@ Key points:
 - Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population and maximum create capacity for that check or scene.
 - `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
+- Public application-shaped commands usually take identity or value parameters and choose the target entity inside the command. Entity-valued parameters are still useful for concise specs and closed-world examples.
+- Entity and system `action` declarations are private implementation behavior, not the public API.
 - `pred` stays internal to the system.
+
+## Predicate-shaped constructs
+
+When several constructs could name a Boolean or fact, choose by audience:
+
+- Public read-only observation: use `query`.
+- Private Boolean helper: use `pred`.
+- Reusable pure computation: use `fn`, even when it returns `bool`.
+- Computed entity/system field: use `derived`.
+- Durable entity/system state fact: use `invariant`.
+- Named system property that should be auto-verified: use `prop`.
+- Reusable proof fact: use `lemma`.
+- Proof-style obligation: use `theorem`.
 
 ## Verification blocks
 
@@ -66,7 +97,22 @@ The `assume` block establishes:
 A `CHECKED` result means Abide did not find a counterexample on the explored
 bounded trace prefixes. The reported depth is a transition bound and may include
 stutter steps when stutter is enabled. It is not a TLC-style exhaustive
-reachable-state result and not an Alloy-style all-instance result.
+reachable-state result and not an Alloy-style all-instance result. Ordinary
+`verify` uses this bounded/exploration workflow by default; when you want an
+unbounded proof attempt for a verify block, rerun with an explicit proof-search
+flag such as `--ic3` or use `theorem` for proof-oriented claims.
+
+Choose verification and inspection constructs by the question you are asking:
+
+- Could this fail? Use `verify`.
+- Can this happen? Use `scene`.
+- Should this reusable system property be checked automatically? Use `prop`.
+- Does this need an unbounded proof-style obligation? Use `theorem`.
+- Is this a reusable proof fact? Use `lemma`.
+- Is this an external trust boundary? Use `axiom`.
+- Is this a structural or CI question? Use QA `ask`, `explain`, or `assert`.
+- Do you want one concrete execution? Use `simulate` or `run`.
+- Do you want a bounded state-space artifact? Use `explore`.
 
 ## Theorems and lemmas
 
@@ -103,6 +149,7 @@ scene successful_payment {
 
 Use scenes when you want to show that some behavior is possible, not that it is universally required.
 Events listed in a `when` block run in textual order by default. To ask for a different shape, bind event calls with `let` and add an explicit `assume` using composition operators such as `->` for sequence, `&` for same-step, `||` for concurrent, or `|`/`^|` for choice.
+Use `implies` for logical implication in assertions and properties; `->` is reserved for sequence composition and function types.
 
 ## Temporal logic
 
@@ -248,5 +295,6 @@ program Publishing(documents: Store<Document>[..4]) {
 ## Terminology
 
 - `command` is the public system operation surface.
+- `query` is the public read-only system observation surface.
 - `action` is private executable behavior inside an entity or system.
 - `program` and `proc` describe orchestration structure.

@@ -3820,31 +3820,6 @@ fn sygus_pooled_accepts_query_and_pred_metadata_before_solver_setup() {
 }
 
 #[test]
-fn sygus_keeps_let_bindings_as_topology_boundary() {
-    let mut system = make_counter_system();
-    system.let_bindings.push(crate::ir::types::IRLetBinding {
-        name: "child".to_owned(),
-        system_type: "CounterSys".to_owned(),
-        store_bindings: vec![],
-    });
-    let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
-        .expect_err("let binding topology should remain unsupported");
-    assert!(err.contains("let-bindings"));
-
-    let entity = make_counter_entity();
-    let mut pooled = make_pooled_store_counter_system();
-    pooled.let_bindings.push(crate::ir::types::IRLetBinding {
-        name: "child".to_owned(),
-        system_type: "CounterStorePool".to_owned(),
-        store_bindings: vec![],
-    });
-    let err =
-        try_cvc5_sygus_pooled_system_safety_inner(&pooled, &entity, 2, &non_negative_property(), 0)
-            .expect_err("pooled let binding topology should remain unsupported");
-    assert!(err.contains("let-bindings"));
-}
-
-#[test]
 fn sygus_core_accepts_derived_fields_before_solver_setup() {
     let mut derived_entity = make_counter_entity();
     derived_entity

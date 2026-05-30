@@ -42,11 +42,13 @@ pub use self::framing::{
 pub(crate) use self::guard::try_encode_guard_expr;
 use self::guard::*;
 use self::step::*;
-pub(crate) use self::step::{apply_global_frame, encode_step_with_params, try_encode_step_inner};
+pub(crate) use self::step::{
+    apply_global_frame, try_encode_step_inner, try_encode_step_with_params,
+};
 pub use self::temporal::{
     encode_step_enabled, encode_step_enabled_with_params, lasso_loopback, transition_constraints,
     transition_constraints_with_fire, try_encode_step_enabled, try_encode_step_enabled_with_params,
-    try_transition_constraints_with_fire, FireTracking, LassoLoop,
+    try_transition_constraints, try_transition_constraints_with_fire, FireTracking, LassoLoop,
 };
 
 // ── Multi-slot entity pool ──────────────────────────────────────────

@@ -126,15 +126,15 @@ enum Command {
         #[arg(long, conflicts_with = "bounded_only")]
         unbounded_only: bool,
 
-        /// End-to-end verify timeout in seconds (default: 1200, 0 = no timeout)
+        /// End-to-end verify timeout in seconds (default: 30, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_VERIFY_TIMEOUT_SECS)]
         timeout: u64,
 
-        /// Induction timeout in seconds (default: 1200, 0 = no timeout)
+        /// Induction timeout in seconds (default: 30, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_INDUCTION_TIMEOUT_SECS)]
         induction_timeout: u64,
 
-        /// BMC timeout in seconds (default: 1200, 0 = no timeout)
+        /// BMC timeout in seconds (default: 30, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_BMC_TIMEOUT_SECS)]
         bmc_timeout: u64,
 
@@ -146,7 +146,7 @@ enum Command {
         #[arg(long = "no-bmc-iterative-deepening")]
         no_bmc_iterative_deepening: bool,
 
-        /// IC3/PDR timeout in seconds (default: 1200, 0 = no timeout)
+        /// IC3/PDR timeout in seconds (default: 30, 0 = no timeout)
         #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
         ic3_timeout: u64,
 
@@ -304,7 +304,7 @@ enum TraceCommand {
 /// The default user-facing verify path should terminate on its own even when
 /// backends hit hard cases. Individual passes remain overrideable with the
 /// existing per-flag controls.
-const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 20 * 60;
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 30;
 
 /// Default timeout for Tier 1 induction attempts, in seconds.
 const DEFAULT_INDUCTION_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;

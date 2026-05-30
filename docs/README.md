@@ -8,7 +8,7 @@
 
 **Running Abide from the CLI?** Read [CLI Reference](cli.md) for the current command surface, including `verify`, `simulate`, `qa`, and the REPL.
 
-**Understanding the design?** Read [Core Concepts](core-concepts.md) for the five specification layers, then explore the `examples/` directory for real specs.
+**Understanding the design?** Read [Core Concepts](core-concepts.md) for the modeling ladder, then explore the `examples/` directory for real specs.
 
 ## Pages
 
@@ -16,7 +16,7 @@
 |------|-------------|
 | [Getting Started](getting-started.md) | Build the compiler, write and check your first spec |
 | [Syntax at a Glance](syntax-at-a-glance.md) | One-page cheat sheet with compact examples |
-| [Core Concepts](core-concepts.md) | The five specification layers and how they fit together |
+| [Core Concepts](core-concepts.md) | The modeling ladder and how the main constructs fit together |
 | [Examples](examples.md) | Curated examples with commentary |
 | [CLI Reference](cli.md) | Current command surface, flags, reporting modes, and file conventions |
 | [REPL](repl.md) | Interactive specification authoring, verification, simulation, and artifact exploration |

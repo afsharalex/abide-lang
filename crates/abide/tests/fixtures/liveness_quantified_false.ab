@@ -7,10 +7,11 @@ module LivenessQuantifiedFalse
 // permanently (no recovery from Green/Blue). This makes "all balls green"
 // universally false — only an existential "some ball green" is true.
 //
-// Quantified liveness uses symmetry reduction: prove the
-// property on a 1-slot system, then generalize by entity symmetry.
-// A lasso BMC sanity check with proper weak fairness catches dead-state
-// counterexamples that IC3's coarse justice would miss.
+// Quantified liveness deliberately does not use the current IC3/BAS monitor for
+// unbounded proof claims. The monitor's coarse justice encoding can miss
+// reachable dead-state lassos where weak fairness is vacuous. Until k-liveness
+// or per-event enabled tracking is implemented, theorem paths report
+// UNPROVABLE and verify paths use bounded lasso evidence.
 //
 // POST-SWEEP: fairness lives in `assume { }` blocks on the verification site.
 

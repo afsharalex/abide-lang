@@ -1,3 +1,4 @@
+use super::relation_expr::lower_relation_expr;
 use super::*;
 use crate::ir::relation::{IRRelationExpr, IRRelationSource, IRRelationType};
 use crate::span::Span;
@@ -550,6 +551,7 @@ fn lower_verify_propagates_span_and_file() {
             system_type: "Sys".to_owned(),
             store_bindings: vec![("es".to_owned(), "es".to_owned())],
         }],
+        initial_constraints: vec![],
         assume_block: None,
         assumption_set: E::AssumptionSet::default_for_verify(),
         asserts: vec![E::EExpr::Lit(

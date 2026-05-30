@@ -9,7 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{
-    IRAssumptionSet, IRCommandRef, IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify,
+    IRAssumptionSet, IRCommandRef, IREntity, IRExpr, IRProgram, IRStutterProvenance, IRSystem,
+    IRTheorem, IRVerify,
 };
 
 use super::context::VerifyContext;
@@ -35,6 +36,7 @@ use super::walkers::count_entity_quantifiers;
 #[derive(Debug, Clone)]
 pub struct TransitionAssumptions {
     stutter: bool,
+    stutter_provenance: IRStutterProvenance,
     weak_fair_event_keys: Vec<(String, String)>,
     strong_fair_event_keys: Vec<(String, String)>,
     per_tuple_fair_event_keys: Vec<(String, String)>,
@@ -45,6 +47,7 @@ impl TransitionAssumptions {
     fn from_ir(set: &IRAssumptionSet) -> Self {
         Self {
             stutter: set.stutter,
+            stutter_provenance: set.stutter_provenance,
             weak_fair_event_keys: set
                 .weak_fair
                 .iter()
@@ -136,6 +139,7 @@ impl TransitionAssumptions {
     pub fn as_ir_assumption_set(&self) -> IRAssumptionSet {
         IRAssumptionSet {
             stutter: self.stutter,
+            stutter_provenance: self.stutter_provenance,
             weak_fair: self
                 .weak_fair_event_keys
                 .iter()
@@ -1144,14 +1148,27 @@ impl TransitionBackend for Ic3TransitionBackend {
                 vctx,
                 property,
                 timeout_ms,
-            } => ic3::try_ic3_single_entity(entity, vctx, property, timeout_ms),
+            } => ic3::try_ic3_single_entity_with_semantics(
+                entity,
+                vctx,
+                property,
+                ic3::Ic3TransitionSemantics::default(),
+                timeout_ms,
+            ),
             TransitionObligation::MultiSlotSafety {
                 entity,
                 vctx,
                 property,
                 n_slots,
                 timeout_ms,
-            } => ic3::try_ic3_multi_slot(entity, vctx, property, n_slots, timeout_ms),
+            } => ic3::try_ic3_multi_slot_with_semantics(
+                entity,
+                vctx,
+                property,
+                n_slots,
+                ic3::Ic3TransitionSemantics::default(),
+                timeout_ms,
+            ),
             TransitionObligation::SystemSafety {
                 safety,
                 property_index,
@@ -1163,12 +1180,18 @@ impl TransitionBackend for Ic3TransitionBackend {
                         "invalid transition safety property index {property_index}"
                     ));
                 };
-                ic3::try_ic3_system(
+                let semantics = if system.assumptions().stutter() {
+                    ic3::Ic3TransitionSemantics::stutter_enabled()
+                } else {
+                    ic3::Ic3TransitionSemantics::stutter_disabled()
+                };
+                ic3::try_ic3_system_with_semantics(
                     system.ir,
                     system.vctx,
                     system.system_names(),
                     property,
                     system.slots_per_entity(),
+                    semantics,
                     timeout_ms,
                 )
             }
@@ -1303,6 +1326,7 @@ mod tests {
     fn transition_assumptions_merge_fair_event_keys_without_duplication() {
         let assumptions = TransitionAssumptions::from_ir(&IRAssumptionSet {
             stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
             weak_fair: vec![
                 IRCommandRef {
                     system: "Sys".to_owned(),

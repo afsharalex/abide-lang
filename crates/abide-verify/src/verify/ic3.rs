@@ -43,6 +43,32 @@ pub enum Ic3Result {
     Unknown(String),
 }
 
+/// Transition semantics that affect CHC reachability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ic3TransitionSemantics {
+    pub allow_stutter: bool,
+}
+
+impl Ic3TransitionSemantics {
+    pub const fn stutter_enabled() -> Self {
+        Self {
+            allow_stutter: true,
+        }
+    }
+
+    pub const fn stutter_disabled() -> Self {
+        Self {
+            allow_stutter: false,
+        }
+    }
+}
+
+impl Default for Ic3TransitionSemantics {
+    fn default() -> Self {
+        Self::stutter_enabled()
+    }
+}
+
 /// A single step in an IC3 counterexample trace.
 #[derive(Debug, Clone)]
 pub struct Ic3TraceStep {
@@ -102,13 +128,29 @@ pub fn try_ic3_single_entity(
     property: &IRExpr,
     timeout_ms: u64,
 ) -> Ic3Result {
+    try_ic3_single_entity_with_semantics(
+        entity,
+        vctx,
+        property,
+        Ic3TransitionSemantics::default(),
+        timeout_ms,
+    )
+}
+
+pub fn try_ic3_single_entity_with_semantics(
+    entity: &IREntity,
+    vctx: &VerifyContext,
+    property: &IRExpr,
+    semantics: Ic3TransitionSemantics,
+    timeout_ms: u64,
+) -> Ic3Result {
     let property = match property::normalize_verifier_choose_expr(property) {
         Ok(expr) => expr,
         Err(e) => return Ic3Result::Unknown(format!("CHC encoding failed: {e}")),
     };
 
     // Build CHC string — propagate encoding errors
-    let chc = match build_chc_string(entity, vctx, &property) {
+    let chc = match build_chc_string_with_semantics(entity, vctx, &property, semantics) {
         Ok(s) => s,
         Err(e) => return Ic3Result::Unknown(format!("CHC encoding failed: {e}")),
     };
@@ -147,16 +189,37 @@ pub fn try_ic3_multi_slot(
     n_slots: usize,
     timeout_ms: u64,
 ) -> Ic3Result {
+    try_ic3_multi_slot_with_semantics(
+        entity,
+        vctx,
+        property,
+        n_slots,
+        Ic3TransitionSemantics::default(),
+        timeout_ms,
+    )
+}
+
+pub fn try_ic3_multi_slot_with_semantics(
+    entity: &IREntity,
+    vctx: &VerifyContext,
+    property: &IRExpr,
+    n_slots: usize,
+    semantics: Ic3TransitionSemantics,
+    timeout_ms: u64,
+) -> Ic3Result {
     let property = match property::normalize_verifier_choose_expr(property) {
         Ok(expr) => expr,
         Err(e) => return Ic3Result::Unknown(format!("CHC encoding failed: {e}")),
     };
 
     if n_slots <= 1 {
-        return try_ic3_single_entity(entity, vctx, &property, timeout_ms);
+        return try_ic3_single_entity_with_semantics(
+            entity, vctx, &property, semantics, timeout_ms,
+        );
     }
 
-    let chc = match build_multi_slot_chc(entity, vctx, &property, n_slots) {
+    let chc = match build_multi_slot_chc_with_semantics(entity, vctx, &property, n_slots, semantics)
+    {
         Ok(s) => s,
         Err(e) => return Ic3Result::Unknown(format!("CHC encoding failed: {e}")),
     };
@@ -187,6 +250,26 @@ pub fn try_ic3_system(
     system_names: &[String],
     property: &IRExpr,
     slots_per_entity: &HashMap<String, usize>,
+    timeout_ms: u64,
+) -> Ic3Result {
+    try_ic3_system_with_semantics(
+        ir,
+        vctx,
+        system_names,
+        property,
+        slots_per_entity,
+        Ic3TransitionSemantics::default(),
+        timeout_ms,
+    )
+}
+
+pub fn try_ic3_system_with_semantics(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    system_names: &[String],
+    property: &IRExpr,
+    slots_per_entity: &HashMap<String, usize>,
+    semantics: Ic3TransitionSemantics,
     timeout_ms: u64,
 ) -> Ic3Result {
     let property = match property::normalize_verifier_choose_expr(property) {
@@ -232,12 +315,20 @@ pub fn try_ic3_system(
         .filter(|s| all_system_names.contains(&s.name))
         .collect();
 
-    let chc = match build_system_chc(
+    if !semantics.allow_stutter && !relevant_systems.is_empty() {
+        return Ic3Result::Unknown(
+            "no-stutter IC3 for system actions requires deadlock-aware enabledness encoding"
+                .to_owned(),
+        );
+    }
+
+    let chc = match build_system_chc_with_semantics(
         &relevant_entities,
         &relevant_systems,
         vctx,
         &property,
         slots_per_entity,
+        semantics,
     ) {
         Ok(s) => s,
         Err(e) => return Ic3Result::Unknown(format!("CHC encoding failed: {e}")),

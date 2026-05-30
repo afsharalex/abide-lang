@@ -337,12 +337,36 @@ fn rename_var_in_expr(e: &mut EExpr, from: &str, to: &str) {
         EExpr::Var(_, name, _) if name == from => {
             to.clone_into(name);
         }
-        EExpr::BinOp(_, _, a, b, _) => {
-            rename_var_in_expr(a, from, to);
-            rename_var_in_expr(b, from, to);
+        EExpr::Lit(_, _, _)
+        | EExpr::Var(_, _, _)
+        | EExpr::Qual(_, _, _, _)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_) => {}
+        EExpr::Field(_, inner, _, _)
+        | EExpr::Prime(_, inner, _)
+        | EExpr::UnOp(_, _, inner, _)
+        | EExpr::Always(_, inner, _)
+        | EExpr::Eventually(_, inner, _)
+        | EExpr::Historically(_, inner, _)
+        | EExpr::Once(_, inner, _)
+        | EExpr::Previously(_, inner, _)
+        | EExpr::Assert(_, inner, _)
+        | EExpr::Assume(_, inner, _)
+        | EExpr::NamedPair(_, _, inner, _)
+        | EExpr::Card(_, inner, _) => {
+            rename_var_in_expr(inner, from, to);
         }
-        EExpr::UnOp(_, _, a, _) => {
-            rename_var_in_expr(a, from, to);
+        EExpr::BinOp(_, _, left, right, _)
+        | EExpr::Until(_, left, right, _)
+        | EExpr::Since(_, left, right, _)
+        | EExpr::Assign(_, left, right, _)
+        | EExpr::Seq(_, left, right, _)
+        | EExpr::SameStep(_, left, right, _)
+        | EExpr::In(_, left, right, _)
+        | EExpr::Pipe(_, left, right, _)
+        | EExpr::Index(_, left, right, _) => {
+            rename_var_in_expr(left, from, to);
+            rename_var_in_expr(right, from, to);
         }
         EExpr::Call(_, f, args, _) => {
             rename_var_in_expr(f, from, to);
@@ -350,7 +374,178 @@ fn rename_var_in_expr(e: &mut EExpr, from: &str, to: &str) {
                 rename_var_in_expr(arg, from, to);
             }
         }
-        _ => {}
+        EExpr::CallR(_, f, args, refs, _) => {
+            rename_var_in_expr(f, from, to);
+            for arg in args {
+                rename_var_in_expr(arg, from, to);
+            }
+            for reference in refs {
+                rename_var_in_expr(reference, from, to);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for arg in args {
+                rename_var_in_expr(arg, from, to);
+            }
+        }
+        EExpr::Quant(_, _, var, _, body, _) => {
+            if var != from {
+                rename_var_in_expr(body, from, to);
+            }
+        }
+        EExpr::Let(bindings, body, _) => {
+            let mut shadowed = false;
+            for (name, _, value) in bindings {
+                if !shadowed {
+                    rename_var_in_expr(value, from, to);
+                }
+                if name == from {
+                    shadowed = true;
+                }
+            }
+            if !shadowed {
+                rename_var_in_expr(body, from, to);
+            }
+        }
+        EExpr::Lam(params, _, body, _) => {
+            if params.iter().all(|(name, _)| name != from) {
+                rename_var_in_expr(body, from, to);
+            }
+        }
+        EExpr::Unresolved(name, _) => {
+            if name == from {
+                to.clone_into(name);
+            }
+        }
+        EExpr::TupleLit(_, elements, _)
+        | EExpr::SetLit(_, elements, _)
+        | EExpr::SeqLit(_, elements, _)
+        | EExpr::Block(elements, _) => {
+            for element in elements {
+                rename_var_in_expr(element, from, to);
+            }
+        }
+        EExpr::Match(scrutinee, arms, _) => {
+            rename_var_in_expr(scrutinee, from, to);
+            for (pattern, guard, body) in arms {
+                if !pattern_binds_var(pattern, from) {
+                    if let Some(guard) = guard {
+                        rename_var_in_expr(guard, from, to);
+                    }
+                    rename_var_in_expr(body, from, to);
+                }
+            }
+        }
+        EExpr::Choose(_, var, _, filter, _) => {
+            if var != from {
+                if let Some(filter) = filter {
+                    rename_var_in_expr(filter, from, to);
+                }
+            }
+        }
+        EExpr::MapUpdate(_, map, key, value, _) => {
+            rename_var_in_expr(map, from, to);
+            rename_var_in_expr(key, from, to);
+            rename_var_in_expr(value, from, to);
+        }
+        EExpr::SetComp(_, source, var, _, filter, projection, _) => {
+            if let Some(source) = source {
+                rename_var_in_expr(source, from, to);
+            }
+            if var != from {
+                if let Some(filter) = filter {
+                    rename_var_in_expr(filter, from, to);
+                }
+                rename_var_in_expr(projection, from, to);
+            }
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            let mut shadowed = false;
+            for binding in bindings {
+                if !shadowed {
+                    if let Some(source) = &mut binding.source {
+                        rename_var_in_expr(source, from, to);
+                    }
+                }
+                if binding.var == from {
+                    shadowed = true;
+                }
+            }
+            if !shadowed {
+                rename_var_in_expr(projection, from, to);
+                rename_var_in_expr(filter, from, to);
+            }
+        }
+        EExpr::MapLit(_, entries, _) => {
+            for (key, value) in entries {
+                rename_var_in_expr(key, from, to);
+                rename_var_in_expr(value, from, to);
+            }
+        }
+        EExpr::VarDecl(name, _, init, rest, _) => {
+            rename_var_in_expr(init, from, to);
+            if name != from {
+                rename_var_in_expr(rest, from, to);
+            }
+        }
+        EExpr::While(cond, contracts, body, _) => {
+            rename_var_in_expr(cond, from, to);
+            for contract in contracts {
+                rename_var_in_contract(contract, from, to);
+            }
+            rename_var_in_expr(body, from, to);
+        }
+        EExpr::IfElse(cond, then_body, else_body, _) => {
+            rename_var_in_expr(cond, from, to);
+            rename_var_in_expr(then_body, from, to);
+            if let Some(else_body) = else_body {
+                rename_var_in_expr(else_body, from, to);
+            }
+        }
+        EExpr::Aggregate(_, _, var, _, body, in_filter, _) => {
+            if var != from {
+                rename_var_in_expr(body, from, to);
+                if let Some(in_filter) = in_filter {
+                    rename_var_in_expr(in_filter, from, to);
+                }
+            }
+        }
+        EExpr::Saw(_, _, _, args, _) => {
+            for arg in args.iter_mut().flatten() {
+                rename_var_in_expr(arg, from, to);
+            }
+        }
+        EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
+            for (_, value) in fields {
+                rename_var_in_expr(value, from, to);
+            }
+        }
+    }
+}
+
+fn rename_var_in_contract(contract: &mut EContract, from: &str, to: &str) {
+    match contract {
+        EContract::Requires(expr) | EContract::Ensures(expr) | EContract::Invariant(expr) => {
+            rename_var_in_expr(expr, from, to);
+        }
+        EContract::Decreases { measures, .. } => {
+            for measure in measures {
+                rename_var_in_expr(measure, from, to);
+            }
+        }
+    }
+}
+
+fn pattern_binds_var(pattern: &super::types::EPattern, name: &str) -> bool {
+    match pattern {
+        super::types::EPattern::Var(var) => var == name,
+        super::types::EPattern::Ctor(_, fields) => fields
+            .iter()
+            .any(|(_, pattern)| pattern_binds_var(pattern, name)),
+        super::types::EPattern::Wild => false,
+        super::types::EPattern::Or(left, right) => {
+            pattern_binds_var(left, name) || pattern_binds_var(right, name)
+        }
     }
 }
 
@@ -959,7 +1154,9 @@ fn collect_contract(c: &ast::Contract) -> EContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::AggKind;
     use crate::ast::Visibility;
+    use crate::elab::types::{EPattern, ERelCompBinding};
     use crate::lex;
     use crate::parse::Parser;
 
@@ -968,6 +1165,644 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let prog = parser.parse_program().expect("parse error");
         collect(&prog)
+    }
+
+    fn int_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn bool_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Bool)
+    }
+
+    fn var(name: &str) -> EExpr {
+        EExpr::Var(int_ty(), name.to_owned(), None)
+    }
+
+    fn bool_var(name: &str) -> EExpr {
+        EExpr::Var(bool_ty(), name.to_owned(), None)
+    }
+
+    fn lit_int(value: i64) -> EExpr {
+        EExpr::Lit(int_ty(), super::super::types::Literal::Int(value), None)
+    }
+
+    fn expr_contains_var(expr: &EExpr, target: &str) -> bool {
+        match expr {
+            EExpr::Lit(_, _, _) | EExpr::Qual(_, _, _, _) | EExpr::Sorry(_) | EExpr::Todo(_) => {
+                false
+            }
+            EExpr::Var(_, name, _) | EExpr::Unresolved(name, _) => name == target,
+            EExpr::Field(_, inner, _, _)
+            | EExpr::Prime(_, inner, _)
+            | EExpr::UnOp(_, _, inner, _)
+            | EExpr::Always(_, inner, _)
+            | EExpr::Eventually(_, inner, _)
+            | EExpr::Historically(_, inner, _)
+            | EExpr::Once(_, inner, _)
+            | EExpr::Previously(_, inner, _)
+            | EExpr::Assert(_, inner, _)
+            | EExpr::Assume(_, inner, _)
+            | EExpr::NamedPair(_, _, inner, _)
+            | EExpr::Card(_, inner, _) => expr_contains_var(inner, target),
+            EExpr::BinOp(_, _, left, right, _)
+            | EExpr::Until(_, left, right, _)
+            | EExpr::Since(_, left, right, _)
+            | EExpr::Assign(_, left, right, _)
+            | EExpr::Seq(_, left, right, _)
+            | EExpr::SameStep(_, left, right, _)
+            | EExpr::In(_, left, right, _)
+            | EExpr::Pipe(_, left, right, _)
+            | EExpr::Index(_, left, right, _) => {
+                expr_contains_var(left, target) || expr_contains_var(right, target)
+            }
+            EExpr::Call(_, func, args, _) => {
+                expr_contains_var(func, target)
+                    || args.iter().any(|arg| expr_contains_var(arg, target))
+            }
+            EExpr::CallR(_, func, args, refs, _) => {
+                expr_contains_var(func, target)
+                    || args.iter().any(|arg| expr_contains_var(arg, target))
+                    || refs
+                        .iter()
+                        .any(|reference| expr_contains_var(reference, target))
+            }
+            EExpr::QualCall(_, _, _, args, _) => {
+                args.iter().any(|arg| expr_contains_var(arg, target))
+            }
+            EExpr::Quant(_, _, _, _, body, _) => expr_contains_var(body, target),
+            EExpr::Let(bindings, body, _) => {
+                bindings
+                    .iter()
+                    .any(|(_, _, value)| expr_contains_var(value, target))
+                    || expr_contains_var(body, target)
+            }
+            EExpr::Lam(_, _, body, _) => expr_contains_var(body, target),
+            EExpr::TupleLit(_, elements, _)
+            | EExpr::SetLit(_, elements, _)
+            | EExpr::SeqLit(_, elements, _)
+            | EExpr::Block(elements, _) => elements
+                .iter()
+                .any(|element| expr_contains_var(element, target)),
+            EExpr::Match(scrutinee, arms, _) => {
+                expr_contains_var(scrutinee, target)
+                    || arms.iter().any(|(_, guard, body)| {
+                        guard
+                            .as_ref()
+                            .is_some_and(|guard| expr_contains_var(guard, target))
+                            || expr_contains_var(body, target)
+                    })
+            }
+            EExpr::Choose(_, _, _, filter, _) => filter
+                .as_ref()
+                .is_some_and(|filter| expr_contains_var(filter, target)),
+            EExpr::MapUpdate(_, map, key, value, _) => {
+                expr_contains_var(map, target)
+                    || expr_contains_var(key, target)
+                    || expr_contains_var(value, target)
+            }
+            EExpr::SetComp(_, source, _, _, filter, projection, _) => {
+                source
+                    .as_ref()
+                    .is_some_and(|source| expr_contains_var(source, target))
+                    || filter
+                        .as_ref()
+                        .is_some_and(|filter| expr_contains_var(filter, target))
+                    || expr_contains_var(projection, target)
+            }
+            EExpr::RelComp(_, projection, bindings, filter, _) => {
+                expr_contains_var(projection, target)
+                    || bindings.iter().any(|binding| {
+                        binding
+                            .source
+                            .as_ref()
+                            .is_some_and(|source| expr_contains_var(source, target))
+                    })
+                    || expr_contains_var(filter, target)
+            }
+            EExpr::MapLit(_, entries, _) => entries.iter().any(|(key, value)| {
+                expr_contains_var(key, target) || expr_contains_var(value, target)
+            }),
+            EExpr::VarDecl(_, _, init, rest, _) => {
+                expr_contains_var(init, target) || expr_contains_var(rest, target)
+            }
+            EExpr::While(cond, contracts, body, _) => {
+                expr_contains_var(cond, target)
+                    || contracts
+                        .iter()
+                        .any(|contract| contract_contains_var(contract, target))
+                    || expr_contains_var(body, target)
+            }
+            EExpr::IfElse(cond, then_body, else_body, _) => {
+                expr_contains_var(cond, target)
+                    || expr_contains_var(then_body, target)
+                    || else_body
+                        .as_ref()
+                        .is_some_and(|else_body| expr_contains_var(else_body, target))
+            }
+            EExpr::Aggregate(_, _, _, _, body, in_filter, _) => {
+                expr_contains_var(body, target)
+                    || in_filter
+                        .as_ref()
+                        .is_some_and(|in_filter| expr_contains_var(in_filter, target))
+            }
+            EExpr::Saw(_, _, _, args, _) => args.iter().any(|arg| {
+                arg.as_ref()
+                    .is_some_and(|arg| expr_contains_var(arg, target))
+            }),
+            EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => fields
+                .iter()
+                .any(|(_, value)| expr_contains_var(value, target)),
+        }
+    }
+
+    fn contract_contains_var(contract: &EContract, target: &str) -> bool {
+        match contract {
+            EContract::Requires(expr) | EContract::Ensures(expr) | EContract::Invariant(expr) => {
+                expr_contains_var(expr, target)
+            }
+            EContract::Decreases { measures, .. } => measures
+                .iter()
+                .any(|measure| expr_contains_var(measure, target)),
+        }
+    }
+
+    #[test]
+    fn rename_var_in_expr_covers_all_current_expr_variants() {
+        let cases = vec![
+            (
+                "Lit",
+                EExpr::Lit(int_ty(), super::super::types::Literal::Int(1), None),
+                false,
+            ),
+            ("Var", var("x"), true),
+            (
+                "Field",
+                EExpr::Field(int_ty(), Box::new(var("x")), "value".to_owned(), None),
+                true,
+            ),
+            (
+                "Prime",
+                EExpr::Prime(int_ty(), Box::new(var("x")), None),
+                true,
+            ),
+            (
+                "BinOp",
+                EExpr::BinOp(
+                    bool_ty(),
+                    super::super::types::BinOp::Gt,
+                    Box::new(var("x")),
+                    Box::new(lit_int(0)),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "UnOp",
+                EExpr::UnOp(
+                    bool_ty(),
+                    super::super::types::UnOp::Not,
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Call",
+                EExpr::Call(int_ty(), Box::new(var("f")), vec![var("x")], None),
+                true,
+            ),
+            (
+                "CallR",
+                EExpr::CallR(
+                    int_ty(),
+                    Box::new(var("f")),
+                    vec![var("x")],
+                    vec![var("x")],
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Qual",
+                EExpr::Qual(int_ty(), "M".to_owned(), "x".to_owned(), None),
+                false,
+            ),
+            (
+                "Quant",
+                EExpr::Quant(
+                    bool_ty(),
+                    super::super::types::Quantifier::All,
+                    "y".to_owned(),
+                    int_ty(),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Always",
+                EExpr::Always(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Eventually",
+                EExpr::Eventually(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Until",
+                EExpr::Until(
+                    bool_ty(),
+                    Box::new(bool_var("x")),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Historically",
+                EExpr::Historically(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Once",
+                EExpr::Once(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Previously",
+                EExpr::Previously(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Since",
+                EExpr::Since(
+                    bool_ty(),
+                    Box::new(bool_var("x")),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Assert",
+                EExpr::Assert(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Assume",
+                EExpr::Assume(bool_ty(), Box::new(bool_var("x")), None),
+                true,
+            ),
+            (
+                "Assign",
+                EExpr::Assign(int_ty(), Box::new(var("x")), Box::new(lit_int(1)), None),
+                true,
+            ),
+            (
+                "NamedPair",
+                EExpr::NamedPair(int_ty(), "item".to_owned(), Box::new(var("x")), None),
+                true,
+            ),
+            (
+                "Seq",
+                EExpr::Seq(
+                    bool_ty(),
+                    Box::new(bool_var("x")),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "SameStep",
+                EExpr::SameStep(
+                    bool_ty(),
+                    Box::new(bool_var("x")),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Let",
+                EExpr::Let(
+                    vec![("y".to_owned(), Some(int_ty()), var("x"))],
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Lam",
+                EExpr::Lam(
+                    vec![("y".to_owned(), int_ty())],
+                    Some(int_ty()),
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            ("Unresolved", EExpr::Unresolved("x".to_owned(), None), true),
+            (
+                "TupleLit",
+                EExpr::TupleLit(int_ty(), vec![var("x")], None),
+                true,
+            ),
+            (
+                "In",
+                EExpr::In(bool_ty(), Box::new(var("x")), Box::new(var("set")), None),
+                true,
+            ),
+            (
+                "Card",
+                EExpr::Card(int_ty(), Box::new(var("x")), None),
+                true,
+            ),
+            (
+                "Pipe",
+                EExpr::Pipe(int_ty(), Box::new(var("x")), Box::new(var("f")), None),
+                true,
+            ),
+            (
+                "Match",
+                EExpr::Match(
+                    Box::new(var("x")),
+                    vec![(EPattern::Wild, Some(bool_var("x")), var("x"))],
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Choose",
+                EExpr::Choose(
+                    int_ty(),
+                    "y".to_owned(),
+                    int_ty(),
+                    Some(Box::new(bool_var("x"))),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "MapUpdate",
+                EExpr::MapUpdate(
+                    int_ty(),
+                    Box::new(var("x")),
+                    Box::new(var("x")),
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Index",
+                EExpr::Index(int_ty(), Box::new(var("x")), Box::new(var("x")), None),
+                true,
+            ),
+            (
+                "SetComp",
+                EExpr::SetComp(
+                    int_ty(),
+                    Some(Box::new(var("x"))),
+                    "y".to_owned(),
+                    int_ty(),
+                    Some(Box::new(bool_var("x"))),
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "RelComp",
+                EExpr::RelComp(
+                    int_ty(),
+                    Box::new(var("x")),
+                    vec![ERelCompBinding {
+                        var: "y".to_owned(),
+                        domain: int_ty(),
+                        source: Some(Box::new(var("x"))),
+                    }],
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "SetLit",
+                EExpr::SetLit(int_ty(), vec![var("x")], None),
+                true,
+            ),
+            (
+                "SeqLit",
+                EExpr::SeqLit(int_ty(), vec![var("x")], None),
+                true,
+            ),
+            (
+                "MapLit",
+                EExpr::MapLit(int_ty(), vec![(var("x"), var("x"))], None),
+                true,
+            ),
+            (
+                "QualCall",
+                EExpr::QualCall(
+                    int_ty(),
+                    "Set".to_owned(),
+                    "size".to_owned(),
+                    vec![var("x")],
+                    None,
+                ),
+                true,
+            ),
+            ("Sorry", EExpr::Sorry(None), false),
+            ("Todo", EExpr::Todo(None), false),
+            ("Block", EExpr::Block(vec![var("x")], None), true),
+            (
+                "VarDecl",
+                EExpr::VarDecl(
+                    "y".to_owned(),
+                    Some(int_ty()),
+                    Box::new(var("x")),
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "While",
+                EExpr::While(
+                    Box::new(bool_var("x")),
+                    vec![
+                        EContract::Requires(bool_var("x")),
+                        EContract::Ensures(bool_var("x")),
+                        EContract::Invariant(bool_var("x")),
+                        EContract::Decreases {
+                            measures: vec![var("x")],
+                            star: false,
+                        },
+                    ],
+                    Box::new(var("x")),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "IfElse",
+                EExpr::IfElse(
+                    Box::new(bool_var("x")),
+                    Box::new(var("x")),
+                    Some(Box::new(var("x"))),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Aggregate",
+                EExpr::Aggregate(
+                    int_ty(),
+                    AggKind::Sum,
+                    "y".to_owned(),
+                    int_ty(),
+                    Box::new(var("x")),
+                    Some(Box::new(var("x"))),
+                    None,
+                ),
+                true,
+            ),
+            (
+                "Saw",
+                EExpr::Saw(
+                    bool_ty(),
+                    "S".to_owned(),
+                    "event".to_owned(),
+                    vec![Some(Box::new(var("x"))), None],
+                    None,
+                ),
+                true,
+            ),
+            (
+                "CtorRecord",
+                EExpr::CtorRecord(
+                    int_ty(),
+                    Some("Option".to_owned()),
+                    "Some".to_owned(),
+                    vec![("value".to_owned(), var("x"))],
+                    None,
+                ),
+                true,
+            ),
+            (
+                "StructCtor",
+                EExpr::StructCtor(
+                    int_ty(),
+                    "Point".to_owned(),
+                    vec![("x".to_owned(), var("x"))],
+                    None,
+                ),
+                true,
+            ),
+        ];
+
+        for (label, mut expr, should_rename) in cases {
+            rename_var_in_expr(&mut expr, "x", "$");
+            assert!(
+                !expr_contains_var(&expr, "x"),
+                "{label} retained the original variable after rename: {expr:?}"
+            );
+            assert_eq!(
+                expr_contains_var(&expr, "$"),
+                should_rename,
+                "{label} did not report the expected renamed placeholder state: {expr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_var_in_expr_respects_binding_shadowing() {
+        let mut expr = EExpr::Block(
+            vec![
+                EExpr::Quant(
+                    bool_ty(),
+                    super::super::types::Quantifier::All,
+                    "x".to_owned(),
+                    int_ty(),
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                EExpr::Let(
+                    vec![("x".to_owned(), Some(int_ty()), var("x"))],
+                    Box::new(var("x")),
+                    None,
+                ),
+                EExpr::Lam(
+                    vec![("x".to_owned(), int_ty())],
+                    Some(int_ty()),
+                    Box::new(var("x")),
+                    None,
+                ),
+                EExpr::Match(
+                    Box::new(var("x")),
+                    vec![(EPattern::Var("x".to_owned()), Some(bool_var("x")), var("x"))],
+                    None,
+                ),
+                EExpr::Choose(
+                    int_ty(),
+                    "x".to_owned(),
+                    int_ty(),
+                    Some(Box::new(bool_var("x"))),
+                    None,
+                ),
+                EExpr::SetComp(
+                    int_ty(),
+                    Some(Box::new(var("x"))),
+                    "x".to_owned(),
+                    int_ty(),
+                    Some(Box::new(bool_var("x"))),
+                    Box::new(var("x")),
+                    None,
+                ),
+                EExpr::RelComp(
+                    int_ty(),
+                    Box::new(var("x")),
+                    vec![ERelCompBinding {
+                        var: "x".to_owned(),
+                        domain: int_ty(),
+                        source: Some(Box::new(var("x"))),
+                    }],
+                    Box::new(bool_var("x")),
+                    None,
+                ),
+                EExpr::VarDecl(
+                    "x".to_owned(),
+                    Some(int_ty()),
+                    Box::new(var("x")),
+                    Box::new(var("x")),
+                    None,
+                ),
+                EExpr::Aggregate(
+                    int_ty(),
+                    AggKind::Sum,
+                    "x".to_owned(),
+                    int_ty(),
+                    Box::new(var("x")),
+                    Some(Box::new(var("x"))),
+                    None,
+                ),
+            ],
+            None,
+        );
+
+        rename_var_in_expr(&mut expr, "x", "$");
+
+        assert!(
+            expr_contains_var(&expr, "$"),
+            "free occurrences in scrutinees, initializers, and sources should still be renamed"
+        );
+        assert!(
+            expr_contains_var(&expr, "x"),
+            "binder-scoped occurrences should remain untouched"
+        );
     }
 
     #[test]

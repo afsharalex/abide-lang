@@ -122,6 +122,33 @@ fn lower_loaded_files(paths: &[&str]) -> ir::types::IRProgram {
     ir_program
 }
 
+#[test]
+fn validation_gates_expose_unbounded_proof_tests() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            contents.contains("test-unbounded"),
+            "{file_name} must expose a named unbounded proof validation gate"
+        );
+        assert!(
+            contents.contains("ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1"),
+            "{file_name} must make the opt-in unbounded proof tests actually run"
+        );
+        assert!(
+            contents.contains("test -p abide-verify"),
+            "{file_name} unbounded proof gate must include the verifier test suite"
+        );
+    }
+}
+
 /// Commerce fixture: multi-file via include (commerce.ab includes billing.ab).
 const COMMERCE_FIXTURE: &[&str] = &["tests/fixtures/commerce.ab"];
 
@@ -236,7 +263,175 @@ fn lower_logistics() {
     assert!(!prog.verifies.is_empty(), "should have verify blocks");
     assert!(!prog.scenes.is_empty(), "should have scene blocks");
     let json = ir::emit_json(&prog).expect("IR serialization should succeed");
-    let _parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_logistics_emit_ir_contract(&parsed);
+}
+
+#[test]
+fn cli_emit_ir_logistics_exposes_minimal_stability_contract() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .args(["emit-ir", "tests/fixtures/logistics.ab"])
+        .output()
+        .expect("failed to run abide emit-ir for logistics fixture");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "emit-ir should succeed: stderr={stderr}"
+    );
+    assert!(
+        stderr.trim().is_empty(),
+        "emit-ir should not emit diagnostics for logistics fixture: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("emit-ir stdout should be valid JSON");
+    assert_logistics_emit_ir_contract(&parsed);
+}
+
+fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
+    // Minimal emit-ir stability contract for logistics.ab:
+    // - included declarations survive lowering,
+    // - aliases normalize to their declared IR names,
+    // - key commands preserve create/cross-call bodies,
+    // - verify and scene blocks retain their stores, systems, events, and assertions.
+    let names_in = |section: &str| -> Vec<&str> {
+        parsed[section]
+            .as_array()
+            .unwrap_or_else(|| panic!("{section} should be a JSON array"))
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect()
+    };
+    let find_named = |section: &str, name: &str| -> &serde_json::Value {
+        parsed[section]
+            .as_array()
+            .unwrap_or_else(|| panic!("{section} should be a JSON array"))
+            .iter()
+            .find(|item| item["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("{section} should contain `{name}`: {}", parsed[section]))
+    };
+    let has_object = |value: &serde_json::Value, expected: &[(&str, &str)]| -> bool {
+        fn walk(value: &serde_json::Value, expected: &[(&str, &str)]) -> bool {
+            match value {
+                serde_json::Value::Object(map) => {
+                    expected.iter().all(|(key, val)| {
+                        map.get(*key).and_then(serde_json::Value::as_str) == Some(*val)
+                    }) || map.values().any(|child| walk(child, expected))
+                }
+                serde_json::Value::Array(items) => items.iter().any(|item| walk(item, expected)),
+                _ => false,
+            }
+        }
+        walk(value, expected)
+    };
+
+    let type_names = names_in("types");
+    assert!(type_names.contains(&"ShipStatus"));
+    assert!(type_names.contains(&"SlotStatus"));
+
+    let entity_names = names_in("entities");
+    assert!(entity_names.contains(&"Package"));
+    assert!(entity_names.contains(&"Slot"));
+    assert!(
+        !entity_names.contains(&"WSlot"),
+        "alias WSlot should lower to canonical entity Slot"
+    );
+
+    let function_names = names_in("functions");
+    assert!(function_names.contains(&"package_pending"));
+    assert!(function_names.contains(&"slot_available"));
+
+    let logistics = find_named("systems", "Logistics");
+    let warehouse = find_named("systems", "Warehouse");
+    assert!(has_object(
+        &logistics["store_params"],
+        &[("name", "wSlots"), ("entity_type", "Slot")]
+    ));
+    assert!(has_object(
+        &logistics["store_params"],
+        &[("name", "packages"), ("entity_type", "Package")]
+    ));
+    for action in [
+        "ship_package",
+        "reserve_slot",
+        "provision_slot",
+        "create_slot",
+    ] {
+        assert!(
+            logistics["actions"]
+                .as_array()
+                .expect("Logistics actions should be an array")
+                .iter()
+                .any(|item| item["name"].as_str() == Some(action)),
+            "Logistics action `{action}` should survive lowering"
+        );
+    }
+    assert!(has_object(
+        logistics,
+        &[
+            ("tag", "CrossCall"),
+            ("system", "Warehouse"),
+            ("command", "add_slot")
+        ]
+    ));
+    assert!(has_object(
+        logistics,
+        &[("tag", "Create"), ("entity", "Slot")]
+    ));
+    assert!(has_object(
+        warehouse,
+        &[("tag", "Create"), ("entity", "Slot")]
+    ));
+
+    let verify = find_named("verifies", "logistics_safety");
+    assert!(has_object(
+        &verify["stores"],
+        &[("name", "wSlots"), ("entity_type", "Slot")]
+    ));
+    assert!(has_object(&verify["systems"], &[("name", "Logistics")]));
+    assert!(has_object(
+        &verify["asserts"],
+        &[("tag", "Forall"), ("var", "s")]
+    ));
+    assert!(has_object(
+        &verify["asserts"],
+        &[("tag", "Ctor"), ("enum", "SlotStatus"), ("ctor", "Empty")]
+    ));
+
+    let scene = find_named("scenes", "reserve_and_ship");
+    assert!(has_object(
+        &scene["stores"],
+        &[("name", "packages"), ("entity_type", "Package")]
+    ));
+    assert!(has_object(
+        &scene["stores"],
+        &[("name", "wSlots"), ("entity_type", "Slot")]
+    ));
+    assert!(has_object(
+        &scene["events"],
+        &[("system", "Logistics"), ("event", "reserve_slot")]
+    ));
+    assert!(has_object(
+        &scene["events"],
+        &[("system", "Logistics"), ("event", "ship_package")]
+    ));
+    assert!(has_object(
+        &scene["assertions"],
+        &[
+            ("tag", "Ctor"),
+            ("enum", "SlotStatus"),
+            ("ctor", "Reserved")
+        ]
+    ));
+    assert!(has_object(
+        &scene["assertions"],
+        &[
+            ("tag", "Ctor"),
+            ("enum", "ShipStatus"),
+            ("ctor", "InTransit")
+        ]
+    ));
 }
 
 #[test]
@@ -347,6 +542,11 @@ verify v {
     let result = elaborate_source(src);
     let v = result.verifies.iter().find(|v| v.name == "v").expect("v");
     assert!(v.assumption_set.stutter, "verify default is stutter");
+    assert_eq!(
+        v.assumption_set.stutter_provenance,
+        abide::elab::types::StutterProvenance::Default,
+        "verify default stutter must retain default provenance"
+    );
     assert!(v.assumption_set.weak_fair.is_empty());
     assert!(v.assumption_set.strong_fair.is_empty());
 }
@@ -509,6 +709,10 @@ theorem t for Sys { show always true }
     let result = elaborate_source(src);
     let t = result.theorems.iter().find(|t| t.name == "t").expect("t");
     assert!(t.assumption_set.stutter, "theorem default is stutter on");
+    assert_eq!(
+        t.assumption_set.stutter_provenance,
+        abide::elab::types::StutterProvenance::Default
+    );
 }
 
 #[test]
@@ -536,6 +740,11 @@ verify v {
 ";
     let result = elaborate_source(src);
     let v = result.verifies.iter().find(|v| v.name == "v").expect("v");
+    assert_eq!(
+        v.assumption_set.stutter_provenance,
+        abide::elab::types::StutterProvenance::Default,
+        "fairness-only assume blocks should not make stutter look explicit"
+    );
     assert_eq!(v.assumption_set.weak_fair.len(), 1);
     assert_eq!(v.assumption_set.strong_fair.len(), 1);
     let weak = v.assumption_set.weak_fair.iter().next().unwrap();
@@ -593,6 +802,33 @@ theorem t for Sys {
     assert!(
         !t.assumption_set.stutter,
         "explicit `no stutter` wins over theorem default"
+    );
+    assert_eq!(
+        t.assumption_set.stutter_provenance,
+        abide::elab::types::StutterProvenance::ExplicitNoStutter
+    );
+}
+
+#[test]
+fn assumption_set_explicit_stutter_records_provenance() {
+    let src = r"module T
+
+enum S = A | B
+entity E { s: S = @A
+  action go() requires s == @A { s' = @B } }
+system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() } } }
+
+verify v {
+  assume { stutter }
+  assert always true
+}
+";
+    let result = elaborate_source(src);
+    let v = result.verifies.iter().find(|v| v.name == "v").expect("v");
+    assert!(v.assumption_set.stutter);
+    assert_eq!(
+        v.assumption_set.stutter_provenance,
+        abide::elab::types::StutterProvenance::ExplicitStutter
     );
 }
 
@@ -676,8 +912,8 @@ system Sys(es: Store<E>) {command tick() { choose e: E where e.s == @A { e.go() 
 
 verify v {
   assume {
-    store orders: Order[0..3]
-    let sys = Sys { orders: orders }
+    store es: E[0..3]
+    let sys = Sys { es: es }
   
    fair Sys::nonexistent }
   assert always true
@@ -690,13 +926,23 @@ verify v {
     f.write_all(src.as_bytes()).expect("write");
     drop(f);
     let program = parse_file(file.to_str().unwrap());
-    let (_result, errors) = elab::elaborate(&program);
+    let (result, errors) = elab::elaborate(&program);
+    let actual_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
     assert!(
-        errors.iter().any(|e| {
+        actual_errors.iter().any(|e| {
             let msg = format!("{e}");
             msg.contains("unknown event") || msg.contains("nonexistent")
         }),
         "should report UNKNOWN_FAIR_EVENT diagnostic, got: {errors:?}"
+    );
+    let verify = result.verifies.iter().find(|v| v.name == "v").expect("v");
+    assert!(
+        verify.assumption_set.weak_fair.is_empty() && verify.assumption_set.strong_fair.is_empty(),
+        "unresolved fairness item must not materialize as a weaker successful assumption set: {:?}",
+        verify.assumption_set
     );
 }
 
@@ -769,6 +1015,10 @@ verify v {
     let result = elaborate_source(src);
     let (prog, _lower_diag) = ir::lower(&result);
     let v = prog.verifies.iter().find(|v| v.name == "v").expect("v");
+    assert_eq!(
+        v.assumption_set.stutter_provenance,
+        abide::ir::types::IRStutterProvenance::Default
+    );
     assert_eq!(v.assumption_set.per_tuple.len(), 1);
     assert_eq!(v.assumption_set.per_tuple[0].command, "tick");
 }
@@ -786,6 +1036,10 @@ fn assumption_set_lowered_to_ir() {
     assert!(
         strong_thm.assumption_set.stutter,
         "theorem default = stutter on"
+    );
+    assert_eq!(
+        strong_thm.assumption_set.stutter_provenance,
+        abide::ir::types::IRStutterProvenance::Default
     );
     assert_eq!(strong_thm.assumption_set.strong_fair.len(), 1);
     assert_eq!(strong_thm.assumption_set.strong_fair[0].command, "go_c");
@@ -953,36 +1207,137 @@ fn verify_file(path: &str) -> Vec<abide::verify::VerificationResult> {
 }
 
 #[test]
-fn public_examples_verify_with_documented_bounded_command() {
+fn public_example_verify_blocks_run_with_bounded_targets() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let targets: &[(&str, &[(&str, &str)])] = &[
+        (
+            "examples/advanced_temporal.ab",
+            &[("until_and_history", "CHECKED")],
+        ),
+        ("examples/banking.ab", &[("account_safety", "CHECKED")]),
+        (
+            "examples/collections.ab",
+            &[
+                ("set_source_comprehension", "CHECKED"),
+                ("typed_set_source_comprehension", "CHECKED"),
+                ("seq_source_comprehension", "CHECKED"),
+            ],
+        ),
+        ("examples/commerce.ab", &[("payment_integrity", "CHECKED")]),
+        (
+            "examples/healthcare.ab",
+            &[("admitted_patients_have_rooms", "CHECKED")],
+        ),
+        (
+            "examples/order.ab",
+            &[("shipped_orders_have_positive_totals", "CHECKED")],
+        ),
+        (
+            "examples/orchestration.ab",
+            &[("published_documents_leave_draft", "PROVED")],
+        ),
+        (
+            "examples/proofs_and_boundaries.ab",
+            &[
+                ("closed_tickets_stay_closed", "CHECKED"),
+                ("open_tickets_eventually_close", "CHECKED"),
+            ],
+        ),
+        (
+            "examples/relations.ab",
+            &[
+                ("stage_lane_join", "CHECKED"),
+                ("transpose_flips_columns", "CHECKED"),
+                ("lifecycle_reachability", "CHECKED"),
+                ("lifecycle_reachability_with_identity", "CHECKED"),
+                ("product_cardinality", "CHECKED"),
+                ("projection_keeps_order_ids", "CHECKED"),
+                ("filtered_relation_comprehension_matches_join", "CHECKED"),
+                ("store_backed_relation_reachability", "CHECKED"),
+            ],
+        ),
+        (
+            "examples/state_modeling.ab",
+            &[("state_modeling_smoke", "CHECKED")],
+        ),
+    ];
+
+    for (example, verify_targets) in targets {
+        for (verify_target, expected_verdict) in *verify_targets {
+            let target = format!("verify:{verify_target}");
+            let output = std::process::Command::new(binary)
+                .args([
+                    "verify",
+                    example,
+                    "--bounded-only",
+                    "--target",
+                    &target,
+                    "--timeout",
+                    "30",
+                ])
+                .current_dir(&workspace_root)
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!("failed to run verifier for {example} {target}: {error}")
+                });
+
+            assert!(
+                output.status.success(),
+                "{example} {target} should verify with documented bounded target command\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let verdict_prefix = format!("{expected_verdict}: {verify_target}");
+            let verdict_lines: Vec<_> = stdout
+                .lines()
+                .filter(|line| {
+                    line.starts_with("PROVED:")
+                        || line.starts_with("CHECKED:")
+                        || line.starts_with("COUNTEREXAMPLE:")
+                        || line.starts_with("LIVENESS VIOLATION:")
+                        || line.starts_with("DEADLOCK:")
+                        || line.starts_with("UNPROVABLE:")
+                })
+                .collect();
+            assert!(
+                verdict_lines.len() == 1 && verdict_lines[0].starts_with(&verdict_prefix),
+                "{example} {target} should report exactly one {expected_verdict} verdict for {verify_target}\nstdout:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_examples_without_verify_blocks_still_load_under_bounded_command() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let examples = [
-        "examples/advanced_temporal.ab",
         "examples/algorithms.ab",
-        "examples/banking.ab",
-        "examples/collections.ab",
-        "examples/commerce.ab",
         "examples/contracts.ab",
-        "examples/healthcare.ab",
         "examples/imperative.ab",
         "examples/matching.ab",
-        "examples/order.ab",
-        "examples/orchestration.ab",
-        "examples/proofs_and_boundaries.ab",
-        "examples/relations.ab",
-        "examples/state_modeling.ab",
     ];
 
     for example in examples {
         let output = std::process::Command::new(binary)
-            .args(["verify", example, "--bounded-only", "--timeout", "30"])
+            .args([
+                "verify",
+                example,
+                "--bounded-only",
+                "--no-prop-verify",
+                "--no-fn-verify",
+                "--timeout",
+                "30",
+            ])
             .current_dir(&workspace_root)
             .output()
             .unwrap_or_else(|error| panic!("failed to run verifier for {example}: {error}"));
 
         assert!(
             output.status.success(),
-            "{example} should verify with documented bounded command\nstdout:\n{}\nstderr:\n{}",
+            "{example} should load under the bounded command when implicit proof obligations are disabled\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1350,14 +1705,15 @@ fn verify_commerce_fixture() {
     // Multi-file: commerce.ab includes billing.ab
     let prog = lower_loaded_files(COMMERCE_FIXTURE);
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
-    // commerce_smoke: COUNTEREXAMPLE (expected — eventually in bounded check)
+    // commerce_smoke: LIVENESS VIOLATION. Under default stutter, a trace may
+    // avoid reaching Paid forever, so the eventuality is semantically false.
     assert!(
         results.iter().any(|r| matches!(
             &r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "commerce_smoke"
         )),
-        "commerce_smoke should be COUNTEREXAMPLE"
+        "commerce_smoke should be LIVENESS VIOLATION"
     );
     // billing_safety: PROVED
     assert!(
@@ -2043,6 +2399,122 @@ fn cli_verify_report_json_discloses_checked_bounded_semantics() {
                     && coverage.contains("all-instance")
             }),
         "expected CHECKED coverage limits in report JSON: {report_json}"
+    );
+}
+
+#[test]
+fn cli_verify_surfaces_ic3_unknown_reason_only_in_verbose_and_report_json() {
+    let spec = r"
+module T
+
+entity Counter {
+  x: int = 0
+  y: int = 0
+
+  action bump() requires x < 10 {
+    x' = x + 1
+    y' = y + 1
+  }
+}
+
+system S(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.bump() }
+  }
+}
+
+verify v {
+  assume {
+    store counters: Counter[0..20]
+    let s = S { counters: counters }
+    stutter
+  }
+  assert always all c: Counter | c.y <= 10
+}
+";
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let spec_path = dir.path().join("ic3_unknown_checked.ab");
+    std::fs::write(&spec_path, spec).expect("write spec");
+
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let ordinary = std::process::Command::new(binary)
+        .args([
+            "verify",
+            spec_path.to_str().expect("temp path should be valid UTF-8"),
+            "--chc-solver",
+            "cvc5",
+            "--ic3",
+        ])
+        .output()
+        .expect("failed to run ordinary verify");
+    let ordinary_stdout = String::from_utf8_lossy(&ordinary.stdout);
+    let ordinary_stderr = String::from_utf8_lossy(&ordinary.stderr);
+    assert!(
+        ordinary.status.success(),
+        "ordinary checked fallback should succeed: stdout={ordinary_stdout}, stderr={ordinary_stderr}"
+    );
+    assert!(
+        ordinary_stdout.contains("CHECKED"),
+        "ordinary output should report checked result: {ordinary_stdout}"
+    );
+    assert!(
+        !ordinary_stdout.contains("IC3/PDR") && !ordinary_stderr.contains("IC3/PDR"),
+        "ordinary success output should stay concise: stdout={ordinary_stdout}, stderr={ordinary_stderr}"
+    );
+
+    let report_dir = dir.path().join("reports");
+    let verbose = std::process::Command::new(binary)
+        .args([
+            "verify",
+            spec_path.to_str().expect("temp path should be valid UTF-8"),
+            "--chc-solver",
+            "cvc5",
+            "--ic3",
+            "--verbose",
+            "--report",
+            "json",
+            report_dir
+                .to_str()
+                .expect("report path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("failed to run verbose verify");
+    let verbose_stdout = String::from_utf8_lossy(&verbose.stdout);
+    let verbose_stderr = String::from_utf8_lossy(&verbose.stderr);
+    assert!(
+        verbose.status.success(),
+        "verbose checked fallback should succeed: stdout={verbose_stdout}, stderr={verbose_stderr}"
+    );
+    assert!(
+        verbose_stdout.contains("backend diagnostics")
+            && verbose_stdout.contains("IC3/PDR")
+            && verbose_stdout.to_lowercase().contains("cvc5"),
+        "verbose output should include IC3 unknown reason: stdout={verbose_stdout}, stderr={verbose_stderr}"
+    );
+
+    let report_path = report_dir.join("ic3_unknown_checked.report.json");
+    let report_json =
+        std::fs::read_to_string(&report_path).expect("should read generated json report");
+    let value: serde_json::Value =
+        serde_json::from_str(&report_json).expect("report should be valid JSON");
+    let diagnostics = value
+        .pointer("/results/0/backend_diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .expect("checked result should carry backend diagnostics");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                == Some("IC3/PDR")
+                && diagnostic.get("phase").and_then(serde_json::Value::as_str)
+                    == Some("unbounded_safety")
+                && diagnostic
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| message.to_lowercase().contains("cvc5"))
+        }),
+        "report JSON should preserve structured IC3 unknown reason: {report_json}"
     );
 }
 
@@ -5222,55 +5694,55 @@ fn verify_until_fixture() {
     let prog = lower_file("tests/fixtures/until.ab");
     let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
 
-    // Direct: Red until Green is bounded-checked on this finite fixture.
+    // Direct: default stutter can keep a newly-created Red signal in a lasso
+    // forever before `toggle` fires.
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Checked { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "direct_until"
         )),
-        "direct_until should produce CHECKED"
+        "direct_until should produce LIVENESS VIOLATION"
     );
 
-    // Indirect: Red until Green fails (Yellow intervenes)
+    // Indirect: Red until Green fails (Yellow intervenes).
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Counterexample { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "indirect_fails"
         )),
-        "indirect_fails should produce COUNTEREXAMPLE"
+        "indirect_fails should produce LIVENESS VIOLATION"
     );
 
-    // StuckRed has no active signal in the bounded prefix, so the universal
-    // property is bounded-checked vacuously.
+    // StuckRed can create a Red signal and then stutter forever.
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Checked { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "never_green"
         )),
-        "never_green should produce CHECKED"
+        "never_green should produce LIVENESS VIOLATION"
     );
 
-    // Via prop: until inside prop definition (def expansion path)
+    // Via prop: until inside prop definition (def expansion path).
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Checked { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "via_prop"
         )),
-        "via_prop should produce CHECKED"
+        "via_prop should produce LIVENESS VIOLATION"
     );
 
-    // Via pred: until inside pred definition (def expansion path)
+    // Via pred: until inside pred definition (def expansion path).
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Checked { name, .. }
+            abide::verify::VerificationResult::LivenessViolation { name, .. }
                 if name == "via_pred"
         )),
-        "via_pred should produce CHECKED"
+        "via_pred should produce LIVENESS VIOLATION"
     );
 }
 
@@ -6686,6 +7158,120 @@ fn assert_verify_result_success(results: &[abide::verify::VerificationResult], n
     assert!(
         found.is_some(),
         "{name} should be PROVED or CHECKED (got: {results:?})"
+    );
+}
+
+#[test]
+fn ordinary_verify_defaults_to_bounded_check_with_proof_mode_hint() {
+    let src = r"module T
+
+entity Counter { value: int = 0 }
+
+system Inc(counters: Store<Counter>) {
+  command inc(c: Counter) requires c.value >= 0 {
+    c.value' = c.value + 1
+  }
+}
+
+verify bounded_counter {
+  assume {
+    store counters: Counter[1..1]
+    let inc = Inc { counters: counters }
+    stutter
+  }
+
+  assert always (all c: Counter | c.value >= 0)
+}
+";
+
+    let results = verify_source(src);
+
+    let result = results
+        .iter()
+        .find(|result| {
+            matches!(
+                result,
+                abide::verify::VerificationResult::Checked { name, .. }
+                    if name == "bounded_counter"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("ordinary verify should default to bounded CHECKED, got {results:?}")
+        });
+    let diagnostics = result.backend_diagnostics();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.phase == "proof_mode"
+                && diagnostic.message.contains("--ic3")
+                && diagnostic.message.contains("--unbounded-only")
+        }),
+        "bounded CHECKED verify should carry an explicit proof-mode hint, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn explicit_ic3_mode_still_allows_verify_proofs() {
+    let src = r"module T
+
+entity Counter { value: int = 0 }
+
+system Inc(counters: Store<Counter>) {
+  command inc(c: Counter) requires c.value >= 0 {
+    c.value' = c.value + 1
+  }
+}
+
+verify bounded_counter {
+  assume {
+    store counters: Counter[1..1]
+    let inc = Inc { counters: counters }
+    stutter
+  }
+
+  assert always (all c: Counter | c.value >= 0)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            no_ic3: false,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| {
+            matches!(
+                result,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    if name == "bounded_counter"
+            )
+        }),
+        "explicit IC3/proof mode should still allow proof search, got {results:?}"
+    );
+}
+
+#[test]
+fn cli_verify_help_discloses_short_default_timeout() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .args(["verify", "--help"])
+        .output()
+        .expect("run abide verify --help");
+
+    assert!(
+        output.status.success(),
+        "help should exit successfully: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("default: 30"),
+        "verify help should disclose the short ordinary timeout default: {stdout}"
+    );
+    assert!(
+        stdout.contains("--ic3"),
+        "verify help should expose the explicit proof-search opt-in: {stdout}"
     );
 }
 
@@ -9566,6 +10152,73 @@ system SlackAdapter implements NotificationBackend {
 }
 
 #[test]
+fn interface_command_without_return_matches_implementation_without_return() {
+    let src = r"module T
+
+interface NotificationBackend {
+  command send(recipient: string, body: string)
+}
+
+system SlackAdapter implements NotificationBackend {
+  command send(recipient: string, body: string) {
+  }
+}
+";
+    let result = elaborate_source(src);
+    assert_eq!(result.interfaces.len(), 1);
+    assert_eq!(result.systems.len(), 1);
+    assert_eq!(
+        result.systems[0].implements.as_deref(),
+        Some("NotificationBackend")
+    );
+}
+
+#[test]
+fn interface_command_missing_return_is_rejected() {
+    let src = r"module T
+
+interface NotificationBackend {
+  command send(recipient: string, body: string) -> string
+}
+
+system SlackAdapter implements NotificationBackend {
+  command send(recipient: string, body: string) {
+  }
+}
+";
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains(
+            "command `send` has no return type but interface `NotificationBackend` requires `string`"
+        )),
+        "expected missing command return diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn interface_command_over_return_is_rejected() {
+    let src = r#"module T
+
+interface NotificationBackend {
+  command send(recipient: string, body: string)
+}
+
+system SlackAdapter implements NotificationBackend {
+  command send(recipient: string, body: string) -> string {
+    return "queued"
+  }
+}
+"#;
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains(
+            "command `send` returns `string` but interface `NotificationBackend` declares no return value"
+        )),
+        "expected command over-return diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
 fn interface_missing_required_query_is_rejected() {
     let src = r"module T
 
@@ -12096,6 +12749,48 @@ fn temporal_implies_grouping_preserved_per_item_21_4() {
     }
 }
 
+#[test]
+fn arrow_sequence_in_verify_assertion_points_to_implies() {
+    let src = r"module T
+
+verify v {
+  assert true -> false
+}
+";
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| {
+            e.message
+                .contains("`->` is sequence composition, not implication")
+                && e.help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("use `implies`"))
+        }),
+        "expected dedicated `->` vs `implies` diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn arrow_sequence_in_prop_points_to_implies() {
+    let src = r"module T
+
+system S {}
+
+prop p for S = true -> false
+";
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| {
+            e.message
+                .contains("`->` is sequence composition, not implication")
+                && e.help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("use `implies`"))
+        }),
+        "expected dedicated `->` vs `implies` diagnostic, got: {errors:?}"
+    );
+}
+
 /// Future-time liveness operators `eventually` and `until` are also
 /// rejected in invariant bodies.
 #[test]
@@ -12887,24 +13582,20 @@ extern Stripe {
 /// arrow forms after `saw` are rejected.
 #[test]
 fn saw_arrow_form_rejected() {
-    let src = r"verify v {
-  assume {
-    store es: E[0..1]
-    let s = S { es: es }
-  } assert saw S::tick() -> true }";
-    let tokens = lex::lex(src);
-    // This should either fail at parse or lex level. The arrow after saw
-    // might parse differently since -> is the sequence operator. Let's
-    // check that saw parses as a standalone expression — the -> is a
-    // separate infix and should produce `Seq(Saw(...), true)` which is
-    // valid at the parse level. The arrow rejection fires only when ->
-    // immediately follows the closing paren of the saw argument list.
-    // In practice, `saw S::tick() -> true` parses as
-    // `(saw S::tick()) -> true` which is a sequence. This is valid.
-    //
-    // Skip this test — the parser correctly treats -> as the sequence
-    // operator at a lower binding power than the prefix `saw`.
-    assert!(tokens.is_ok() || tokens.is_err());
+    for arrow in ["->", "=>"] {
+        let src =
+            format!("module T\n\nverify v {{\n  assert saw Stripe::charge(1) {arrow} @ok\n}}");
+        let tokens = lex::lex(&src).unwrap_or_else(|errors| panic!("lex errors: {errors:?}"));
+        let mut parser = Parser::new(tokens);
+        let err = parser
+            .parse_program()
+            .expect_err("saw arrow return-value forms must be rejected by the parser");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("`saw` matches the command call, not the return value"),
+            "expected saw arrow parser diagnostic for {arrow}, got: {rendered}"
+        );
+    }
 }
 
 /// review: `saw` inside a function contract produces the
@@ -14451,7 +15142,7 @@ verify fulfill_is_executable {
 }
 
 #[test]
-fn proc_start_and_node_transitions_are_provable_with_cvc5() {
+fn proc_start_and_node_transitions_are_proved_by_cvc5_sygus() {
     require_unbounded_proof_tests!();
 
     let src = r"module T
@@ -14494,6 +15185,7 @@ verify fulfill_is_executable {
         abide::verify::VerifyConfig {
             solver_selection: abide::verify::SolverSelection::Cvc5,
             unbounded_only: true,
+            cvc5_sygus: true,
             no_ic3: true,
             ..abide::verify::VerifyConfig::default()
         },
@@ -14501,10 +15193,11 @@ verify fulfill_is_executable {
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Proved { name, .. }
+            abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "fulfill_is_executable"
+                    && method == "CVC5 SyGuS invariant synthesis"
         )),
-        "expected CVC5 proof for proc workflow execution, got: {results:?}"
+        "expected CVC5 SyGuS to prove proc workflow execution, got: {results:?}"
     );
     assert!(
         !results.iter().any(|r| matches!(
@@ -14517,7 +15210,7 @@ verify fulfill_is_executable {
 }
 
 #[test]
-fn proc_store_workflow_is_provable_with_cvc5() {
+fn proc_store_workflow_is_proved_by_cvc5_sygus() {
     require_unbounded_proof_tests!();
 
     let src = r"module T
@@ -14566,6 +15259,7 @@ verify fulfill_is_safe {
         abide::verify::VerifyConfig {
             solver_selection: abide::verify::SolverSelection::Cvc5,
             unbounded_only: true,
+            cvc5_sygus: true,
             no_ic3: true,
             ..abide::verify::VerifyConfig::default()
         },
@@ -14573,10 +15267,11 @@ verify fulfill_is_safe {
     assert!(
         results.iter().any(|r| matches!(
             r,
-            abide::verify::VerificationResult::Proved { name, .. }
+            abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "fulfill_is_safe"
+                    && method == "CVC5 SyGuS invariant synthesis"
         )),
-        "expected CVC5 proof for pooled proc workflow safety, got: {results:?}"
+        "expected CVC5 SyGuS to prove pooled proc workflow safety, got: {results:?}"
     );
     assert!(
         !results.iter().any(|r| matches!(
@@ -14585,6 +15280,62 @@ verify fulfill_is_safe {
                 if name == "fulfill_is_safe"
         )),
         "pooled proc workflow should not deadlock under CVC5 routing, got: {results:?}"
+    );
+}
+
+#[test]
+fn verifier_reports_macro_step_encoding_errors_without_panicking() {
+    let src = r"module T
+
+entity Order { status: int = 0 }
+
+enum Outcome = ok | err
+
+system Worker(orders: Store<Order>) {
+  command decide(order: Order) -> Outcome requires order.status == 0 {
+    order.status' = 1
+  }
+
+  command commit(order: Order) requires order.status == 1 {
+    order.status' = 2
+  }
+}
+
+program Shop(orders: Store<Order>) {
+  let worker = Worker { orders: orders }
+
+  proc run(order: Order) {
+    decision = worker.decide(order)
+    done = worker.commit(order)
+
+    done needs decision.ok
+  }
+}
+
+verify macro_step_encoder_error {
+  assume {
+    store orders: Order[0..1]
+    let shop = Shop { orders: orders }
+  }
+  assert always true
+}
+";
+
+    let outcome = std::panic::catch_unwind(|| verify_source(src));
+    assert!(
+        outcome.is_ok(),
+        "macro-step encoding failures should be verifier diagnostics, not panics"
+    );
+    let results = outcome.expect("panic checked above");
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "macro_step_encoder_error"
+                    && hint.contains("transition encoding error")
+                    && hint.contains("return a value")
+        )),
+        "expected Unprovable transition-encoding diagnostic, got: {results:?}"
     );
 }
 
@@ -16336,6 +17087,110 @@ verify v {
     }
 }
 
+/// generic enum nested inside a newtype inner type must be registered as a
+/// concrete monomorphized enum, not merely inlined at the use site.
+#[test]
+fn generic_enum_nested_in_newtype_inner_lowers() {
+    use std::io::Write;
+    let src = r"module T
+
+enum Option<T> = Some(T) | None
+type MaybeInt(Option<int>)
+
+entity Holder {
+  id: identity
+  wrapped: MaybeInt
+}
+
+system Registry(holders: Store<Holder>) { }
+
+verify v {
+  assume {
+    store holders: Holder[0..1]
+    let registry = Registry { holders: holders }
+    stutter
+  }
+  assert always true
+}
+";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("test.ab");
+    let mut f = std::fs::File::create(&file).expect("create");
+    f.write_all(src.as_bytes()).expect("write");
+    drop(f);
+    let path_str = file.to_str().unwrap().to_owned();
+    let prog = lower_file(&path_str);
+    let type_names: Vec<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        type_names.contains(&"Option<int>"),
+        "expected Option<int> to be registered from newtype inner type, got: {type_names:?}"
+    );
+}
+
+/// generic enum nested inside relation columns must be discovered and
+/// registered before lowering.
+#[test]
+fn generic_enum_nested_in_relation_type_lowers() {
+    use std::io::Write;
+    let src = r"module T
+
+enum Option<T> = Some(T) | None
+type MaybeEdges = Rel<Option<int>, int>
+
+entity Graph {
+  id: identity
+  edges: MaybeEdges
+}
+
+system Registry(graphs: Store<Graph>) { }
+
+verify v {
+  assume {
+    store graphs: Graph[0..1]
+    let registry = Registry { graphs: graphs }
+    stutter
+  }
+  assert always true
+}
+";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("test.ab");
+    let mut f = std::fs::File::create(&file).expect("create");
+    f.write_all(src.as_bytes()).expect("write");
+    drop(f);
+    let path_str = file.to_str().unwrap().to_owned();
+    let prog = lower_file(&path_str);
+    let type_names: Vec<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        type_names.contains(&"Option<int>"),
+        "expected Option<int> to be registered from relation column type, got: {type_names:?}"
+    );
+}
+
+#[test]
+fn generic_enum_wrong_arity_in_relation_alias_rejected() {
+    let errors = elab_errors(
+        r"module T
+
+enum Option<T> = Some(T) | None
+type BadEdges = Rel<Option<int, bool>, int>
+",
+    );
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("expects 1 type argument") || e.contains("arity")),
+        "expected generic arity diagnostic for relation column, got: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("Ty::Param")),
+        "generic misuse should be diagnosed before Ty::Param leaks: {errors:?}"
+    );
+}
+
 /// nested generic elaborates cleanly — no errors
 #[test]
 fn nested_generic_elaborates_cleanly() {
@@ -16452,6 +17307,54 @@ verify v {
             if name == "v"
         )),
         "expected verify with multi-instantiation defaults to pass, got: {results:?}"
+    );
+}
+
+#[test]
+fn generic_enum_distinguishes_nominal_newtype_arguments() {
+    use std::io::Write;
+    let src = r"module T
+
+enum Box<T> = Full(T) | Empty
+type UserId(string)
+type OrderId(string)
+
+entity Pair {
+  user: Box<UserId> = @Empty
+  order: Box<OrderId> = @Empty
+}
+
+system Registry(pairs: Store<Pair>) { }
+
+verify v {
+  assume {
+    store pairs: Pair[0..1]
+    let registry = Registry { pairs: pairs }
+    stutter
+  }
+  assert always true
+}
+";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("test.ab");
+    let mut f = std::fs::File::create(&file).expect("create");
+    f.write_all(src.as_bytes()).expect("write");
+    drop(f);
+    let path_str = file.to_str().unwrap().to_owned();
+    let prog = lower_file(&path_str);
+    let type_names: Vec<&str> = prog.types.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        type_names.contains(&"Box<UserId>"),
+        "expected Box<UserId> monomorphization, got {type_names:?}"
+    );
+    assert!(
+        type_names.contains(&"Box<OrderId>"),
+        "expected Box<OrderId> monomorphization, got {type_names:?}"
+    );
+    assert!(
+        !type_names.iter().any(|name| name.contains("Box<?>")),
+        "newtype arguments must not collapse through a fallback cache key: {type_names:?}"
     );
 }
 
@@ -16941,6 +17844,55 @@ fn named_refinement_type_parameter() {
                 if name == "v"
         )),
         "named refinement should PROVE, got: {results:?}"
+    );
+}
+
+/// Named refinement predicates must rename parameter references even when they
+/// are nested under expression forms such as `if`.
+#[test]
+fn named_refinement_nested_if_predicate_is_enforced_at_call_site() {
+    let src = r"module T
+
+type PositiveIf = x: int{if x > 0 { true } else { false }}
+
+fn consume_positive(n: PositiveIf): int
+  ensures result == 0
+{
+  0
+}
+
+fn call_good(x: int): int
+  requires x > 0
+  ensures result == 0
+{
+  consume_positive(x)
+}
+
+fn call_bad(x: int): int
+  ensures result == 0
+{
+  consume_positive(x)
+}
+";
+
+    let results = verify_source(src);
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { name, .. }
+                if name == "call_good"
+        )),
+        "caller with x > 0 should satisfy nested named refinement: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_call_bad"
+                    && hint.contains("precondition of called function may not hold")
+        )),
+        "unconstrained caller must fail the nested named refinement precondition: {results:?}"
     );
 }
 

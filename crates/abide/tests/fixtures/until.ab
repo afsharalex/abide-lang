@@ -28,7 +28,8 @@ system Indirect(signals: Store<Signal>) {
   }
 }
 
-// Red holds until Green — should PROVE (Red then directly Green)
+// Red until Green is false under default stutter: after a signal is created,
+// the execution may stutter forever before `toggle` fires.
 verify direct_until {
   assume {
     store signals: Signal[0..5]
@@ -38,7 +39,7 @@ verify direct_until {
     s.color == @Red until s.color == @Green
 }
 
-// Red until Green — should FAIL because Red becomes Yellow first
+// Red until Green fails because Red can become Yellow first.
 verify indirect_fails {
   assume {
     store signals: Signal[0..5]
@@ -54,8 +55,8 @@ system StuckRed(signals: Store<Signal>) {
   // No action changes color — signals stay Red forever
 }
 
-// Red until Green — should FAIL because Green never occurs
-// (Q never becomes true violates the "until" requirement)
+// Red until Green fails because Green never occurs; default stutter can keep
+// an active Red signal in the lasso forever.
 verify never_green {
   assume {
     store signals: Signal[0..5]

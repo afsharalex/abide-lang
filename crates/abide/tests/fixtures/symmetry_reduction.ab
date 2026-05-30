@@ -1,14 +1,15 @@
 module SymmetryReduction
 
-// Symmetry reduction tests
+// Symmetry validation tests
 //
 // Symmetric system: entities have identical transitions, no inter-entity
-// Choose/ForAll over the same type. Quantified liveness is PROVED by
-// reducing to a 1-slot system and using IC3.
+// Choose/ForAll over the same type. Quantified liveness is still UNPROVABLE on
+// the theorem path because the current IC3/BAS monitor has an unsound coarse
+// justice encoding for liveness proof claims.
 //
 // Asymmetric system: event body has nested Choose over the same entity
-// type (inter-entity interaction). Symmetry validation fails, falls
-// back to lasso BMC (CHECKED) or UNPROVABLE (theorem).
+// type (inter-entity interaction). Symmetry validation fails, and theorem
+// liveness remains UNPROVABLE.
 //
 // POST-SWEEP: fairness lives in `assume { }` blocks on the verification site.
 

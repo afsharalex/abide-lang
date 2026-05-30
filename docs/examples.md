@@ -1,13 +1,48 @@
 # Examples
 
-Curated examples live in [`abide-lang/examples/`](../examples/). Every example listed here is intended to run under:
+Curated examples live in [`abide-lang/examples/`](../examples/). Examples with
+top-level `verify` blocks are intended to run with the bounded verifier, either
+as a whole file or by selecting a specific target:
 
 ```bash
-abide verify examples/<name>.ab --bounded-only
+abide verify examples/<name>.ab
+abide verify examples/<name>.ab --target verify:<target>
 ```
+
+Ordinary `verify` defaults to bounded/exploration checking. Add `--ic3` or
+`--unbounded-only` only when you intentionally want proof-search behavior.
+
+Some syntax-focused examples contain only functions, predicates, scenes, or data
+model declarations. Use `--no-fn-verify` or `--no-prop-verify` for quick parser
+and elaboration smoke checks when you do not want implicit proof obligations.
 
 Intentional failure examples are listed separately at the end. Run them by
 target name because the expected outcome is a verifier failure.
+
+Expected bounded verify targets:
+
+| Example | Target | Expected bounded verdict |
+| --- | --- | --- |
+| `advanced_temporal.ab` | `until_and_history` | `CHECKED` |
+| `banking.ab` | `account_safety` | `CHECKED` |
+| `collections.ab` | `set_source_comprehension` | `CHECKED` |
+| `collections.ab` | `typed_set_source_comprehension` | `CHECKED` |
+| `collections.ab` | `seq_source_comprehension` | `CHECKED` |
+| `commerce.ab` | `payment_integrity` | `CHECKED` |
+| `healthcare.ab` | `admitted_patients_have_rooms` | `CHECKED` |
+| `order.ab` | `shipped_orders_have_positive_totals` | `CHECKED` |
+| `orchestration.ab` | `published_documents_leave_draft` | `PROVED` |
+| `proofs_and_boundaries.ab` | `closed_tickets_stay_closed` | `CHECKED` |
+| `proofs_and_boundaries.ab` | `open_tickets_eventually_close` | `CHECKED` |
+| `relations.ab` | `stage_lane_join` | `CHECKED` |
+| `relations.ab` | `transpose_flips_columns` | `CHECKED` |
+| `relations.ab` | `lifecycle_reachability` | `CHECKED` |
+| `relations.ab` | `lifecycle_reachability_with_identity` | `CHECKED` |
+| `relations.ab` | `product_cardinality` | `CHECKED` |
+| `relations.ab` | `projection_keeps_order_ids` | `CHECKED` |
+| `relations.ab` | `filtered_relation_comprehension_matches_join` | `CHECKED` |
+| `relations.ab` | `store_backed_relation_reachability` | `CHECKED` |
+| `state_modeling.ab` | `state_modeling_smoke` | `CHECKED` |
 
 ## Minimal order lifecycle
 
@@ -15,8 +50,9 @@ See: [`examples/order.ab`](../examples/order.ab)
 
 Highlights:
 - store-backed system constructor: `system Orders(orders: Store<Order>)`
-- inline `command` bodies
-- `query`
+- public identity-based `command` bodies
+- public read-only `query`
+- private entity `action` calls inside commands
 - `verify` with `assume { store ...; let ... }`
 
 ```abide
@@ -24,9 +60,10 @@ system Orders(orders: Store<Order>) {
   query payable(order: Order) =
     order.status == @Pending and order.total > 0
 
-  command confirm_order(order: Order)
-    requires payable(order) {
-    order.confirm()
+  command confirm_order(order_id: identity) {
+    choose order: Order where order.id == order_id and order.status == @Pending and order.total > 0 {
+      order.confirm()
+    }
   }
 }
 ```
@@ -135,7 +172,7 @@ Highlights:
 - recursion and termination
 - imperative `var` / `while` / invariants
 
-## Proofs and external boundaries
+## Advanced: proofs and external boundaries
 
 See: [`examples/proofs_and_boundaries.ab`](../examples/proofs_and_boundaries.ab)
 

@@ -3,6 +3,12 @@ use crate::ir::types::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// Transitional split map for the legacy verifier integration tests:
+// - witness_replay: replayable operational counterexample evidence.
+// Future mechanical slices should follow feature boundaries such as
+// explicit_state, collections, theorem_dispatch, temporal, and solver_selection.
+mod witness_replay;
+
 // NOTE: I don't know if I like having a separate file for this, but I'm not sure
 // where else to put it. Should see if we can break this up and move to their local
 // modules/files.
@@ -14,6 +20,13 @@ fn short_solver_regression_config() -> VerifyConfig {
         ic3_timeout_ms: 5_000,
         overall_timeout_ms: 15_000,
         ..VerifyConfig::default()
+    }
+}
+
+fn proof_search_regression_config() -> VerifyConfig {
+    VerifyConfig {
+        no_ic3: false,
+        ..short_solver_regression_config()
     }
 }
 
@@ -69,6 +82,22 @@ fn int_lit(value: i64) -> IRExpr {
         value: LitVal::Int { value },
         span: None,
     }
+}
+
+fn system_enum_variant<'a>(state: &'a op::State, system: &str, field: &str) -> Option<&'a str> {
+    match state.system_fields().get(system)?.get(field)? {
+        op::WitnessValue::EnumVariant { variant, .. } => Some(variant.as_str()),
+        _ => None,
+    }
+}
+
+fn behavior_has_command(behavior: &op::Behavior, system: &str, command: &str) -> bool {
+    behavior.transitions().iter().any(|transition| {
+        transition
+            .atomic_steps()
+            .iter()
+            .any(|step| step.system() == system && step.command() == command)
+    })
 }
 
 macro_rules! require_unbounded_proof_tests {
@@ -214,6 +243,7 @@ fn make_order_ir(assert_expr: IRExpr, bound: usize) -> IRProgram {
         stores: vec![],
         assumption_set: crate::ir::types::IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -264,6 +294,7 @@ fn verification_panic_boundary_preserves_success_result() {
             method: None,
             time_ms: 0,
             assumptions: vec![],
+            backend_diagnostics: vec![],
             span: None,
             file: None,
         }
@@ -466,6 +497,7 @@ fn make_system_field_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -590,6 +622,7 @@ fn make_system_field_enum_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -687,6 +720,7 @@ fn make_system_field_enum_deadlock_ir() -> IRProgram {
     ir.verifies[0].name = "workflow_deadlocks_after_finish".to_owned();
     ir.verifies[0].assumption_set = IRAssumptionSet {
         stutter: false,
+        stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
         weak_fair: Vec::new(),
         strong_fair: Vec::new(),
         per_tuple: Vec::new(),
@@ -840,6 +874,7 @@ fn make_system_field_eventual_liveness_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -974,6 +1009,7 @@ fn make_system_field_bool_param_weak_fair_eventual_liveness_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: vec![IRCommandRef {
                 system: "ToggleLiveness".to_owned(),
                 command: "set_flag".to_owned(),
@@ -1225,6 +1261,7 @@ fn make_system_field_enum_param_per_tuple_weak_fair_liveness_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: vec![IRCommandRef {
                 system: "TupleFairness".to_owned(),
                 command: "serve".to_owned(),
@@ -1474,6 +1511,7 @@ fn make_system_field_strong_fair_eventual_liveness_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
             weak_fair: Vec::new(),
             strong_fair: vec![IRCommandRef {
                 system: "WorkflowStrongFair".to_owned(),
@@ -1695,6 +1733,7 @@ fn make_multi_system_field_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -1904,6 +1943,7 @@ fn make_explicit_entity_store_ir() -> IRProgram {
         }],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -2035,6 +2075,7 @@ fn make_explicit_entity_store_deadlock_ir() -> IRProgram {
     ir.verifies[0].name = "ticket_pool_deadlocks_without_create".to_owned();
     ir.verifies[0].assumption_set = IRAssumptionSet {
         stutter: false,
+        stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
         weak_fair: Vec::new(),
         strong_fair: Vec::new(),
         per_tuple: Vec::new(),
@@ -2051,6 +2092,7 @@ fn make_explicit_entity_store_eventual_liveness_ir() -> IRProgram {
     ir.verifies[0].name = "tickets_eventually_finish".to_owned();
     ir.verifies[0].assumption_set = IRAssumptionSet {
         stutter: true,
+        stutter_provenance: IRStutterProvenance::Default,
         weak_fair: Vec::new(),
         strong_fair: Vec::new(),
         per_tuple: Vec::new(),
@@ -2103,6 +2145,7 @@ fn make_explicit_entity_store_implication_liveness_ir() -> IRProgram {
     ir.verifies[0].name = "tickets_pending_implies_eventually_finish".to_owned();
     ir.verifies[0].assumption_set = IRAssumptionSet {
         stutter: true,
+        stutter_provenance: IRStutterProvenance::Default,
         weak_fair: Vec::new(),
         strong_fair: Vec::new(),
         per_tuple: Vec::new(),
@@ -2317,6 +2360,7 @@ fn make_explicit_entity_store_transition_arg_counterexample_ir() -> IRProgram {
         }],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -2554,6 +2598,7 @@ fn make_explicit_entity_store_ref_counterexample_ir() -> IRProgram {
         }],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -2953,6 +2998,7 @@ fn make_explicit_entity_store_ref_param_per_tuple_weak_fair_liveness_ir() -> IRP
         }],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: vec![IRCommandRef {
                 system: "TicketPeerParamOps".to_owned(),
                 command: "set_one_with_peer".to_owned(),
@@ -4318,6 +4364,7 @@ fn make_explicit_multi_entity_store_counterexample_ir() -> IRProgram {
         ],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -4687,6 +4734,7 @@ fn make_explicit_system_cross_call_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -4934,6 +4982,7 @@ fn make_explicit_system_let_crosscall_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -5202,6 +5251,7 @@ fn make_explicit_system_match_crosscall_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -5576,6 +5626,7 @@ fn make_explicit_entity_store_param_per_tuple_weak_fair_liveness_ir() -> IRProgr
         }],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: vec![IRCommandRef {
                 system: "TicketFairParamOps".to_owned(),
                 command: "set_one".to_owned(),
@@ -5717,6 +5768,7 @@ fn make_system_field_bool_param_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -5837,6 +5889,7 @@ fn make_system_field_enum_param_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -5993,6 +6046,7 @@ fn make_system_field_counter_with_invariant_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -6123,6 +6177,7 @@ fn make_system_field_match_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -6306,6 +6361,7 @@ fn make_pooled_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -6500,6 +6556,7 @@ fn make_pooled_ticket_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -6694,6 +6751,7 @@ fn make_pooled_ref_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -6892,6 +6950,7 @@ fn make_pooled_nested_ref_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -7085,6 +7144,7 @@ fn make_pooled_forall_nested_ref_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -7271,6 +7331,7 @@ fn make_pooled_arg_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -7636,6 +7697,7 @@ fn make_pooled_match_crosscall_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -7861,6 +7923,7 @@ fn make_pooled_let_crosscall_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -8141,6 +8204,7 @@ fn make_pooled_match_var_crosscall_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -8405,6 +8469,7 @@ fn make_pooled_let_crosscall_into_crosscall_arg_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -8639,6 +8704,7 @@ fn make_pooled_callee_field_crosscall_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -8905,6 +8971,7 @@ fn make_pooled_callee_store_crosscall_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -9161,6 +9228,7 @@ fn make_pooled_apply_chain_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -9356,6 +9424,7 @@ fn make_pooled_create_then_inc_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -9476,6 +9545,7 @@ fn make_pooled_store_counter_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -9883,6 +9953,7 @@ fn make_multi_pooled_counter_marker_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -11307,6 +11378,7 @@ fn make_dead_event_theorem_ir(invariants: Vec<IRExpr>, shows: Vec<IRExpr>) -> IR
             // user must opt out via `assume { no stutter }`.
             assumption_set: crate::ir::types::IRAssumptionSet {
                 stutter: false,
+                stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
                 weak_fair: Vec::new(),
                 strong_fair: Vec::new(),
                 per_tuple: Vec::new(),
@@ -11630,68 +11702,35 @@ fn tiered_unbounded_only_returns_unknown_on_failure() {
 }
 
 #[test]
-fn bmc_timeout_returns_unknown() {
-    // With a 1ms BMC timeout, even a simple property should return UNKNOWN
-    // because the solver can't finish in time.
-    let property = IRExpr::Always {
-        body: Box::new(IRExpr::Forall {
-            var: "o".to_owned(),
-            domain: IRType::Entity {
-                name: "Order".to_owned(),
-            },
-            body: Box::new(IRExpr::BinOp {
-                op: "OpNEq".to_owned(),
-                left: Box::new(IRExpr::Field {
-                    expr: Box::new(IRExpr::Var {
-                        name: "o".to_owned(),
-                        ty: IRType::Entity {
-                            name: "Order".to_owned(),
-                        },
-
-                        span: None,
-                    }),
-                    field: "status".to_owned(),
-                    ty: IRType::Int,
-
-                    span: None,
-                }),
-                right: Box::new(IRExpr::Lit {
-                    ty: IRType::Int,
-                    value: LitVal::Int { value: -1 },
-
-                    span: None,
-                }),
-                ty: IRType::Bool,
-
-                span: None,
-            }),
-
-            span: None,
-        }),
-
+fn bmc_timeout_unknown_is_reported_as_unprovable_only() {
+    let verify_block = IRVerify {
+        name: "timeout_case".to_owned(),
+        depth: Some(1),
+        systems: vec![],
+        stores: vec![],
+        assumption_set: IRAssumptionSet::default_for_verify(),
+        initial_constraints: vec![],
+        asserts: vec![],
         span: None,
+        file: None,
     };
-    let ir = make_order_ir(property, 10);
     let config = VerifyConfig {
         bounded_only: true,
-        bmc_timeout_ms: 1, // 1ms — too short to solve
+        bmc_timeout_ms: 1,
         ..VerifyConfig::default()
     };
-    let results = verify_all(&ir, &config);
-    assert_eq!(results.len(), 1);
-    // Should be CHECKED/PROVED if a bounded engine is fast enough, or UNKNOWN
-    // on timeout. Accept either successful bounded result — the important
-    // thing is that timeout handling does not panic.
-    assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Checked { .. }
-                | VerificationResult::Proved { .. }
-                | VerificationResult::Unprovable { .. }
-        ),
-        "expected CHECKED, PROVED, or UNKNOWN with 1ms timeout, got: {:?}",
-        results[0]
-    );
+    let result = bmc_unknown_result(&verify_block, &config, "timeout");
+
+    match result {
+        VerificationResult::Unprovable { name, hint, .. } => {
+            assert_eq!(name, "timeout_case");
+            assert!(
+                hint.contains("timed out after 1ms"),
+                "timeout path should produce a timeout-specific diagnostic, got: {hint}"
+            );
+        }
+        other => panic!("timeout unknown must not be accepted as proof success: {other:?}"),
+    }
 }
 
 #[test]
@@ -11960,6 +11999,7 @@ fn ic3_proves_property_induction_cannot() {
             stores: vec![],
             assumption_set: crate::ir::types::IRAssumptionSet {
                 stutter: true,
+                stutter_provenance: IRStutterProvenance::Default,
                 weak_fair: Vec::new(),
                 strong_fair: Vec::new(),
                 per_tuple: Vec::new(),
@@ -12303,6 +12343,7 @@ fn make_two_counter_ir() -> IRProgram {
             stores: vec![],
             assumption_set: crate::ir::types::IRAssumptionSet {
                 stutter: true,
+                stutter_provenance: IRStutterProvenance::Default,
                 weak_fair: Vec::new(),
                 strong_fair: Vec::new(),
                 per_tuple: Vec::new(),
@@ -12902,8 +12943,8 @@ fn contains_liveness_distinguishes_history_from_liveness() {
         span: None,
     };
 
-    assert!(contains_liveness(&previously));
-    assert!(contains_liveness(&since));
+    assert!(!contains_liveness(&previously));
+    assert!(!contains_liveness(&since));
     assert!(!contains_liveness(&historically));
     assert!(!contains_liveness(&once));
 }
@@ -13204,7 +13245,7 @@ fn map_field_verify_index_after_update() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
     assert_eq!(results.len(), 2, "expected 2 verify results");
 
     // Reflexivity: data[42] == data[42] — PROVED by induction (trivially true)
@@ -13989,7 +14030,7 @@ fn set_literal_in_property() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
     assert_eq!(results.len(), 1);
     // Set(1,2,3)[2] is always true — should be PROVED
     assert!(
@@ -14137,7 +14178,7 @@ fn set_literal_cardinality() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
     assert_eq!(results.len(), 1);
     // #Set(1,2,3) = 3 — compile-time constant, trivially PROVED
     assert!(
@@ -14282,7 +14323,7 @@ fn set_literal_cardinality_deduplicates() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
     assert_eq!(results.len(), 1);
     assert!(
         matches!(&results[0], VerificationResult::Proved { .. }),
@@ -14526,10 +14567,10 @@ fn set_comprehension_simple_form() {
 
 #[test]
 fn set_comprehension_membership_check() {
-    // After activate: slot 0 should be in { o: Obj where o.status == @Active }.
-    // Uses Index on the comprehension result to check membership.
-    // This won't be provable (needs invariant linking slot index to active set),
-    // but it validates the full SetComp→Index→Bool encoding chain.
+    // @Idle should become a member of { o.status | o: Obj where true } after
+    // create_obj. The negated safety property below must produce a
+    // counterexample; if SetComp or Index collapses to a stub value, this test
+    // will stop finding it.
     let status_type = IRTypeEntry {
         name: "Status".to_owned(),
         ty: IRType::Enum {
@@ -14590,11 +14631,8 @@ fn set_comprehension_membership_check() {
         procs: vec![],
     };
 
-    // { o: Obj where true }[0] — slot 0 membership in "all objects" set
-    // This is true iff slot 0 is active. Since we can create objects, and
-    // the set includes all active objects, Index(comprehension, 0) == active[0].
-    // We check: Index(comprehension, 0) == Index(comprehension, 0) — reflexive,
-    // but validates the SetComp→Index chain doesn't panic.
+    // { o.status | o: Obj where true }[@Idle] is true iff an active object has
+    // the default Idle status.
     let comp = IRExpr::SetComp {
         var: "o".to_owned(),
         domain: IRType::Entity {
@@ -14607,9 +14645,26 @@ fn set_comprehension_membership_check() {
 
             span: None,
         }),
-        projection: None,
+        projection: Some(Box::new(IRExpr::Field {
+            expr: Box::new(IRExpr::Var {
+                name: "o".to_owned(),
+                ty: IRType::Entity {
+                    name: "Obj".to_owned(),
+                },
+                span: None,
+            }),
+            field: "status".to_owned(),
+            ty: IRType::Enum {
+                name: "Status".to_owned(),
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
+            },
+            span: None,
+        })),
         ty: IRType::Set {
-            element: Box::new(IRType::Int),
+            element: Box::new(IRType::Enum {
+                name: "Status".to_owned(),
+                variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Active")],
+            }),
         },
 
         span: None,
@@ -14617,10 +14672,10 @@ fn set_comprehension_membership_check() {
 
     let comp_at_0 = IRExpr::Index {
         map: Box::new(comp),
-        key: Box::new(IRExpr::Lit {
-            ty: IRType::Int,
-            value: LitVal::Int { value: 0 },
-
+        key: Box::new(IRExpr::Ctor {
+            enum_name: "Status".to_owned(),
+            ctor: "Idle".to_owned(),
+            args: vec![],
             span: None,
         }),
         ty: IRType::Bool,
@@ -14629,10 +14684,9 @@ fn set_comprehension_membership_check() {
     };
 
     let property = IRExpr::Always {
-        body: Box::new(IRExpr::BinOp {
-            op: "OpEq".to_owned(),
-            left: Box::new(comp_at_0.clone()),
-            right: Box::new(comp_at_0),
+        body: Box::new(IRExpr::UnOp {
+            op: "OpNot".to_owned(),
+            operand: Box::new(comp_at_0),
             ty: IRType::Bool,
 
             span: None,
@@ -14668,14 +14722,17 @@ fn set_comprehension_membership_check() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            bounded_only: true,
+            ..VerifyConfig::default()
+        },
+    );
     assert_eq!(results.len(), 1);
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
-        ),
-        "SetComp→Index chain should encode without error: got {}",
+        matches!(&results[0], VerificationResult::Counterexample { name, .. } if name == "set_comp_index"),
+        "SetComp→Index membership should find slot-activation counterexample: got {}",
         results[0]
     );
 }
@@ -14867,7 +14924,7 @@ fn set_comprehension_maps_over_inferred_set_source() {
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results
@@ -14895,7 +14952,7 @@ fn verifier_property_supports_dependent_choose_in_set_comprehension_projection()
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results
@@ -14924,7 +14981,7 @@ fn verifier_property_supports_entity_choose_in_set_comprehension_projection() {
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results.iter().any(
@@ -14953,7 +15010,7 @@ fn verifier_property_counts_entity_choose_set_comprehension_projection_values() 
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results.iter().any(
@@ -14985,7 +15042,7 @@ fn verifier_property_supports_dependent_choose_in_match_binding_arm() {
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results
@@ -15013,7 +15070,7 @@ fn verifier_property_supports_dependent_choose_in_value_binding_match_arm() {
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results
@@ -15074,7 +15131,7 @@ fn set_comprehension_maps_over_inferred_seq_source() {
          }\n",
     );
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
 
     assert!(
         results.iter().any(
@@ -15281,7 +15338,7 @@ fn seq_literal_index_and_cardinality() {
         scenes: vec![],
     };
 
-    let results = verify_all(&ir, &VerifyConfig::default());
+    let results = verify_all(&ir, &proof_search_regression_config());
     assert_eq!(results.len(), 2);
 
     // Seq(10,20,30)[1] == 20 — PROVED (store/select axiom)
@@ -16494,83 +16551,14 @@ fn prop_bmc_depth_controls_bounded_prop_verification() {
     );
 }
 
-#[test]
-fn bmc_counterexample_replay_metadata_accepts_valid_operational_trace() {
-    let ir = lower_fixture("shortest_counterexample.ab");
-    let results = verify_all(
-        &ir,
-        &VerifyConfig {
-            bounded_only: true,
-            ..VerifyConfig::default()
-        },
-    );
-    assert_eq!(results.len(), 1);
-
-    let VerificationResult::Counterexample {
-        replay: Some(replay),
-        ..
-    } = &results[0]
-    else {
-        panic!(
-            "expected counterexample with replay metadata, got {}",
-            results[0]
-        );
-    };
-
-    assert!(replay.checked, "valid operational trace should replay");
-    assert!(
-        replay.property_violated,
-        "replay should confirm property violation"
-    );
-    assert_eq!(replay.steps, 1);
-}
-
-#[test]
-fn bmc_counterexample_replay_rejects_corrupted_operational_trace() {
-    let ir = lower_fixture("shortest_counterexample.ab");
-    let results = verify_all(
-        &ir,
-        &VerifyConfig {
-            bounded_only: true,
-            ..VerifyConfig::default()
-        },
-    );
-    let witness = results[0]
-        .operational_witness()
-        .expect("counterexample should carry operational witness");
-    let behavior = witness.behavior();
-    let corrupted = op::OperationalWitness::counterexample(
-        op::Behavior::from_parts(
-            vec![behavior.states()[0].clone(), behavior.states()[0].clone()],
-            behavior.transitions().to_vec(),
-        )
-        .expect("corrupted behavior still has valid topology"),
-    )
-    .expect("valid operational witness envelope");
-
-    let replay = replay_counterexample_witness(&ir, &ir.verifies[0], &corrupted);
-
-    assert!(!replay.checked, "corrupted transition should not replay");
-    assert!(
-        replay
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("no matching operational successor")),
-        "expected successor mismatch, got {replay:?}"
-    );
-}
-
 // ── Multi-apply sequential composition tests ──────────────────
 
 #[test]
 fn multi_apply_sequential_chaining() {
     // Two sequential Apply actions: pack (status 0→1) then ship (requires status==1, sets 2).
     // With intermediate variable chaining, ship's guard sees the result of pack.
-    // Property: status is always 0 or 2 (never 1) at action boundaries — FALSE because
-    // entities start at 0 and pack_and_ship takes them to 2 in one event step,
-    // but status could be 0 (before pack_and_ship) or 2 (after). Status 1 only
-    // exists in the intermediate state within the event.
-    // Simpler property: status >= 0 (always true). Tests encoding doesn't panic.
+    // The negated safety property below must fail exactly because pack_and_ship
+    // can drive an entity to status 2 in one system event.
     let entity = IREntity {
         name: "F".to_owned(),
         fields: vec![IRField {
@@ -16725,7 +16713,8 @@ fn multi_apply_sequential_chaining() {
         procs: vec![],
     };
 
-    // Property: status >= 0 (always true — 0, 1, or 2)
+    // Property: status < 2 for every entity. A counterexample requires the
+    // sequential Apply chain to pass pack's intermediate status to ship's guard.
     let property = IRExpr::Always {
         body: Box::new(IRExpr::Forall {
             var: "f".to_owned(),
@@ -16733,7 +16722,7 @@ fn multi_apply_sequential_chaining() {
                 name: "F".to_owned(),
             },
             body: Box::new(IRExpr::BinOp {
-                op: "OpGe".to_owned(),
+                op: "OpLt".to_owned(),
                 left: Box::new(IRExpr::Field {
                     expr: Box::new(IRExpr::Var {
                         name: "f".to_owned(),
@@ -16750,7 +16739,7 @@ fn multi_apply_sequential_chaining() {
                 }),
                 right: Box::new(IRExpr::Lit {
                     ty: IRType::Int,
-                    value: LitVal::Int { value: 0 },
+                    value: LitVal::Int { value: 2 },
 
                     span: None,
                 }),
@@ -16798,14 +16787,9 @@ fn multi_apply_sequential_chaining() {
     };
     let results = verify_all(&ir, &config);
     assert_eq!(results.len(), 1);
-    // Should succeed — status is always 0 or 2 at action boundaries, both >= 0.
-    // The key test: this doesn't panic and the guard chain works (ship sees pack's result).
     assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Proved { .. } | VerificationResult::Checked { .. }
-        ),
-        "multi-apply sequential chaining should succeed: got {}",
+        matches!(&results[0], VerificationResult::Counterexample { name, .. } if name == "multi_apply_test"),
+        "multi-apply sequential chaining should reach status 2 counterexample: got {}",
         results[0]
     );
 }
@@ -19097,6 +19081,18 @@ fn format_assumptions_stutter_only() {
 }
 
 #[test]
+fn format_assumptions_default_stutter_only() {
+    let a = vec![TrustedAssumption::DefaultStutter];
+    assert_eq!(super::format_assumptions(&a), " under default stutter");
+}
+
+#[test]
+fn format_assumptions_no_stutter_only() {
+    let a = vec![TrustedAssumption::NoStutter];
+    assert_eq!(super::format_assumptions(&a), " under no stutter");
+}
+
+#[test]
 fn format_assumptions_mixed_ordering() {
     let a = vec![
         TrustedAssumption::StrongFairness {
@@ -19125,6 +19121,131 @@ fn format_assumptions_mixed_ordering() {
     assert_eq!(
         result,
         " under stutter, WF Billing::pay, WF Shipping::ship, SF Billing::charge, by helper, axiom safety_axiom"
+    );
+}
+
+#[test]
+fn format_assumptions_marks_per_tuple_fairness() {
+    let a = vec![
+        TrustedAssumption::Stutter,
+        TrustedAssumption::PerTupleWeakFairness {
+            system: "Workflow".to_owned(),
+            command: "finish".to_owned(),
+        },
+        TrustedAssumption::PerTupleStrongFairness {
+            system: "Workflow".to_owned(),
+            command: "schedule".to_owned(),
+        },
+    ];
+    assert_eq!(
+        super::format_assumptions(&a),
+        " under stutter, WF per-tuple Workflow::finish, SF per-tuple Workflow::schedule"
+    );
+}
+
+#[test]
+fn build_assumptions_discloses_no_stutter_and_per_tuple_fairness() {
+    let finish = IRCommandRef {
+        system: "Workflow".to_owned(),
+        command: "finish".to_owned(),
+    };
+    let schedule = IRCommandRef {
+        system: "Workflow".to_owned(),
+        command: "schedule".to_owned(),
+    };
+    let assumptions = super::build_assumptions(
+        &IRAssumptionSet {
+            stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
+            weak_fair: vec![finish.clone()],
+            strong_fair: vec![schedule.clone()],
+            per_tuple: vec![finish, schedule],
+        },
+        &[],
+    );
+
+    assert!(
+        assumptions
+            .iter()
+            .any(|assumption| matches!(assumption, TrustedAssumption::NoStutter)),
+        "no-stutter mode must be visible in rendered assumptions: {assumptions:?}"
+    );
+    assert!(
+        assumptions.iter().any(|assumption| matches!(
+            assumption,
+            TrustedAssumption::PerTupleWeakFairness { system, command }
+                if system == "Workflow" && command == "finish"
+        )),
+        "weak per-tuple fairness must not collapse to ordinary WF: {assumptions:?}"
+    );
+    assert!(
+        assumptions.iter().any(|assumption| matches!(
+            assumption,
+            TrustedAssumption::PerTupleStrongFairness { system, command }
+                if system == "Workflow" && command == "schedule"
+        )),
+        "strong per-tuple fairness must not collapse to ordinary SF: {assumptions:?}"
+    );
+}
+
+#[test]
+fn build_assumptions_distinguishes_default_explicit_and_no_stutter() {
+    let default = super::build_assumptions(
+        &IRAssumptionSet {
+            stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
+            weak_fair: Vec::new(),
+            strong_fair: Vec::new(),
+            per_tuple: Vec::new(),
+        },
+        &[],
+    );
+    assert_eq!(default.first(), Some(&TrustedAssumption::DefaultStutter));
+
+    let explicit_stutter = super::build_assumptions(
+        &IRAssumptionSet {
+            stutter: true,
+            stutter_provenance: IRStutterProvenance::ExplicitStutter,
+            weak_fair: Vec::new(),
+            strong_fair: Vec::new(),
+            per_tuple: Vec::new(),
+        },
+        &[],
+    );
+    assert_eq!(explicit_stutter.first(), Some(&TrustedAssumption::Stutter));
+
+    let no_stutter = super::build_assumptions(
+        &IRAssumptionSet {
+            stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
+            weak_fair: Vec::new(),
+            strong_fair: Vec::new(),
+            per_tuple: Vec::new(),
+        },
+        &[],
+    );
+    assert_eq!(no_stutter.first(), Some(&TrustedAssumption::NoStutter));
+}
+
+#[test]
+fn trusted_assumption_json_exposes_stutter_provenance() {
+    let value =
+        serde_json::to_value(TrustedAssumption::DefaultStutter).expect("serialize assumption");
+    assert_eq!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("default_stutter")
+    );
+
+    let value = serde_json::to_value(TrustedAssumption::Stutter).expect("serialize assumption");
+    assert_eq!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("stutter")
+    );
+
+    let value = serde_json::to_value(TrustedAssumption::NoStutter).expect("serialize assumption");
+    assert_eq!(
+        value.get("kind").and_then(serde_json::Value::as_str),
+        Some("no_stutter")
     );
 }
 
@@ -19246,6 +19367,7 @@ fn verify_all_with_independent_z3_chc_selection_preserves_ic3_proofs() {
     let config = VerifyConfig {
         solver_selection: SolverSelection::Cvc5,
         chc_selection: ChcSelection::Z3,
+        no_ic3: false,
         ..short_solver_regression_config()
     };
 
@@ -19290,6 +19412,34 @@ fn verify_all_with_cvc5_chc_selection_is_honest_about_current_chc_limit() {
 }
 
 #[test]
+fn ic3_unknown_reason_is_preserved_on_checked_bmc_fallback() {
+    let ir = make_two_counter_ir();
+    let config = VerifyConfig {
+        chc_selection: ChcSelection::Cvc5,
+        no_ic3: false,
+        bmc_timeout_ms: 30_000,
+        overall_timeout_ms: 60_000,
+        ..short_solver_regression_config()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    let checked = results
+        .iter()
+        .find(|result| matches!(result, VerificationResult::Checked { name, .. } if name == "v"))
+        .unwrap_or_else(|| panic!("expected verify block to fall back to CHECKED: {results:?}"));
+    let diagnostics = checked.backend_diagnostics();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.backend == "IC3/PDR"
+                && diagnostic.phase == "unbounded_safety"
+                && diagnostic.message.to_lowercase().contains("cvc5")
+        }),
+        "CHECKED fallback should preserve IC3 unknown reason, got {diagnostics:?} in {checked:?}"
+    );
+}
+
+#[test]
 fn verify_all_with_cvc5_selection_does_not_use_sygus_without_opt_in() {
     let ir = make_system_field_counter_ir();
     let config = VerifyConfig {
@@ -19309,35 +19459,6 @@ fn verify_all_with_cvc5_selection_does_not_use_sygus_without_opt_in() {
                 if method == "CVC5 SyGuS invariant synthesis"
         )),
         "default cvc5 verify path should not use SyGuS without explicit opt-in: {results:?}"
-    );
-}
-
-#[test]
-fn verify_all_with_cvc5_sygus_opt_in_reports_unsupported_fragments() {
-    let mut ir = make_system_field_counter_ir();
-    ir.systems[0].let_bindings.push(IRLetBinding {
-        name: "child".to_owned(),
-        system_type: "CounterSys".to_owned(),
-        store_bindings: vec![],
-    });
-    let config = VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        unbounded_only: true,
-        no_ic3: true,
-        cvc5_sygus: true,
-        ..short_solver_regression_config()
-    };
-
-    let results = verify_all(&ir, &config);
-
-    assert!(
-        matches!(
-            &results[0],
-            VerificationResult::Unprovable { hint, .. }
-                if hint.contains("cvc5 SyGuS opt-in")
-                    && hint.contains("does not support let-bindings")
-        ),
-        "explicit cvc5 SyGuS opt-in should report unsupported fragments honestly: {results:?}"
     );
 }
 
@@ -19458,9 +19579,39 @@ fn verify_all_explicit_state_finds_counterexample_with_operational_witness() {
         matches!(&results[0], VerificationResult::Counterexample { .. }),
         "expected explicit-state counterexample, got: {results:?}"
     );
+    let VerificationResult::Counterexample {
+        replay: Some(replay),
+        ..
+    } = &results[0]
+    else {
+        panic!("expected replay metadata on explicit-state counterexample: {results:?}");
+    };
+    assert!(replay.checked, "explicit-state trace should replay");
     assert!(
-        results[0].operational_witness().is_some(),
-        "expected operational witness on explicit-state counterexample: {results:?}"
+        replay.property_violated,
+        "replay should confirm the pending-status property violation"
+    );
+
+    let witness = results[0]
+        .operational_witness()
+        .expect("expected operational witness on explicit-state counterexample");
+    let op::OperationalWitness::Counterexample { behavior } = witness else {
+        panic!("expected counterexample witness shape, got: {witness:?}");
+    };
+    assert_eq!(
+        system_enum_variant(&behavior.states()[0], "Workflow", "status"),
+        Some("Pending")
+    );
+    assert!(
+        behavior
+            .states()
+            .iter()
+            .any(|state| system_enum_variant(state, "Workflow", "status") == Some("Done")),
+        "counterexample witness should include the violating Done state: {witness:?}"
+    );
+    assert!(
+        behavior_has_command(behavior, "Workflow", "finish"),
+        "counterexample witness should record the finish event: {witness:?}"
     );
 }
 
@@ -19479,9 +19630,25 @@ fn verify_all_explicit_state_finds_deadlock_with_operational_witness() {
         matches!(&results[0], VerificationResult::Deadlock { step: 1, .. }),
         "expected explicit-state deadlock at step 1, got: {results:?}"
     );
+    let witness = results[0]
+        .operational_witness()
+        .expect("expected operational witness on explicit-state deadlock");
+    let op::OperationalWitness::Deadlock { witness: deadlock } = witness else {
+        panic!("expected deadlock witness shape, got: {witness:?}");
+    };
+    assert_eq!(deadlock.deadlocked_at(), 1);
+    let behavior = deadlock.behavior();
+    assert_eq!(
+        system_enum_variant(&behavior.states()[0], "Workflow", "status"),
+        Some("Pending")
+    );
+    assert_eq!(
+        system_enum_variant(&behavior.states()[1], "Workflow", "status"),
+        Some("Done")
+    );
     assert!(
-        results[0].operational_witness().is_some(),
-        "expected operational witness on explicit-state deadlock: {results:?}"
+        behavior_has_command(behavior, "Workflow", "finish"),
+        "deadlock witness should record the transition into the deadlocked state: {witness:?}"
     );
 }
 
@@ -19500,9 +19667,28 @@ fn verify_all_explicit_state_finds_liveness_violation_with_operational_witness()
         .iter()
         .find(|r| matches!(r, VerificationResult::LivenessViolation { .. }))
         .expect("expected explicit-state liveness violation");
+    let witness = liveness
+        .operational_witness()
+        .expect("expected operational witness on explicit-state liveness violation");
+    let op::OperationalWitness::Liveness { witness: lasso } = witness else {
+        panic!("expected liveness witness shape, got: {witness:?}");
+    };
+    let behavior = lasso.behavior();
     assert!(
-        liveness.operational_witness().is_some(),
-        "expected operational witness on explicit-state liveness violation: {results:?}"
+        lasso.loop_start() < behavior.states().len(),
+        "lasso loop start should point at a concrete state: {witness:?}"
+    );
+    assert_eq!(
+        system_enum_variant(
+            &behavior.states()[lasso.loop_start()],
+            "WorkflowLiveness",
+            "phase"
+        ),
+        Some("Pending")
+    );
+    assert!(
+        behavior_has_command(behavior, "WorkflowLiveness", "hold"),
+        "liveness witness should record the pending self-loop that violates eventual finish: {witness:?}"
     );
 }
 
@@ -19848,6 +20034,7 @@ fn make_multi_system_duplicate_field_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: false,
+            stutter_provenance: IRStutterProvenance::ExplicitNoStutter,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -20035,6 +20222,7 @@ fn make_explicit_pooled_let_crosscall_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -20272,6 +20460,7 @@ fn make_explicit_pooled_match_crosscall_counterexample_ir() -> IRProgram {
         stores: vec![],
         assumption_set: IRAssumptionSet {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -22691,6 +22880,41 @@ fn fixture_counterexample_deadlock_and_liveness_results_carry_operational_witnes
     assert!(
         liveness.operational_witness().is_some(),
         "liveness violation should carry operational witness envelope: {liveness:?}"
+    );
+}
+
+#[test]
+fn no_stutter_reaching_deadlock_is_not_proved_by_unbounded_backends() {
+    let ir = lower_source_file(
+        "reachable_deadlock.ab",
+        "module T\n\n\
+         entity Counter {\n  value: int = 0\n\n  action advance() requires value < 1 {\n    value' = value + 1\n  }\n}\n\n\
+         system Counters(counters: Store<Counter>) {\n  \
+         command advance() { choose c: Counter where c.value < 1 { c.advance() } }\n}\n\n\
+         verify reaches_deadlock {\n  \
+         assume {\n    store counters: Counter[1..1]\n    let sys = Counters { counters: counters }\n    no stutter\n  }\n  \
+         assert always true\n}\n",
+    );
+    let config = VerifyConfig {
+        no_ic3: false,
+        ..VerifyConfig::default()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        results
+            .iter()
+            .any(|result| matches!(result, VerificationResult::Deadlock { name, step, .. }
+                if name == "reaches_deadlock" && *step > 0)),
+        "no-stutter reachable deadlock must fall through to the deadlock-aware bounded path, got: {results:?}"
+    );
+    assert!(
+        !results.iter().any(
+            |result| matches!(result, VerificationResult::Proved { name, .. }
+                if name == "reaches_deadlock")
+        ),
+        "unbounded backends must not prove a no-stutter verify that reaches deadlock: {results:?}"
     );
 }
 
@@ -25833,6 +26057,60 @@ fn fixture_relational_liveness_and_nondeterminism_smoke() {
         )),
         "deep_dead_state should exercise deep liveness/dead-state handling: {dead:?}"
     );
+}
+
+#[test]
+fn quantified_liveness_theorems_do_not_use_ic3_bas_proof_claims() {
+    let result_named = |result: &VerificationResult, target: &str| match result {
+        VerificationResult::Proved { name, .. }
+        | VerificationResult::Admitted { name, .. }
+        | VerificationResult::Checked { name, .. }
+        | VerificationResult::Counterexample { name, .. }
+        | VerificationResult::Unprovable { name, .. }
+        | VerificationResult::LivenessViolation { name, .. }
+        | VerificationResult::Deadlock { name, .. }
+        | VerificationResult::ScenePass { name, .. }
+        | VerificationResult::SceneFail { name, .. }
+        | VerificationResult::SceneUnknown { name, .. }
+        | VerificationResult::FnContractProved { name, .. }
+        | VerificationResult::FnContractFailed { name, .. }
+        | VerificationResult::FnContractAdmitted { name, .. } => name == target,
+    };
+
+    for (fixture, names) in [
+        (
+            "liveness_quantified_false.ab",
+            &[
+                "false_eventually_all_green",
+                "true_each_eventually_painted",
+                "until_painted",
+            ][..],
+        ),
+        (
+            "symmetry_reduction.ab",
+            &[
+                "symmetric_eventuality",
+                "symmetric_response",
+                "asymmetric_liveness",
+            ][..],
+        ),
+    ] {
+        let results = verify_fixture(fixture);
+        for name in names {
+            let result = results
+                .iter()
+                .find(|result| result_named(result, name))
+                .unwrap_or_else(|| panic!("{fixture} should produce result {name}: {results:?}"));
+            assert!(
+                matches!(result, VerificationResult::Unprovable { .. }),
+                "{fixture}:{name} must stay UNPROVABLE until BAS liveness has a sound fairness encoding, got {result:?}"
+            );
+            assert!(
+                !matches!(result, VerificationResult::Proved { method, .. } if method.contains("IC3")),
+                "{fixture}:{name} must not be proved by IC3/BAS liveness, got {result:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -269,6 +269,70 @@ fn make_result_entity_with_dual_payload_variants() -> (IREntity, Vec<IRTypeEntry
     (entity, vec![result_ty])
 }
 
+fn make_empty_system(name: &str, entity_names: &[&str]) -> IRSystem {
+    IRSystem {
+        name: name.to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: entity_names
+            .iter()
+            .map(|entity| (*entity).to_owned())
+            .collect(),
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    }
+}
+
+fn all_orders_have_status(ctor: &str) -> IRExpr {
+    IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Field {
+                    expr: Box::new(IRExpr::Var {
+                        name: "o".to_owned(),
+                        ty: IRType::Entity {
+                            name: "Order".to_owned(),
+                        },
+                        span: None,
+                    }),
+                    field: "status".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Status".to_owned(),
+                        variants: vec![
+                            IRVariant::simple("Pending"),
+                            IRVariant::simple("Confirmed"),
+                            IRVariant::simple("Shipped"),
+                        ],
+                    },
+                    span: None,
+                }),
+                right: Box::new(IRExpr::Ctor {
+                    enum_name: "Status".to_owned(),
+                    ctor: ctor.to_owned(),
+                    args: vec![],
+                    span: None,
+                }),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        }),
+        span: None,
+    }
+}
+
 fn make_ir_for_entity(entity: &IREntity, types: Vec<IRTypeEntry>) -> IRProgram {
     IRProgram {
         types,
@@ -6623,6 +6687,141 @@ fn build_multi_slot_chc_and_system_chc_emit_expected_rules() {
     assert!(system_chc.contains("create_Order_0"));
     assert!(system_chc.contains("trans_Order_confirm_0"));
     assert!(system_chc.contains("domain_Order_0_1"));
+}
+
+#[test]
+fn build_system_chc_keeps_entity_rules_when_system_scope_is_nonempty() {
+    let (entity, tys) = make_simple_entity();
+    let system = make_empty_system("Inventory", &["Order"]);
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity.clone()],
+        systems: vec![system.clone()],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = all_orders_have_status("Pending");
+    let slots = HashMap::from([("Order".to_owned(), 2_usize)]);
+
+    let multi = build_multi_slot_chc(&entity, &vctx, &property, 2).expect("multi-slot chc");
+    let system_chc =
+        build_system_chc(&[&entity], &[&system], &vctx, &property, &slots).expect("system chc");
+
+    assert!(
+        multi.contains("trans_confirm_s0") && multi.contains("create_s0"),
+        "multi-slot baseline should include entity transition/create rules:\n{multi}"
+    );
+    assert!(
+        system_chc.contains("trans_Order_confirm_0") && system_chc.contains("create_Order_0"),
+        "system CHC must keep entity rules even with a selected system:\n{system_chc}"
+    );
+}
+
+#[test]
+fn ic3_system_with_irrelevant_system_sees_entity_transition_violation() {
+    require_unbounded_proof_tests!();
+
+    let (entity, tys) = make_simple_entity();
+    let system = make_empty_system("Inventory", &["Order"]);
+    let ir = IRProgram {
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![system],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = all_orders_have_status("Pending");
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+
+    let result = try_ic3_system(
+        &ir,
+        &vctx,
+        &["Inventory".to_owned()],
+        &property,
+        &slots,
+        5000,
+    );
+
+    assert!(
+        matches!(result, Ic3Result::Violated(_)),
+        "entity transition `confirm` should remain visible under non-empty system scope, got: {result:?}"
+    );
+}
+
+#[test]
+fn no_stutter_chc_encodings_remove_self_loop_and_report_deadlock_error() {
+    let (entity, tys) = make_simple_entity();
+    let ir = IRProgram {
+        types: tys.clone(),
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity.clone()],
+        systems: vec![],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value: true },
+        span: None,
+    };
+    let semantics = Ic3TransitionSemantics::stutter_disabled();
+
+    let single =
+        build_chc_string_with_semantics(&entity, &vctx, &property, semantics).expect("single chc");
+    assert!(
+        !single.contains(" stutter)"),
+        "no-stutter single-entity CHC must not emit a stutter rule:\n{single}"
+    );
+    assert!(
+        single.contains("deadlock_no_stutter"),
+        "no-stutter single-entity CHC must encode deadlock as Error:\n{single}"
+    );
+
+    let multi = build_multi_slot_chc_with_semantics(&entity, &vctx, &property, 2, semantics)
+        .expect("multi-slot chc");
+    assert!(
+        !multi.contains(" stutter)"),
+        "no-stutter multi-slot CHC must not emit a stutter rule:\n{multi}"
+    );
+    assert!(
+        multi.contains("deadlock_no_stutter"),
+        "no-stutter multi-slot CHC must encode deadlock as Error:\n{multi}"
+    );
+
+    let system_chc = build_system_chc_with_semantics(
+        &[&entity],
+        &[],
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+        semantics,
+    )
+    .expect("pure entity system chc");
+    assert!(
+        !system_chc.contains(" stutter)"),
+        "no-stutter pure-entity system CHC must not emit a stutter rule:\n{system_chc}"
+    );
+    assert!(
+        system_chc.contains("deadlock_no_stutter"),
+        "no-stutter pure-entity system CHC must encode deadlock as Error:\n{system_chc}"
+    );
 }
 
 #[test]

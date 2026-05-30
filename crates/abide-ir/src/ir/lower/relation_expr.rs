@@ -1,4 +1,9 @@
-//! Lower elaborated relation-valued expressions into backend-neutral relation IR.
+//! Test-only prototype for lowering elaborated relation-valued expressions.
+//!
+//! Production relation assertions are lowered through the ordinary `IRExpr`
+//! pipeline and then translated to `IRRelationExpr` by
+//! `abide-verify::verify::relation_sat`. Keep this module private to tests so
+//! maintainers do not mistake it for the load-bearing relation path.
 
 use super::{lower_ty, LowerCtx};
 use crate::elab::types as E;

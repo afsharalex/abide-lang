@@ -596,6 +596,22 @@ pub(super) enum StaticRelationOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticRelationSolverVerdict {
+    AssertionHolds,
+    AssertionMayFail,
+}
+
+fn classify_static_relation_solver_result(
+    result: SolverResult,
+) -> Result<StaticRelationSolverVerdict, String> {
+    match result {
+        SolverResult::Sat => Ok(StaticRelationSolverVerdict::AssertionHolds),
+        SolverResult::Unsat => Ok(StaticRelationSolverVerdict::AssertionMayFail),
+        SolverResult::Interrupted => Err("RustSAT relation solve interrupted".to_owned()),
+    }
+}
+
 pub(super) fn try_check_static_relation_assertions(
     assertions: &[IRExpr],
 ) -> Option<Result<StaticRelationOutcome, String>> {
@@ -641,15 +657,18 @@ fn check_static_relation_assertions(
                 }
             }
         }
-        if !matches!(solve_static_relation(encoder)?, SolverResult::Sat) {
-            let (witness, witness_error) = match witness {
-                Ok(witness) => (Some(witness), None),
-                Err(err) => (None, Some(err)),
-            };
-            return Ok(StaticRelationOutcome::Counterexample {
-                witness,
-                witness_error,
-            });
+        match classify_static_relation_solver_result(solve_static_relation(encoder)?)? {
+            StaticRelationSolverVerdict::AssertionHolds => {}
+            StaticRelationSolverVerdict::AssertionMayFail => {
+                let (witness, witness_error) = match witness {
+                    Ok(witness) => (Some(witness), None),
+                    Err(err) => (None, Some(err)),
+                };
+                return Ok(StaticRelationOutcome::Counterexample {
+                    witness,
+                    witness_error,
+                });
+            }
         }
     }
     Ok(StaticRelationOutcome::Checked)
@@ -857,6 +876,9 @@ fn lower_static_relation_expr(
     expr: &IRExpr,
     universe: &mut RelationUniverse,
 ) -> Result<IRRelationExpr, String> {
+    // This is the production bridge from the public generic IR expression
+    // surface to the structured relation IR consumed by the RustSAT encoder.
+    // The old elaboration-stage relation lowering helper is test-only.
     match expr {
         IRExpr::SetLit { elements, ty, .. } if is_ir_relation_type(ty) => {
             let relation_ty = relation_type_from_ir_type(ty)?;
@@ -1651,6 +1673,54 @@ mod tests {
         }
     }
 
+    fn tuple_set_ty(left: &str, right: &str) -> IRType {
+        IRType::Set {
+            element: Box::new(IRType::Tuple {
+                elements: vec![entity(left), entity(right)],
+            }),
+        }
+    }
+
+    fn atom(name: &str, ty: IRType) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty,
+            span: None,
+        }
+    }
+
+    fn tuple_lit(values: Vec<IRExpr>) -> IRExpr {
+        let tuple_ty = IRType::Tuple {
+            elements: values.iter().filter_map(ir_expr_ty).cloned().collect(),
+        };
+        values.into_iter().fold(
+            IRExpr::Var {
+                name: "Tuple".to_owned(),
+                ty: tuple_ty.clone(),
+                span: None,
+            },
+            |func, arg| IRExpr::App {
+                func: Box::new(func),
+                arg: Box::new(arg),
+                ty: tuple_ty.clone(),
+                span: None,
+            },
+        )
+    }
+
+    fn binary_tuple_set(left: &str, right: &str, tuples: Vec<[&str; 2]>) -> IRExpr {
+        IRExpr::SetLit {
+            elements: tuples
+                .into_iter()
+                .map(|[first, second]| {
+                    tuple_lit(vec![atom(first, entity(left)), atom(second, entity(right))])
+                })
+                .collect(),
+            ty: tuple_set_ty(left, right),
+            span: None,
+        }
+    }
+
     fn set_bin(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
         IRExpr::BinOp {
             op: op.to_owned(),
@@ -1661,6 +1731,51 @@ mod tests {
             },
             span: None,
         }
+    }
+
+    #[test]
+    fn load_bearing_static_relation_lowering_starts_from_generic_ir_expr() {
+        let join = IRExpr::BinOp {
+            op: "OpRelJoin".to_owned(),
+            left: Box::new(binary_tuple_set(
+                "Order",
+                "Customer",
+                vec![["o0", "c0"], ["o1", "c1"]],
+            )),
+            right: Box::new(binary_tuple_set("Customer", "Segment", vec![["c0", "vip"]])),
+            ty: tuple_set_ty("Order", "Segment"),
+            span: None,
+        };
+
+        let mut universe = RelationUniverse::default();
+        let lowered = lower_static_relation_expr(&join, &mut universe)
+            .expect("generic IR relation join should lower for static relation SAT");
+
+        assert!(
+            matches!(lowered, IRRelationExpr::Join(_, _)),
+            "static relation SAT should lower generic IRExpr relation ops into IRRelationExpr, got {lowered:?}"
+        );
+        assert_eq!(
+            lowered.relation_type().expect("join relation type"),
+            IRRelationType::binary(entity("Order"), entity("Segment"))
+        );
+    }
+
+    #[test]
+    fn static_relation_solver_result_classification_is_exhaustive() {
+        assert_eq!(
+            classify_static_relation_solver_result(SolverResult::Sat),
+            Ok(StaticRelationSolverVerdict::AssertionHolds)
+        );
+        assert_eq!(
+            classify_static_relation_solver_result(SolverResult::Unsat),
+            Ok(StaticRelationSolverVerdict::AssertionMayFail)
+        );
+        assert!(
+            classify_static_relation_solver_result(SolverResult::Interrupted)
+                .expect_err("interrupted relation solve must be unknown, not a counterexample")
+                .contains("interrupted")
+        );
     }
 
     #[test]

@@ -96,6 +96,14 @@ was found within the explored transition depth. The depth can include stutter
 steps, and it is not exhaustive reachable-state exploration or all-instance
 coverage.
 
+Ordinary `verify` runs bounded/exploration checking by default with a
+30-second end-to-end timeout. When a bounded `CHECKED` result may need an
+unbounded proof attempt, Abide reports that and suggests an explicit proof-mode
+rerun. Use `--ic3` to opt verify blocks into IC3/PDR proof search, or
+`--unbounded-only` when you want proof search without the bounded fallback.
+Scenes and `run`/`simulate` remain bounded/execution workflows and do not use
+proof engines.
+
 Safety BMC searches depths incrementally by default so counterexamples stop at
 the first failing bound. Use `--no-bmc-iterative-deepening` to run the selected
 bound as one solver query.

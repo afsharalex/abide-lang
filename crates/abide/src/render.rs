@@ -2407,6 +2407,16 @@ fn render_result_verbose_details(
                 .join(", ")
         ));
     }
+    let backend_diagnostics = result.backend_diagnostics();
+    if !backend_diagnostics.is_empty() {
+        lines.push("backend diagnostics:".to_owned());
+        for diagnostic in backend_diagnostics {
+            lines.push(format!(
+                "  [{}:{}] {}",
+                diagnostic.backend, diagnostic.phase, diagnostic.message
+            ));
+        }
+    }
     if let Some(evidence) = result.evidence() {
         let kind = match evidence.payload() {
             abide_witness::EvidencePayload::Witness(witness) => match witness.payload() {
@@ -2457,12 +2467,20 @@ fn report_result_verbose_details(result: &verify::VerificationResult, failure_st
 
 fn render_trusted_assumption(assumption: &verify::TrustedAssumption) -> String {
     match assumption {
+        verify::TrustedAssumption::DefaultStutter => "default stutter".to_owned(),
         verify::TrustedAssumption::Stutter => "stutter".to_owned(),
+        verify::TrustedAssumption::NoStutter => "no stutter".to_owned(),
         verify::TrustedAssumption::WeakFairness { system, command } => {
             format!("WF {system}::{command}")
         }
+        verify::TrustedAssumption::PerTupleWeakFairness { system, command } => {
+            format!("WF per-tuple {system}::{command}")
+        }
         verify::TrustedAssumption::StrongFairness { system, command } => {
             format!("SF {system}::{command}")
+        }
+        verify::TrustedAssumption::PerTupleStrongFairness { system, command } => {
+            format!("SF per-tuple {system}::{command}")
         }
         verify::TrustedAssumption::Lemma { name } => format!("lemma {name}"),
         verify::TrustedAssumption::Axiom {
@@ -2939,15 +2957,22 @@ fn result_secondary_summary(result: &verify::VerificationResult) -> String {
             method,
             time_ms,
             assumptions,
+            backend_diagnostics,
             ..
         } => {
             let method = method
                 .as_deref()
                 .map(|method| format!(" by {method}"))
                 .unwrap_or_default();
+            let proof_mode_hint = backend_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.phase == "proof_mode")
+                .map(|diagnostic| format!("; {}", diagnostic.message))
+                .unwrap_or_default();
             format!(
-                "no counterexample on bounded trace-prefix depth {depth}{method} in {time_ms}ms; depth may include stutter steps; not exhaustive reachable-state or all-instance coverage{}",
-                render_assumption_suffix(assumptions)
+                "no counterexample on bounded trace-prefix depth {depth}{method} in {time_ms}ms; depth may include stutter steps; not exhaustive reachable-state or all-instance coverage{}{}",
+                render_assumption_suffix(assumptions),
+                proof_mode_hint
             )
         }
         verify::VerificationResult::Counterexample { assumptions, .. } => {
@@ -3085,6 +3110,7 @@ mod tests {
             method: Some("bounded model checking".to_owned()),
             time_ms: 12,
             assumptions: Vec::new(),
+            backend_diagnostics: Vec::new(),
             span: None,
             file: None,
         };
@@ -3102,6 +3128,27 @@ mod tests {
         assert!(
             summary.contains("not exhaustive"),
             "expected CHECKED summary to disclose coverage limits: {summary}"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_renders_default_stutter_assumption() {
+        let result = verify::VerificationResult::Checked {
+            name: "bounded_safety".to_owned(),
+            depth: 3,
+            method: Some("bounded model checking".to_owned()),
+            time_ms: 12,
+            assumptions: vec![verify::TrustedAssumption::DefaultStutter],
+            backend_diagnostics: Vec::new(),
+            span: None,
+            file: None,
+        };
+
+        let summary = render_terminal_summary(&result);
+
+        assert!(
+            summary.contains("under default stutter"),
+            "expected terminal summary to disclose default stutter provenance: {summary}"
         );
     }
 

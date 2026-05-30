@@ -995,13 +995,21 @@ pub(super) fn build_domain_predicate(
                 .iter()
                 .map(|v| vctx.variants.try_id_of(name, &v.name))
                 .collect::<Result<_, _>>()?;
-            let min_id = *ids.iter().min().unwrap();
-            let max_id = *ids.iter().max().unwrap();
+            let min_id = ids
+                .iter()
+                .min()
+                .copied()
+                .ok_or_else(|| format!("enum `{name}` has no variants to bound"))?;
+            let max_id = ids
+                .iter()
+                .max()
+                .copied()
+                .ok_or_else(|| format!("enum `{name}` has no variants to bound"))?;
             let lo = smt::int_val(min_id);
             let hi = smt::int_val(max_id);
             Ok(Some(smt::bool_and(&[
-                &smt::int_ge(var_int, lo.as_int().unwrap()),
-                &smt::int_le(var_int, hi.as_int().unwrap()),
+                &smt::int_ge(var_int, lo.as_int()?),
+                &smt::int_le(var_int, hi.as_int()?),
             ])))
         }
         IRType::Refinement { predicate, .. } => {
@@ -1921,6 +1929,40 @@ mod tests {
         let solver = AbideSolver::new();
         solver.assert(&smt::bool_not(&refinement_pred));
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn build_domain_predicate_reports_empty_enum_domain_without_panicking() {
+        let ir = IRProgram {
+            types: vec![IRTypeEntry {
+                name: "Empty".to_owned(),
+                ty: IRType::Enum {
+                    name: "Empty".to_owned(),
+                    variants: vec![],
+                },
+            }],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let empty_ty = IRType::Enum {
+            name: "Empty".to_owned(),
+            variants: vec![],
+        };
+
+        let result = build_domain_predicate(
+            &empty_ty,
+            &smt::int_var("empty"),
+            &HashMap::new(),
+            &vctx,
+            &defs,
+            None,
+        );
+
+        assert!(
+            matches!(result, Err(ref reason) if reason.contains("has no variants")),
+            "expected structured empty-enum domain error, got: {result:?}"
+        );
     }
 
     #[test]

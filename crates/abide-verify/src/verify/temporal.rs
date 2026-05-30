@@ -907,10 +907,10 @@ pub(super) fn desugar_until(expr: &IRExpr) -> IRExpr {
 pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Eventually { .. } | IRExpr::Until { .. } => true,
-        IRExpr::Previously { .. } | IRExpr::Since { .. } => true,
         IRExpr::Always { body, .. }
         | IRExpr::Historically { body, .. }
         | IRExpr::Once { body, .. }
+        | IRExpr::Previously { body, .. }
         | IRExpr::UnOp { operand: body, .. }
         | IRExpr::Field { expr: body, .. }
         | IRExpr::Prime { expr: body, .. }
@@ -918,6 +918,7 @@ pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
         | IRExpr::Assert { expr: body, .. }
         | IRExpr::Assume { expr: body, .. } => contains_liveness(body),
         IRExpr::BinOp { left, right, .. }
+        | IRExpr::Since { left, right, .. }
         | IRExpr::App {
             func: left,
             arg: right,
@@ -1532,7 +1533,7 @@ mod tests {
 
         assert_eq!(exports.len(), 1);
         assert!(exports[0].contains_temporal);
-        assert!(exports[0].contains_liveness);
+        assert!(!exports[0].contains_liveness);
         assert!(exports[0].contains_past_time);
         assert!(exports[0].spot.is_none());
         assert!(exports[0].buchi.is_some());

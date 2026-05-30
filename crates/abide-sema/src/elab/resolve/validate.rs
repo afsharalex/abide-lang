@@ -1089,9 +1089,27 @@ pub(super) fn collect_ty_params_in_expr(expr: &EExpr, out: &mut Vec<(String, Vec
                 collect_ty_params_in_expr(f, out);
             }
         }
-        EExpr::While(cond, _, body, _) => {
+        EExpr::While(cond, contracts, body, _) => {
             collect_ty_params_in_expr(cond, out);
+            for contract in contracts {
+                match contract {
+                    EContract::Requires(expr)
+                    | EContract::Ensures(expr)
+                    | EContract::Invariant(expr) => collect_ty_params_in_expr(expr, out),
+                    EContract::Decreases { measures, .. } => {
+                        for measure in measures {
+                            collect_ty_params_in_expr(measure, out);
+                        }
+                    }
+                }
+            }
             collect_ty_params_in_expr(body, out);
+        }
+        EExpr::Choose(_, _, domain_ty, predicate, _) => {
+            super::collect_all_param_uses(domain_ty, out);
+            if let Some(predicate) = predicate {
+                collect_ty_params_in_expr(predicate, out);
+            }
         }
         EExpr::SetComp(_, expr, _, _, source, body, _) => {
             if let Some(e) = expr {
@@ -1147,8 +1165,12 @@ pub(super) fn collect_ty_params_in_expr(expr: &EExpr, out: &mut Vec<(String, Vec
                 collect_ty_params_in_expr(e, out);
             }
         }
-        // Leaf expressions: Lit, Var, Qual, Unresolved, Sorry, Todo
-        _ => {}
+        EExpr::Lit(_, _, _)
+        | EExpr::Var(_, _, _)
+        | EExpr::Qual(_, _, _, _)
+        | EExpr::Unresolved(_, _)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_) => {}
     }
 }
 
@@ -1371,10 +1393,15 @@ fn collect_named_in_ty(ty: &Ty, out: &mut Vec<String>) {
                 collect_named_in_ty(t, out);
             }
         }
+        Ty::Relation(columns) => {
+            for column in columns {
+                collect_named_in_ty(column, out);
+            }
+        }
         Ty::Refinement(base, _) => {
             collect_named_in_ty(base, out);
         }
-        _ => {}
+        Ty::Enum(_, _) | Ty::Builtin(_) | Ty::Entity(_) | Ty::Error | Ty::Store(_) => {}
     }
 }
 
@@ -1400,7 +1427,12 @@ fn rewrite_named_ty(ty: &mut Ty) {
             rewrite_named_ty(key);
             rewrite_named_ty(value);
         }
-        _ => {}
+        Ty::Relation(columns) => {
+            for column in columns {
+                rewrite_named_ty(column);
+            }
+        }
+        Ty::Enum(_, _) | Ty::Builtin(_) | Ty::Entity(_) | Ty::Error | Ty::Store(_) => {}
     }
 }
 
@@ -1455,5 +1487,116 @@ fn rewrite_named_types_to_error(env: &mut Env) {
         for (_, ty) in &mut pred.params {
             rewrite_named_ty(ty);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{BinOp, Literal};
+
+    fn int_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn bool_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Bool)
+    }
+
+    fn param(name: &str) -> Ty {
+        Ty::Param(name.to_owned(), vec![int_ty()])
+    }
+
+    fn var_with_ty(name: &str, ty: Ty) -> EExpr {
+        EExpr::Var(ty, name.to_owned(), None)
+    }
+
+    fn lit_bool(value: bool) -> EExpr {
+        EExpr::Lit(bool_ty(), Literal::Bool(value), None)
+    }
+
+    fn collected_param_names(expr: &EExpr) -> Vec<String> {
+        let mut out = Vec::new();
+        collect_ty_params_in_expr(expr, &mut out);
+        out.into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn collect_ty_params_in_expr_walks_choose_and_while_contracts() {
+        let expr = EExpr::While(
+            Box::new(lit_bool(true)),
+            vec![
+                EContract::Requires(var_with_ty("req", param("ReqBox"))),
+                EContract::Ensures(var_with_ty("ens", param("EnsBox"))),
+                EContract::Invariant(var_with_ty("inv", param("InvBox"))),
+                EContract::Decreases {
+                    measures: vec![var_with_ty("dec", param("DecBox"))],
+                    star: false,
+                },
+            ],
+            Box::new(EExpr::Choose(
+                param("ChooseResult"),
+                "x".to_owned(),
+                param("DomainBox"),
+                Some(Box::new(EExpr::BinOp(
+                    bool_ty(),
+                    BinOp::Eq,
+                    Box::new(var_with_ty("lhs", param("PredicateBox"))),
+                    Box::new(var_with_ty("rhs", param("PredicateBox"))),
+                    None,
+                ))),
+                None,
+            )),
+            None,
+        );
+
+        let names = collected_param_names(&expr);
+        for expected in [
+            "ReqBox",
+            "EnsBox",
+            "InvBox",
+            "DecBox",
+            "ChooseResult",
+            "DomainBox",
+            "PredicateBox",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "expected to collect {expected}, got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_type_helpers_walk_relation_columns_exhaustively() {
+        let mut names = Vec::new();
+        collect_named_in_ty(
+            &Ty::Relation(vec![
+                Ty::Named("MissingLeft".to_owned()),
+                Ty::Map(
+                    Box::new(int_ty()),
+                    Box::new(Ty::Named("MissingRight".to_owned())),
+                ),
+            ]),
+            &mut names,
+        );
+        assert_eq!(names, vec!["MissingLeft", "MissingRight"]);
+
+        let mut ty = Ty::Relation(vec![
+            Ty::Named("MissingLeft".to_owned()),
+            Ty::Map(
+                Box::new(int_ty()),
+                Box::new(Ty::Named("MissingRight".to_owned())),
+            ),
+        ]);
+        rewrite_named_ty(&mut ty);
+        let Ty::Relation(columns) = ty else {
+            panic!("expected relation");
+        };
+        assert!(matches!(columns[0], Ty::Error));
+        let Ty::Map(_, value) = &columns[1] else {
+            panic!("expected map column");
+        };
+        assert!(matches!(value.as_ref(), Ty::Error));
     }
 }

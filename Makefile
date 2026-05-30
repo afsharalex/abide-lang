@@ -1,4 +1,4 @@
-.PHONY: help build run fmt fmt-check clippy test test-lib test-integration coverage coverage-html check clean
+.PHONY: help build run fmt fmt-check clippy test test-lib test-integration test-unbounded coverage coverage-html check check-strict clean
 
 CARGO := cargo
 LLVM_COV := cargo llvm-cov
@@ -15,9 +15,11 @@ help:
 	@printf "  make test              Run unit, integration, and doc tests\n"
 	@printf "  make test-lib          Run library unit tests only\n"
 	@printf "  make test-integration  Run integration tests only\n"
+	@printf "  make test-unbounded    Run opt-in unbounded proof backend tests\n"
 	@printf "  make coverage          Run llvm-cov and print a summary\n"
 	@printf "  make coverage-html     Generate an HTML coverage report\n"
 	@printf "  make check             Run fmt-check, clippy, and test\n"
+	@printf "  make check-strict      Run check plus unbounded proof backend tests\n"
 	@printf "  make clean             Remove build artifacts\n"
 
 build:
@@ -44,6 +46,10 @@ test-lib:
 test-integration:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide integration tests" -- $(CARGO) test -p abide --test integration
 
+test-unbounded:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide-verify unbounded proof tests" -- env ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 $(CARGO) test -p abide-verify --lib
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide integration unbounded proof tests" -- env ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 $(CARGO) test -p abide --test integration cvc5_sygus_boundary
+
 coverage:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide coverage" -- $(LLVM_COV) -p abide --lib --tests
 
@@ -51,6 +57,8 @@ coverage-html:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide html coverage" -- $(LLVM_COV) -p abide --lib --tests --html
 
 check: fmt-check clippy test
+
+check-strict: check test-unbounded
 
 clean:
 	$(CARGO) clean

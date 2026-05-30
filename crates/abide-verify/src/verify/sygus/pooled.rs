@@ -13,6 +13,12 @@ struct PooledSyGuSCtx<'a> {
 
 type PooledEntityBindings = HashMap<String, (String, usize)>;
 
+#[derive(Clone, Default)]
+struct PooledParamEnv {
+    terms: HashMap<String, Cvc5Term>,
+    entity_bindings: PooledEntityBindings,
+}
+
 struct PooledCrossCallCapture {
     formula: Cvc5Term,
     return_value: Option<Cvc5Term>,
@@ -160,16 +166,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             }
         }
     }
-    if !root_system.let_bindings.is_empty() {
-        return Err("cvc5 SyGuS pooled system safety does not support let-bindings yet".to_owned());
-    }
     for system in systems {
-        if !system.let_bindings.is_empty() {
-            return Err(format!(
-                "cvc5 SyGuS pooled system safety does not support let-bindings yet (`{}`)",
-                system.name
-            ));
-        }
         for entity_name in &system.entities {
             if !entities_by_name.contains_key(entity_name) {
                 return Err(format!(
@@ -187,10 +184,10 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
         entity
             .fields
             .iter()
-            .any(|field| field.initial_constraint.is_some() || field.default.is_none())
+            .any(|field| field.initial_constraint.is_some())
     }) {
         return Err(
-            "cvc5 SyGuS pooled system safety requires deterministic entity defaults and no initial constraints"
+            "cvc5 SyGuS pooled system safety does not support entity initial constraints yet"
                 .to_owned(),
         );
     }
@@ -223,6 +220,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
         for derived in &system.derived_fields {
             enum_catalog.register_type(&tm, &derived.ty)?;
         }
+        register_system_signature_types(&tm, &mut enum_catalog, system)?;
     }
     for entity in entities {
         for derived in &entity.derived_fields {
@@ -354,27 +352,26 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
                 ),
             );
             for field in &entity.fields {
-                let next = slot_curr
-                    .get(&pool_slot_field_key(&entity.name, slot, &field.name))
-                    .ok_or_else(|| {
-                        format!(
-                            "missing pooled field `{}` for {entity_name} slot {slot}",
-                            field.name
-                        )
-                    })?;
-                let default = field
-                    .default
-                    .as_ref()
-                    .expect("checked deterministic default");
-                let encoded = encode_pooled_expr(
-                    &tm,
-                    default,
-                    &curr_vars,
-                    &HashMap::new(),
-                    &pre_ctx,
-                    &enum_catalog,
-                )?;
-                pre_conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), encoded]));
+                if let Some(default) = &field.default {
+                    let next = slot_curr
+                        .get(&pool_slot_field_key(&entity.name, slot, &field.name))
+                        .ok_or_else(|| {
+                            format!(
+                                "missing pooled field `{}` for {entity_name} slot {slot}",
+                                field.name
+                            )
+                        })?;
+                    let encoded = encode_pooled_expr(
+                        &tm,
+                        default,
+                        &curr_vars,
+                        &HashMap::new(),
+                        &pre_ctx,
+                        &enum_catalog,
+                    )?;
+                    pre_conjuncts
+                        .push(tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next.clone(), encoded]));
+                }
             }
         }
     }
@@ -875,6 +872,148 @@ fn frame_all_pooled_entities(
     Ok(frames)
 }
 
+fn enumerate_pooled_param_envs(
+    tm: &Cvc5Tm,
+    step: &IRSystemAction,
+    params: &[IRTransParam],
+    slots_per_entity: &HashMap<String, usize>,
+    enum_catalog: &EnumCatalog,
+) -> Result<Vec<PooledParamEnv>, String> {
+    let mut envs = vec![PooledParamEnv::default()];
+    for param in params {
+        let mut next_envs = Vec::new();
+        let entity_name = entity_type_name(&param.ty).map(str::to_owned).or_else(|| {
+            infer_entity_param_entity(&param.name, &param.ty, &step.body, slots_per_entity)
+        });
+        if let Some(name) = entity_name.as_deref() {
+            let n_slots = *slots_per_entity.get(name).ok_or_else(|| {
+                    format!("cvc5 SyGuS pooled system safety is missing slot scope for entity param `{}` -> `{name}`", param.name)
+                })?;
+            for env in &envs {
+                for slot in 0..n_slots {
+                    let mut extended = env.clone();
+                    extended
+                        .terms
+                        .insert(param.name.clone(), tm.mk_integer(slot as i64));
+                    extended
+                        .entity_bindings
+                        .insert(param.name.clone(), (name.to_owned(), slot));
+                    next_envs.push(extended);
+                }
+            }
+        } else {
+            let values = finite_param_values(tm, param, enum_catalog)?;
+            for env in &envs {
+                for value in &values {
+                    let mut extended = env.clone();
+                    extended.terms.insert(param.name.clone(), value.clone());
+                    next_envs.push(extended);
+                }
+            }
+        }
+        envs = next_envs;
+    }
+    Ok(envs)
+}
+
+fn entity_type_name(ty: &IRType) -> Option<&str> {
+    match ty {
+        IRType::Entity { name } => Some(name),
+        IRType::Refinement { base, .. } => entity_type_name(base),
+        _ => None,
+    }
+}
+
+fn infer_entity_param_entity(
+    param: &str,
+    ty: &IRType,
+    actions: &[IRAction],
+    slots_per_entity: &HashMap<String, usize>,
+) -> Option<String> {
+    if !matches!(ty, IRType::Int) || !actions_use_entity_param(actions, param) {
+        return None;
+    }
+    slots_per_entity
+        .keys()
+        .filter(|name| !name.starts_with("__abide_procinst__"))
+        .find(|name| name.eq_ignore_ascii_case(param))
+        .cloned()
+}
+
+fn actions_use_entity_param(actions: &[IRAction], param: &str) -> bool {
+    actions.iter().any(|action| match action {
+        IRAction::Apply {
+            target, refs, args, ..
+        } => {
+            target == param
+                || refs.iter().any(|reference| reference == param)
+                || args.iter().any(|arg| expr_uses_entity_param(arg, param))
+        }
+        IRAction::ExprStmt { expr } => expr_uses_entity_param(expr, param),
+        IRAction::Choose { filter, ops, .. } => {
+            expr_uses_entity_param(filter, param) || actions_use_entity_param(ops, param)
+        }
+        IRAction::ForAll { ops, .. } => actions_use_entity_param(ops, param),
+        IRAction::CrossCall { args, .. } | IRAction::LetCrossCall { args, .. } => {
+            args.iter().any(|arg| expr_uses_entity_param(arg, param))
+        }
+        IRAction::Match { arms, .. } => arms.iter().any(|arm| {
+            arm.guard
+                .as_ref()
+                .is_some_and(|guard| expr_uses_entity_param(guard, param))
+                || actions_use_entity_param(&arm.body, param)
+        }),
+        IRAction::Create { fields, .. } => fields
+            .iter()
+            .any(|field| expr_uses_entity_param(&field.value, param)),
+    })
+}
+
+fn expr_uses_entity_param(expr: &IRExpr, param: &str) -> bool {
+    match expr {
+        IRExpr::Var { name, .. } => name == param,
+        IRExpr::Field { expr, .. } | IRExpr::Prime { expr, .. } => {
+            expr_uses_entity_param(expr, param)
+        }
+        IRExpr::BinOp { left, right, .. } => {
+            expr_uses_entity_param(left, param) || expr_uses_entity_param(right, param)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            expr_uses_entity_param(cond, param)
+                || expr_uses_entity_param(then_body, param)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|body| expr_uses_entity_param(body, param))
+        }
+        IRExpr::Ctor { args, .. } => args
+            .iter()
+            .any(|(_, arg)| expr_uses_entity_param(arg, param)),
+        IRExpr::Block { exprs, .. } => exprs.iter().any(|stmt| expr_uses_entity_param(stmt, param)),
+        _ => false,
+    }
+}
+
+fn pooled_entity_binding_active_constraints(
+    active_vars: &HashMap<String, HashMap<usize, Cvc5Term>>,
+    entity_bindings: &PooledEntityBindings,
+) -> Result<Vec<Cvc5Term>, String> {
+    entity_bindings
+        .values()
+        .map(|(entity, slot)| {
+            active_vars
+                .get(entity)
+                .and_then(|slots| slots.get(slot))
+                .cloned()
+                .ok_or_else(|| format!("missing active variable for {entity} slot {slot}"))
+        })
+        .collect()
+}
+
 fn resolve_pooled_ref_bindings(
     trans: &IRTransition,
     apply_refs: &[String],
@@ -947,6 +1086,7 @@ fn encode_pooled_ops_for_target(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
     entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
@@ -1022,6 +1162,7 @@ fn encode_pooled_ops_for_target(
                 entities_by_name,
                 slots_per_entity,
                 vars,
+                next_vars,
                 entity_bindings,
                 active_curr,
                 stage_active_next,
@@ -1080,7 +1221,7 @@ fn encode_pooled_ops_for_target(
             filter,
             ops: inner_ops,
         } => {
-            entities_by_name
+            let choose_target = entities_by_name
                 .get(choose_entity)
                 .ok_or_else(|| format!("unknown pooled entity `{choose_entity}`"))?;
             let n_slots = *slots_per_entity
@@ -1090,6 +1231,7 @@ fn encode_pooled_ops_for_target(
             for slot in 0..n_slots {
                 let mut bindings = entity_bindings.clone();
                 bindings.insert(var.clone(), (choose_entity.clone(), slot));
+                let scoped_vars = pooled_target_scoped_vars(choose_target, slot, vars, slot_curr)?;
                 branches.push(mk_and(
                     tm,
                     &[
@@ -1102,7 +1244,14 @@ fn encode_pooled_ops_for_target(
                                 )
                             })?
                             .clone(),
-                        encode_pooled_expr(tm, filter, vars, &bindings, pool_ctx, enum_catalog)?,
+                        encode_pooled_expr(
+                            tm,
+                            filter,
+                            &scoped_vars,
+                            &bindings,
+                            pool_ctx,
+                            enum_catalog,
+                        )?,
                         encode_pooled_ops_for_target(
                             tm,
                             target_var,
@@ -1113,7 +1262,8 @@ fn encode_pooled_ops_for_target(
                             _systems_by_name,
                             entities_by_name,
                             slots_per_entity,
-                            vars,
+                            &scoped_vars,
+                            next_vars,
                             &bindings,
                             active_curr,
                             active_next,
@@ -1145,6 +1295,7 @@ fn encode_pooled_ops_for_target(
             entities_by_name,
             slots_per_entity,
             vars,
+            next_vars,
             entity_bindings,
             active_curr,
             active_next,
@@ -1166,6 +1317,7 @@ fn encode_pooled_ops_for_target(
             entities_by_name,
             slots_per_entity,
             vars,
+            next_vars,
             entity_bindings,
             active_curr,
             active_next,
@@ -1189,6 +1341,29 @@ fn encode_pooled_ops_for_target(
             enum_catalog,
             pool_ctx,
         ),
+        IRAction::CrossCall {
+            system: target_system_name,
+            command,
+            args,
+        } => encode_pooled_crosscall_capture(
+            tm,
+            target_system_name,
+            command,
+            args,
+            _systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            vars,
+            next_vars,
+            entity_bindings,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            _call_stack,
+        )
+        .map(|capture| capture.formula),
         other => Err(format!(
             "cvc5 SyGuS pooled system safety does not support nested op `{other:?}` yet"
         )),
@@ -1209,6 +1384,7 @@ fn encode_pooled_ops_forall_for_target(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
     entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
@@ -1246,6 +1422,7 @@ fn encode_pooled_ops_forall_for_target(
             entities_by_name,
             slots_per_entity,
             vars,
+            next_vars,
             &bindings,
             active_curr,
             active_next,
@@ -1316,6 +1493,7 @@ fn encode_pooled_ops_match_for_target(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
     entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
@@ -1388,6 +1566,7 @@ fn encode_pooled_ops_match_for_target(
             entities_by_name,
             slots_per_entity,
             &arm_vars,
+            next_vars,
             entity_bindings,
             active_curr,
             active_next,
@@ -1826,6 +2005,8 @@ fn encode_pooled_choose_action(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
     slot_curr: &HashMap<String, Cvc5Term>,
@@ -1852,8 +2033,9 @@ fn encode_pooled_choose_action(
     };
     let mut branches = Vec::new();
     for slot in 0..n_slots {
-        let mut bindings = HashMap::new();
+        let mut bindings = entity_bindings.clone();
         bindings.insert(var.to_owned(), (entity.name.clone(), slot));
+        let scoped_vars = pooled_target_scoped_vars(entity, slot, vars, slot_curr)?;
         let mut conjuncts = vec![
             active_curr
                 .get(&entity.name)
@@ -1865,7 +2047,7 @@ fn encode_pooled_choose_action(
                     )
                 })?
                 .clone(),
-            encode_pooled_expr(tm, filter, vars, &bindings, &pool_ctx, enum_catalog)?,
+            encode_pooled_expr(tm, filter, &scoped_vars, &bindings, &pool_ctx, enum_catalog)?,
             encode_pooled_ops_for_target(
                 tm,
                 var,
@@ -1876,7 +2058,8 @@ fn encode_pooled_choose_action(
                 systems_by_name,
                 entities_by_name,
                 slots_per_entity,
-                vars,
+                &scoped_vars,
+                next_vars,
                 &bindings,
                 active_curr,
                 active_next,
@@ -1914,6 +2097,8 @@ fn encode_pooled_forall_action(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
+    next_vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
     slot_curr: &HashMap<String, Cvc5Term>,
@@ -1947,7 +2132,7 @@ fn encode_pooled_forall_action(
                 )
             })?
             .clone();
-        let mut bindings = HashMap::new();
+        let mut bindings = entity_bindings.clone();
         bindings.insert(var.to_owned(), (entity.name.clone(), slot));
         let active_branch = mk_and(
             tm,
@@ -1964,6 +2149,7 @@ fn encode_pooled_forall_action(
                     entities_by_name,
                     slots_per_entity,
                     vars,
+                    next_vars,
                     &bindings,
                     active_curr,
                     active_next,
@@ -2057,6 +2243,7 @@ fn encode_pooled_system_exprstmt_formula(
     slots_per_entity: &HashMap<String, usize>,
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
     slot_curr: &HashMap<String, Cvc5Term>,
@@ -2064,6 +2251,56 @@ fn encode_pooled_system_exprstmt_formula(
     pool_ctx: &PooledSyGuSCtx<'_>,
     enum_catalog: &EnumCatalog,
 ) -> Result<Cvc5Term, String> {
+    if let Some((target_var, entity_name, slot)) =
+        exprstmt_bound_entity_target(expr, entity_bindings)?
+    {
+        let entity = entities_by_name
+            .get(&entity_name)
+            .ok_or_else(|| format!("unknown pooled entity `{entity_name}`"))?;
+        let mut conjuncts = vec![encode_pooled_entity_exprstmt_at_slot(
+            tm,
+            expr,
+            &target_var,
+            entity,
+            slot,
+            curr_vars,
+            entity_bindings,
+            active_next,
+            slot_curr,
+            slot_next,
+            enum_catalog,
+            pool_ctx,
+        )?];
+        conjuncts.extend(frame_all_system_fields(
+            tm,
+            systems_by_name,
+            curr_vars,
+            next_vars,
+        )?);
+        conjuncts.extend(frame_other_pooled_entities(
+            tm,
+            entities_by_name,
+            slots_per_entity,
+            &entity_name,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+        )?);
+        conjuncts.extend(frame_other_pooled_slots(
+            tm,
+            entity,
+            slot,
+            active_curr,
+            active_next,
+            slot_curr,
+            slot_next,
+            *slots_per_entity
+                .get(&entity_name)
+                .ok_or_else(|| format!("missing slot scope for `{entity_name}`"))?,
+        )?);
+        return Ok(mk_and(tm, &conjuncts));
+    }
     let (field_name, update) = encode_pooled_system_exprstmt_update(
         tm,
         expr,
@@ -2102,6 +2339,27 @@ fn encode_pooled_system_exprstmt_formula(
     Ok(mk_and(tm, &conjuncts))
 }
 
+fn exprstmt_bound_entity_target(
+    expr: &IRExpr,
+    entity_bindings: &PooledEntityBindings,
+) -> Result<Option<(String, String, usize)>, String> {
+    let IRExpr::BinOp { left, .. } = expr else {
+        return Ok(None);
+    };
+    let IRExpr::Prime { expr: primed, .. } = left.as_ref() else {
+        return Ok(None);
+    };
+    let IRExpr::Field { expr: receiver, .. } = primed.as_ref() else {
+        return Ok(None);
+    };
+    let IRExpr::Var { name, .. } = receiver.as_ref() else {
+        return Ok(None);
+    };
+    Ok(entity_bindings
+        .get(name)
+        .map(|(entity, slot)| (name.clone(), entity.clone(), *slot)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_action(
     tm: &Cvc5Tm,
@@ -2112,6 +2370,7 @@ fn encode_pooled_system_action(
     slots_per_entity: &HashMap<String, usize>,
     vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
     local_bindings: &PooledLocalBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
@@ -2145,6 +2404,7 @@ fn encode_pooled_system_action(
                     slots_per_entity,
                     &merged_vars,
                     next_vars,
+                    entity_bindings,
                     active_curr,
                     active_next,
                     slot_curr,
@@ -2218,6 +2478,8 @@ fn encode_pooled_system_action(
                 entities_by_name,
                 slots_per_entity,
                 &merged_vars,
+                next_vars,
+                entity_bindings,
                 active_curr,
                 active_next,
                 slot_curr,
@@ -2263,6 +2525,8 @@ fn encode_pooled_system_action(
                 entities_by_name,
                 slots_per_entity,
                 &merged_vars,
+                next_vars,
+                entity_bindings,
                 active_curr,
                 active_next,
                 slot_curr,
@@ -2300,6 +2564,7 @@ fn encode_pooled_system_action(
             slots_per_entity,
             &merged_vars,
             next_vars,
+            entity_bindings,
             active_curr,
             active_next,
             slot_curr,
@@ -2327,6 +2592,7 @@ fn encode_pooled_system_action(
                 slots_per_entity,
                 &merged_vars,
                 next_vars,
+                entity_bindings,
                 active_curr,
                 active_next,
                 slot_curr,
@@ -2397,7 +2663,8 @@ fn encode_pooled_system_step(
     enum_catalog: &EnumCatalog,
     call_stack: &[String],
 ) -> Result<Cvc5Term, String> {
-    let param_envs = enumerate_param_envs(tm, &step.params, enum_catalog)?;
+    let param_envs =
+        enumerate_pooled_param_envs(tm, step, &step.params, slots_per_entity, enum_catalog)?;
     encode_pooled_system_step_with_param_envs(
         tm,
         step,
@@ -2432,7 +2699,7 @@ fn encode_pooled_system_step_with_bound_params(
     slot_curr: &HashMap<String, Cvc5Term>,
     slot_next: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
-    param_env: HashMap<String, Cvc5Term>,
+    param_env: PooledParamEnv,
     call_stack: &[String],
 ) -> Result<Cvc5Term, String> {
     encode_pooled_system_step_with_param_envs(
@@ -2469,13 +2736,13 @@ fn encode_pooled_system_step_with_param_envs(
     slot_curr: &HashMap<String, Cvc5Term>,
     slot_next: &HashMap<String, Cvc5Term>,
     enum_catalog: &EnumCatalog,
-    param_envs: Vec<HashMap<String, Cvc5Term>>,
+    param_envs: Vec<PooledParamEnv>,
     call_stack: &[String],
 ) -> Result<Cvc5Term, String> {
     let mut branches = Vec::new();
     for param_env in param_envs {
         let mut vars = curr_vars.clone();
-        vars.extend(param_env);
+        vars.extend(param_env.terms.clone());
         let store_param_types = system_store_param_types(system);
         let pool_ctx = PooledSyGuSCtx {
             slots_per_entity,
@@ -2487,10 +2754,14 @@ fn encode_pooled_system_step_with_param_envs(
             tm,
             &step.guard,
             &vars,
-            &HashMap::new(),
+            &param_env.entity_bindings,
             &pool_ctx,
             enum_catalog,
         )?];
+        conjuncts.extend(pooled_entity_binding_active_constraints(
+            active_curr,
+            &param_env.entity_bindings,
+        )?);
         let body_term = if step.body.is_empty() {
             conjuncts.extend(frame_all_system_fields(
                 tm,
@@ -2521,6 +2792,7 @@ fn encode_pooled_system_step_with_param_envs(
                     slots_per_entity,
                     &vars,
                     next_vars,
+                    &param_env.entity_bindings,
                     active_curr,
                     active_next,
                     slot_curr,
@@ -2544,6 +2816,7 @@ fn encode_pooled_system_step_with_param_envs(
                     slots_per_entity,
                     &vars,
                     next_vars,
+                    &param_env.entity_bindings,
                     &HashMap::new(),
                     active_curr,
                     active_next,
@@ -2560,6 +2833,7 @@ fn encode_pooled_system_step_with_param_envs(
                 .filter(|(name, _)| !curr_vars.contains_key(*name))
                 .map(|(name, term)| (name.clone(), term.clone()))
                 .collect();
+            let param_entity_bindings = param_env.entity_bindings.clone();
             let mut intermediate_active = Vec::new();
             let mut intermediate_slots = Vec::new();
             let mut intermediate_system_vars = Vec::new();
@@ -2677,6 +2951,7 @@ fn encode_pooled_system_step_with_param_envs(
                             slots_per_entity,
                             &stage_vars,
                             stage_system_next,
+                            &param_entity_bindings,
                             stage_active_curr,
                             stage_active_next,
                             stage_slot_curr,
@@ -2695,6 +2970,7 @@ fn encode_pooled_system_step_with_param_envs(
                             slots_per_entity,
                             &stage_vars,
                             stage_system_next,
+                            &param_entity_bindings,
                             &locals,
                             stage_active_curr,
                             stage_active_next,
@@ -2767,6 +3043,7 @@ fn encode_pooled_system_action_sequence(
             slots_per_entity,
             curr_vars,
             next_vars,
+            &HashMap::new(),
             local_bindings,
             active_curr,
             active_next,
@@ -2895,6 +3172,7 @@ fn encode_pooled_system_action_sequence(
                     slots_per_entity,
                     &stage_vars,
                     stage_system_next,
+                    &HashMap::new(),
                     stage_active_curr,
                     stage_active_next,
                     stage_slot_curr,
@@ -2913,6 +3191,7 @@ fn encode_pooled_system_action_sequence(
                     slots_per_entity,
                     &stage_vars,
                     stage_system_next,
+                    &HashMap::new(),
                     &locals,
                     stage_active_curr,
                     stage_active_next,
@@ -3865,7 +4144,7 @@ fn bind_explicit_params(
     pool_ctx: &PooledSyGuSCtx<'_>,
     enum_catalog: &EnumCatalog,
     context: &str,
-) -> Result<HashMap<String, Cvc5Term>, String> {
+) -> Result<PooledParamEnv, String> {
     if params.len() != args.len() {
         return Err(format!(
             "cvc5 SyGuS pooled cross-call safety expected {} args for `{context}`, got {}",
@@ -3873,13 +4152,35 @@ fn bind_explicit_params(
             args.len()
         ));
     }
-    let mut bound = HashMap::new();
+    let mut bound = PooledParamEnv::default();
     let mut scoped = vars.clone();
     for (param, arg) in params.iter().zip(args.iter()) {
         let arg_term =
             encode_pooled_expr(tm, arg, &scoped, entity_bindings, pool_ctx, enum_catalog)?;
+        if let Some(name) = entity_type_name(&param.ty) {
+            let IRExpr::Var { name: arg_name, .. } = arg else {
+                return Err(format!(
+                    "cvc5 SyGuS pooled cross-call safety requires entity argument `{}` for `{context}` to be a bound entity variable",
+                    param.name
+                ));
+            };
+            let (entity_name, slot) = entity_bindings.get(arg_name).cloned().ok_or_else(|| {
+                format!(
+                    "cvc5 SyGuS pooled cross-call safety could not bind entity argument `{arg_name}` for `{context}`"
+                )
+            })?;
+            if entity_name != *name {
+                return Err(format!(
+                    "cvc5 SyGuS pooled cross-call safety expected entity argument `{}` to bind `{name}`, got `{entity_name}`",
+                    param.name
+                ));
+            }
+            bound
+                .entity_bindings
+                .insert(param.name.clone(), (entity_name, slot));
+        }
         scoped.insert(param.name.clone(), arg_term.clone());
-        bound.insert(param.name.clone(), arg_term);
+        bound.terms.insert(param.name.clone(), arg_term);
     }
     Ok(bound)
 }
@@ -3901,6 +4202,7 @@ fn encode_pooled_crosscall_capture(
     slots_per_entity: &HashMap<String, usize>,
     curr_vars: &HashMap<String, Cvc5Term>,
     next_vars: &HashMap<String, Cvc5Term>,
+    entity_bindings: &PooledEntityBindings,
     active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
     active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
     slot_curr: &HashMap<String, Cvc5Term>,
@@ -3933,7 +4235,7 @@ fn encode_pooled_crosscall_capture(
         &target_step.params,
         args,
         curr_vars,
-        &HashMap::new(),
+        entity_bindings,
         &PooledSyGuSCtx {
             slots_per_entity,
             active_vars: active_curr,
@@ -3962,7 +4264,7 @@ fn encode_pooled_crosscall_capture(
     )?;
     let return_value = if let Some(ret) = &target_step.return_expr {
         let mut ret_vars = curr_vars.clone();
-        ret_vars.extend(bound_params);
+        ret_vars.extend(bound_params.terms);
         let next_ctx = PooledSyGuSCtx {
             slots_per_entity,
             active_vars: active_next,
@@ -3973,7 +4275,7 @@ fn encode_pooled_crosscall_capture(
             tm,
             ret,
             &ret_vars,
-            &HashMap::new(),
+            &bound_params.entity_bindings,
             &next_ctx,
             enum_catalog,
         )?)
@@ -3983,10 +4285,12 @@ fn encode_pooled_crosscall_capture(
     Ok(PooledCrossCallCapture {
         formula,
         return_value,
-        return_type: target_step
-            .return_expr
-            .as_ref()
-            .and_then(sygus_match_scrutinee_type),
+        return_type: command_return_type(target_system, command).or_else(|| {
+            target_step
+                .return_expr
+                .as_ref()
+                .and_then(sygus_match_scrutinee_type)
+        }),
     })
 }
 
@@ -4056,6 +4360,7 @@ fn encode_pooled_action_match(
                 slots_per_entity,
                 vars,
                 next_vars,
+                &HashMap::new(),
                 active_curr,
                 active_next,
                 slot_curr,

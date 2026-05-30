@@ -17,8 +17,8 @@ use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSceneGiven, I
 use super::context::VerifyContext;
 use super::defenv;
 use super::harness::{
-    self, create_slot_pool_with_systems, domain_constraints, encode_step_with_params,
-    store_active_cardinality_constraints,
+    self, create_slot_pool_with_systems, domain_constraints, store_active_cardinality_constraints,
+    try_encode_step_with_params,
 };
 use super::property::{encode_prop_expr_with_ctx, encode_prop_value_with_ctx, PropertyCtx};
 use super::scope::{
@@ -1784,11 +1784,11 @@ pub(super) fn check_scene_block(
                 };
 
                 // Encode a disjunction over all steps implementing this command.
-                let step_formulas: Vec<Bool> = re
+                let step_formulas = re
                     .steps
                     .iter()
                     .map(|step_ir| {
-                        encode_step_with_params(
+                        try_encode_step_with_params(
                             &pool,
                             vctx,
                             &relevant_entities,
@@ -1798,7 +1798,18 @@ pub(super) fn check_scene_block(
                             override_params.clone(),
                         )
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>();
+                let step_formulas = match step_formulas {
+                    Ok(step_formulas) => step_formulas,
+                    Err(reason) => {
+                        return VerificationResult::SceneFail {
+                            name: scene.name.clone(),
+                            reason: format!("transition encoding error: {reason}"),
+                            span: None,
+                            file: None,
+                        };
+                    }
+                };
                 let event_formula = if step_formulas.len() == 1 {
                     step_formulas.into_iter().next().unwrap()
                 } else {

@@ -1,10 +1,11 @@
 use super::*;
 
 #[allow(clippy::format_push_string)]
-pub(in crate::verify::ic3) fn build_chc_string(
+pub(in crate::verify::ic3) fn build_chc_string_with_semantics(
     entity: &IREntity,
     vctx: &VerifyContext,
     property: &IRExpr,
+    semantics: Ic3TransitionSemantics,
 ) -> Result<String, String> {
     let mut chc = String::new();
     emit_ic3_datatype_decls_with_expr(
@@ -74,8 +75,10 @@ pub(in crate::verify::ic3) fn build_chc_string(
     chc.push_str("true)) create)\n");
 
     // ── Transition rules ───────────────────────────────────────────
+    let mut enabled_steps = vec!["(not active)".to_owned()];
     for transition in &entity.transitions {
         let guard_smt = guard_to_smt(&transition.guard, entity, vctx)?;
+        enabled_steps.push(format!("(and active {guard_smt})"));
 
         // Build next-state: updates override, frame preserves
         let mut next_fields: Vec<String> = Vec::new();
@@ -97,9 +100,21 @@ pub(in crate::verify::ic3) fn build_chc_string(
     }
 
     // ── Stutter rule ───────────────────────────────────────────────
-    chc.push_str(&format!(
-        "(rule (=> (State {vars_str} active) (State {vars_str} active)) stutter)\n"
-    ));
+    if semantics.allow_stutter {
+        chc.push_str(&format!(
+            "(rule (=> (State {vars_str} active) (State {vars_str} active)) stutter)\n"
+        ));
+    } else {
+        let no_enabled = enabled_steps
+            .iter()
+            .map(|enabled| format!("(not {enabled})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        chc.push_str(&format!(
+            "(rule (=> (and (State {vars_str} active) {no_enabled}) Error) \
+             deadlock_no_stutter)\n"
+        ));
+    }
 
     // ── Domain constraints for enum fields ─────────────────────────
     for (fi, f) in entity.fields.iter().enumerate() {

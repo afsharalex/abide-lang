@@ -102,6 +102,7 @@ fn result_named<'a>(results: &'a [VerificationResult], name: &str) -> &'a Verifi
             | VerificationResult::Counterexample { name: n, .. }
             | VerificationResult::ScenePass { name: n, .. }
             | VerificationResult::SceneFail { name: n, .. }
+            | VerificationResult::SceneUnknown { name: n, .. }
             | VerificationResult::Unprovable { name: n, .. }
             | VerificationResult::FnContractProved { name: n, .. }
             | VerificationResult::FnContractAdmitted { name: n, .. }
@@ -132,11 +133,53 @@ fn tuple_value(
         .unwrap_or_else(|| panic!("expected tuple {tuple_index}[{value_index}] in {relation:?}"))
 }
 
-// Heavy witness-structure audits. Run explicitly:
-// cargo test -p abide --test witness_audit -- --ignored
+fn enum_variant(value: &WitnessValue, expected_enum: &str, expected_variant: &str) -> bool {
+    matches!(
+        value,
+        WitnessValue::EnumVariant {
+            enum_name,
+            variant,
+            ..
+        } if enum_name == expected_enum && variant == expected_variant
+    )
+}
+
+fn signal_color<'a>(state: &'a op::State, slot: &op::EntitySlotRef) -> Option<&'a str> {
+    let value = state
+        .entity_slots()
+        .get(slot)
+        .filter(|entity| entity.active())?
+        .fields()
+        .get("color")?;
+    match value {
+        WitnessValue::EnumVariant {
+            enum_name, variant, ..
+        } if enum_name == "Light" => Some(variant.as_str()),
+        _ => None,
+    }
+}
+
+fn unfair_signal_lasso_violation_slot(witness: &op::LassoWitness) -> Option<op::EntitySlotRef> {
+    let behavior = witness.behavior();
+    let loop_start = witness.loop_start();
+    let loop_states = &behavior.states()[loop_start..];
+    let loop_entry = behavior.state(loop_start)?;
+
+    loop_entry.entity_slots().iter().find_map(|(slot, entity)| {
+        if slot.entity() != "Signal" || !entity.active() {
+            return None;
+        }
+        if signal_color(loop_entry, slot) != Some("Red") {
+            return None;
+        }
+        loop_states
+            .iter()
+            .all(|state| signal_color(state, slot) == Some("Red"))
+            .then(|| slot.clone())
+    })
+}
 
 #[test]
-#[ignore = "witness audit"]
 fn operational_counterexample_audit_tracks_system_field_enums_and_steps() {
     let src = r"module T
 
@@ -162,6 +205,19 @@ verify v {
 
     let results = verify_source_with_config(src, &VerifyConfig::default());
     let result = result_named(&results, "v");
+    let VerificationResult::Counterexample {
+        replay: Some(replay),
+        ..
+    } = result
+    else {
+        panic!("expected counterexample with replay metadata, got: {result:?}");
+    };
+    assert!(replay.checked, "operational witness should replay");
+    assert!(
+        replay.property_violated,
+        "replay should confirm the asserted safety property is violated"
+    );
+
     let witness = result
         .operational_witness()
         .expect("counterexample should carry an operational witness");
@@ -178,26 +234,25 @@ verify v {
 
     let initial = behavior.state(0).expect("initial state");
     let next = behavior.state(1).expect("next state");
-    assert!(matches!(
+    assert!(enum_variant(
         system_field(initial, "Ui", "mode"),
-        WitnessValue::EnumVariant { enum_name, variant, .. }
-            if enum_name == "Mode" && variant == "normal"
+        "Mode",
+        "normal"
     ));
-    assert!(matches!(
+    assert!(enum_variant(
         system_field(next, "Ui", "mode"),
-        WitnessValue::EnumVariant { enum_name, variant, .. }
-            if enum_name == "Mode" && variant == "normal"
+        "Mode",
+        "normal"
     ));
-    assert!(matches!(
+    assert!(enum_variant(
         system_field(initial, "Ui", "screen"),
-        WitnessValue::EnumVariant { enum_name, variant, .. }
-            if enum_name == "Screen" && variant == "home"
+        "Screen",
+        "home"
     ));
-    assert!(matches!(
-        system_field(next, "Ui", "screen"),
-        WitnessValue::EnumVariant { enum_name, variant, .. }
-            if enum_name == "Screen" && variant == "compose"
-    ));
+    assert!(
+        enum_variant(system_field(next, "Ui", "screen"), "Screen", "compose"),
+        "the witness must include the state that falsifies `screen == @home`"
+    );
 
     let transition = behavior.transition(0).expect("first transition");
     assert_eq!(transition.atomic_steps().len(), 1);
@@ -208,7 +263,6 @@ verify v {
 }
 
 #[test]
-#[ignore = "witness audit"]
 fn relational_counterexample_audit_exposes_relation_native_system_fields() {
     let src = r"module T
 
@@ -238,6 +292,10 @@ verify v {
     };
     let results = verify_source_with_config(src, &config);
     let result = result_named(&results, "v");
+    assert!(
+        matches!(result, VerificationResult::Counterexample { .. }),
+        "expected relational counterexample result, got: {result:?}"
+    );
     let witness = result
         .relational_witness()
         .expect("counterexample should carry a relational witness");
@@ -260,11 +318,25 @@ verify v {
         .field_relation("Ui", "mode")
         .expect("Ui.mode relation in initial state");
     assert_eq!(mode_initial.arity(), 2);
-    assert!(matches!(
+    assert!(
+        matches!(
         tuple_value(mode_initial, 0, 1),
         WitnessValue::EnumVariant { enum_name, variant, .. }
             if enum_name == "Mode" && variant == "normal"
-    ));
+        ),
+        "initial mode tuple should preserve non-mutated system state"
+    );
+    let screen_initial = initial
+        .field_relation("Ui", "screen")
+        .expect("Ui.screen relation in initial state");
+    assert!(
+        matches!(
+            tuple_value(screen_initial, 0, 1),
+            WitnessValue::EnumVariant { enum_name, variant, .. }
+                if enum_name == "Screen" && variant == "home"
+        ),
+        "initial screen tuple should satisfy the asserted property"
+    );
 
     let compose_state = temporal
         .states()
@@ -283,14 +355,25 @@ verify v {
         .field_relation("Ui", "screen")
         .expect("Ui.screen relation in compose state");
     assert_eq!(screen_compose.arity(), 2);
+    assert!(
+        matches!(
+            tuple_value(screen_compose, 0, 1),
+            WitnessValue::EnumVariant { enum_name, variant, .. }
+                if enum_name == "Screen" && variant == "compose"
+        ),
+        "relational witness must expose a state that violates `screen == @home`"
+    );
 }
 
 #[test]
-#[ignore = "witness audit"]
-fn liveness_witness_audit_exposes_lasso_shape() {
+fn liveness_witness_audit_exposes_semantic_lasso_violation() {
     let results =
         verify_files_with_config(&["tests/fixtures/fairness.ab"], &VerifyConfig::default());
     let result = result_named(&results, "unfair_signal");
+    assert!(
+        matches!(result, VerificationResult::LivenessViolation { .. }),
+        "expected liveness violation result, got: {result:?}"
+    );
     let witness = result
         .operational_witness()
         .expect("liveness violation should carry an operational witness");
@@ -307,5 +390,21 @@ fn liveness_witness_audit_exposes_lasso_shape() {
     assert_eq!(
         witness.behavior().transitions().len() + 1,
         witness.behavior().states().len()
+    );
+    let red_slot = unfair_signal_lasso_violation_slot(witness)
+        .expect("lasso should keep some active red signal from ever becoming green");
+    assert_eq!(red_slot.entity(), "Signal");
+
+    let unrelated = op::LassoWitness::new(
+        op::Behavior::builder()
+            .state(op::State::builder().build())
+            .build()
+            .expect("valid unrelated behavior"),
+        0,
+    )
+    .expect("valid unrelated lasso envelope");
+    assert!(
+        unfair_signal_lasso_violation_slot(&unrelated).is_none(),
+        "audit helper must reject a lasso unrelated to the unfair_signal property"
     );
 }

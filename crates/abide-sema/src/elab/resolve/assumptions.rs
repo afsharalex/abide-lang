@@ -17,8 +17,11 @@ use std::collections::HashMap;
 /// * `event` (1-segment path) is searched across the verification
 ///   site's target systems. Resolved if exactly one match; rejected
 ///   as ambiguous on multiple matches; rejected as unknown on zero.
-/// * Unknown event paths emit `UNKNOWN_FAIR_EVENT` (or
-///   `AMBIGUOUS_FAIR_EVENT`) and the item is dropped from the set.
+/// * Unknown event paths emit fatal `UNKNOWN_FAIR_EVENT` (or
+///   `AMBIGUOUS_FAIR_EVENT`) diagnostics. The recovered normalized set
+///   contains only resolved items so downstream tooling can still inspect
+///   the program, but driver verification rejects the block before any
+///   backend runs.
 ///
 /// Construct defaults are already installed by `collect`; this pass
 /// only flips `stutter` when the assume block contains an explicit
@@ -214,7 +217,8 @@ impl AssumeDelta {
 /// Resolve every item in an `AssumeBlock` into canonical `EventRef`s
 /// and return the resulting `AssumeDelta`. Emits diagnostics for
 /// unknown / ambiguous event paths via `populate_assumption_set`'s
-/// helpers, and silently drops items that fail to resolve.
+/// helpers. The returned delta contains only resolved items and must be
+/// considered usable only when no fatal diagnostics were emitted.
 pub(super) fn build_assume_delta(
     block: &crate::ast::AssumeBlock,
     scope: &[String],
@@ -296,6 +300,11 @@ pub(super) fn build_assume_delta_with_bindings(
 pub(super) fn merge_delta_into(delta: &AssumeDelta, set: &mut crate::elab::types::AssumptionSet) {
     if let Some((stut, _)) = delta.explicit_stutter {
         set.stutter = stut;
+        set.stutter_provenance = if stut {
+            crate::elab::types::StutterProvenance::ExplicitStutter
+        } else {
+            crate::elab::types::StutterProvenance::ExplicitNoStutter
+        };
     }
     for (ev, _) in &delta.weak_fair {
         set.weak_fair.insert(ev.clone());
@@ -521,15 +530,15 @@ pub(super) fn resolve_by_lemmas_subset_containment(env: &mut Env) {
 }
 
 /// Render an `AssumptionSet` in the canonical diagnostic
-/// format: `stutter`/`no stutter` first (when present), then weak
-/// fair items, then strong fair items, separated by `, `.
+/// format: stutter mode first, then weak fair items, then strong fair
+/// items, separated by `, `.
 pub(super) fn format_assumption_set(set: &crate::elab::types::AssumptionSet) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if set.stutter {
-        parts.push("stutter".to_owned());
-    } else {
-        parts.push("no stutter".to_owned());
-    }
+    parts.push(match set.stutter_provenance {
+        crate::elab::types::StutterProvenance::Default => "default stutter".to_owned(),
+        crate::elab::types::StutterProvenance::ExplicitStutter => "stutter".to_owned(),
+        crate::elab::types::StutterProvenance::ExplicitNoStutter => "no stutter".to_owned(),
+    });
     for ev in &set.weak_fair {
         parts.push(format!("fair {ev}"));
     }
@@ -611,9 +620,11 @@ pub(super) fn populate_assumption_set_from_items(
         match item {
             AssumeItem::Stutter { .. } => {
                 set.stutter = true;
+                set.stutter_provenance = crate::elab::types::StutterProvenance::ExplicitStutter;
             }
             AssumeItem::NoStutter { .. } => {
                 set.stutter = false;
+                set.stutter_provenance = crate::elab::types::StutterProvenance::ExplicitNoStutter;
             }
             AssumeItem::Fair { path, span } => {
                 if let Some((ev_ref, is_param)) = super::resolve_event_path(

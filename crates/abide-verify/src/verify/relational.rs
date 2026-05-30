@@ -306,6 +306,9 @@ pub(super) enum RelationalVerifyOutcome {
     Checked {
         time_ms: u64,
     },
+    Unknown {
+        hint: String,
+    },
     Counterexample {
         witness: Option<rel::RelationalWitness>,
         witness_error: Option<String>,
@@ -951,13 +954,11 @@ impl<'a> RelationalVerifyObligation<'a> {
                     witness_error,
                 }
             }
-            Ok(SolverResult::Interrupted) => RelationalVerifyOutcome::Counterexample {
-                witness: None,
-                witness_error: Some("RustSAT solve interrupted".to_owned()),
+            Ok(SolverResult::Interrupted) => RelationalVerifyOutcome::Unknown {
+                hint: "RustSAT solve interrupted".to_owned(),
             },
-            Err(err) => RelationalVerifyOutcome::Counterexample {
-                witness: None,
-                witness_error: Some(format!("RustSAT solve failed: {err}")),
+            Err(err) => RelationalVerifyOutcome::Unknown {
+                hint: format!("RustSAT solve failed: {err}"),
             },
         }
     }

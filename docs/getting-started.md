@@ -51,14 +51,16 @@ system Commerce(orders: Store<Order>) {
     }
   }
 
-  command pay(order: Order)
-    requires order.status == @Pending {
-    order.mark_paid()
+  command pay(order_id: identity) {
+    choose order: Order where order.id == order_id and order.status == @Pending {
+      order.mark_paid()
+    }
   }
 
-  command ship(order: Order)
-    requires order.status == @Paid {
-    order.ship()
+  command ship(order_id: identity) {
+    choose order: Order where order.id == order_id and order.status == @Paid {
+      order.ship()
+    }
   }
 }
 ```
@@ -91,8 +93,8 @@ scene payment_then_shipping {
     let o = one Order in orders where o.total == 25
   }
   when {
-    commerce.pay(o)
-    commerce.ship(o)
+    commerce.pay(o.id)
+    commerce.ship(o.id)
   }
   then {
     assert o.status == @Shipped
@@ -192,12 +194,14 @@ See [`examples/collections.ab`](../examples/collections.ab) for a complete runna
 
 ## What the pieces mean
 
-- `entity` declares stateful domain objects with fields and actions.
+- `entity` declares stateful domain objects with fields and private actions.
 - `system ... (orders: Store<Order>)` declares a system over an entity pool. Put concrete checking bounds on `store` declarations in `assume` or `given` blocks.
 - Store bounds in `assume` or `given` blocks can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
 - In those concrete checking scopes, the lower bound is the initial active population. `[1..4]` starts with one active entity and can grow to four; `[..4]` starts empty.
 - Optional bounds on `Store<T>` system parameters are cardinality contracts, not ordinary demo scopes. Omit them unless the system really requires a minimum, maximum, or exact active population.
 - `command` declares a public system operation and may include its body inline.
+- `query` declares a public read-only system observation.
+- `action` declares private implementation behavior, usually called by commands.
 - `verify` checks universal properties.
 - `scene` checks existential witness scenarios.
 

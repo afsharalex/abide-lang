@@ -6,6 +6,13 @@ use super::*;
 /// State relation and encodes the monitor transition alongside entity transitions.
 /// The error condition is `accepting = true` (loop detected with pending obligation).
 ///
+/// Soundness boundary: this BAS monitor uses coarse justice bits and is not a
+/// sound basis for theorem/proof liveness claims in general. In particular,
+/// reachable states where fair events are disabled can make fairness vacuous,
+/// while the monitor still requires justice bits to fire before it recognizes an
+/// accepting loop. Callers that produce unbounded proof claims must guard this
+/// path until per-event enabled tracking or a k-liveness proof engine is wired in.
+///
 /// `trigger` and `response` are the P and Q from `always (P implies eventually Q)`.
 /// `fair_events` lists (system, event) pairs with weak fairness.
 /// `entity_var` / `entity_name` are set for entity-quantified patterns.
@@ -165,10 +172,12 @@ pub(super) fn build_liveness_chc(
             });
         }
     }
-    // Justice counters (one per fair event): true once ANY event fires since freeze.
-    // Coarse over-approximation: any non-stutter transition satisfies all justice.
-    // This is sound for proving because it only makes the accepting condition EASIER
-    // to satisfy, so any IC3 PROVED result is genuine.
+    // Justice counters (one per fair event): true once a fair event fires since
+    // freeze. This is deliberately coarse and is NOT a complete fairness
+    // encoding: if a fair event is disabled forever, weak fairness is vacuous,
+    // but the monitor can still miss the accepting loop because the justice bit
+    // never fires. Treat IC3 results from this CHC as an experimental backend
+    // result, not a theorem/proof soundness boundary.
     for (i, _) in fair_events.iter().enumerate() {
         monitor_columns.push(SlotColumn {
             var_name: format!("mon_justice_{i}"),

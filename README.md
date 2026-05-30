@@ -112,6 +112,24 @@ Requires a Rust toolchain (stable).
 cargo build --release
 ```
 
+## Validation
+
+Fast local validation uses the ordinary bounded test line:
+
+```sh
+make check
+```
+
+The unbounded proof-backend tests are an explicit gate because they exercise
+heavier Z3/CVC5 proof paths:
+
+```sh
+make test-unbounded
+```
+
+Use `make check-strict` or `just check-strict` before treating proof-backend
+changes as fully validated.
+
 ## Notes for Early Adopters
 
 - This is not production-ready.

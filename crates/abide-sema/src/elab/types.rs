@@ -531,10 +531,22 @@ impl std::fmt::Display for EventRef {
 
 /// Normalized assumption set for a verification site (verify/theorem/lemma).
 /// See the module-level comment above for defaults and normalization rules.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StutterProvenance {
+    /// Stutter was enabled by the construct default.
+    Default,
+    /// The user wrote `stutter`.
+    ExplicitStutter,
+    /// The user wrote `no stutter`.
+    ExplicitNoStutter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssumptionSet {
     /// Whether stutter steps are admitted at this verification site.
     pub stutter: bool,
+    /// Whether the effective stutter mode came from a default or source text.
+    pub stutter_provenance: StutterProvenance,
     /// Events with weak fairness. After normalization, none of these are
     /// also in `strong_fair`.
     pub weak_fair: std::collections::BTreeSet<EventRef>,
@@ -548,6 +560,12 @@ pub struct AssumptionSet {
     pub per_tuple: std::collections::BTreeSet<EventRef>,
 }
 
+impl Default for AssumptionSet {
+    fn default() -> Self {
+        Self::default_for_verify()
+    }
+}
+
 impl AssumptionSet {
     /// Construct the default `AssumptionSet` for a verify block:
     /// stutter on, no fairness.
@@ -555,6 +573,7 @@ impl AssumptionSet {
     pub fn default_for_verify() -> Self {
         Self {
             stutter: true,
+            stutter_provenance: StutterProvenance::Default,
             weak_fair: std::collections::BTreeSet::new(),
             strong_fair: std::collections::BTreeSet::new(),
             per_tuple: std::collections::BTreeSet::new(),
@@ -567,6 +586,7 @@ impl AssumptionSet {
     pub fn default_for_theorem_or_lemma() -> Self {
         Self {
             stutter: true,
+            stutter_provenance: StutterProvenance::Default,
             weak_fair: std::collections::BTreeSet::new(),
             strong_fair: std::collections::BTreeSet::new(),
             per_tuple: std::collections::BTreeSet::new(),
@@ -1171,6 +1191,10 @@ mod assumption_set_tests {
     fn defaults_enable_stutter_for_verify_and_theorem() {
         assert!(AssumptionSet::default_for_verify().stutter);
         assert!(AssumptionSet::default_for_theorem_or_lemma().stutter);
+        assert!(
+            AssumptionSet::default().stutter,
+            "Default must not silently mean `no stutter`; use explicit constructors for site defaults"
+        );
     }
 
     #[test]

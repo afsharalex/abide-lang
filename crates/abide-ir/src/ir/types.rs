@@ -913,9 +913,18 @@ pub struct IRCommandRef {
     pub command: std::string::String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IRStutterProvenance {
+    Default,
+    ExplicitStutter,
+    ExplicitNoStutter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IRAssumptionSet {
     pub stutter: bool,
+    pub stutter_provenance: IRStutterProvenance,
     pub weak_fair: Vec<IRCommandRef>,
     pub strong_fair: Vec<IRCommandRef>,
     /// Subset of `weak_fair ∪ strong_fair` whose events are
@@ -935,8 +944,18 @@ impl IRAssumptionSet {
             system: e.system.clone(),
             command: e.command.clone(),
         };
+        let stutter_provenance = match set.stutter_provenance {
+            crate::elab::types::StutterProvenance::Default => IRStutterProvenance::Default,
+            crate::elab::types::StutterProvenance::ExplicitStutter => {
+                IRStutterProvenance::ExplicitStutter
+            }
+            crate::elab::types::StutterProvenance::ExplicitNoStutter => {
+                IRStutterProvenance::ExplicitNoStutter
+            }
+        };
         Self {
             stutter: set.stutter,
+            stutter_provenance,
             weak_fair: set.weak_fair.iter().map(to_ref).collect(),
             strong_fair: set.strong_fair.iter().map(to_ref).collect(),
             per_tuple: set.per_tuple.iter().map(to_ref).collect(),
@@ -950,6 +969,7 @@ impl IRAssumptionSet {
     pub fn default_for_verify() -> Self {
         Self {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
@@ -963,6 +983,7 @@ impl IRAssumptionSet {
     pub fn default_for_theorem_or_lemma() -> Self {
         Self {
             stutter: true,
+            stutter_provenance: IRStutterProvenance::Default,
             weak_fair: Vec::new(),
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),

@@ -182,6 +182,7 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
         check_collection_homogeneity(&pred.body, &format!("pred {}", pred.name), &mut errors);
     }
     for prop in env.props.values() {
+        check_verifier_surface_expr(&prop.body, &format!("prop {}", prop.name), &mut errors);
         check_match_exhaustiveness(
             &prop.body,
             &env.types,
@@ -329,7 +330,7 @@ pub fn check(env: &Env) -> (ElabResult, Vec<ElabError>) {
                     }
                 }
                 ESceneWhen::Assume(e) => {
-                    check_verifier_surface_expr(
+                    check_verifier_surface_expr_allowing_sequence(
                         e,
                         &format!("scene {} when assumption", scene.name),
                         &mut errors,
@@ -984,6 +985,11 @@ fn check_unresolved_constructors(
         EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
             check_unresolved_constructors(body, ctx, span, known_names, errors);
         }
+        EExpr::Choose(_, _, _, predicate, _) => {
+            if let Some(predicate) = predicate {
+                check_unresolved_constructors(predicate, ctx, span, known_names, errors);
+            }
+        }
         EExpr::Match(scrut, arms, _) => {
             check_unresolved_constructors(scrut, ctx, span, known_names, errors);
             for (_, guard, body) in arms {
@@ -1046,8 +1052,62 @@ fn check_unresolved_constructors(
                 check_unresolved_constructors(v, ctx, span, known_names, errors);
             }
         }
-        // True leaf nodes: Lit, Qual, Unresolved (lowercase), Sorry, Todo
-        _ => {}
+        EExpr::IfElse(cond, then_body, else_body, _) => {
+            check_unresolved_constructors(cond, ctx, span, known_names, errors);
+            check_unresolved_constructors(then_body, ctx, span, known_names, errors);
+            if let Some(else_body) = else_body {
+                check_unresolved_constructors(else_body, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::Block(items, _) => {
+            for item in items {
+                check_unresolved_constructors(item, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::VarDecl(_, _, init, rest, _) => {
+            check_unresolved_constructors(init, ctx, span, known_names, errors);
+            check_unresolved_constructors(rest, ctx, span, known_names, errors);
+        }
+        EExpr::While(cond, contracts, body, _) => {
+            check_unresolved_constructors(cond, ctx, span, known_names, errors);
+            for contract in contracts {
+                match contract {
+                    EContract::Requires(expr)
+                    | EContract::Ensures(expr)
+                    | EContract::Invariant(expr) => {
+                        check_unresolved_constructors(expr, ctx, span, known_names, errors);
+                    }
+                    EContract::Decreases { measures, .. } => {
+                        for measure in measures {
+                            check_unresolved_constructors(measure, ctx, span, known_names, errors);
+                        }
+                    }
+                }
+            }
+            check_unresolved_constructors(body, ctx, span, known_names, errors);
+        }
+        EExpr::Aggregate(_, _, _, _, body, in_filter, _) => {
+            check_unresolved_constructors(body, ctx, span, known_names, errors);
+            if let Some(in_filter) = in_filter {
+                check_unresolved_constructors(in_filter, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::Saw(_, _, _, args, _) => {
+            for arg in args.iter().flatten() {
+                check_unresolved_constructors(arg, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::StructCtor(_, _, fields, _) => {
+            for (_, e) in fields {
+                check_unresolved_constructors(e, ctx, span, known_names, errors);
+            }
+        }
+        EExpr::Lit(_, _, _)
+        | EExpr::Var(_, _, _)
+        | EExpr::Qual(_, _, _, _)
+        | EExpr::Unresolved(_, _)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_) => {}
     }
 }
 
@@ -1236,6 +1296,8 @@ fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
         | EExpr::BinOp(_, _, _, _, sp)
         | EExpr::UnOp(_, _, _, sp)
         | EExpr::Call(_, _, _, sp)
+        | EExpr::CallR(_, _, _, _, sp)
+        | EExpr::Qual(_, _, _, sp)
         | EExpr::QualCall(_, _, _, _, sp)
         | EExpr::Field(_, _, _, sp)
         | EExpr::Prime(_, _, sp)
@@ -1265,6 +1327,7 @@ fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
         | EExpr::MapUpdate(_, _, _, _, sp)
         | EExpr::Index(_, _, _, sp)
         | EExpr::SetComp(_, _, _, _, _, _, sp)
+        | EExpr::RelComp(_, _, _, _, sp)
         | EExpr::SetLit(_, _, sp)
         | EExpr::SeqLit(_, _, sp)
         | EExpr::MapLit(_, _, sp)
@@ -1278,11 +1341,21 @@ fn expr_span(e: &EExpr) -> Option<crate::span::Span> {
         | EExpr::Saw(_, _, _, _, sp)
         | EExpr::CtorRecord(_, _, _, _, sp)
         | EExpr::StructCtor(_, _, _, sp) => *sp,
-        _ => None,
     }
 }
 
 fn check_verifier_surface_expr(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabError>) {
+    if let Some(span) = find_sequence_composition_span(expr) {
+        errors.push(
+            ElabError::with_span(
+                ErrorKind::TypeMismatch,
+                "`->` is sequence composition, not implication",
+                ctx,
+                span,
+            )
+            .with_help("use `implies` for logical implication in boolean/property expressions"),
+        );
+    }
     if let Some(kind) = find_unsupported_verifier_expr(expr) {
         let mut err = ElabError::new(
             ErrorKind::InvalidScope,
@@ -1295,6 +1368,153 @@ fn check_verifier_surface_expr(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabErr
         .with_help(messages::HINT_VERIFIER_EXPR_NOT_ALLOWED);
         err.span = expr_span(expr);
         errors.push(err);
+    }
+}
+
+fn check_verifier_surface_expr_allowing_sequence(
+    expr: &EExpr,
+    ctx: &str,
+    errors: &mut Vec<ElabError>,
+) {
+    if let Some(kind) = find_unsupported_verifier_expr(expr) {
+        let mut err = ElabError::new(
+            ErrorKind::InvalidScope,
+            format!(
+                "{}: `{kind}` is not allowed in {ctx}",
+                messages::VERIFIER_EXPR_NOT_ALLOWED
+            ),
+            ctx,
+        )
+        .with_help(messages::HINT_VERIFIER_EXPR_NOT_ALLOWED);
+        err.span = expr_span(expr);
+        errors.push(err);
+    }
+}
+
+fn find_sequence_composition_span(expr: &EExpr) -> Option<crate::span::Span> {
+    match expr {
+        EExpr::Seq(_, _, _, span) => *span,
+        EExpr::Lit(_, _, _)
+        | EExpr::Var(_, _, _)
+        | EExpr::Qual(_, _, _, _)
+        | EExpr::Unresolved(_, _)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_) => None,
+        EExpr::Field(_, expr, _, _)
+        | EExpr::Prime(_, expr, _)
+        | EExpr::UnOp(_, _, expr, _)
+        | EExpr::Always(_, expr, _)
+        | EExpr::Eventually(_, expr, _)
+        | EExpr::Historically(_, expr, _)
+        | EExpr::Once(_, expr, _)
+        | EExpr::Previously(_, expr, _)
+        | EExpr::Card(_, expr, _)
+        | EExpr::Assert(_, expr, _)
+        | EExpr::Assume(_, expr, _)
+        | EExpr::NamedPair(_, _, expr, _) => find_sequence_composition_span(expr),
+        EExpr::BinOp(_, _, left, right, _)
+        | EExpr::Until(_, left, right, _)
+        | EExpr::Since(_, left, right, _)
+        | EExpr::Assign(_, left, right, _)
+        | EExpr::SameStep(_, left, right, _)
+        | EExpr::In(_, left, right, _)
+        | EExpr::Pipe(_, left, right, _) => {
+            find_sequence_composition_span(left).or_else(|| find_sequence_composition_span(right))
+        }
+        EExpr::Call(_, func, args, _) => find_sequence_composition_span(func)
+            .or_else(|| args.iter().find_map(find_sequence_composition_span)),
+        EExpr::CallR(_, func, args, rets, _) => find_sequence_composition_span(func)
+            .or_else(|| args.iter().find_map(find_sequence_composition_span))
+            .or_else(|| rets.iter().find_map(find_sequence_composition_span)),
+        EExpr::Quant(_, _, _, _, body, _) => find_sequence_composition_span(body),
+        EExpr::Let(bindings, body, _) => bindings
+            .iter()
+            .find_map(|(_, _, binding_expr)| find_sequence_composition_span(binding_expr))
+            .or_else(|| find_sequence_composition_span(body)),
+        EExpr::TupleLit(_, exprs, _) | EExpr::SetLit(_, exprs, _) | EExpr::SeqLit(_, exprs, _) => {
+            exprs.iter().find_map(find_sequence_composition_span)
+        }
+        EExpr::Match(scrutinee, arms, _) => {
+            find_sequence_composition_span(scrutinee).or_else(|| {
+                arms.iter().find_map(|(_, guard, body)| {
+                    guard
+                        .as_ref()
+                        .and_then(find_sequence_composition_span)
+                        .or_else(|| find_sequence_composition_span(body))
+                })
+            })
+        }
+        EExpr::Choose(_, _, _, predicate, _) => predicate
+            .as_deref()
+            .and_then(find_sequence_composition_span),
+        EExpr::MapUpdate(_, map, key, value, _) => find_sequence_composition_span(map)
+            .or_else(|| find_sequence_composition_span(key))
+            .or_else(|| find_sequence_composition_span(value)),
+        EExpr::Index(_, map, key, _) => {
+            find_sequence_composition_span(map).or_else(|| find_sequence_composition_span(key))
+        }
+        EExpr::SetComp(_, source, _, _, filter, projection, _) => source
+            .as_deref()
+            .and_then(find_sequence_composition_span)
+            .or_else(|| filter.as_deref().and_then(find_sequence_composition_span))
+            .or_else(|| find_sequence_composition_span(projection)),
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            find_sequence_composition_span(projection)
+                .or_else(|| {
+                    bindings
+                        .iter()
+                        .filter_map(|binding| binding.source.as_deref())
+                        .find_map(find_sequence_composition_span)
+                })
+                .or_else(|| find_sequence_composition_span(filter))
+        }
+        EExpr::MapLit(_, entries, _) => entries.iter().find_map(|(key, value)| {
+            find_sequence_composition_span(key).or_else(|| find_sequence_composition_span(value))
+        }),
+        EExpr::QualCall(_, _, _, args, _) => args.iter().find_map(find_sequence_composition_span),
+        EExpr::Block(expressions, _) => expressions.iter().find_map(find_sequence_composition_span),
+        EExpr::VarDecl(_, _, init, rest, _) => {
+            find_sequence_composition_span(init).or_else(|| find_sequence_composition_span(rest))
+        }
+        EExpr::While(cond, contracts, body, _) => find_sequence_composition_span(cond)
+            .or_else(|| {
+                contracts
+                    .iter()
+                    .find_map(find_sequence_composition_span_in_contract)
+            })
+            .or_else(|| find_sequence_composition_span(body)),
+        EExpr::IfElse(cond, then_body, else_body, _) => find_sequence_composition_span(cond)
+            .or_else(|| find_sequence_composition_span(then_body))
+            .or_else(|| {
+                else_body
+                    .as_ref()
+                    .and_then(|expr| find_sequence_composition_span(expr))
+            }),
+        EExpr::Aggregate(_, _, _, _, body, in_filter, _) => find_sequence_composition_span(body)
+            .or_else(|| {
+                in_filter
+                    .as_ref()
+                    .and_then(|expr| find_sequence_composition_span(expr))
+            }),
+        EExpr::Saw(_, _, _, args, _) => args
+            .iter()
+            .filter_map(|arg| arg.as_ref())
+            .find_map(|expr| find_sequence_composition_span(expr)),
+        EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => fields
+            .iter()
+            .find_map(|(_, value)| find_sequence_composition_span(value)),
+        EExpr::Lam(_, _, body, _) => find_sequence_composition_span(body),
+    }
+}
+
+fn find_sequence_composition_span_in_contract(contract: &EContract) -> Option<crate::span::Span> {
+    match contract {
+        EContract::Requires(expr) | EContract::Ensures(expr) | EContract::Invariant(expr) => {
+            find_sequence_composition_span(expr)
+        }
+        EContract::Decreases { measures, .. } => {
+            measures.iter().find_map(find_sequence_composition_span)
+        }
     }
 }
 
@@ -1843,5 +2063,68 @@ mod tests {
         let hints = collect_hints(&expr);
         assert_eq!(hints.len(), 1, "should find hint in binop rhs");
         assert!(hints[0].help.as_ref().unwrap().contains("@Active"));
+    }
+
+    #[test]
+    fn unresolved_constructor_walker_covers_imperative_and_composite_variants() {
+        let expr = EExpr::Block(
+            vec![
+                EExpr::IfElse(
+                    Box::new(EExpr::Var(
+                        Ty::Builtin(BuiltinTy::Bool),
+                        "ok".to_string(),
+                        None,
+                    )),
+                    Box::new(unresolved_var("ThenState")),
+                    Some(Box::new(unresolved_var("ElseState"))),
+                    None,
+                ),
+                EExpr::While(
+                    Box::new(EExpr::Var(
+                        Ty::Builtin(BuiltinTy::Bool),
+                        "keep".to_string(),
+                        None,
+                    )),
+                    vec![
+                        EContract::Invariant(unresolved_var("InvariantState")),
+                        EContract::Decreases {
+                            measures: vec![unresolved_var("MeasureState")],
+                            star: false,
+                        },
+                    ],
+                    Box::new(EExpr::StructCtor(
+                        Ty::Error,
+                        "Record".to_string(),
+                        vec![("field".to_string(), unresolved_var("FieldState"))],
+                        None,
+                    )),
+                    None,
+                ),
+                EExpr::Aggregate(
+                    Ty::Builtin(BuiltinTy::Int),
+                    crate::ast::AggKind::Sum,
+                    "x".to_string(),
+                    Ty::Builtin(BuiltinTy::Int),
+                    Box::new(unresolved_var("AggregateState")),
+                    Some(Box::new(unresolved_var("FilterState"))),
+                    None,
+                ),
+                EExpr::Saw(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    "Ext".to_string(),
+                    "event".to_string(),
+                    vec![Some(Box::new(unresolved_var("SawState")))],
+                    None,
+                ),
+            ],
+            None,
+        );
+
+        let hints = collect_hints(&expr);
+        assert_eq!(
+            hints.len(),
+            8,
+            "walker should find constructor hints inside every covered variant: {hints:?}"
+        );
     }
 }

@@ -73,8 +73,8 @@ use serde::{Deserialize, Serialize};
 use self::smt::{AbideSolver, Bool, SatResult};
 
 use crate::ir::types::{
-    IRAction, IRAssumptionSet, IRExpr, IRFunction, IRProgram, IRSystem, IRTheorem, IRType,
-    IRVerify, IRVerifySystem,
+    IRAction, IRAssumptionSet, IRExpr, IRFunction, IRProgram, IRStutterProvenance, IRSystem,
+    IRTheorem, IRType, IRVerify, IRVerifySystem,
 };
 
 pub use self::chc::ChcSelection;
@@ -130,12 +130,20 @@ pub struct DeadlockEventDiag {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrustedAssumption {
+    /// Default stuttering assumption.
+    DefaultStutter,
     /// Stuttering assumption (`assume { stutter }`).
     Stutter,
+    /// No-stutter assumption (`assume { no stutter }`).
+    NoStutter,
     /// Weak fairness (`assume { fair Sys::cmd }`).
     WeakFairness { system: String, command: String },
+    /// Per-tuple weak fairness for a parameterized command.
+    PerTupleWeakFairness { system: String, command: String },
     /// Strong fairness (`assume { strong fair Sys::cmd }`).
     StrongFairness { system: String, command: String },
+    /// Per-tuple strong fairness for a parameterized command.
+    PerTupleStrongFairness { system: String, command: String },
     /// Lemma conclusion injected via `by L`.
     Lemma { name: String },
     /// Axiom taken as a trusted fact (`axiom name = expr` or `axiom name by "file"`).
@@ -180,20 +188,52 @@ pub fn build_assumptions_with_axioms(
     axioms: &[crate::ir::types::IRAxiom],
 ) -> Vec<TrustedAssumption> {
     let mut out = Vec::new();
-    if set.stutter {
-        out.push(TrustedAssumption::Stutter);
-    }
+    out.push(match (set.stutter, set.stutter_provenance) {
+        (true, IRStutterProvenance::Default) => TrustedAssumption::DefaultStutter,
+        (true, IRStutterProvenance::ExplicitStutter) => TrustedAssumption::Stutter,
+        (false, IRStutterProvenance::ExplicitNoStutter) => TrustedAssumption::NoStutter,
+        (true, IRStutterProvenance::ExplicitNoStutter) => TrustedAssumption::Stutter,
+        (false, IRStutterProvenance::Default | IRStutterProvenance::ExplicitStutter) => {
+            TrustedAssumption::NoStutter
+        }
+    });
     for wf in &set.weak_fair {
-        out.push(TrustedAssumption::WeakFairness {
-            system: wf.system.clone(),
-            command: wf.command.clone(),
+        let is_per_tuple = set.per_tuple.iter().any(|pt| pt == wf);
+        out.push(if is_per_tuple {
+            TrustedAssumption::PerTupleWeakFairness {
+                system: wf.system.clone(),
+                command: wf.command.clone(),
+            }
+        } else {
+            TrustedAssumption::WeakFairness {
+                system: wf.system.clone(),
+                command: wf.command.clone(),
+            }
         });
     }
     for sf in &set.strong_fair {
-        out.push(TrustedAssumption::StrongFairness {
-            system: sf.system.clone(),
-            command: sf.command.clone(),
+        let is_per_tuple = set.per_tuple.iter().any(|pt| pt == sf);
+        out.push(if is_per_tuple {
+            TrustedAssumption::PerTupleStrongFairness {
+                system: sf.system.clone(),
+                command: sf.command.clone(),
+            }
+        } else {
+            TrustedAssumption::StrongFairness {
+                system: sf.system.clone(),
+                command: sf.command.clone(),
+            }
         });
+    }
+    for per_tuple in &set.per_tuple {
+        let already_reported = set.weak_fair.iter().any(|wf| wf == per_tuple)
+            || set.strong_fair.iter().any(|sf| sf == per_tuple);
+        if !already_reported {
+            out.push(TrustedAssumption::PerTupleWeakFairness {
+                system: per_tuple.system.clone(),
+                command: per_tuple.command.clone(),
+            });
+        }
     }
     for lemma in by_lemmas {
         out.push(TrustedAssumption::Lemma {
@@ -314,7 +354,18 @@ fn materialize_relational_verify_outcome(
                 &verify_block.assumption_set,
                 &[],
             ),
+            backend_diagnostics: vec![],
             span: None,
+            file: None,
+        },
+        relational::RelationalVerifyOutcome::Unknown { hint } => VerificationResult::Unprovable {
+            name: verify_block.name.clone(),
+            hint,
+            span: if verify_block.asserts.len() == 1 {
+                expr_span(&verify_block.asserts[0])
+            } else {
+                None
+            },
             file: None,
         },
         relational::RelationalVerifyOutcome::Counterexample {
@@ -393,6 +444,34 @@ impl CounterexampleReplayReport {
 
 /// Result of checking a single verification target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendDiagnostic {
+    pub phase: String,
+    pub backend: String,
+    pub severity: String,
+    pub message: String,
+}
+
+impl BackendDiagnostic {
+    fn ic3_unknown(message: String) -> Self {
+        Self {
+            phase: "unbounded_safety".to_owned(),
+            backend: "IC3/PDR".to_owned(),
+            severity: "info".to_owned(),
+            message,
+        }
+    }
+
+    fn proof_mode_hint() -> Self {
+        Self {
+            phase: "proof_mode".to_owned(),
+            backend: "verify".to_owned(),
+            severity: "info".to_owned(),
+            message: "ordinary verify ran bounded/exploration checking; rerun with --ic3 or --unbounded-only to attempt an unbounded proof".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerificationResult {
     /// Property proved inductively (unbounded, all sizes).
@@ -424,6 +503,8 @@ pub enum VerificationResult {
         method: Option<String>,
         time_ms: u64,
         assumptions: Vec<TrustedAssumption>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        backend_diagnostics: Vec<BackendDiagnostic>,
         span: Option<crate::span::Span>,
         file: Option<String>,
     },
@@ -570,6 +651,7 @@ impl VerificationResult {
                 method,
                 time_ms,
                 assumptions,
+                backend_diagnostics,
                 span,
                 file,
             } => Self::Checked {
@@ -578,6 +660,7 @@ impl VerificationResult {
                 method,
                 time_ms,
                 assumptions,
+                backend_diagnostics,
                 span: span.or(block_span),
                 file: file.or(block_file),
             },
@@ -893,6 +976,62 @@ impl VerificationResult {
             | Self::FnContractFailed { .. } => &[],
         }
     }
+
+    pub fn backend_diagnostics(&self) -> &[BackendDiagnostic] {
+        match self {
+            Self::Checked {
+                backend_diagnostics,
+                ..
+            } => backend_diagnostics,
+            _ => &[],
+        }
+    }
+}
+
+fn attach_backend_diagnostics(
+    result: VerificationResult,
+    diagnostics: &[BackendDiagnostic],
+) -> VerificationResult {
+    if diagnostics.is_empty() {
+        return result;
+    }
+    match result {
+        VerificationResult::Checked {
+            name,
+            depth,
+            method,
+            time_ms,
+            assumptions,
+            mut backend_diagnostics,
+            span,
+            file,
+        } => {
+            backend_diagnostics.extend_from_slice(diagnostics);
+            VerificationResult::Checked {
+                name,
+                depth,
+                method,
+                time_ms,
+                assumptions,
+                backend_diagnostics,
+                span,
+                file,
+            }
+        }
+        other => other,
+    }
+}
+
+fn attach_proof_mode_hint(result: VerificationResult, config: &VerifyConfig) -> VerificationResult {
+    if config.bounded_only
+        || config.unbounded_only
+        || !config.no_ic3
+        || config.cvc5_sygus
+        || !matches!(result, VerificationResult::Checked { .. })
+    {
+        return result;
+    }
+    attach_backend_diagnostics(result, &[BackendDiagnostic::proof_mode_hint()])
 }
 
 /// Internal presentation helper for trace-shaped witness rendering.
@@ -2264,6 +2403,7 @@ fn find_deadlock_step(
     relevant_systems: &[IRSystem],
     vctx: &VerifyContext,
     scope: &HashMap<String, usize>,
+    store_ranges: &HashMap<String, VerifyStoreRange>,
     verify_block: &IRVerify,
     bound: usize,
     config: &VerifyConfig,
@@ -2287,7 +2427,7 @@ fn find_deadlock_step(
             relevant_systems.to_vec(),
             scope.clone(),
             k,
-            HashMap::new(),
+            store_ranges.clone(),
             &verify_block.assumption_set,
         )?;
         let encoding = transition::TransitionSmtEncoding::from_plan(
@@ -2345,7 +2485,7 @@ fn find_deadlock_step(
                 relevant_systems.to_vec(),
                 scope.clone(),
                 sat_steps,
-                HashMap::new(),
+                store_ranges.clone(),
                 &verify_block.assumption_set,
             )?;
             let sat_encoding = transition::TransitionSmtEncoding::from_plan(
@@ -2397,7 +2537,7 @@ fn find_deadlock_step(
                 relevant_systems.to_vec(),
                 scope.clone(),
                 sat_steps,
-                HashMap::new(),
+                store_ranges.clone(),
                 &verify_block.assumption_set,
             )?;
             let sat_encoding = transition::TransitionSmtEncoding::from_plan(
@@ -2544,6 +2684,7 @@ fn check_verify_block_tiered(
                         &effective_block.assumption_set,
                         &[],
                     ),
+                    backend_diagnostics: vec![],
                     span: effective_block.span,
                     file: effective_block.file.clone(),
                 },
@@ -2607,6 +2748,7 @@ fn check_verify_block_tiered(
             .any(|system| system.name == scope.name && !system.actions.is_empty())
     });
     let mut bounded_checked_result: Option<VerificationResult> = None;
+    let mut backend_diagnostics: Vec<BackendDiagnostic> = Vec::new();
 
     if let Some(result) =
         explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
@@ -2679,8 +2821,14 @@ fn check_verify_block_tiered(
         }
     }
 
-    // Tier 1a: Try induction (unless bounded-only or liveness)
-    if !config.bounded_only && !has_liveness && active_solver_family() == SolverFamily::Z3 {
+    let proof_search_enabled = config.unbounded_only || !config.no_ic3 || config.cvc5_sygus;
+
+    // Tier 1a: Try induction only for explicit proof-search modes.
+    if proof_search_enabled
+        && !config.bounded_only
+        && !has_liveness
+        && active_solver_family() == SolverFamily::Z3
+    {
         let Some(induction_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {
                 name: effective_block.name.clone(),
@@ -2708,13 +2856,20 @@ fn check_verify_block_tiered(
                 file: effective_block.file.clone(),
             };
         };
-        if let Some(result) = try_ic3_on_verify(ir, vctx, defs, effective_block, &ic3_config) {
+        let attempt =
+            try_ic3_on_verify_with_diagnostics(ir, vctx, defs, effective_block, &ic3_config);
+        if let Some(result) = attempt.result {
             return result;
         }
+        backend_diagnostics.extend(attempt.diagnostics);
         // IC3 failed — fall through to Tier 2
     }
 
-    if !config.bounded_only && !has_liveness && config.chc_selection != ChcSelection::Cvc5 {
+    if config.cvc5_sygus
+        && !config.bounded_only
+        && !has_liveness
+        && config.chc_selection != ChcSelection::Cvc5
+    {
         let Some(sygus_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {
                 name: effective_block.name.clone(),
@@ -2732,7 +2887,10 @@ fn check_verify_block_tiered(
 
     if scoped_system_has_actions {
         if let Some(result) = bounded_checked_result {
-            return result;
+            return attach_proof_mode_hint(
+                attach_backend_diagnostics(result, &backend_diagnostics),
+                config,
+            );
         }
     }
 
@@ -2795,7 +2953,7 @@ fn check_verify_block_tiered(
                     }
                 }
                 // Reduction failed or is not applicable — return CHECKED from lasso.
-                return lasso_result;
+                return attach_proof_mode_hint(lasso_result, config);
             }
             _ => return lasso_result,
         }
@@ -2809,7 +2967,13 @@ fn check_verify_block_tiered(
             file: effective_block.file.clone(),
         };
     };
-    check_verify_block_with_depth_search(ir, vctx, defs, effective_block, &bmc_config)
+    attach_proof_mode_hint(
+        attach_backend_diagnostics(
+            check_verify_block_with_depth_search(ir, vctx, defs, effective_block, &bmc_config),
+            &backend_diagnostics,
+        ),
+        config,
+    )
 }
 
 fn check_static_verify_assertions(
@@ -2828,6 +2992,7 @@ fn check_static_verify_assertions(
             method: None,
             time_ms: 0,
             assumptions,
+            backend_diagnostics: vec![],
             span: verify_block.span,
             file: verify_block.file.clone(),
         };
@@ -2878,6 +3043,7 @@ fn check_static_verify_assertions(
             method: None,
             time_ms: 0,
             assumptions,
+            backend_diagnostics: vec![],
             span: verify_block.span,
             file: verify_block.file.clone(),
         },
@@ -2996,6 +3162,16 @@ fn try_induction_on_verify(
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
     let safety = obligation.safety();
     let system = safety.system();
+
+    // No-stutter verify treats deadlock as an observable failure. The current
+    // 1-induction obligation proves only assertion preservation over existing
+    // transitions; it does not prove that every reachable state has a next
+    // transition. Let the bounded path, which is deadlock-aware, own this
+    // semantic surface until induction carries an explicit enabledness
+    // obligation.
+    if !system.assumptions().stutter() {
+        return None;
+    }
 
     // Pre-check: reject unsupported expressions in asserts AND transitions
     for expr in safety.step_properties() {
@@ -3585,15 +3761,14 @@ pub(super) fn try_liveness_reduction(
     // automatically discover the strengthening invariants needed.
     // ALL patterns must be proved by IC3. If any fails, the block is not proved.
     //
-    // For QUANTIFIED patterns: IC3 with coarse justice tracking on the full
-    // multi-slot system is unsound (events firing on other slots satisfy
-    // justice for the wrong slot). Instead, try symmetry reduction: prove
-    // the property on a 1-slot system where coarse justice IS sound (there's
-    // only one slot, so any event on that slot is the target), then
-    // generalize by entity symmetry.
-    let has_quantified = liveness.has_quantified_patterns();
+    // For QUANTIFIED patterns: IC3/BAS with coarse justice is not sound for
+    // unbounded liveness proof claims. Symmetry validation remains useful as a
+    // guardrail for the future k-liveness/per-enabled-event implementation, but
+    // it must not produce `Proved` today.
+    let has_quantified =
+        liveness.has_quantified_patterns() || recipes.iter().any(|recipe| recipe.is_quantified());
     if has_quantified {
-        // Try symmetry reduction before falling back to lasso BMC
+        // Validate symmetry before falling back to lasso BMC/UNPROVABLE.
         if let Some(result) = try_symmetry_reduction(
             ir,
             vctx,
@@ -3612,6 +3787,11 @@ pub(super) fn try_liveness_reduction(
         }
         return None; // symmetry failed — fall back to lasso BMC (CHECKED)
     }
+
+    debug_assert!(
+        recipes.iter().all(|recipe| !recipe.is_quantified()),
+        "quantified liveness recipes must not reach the IC3/BAS proof path"
+    );
 
     let mut all_proved = true;
     'pattern_loop: for (recipe_index, recipe) in recipes.iter().enumerate() {
@@ -3724,14 +3904,39 @@ fn try_ic3_on_verify(
     verify_block: &IRVerify,
     config: &VerifyConfig,
 ) -> Option<VerificationResult> {
+    try_ic3_on_verify_with_diagnostics(ir, vctx, defs, verify_block, config).result
+}
+
+struct VerifyBackendAttempt {
+    result: Option<VerificationResult>,
+    diagnostics: Vec<BackendDiagnostic>,
+}
+
+fn try_ic3_on_verify_with_diagnostics(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> VerifyBackendAttempt {
     let start = Instant::now();
 
     // shared scope helper. IC3 also widens
     // slots based on quantifier depth, layered on top of the canonical scope.
-    let safety = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)?;
+    let Some(safety) = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
+    else {
+        return VerifyBackendAttempt {
+            result: None,
+            diagnostics: vec![BackendDiagnostic::ic3_unknown(
+                "verify block did not produce a transition-system obligation".to_owned(),
+            )],
+        };
+    };
     if config.progress {
         eprint!(" (trying IC3/PDR)");
     }
+
+    let mut diagnostics = Vec::new();
 
     // Try IC3 on each assert — all must pass for PROVED
     // Try IC3 on each assert — all must pass for PROVED.
@@ -3745,31 +3950,43 @@ fn try_ic3_on_verify(
         );
         match result {
             transition::TransitionResult::Proved => {} // this assert proved, continue
-            transition::TransitionResult::Violated(_)
-            | transition::TransitionResult::Unknown(_) => {
-                return None; // fall back to BMC for confirmed trace
+            transition::TransitionResult::Violated(_) => {
+                return VerifyBackendAttempt {
+                    result: None,
+                    diagnostics,
+                };
+            }
+            transition::TransitionResult::Unknown(reason) => {
+                diagnostics.push(BackendDiagnostic::ic3_unknown(reason));
+                return VerifyBackendAttempt {
+                    result: None,
+                    diagnostics,
+                };
             }
         }
     }
 
     let elapsed = elapsed_ms(&start);
-    Some(VerificationResult::Proved {
-        name: verify_block.name.clone(),
-        method: "IC3/PDR".to_owned(),
-        time_ms: elapsed,
-        assumptions: build_assumptions_for_system_scope(
-            ir,
-            &verify_block
-                .systems
-                .iter()
-                .map(|s| s.name.clone())
-                .collect::<Vec<_>>(),
-            &verify_block.assumption_set,
-            &[],
-        ),
-        span: None,
-        file: None,
-    })
+    VerifyBackendAttempt {
+        result: Some(VerificationResult::Proved {
+            name: verify_block.name.clone(),
+            method: "IC3/PDR".to_owned(),
+            time_ms: elapsed,
+            assumptions: build_assumptions_for_system_scope(
+                ir,
+                &verify_block
+                    .systems
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+                &verify_block.assumption_set,
+                &[],
+            ),
+            span: None,
+            file: None,
+        }),
+        diagnostics,
+    }
 }
 
 // ── BMC check for a single verify block ─────────────────────────────
@@ -3817,6 +4034,34 @@ fn check_verify_block_with_depth_search(
     }
 
     check_verify_block(ir, vctx, defs, verify_block, config)
+}
+
+fn bmc_unknown_result(
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+    solver_reason: &str,
+) -> VerificationResult {
+    let hint = if config.bmc_timeout_ms > 0 {
+        let timeout_display = if config.bmc_timeout_ms >= 1000 {
+            format!("{}s", config.bmc_timeout_ms / 1000)
+        } else {
+            format!("{}ms", config.bmc_timeout_ms)
+        };
+        format!(
+            "Z3 timed out after {timeout_display} — try reducing bound, increasing --bmc-timeout, or simplifying property"
+        )
+    } else if solver_reason.is_empty() {
+        crate::messages::BMC_UNKNOWN.to_owned()
+    } else {
+        format!("{}: {solver_reason}", crate::messages::BMC_UNKNOWN)
+    };
+
+    VerificationResult::Unprovable {
+        name: verify_block.name.clone(),
+        hint,
+        span: None,
+        file: None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4005,6 +4250,7 @@ fn check_verify_block(
                     system.relevant_systems(),
                     vctx,
                     system.slots_per_entity(),
+                    system.store_ranges(),
                     verify_block,
                     bound,
                     config,
@@ -4101,6 +4347,7 @@ fn check_verify_block(
                 &verify_block.assumption_set,
                 &[],
             ),
+            backend_diagnostics: vec![],
             span: None,
             file: None,
         },
@@ -4167,26 +4414,7 @@ fn check_verify_block(
                 file: None,
             }
         }
-        SatResult::Unknown(_) => {
-            let hint = if config.bmc_timeout_ms > 0 {
-                let timeout_display = if config.bmc_timeout_ms >= 1000 {
-                    format!("{}s", config.bmc_timeout_ms / 1000)
-                } else {
-                    format!("{}ms", config.bmc_timeout_ms)
-                };
-                format!(
-                    "Z3 timed out after {timeout_display} — try reducing bound, increasing --bmc-timeout, or simplifying property"
-                )
-            } else {
-                crate::messages::BMC_UNKNOWN.to_owned()
-            };
-            VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint,
-                span: None,
-                file: None,
-            }
-        }
+        SatResult::Unknown(reason) => bmc_unknown_result(verify_block, config, &reason),
     }
 }
 
@@ -4434,6 +4662,7 @@ fn check_verify_block_lasso(
             &verify_block.assumption_set,
             &[],
         ),
+        backend_diagnostics: vec![],
         span: None,
         file: None,
     }
@@ -5137,12 +5366,22 @@ fn format_assumptions(assumptions: &[TrustedAssumption]) -> String {
     }
     let mut parts: Vec<String> = Vec::new();
 
-    // Stutter first
+    // Stutter mode first
     if assumptions
+        .iter()
+        .any(|a| matches!(a, TrustedAssumption::DefaultStutter))
+    {
+        parts.push("default stutter".to_owned());
+    } else if assumptions
         .iter()
         .any(|a| matches!(a, TrustedAssumption::Stutter))
     {
         parts.push("stutter".to_owned());
+    } else if assumptions
+        .iter()
+        .any(|a| matches!(a, TrustedAssumption::NoStutter))
+    {
+        parts.push("no stutter".to_owned());
     }
 
     // Weak fairness (alphabetical, deduplicated)
@@ -5151,6 +5390,9 @@ fn format_assumptions(assumptions: &[TrustedAssumption]) -> String {
         .filter_map(|a| match a {
             TrustedAssumption::WeakFairness { system, command } => {
                 Some(format!("WF {system}::{command}"))
+            }
+            TrustedAssumption::PerTupleWeakFairness { system, command } => {
+                Some(format!("WF per-tuple {system}::{command}"))
             }
             _ => None,
         })
@@ -5165,6 +5407,9 @@ fn format_assumptions(assumptions: &[TrustedAssumption]) -> String {
         .filter_map(|a| match a {
             TrustedAssumption::StrongFairness { system, command } => {
                 Some(format!("SF {system}::{command}"))
+            }
+            TrustedAssumption::PerTupleStrongFairness { system, command } => {
+                Some(format!("SF per-tuple {system}::{command}"))
             }
             _ => None,
         })

@@ -5,11 +5,12 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::verify::{encode, walkers};
 
-mod macro_impl;
+mod branching;
 mod nested;
 
-pub(crate) use self::macro_impl::try_encode_step_inner;
-use self::macro_impl::*;
+pub(crate) use self::branching::try_encode_step_inner;
+#[cfg(test)]
+use self::branching::*;
 
 /// Encode a system event as a single transition step.
 ///
@@ -23,6 +24,7 @@ use self::macro_impl::*;
 ///
 /// Frames all entity slots NOT touched by the event.
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub fn encode_step(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -54,7 +56,7 @@ pub fn try_encode_step(
 /// Scene events supply concrete argument values (resolved from given bindings)
 /// rather than fresh unconstrained Z3 variables.
 #[allow(clippy::implicit_hasher)]
-pub fn encode_step_with_params(
+pub fn try_encode_step_with_params(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],
@@ -62,8 +64,8 @@ pub fn encode_step_with_params(
     event: &IRSystemAction,
     step: usize,
     params: HashMap<String, SmtValue>,
-) -> Bool {
-    let (formula, touched) = encode_step_inner(
+) -> Result<Bool, String> {
+    let (formula, touched) = try_encode_step_inner(
         pool,
         vctx,
         entities,
@@ -72,8 +74,8 @@ pub fn encode_step_with_params(
         step,
         0,
         Some(params),
-    );
-    apply_global_frame(pool, entities, &touched, step, formula)
+    )?;
+    Ok(apply_global_frame(pool, entities, &touched, step, formula))
 }
 
 /// Apply global frame for untouched slots to an event formula.
@@ -1216,6 +1218,45 @@ mod tests {
         )
         .expect_err("nested macro choose should fail");
         assert!(err.contains("not yet supported inside choose/for blocks"));
+    }
+
+    #[test]
+    fn try_encode_step_inner_rejects_unresolved_apply_without_panic() {
+        let entity = make_step_test_entity();
+        let vctx = make_step_test_vctx();
+        let system = make_shop_system(IRSystemAction {
+            name: "bad_apply".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![IRAction::Apply {
+                target: "missing".to_owned(),
+                transition: "missing_transition".to_owned(),
+                args: vec![int_lit(9)],
+                refs: vec![],
+            }],
+            return_expr: None,
+        });
+        let pool = create_slot_pool(
+            std::slice::from_ref(&entity),
+            &HashMap::from([(entity.name.clone(), 1_usize)]),
+            1,
+        );
+        let err = try_encode_step_inner(
+            &pool,
+            &vctx,
+            std::slice::from_ref(&entity),
+            std::slice::from_ref(&system),
+            &system.actions[0],
+            0,
+            0,
+            None,
+        )
+        .expect_err("unresolved apply should return an encoder error");
+        assert!(err.contains("Apply target resolution failed"));
     }
 
     #[test]

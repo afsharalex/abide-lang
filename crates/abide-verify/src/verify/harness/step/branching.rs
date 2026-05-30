@@ -1,30 +1,6 @@
 use super::nested::try_encode_nested_op;
 use super::*;
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub(crate) fn encode_step_inner(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
-    event: &IRSystemAction,
-    step: usize,
-    depth: usize,
-    override_params: Option<HashMap<String, SmtValue>>,
-) -> (Bool, HashSet<(String, usize)>) {
-    try_encode_step_inner(
-        pool,
-        vctx,
-        entities,
-        all_systems,
-        event,
-        step,
-        depth,
-        override_params,
-    )
-    .unwrap_or_else(|msg| panic!("{msg}"))
-}
-
 #[derive(Clone)]
 pub(super) struct MacroBranch {
     formula: Bool,
@@ -53,29 +29,16 @@ pub(crate) fn try_encode_step_inner(
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
 ) -> Result<(Bool, HashSet<(String, usize)>), String> {
-    if contains_macro_actions(&event.body) {
-        try_encode_step_inner_macro(
-            pool,
-            vctx,
-            entities,
-            all_systems,
-            event,
-            step,
-            depth,
-            override_params,
-        )
-    } else {
-        try_encode_step_inner_legacy(
-            pool,
-            vctx,
-            entities,
-            all_systems,
-            event,
-            step,
-            depth,
-            override_params,
-        )
-    }
+    try_encode_step_inner_branching(
+        pool,
+        vctx,
+        entities,
+        all_systems,
+        event,
+        step,
+        depth,
+        override_params,
+    )
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -89,15 +52,17 @@ pub(crate) fn try_encode_step_inner_legacy(
     depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
 ) -> Result<(Bool, HashSet<(String, usize)>), String> {
-    assert!(
-        depth <= 10,
-        "CrossCall recursion depth exceeded (depth {depth}) — possible cyclic cross-system calls"
-    );
-    assert!(
-        step < pool.bound,
-        "step {step} out of bounds for bound {}",
-        pool.bound
-    );
+    if depth > 10 {
+        return Err(format!(
+            "CrossCall recursion depth exceeded (depth {depth}) — possible cyclic cross-system calls"
+        ));
+    }
+    if step >= pool.bound {
+        return Err(format!(
+            "step {step} out of bounds for bound {}",
+            pool.bound
+        ));
+    }
 
     let mut conjuncts = Vec::new();
     // Track which entity types have ALL their slots handled internally
@@ -473,10 +438,10 @@ pub(crate) fn try_encode_step_inner_legacy(
                                         // Apply targeting a different variable inside a Choose
                                         // is malformed IR — the Apply target should match
                                         // the Choose-bound variable.
-                                        panic!(
+                                        return Err(format!(
                                             "Apply target {target} does not match Choose var {var} \
                                              — cross-target Apply in Choose is not supported"
-                                        );
+                                        ));
                                     }
                                     _ => {
                                         if let Some(ent) = entity_ir {
@@ -606,20 +571,20 @@ pub(crate) fn try_encode_step_inner_legacy(
                     }
                 });
                 let Some(ent) = resolved_entity else {
-                    panic!(
+                    return Err(format!(
                         "Apply target resolution failed: target={target:?}, transition={transition:?} \
                          — could not resolve entity (var_to_entity keys: {:?}, entity names: {:?})",
                         var_to_entity.keys().collect::<Vec<_>>(),
                         entities.iter().map(|e| &e.name).collect::<Vec<_>>()
-                    );
+                    ));
                 };
                 let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) else {
-                    panic!(
+                    return Err(format!(
                         "Apply transition not found: entity={}, transition={transition:?} \
                          — available transitions: {:?}",
                         ent.name,
                         ent.transitions.iter().map(|t| &t.name).collect::<Vec<_>>()
-                    );
+                    ));
                 };
                 // Use resolved entity name, not the target variable name
                 let ent_name = &ent.name;
@@ -1153,7 +1118,7 @@ pub(crate) fn try_encode_step_inner_legacy(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn try_encode_step_inner_macro(
+pub(super) fn try_encode_step_inner_branching(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],

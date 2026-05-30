@@ -56,6 +56,11 @@ This is the serialized form of `IRProgram` from
 - Assumption sets are normalized before they reach IR:
   - `stutter` is a boolean
   - `weak_fair`, `strong_fair`, and `per_tuple` are arrays of command refs
+- Relation surface expressions in `emit-ir` remain ordinary `IRExpr` nodes
+  such as `OpRelJoin`, `OpRelProject`, `OpSetUnion`, and set literals. Static
+  relation assertions are translated into `IRRelationExpr` inside
+  `abide-verify::verify::relation_sat`; there is no separate structured
+  relation-expression payload in the public IR JSON.
 
 Example assumption set:
 

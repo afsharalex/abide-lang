@@ -5,11 +5,11 @@
 
 mod expr;
 mod qualify;
+#[cfg(test)]
 mod relation_expr;
 mod system;
 
 use expr::{card_from_text, lower_expr};
-pub use relation_expr::{lower_relation_expr, RelationLowerError};
 use system::{lower_extern, lower_system, synthesize_proc_entities};
 
 use crate::elab::types as E;
@@ -365,7 +365,7 @@ fn lower_fn(ef: &E::EFn, ctx: &LowerCtx<'_>) -> IRFunction {
         .iter()
         .filter_map(|(name, ty)| {
             if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
-                Some(subst_dollar(name, &lower_expr(pred, ctx)))
+                Some(lower_expr(&subst_dollar_elab(name, pred), ctx))
             } else {
                 None
             }
@@ -402,88 +402,6 @@ fn lower_fn(ef: &E::EFn, ctx: &LowerCtx<'_>) -> IRFunction {
         decreases,
         span: ef.span,
         file: ef.file.clone(),
-    }
-}
-
-/// Substitute `$` with a parameter name in an IR expression.
-fn subst_dollar(name: &str, expr: &IRExpr) -> IRExpr {
-    match expr {
-        IRExpr::Var {
-            name: n, ty, span, ..
-        } if n == "$" => IRExpr::Var {
-            name: name.to_owned(),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::BinOp {
-            op,
-            left,
-            right,
-            ty,
-            span,
-        } => IRExpr::BinOp {
-            op: op.clone(),
-            left: Box::new(subst_dollar(name, left)),
-            right: Box::new(subst_dollar(name, right)),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::UnOp {
-            op,
-            operand,
-            ty,
-            span,
-        } => IRExpr::UnOp {
-            op: op.clone(),
-            operand: Box::new(subst_dollar(name, operand)),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::App {
-            func,
-            arg,
-            ty,
-            span,
-        } => IRExpr::App {
-            func: Box::new(subst_dollar(name, func)),
-            arg: Box::new(subst_dollar(name, arg)),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::Field {
-            expr: e,
-            field,
-            ty,
-            span,
-        } => IRExpr::Field {
-            expr: Box::new(subst_dollar(name, e)),
-            field: field.clone(),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::Forall {
-            var,
-            domain,
-            body,
-            span,
-        } if var != "$" => IRExpr::Forall {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(subst_dollar(name, body)),
-            span: *span,
-        },
-        IRExpr::Exists {
-            var,
-            domain,
-            body,
-            span,
-        } if var != "$" => IRExpr::Exists {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(subst_dollar(name, body)),
-            span: *span,
-        },
-        _ => expr.clone(),
     }
 }
 
@@ -761,6 +679,20 @@ fn extract_param_refinements(params: &[(String, E::Ty)]) -> Vec<E::EExpr> {
 fn subst_dollar_elab(name: &str, expr: &E::EExpr) -> E::EExpr {
     match expr {
         E::EExpr::Var(ty, n, sp) if n == "$" => E::EExpr::Var(ty.clone(), name.to_owned(), *sp),
+        E::EExpr::Lit(_, _, _)
+        | E::EExpr::Var(_, _, _)
+        | E::EExpr::Qual(_, _, _, _)
+        | E::EExpr::Sorry(_)
+        | E::EExpr::Todo(_) => expr.clone(),
+        E::EExpr::Field(ty, inner, field, span) => E::EExpr::Field(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, inner)),
+            field.clone(),
+            *span,
+        ),
+        E::EExpr::Prime(ty, inner, span) => {
+            E::EExpr::Prime(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
         E::EExpr::BinOp(ty, op, a, b, sp) => E::EExpr::BinOp(
             ty.clone(),
             *op,
@@ -768,10 +700,417 @@ fn subst_dollar_elab(name: &str, expr: &E::EExpr) -> E::EExpr {
             Box::new(subst_dollar_elab(name, b)),
             *sp,
         ),
-        E::EExpr::UnOp(ty, op, e, sp) => {
-            E::EExpr::UnOp(ty.clone(), *op, Box::new(subst_dollar_elab(name, e)), *sp)
+        E::EExpr::UnOp(ty, op, inner, span) => E::EExpr::UnOp(
+            ty.clone(),
+            *op,
+            Box::new(subst_dollar_elab(name, inner)),
+            *span,
+        ),
+        E::EExpr::Call(ty, func, args, span) => E::EExpr::Call(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, func)),
+            args.iter()
+                .map(|arg| subst_dollar_elab(name, arg))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::CallR(ty, func, args, refs, span) => E::EExpr::CallR(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, func)),
+            args.iter()
+                .map(|arg| subst_dollar_elab(name, arg))
+                .collect(),
+            refs.iter()
+                .map(|reference| subst_dollar_elab(name, reference))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::Quant(ty, quant, var, domain_ty, body, span) => E::EExpr::Quant(
+            ty.clone(),
+            *quant,
+            var.clone(),
+            domain_ty.clone(),
+            if var == "$" {
+                body.clone()
+            } else {
+                Box::new(subst_dollar_elab(name, body))
+            },
+            *span,
+        ),
+        E::EExpr::Always(ty, inner, span) => {
+            E::EExpr::Always(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
         }
-        _ => expr.clone(),
+        E::EExpr::Eventually(ty, inner, span) => {
+            E::EExpr::Eventually(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Until(ty, left, right, span) => E::EExpr::Until(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::Historically(ty, inner, span) => {
+            E::EExpr::Historically(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Once(ty, inner, span) => {
+            E::EExpr::Once(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Previously(ty, inner, span) => {
+            E::EExpr::Previously(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Since(ty, left, right, span) => E::EExpr::Since(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::Assert(ty, inner, span) => {
+            E::EExpr::Assert(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Assume(ty, inner, span) => {
+            E::EExpr::Assume(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Assign(ty, left, right, span) => E::EExpr::Assign(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::NamedPair(ty, pair_name, inner, span) => E::EExpr::NamedPair(
+            ty.clone(),
+            pair_name.clone(),
+            Box::new(subst_dollar_elab(name, inner)),
+            *span,
+        ),
+        E::EExpr::Seq(ty, left, right, span) => E::EExpr::Seq(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::SameStep(ty, left, right, span) => E::EExpr::SameStep(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::Let(bindings, body, span) => {
+            let mut shadowed = false;
+            let bindings = bindings
+                .iter()
+                .map(|(binding_name, ty, value)| {
+                    let value = if shadowed {
+                        value.clone()
+                    } else {
+                        subst_dollar_elab(name, value)
+                    };
+                    if binding_name == "$" {
+                        shadowed = true;
+                    }
+                    (binding_name.clone(), ty.clone(), value)
+                })
+                .collect();
+            E::EExpr::Let(
+                bindings,
+                if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(subst_dollar_elab(name, body))
+                },
+                *span,
+            )
+        }
+        E::EExpr::Lam(params, ret_ty, body, span) => E::EExpr::Lam(
+            params.clone(),
+            ret_ty.clone(),
+            if params.iter().any(|(param, _)| param == "$") {
+                body.clone()
+            } else {
+                Box::new(subst_dollar_elab(name, body))
+            },
+            *span,
+        ),
+        E::EExpr::Unresolved(unresolved, span) if unresolved == "$" => {
+            E::EExpr::Unresolved(name.to_owned(), *span)
+        }
+        E::EExpr::Unresolved(_, _) => expr.clone(),
+        E::EExpr::TupleLit(ty, elements, span) => E::EExpr::TupleLit(
+            ty.clone(),
+            elements
+                .iter()
+                .map(|element| subst_dollar_elab(name, element))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::In(ty, left, right, span) => E::EExpr::In(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::Card(ty, inner, span) => {
+            E::EExpr::Card(ty.clone(), Box::new(subst_dollar_elab(name, inner)), *span)
+        }
+        E::EExpr::Pipe(ty, left, right, span) => E::EExpr::Pipe(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, left)),
+            Box::new(subst_dollar_elab(name, right)),
+            *span,
+        ),
+        E::EExpr::Match(scrutinee, arms, span) => E::EExpr::Match(
+            Box::new(subst_dollar_elab(name, scrutinee)),
+            arms.iter()
+                .map(|(pattern, guard, body)| {
+                    if pattern_binds_elab_var(pattern, "$") {
+                        (pattern.clone(), guard.clone(), body.clone())
+                    } else {
+                        (
+                            pattern.clone(),
+                            guard.as_ref().map(|guard| subst_dollar_elab(name, guard)),
+                            subst_dollar_elab(name, body),
+                        )
+                    }
+                })
+                .collect(),
+            *span,
+        ),
+        E::EExpr::Choose(ty, var, domain_ty, filter, span) => E::EExpr::Choose(
+            ty.clone(),
+            var.clone(),
+            domain_ty.clone(),
+            if var == "$" {
+                filter.clone()
+            } else {
+                filter
+                    .as_ref()
+                    .map(|filter| Box::new(subst_dollar_elab(name, filter)))
+            },
+            *span,
+        ),
+        E::EExpr::MapUpdate(ty, map, key, value, span) => E::EExpr::MapUpdate(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, map)),
+            Box::new(subst_dollar_elab(name, key)),
+            Box::new(subst_dollar_elab(name, value)),
+            *span,
+        ),
+        E::EExpr::Index(ty, map, key, span) => E::EExpr::Index(
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, map)),
+            Box::new(subst_dollar_elab(name, key)),
+            *span,
+        ),
+        E::EExpr::SetComp(ty, source, var, domain_ty, filter, projection, span) => {
+            let source = source
+                .as_ref()
+                .map(|source| Box::new(subst_dollar_elab(name, source)));
+            E::EExpr::SetComp(
+                ty.clone(),
+                source,
+                var.clone(),
+                domain_ty.clone(),
+                if var == "$" {
+                    filter.clone()
+                } else {
+                    filter
+                        .as_ref()
+                        .map(|filter| Box::new(subst_dollar_elab(name, filter)))
+                },
+                if var == "$" {
+                    projection.clone()
+                } else {
+                    Box::new(subst_dollar_elab(name, projection))
+                },
+                *span,
+            )
+        }
+        E::EExpr::RelComp(ty, projection, bindings, filter, span) => {
+            let mut shadowed = false;
+            let bindings = bindings
+                .iter()
+                .map(|binding| {
+                    let source = if shadowed {
+                        binding.source.clone()
+                    } else {
+                        binding
+                            .source
+                            .as_ref()
+                            .map(|source| Box::new(subst_dollar_elab(name, source)))
+                    };
+                    if binding.var == "$" {
+                        shadowed = true;
+                    }
+                    E::ERelCompBinding {
+                        var: binding.var.clone(),
+                        domain: binding.domain.clone(),
+                        source,
+                    }
+                })
+                .collect();
+            E::EExpr::RelComp(
+                ty.clone(),
+                if shadowed {
+                    projection.clone()
+                } else {
+                    Box::new(subst_dollar_elab(name, projection))
+                },
+                bindings,
+                if shadowed {
+                    filter.clone()
+                } else {
+                    Box::new(subst_dollar_elab(name, filter))
+                },
+                *span,
+            )
+        }
+        E::EExpr::SetLit(ty, elements, span) => E::EExpr::SetLit(
+            ty.clone(),
+            elements
+                .iter()
+                .map(|element| subst_dollar_elab(name, element))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::SeqLit(ty, elements, span) => E::EExpr::SeqLit(
+            ty.clone(),
+            elements
+                .iter()
+                .map(|element| subst_dollar_elab(name, element))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::MapLit(ty, entries, span) => E::EExpr::MapLit(
+            ty.clone(),
+            entries
+                .iter()
+                .map(|(key, value)| (subst_dollar_elab(name, key), subst_dollar_elab(name, value)))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::QualCall(ty, qualifier, func, args, span) => E::EExpr::QualCall(
+            ty.clone(),
+            qualifier.clone(),
+            func.clone(),
+            args.iter()
+                .map(|arg| subst_dollar_elab(name, arg))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::Block(expressions, span) => E::EExpr::Block(
+            expressions
+                .iter()
+                .map(|expression| subst_dollar_elab(name, expression))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::VarDecl(var, ty, init, rest, span) => E::EExpr::VarDecl(
+            var.clone(),
+            ty.clone(),
+            Box::new(subst_dollar_elab(name, init)),
+            if var == "$" {
+                rest.clone()
+            } else {
+                Box::new(subst_dollar_elab(name, rest))
+            },
+            *span,
+        ),
+        E::EExpr::While(cond, contracts, body, span) => E::EExpr::While(
+            Box::new(subst_dollar_elab(name, cond)),
+            contracts
+                .iter()
+                .map(|contract| subst_dollar_elab_contract(name, contract))
+                .collect(),
+            Box::new(subst_dollar_elab(name, body)),
+            *span,
+        ),
+        E::EExpr::IfElse(cond, then_body, else_body, span) => E::EExpr::IfElse(
+            Box::new(subst_dollar_elab(name, cond)),
+            Box::new(subst_dollar_elab(name, then_body)),
+            else_body
+                .as_ref()
+                .map(|else_body| Box::new(subst_dollar_elab(name, else_body))),
+            *span,
+        ),
+        E::EExpr::Aggregate(ty, kind, var, domain_ty, body, in_filter, span) => {
+            E::EExpr::Aggregate(
+                ty.clone(),
+                *kind,
+                var.clone(),
+                domain_ty.clone(),
+                if var == "$" {
+                    body.clone()
+                } else {
+                    Box::new(subst_dollar_elab(name, body))
+                },
+                if var == "$" {
+                    in_filter.clone()
+                } else {
+                    in_filter
+                        .as_ref()
+                        .map(|in_filter| Box::new(subst_dollar_elab(name, in_filter)))
+                },
+                *span,
+            )
+        }
+        E::EExpr::Saw(ty, system, event, args, span) => E::EExpr::Saw(
+            ty.clone(),
+            system.clone(),
+            event.clone(),
+            args.iter()
+                .map(|arg| {
+                    arg.as_ref()
+                        .map(|arg| Box::new(subst_dollar_elab(name, arg)))
+                })
+                .collect(),
+            *span,
+        ),
+        E::EExpr::CtorRecord(ty, qualifier, ctor, fields, span) => E::EExpr::CtorRecord(
+            ty.clone(),
+            qualifier.clone(),
+            ctor.clone(),
+            fields
+                .iter()
+                .map(|(field, value)| (field.clone(), subst_dollar_elab(name, value)))
+                .collect(),
+            *span,
+        ),
+        E::EExpr::StructCtor(ty, struct_name, fields, span) => E::EExpr::StructCtor(
+            ty.clone(),
+            struct_name.clone(),
+            fields
+                .iter()
+                .map(|(field, value)| (field.clone(), subst_dollar_elab(name, value)))
+                .collect(),
+            *span,
+        ),
+    }
+}
+
+fn subst_dollar_elab_contract(name: &str, contract: &E::EContract) -> E::EContract {
+    match contract {
+        E::EContract::Requires(expr) => E::EContract::Requires(subst_dollar_elab(name, expr)),
+        E::EContract::Ensures(expr) => E::EContract::Ensures(subst_dollar_elab(name, expr)),
+        E::EContract::Invariant(expr) => E::EContract::Invariant(subst_dollar_elab(name, expr)),
+        E::EContract::Decreases { measures, star } => E::EContract::Decreases {
+            measures: measures
+                .iter()
+                .map(|measure| subst_dollar_elab(name, measure))
+                .collect(),
+            star: *star,
+        },
+    }
+}
+
+fn pattern_binds_elab_var(pattern: &E::EPattern, name: &str) -> bool {
+    match pattern {
+        E::EPattern::Var(var) => var == name,
+        E::EPattern::Ctor(_, fields) => fields
+            .iter()
+            .any(|(_, pattern)| pattern_binds_elab_var(pattern, name)),
+        E::EPattern::Wild => false,
+        E::EPattern::Or(left, right) => {
+            pattern_binds_elab_var(left, name) || pattern_binds_elab_var(right, name)
+        }
     }
 }
 

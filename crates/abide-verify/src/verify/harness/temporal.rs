@@ -11,17 +11,30 @@ pub fn transition_constraints(
     step: usize,
     assumption_set: &IRAssumptionSet,
 ) -> Bool {
-    assert!(
-        step < pool.bound,
-        "step {step} out of bounds for bound {}",
-        pool.bound
-    );
+    try_transition_constraints(pool, vctx, entities, systems, step, assumption_set)
+        .unwrap_or_else(|msg| panic!("{msg}"))
+}
+
+pub fn try_transition_constraints(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    entities: &[IREntity],
+    systems: &[IRSystem],
+    step: usize,
+    assumption_set: &IRAssumptionSet,
+) -> Result<Bool, String> {
+    if step >= pool.bound {
+        return Err(format!(
+            "step {step} out of bounds for bound {}",
+            pool.bound
+        ));
+    }
 
     let mut disjuncts = Vec::new();
 
     for system in systems {
         for event in &system.actions {
-            let event_formula = encode_step(pool, vctx, entities, systems, event, step);
+            let event_formula = try_encode_step(pool, vctx, entities, systems, event, step)?;
             let sys_frames =
                 system_field_frame_conjuncts(pool, vctx, systems, system, &event.body, step);
             if sys_frames.is_empty() {
@@ -48,7 +61,7 @@ pub fn transition_constraints(
     }
 
     let refs: Vec<&Bool> = disjuncts.iter().collect();
-    smt::bool_or(&refs)
+    Ok(smt::bool_or(&refs))
 }
 
 pub struct FireTracking {

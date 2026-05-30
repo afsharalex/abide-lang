@@ -21,6 +21,15 @@ QA semantic temporal queries are lowered to synthetic `verify` blocks, not
 synthetic theorems. They therefore inherit the same default stuttering behavior
 as `verify`.
 
+## Reporting Contract
+
+Evidence-bearing verification results and machine-readable reports should expose
+the effective assumption set: stutter mode, weak fair commands, strong fair
+commands, and whether fairness is per command or per finite command/argument
+tuple. Liveness diagnostics should show these assumptions because they determine
+whether an infinite behavior is a real counterexample, a stuttering extension,
+or excluded by fairness.
+
 ## Fairness Strength
 
 `fair System::command` is weak fairness: if the command is continuously enabled

@@ -18,13 +18,24 @@ pub(super) fn mono_ty_name(ty: &Ty) -> String {
         Ty::Enum(n, _) | Ty::Record(n, _) | Ty::Entity(n) => n.clone(),
         Ty::Builtin(b) => b.name().to_string(),
         Ty::Alias(_, inner) => mono_ty_name(inner),
+        Ty::Newtype(n, _) => n.clone(),
         Ty::Param(n, args) => format_mono_name(n, args),
         Ty::Set(a) => format!("Set<{}>", mono_ty_name(a)),
         Ty::Seq(a) => format!("Seq<{}>", mono_ty_name(a)),
         Ty::Map(k, v) => format!("Map<{}, {}>", mono_ty_name(k), mono_ty_name(v)),
+        Ty::Store(entity) => format!("Store<{entity}>"),
+        Ty::Relation(columns) => {
+            let column_names: Vec<String> = columns.iter().map(mono_ty_name).collect();
+            format!("Rel<{}>", column_names.join(", "))
+        }
+        Ty::Tuple(ts) => {
+            let names: Vec<String> = ts.iter().map(mono_ty_name).collect();
+            format!("({})", names.join(", "))
+        }
+        Ty::Fn(a, b) => format!("{} -> {}", mono_ty_name(a), mono_ty_name(b)),
+        Ty::Refinement(base, _) => mono_ty_name(base),
         Ty::Named(n) => n.clone(),
         Ty::Error => "?".to_string(),
-        _ => "?".to_string(),
     }
 }
 
@@ -60,6 +71,10 @@ pub(super) fn substitute_ty(ty: &Ty, subst: &HashMap<String, Ty>) -> Ty {
             Box::new(substitute_ty(b, subst)),
         ),
         Ty::Alias(n, t) => Ty::Alias(n.clone(), Box::new(substitute_ty(t, subst))),
+        Ty::Newtype(n, t) => Ty::Newtype(n.clone(), Box::new(substitute_ty(t, subst))),
+        Ty::Relation(columns) => {
+            Ty::Relation(columns.iter().map(|t| substitute_ty(t, subst)).collect())
+        }
         Ty::Refinement(base, pred) => {
             Ty::Refinement(Box::new(substitute_ty(base, subst)), pred.clone())
         }
@@ -238,6 +253,30 @@ pub(super) fn resolve_nested_generics(
                 registered,
             )),
         ),
+        Ty::Newtype(n, t) => Ty::Newtype(
+            n.clone(),
+            Box::new(resolve_nested_generics(
+                t,
+                generic_types,
+                types,
+                variant_fields,
+                registered,
+            )),
+        ),
+        Ty::Relation(columns) => Ty::Relation(
+            columns
+                .iter()
+                .map(|column| {
+                    resolve_nested_generics(
+                        column,
+                        generic_types,
+                        types,
+                        variant_fields,
+                        registered,
+                    )
+                })
+                .collect(),
+        ),
         Ty::Refinement(base, pred) => Ty::Refinement(
             Box::new(resolve_nested_generics(
                 base,
@@ -411,7 +450,101 @@ pub(super) fn collect_all_param_uses(ty: &Ty, out: &mut Vec<(String, Vec<Ty>)>) 
                 collect_all_param_uses(t, out);
             }
         }
-        Ty::Alias(_, t) | Ty::Refinement(t, _) => collect_all_param_uses(t, out),
+        Ty::Relation(columns) => {
+            for column in columns {
+                collect_all_param_uses(column, out);
+            }
+        }
+        Ty::Alias(_, t) | Ty::Newtype(_, t) | Ty::Refinement(t, _) => {
+            collect_all_param_uses(t, out);
+        }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::BuiltinTy;
+
+    fn int_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn param(name: &str, args: Vec<Ty>) -> Ty {
+        Ty::Param(name.to_owned(), args)
+    }
+
+    fn collected_names(ty: &Ty) -> Vec<String> {
+        let mut uses = Vec::new();
+        collect_all_param_uses(ty, &mut uses);
+        uses.into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn collect_all_param_uses_walks_newtype_inner() {
+        let ty = Ty::Newtype(
+            "Wrapper".to_owned(),
+            Box::new(param("Option", vec![int_ty()])),
+        );
+
+        assert_eq!(collected_names(&ty), vec!["Option"]);
+    }
+
+    #[test]
+    fn collect_all_param_uses_walks_relation_columns() {
+        let ty = Ty::Relation(vec![
+            param("Option", vec![int_ty()]),
+            Ty::Map(
+                Box::new(int_ty()),
+                Box::new(param("Result", vec![int_ty(), int_ty()])),
+            ),
+        ]);
+
+        assert_eq!(collected_names(&ty), vec!["Option", "Result"]);
+    }
+
+    #[test]
+    fn collect_all_param_uses_walks_nested_newtype_relation_combinations() {
+        let ty = Ty::Newtype(
+            "Facts".to_owned(),
+            Box::new(Ty::Relation(vec![
+                Ty::Alias(
+                    "Alias".to_owned(),
+                    Box::new(param("Box", vec![param("Option", vec![int_ty()])])),
+                ),
+                Ty::Refinement(
+                    Box::new(param("Result", vec![int_ty(), int_ty()])),
+                    Box::new(crate::elab::types::EExpr::Lit(
+                        Ty::Builtin(BuiltinTy::Bool),
+                        crate::elab::types::Literal::Bool(true),
+                        None,
+                    )),
+                ),
+            ])),
+        );
+
+        assert_eq!(
+            collected_names(&ty),
+            vec!["Box", "Option", "Result"],
+            "new wrapper forms must not hide nested generic uses"
+        );
+    }
+
+    #[test]
+    fn mono_ty_name_preserves_nominal_newtype_identity() {
+        let user_id = Ty::Newtype(
+            "UserId".to_owned(),
+            Box::new(Ty::Builtin(BuiltinTy::String)),
+        );
+        let order_id = Ty::Newtype(
+            "OrderId".to_owned(),
+            Box::new(Ty::Builtin(BuiltinTy::String)),
+        );
+
+        assert_eq!(mono_ty_name(&user_id), "UserId");
+        assert_eq!(mono_ty_name(&order_id), "OrderId");
+        assert_eq!(format_mono_name("Box", &[user_id]), "Box<UserId>");
+        assert_eq!(format_mono_name("Box", &[order_id]), "Box<OrderId>");
     }
 }
