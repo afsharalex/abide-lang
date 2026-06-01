@@ -281,11 +281,12 @@ pub(super) fn build_assume_delta_with_bindings(
                     delta.strong_fair.push((ev_ref, *span));
                 }
             }
-            // Store, Let, Proc, and initial constraints are handled during
+            // Store, Let, Proc, activation, and initial constraints are handled during
             // collection, not during assumption set resolution.
             AssumeItem::Store(_)
             | AssumeItem::Let(_)
             | AssumeItem::Proc(_)
+            | AssumeItem::Activate(_)
             | AssumeItem::Constraint { .. } => {}
         }
     }
@@ -660,6 +661,7 @@ pub(super) fn populate_assumption_set_from_items(
             AssumeItem::Store(_)
             | AssumeItem::Let(_)
             | AssumeItem::Proc(_)
+            | AssumeItem::Activate(_)
             | AssumeItem::Constraint { .. } => {}
         }
     }

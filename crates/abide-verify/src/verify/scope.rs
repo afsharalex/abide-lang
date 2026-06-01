@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::types::{
-    IRAction, IREntity, IRExpr, IRField, IRProgram, IRSystem, IRTheorem, IRType, IRVerify,
-    LetBinding,
+    IRAction, IRActivation, IREntity, IRExpr, IRField, IRProgram, IRSystem, IRTheorem, IRType,
+    IRVerify, LetBinding,
 };
 
 use super::defenv;
@@ -24,8 +24,50 @@ pub struct VerifyStoreRange {
     pub entity_type: String,
     pub start_slot: usize,
     pub slot_count: usize,
-    pub min_active: usize,
-    pub max_active: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VerifyInitialBindings {
+    pub bindings: HashMap<String, (String, usize)>,
+    pub active_slots: HashSet<(String, usize)>,
+}
+
+pub(super) fn allocate_initial_activations(
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+    activations: &[IRActivation],
+) -> Result<VerifyInitialBindings, String> {
+    let mut out = VerifyInitialBindings::default();
+    let mut next_slot_by_store: HashMap<&str, usize> = HashMap::new();
+
+    for activation in activations {
+        let Some(range) = store_ranges.get(&activation.store_name) else {
+            return Err(format!(
+                "unknown store `{}` in activation",
+                activation.store_name
+            ));
+        };
+        let next = next_slot_by_store
+            .entry(activation.store_name.as_str())
+            .or_insert(range.start_slot);
+        for instance in &activation.instances {
+            if *next >= range.start_slot + range.slot_count {
+                return Err(format!(
+                    "store `{}` is full: cannot activate `{}` beyond {} slots",
+                    activation.store_name, instance, range.slot_count
+                ));
+            }
+            let slot = *next;
+            *next += 1;
+            if out.bindings.contains_key(instance) {
+                return Err(format!("duplicate activated instance `{instance}`"));
+            }
+            out.bindings
+                .insert(instance.clone(), (range.entity_type.clone(), slot));
+            out.active_slots.insert((range.entity_type.clone(), slot));
+        }
+    }
+
+    Ok(out)
 }
 
 /// Compute the canonical entity scope and reachable systems for a
@@ -44,8 +86,8 @@ pub struct VerifyStoreRange {
 /// the correct model was even built).
 ///
 /// Returns:
-/// - `scope`: entity name → slot count, sized from each verify target
-///   `vs.hi.max(1)` and propagated through cross-call expansion.
+/// - `scope`: entity name → slot count, sized from each verify store's
+///   `hi` capacity and propagated through cross-call expansion.
 /// - `system_names`: target systems plus all systems transitively
 ///   reachable via cross-calls.
 /// - `bound`: the maximum `hi` across verify targets, also used as the
@@ -87,11 +129,7 @@ pub(super) fn compute_verify_scope(
     // independent slots. Example: two `Order[0..3]` stores → 6 slots total.
     for store in &verify_block.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let slot_count = store.hi.max(1) as usize;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let lo = store.lo.max(0) as usize;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let max_active = store.hi.max(0) as usize;
+        let slot_count = store.hi.max(0) as usize;
         bound = bound.max(slot_count);
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         // Track this store's slot range before accumulating.
@@ -101,8 +139,6 @@ pub(super) fn compute_verify_scope(
                 entity_type: store.entity_type.clone(),
                 start_slot: existing,
                 slot_count,
-                min_active: lo,
-                max_active,
             },
         );
         // Each store gets its own slot range within the entity pool.
@@ -1077,6 +1113,7 @@ mod tests {
                 },
             ],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Saw {
                 system_name: "Audit".to_owned(),
@@ -1097,12 +1134,8 @@ mod tests {
         assert!(systems.contains(&"Audit".to_owned()));
         assert_eq!(ranges["pending"].start_slot, 0);
         assert_eq!(ranges["pending"].slot_count, 2);
-        assert_eq!(ranges["pending"].min_active, 1);
-        assert_eq!(ranges["pending"].max_active, 2);
         assert_eq!(ranges["archived"].start_slot, 2);
         assert_eq!(ranges["archived"].slot_count, 3);
-        assert_eq!(ranges["archived"].min_active, 0);
-        assert_eq!(ranges["archived"].max_active, 3);
     }
 
     #[test]

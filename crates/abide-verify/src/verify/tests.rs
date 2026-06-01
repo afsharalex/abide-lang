@@ -259,6 +259,7 @@ fn make_order_ir(assert_expr: IRExpr, bound: usize) -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![assert_expr],
         span: None,
@@ -330,6 +331,7 @@ fn target_selector_test_ir() -> IRProgram {
             systems: vec![],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![bool_lit(true)],
             span: None,
@@ -513,6 +515,7 @@ fn make_system_field_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -638,6 +641,7 @@ fn make_system_field_enum_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -890,6 +894,7 @@ fn make_system_field_eventual_liveness_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Eventually {
@@ -1028,6 +1033,7 @@ fn make_system_field_bool_param_weak_fair_eventual_liveness_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Eventually {
@@ -1283,6 +1289,7 @@ fn make_system_field_enum_param_per_tuple_weak_fair_liveness_ir() -> IRProgram {
                 command: "serve".to_owned(),
             }],
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Eventually {
@@ -1530,6 +1537,7 @@ fn make_system_field_strong_fair_eventual_liveness_ir() -> IRProgram {
             }],
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Eventually {
@@ -1749,6 +1757,7 @@ fn make_multi_system_field_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -1959,6 +1968,7 @@ fn make_explicit_entity_store_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -2377,6 +2387,7 @@ fn make_explicit_entity_store_transition_arg_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![no_initial_active_entities("Ticket")],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -2615,6 +2626,7 @@ fn make_explicit_entity_store_ref_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![no_initial_active_entities("Ticket")],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -3021,6 +3033,7 @@ fn make_explicit_entity_store_ref_param_per_tuple_weak_fair_liveness_ir() -> IRP
                 command: "set_one_with_peer".to_owned(),
             }],
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -4381,6 +4394,7 @@ fn make_explicit_multi_entity_store_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -4591,6 +4605,10 @@ fn make_explicit_bare_entity_apply_counterexample_ir() -> IRProgram {
             hi: 1,
         }],
         assumption_set: IRAssumptionSet::default_for_verify(),
+        activations: vec![IRActivation {
+            instances: vec!["task0".to_owned()],
+            store_name: "tasks".to_owned(),
+        }],
         initial_constraints: vec![],
         asserts: vec![property],
         span: None,
@@ -4751,6 +4769,7 @@ fn make_explicit_system_cross_call_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -4999,6 +5018,7 @@ fn make_explicit_system_let_crosscall_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -5268,6 +5288,7 @@ fn make_explicit_system_match_crosscall_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -5649,6 +5670,7 @@ fn make_explicit_entity_store_param_per_tuple_weak_fair_liveness_ir() -> IRProgr
                 command: "set_one".to_owned(),
             }],
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -5785,6 +5807,7 @@ fn make_system_field_bool_param_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -5906,6 +5929,7 @@ fn make_system_field_enum_param_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -6063,6 +6087,7 @@ fn make_system_field_counter_with_invariant_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Lit {
@@ -6194,6 +6219,7 @@ fn make_system_field_match_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Match {
@@ -6378,6 +6404,7 @@ fn make_pooled_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -6573,6 +6600,7 @@ fn make_pooled_ticket_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -6768,6 +6796,7 @@ fn make_pooled_ref_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -6967,6 +6996,7 @@ fn make_pooled_nested_ref_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -7161,6 +7191,7 @@ fn make_pooled_forall_nested_ref_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -7348,6 +7379,7 @@ fn make_pooled_arg_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -7714,6 +7746,7 @@ fn make_pooled_match_crosscall_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -7940,6 +7973,7 @@ fn make_pooled_let_crosscall_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -8221,6 +8255,7 @@ fn make_pooled_match_var_crosscall_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -8486,6 +8521,7 @@ fn make_pooled_let_crosscall_into_crosscall_arg_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -8721,6 +8757,7 @@ fn make_pooled_callee_field_crosscall_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -8988,6 +9025,7 @@ fn make_pooled_callee_store_crosscall_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -9245,6 +9283,7 @@ fn make_pooled_apply_chain_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -9441,6 +9480,7 @@ fn make_pooled_create_then_inc_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -9562,6 +9602,7 @@ fn make_pooled_store_counter_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -9970,6 +10011,7 @@ fn make_multi_pooled_counter_marker_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -11721,6 +11763,7 @@ fn bmc_timeout_unknown_is_reported_as_unprovable_only() {
         systems: vec![],
         stores: vec![],
         assumption_set: IRAssumptionSet::default_for_verify(),
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![],
         span: None,
@@ -12021,6 +12064,7 @@ fn ic3_proves_property_induction_cannot() {
                 lo: 0,
                 hi: 20,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property.clone()],
             span: None,
@@ -12365,6 +12409,7 @@ fn make_two_counter_ir() -> IRProgram {
                 lo: 0,
                 hi: 20,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property.clone()],
             span: None,
@@ -12458,6 +12503,7 @@ fn make_single_entity_ir(hi: i64) -> IRProgram {
             }],
             stores: vec![],
             assumption_set: crate::ir::types::IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Lit {
                 ty: IRType::Bool,
@@ -13230,6 +13276,7 @@ fn map_field_verify_index_after_update() {
                     lo: 0,
                     hi: 3,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![reflex_property],
                 span: None,
@@ -13245,6 +13292,7 @@ fn map_field_verify_index_after_update() {
                     lo: 0,
                     hi: 5,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![post_put_property],
                 span: None,
@@ -13405,6 +13453,7 @@ fn map_literal_in_property_encoding() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -13649,6 +13698,7 @@ fn primed_map_update_sugar_encoding() {
                 lo: 0,
                 hi: 5,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -13872,6 +13922,7 @@ fn set_membership_via_index() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![membership_property],
             span: None,
@@ -14031,6 +14082,7 @@ fn set_literal_in_property() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14179,6 +14231,7 @@ fn set_literal_cardinality() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14324,6 +14377,7 @@ fn set_literal_cardinality_deduplicates() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14554,6 +14608,7 @@ fn set_comprehension_simple_form() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14723,6 +14778,7 @@ fn set_comprehension_membership_check() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14895,6 +14951,7 @@ fn set_comprehension_projection_form() {
                 lo: 0,
                 hi: 3,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -14987,6 +15044,7 @@ fn verifier_property_supports_entity_choose_in_set_comprehension_projection() {
          verify entity_choose_projection {\n\
            assume {\n\
              store orders: Order[1]\n\
+             activate {o1} in orders\n\
              let commerce = Commerce { orders: orders }\n\
            }\n\
            assert ({ (choose o: Order where o.status == @Pending).status | x in Set(1) where true })[@Pending]\n\
@@ -15016,6 +15074,7 @@ fn verifier_property_counts_entity_choose_set_comprehension_projection_values() 
          verify entity_choose_projection_cardinality {\n\
            assume {\n\
              store orders: Order[1]\n\
+             activate {o1} in orders\n\
              let commerce = Commerce { orders: orders }\n\
            }\n\
            assert #({ (choose o: Order where o.status == @Pending).status | x in Set(1) where true }) == 1\n\
@@ -15323,6 +15382,7 @@ fn seq_literal_index_and_cardinality() {
                     lo: 0,
                     hi: 3,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![index_prop],
                 span: None,
@@ -15338,6 +15398,7 @@ fn seq_literal_index_and_cardinality() {
                     lo: 0,
                     hi: 3,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![card_prop],
                 span: None,
@@ -15597,6 +15658,7 @@ fn seq_field_frame_across_transition() {
                 lo: 0,
                 hi: 5,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -15855,6 +15917,7 @@ fn card_set_comp_bounded_sum() {
                     lo: 0,
                     hi: 2,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![non_neg_prop],
                 span: None,
@@ -15870,6 +15933,7 @@ fn card_set_comp_bounded_sum() {
                     lo: 0,
                     hi: 2,
                 }],
+                activations: vec![],
                 initial_constraints: vec![],
                 asserts: vec![bounded_prop],
                 span: None,
@@ -16782,6 +16846,7 @@ fn multi_apply_sequential_chaining() {
                 lo: 0,
                 hi: 5,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -17577,6 +17642,7 @@ fn multi_apply_step_scoping_no_intermediate_collision() {
                 lo: 0,
                 hi: 5,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -17856,6 +17922,7 @@ fn multi_apply_active_flag_preserved_in_chain() {
                 lo: 0,
                 hi: 5,
             }],
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![property],
             span: None,
@@ -20051,6 +20118,7 @@ fn make_multi_system_duplicate_field_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::BinOp {
@@ -20239,6 +20307,7 @@ fn make_explicit_pooled_let_crosscall_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -20477,6 +20546,7 @@ fn make_explicit_pooled_match_crosscall_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
@@ -22904,7 +22974,7 @@ fn no_stutter_reaching_deadlock_is_not_proved_by_unbounded_backends() {
          system Counters(counters: Store<Counter>) {\n  \
          command advance() { choose c: Counter where c.value < 1 { c.advance() } }\n}\n\n\
          verify reaches_deadlock {\n  \
-         assume {\n    store counters: Counter[1..1]\n    let sys = Counters { counters: counters }\n    no stutter\n  }\n  \
+         assume {\n    store counters: Counter[1..1]\n    activate {c0} in counters\n    let sys = Counters { counters: counters }\n    no stutter\n  }\n  \
          assert always true\n}\n",
     );
     let config = VerifyConfig {
@@ -23382,6 +23452,7 @@ fn verify_projected_field_relation_subset_reports_counterexample_for_arbitrary_i
          verify every_parent_id_names_an_existing_node {\n\
            assume {\n\
              store nodes: FsNode[1]\n\
+             activate {node0} in nodes\n\
              let tree = FileTree { nodes: nodes }\n\
              stutter\n\
            }\n\
@@ -23440,16 +23511,46 @@ fn verify_routes_store_relation_reachability_to_rustsat() {
 }
 
 #[test]
-fn scene_store_lower_bound_activates_initial_entities() {
+fn scene_store_bound_is_capacity_not_initial_population() {
     let ir = lower_source_file(
-        "scene_store_lower_bound.ab",
+        "scene_store_bound_capacity.ab",
         "module StoreCardinality\n\n\
          enum Status = Pending\n\n\
          entity Order {\n  status: Status = @Pending\n}\n\n\
          system Commerce(orders: Store<Order>[1]) {}\n\n\
-         scene lower_bound_active {\n\
+         scene capacity_starts_empty {\n\
            given {\n\
              store orders: Order[1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           then {\n\
+             assert not (exists o: Order in orders | true)\n\
+           }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "capacity_starts_empty")),
+        "store bounds should describe capacity, not initial population: {results:?}"
+    );
+}
+
+#[test]
+fn scene_explicit_activation_creates_initial_named_entity() {
+    let ir = lower_source_file(
+        "scene_explicit_activation.ab",
+        "module StoreCardinality\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {}\n\n\
+         scene activated_order {\n\
+           given {\n\
+             store orders: Order[1]\n\
+             activate {o1} in orders\n\
              let commerce = Commerce { orders: orders }\n\
            }\n\
            then {\n\
@@ -23461,10 +23562,10 @@ fn scene_store_lower_bound_activates_initial_entities() {
     let results = verify_all(&ir, &VerifyConfig::default());
 
     assert!(
-        results
-            .iter()
-            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "lower_bound_active")),
-        "store lower bound should provide an initial active entity: {results:?}"
+        results.iter().any(
+            |r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "activated_order")
+        ),
+        "explicit activation should provide an initial active entity: {results:?}"
     );
 }
 
@@ -25237,17 +25338,48 @@ fn relational_verify_fragment_detects_create_only_bounded_verify() {
 }
 
 #[test]
-fn verify_store_lower_bound_activates_initial_entities() {
+fn verify_store_bound_is_capacity_not_initial_population() {
     let ir = lower_source_file(
-        "verify_store_lower_bound.ab",
+        "verify_store_bound_capacity.ab",
         "module StoreCardinality\n\n\
          enum Status = Pending\n\n\
          entity Order {\n  status: Status = @Pending\n}\n\n\
          system Commerce(orders: Store<Order>[1]) {}\n\n\
-         verify lower_bound_active_verify {\n\
+         verify capacity_starts_empty_verify {\n\
            assume {\n\
              stutter\n\
              store orders: Order[1]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always not (exists o: Order in orders | true)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &short_solver_regression_config());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }
+                if name == "capacity_starts_empty_verify"
+        )),
+        "store bounds should describe capacity, not initial population for verify blocks: {results:?}"
+    );
+}
+
+#[test]
+fn verify_explicit_activation_creates_initial_named_entity() {
+    let ir = lower_source_file(
+        "verify_explicit_activation.ab",
+        "module StoreCardinality\n\n\
+         enum Status = Pending\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {}\n\n\
+         verify activated_order_verify {\n\
+           assume {\n\
+             stutter\n\
+             store orders: Order[1]\n\
+             activate {o1} in orders\n\
              let commerce = Commerce { orders: orders }\n\
            }\n\
            assert always (exists o: Order in orders | o.status == @Pending)\n\
@@ -25260,9 +25392,9 @@ fn verify_store_lower_bound_activates_initial_entities() {
         results.iter().any(|r| matches!(
             r,
             VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }
-                if name == "lower_bound_active_verify"
+                if name == "activated_order_verify"
         )),
-        "store lower bound should provide an initial active entity for verify blocks: {results:?}"
+        "explicit activation should provide an initial active entity for verify blocks: {results:?}"
     );
 }
 

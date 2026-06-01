@@ -1508,6 +1508,7 @@ mod tests {
                 hi: 2,
             }],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: Vec::new(),
             span: None,

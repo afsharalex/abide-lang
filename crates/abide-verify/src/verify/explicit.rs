@@ -18,7 +18,7 @@ use crate::ir::types::{
 
 use super::context::{EntityInfo, VerifyContext};
 use super::defenv;
-use super::scope::VerifyStoreRange;
+use super::scope::allocate_initial_activations;
 use super::transition;
 use super::{
     build_assumptions_for_system_scope, verification_timeout_hint, CounterexampleReplayReport,
@@ -199,6 +199,7 @@ struct ExplicitModel<'a> {
     liveness_monitors: Vec<ExplicitLivenessMonitor>,
     extern_assume_exprs: Vec<IRExpr>,
     initial_constraints: Vec<IRExpr>,
+    initial_slot_locals: HashMap<String, ExplicitSlotBinding>,
     stutter: bool,
     weak_fair: Vec<(String, String)>,
     strong_fair: Vec<(String, String)>,
@@ -585,6 +586,28 @@ impl<'a> ExplicitModel<'a> {
                 return Ok(None);
             }
         }
+        let initial_bindings =
+            allocate_initial_activations(system.store_ranges(), system.activations())?;
+        let mut initial_validation_slots = HashMap::new();
+        let mut initial_slot_locals = HashMap::new();
+        let mut initial_active_slots = HashSet::new();
+        for (name, (entity, slot)) in &initial_bindings.bindings {
+            let Some(&entity_index) = entity_indices.get(entity) else {
+                return Err(format!(
+                    "activated instance `{name}` references unknown entity `{entity}`"
+                ));
+            };
+            initial_validation_slots.insert(name.clone(), entity_index);
+            initial_slot_locals.insert(
+                name.clone(),
+                ExplicitSlotBinding {
+                    entity_index,
+                    slot: *slot,
+                },
+            );
+            initial_active_slots.insert((entity_index, *slot));
+        }
+
         let initial_constraints = system.initial_constraints().to_vec();
         for expr in &initial_constraints {
             if !supports_state_expr(
@@ -594,7 +617,7 @@ impl<'a> ExplicitModel<'a> {
                 &system_field_types,
                 &entity_specs,
                 &HashSet::new(),
-                &HashMap::new(),
+                &initial_validation_slots,
             ) {
                 return Ok(None);
             }
@@ -651,22 +674,7 @@ impl<'a> ExplicitModel<'a> {
             }
         }
 
-        let mut active_slot_options = vec![HashSet::new()];
-        for range in system.store_ranges().values() {
-            let Some(&entity_index) = entity_indices.get(&range.entity_type) else {
-                continue;
-            };
-            let store_options = active_slot_combinations_for_store_range(entity_index, range)?;
-            let mut next_options = Vec::new();
-            for prefix in &active_slot_options {
-                for store_option in &store_options {
-                    let mut combined = prefix.clone();
-                    combined.extend(store_option.iter().copied());
-                    next_options.push(combined);
-                }
-            }
-            active_slot_options = next_options;
-        }
+        let active_slot_options = vec![initial_active_slots];
 
         let model = Self {
             roots: system.selected_system_names().to_vec(),
@@ -680,6 +688,7 @@ impl<'a> ExplicitModel<'a> {
             liveness_monitors,
             extern_assume_exprs,
             initial_constraints,
+            initial_slot_locals,
             stutter: system.assumptions().stutter(),
             weak_fair: system.assumptions().weak_fair_event_keys().to_vec(),
             strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
@@ -740,7 +749,15 @@ impl<'a> ExplicitModel<'a> {
 
     fn state_satisfies_initial_constraints(&self, state: &ExplicitState) -> Result<bool, String> {
         for expr in &self.initial_constraints {
-            if !self.eval_bool(state, expr)? {
+            if !eval_bool_with_locals(
+                state,
+                expr,
+                None,
+                &self.system_field_indices,
+                &self.entity_specs,
+                &HashMap::new(),
+                &self.initial_slot_locals,
+            )? {
                 return Ok(false);
             }
         }
@@ -1675,7 +1692,7 @@ pub fn explore_verify_state_space(
             .map(|store| ExplicitStateSpaceStoreBound {
                 name: store.name.clone(),
                 entity_type: store.entity_type.clone(),
-                slots: usize::try_from(store.hi.max(1)).unwrap_or(1),
+                slots: usize::try_from(store.hi.max(0)).unwrap_or(0),
             })
             .collect(),
         states: nodes
@@ -2181,63 +2198,6 @@ fn enumerate_initial_states(
     }
 
     Ok(states)
-}
-
-fn active_slot_combinations_for_store_range(
-    entity_index: usize,
-    range: &VerifyStoreRange,
-) -> Result<Vec<HashSet<(usize, usize)>>, String> {
-    if range.min_active > range.max_active || range.max_active > range.slot_count {
-        return Err(format!(
-            "invalid explicit-state store range `{}`: active bounds {}..{} exceed capacity {}",
-            range.entity_type, range.min_active, range.max_active, range.slot_count
-        ));
-    }
-    let slots = (range.start_slot..range.start_slot + range.slot_count).collect::<Vec<_>>();
-    let mut out = Vec::new();
-    for active_count in range.min_active..=range.max_active {
-        collect_active_slot_combinations(
-            entity_index,
-            &slots,
-            active_count,
-            0,
-            &mut Vec::new(),
-            &mut out,
-        );
-    }
-    Ok(out)
-}
-
-fn collect_active_slot_combinations(
-    entity_index: usize,
-    slots: &[usize],
-    remaining: usize,
-    start: usize,
-    chosen: &mut Vec<usize>,
-    out: &mut Vec<HashSet<(usize, usize)>>,
-) {
-    if remaining == 0 {
-        out.push(
-            chosen
-                .iter()
-                .map(|slot| (entity_index, *slot))
-                .collect::<HashSet<_>>(),
-        );
-        return;
-    }
-    let max_start = slots.len().saturating_sub(remaining);
-    for index in start..=max_start {
-        chosen.push(slots[index]);
-        collect_active_slot_combinations(
-            entity_index,
-            slots,
-            remaining - 1,
-            index + 1,
-            chosen,
-            out,
-        );
-        chosen.pop();
-    }
 }
 
 fn enumerate_system_initial_values(fields: &[IRField]) -> Result<Vec<Vec<ExplicitValue>>, String> {
@@ -6867,6 +6827,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7285,6 +7246,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7493,6 +7455,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7551,6 +7514,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7615,6 +7579,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7700,6 +7665,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7880,6 +7846,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7982,6 +7949,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8110,6 +8078,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8273,6 +8242,7 @@ mod tests {
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
+            initial_slot_locals: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],

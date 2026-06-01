@@ -736,6 +736,9 @@ pub struct EVerify {
     pub proc_bounds: Vec<EProcBoundDecl>,
     /// let bindings from assume block.
     pub let_bindings: Vec<ELetBinding>,
+    /// Activate declarations from assume blocks. Each activation
+    /// pre-configures named entity instances in a store at step 0.
+    pub activations: Vec<EActivation>,
     /// Bare Boolean expressions from the assume block. These constrain
     /// the initial state of bounded verify checks.
     pub initial_constraints: Vec<EExpr>,

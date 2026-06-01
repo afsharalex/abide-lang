@@ -309,21 +309,19 @@ pub fn domain_constraints(
 
 /// Generate initial state constraints.
 ///
-/// Legacy entity scopes without explicit stores start with all slots inactive.
-/// Explicit store ranges start with exactly their declared lower-bound
-/// population, occupying the store's first slots. Later transition constraints
-/// can grow the active population up to the declared upper bound.
+/// All slots start inactive unless an explicit activation binds a named
+/// instance to a store slot. Store bounds size identity capacity; they do not
+/// create active entities by themselves.
 pub fn initial_state_constraints(
     pool: &SlotPool,
-    store_ranges: &HashMap<String, VerifyStoreRange>,
+    active_slots: &HashSet<(String, usize)>,
 ) -> Vec<Bool> {
     let mut constraints = Vec::new();
-    let explicit_initial_active = explicit_initial_active_slots(store_ranges);
 
     for ((entity, slot), actives) in &pool.active_vars {
         if let SmtValue::Bool(active_t0) = &actives[0] {
             let key = (entity.clone(), *slot);
-            if explicit_initial_active.contains(&key) {
+            if active_slots.contains(&key) {
                 constraints.push(active_t0.clone());
             } else {
                 constraints.push(smt::bool_not(active_t0));
@@ -338,9 +336,9 @@ pub fn entity_field_initial_constraints(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],
-    store_ranges: &HashMap<String, VerifyStoreRange>,
+    active_slots: &HashSet<(String, usize)>,
 ) -> Vec<Bool> {
-    try_entity_field_initial_constraints(pool, vctx, entities, store_ranges)
+    try_entity_field_initial_constraints(pool, vctx, entities, active_slots)
         .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
@@ -348,16 +346,15 @@ pub fn try_entity_field_initial_constraints(
     pool: &SlotPool,
     vctx: &VerifyContext,
     entities: &[IREntity],
-    store_ranges: &HashMap<String, VerifyStoreRange>,
+    active_slots: &HashSet<(String, usize)>,
 ) -> Result<Vec<Bool>, String> {
-    let explicit_initial_active = explicit_initial_active_slots(store_ranges);
     let empty_entity_param_types: HashMap<String, String> = HashMap::new();
     let empty_store_param_types: HashMap<String, String> = HashMap::new();
     let mut constraints = Vec::new();
 
     for entity in entities {
         for slot in 0..pool.slots_for(&entity.name) {
-            if !explicit_initial_active.contains(&(entity.name.clone(), slot)) {
+            if !active_slots.contains(&(entity.name.clone(), slot)) {
                 continue;
             }
             for field in &entity.fields {
@@ -387,23 +384,11 @@ pub fn try_entity_field_initial_constraints(
     Ok(constraints)
 }
 
-fn explicit_initial_active_slots(
-    store_ranges: &HashMap<String, VerifyStoreRange>,
-) -> HashSet<(String, usize)> {
-    let mut active = HashSet::new();
-    for range in store_ranges.values() {
-        for slot in range.start_slot..range.start_slot + range.min_active {
-            active.insert((range.entity_type.clone(), slot));
-        }
-    }
-    active
-}
-
 /// Constrain each explicit store's active population at every encoded step.
 ///
-/// The store upper bound is also the slot capacity, so `sum <= max_active` is
-/// usually tautological. Keeping it explicit makes the cardinality contract
-/// local to this helper and protects future encodings that may introduce
+/// The store bound is identity capacity, so this is normally tautological for
+/// contiguous store-owned slots. Keeping it explicit makes the capacity
+/// contract local to this helper and protects future encodings that introduce
 /// deactivation or non-contiguous store ownership.
 pub fn store_active_cardinality_constraints(
     pool: &SlotPool,
@@ -428,10 +413,8 @@ pub fn store_active_cardinality_constraints(
             } else {
                 smt::int_add(&refs)
             };
-            let min_active = i64::try_from(range.min_active).unwrap_or(i64::MAX);
-            let max_active = i64::try_from(range.max_active).unwrap_or(i64::MAX);
-            constraints.push(smt::int_ge(&active_count, &smt::int_lit(min_active)));
-            constraints.push(smt::int_le(&active_count, &smt::int_lit(max_active)));
+            let capacity = i64::try_from(range.slot_count).unwrap_or(i64::MAX);
+            constraints.push(smt::int_le(&active_count, &smt::int_lit(capacity)));
         }
     }
     constraints

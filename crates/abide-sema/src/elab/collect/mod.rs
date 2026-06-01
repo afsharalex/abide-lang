@@ -611,6 +611,7 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
     let mut stores = Vec::new();
     let mut proc_bounds = Vec::new();
     let mut let_bindings = Vec::new();
+    let mut activations = Vec::new();
     let mut initial_constraints = Vec::new();
     if let Some(ref ab) = vd.assume_block {
         for item in &ab.items {
@@ -625,6 +626,10 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
                     name: ld.name.clone(),
                     system_type: ld.system_type.clone(),
                     store_bindings: ld.fields.clone(),
+                }),
+                ast::AssumeItem::Activate(ad) => activations.push(EActivation {
+                    instances: ad.instances.clone(),
+                    store_name: ad.store_name.clone(),
                 }),
                 ast::AssumeItem::Constraint { expr, .. } => {
                     initial_constraints.push(collect_expr(expr));
@@ -647,6 +652,7 @@ fn collect_verify(env: &mut Env, vd: &ast::VerifyDecl) {
         stores,
         proc_bounds,
         let_bindings,
+        activations,
         initial_constraints,
         assume_block: vd.assume_block.clone(),
         // collect installs the construct default. The resolve

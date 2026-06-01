@@ -54,7 +54,7 @@ system Banking(accounts: Store<Account>) {
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
 - Store parameter bounds are optional cardinality contracts: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.
-- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population and maximum create capacity for that check or scene.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define capacity for that check or scene; stores start empty unless the block explicitly activates named entities.
 - `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
 - Public application-shaped commands usually take identity or value parameters and choose the target entity inside the command. Entity-valued parameters are still useful for concise specs and closed-world examples.
@@ -91,6 +91,7 @@ verify no_negative_balances {
 The `assume` block establishes:
 - finite store bounds
 - instantiated systems
+- explicitly activated initial entities, when a scenario needs pre-existing objects
 - bare Boolean predicates over stores that must hold in the initial state
 - fairness, stutter, and related execution assumptions when needed
 
@@ -135,8 +136,9 @@ lemma positive_amounts {
 scene successful_payment {
   given {
     store orders: Order[1]
+    activate {o} in orders
     let commerce = Commerce { orders: orders }
-    let o = one Order in orders where o.total == 25
+    o.total == 25
   }
   when {
     commerce.pay(o)

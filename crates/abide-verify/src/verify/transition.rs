@@ -26,7 +26,8 @@ use super::harness::{
 use super::ic3;
 use super::property::{encode_prop_expr_with_ctx, PropertyCtx};
 use super::scope::{
-    compute_theorem_scope, compute_verify_scope, select_verify_relevant, VerifyStoreRange,
+    allocate_initial_activations, compute_theorem_scope, compute_verify_scope,
+    select_verify_relevant, VerifyStoreRange,
 };
 use super::smt::{self, AbideSolver, Bool, SatResult, SmtValue};
 use super::solver::{active_solver_family, SolverFamily};
@@ -218,6 +219,7 @@ pub struct TransitionSystemSpec<'a> {
     bound: usize,
     store_ranges: HashMap<String, VerifyStoreRange>,
     assumptions: TransitionAssumptions,
+    activations: Vec<crate::ir::types::IRActivation>,
     initial_constraints: Vec<IRExpr>,
     relevant_entities: Vec<IREntity>,
     relevant_systems: Vec<IRSystem>,
@@ -230,6 +232,8 @@ pub struct TransitionSelectedParts {
     pub slots_per_entity: HashMap<String, usize>,
     pub bound: usize,
     pub store_ranges: HashMap<String, VerifyStoreRange>,
+    pub activations: Vec<crate::ir::types::IRActivation>,
+    pub initial_constraints: Vec<IRExpr>,
 }
 
 struct TransitionVerifyScopeParts {
@@ -239,6 +243,7 @@ struct TransitionVerifyScopeParts {
     bound: usize,
     store_ranges: HashMap<String, VerifyStoreRange>,
     assumptions: TransitionAssumptions,
+    activations: Vec<crate::ir::types::IRActivation>,
     initial_constraints: Vec<IRExpr>,
 }
 
@@ -256,6 +261,8 @@ impl<'a> TransitionSystemSpec<'a> {
             slots_per_entity,
             bound,
             store_ranges,
+            activations,
+            initial_constraints,
         } = parts;
         let system_names: Vec<String> = relevant_systems.iter().map(|s| s.name.clone()).collect();
         if system_names.is_empty() {
@@ -272,7 +279,8 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             assumptions,
-            initial_constraints: vec![],
+            activations,
+            initial_constraints,
             relevant_entities,
             relevant_systems,
         })
@@ -290,6 +298,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             assumptions,
+            activations,
             initial_constraints,
         } = parts;
         if system_names.is_empty() {
@@ -307,6 +316,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound,
             store_ranges,
             assumptions,
+            activations,
             initial_constraints,
             relevant_entities,
             relevant_systems,
@@ -349,6 +359,7 @@ impl<'a> TransitionSystemSpec<'a> {
                 bound,
                 store_ranges,
                 assumptions: TransitionAssumptions::from_ir(&verify_block.assumption_set),
+                activations: verify_block.activations.clone(),
                 initial_constraints: verify_block.initial_constraints.clone(),
             },
         )
@@ -375,6 +386,7 @@ impl<'a> TransitionSystemSpec<'a> {
                 bound,
                 store_ranges,
                 assumptions: TransitionAssumptions::from_ir(&verify_block.assumption_set),
+                activations: verify_block.activations.clone(),
                 initial_constraints: verify_block.initial_constraints.clone(),
             },
         )
@@ -406,6 +418,7 @@ impl<'a> TransitionSystemSpec<'a> {
             bound: 0,
             store_ranges: HashMap::new(),
             assumptions,
+            activations: vec![],
             initial_constraints: vec![],
             relevant_entities,
             relevant_systems,
@@ -438,6 +451,10 @@ impl<'a> TransitionSystemSpec<'a> {
 
     pub fn initial_constraints(&self) -> &[IRExpr] {
         &self.initial_constraints
+    }
+
+    pub fn activations(&self) -> &[crate::ir::types::IRActivation] {
+        &self.activations
     }
 
     pub fn relevant_entities(&self) -> &[IREntity] {
@@ -1036,12 +1053,15 @@ impl<'a> TransitionSmtEncoding<'a> {
             steps,
             system.relevant_systems(),
         );
-        let mut initial_constraints = initial_state_constraints(&pool, system.store_ranges());
+        let initial_bindings =
+            allocate_initial_activations(system.store_ranges(), system.activations())?;
+        let mut initial_constraints =
+            initial_state_constraints(&pool, &initial_bindings.active_slots);
         initial_constraints.extend(try_entity_field_initial_constraints(
             &pool,
             system.vctx,
             system.relevant_entities(),
-            system.store_ranges(),
+            &initial_bindings.active_slots,
         )?);
         initial_constraints.extend(store_active_cardinality_constraints(
             &pool,
@@ -1049,7 +1069,9 @@ impl<'a> TransitionSmtEncoding<'a> {
         ));
         if !system.initial_constraints().is_empty() {
             let defs = defenv::DefEnv::from_ir(system.ir);
-            let ctx = PropertyCtx::new().with_store_ranges(system.store_ranges().clone());
+            let ctx = PropertyCtx::new()
+                .with_store_ranges(system.store_ranges().clone())
+                .with_given_bindings(&initial_bindings.bindings);
             for expr in system.initial_constraints() {
                 initial_constraints.push(encode_prop_expr_with_ctx(
                     &pool,
@@ -1721,6 +1743,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Forall {
@@ -1836,6 +1859,10 @@ mod tests {
                 hi: 1,
             }],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![crate::ir::types::IRActivation {
+                instances: vec!["c0".to_owned()],
+                store_name: "counters".to_owned(),
+            }],
             initial_constraints: vec![initial_constraint],
             asserts: vec![IRExpr::Lit {
                 ty: IRType::Bool,
@@ -1888,6 +1915,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Lit {
@@ -1979,6 +2007,7 @@ mod tests {
             }],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Always {
                 body: Box::new(IRExpr::Forall {
@@ -2112,6 +2141,8 @@ mod tests {
                 slots_per_entity: HashMap::new(),
                 bound: 3,
                 store_ranges: HashMap::new(),
+                activations: vec![],
+                initial_constraints: vec![],
             },
             &IRAssumptionSet::default_for_verify(),
         )

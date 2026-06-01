@@ -1507,6 +1507,7 @@ mod tests {
             systems: vec![],
             stores: vec![],
             assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: vec![IRExpr::Since {
                 left: Box::new(bool_var("p")),

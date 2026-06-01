@@ -6,7 +6,7 @@
 //! - bounded relational verify fragments over one pooled entity type with
 //!   finite field domains and narrow create / choose-apply operational steps
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use rustsat::instances::SatInstance;
@@ -23,6 +23,7 @@ use crate::ir::types::{
 };
 
 use super::scene::collect_ordering_leaf_vars;
+use super::scope::{allocate_initial_activations, VerifyStoreRange};
 use super::{defenv, expand_through_defs, VerificationResult, WitnessSemantics};
 
 const STATEFUL_SCENE_SOME_EVENT_BUDGET: usize = 3;
@@ -274,7 +275,7 @@ struct RelationalSystemStepSpec {
 #[derive(Debug, Clone)]
 struct RelationalEntitySpec {
     slot_count: usize,
-    initial_lower_bound: usize,
+    initial_active_slots: HashSet<usize>,
     defaults: HashMap<String, SimpleValue>,
     field_domains: HashMap<String, Vec<SimpleValue>>,
 }
@@ -427,7 +428,7 @@ fn build_create_only_scene_sat(
         scene,
         &store_slots,
         &entities_by_name,
-    )?);
+    ));
     let some_budget = scene.events.len().max(2);
     let mut event_instance_ranges = Vec::with_capacity(scene.events.len());
     let horizon: usize = scene
@@ -546,51 +547,12 @@ fn build_create_only_scene_sat(
 }
 
 fn build_initial_store_instances(
-    sat: &mut SatInstance,
-    scene: &IRScene,
-    store_slots: &HashMap<String, usize>,
-    entities_by_name: &HashMap<String, &IREntity>,
-) -> Result<Vec<CreateInstance>, String> {
-    let mut instances = Vec::new();
-    let mut next_slot_by_entity: HashMap<String, usize> = HashMap::new();
-
-    for store in &scene.stores {
-        let slot_count = store_slots.get(&store.entity_type).copied().unwrap_or(0);
-        let start_slot = next_slot_by_entity
-            .get(&store.entity_type)
-            .copied()
-            .unwrap_or(0);
-        let store_capacity = usize::try_from(store.hi.max(1)).unwrap_or(1);
-        next_slot_by_entity.insert(store.entity_type.clone(), start_slot + store_capacity);
-
-        let min_active = usize::try_from(store.lo.max(0)).unwrap_or(0);
-        if min_active == 0 {
-            continue;
-        }
-        let Some(entity_ir) = entities_by_name.get(&store.entity_type) else {
-            return Err(format!("unknown entity `{}`", store.entity_type));
-        };
-        let Some(field_values) = build_default_field_map(entity_ir)? else {
-            return Err(format!(
-                "unsupported default field values for initial `{}` store slots",
-                store.entity_type
-            ));
-        };
-        for slot in start_slot..start_slot + min_active {
-            let assigns = (0..slot_count)
-                .map(|idx| const_lit(sat, idx == slot))
-                .collect();
-            instances.push(CreateInstance {
-                entity: store.entity_type.clone(),
-                fire: const_lit(sat, true),
-                assigns,
-                positions: Vec::new(),
-                field_values: field_values.clone(),
-            });
-        }
-    }
-
-    Ok(instances)
+    _sat: &mut SatInstance,
+    _scene: &IRScene,
+    _store_slots: &HashMap<String, usize>,
+    _entities_by_name: &HashMap<String, &IREntity>,
+) -> Vec<CreateInstance> {
+    Vec::new()
 }
 
 fn build_stateful_scene_sat(
@@ -776,23 +738,13 @@ impl<'a> RelationalVerifyObligation<'a> {
         let mut entity_states = HashMap::new();
         for (entity_name, entity_spec) in &entities {
             let mut active_by_state = Vec::with_capacity(bound + 1);
-            if entity_spec.initial_lower_bound == 0 {
-                active_by_state.push(
-                    (0..entity_spec.slot_count)
-                        .map(|_| const_lit(&mut sat, false))
-                        .collect::<Vec<_>>(),
-                );
-            } else {
-                active_by_state.push(
-                    (0..entity_spec.slot_count)
-                        .map(|_| sat.new_lit())
-                        .collect::<Vec<_>>(),
-                );
-                sat.add_card_constr(CardConstraint::new_lb(
-                    active_by_state[0].clone(),
-                    entity_spec.initial_lower_bound,
-                ));
-            }
+            active_by_state.push(
+                (0..entity_spec.slot_count)
+                    .map(|slot| {
+                        const_lit(&mut sat, entity_spec.initial_active_slots.contains(&slot))
+                    })
+                    .collect::<Vec<_>>(),
+            );
             for _ in 0..bound {
                 active_by_state.push(
                     (0..entity_spec.slot_count)
@@ -1118,7 +1070,7 @@ fn relational_stateful_scene_spec(
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     let mut entities = HashMap::new();
     for store in &scene.stores {
-        if store.lo > 0 || store.hi <= 0 {
+        if store.hi <= 0 {
             return Ok(None);
         }
         if !system
@@ -1140,8 +1092,8 @@ fn relational_stateful_scene_spec(
         entities.insert(
             store.entity_type.clone(),
             RelationalEntitySpec {
-                slot_count: usize::try_from(store.hi.max(1)).unwrap_or(1),
-                initial_lower_bound: 0,
+                slot_count: usize::try_from(store.hi).unwrap_or(0),
+                initial_active_slots: HashSet::new(),
                 defaults,
                 field_domains: finite_field_domains(entity_ir),
             },
@@ -1320,7 +1272,7 @@ fn create_spec(
 fn build_store_slots(scene: &IRScene) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for store in &scene.stores {
-        let slots = usize::try_from(store.hi.max(1)).unwrap_or(1);
+        let slots = usize::try_from(store.hi.max(0)).unwrap_or(0);
         let entry = out.entry(store.entity_type.clone()).or_insert(0);
         *entry += slots;
     }
@@ -2149,6 +2101,7 @@ fn relational_verify_spec(
     }
     let entities_by_name: HashMap<_, _> = ir.entities.iter().map(|e| (e.name.clone(), e)).collect();
     let mut entities = HashMap::new();
+    let mut store_ranges = HashMap::new();
     for store in &verify.stores {
         if store.hi <= 0 || store.lo > store.hi || entities.contains_key(&store.entity_type) {
             return Ok(None);
@@ -2166,15 +2119,32 @@ fn relational_verify_spec(
         let Some(defaults) = build_default_field_map(entity_ir)? else {
             return Ok(None);
         };
+        let slot_count = usize::try_from(store.hi).unwrap_or(0);
+        store_ranges.insert(
+            store.name.clone(),
+            VerifyStoreRange {
+                entity_type: store.entity_type.clone(),
+                start_slot: 0,
+                slot_count,
+            },
+        );
         entities.insert(
             store.entity_type.clone(),
             RelationalEntitySpec {
-                slot_count: usize::try_from(store.hi.max(1)).unwrap_or(1),
-                initial_lower_bound: usize::try_from(store.lo).unwrap_or(0),
+                slot_count,
+                initial_active_slots: HashSet::new(),
                 defaults,
                 field_domains: finite_field_domains(entity_ir),
             },
         );
+    }
+
+    let initial_bindings = allocate_initial_activations(&store_ranges, &verify.activations)?;
+    for (entity_name, slot) in initial_bindings.active_slots.into_iter() {
+        let Some(entity) = entities.get_mut(&entity_name) else {
+            return Err(format!("unknown activated entity `{entity_name}`"));
+        };
+        entity.initial_active_slots.insert(slot);
     }
 
     let mut steps = Vec::with_capacity(system.actions.len());
@@ -6005,7 +5975,7 @@ mod tests {
     }
 
     #[test]
-    fn create_only_scene_seeds_store_lower_bound_default_instances() {
+    fn create_only_scene_bounds_do_not_seed_initial_instances() {
         let status_ty = IRType::Enum {
             name: "Status".to_owned(),
             variants: vec![crate::ir::types::IRVariant::simple("Pending")],
@@ -6031,7 +6001,7 @@ mod tests {
         let store_slots = HashMap::from([("Order".to_owned(), 1)]);
         let entities_by_name = HashMap::from([("Order".to_owned(), &order)]);
         let scene = IRScene {
-            name: "lower_bound_active".to_owned(),
+            name: "capacity_only".to_owned(),
             systems: vec!["Commerce".to_owned()],
             stores: vec![IRStoreDecl {
                 name: "orders".to_owned(),
@@ -6048,70 +6018,14 @@ mod tests {
             span: None,
             file: None,
         };
-        let assertion = IRExpr::Exists {
-            var: "o".to_owned(),
-            domain: IRType::Entity {
-                name: "Order".to_owned(),
-            },
-            body: Box::new(IRExpr::BinOp {
-                op: "OpAnd".to_owned(),
-                left: Box::new(IRExpr::Index {
-                    map: Box::new(IRExpr::Var {
-                        name: "orders".to_owned(),
-                        ty: IRType::Set {
-                            element: Box::new(IRType::Entity {
-                                name: "Order".to_owned(),
-                            }),
-                        },
-                        span: None,
-                    }),
-                    key: Box::new(IRExpr::Var {
-                        name: "o".to_owned(),
-                        ty: IRType::Entity {
-                            name: "Order".to_owned(),
-                        },
-                        span: None,
-                    }),
-                    ty: IRType::Bool,
-                    span: None,
-                }),
-                right: Box::new(IRExpr::BinOp {
-                    op: "OpEq".to_owned(),
-                    left: Box::new(IRExpr::Field {
-                        expr: Box::new(IRExpr::Var {
-                            name: "o".to_owned(),
-                            ty: IRType::Entity {
-                                name: "Order".to_owned(),
-                            },
-                            span: None,
-                        }),
-                        field: "status".to_owned(),
-                        ty: status_ty,
-                        span: None,
-                    }),
-                    right: Box::new(IRExpr::Ctor {
-                        enum_name: "Status".to_owned(),
-                        ctor: "Pending".to_owned(),
-                        args: Vec::new(),
-                        span: None,
-                    }),
-                    ty: IRType::Bool,
-                    span: None,
-                }),
-                ty: IRType::Bool,
-                span: None,
-            }),
-            span: None,
-        };
         let mut sat = SatInstance::new();
         let instances =
-            build_initial_store_instances(&mut sat, &scene, &store_slots, &entities_by_name)
-                .expect("initial lower-bound slots should encode");
-        let lit = encode_assertion_into(&assertion, &instances, &mut sat)
-            .expect("lower-bound instance should satisfy store-scoped assertion");
-        sat.add_unit(lit);
+            build_initial_store_instances(&mut sat, &scene, &store_slots, &entities_by_name);
 
-        assert!(matches!(solve_instance(sat), SolverResult::Sat));
+        assert!(
+            instances.is_empty(),
+            "store bounds describe capacity; initial entities must be activated explicitly"
+        );
     }
 
     #[test]

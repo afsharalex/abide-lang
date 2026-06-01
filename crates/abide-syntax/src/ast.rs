@@ -905,6 +905,8 @@ pub enum AssumeItem {
     /// `let name = SystemType { field: store,... }`
     /// — system instantiation via let binding in assume/given blocks.
     Let(LetBindingDecl),
+    /// `activate {instances} in store` — named initial entity setup.
+    Activate(ActivateDecl),
     /// Bare Boolean expression inside `assume { ... }`.
     /// Interpreted by verify blocks as an initial-state predicate.
     Constraint { expr: Expr, span: Span },

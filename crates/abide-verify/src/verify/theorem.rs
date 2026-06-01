@@ -512,6 +512,7 @@ fn handle_theorem_liveness(
             .collect(),
         stores: vec![],
         assumption_set: theorem.assumption_set.clone(),
+        activations: vec![],
         initial_constraints: vec![],
         asserts: virtual_asserts,
         span: theorem.span,
@@ -680,7 +681,7 @@ fn prove_invariant_base(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationRes
         Ok(solver) => solver,
         Err(result) => return Some(*result),
     };
-    for c in initial_state_constraints(&pool, &HashMap::new()) {
+    for c in initial_state_constraints(&pool, &HashSet::new()) {
         solver.assert(&c);
     }
     assert_domain_and_lemmas(ctx, &pool, &solver);
@@ -742,7 +743,7 @@ fn prove_theorem_base(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
         Ok(solver) => solver,
         Err(result) => return Some(*result),
     };
-    for c in initial_state_constraints(&pool, &HashMap::new()) {
+    for c in initial_state_constraints(&pool, &HashSet::new()) {
         solver.assert(&c);
     }
     assert_domain_and_lemmas(ctx, &pool, &solver);
@@ -1011,7 +1012,7 @@ fn try_ic3_on_theorem(
                 file: theorem.file.clone(),
             });
         }
-        for c in initial_state_constraints(&pool, &HashMap::new()) {
+        for c in initial_state_constraints(&pool, &HashSet::new()) {
             probe_solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, system.relevant_entities()) {

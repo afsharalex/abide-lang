@@ -975,6 +975,10 @@ pub struct IRVerify {
     /// Normalized assumption set populated during elaboration.
     /// Verifier backends read fairness and stutter semantics from this field.
     pub assumption_set: IRAssumptionSet,
+    /// Activate declarations from `assume { ... }`. These bind named
+    /// entities to concrete store slots and make them active at step 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activations: Vec<IRActivation>,
     /// Initial-state predicates from bare expressions in `assume { ... }`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_constraints: Vec<IRExpr>,

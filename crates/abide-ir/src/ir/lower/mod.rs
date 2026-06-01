@@ -1203,6 +1203,14 @@ fn lower_verify(
         systems,
         stores,
         assumption_set: crate::ir::types::IRAssumptionSet::from_elab(&ev.assumption_set),
+        activations: ev
+            .activations
+            .iter()
+            .map(|a| crate::ir::types::IRActivation {
+                instances: a.instances.clone(),
+                store_name: a.store_name.clone(),
+            })
+            .collect(),
         initial_constraints: ev
             .initial_constraints
             .iter()

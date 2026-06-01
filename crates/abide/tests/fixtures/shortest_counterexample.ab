@@ -31,6 +31,7 @@ system Flags(flags: Store<Flag>) {
 verify shortest_counterexample [depth: 4] {
   assume {
     store flags: Flag[1..1]
+    activate {f0} in flags
     let flags_sys = Flags { flags: flags }
     no stutter
   }

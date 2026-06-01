@@ -1347,6 +1347,35 @@ strong fair Commerce::ship_order
 }
 
 #[test]
+fn verify_assume_block_accepts_activation_declarations() {
+    let src = "verify seeded {
+  assume {
+    store orders: Order[1]
+    activate {o1, o2} in orders
+  }
+  assert always true
+}";
+    let prog = parse_program(src);
+    let v = match &prog.decls[0] {
+        TopDecl::Verify(v) => v,
+        other => panic!("expected Verify, got {other:?}"),
+    };
+    let ab = v
+        .assume_block
+        .as_ref()
+        .expect("verify should have an assume block");
+    assert_eq!(ab.items.len(), 2);
+    assert!(matches!(&ab.items[0], AssumeItem::Store(_)));
+    match &ab.items[1] {
+        AssumeItem::Activate(activation) => {
+            assert_eq!(activation.instances, vec!["o1".to_owned(), "o2".to_owned()]);
+            assert_eq!(activation.store_name, "orders");
+        }
+        other => panic!("expected Activate, got {other:?}"),
+    }
+}
+
+#[test]
 fn verify_assume_block_accepts_bare_initial_constraints() {
     let src = r"verify initial_predicate {
   assume {

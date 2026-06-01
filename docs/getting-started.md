@@ -89,8 +89,9 @@ verify shipped_orders_have_value {
 scene payment_then_shipping {
   given {
     store orders: Order[1]
+    activate {o} in orders
     let commerce = Commerce { orders: orders }
-    let o = one Order in orders where o.total == 25
+    o.total == 25
   }
   when {
     commerce.pay(o.id)
@@ -197,8 +198,8 @@ See [`examples/collections.ab`](../examples/collections.ab) for a complete runna
 - `entity` declares stateful domain objects with fields and private actions.
 - `system ... (orders: Store<Order>)` declares a system over an entity pool. Put concrete checking bounds on `store` declarations in `assume` or `given` blocks.
 - Store bounds in `assume` or `given` blocks can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
-- In those concrete checking scopes, the lower bound is the initial active population. `[1..4]` starts with one active entity and can grow to four; `[..4]` starts empty.
-- Optional bounds on `Store<T>` system parameters are cardinality contracts, not ordinary demo scopes. Omit them unless the system really requires a minimum, maximum, or exact active population.
+- In concrete checking scopes, store bounds describe capacity. Stores start empty unless the `assume` or `given` block explicitly activates named entities with `activate {o1} in orders`; `create` can then grow the active population up to the upper bound.
+- Optional bounds on `Store<T>` system parameters are cardinality contracts, not ordinary demo scopes. Omit them unless the system really requires a minimum, maximum, or exact capacity contract.
 - `command` declares a public system operation and may include its body inline.
 - `query` declares a public read-only system observation.
 - `action` declares private implementation behavior, usually called by commands.

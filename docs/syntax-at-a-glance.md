@@ -61,7 +61,7 @@ system Commerce(orders: Store<Order>) {
 Notes:
 - `Store<T>` constructor params are the current entity-pool surface.
 - Store constructor params may optionally carry cardinality contracts: `Store<Order>[N]`, `Store<Order>[lo..hi]`, or `Store<Order>[..hi]`.
-- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define the active startup population: `[N]` starts with exactly `N` active entities, `[lo..hi]` starts with `lo`, and `[..hi]` starts with `0`; create actions may grow the active population up to the upper bound.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define store capacity; stores start empty unless the block explicitly activates named entities with `activate {o1} in orders`. Create actions may grow the active population up to the upper bound.
 - `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
 - `action` is private implementation behavior called by commands or other internal behavior.
@@ -139,8 +139,9 @@ the extern block's `may` clauses and from actual calls that appear in commands.
 scene successful_payment {
   given {
     store orders: Order[1]
+    activate {o} in orders
     let commerce = Commerce { orders: orders }
-    let o = one Order in orders where o.total == 25
+    o.total == 25
   }
   when {
     commerce.pay(o)

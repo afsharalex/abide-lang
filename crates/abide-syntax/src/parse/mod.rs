@@ -1337,6 +1337,8 @@ impl Parser {
                 Some(Token::Proc) => AssumeItem::Proc(self.proc_bound_decl()?),
                 // `let name = SystemType { field: store }`
                 Some(Token::Let) => AssumeItem::Let(self.let_binding_decl()?),
+                // `activate {a, b} in store`
+                Some(Token::Activate) => AssumeItem::Activate(self.activate_decl()?),
                 Some(_) => {
                     let expr = self.expr()?;
                     let span = expr.span;

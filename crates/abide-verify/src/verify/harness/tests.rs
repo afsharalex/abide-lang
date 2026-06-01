@@ -570,48 +570,38 @@ fn initial_state_all_inactive() {
     scopes.insert("Order".to_owned(), 3);
     let pool = create_slot_pool(&[entity], &scopes, 2);
 
-    let constraints = initial_state_constraints(&pool, &HashMap::new());
+    let constraints = initial_state_constraints(&pool, &HashSet::new());
     // 3 slots should produce 3 "not active at step 0" constraints
     assert_eq!(constraints.len(), 3);
 }
 
 #[test]
-fn initial_state_activates_store_lower_bound_prefix() {
+fn initial_state_activates_only_explicit_slots() {
     let entity = make_order_entity();
     let mut scopes = HashMap::new();
     scopes.insert("Order".to_owned(), 3);
     let pool = create_slot_pool(&[entity], &scopes, 0);
-    let mut ranges = HashMap::new();
-    ranges.insert(
-        "orders".to_owned(),
-        crate::verify::scope::VerifyStoreRange {
-            entity_type: "Order".to_owned(),
-            start_slot: 0,
-            slot_count: 2,
-            min_active: 1,
-            max_active: 2,
-        },
-    );
+    let active_slots = HashSet::from([("Order".to_owned(), 1usize)]);
 
-    let constraints = initial_state_constraints(&pool, &ranges);
+    let constraints = initial_state_constraints(&pool, &active_slots);
     assert_eq!(constraints.len(), 3);
 
     let solver = AbideSolver::new();
     for constraint in &constraints {
         solver.assert(constraint);
     }
-    if let Some(SmtValue::Bool(active_0)) = pool.active_at("Order", 0, 0) {
-        solver.assert(smt::bool_not(active_0));
+    if let Some(SmtValue::Bool(active_1)) = pool.active_at("Order", 1, 0) {
+        solver.assert(smt::bool_not(active_1));
     }
     assert_eq!(
         solver.check(),
         SatResult::Unsat,
-        "slot 0 is inside the store lower-bound prefix and must start active"
+        "explicitly activated slots must start active"
     );
 }
 
 #[test]
-fn entity_field_initial_constraints_apply_defaults_to_active_store_prefix() {
+fn entity_field_initial_constraints_apply_defaults_to_explicit_active_slots() {
     let mut entity = make_order_entity();
     entity.fields[1].default = Some(IRExpr::Ctor {
         enum_name: "OrderStatus".to_owned(),
@@ -638,19 +628,9 @@ fn entity_field_initial_constraints_apply_defaults_to_active_store_prefix() {
     let mut scopes = HashMap::new();
     scopes.insert("Order".to_owned(), 2);
     let pool = create_slot_pool(&[entity.clone()], &scopes, 0);
-    let mut ranges = HashMap::new();
-    ranges.insert(
-        "orders".to_owned(),
-        crate::verify::scope::VerifyStoreRange {
-            entity_type: "Order".to_owned(),
-            start_slot: 0,
-            slot_count: 2,
-            min_active: 1,
-            max_active: 2,
-        },
-    );
+    let active_slots = HashSet::from([("Order".to_owned(), 0usize)]);
 
-    let constraints = try_entity_field_initial_constraints(&pool, &vctx, &[entity], &ranges)
+    let constraints = try_entity_field_initial_constraints(&pool, &vctx, &[entity], &active_slots)
         .expect("entity initial defaults should encode");
     assert_eq!(constraints.len(), 3);
 
@@ -680,12 +660,12 @@ fn entity_field_initial_constraints_apply_defaults_to_active_store_prefix() {
     assert_eq!(
         solver.check(),
         SatResult::Unsat,
-        "active initial store slots must satisfy entity field defaults"
+        "explicitly active initial slots must satisfy entity field defaults"
     );
 }
 
 #[test]
-fn store_active_cardinality_constraints_enforce_exact_store_population() {
+fn store_active_cardinality_constraints_allow_empty_capacity() {
     let entity = make_order_entity();
     let mut scopes = HashMap::new();
     scopes.insert("Order".to_owned(), 2);
@@ -697,8 +677,6 @@ fn store_active_cardinality_constraints_enforce_exact_store_population() {
             entity_type: "Order".to_owned(),
             start_slot: 0,
             slot_count: 2,
-            min_active: 1,
-            max_active: 1,
         },
     );
 
@@ -713,7 +691,7 @@ fn store_active_cardinality_constraints_enforce_exact_store_population() {
     if let Some(SmtValue::Bool(active_1)) = pool.active_at("Order", 1, 0) {
         both_inactive.assert(smt::bool_not(active_1));
     }
-    assert_eq!(both_inactive.check(), SatResult::Unsat);
+    assert_eq!(both_inactive.check(), SatResult::Sat);
 
     let exactly_one = AbideSolver::new();
     for constraint in &constraints {

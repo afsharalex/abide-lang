@@ -1697,6 +1697,7 @@ fn synthetic_prop_verify(
         // Props verified through the bounded verify fallback still represent
         // top-level proof obligations, so keep theorem/lemma defaults.
         assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        activations: vec![],
         initial_constraints: vec![],
         asserts: vec![IRExpr::Always {
             body: Box::new(func.body.clone()),
@@ -2603,6 +2604,8 @@ fn find_deadlock_step(ctx: DeadlockProbeCtx<'_>) -> Option<DeadlockProbeOutcome>
         slots_per_entity: scope.clone(),
         bound,
         store_ranges: store_ranges.clone(),
+        activations: verify_block.activations.clone(),
+        initial_constraints: verify_block.initial_constraints.clone(),
     };
 
     // We know step 0 is fine (check_for_deadlock passed).
@@ -2821,6 +2824,7 @@ fn check_verify_block_tiered(
             systems: verify_block.systems.clone(),
             stores: verify_block.stores.clone(),
             assumption_set: verify_block.assumption_set.clone(),
+            activations: vec![],
             initial_constraints: vec![],
             asserts: merged_asserts,
             span: verify_block.span,
@@ -3405,7 +3409,9 @@ fn prove_induction_base(
         system.relevant_systems(),
     );
     let solver = induction_solver(config);
-    for c in initial_state_constraints(&pool, system.store_ranges()) {
+    let initial_bindings =
+        allocate_initial_activations(system.store_ranges(), system.activations()).ok()?;
+    for c in initial_state_constraints(&pool, &initial_bindings.active_slots) {
         solver.assert(&c);
     }
     for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
@@ -3989,6 +3995,7 @@ fn prove_liveness_safety_obligations(
         systems: verify_block.systems.clone(),
         stores: verify_block.stores.clone(),
         assumption_set: verify_block.assumption_set.clone(),
+        activations: vec![],
         initial_constraints: vec![],
         asserts: safety_obligations.to_vec(),
         span: verify_block.span,

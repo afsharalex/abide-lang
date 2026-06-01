@@ -967,7 +967,7 @@ fn initial_scene_scope(scene: &IRScene) -> HashMap<String, usize> {
     let mut scope = HashMap::new();
     for store in &scene.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let hi = store.hi.max(1) as usize;
+        let hi = store.hi.max(0) as usize;
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         scope.insert(store.entity_type.clone(), existing + hi);
     }
@@ -1078,8 +1078,6 @@ fn scene_store_ranges(scene: &IRScene) -> SceneStores {
                     entity_type: entity_type.clone(),
                     start_slot: *start_slot,
                     slot_count: *slot_count,
-                    min_active: scene_store_bound(scene, store_name, true).unwrap_or(0),
-                    max_active: scene_store_bound(scene, store_name, false).unwrap_or(*slot_count),
                 },
             )
         })
@@ -1092,7 +1090,7 @@ fn raw_scene_store_ranges(scene: &IRScene) -> HashMap<String, (String, usize, us
     let mut running: HashMap<String, usize> = HashMap::new();
     for store in &scene.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let count = store.hi.max(1) as usize;
+        let count = store.hi.max(0) as usize;
         let start = running.get(&store.entity_type).copied().unwrap_or(0);
         ranges.insert(
             store.name.clone(),
@@ -1101,17 +1099,6 @@ fn raw_scene_store_ranges(scene: &IRScene) -> HashMap<String, (String, usize, us
         running.insert(store.entity_type.clone(), start + count);
     }
     ranges
-}
-
-fn scene_store_bound(scene: &IRScene, store_name: &str, lower: bool) -> Option<usize> {
-    scene
-        .stores
-        .iter()
-        .find(|store| store.name == store_name)
-        .map(|store| {
-            let value = if lower { store.lo } else { store.hi };
-            usize::try_from(value.max(0)).unwrap_or(usize::MAX)
-        })
 }
 
 fn encode_scene_initial_state(ctx: &SceneInitCtx<'_>) -> SceneCheckResult<SceneBindings> {
@@ -1469,17 +1456,9 @@ fn constrain_scene_initial_activity(
         .values()
         .map(|(entity, slot)| (entity.clone(), *slot))
         .collect();
-    let lower_bound_slots = scene_lower_bound_active_slots(&ctx.stores.property);
-    for (entity, slot) in &lower_bound_slots {
-        if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(entity, *slot, 0) {
-            ctx.solver.assert(active);
-        }
-    }
     for entity in ctx.relevant_entities {
         for slot in 0..ctx.pool.slots_for(&entity.name) {
-            if activated_slots.contains(&(entity.name.clone(), slot))
-                || lower_bound_slots.contains(&(entity.name.clone(), slot))
-            {
+            if activated_slots.contains(&(entity.name.clone(), slot)) {
                 continue;
             }
             if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(&entity.name, slot, 0) {
@@ -1487,18 +1466,6 @@ fn constrain_scene_initial_activity(
             }
         }
     }
-}
-
-fn scene_lower_bound_active_slots(
-    store_ranges: &HashMap<String, VerifyStoreRange>,
-) -> HashSet<(String, usize)> {
-    store_ranges
-        .values()
-        .flat_map(|range| {
-            (range.start_slot..range.start_slot + range.min_active)
-                .map(|slot| (range.entity_type.clone(), slot))
-        })
-        .collect()
 }
 
 fn build_scene_firing_plan<'a>(

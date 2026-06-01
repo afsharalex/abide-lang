@@ -228,7 +228,7 @@ pub(super) struct PropertyCtx {
     /// Used for enum/Int/Bool/Real domain quantifiers in verify/theorem properties.
     pub(super) locals: HashMap<String, SmtValue>,
     /// Store ranges from `compute_verify_scope`. Maps `store_name` →
-    /// `VerifyStoreRange { entity_type, start_slot, slot_count, ... }`.
+    /// `VerifyStoreRange { entity_type, start_slot, slot_count }`.
     /// Available for future store-scoped quantifier iteration: when a
     /// quantifier has an `in store_name` filter, the encoding can
     /// restrict iteration to `start_slot..start_slot+slot_count` instead
@@ -4353,8 +4353,6 @@ mod tests {
                 entity_type: "Order".to_owned(),
                 start_slot: 2,
                 slot_count: 3,
-                min_active: 0,
-                max_active: 3,
             },
         );
         let mut given = HashMap::new();
@@ -6355,8 +6353,6 @@ mod tests {
                 entity_type: "Order".to_owned(),
                 start_slot: 0,
                 slot_count: 1,
-                min_active: 0,
-                max_active: 1,
             },
         );
         ranges.insert(
@@ -6365,8 +6361,6 @@ mod tests {
                 entity_type: "Order".to_owned(),
                 start_slot: 1,
                 slot_count: 1,
-                min_active: 0,
-                max_active: 1,
             },
         );
         let ctx = PropertyCtx::new().with_store_ranges(ranges);

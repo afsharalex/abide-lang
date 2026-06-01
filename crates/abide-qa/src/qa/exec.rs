@@ -1146,6 +1146,7 @@ fn build_semantic_verify(
             stores,
             proc_bounds: Vec::new(),
             let_bindings,
+            activations: Vec::new(),
             initial_constraints: Vec::new(),
             assume_block: None,
             assumption_set: AssumptionSet::default_for_verify(),
@@ -3933,7 +3934,7 @@ system Commerce(orders: Store<Order>) {
             },
         ) {
             QueryResult::BoolWithMode { value: true, mode } => {
-                assert_eq!(mode, "semantic:proved[slots=4]");
+                assert_eq!(mode, "semantic:checked[slots=4]");
             }
             other => panic!("expected semantic success with default stutter, got {other:?}"),
         }

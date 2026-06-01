@@ -551,6 +551,7 @@ fn lower_verify_propagates_span_and_file() {
             system_type: "Sys".to_owned(),
             store_bindings: vec![("es".to_owned(), "es".to_owned())],
         }],
+        activations: vec![],
         initial_constraints: vec![],
         assume_block: None,
         assumption_set: E::AssumptionSet::default_for_verify(),
