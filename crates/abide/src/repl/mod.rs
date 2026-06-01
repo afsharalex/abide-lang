@@ -23,7 +23,7 @@ use crate::qa::{exec, extract, fmt, parse as qa_parse};
 use crate::simulate::SimulateConfig;
 use crate::verify::VerifyConfig;
 
-use self::artifacts::ArtifactStore;
+use self::artifacts::{ArtifactStore, ReplArtifact};
 
 use complete::AbideCompleter;
 
@@ -394,11 +394,22 @@ fn merge_overlay(dst: &mut Env, src: &Env) {
 }
 
 /// Run the interactive REPL.
-#[allow(clippy::single_match_else, clippy::too_many_lines)]
+#[allow(clippy::single_match_else)]
 pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
+    let (loaded_targets, base_env) = initialize_repl(load_path, scratch);
+    let mut state = ReplState::new(loaded_targets, base_env);
+    let mut mode = Mode::Abide;
+    let mut line_editor = create_line_editor(mode, &state, vi_mode);
+    line_editor = install_history(line_editor);
+    println!("Abide REPL (type /help for commands, /quit to exit)");
+    println!();
+    run_repl_loop(line_editor, &mut mode, &mut state);
+}
+
+fn initialize_repl(load_path: Option<&Path>, scratch: bool) -> (Vec<PathBuf>, Option<Env>) {
     let startup_targets = determine_startup_targets(load_path, scratch);
-    let (loaded_targets, base_env) = match startup_targets {
-        Some(targets) => match load_base_envs(&targets) {
+    if let Some(targets) = startup_targets {
+        match load_base_envs(&targets) {
             Ok(env) => {
                 let entity_count = env.entities.len();
                 let system_count = env.systems.len();
@@ -411,26 +422,20 @@ pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
                 }
                 (Vec::new(), None)
             }
-        },
-        None => {
-            println!("No specs loaded. Use /load <path> to load specifications.");
-            (Vec::new(), None)
         }
-    };
+    } else {
+        println!("No specs loaded. Use /load <path> to load specifications.");
+        (Vec::new(), None)
+    }
+}
 
-    let mut state = ReplState::new(loaded_targets, base_env);
-    let mut mode = Mode::Abide;
-
-    // Set up completer
+fn create_line_editor(mode: Mode, state: &ReplState, vi_mode: bool) -> Reedline {
     let completer = Box::new(AbideCompleter::new(
         mode,
         state.model.as_ref(),
         &state.env_names,
     ));
-
-    // Set up reedline
     let completion_menu = Box::new(ColumnarMenu::default().with_name("completion_menu"));
-
     let mut keybindings = default_emacs_keybindings();
     keybindings.add_binding(
         KeyModifiers::NONE,
@@ -446,13 +451,13 @@ pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
     } else {
         Box::new(Emacs::new(keybindings))
     };
-
-    let mut line_editor = Reedline::create()
+    Reedline::create()
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
-        .with_edit_mode(edit_mode);
+        .with_edit_mode(edit_mode)
+}
 
-    // Set up history (create directory if needed)
+fn install_history(mut line_editor: Reedline) -> Reedline {
     if let Some(history_path) = history_file_path() {
         if let Some(parent) = history_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -461,67 +466,25 @@ pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
             line_editor = line_editor.with_history(Box::new(history));
         }
     }
+    line_editor
+}
 
-    println!("Abide REPL (type /help for commands, /quit to exit)");
-    println!();
-
+fn run_repl_loop(mut line_editor: Reedline, mode: &mut Mode, state: &mut ReplState) {
     let mut input_buffer = String::new();
-
     loop {
         let prompt = if input_buffer.is_empty() {
-            make_prompt(mode)
+            make_prompt(*mode)
         } else {
             make_continuation_prompt()
         };
-
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => {
-                let trimmed = line.trim();
-
-                // Empty line on fresh prompt: skip. On continuation: submit buffer.
-                if trimmed.is_empty() && input_buffer.is_empty() {
-                    continue;
-                }
-
-                // Handle tool commands (only on fresh prompt)
-                if input_buffer.is_empty() && trimmed.starts_with('/') {
-                    match handle_tool_command(trimmed, &mut mode, &mut state) {
-                        ToolResult::Continue => continue,
-                        ToolResult::Quit => break,
-                        ToolResult::UpdateCompleter => {
-                            let new_completer = Box::new(AbideCompleter::new(
-                                mode,
-                                state.model.as_ref(),
-                                &state.env_names,
-                            ));
-                            line_editor = line_editor.with_completer(new_completer);
-                            continue;
-                        }
+                match handle_repl_success_line(mode, state, &mut input_buffer, &line) {
+                    ReplLineAction::Continue => {}
+                    ReplLineAction::Quit => break,
+                    ReplLineAction::RefreshCompleter => {
+                        line_editor = with_repl_completer(line_editor, *mode, state);
                     }
-                }
-
-                // Accumulate multi-line input
-                if !input_buffer.is_empty() {
-                    input_buffer.push('\n');
-                }
-                input_buffer.push_str(&line);
-
-                // Check if braces/parens are balanced
-                if !is_balanced(&input_buffer) {
-                    continue;
-                }
-
-                let full_input = input_buffer.trim().to_owned();
-                input_buffer.clear();
-
-                // Execute based on mode
-                match mode {
-                    Mode::QA => handle_qa_input(
-                        &full_input,
-                        state.model.as_ref(),
-                        Some(&state.merged_env()),
-                    ),
-                    Mode::Abide => handle_abide_input(&full_input, &mut state),
                 }
             }
             Ok(Signal::CtrlD | Signal::CtrlC) => {
@@ -540,6 +503,66 @@ pub fn run_repl(load_path: Option<&Path>, scratch: bool, vi_mode: bool) {
     }
 }
 
+enum ReplLineAction {
+    Continue,
+    Quit,
+    RefreshCompleter,
+}
+
+fn handle_repl_success_line(
+    mode: &mut Mode,
+    state: &mut ReplState,
+    input_buffer: &mut String,
+    line: &str,
+) -> ReplLineAction {
+    let trimmed = line.trim();
+    if trimmed.is_empty() && input_buffer.is_empty() {
+        return ReplLineAction::Continue;
+    }
+    if input_buffer.is_empty() && trimmed.starts_with('/') {
+        return handle_repl_tool_result(mode, state, trimmed);
+    }
+    if !input_buffer.is_empty() {
+        input_buffer.push('\n');
+    }
+    input_buffer.push_str(line);
+    if !is_balanced(input_buffer) {
+        return ReplLineAction::Continue;
+    }
+    let full_input = input_buffer.trim().to_owned();
+    input_buffer.clear();
+    execute_repl_input(&full_input, *mode, state);
+    ReplLineAction::Continue
+}
+
+fn handle_repl_tool_result(
+    mode: &mut Mode,
+    state: &mut ReplState,
+    trimmed: &str,
+) -> ReplLineAction {
+    match handle_tool_command(trimmed, mode, state) {
+        ToolResult::Continue => ReplLineAction::Continue,
+        ToolResult::Quit => ReplLineAction::Quit,
+        ToolResult::UpdateCompleter => ReplLineAction::RefreshCompleter,
+    }
+}
+
+fn with_repl_completer(line_editor: Reedline, mode: Mode, state: &ReplState) -> Reedline {
+    let new_completer = Box::new(AbideCompleter::new(
+        mode,
+        state.model.as_ref(),
+        &state.env_names,
+    ));
+    line_editor.with_completer(new_completer)
+}
+
+fn execute_repl_input(full_input: &str, mode: Mode, state: &mut ReplState) {
+    match mode {
+        Mode::QA => handle_qa_input(full_input, state.model.as_ref(), Some(&state.merged_env())),
+        Mode::Abide => handle_abide_input(full_input, state),
+    }
+}
+
 enum ToolResult {
     Continue,
     Quit,
@@ -548,256 +571,321 @@ enum ToolResult {
 
 fn handle_tool_command(cmd: &str, mode: &mut Mode, state: &mut ReplState) -> ToolResult {
     let trimmed = cmd.trim();
+    if let Some(result) = handle_session_command(trimmed, mode) {
+        return result;
+    }
+    if let Some(result) = handle_load_command(trimmed, state) {
+        return result;
+    }
+    if let Some(result) = handle_execution_command(trimmed, state) {
+        return result;
+    }
+    if let Some(result) = handle_artifact_command(trimmed, state) {
+        return result;
+    }
+    if trimmed == "/schema" {
+        print_schema(state);
+        return ToolResult::Continue;
+    }
+    println!("Unknown command: {cmd}. Type /help for available commands.");
+    ToolResult::Continue
+}
+
+fn handle_session_command(trimmed: &str, mode: &mut Mode) -> Option<ToolResult> {
     match trimmed {
-        "/quit" | "/q" => ToolResult::Quit,
+        "/quit" | "/q" => Some(ToolResult::Quit),
         "/help" | "/h" => {
             print_help(*mode);
-            ToolResult::Continue
+            Some(ToolResult::Continue)
         }
         "/qa" => {
             *mode = Mode::QA;
             println!("Switched to QA mode.");
-            ToolResult::UpdateCompleter
+            Some(ToolResult::UpdateCompleter)
         }
         "/abide" => {
             *mode = Mode::Abide;
             println!("Switched to Abide mode.");
-            ToolResult::UpdateCompleter
+            Some(ToolResult::UpdateCompleter)
         }
-        _ if trimmed.starts_with("/load") => {
-            match parse_target_command(trimmed, "/load") {
-                Ok(target) => match state.add_loaded_target(target) {
-                    Ok(LoadTargetOutcome::Loaded {
-                        target,
-                        entity_count,
-                        system_count,
-                        cleared_artifacts,
-                    }) => {
-                        println!(
-                            "Loaded {}. Current base set: {} ({entity_count} entities, {system_count} systems)",
-                            target.display(),
-                            state.loaded_target_display()
-                        );
-                        if cleared_artifacts > 0 {
-                            println!("Invalidated {cleared_artifacts} stored artifacts.");
-                        }
-                    }
-                    Ok(LoadTargetOutcome::AlreadyLoaded(target)) => {
-                        println!(
-                            "Target `{}` is already loaded. Use `/reload` or `/reload {}`.",
-                            target.display(),
-                            target.display()
-                        );
-                    }
-                    Err(errors) => {
-                        for e in &errors {
-                            eprintln!("{e}");
-                        }
-                    }
-                },
-                Err(err) => println!("{err}"),
-            }
-            ToolResult::UpdateCompleter
-        }
-        _ if trimmed.starts_with("/reload") => {
-            let target = match parse_optional_target_command(trimmed, "/reload") {
-                Ok(target) => target,
-                Err(err) => {
-                    println!("{err}");
-                    return ToolResult::Continue;
-                }
-            };
-            match state.reload_targets(target.as_deref()) {
-                Ok(ReloadOutcome::Reloaded {
-                    entity_count,
-                    system_count,
-                    cleared_artifacts,
-                }) => {
-                    println!(
-                        "Reloaded: {} ({entity_count} entities, {system_count} systems; in-memory changes discarded)",
-                        state.loaded_target_display()
-                    );
-                    if cleared_artifacts > 0 {
-                        println!("Invalidated {cleared_artifacts} stored artifacts.");
-                    }
-                }
-                Ok(ReloadOutcome::NothingLoaded) => {
-                    println!("Nothing to reload — no specs are currently loaded.");
-                }
-                Ok(ReloadOutcome::TargetNotLoaded(target)) => {
-                    println!(
-                        "Target `{}` is not currently loaded. Use `/load {}` first.",
-                        target.display(),
-                        target.display()
-                    );
-                }
-                Err(errors) => {
-                    for e in &errors {
-                        eprintln!("{e}");
-                    }
-                }
-            }
-            ToolResult::UpdateCompleter
-        }
-        _ if is_tool_command(trimmed, "/verify") => {
-            let target_text = trimmed.strip_prefix("/verify").unwrap_or_default().trim();
-            let target = if target_text.is_empty() {
-                Ok(None)
-            } else {
-                target_text.parse().map(Some)
-            };
-            match target {
-                Ok(target) => match state.verify_current(target) {
-                    Ok((results, stored)) => {
-                        for result in &results {
-                            println!("{result}");
-                        }
-                        if stored == 0 {
-                            println!("No native evidence artifacts were produced.");
-                        } else {
-                            println!("Stored {stored} native evidence artifact(s).");
-                        }
-                    }
-                    Err(err) => {
-                        println!("Cannot verify current REPL environment: {err}");
-                    }
-                },
-                Err(err) => println!("Invalid verification target: {err}"),
-            }
-            ToolResult::Continue
-        }
-        _ if is_tool_command(trimmed, "/run") || is_tool_command(trimmed, "/simulate") => {
-            match parse_run_command(trimmed) {
-                Ok(config) => match state.simulate_current(&config) {
-                    Ok((result, stored)) => {
-                        print!("{}", result.render_text());
-                        println!("Stored {stored} simulation artifact(s).");
-                    }
-                    Err(err) => {
-                        println!("Cannot simulate current REPL environment: {err}");
-                    }
-                },
-                Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
-        }
-        _ if trimmed.starts_with("/explore") => {
-            match parse_explore_command(trimmed) {
-                Ok(request) => match state.explore_current(&request) {
-                    Ok((result, stored)) => {
-                        print!("{}", crate::qa::runner::render_state_space_summary(&result));
-                        println!("Stored {stored} state-space artifact(s).");
-                    }
-                    Err(err) => {
-                        println!("Cannot explore current REPL environment: {err}");
-                    }
-                },
-                Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
-        }
-        "/artifacts" => {
-            if state.artifacts.is_empty() {
-                println!("No stored artifacts.");
-            } else {
-                for artifact in state.artifacts.artifacts() {
-                    println!("{}", artifact.summary_line());
-                }
-            }
-            ToolResult::Continue
-        }
-        "/schema" => {
-            if let Some(m) = &state.model {
-                println!("Entities: {}", m.entity_names.join(", "));
+        _ => None,
+    }
+}
+
+fn handle_load_command(trimmed: &str, state: &mut ReplState) -> Option<ToolResult> {
+    if trimmed.starts_with("/load") {
+        load_target(trimmed, state);
+        return Some(ToolResult::UpdateCompleter);
+    }
+    if trimmed.starts_with("/reload") {
+        reload_targets(trimmed, state);
+        return Some(ToolResult::UpdateCompleter);
+    }
+    None
+}
+
+fn load_target(trimmed: &str, state: &mut ReplState) {
+    match parse_target_command(trimmed, "/load") {
+        Ok(target) => match state.add_loaded_target(target) {
+            Ok(LoadTargetOutcome::Loaded {
+                target,
+                entity_count,
+                system_count,
+                cleared_artifacts,
+            }) => {
                 println!(
-                    "Systems: {}",
-                    m.systems.keys().cloned().collect::<Vec<_>>().join(", ")
+                    "Loaded {}. Current base set: {} ({entity_count} entities, {system_count} systems)",
+                    target.display(),
+                    state.loaded_target_display()
                 );
-                println!("Types: {}", m.type_names.join(", "));
-                for ((entity, field), sg) in &m.state_graphs {
-                    println!(
-                        "  {entity}.{field}: {} (initial: {})",
-                        sg.states.join(" | "),
-                        sg.initial.as_deref().unwrap_or("?")
-                    );
+                print_invalidated_artifacts(cleared_artifacts);
+            }
+            Ok(LoadTargetOutcome::AlreadyLoaded(target)) => {
+                println!(
+                    "Target `{}` is already loaded. Use `/reload` or `/reload {}`.",
+                    target.display(),
+                    target.display()
+                );
+            }
+            Err(errors) => print_load_errors(&errors),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn reload_targets(trimmed: &str, state: &mut ReplState) {
+    let target = match parse_optional_target_command(trimmed, "/reload") {
+        Ok(target) => target,
+        Err(err) => {
+            println!("{err}");
+            return;
+        }
+    };
+    match state.reload_targets(target.as_deref()) {
+        Ok(ReloadOutcome::Reloaded {
+            entity_count,
+            system_count,
+            cleared_artifacts,
+        }) => {
+            println!(
+                "Reloaded: {} ({entity_count} entities, {system_count} systems; in-memory changes discarded)",
+                state.loaded_target_display()
+            );
+            print_invalidated_artifacts(cleared_artifacts);
+        }
+        Ok(ReloadOutcome::NothingLoaded) => {
+            println!("Nothing to reload — no specs are currently loaded.");
+        }
+        Ok(ReloadOutcome::TargetNotLoaded(target)) => {
+            println!(
+                "Target `{}` is not currently loaded. Use `/load {}` first.",
+                target.display(),
+                target.display()
+            );
+        }
+        Err(errors) => print_load_errors(&errors),
+    }
+}
+
+fn print_load_errors(errors: &[String]) {
+    for error in errors {
+        eprintln!("{error}");
+    }
+}
+
+fn print_invalidated_artifacts(cleared_artifacts: usize) {
+    if cleared_artifacts > 0 {
+        println!("Invalidated {cleared_artifacts} stored artifacts.");
+    }
+}
+
+fn handle_execution_command(trimmed: &str, state: &mut ReplState) -> Option<ToolResult> {
+    if is_tool_command(trimmed, "/verify") {
+        verify_current(trimmed, state);
+        return Some(ToolResult::Continue);
+    }
+    if is_tool_command(trimmed, "/run") || is_tool_command(trimmed, "/simulate") {
+        simulate_current(trimmed, state);
+        return Some(ToolResult::Continue);
+    }
+    if trimmed.starts_with("/explore") {
+        explore_current(trimmed, state);
+        return Some(ToolResult::Continue);
+    }
+    None
+}
+
+fn verify_current(trimmed: &str, state: &mut ReplState) {
+    let target_text = trimmed.strip_prefix("/verify").unwrap_or_default().trim();
+    let target = if target_text.is_empty() {
+        Ok(None)
+    } else {
+        target_text.parse().map(Some)
+    };
+    match target {
+        Ok(target) => match state.verify_current(target) {
+            Ok((results, stored)) => {
+                for result in &results {
+                    println!("{result}");
                 }
-            } else {
-                println!("No specs loaded.");
+                print_stored_evidence_count(stored);
             }
-            ToolResult::Continue
+            Err(err) => println!("Cannot verify current REPL environment: {err}"),
+        },
+        Err(err) => println!("Invalid verification target: {err}"),
+    }
+}
+
+fn print_stored_evidence_count(stored: usize) {
+    if stored == 0 {
+        println!("No native evidence artifacts were produced.");
+    } else {
+        println!("Stored {stored} native evidence artifact(s).");
+    }
+}
+
+fn simulate_current(trimmed: &str, state: &mut ReplState) {
+    match parse_run_command(trimmed) {
+        Ok(config) => match state.simulate_current(&config) {
+            Ok((result, stored)) => {
+                print!("{}", result.render_text());
+                println!("Stored {stored} simulation artifact(s).");
+            }
+            Err(err) => println!("Cannot simulate current REPL environment: {err}"),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn explore_current(trimmed: &str, state: &mut ReplState) {
+    match parse_explore_command(trimmed) {
+        Ok(request) => match state.explore_current(&request) {
+            Ok((result, stored)) => {
+                print!("{}", crate::qa::runner::render_state_space_summary(&result));
+                println!("Stored {stored} state-space artifact(s).");
+            }
+            Err(err) => println!("Cannot explore current REPL environment: {err}"),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn handle_artifact_command(trimmed: &str, state: &ReplState) -> Option<ToolResult> {
+    if trimmed == "/artifacts" {
+        print_artifact_list(state);
+    } else if trimmed.starts_with("/show artifact ") {
+        show_artifact(trimmed, state);
+    } else if trimmed.starts_with("/draw artifact ") {
+        draw_artifact(trimmed, state);
+    } else if trimmed.starts_with("/state artifact ") {
+        show_artifact_state(trimmed, state);
+    } else if trimmed.starts_with("/diff artifact ") {
+        diff_artifact(trimmed, state);
+    } else if trimmed.starts_with("/export artifact ") {
+        export_artifact(trimmed, state);
+    } else {
+        return None;
+    }
+    Some(ToolResult::Continue)
+}
+
+fn print_artifact_list(state: &ReplState) {
+    if state.artifacts.is_empty() {
+        println!("No stored artifacts.");
+    } else {
+        for artifact in state.artifacts.artifacts() {
+            println!("{}", artifact.summary_line());
         }
-        _ if trimmed.starts_with("/show artifact ") => {
-            match parse_artifact_selector(trimmed, "/show artifact ") {
-                Ok(selector) => match state.artifacts.resolve(&selector) {
-                    Some(artifact) => print!("{}", artifact.render_show()),
-                    None => println!("Unknown artifact selector `{selector}`."),
-                },
+    }
+}
+
+fn show_artifact(trimmed: &str, state: &ReplState) {
+    match parse_artifact_selector(trimmed, "/show artifact ") {
+        Ok(selector) => match state.artifacts.resolve(&selector) {
+            Some(artifact) => print!("{}", artifact.render_show()),
+            None => println!("Unknown artifact selector `{selector}`."),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn draw_artifact(trimmed: &str, state: &ReplState) {
+    match parse_artifact_selector(trimmed, "/draw artifact ") {
+        Ok(selector) => match state.artifacts.resolve(&selector) {
+            Some(artifact) => match artifact.render_draw() {
+                Ok(rendered) => print!("{rendered}"),
                 Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
-        }
-        _ if trimmed.starts_with("/draw artifact ") => {
-            match parse_artifact_selector(trimmed, "/draw artifact ") {
-                Ok(selector) => match state.artifacts.resolve(&selector) {
-                    Some(artifact) => match artifact.render_draw() {
-                        Ok(rendered) => print!("{rendered}"),
-                        Err(err) => println!("{err}"),
-                    },
-                    None => println!("Unknown artifact selector `{selector}`."),
-                },
+            },
+            None => println!("Unknown artifact selector `{selector}`."),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn show_artifact_state(trimmed: &str, state: &ReplState) {
+    match parse_artifact_state_args(trimmed, "/state artifact ") {
+        Ok((selector, index)) => match state.artifacts.resolve(&selector) {
+            Some(artifact) => match artifact.render_state(index) {
+                Ok(rendered) => print!("{rendered}"),
                 Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
-        }
-        _ if trimmed.starts_with("/state artifact ") => {
-            match parse_artifact_state_args(trimmed, "/state artifact ") {
-                Ok((selector, index)) => match state.artifacts.resolve(&selector) {
-                    Some(artifact) => match artifact.render_state(index) {
-                        Ok(rendered) => print!("{rendered}"),
-                        Err(err) => println!("{err}"),
-                    },
-                    None => println!("Unknown artifact selector `{selector}`."),
-                },
+            },
+            None => println!("Unknown artifact selector `{selector}`."),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn diff_artifact(trimmed: &str, state: &ReplState) {
+    match parse_artifact_diff_args(trimmed, "/diff artifact ") {
+        Ok((selector, from, to)) => match state.artifacts.resolve(&selector) {
+            Some(artifact) => match artifact.render_diff(from, to) {
+                Ok(rendered) => print!("{rendered}"),
                 Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
+            },
+            None => println!("Unknown artifact selector `{selector}`."),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn export_artifact(trimmed: &str, state: &ReplState) {
+    match parse_artifact_export_args(trimmed, "/export artifact ") {
+        Ok((selector, format)) => match state.artifacts.resolve(&selector) {
+            Some(artifact) => export_resolved_artifact(artifact, &format),
+            None => println!("Unknown artifact selector `{selector}`."),
+        },
+        Err(err) => println!("{err}"),
+    }
+}
+
+fn export_resolved_artifact(artifact: &ReplArtifact, format: &str) {
+    if format == "json" {
+        match artifact.export_json() {
+            Ok(json) => println!("{json}"),
+            Err(err) => println!("{err}"),
         }
-        _ if trimmed.starts_with("/diff artifact ") => {
-            match parse_artifact_diff_args(trimmed, "/diff artifact ") {
-                Ok((selector, from, to)) => match state.artifacts.resolve(&selector) {
-                    Some(artifact) => match artifact.render_diff(from, to) {
-                        Ok(rendered) => print!("{rendered}"),
-                        Err(err) => println!("{err}"),
-                    },
-                    None => println!("Unknown artifact selector `{selector}`."),
-                },
-                Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
+    } else {
+        println!("Unsupported export format `{format}`. Use `json`.");
+    }
+}
+
+fn print_schema(state: &ReplState) {
+    if let Some(m) = &state.model {
+        println!("Entities: {}", m.entity_names.join(", "));
+        println!(
+            "Systems: {}",
+            m.systems.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+        println!("Types: {}", m.type_names.join(", "));
+        for ((entity, field), sg) in &m.state_graphs {
+            println!(
+                "  {entity}.{field}: {} (initial: {})",
+                sg.states.join(" | "),
+                sg.initial.as_deref().unwrap_or("?")
+            );
         }
-        _ if trimmed.starts_with("/export artifact ") => {
-            match parse_artifact_export_args(trimmed, "/export artifact ") {
-                Ok((selector, format)) => match state.artifacts.resolve(&selector) {
-                    Some(artifact) => {
-                        if format == "json" {
-                            match artifact.export_json() {
-                                Ok(json) => println!("{json}"),
-                                Err(err) => println!("{err}"),
-                            }
-                        } else {
-                            println!("Unsupported export format `{format}`. Use `json`.");
-                        }
-                    }
-                    None => println!("Unknown artifact selector `{selector}`."),
-                },
-                Err(err) => println!("{err}"),
-            }
-            ToolResult::Continue
-        }
-        _ => {
-            println!("Unknown command: {cmd}. Type /help for available commands.");
-            ToolResult::Continue
-        }
+    } else {
+        println!("No specs loaded.");
     }
 }
 

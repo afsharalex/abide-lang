@@ -20,12 +20,10 @@ fn finite_slot_domain_values(ctx: &SlotEncodeCtx<'_>, domain: &IRType) -> Option
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn encode_slot_expr(ctx: &SlotEncodeCtx<'_>, expr: &IRExpr, step: usize) -> SmtValue {
     try_encode_slot_expr(ctx, expr, step).unwrap_or_else(|msg| panic!("{msg}"))
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn try_encode_slot_expr(
     ctx: &SlotEncodeCtx<'_>,
     expr: &IRExpr,
@@ -116,6 +114,21 @@ pub fn try_encode_slot_expr(
             }
             let id = ctx.vctx.variants.try_id_of(enum_name, ctor)?;
             Ok(smt::int_val(id))
+        }
+
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ..
+        } => {
+            let Some(witness) = direct_slot_choose_witness(var, domain, predicate.as_deref())
+            else {
+                return Err(format!(
+                    "slot expression encoding not yet supported: {expr:?}"
+                ));
+            };
+            try_encode_slot_expr(ctx, &witness, step)
         }
 
         IRExpr::BinOp {
@@ -281,6 +294,10 @@ pub fn try_encode_slot_expr(
         }
 
         IRExpr::App { .. } => {
+            if let Some(value) = try_encode_ctor_app(ctx, expr, step)? {
+                return Ok(value);
+            }
+
             let Some((kind, full_name, args)) = defenv::classify_app_chain_public(
                 &ctx.vctx.defs,
                 expr,
@@ -737,6 +754,186 @@ pub fn try_encode_slot_expr(
             "slot expression encoding not yet supported: {other:?}"
         )),
     }
+}
+
+fn try_encode_ctor_app(
+    ctx: &SlotEncodeCtx<'_>,
+    expr: &IRExpr,
+    step: usize,
+) -> Result<Option<SmtValue>, String> {
+    let Some((enum_name, ctor, args)) = decompose_ctor_app(expr) else {
+        return Ok(None);
+    };
+    let Some(dt) = ctx.vctx.adt_sorts.get(enum_name) else {
+        return Ok(None);
+    };
+    let Some(variant) = dt
+        .variants
+        .iter()
+        .find(|variant| smt::func_decl_name(&variant.constructor) == ctor)
+    else {
+        return Err(format!("unknown constructor '{ctor}' of '{enum_name}'"));
+    };
+    if variant.accessors.len() != args.len() {
+        return Err(format!(
+            "constructor '{ctor}' of '{enum_name}' expects {} argument(s), got {}",
+            variant.accessors.len(),
+            args.len()
+        ));
+    }
+    let z3_args = args
+        .iter()
+        .map(|arg| try_encode_slot_expr(ctx, arg, step).map(|value| value.to_dynamic()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs = z3_args.iter().collect::<Vec<_>>();
+    Ok(Some(walkers::dynamic_to_smt_value(smt::func_decl_apply(
+        &variant.constructor,
+        &refs,
+    ))))
+}
+
+fn decompose_ctor_app(expr: &IRExpr) -> Option<(&str, &str, Vec<&IRExpr>)> {
+    let mut args = Vec::new();
+    let mut head = expr;
+    while let IRExpr::App { func, arg, .. } = head {
+        args.push(arg.as_ref());
+        head = func.as_ref();
+    }
+    let IRExpr::Ctor {
+        enum_name,
+        ctor,
+        args: named_args,
+        ..
+    } = head
+    else {
+        return None;
+    };
+    if !named_args.is_empty() {
+        return None;
+    }
+    args.reverse();
+    Some((enum_name, ctor, args))
+}
+
+#[derive(Default)]
+struct IntChooseBounds {
+    lower: Option<i64>,
+    upper: Option<i64>,
+    equal: Option<i64>,
+}
+
+fn direct_slot_choose_witness(
+    var: &str,
+    domain: &IRType,
+    predicate: Option<&IRExpr>,
+) -> Option<IRExpr> {
+    if !matches!(domain, IRType::Int) {
+        return None;
+    }
+    let predicate = predicate?;
+    let mut bounds = IntChooseBounds::default();
+    collect_int_choose_bounds(predicate, var, &mut bounds).then(|| {
+        let value = bounds.equal.or(bounds.lower).unwrap_or(0);
+        let valid_lower = bounds.lower.is_none_or(|lower| value >= lower);
+        let valid_upper = bounds.upper.is_none_or(|upper| value <= upper);
+        (valid_lower && valid_upper).then_some(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        })
+    })?
+}
+
+fn collect_int_choose_bounds(expr: &IRExpr, var: &str, bounds: &mut IntChooseBounds) -> bool {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Bool { value: true },
+            ..
+        } => true,
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" || op == "and" || op == "&&" => {
+            collect_int_choose_bounds(left, var, bounds)
+                && collect_int_choose_bounds(right, var, bounds)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => apply_int_choose_comparison(op, left, right, var, bounds),
+        _ => false,
+    }
+}
+
+fn apply_int_choose_comparison(
+    op: &str,
+    left: &IRExpr,
+    right: &IRExpr,
+    var: &str,
+    bounds: &mut IntChooseBounds,
+) -> bool {
+    if candidate_var(left, var) {
+        return int_literal(right).is_some_and(|literal| update_choose_bounds(op, literal, bounds));
+    }
+    if candidate_var(right, var) {
+        let Some(inverted) = invert_comparison(op) else {
+            return false;
+        };
+        return int_literal(left)
+            .is_some_and(|literal| update_choose_bounds(inverted, literal, bounds));
+    }
+    false
+}
+
+fn candidate_var(expr: &IRExpr, var: &str) -> bool {
+    matches!(expr, IRExpr::Var { name, .. } if name == var || name == "$")
+}
+
+fn int_literal(expr: &IRExpr) -> Option<i64> {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Int { value },
+            ..
+        } => Some(*value),
+        _ => None,
+    }
+}
+
+fn invert_comparison(op: &str) -> Option<&'static str> {
+    match op {
+        "OpGt" | ">" => Some("OpLt"),
+        "OpGe" | ">=" => Some("OpLe"),
+        "OpLt" | "<" => Some("OpGt"),
+        "OpLe" | "<=" => Some("OpGe"),
+        "OpEq" | "==" => Some("OpEq"),
+        _ => None,
+    }
+}
+
+fn update_choose_bounds(op: &str, literal: i64, bounds: &mut IntChooseBounds) -> bool {
+    match op {
+        "OpEq" | "==" => {
+            bounds.equal = Some(literal);
+            true
+        }
+        "OpGt" | ">" => literal
+            .checked_add(1)
+            .is_some_and(|lower| update_lower_bound(bounds, lower)),
+        "OpGe" | ">=" => update_lower_bound(bounds, literal),
+        "OpLt" | "<" => literal
+            .checked_sub(1)
+            .is_some_and(|upper| update_upper_bound(bounds, upper)),
+        "OpLe" | "<=" => update_upper_bound(bounds, literal),
+        _ => false,
+    }
+}
+
+fn update_lower_bound(bounds: &mut IntChooseBounds, lower: i64) -> bool {
+    bounds.lower = Some(bounds.lower.map_or(lower, |current| current.max(lower)));
+    true
+}
+
+fn update_upper_bound(bounds: &mut IntChooseBounds, upper: i64) -> bool {
+    bounds.upper = Some(bounds.upper.map_or(upper, |current| current.min(upper)));
+    true
 }
 
 pub(super) fn encode_slot_literal(lit: &LitVal) -> SmtValue {

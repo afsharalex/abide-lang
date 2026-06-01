@@ -1,5 +1,57 @@
 use super::*;
 
+#[allow(clippy::implicit_hasher)]
+pub struct Ic3LivenessInput<'a> {
+    pub ir: &'a IRProgram,
+    pub vctx: &'a VerifyContext,
+    pub system_names: &'a [String],
+    pub monitor: LivenessMonitorInput<'a>,
+    pub slots_per_entity: &'a HashMap<String, usize>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct LivenessMonitorInput<'a> {
+    pub trigger: &'a IRExpr,
+    pub response: &'a IRExpr,
+    pub entity_var: Option<&'a str>,
+    pub entity_name_for_binding: Option<&'a str>,
+    pub fair_events: &'a [(String, String)],
+    pub is_oneshot: bool,
+    pub target_slot: Option<usize>,
+}
+
+pub(super) struct LivenessChcInput<'a> {
+    pub(super) entities: &'a [&'a IREntity],
+    pub(super) systems: &'a [&'a IRSystem],
+    pub(super) vctx: &'a VerifyContext,
+    pub(super) monitor: LivenessMonitorInput<'a>,
+    pub(super) slots_per_entity: &'a HashMap<String, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct LivenessEventCtx<'a> {
+    entities: &'a [&'a IREntity],
+    vctx: &'a VerifyContext,
+    slots_per_entity: &'a HashMap<String, usize>,
+    all_vars_str: &'a str,
+    monitor_no_freeze_str: &'a str,
+    monitor_freeze_str: &'a str,
+    freeze_guard: &'a str,
+    all_systems: &'a [&'a IRSystem],
+    rule_prefix: &'a str,
+}
+
+struct DualLivenessRule<'a> {
+    all_vars_str: &'a str,
+    guard_str: &'a str,
+    entity_next_str: &'a str,
+    monitor_no_freeze_str: &'a str,
+    monitor_freeze_str: &'a str,
+    freeze_guard: &'a str,
+    rule_name: &'a str,
+}
+
 /// Try IC3/PDR on a liveness property via the liveness-to-safety reduction.
 ///
 /// Adds monitor columns (pending, saved state, justice counters) to the CHC
@@ -16,25 +68,15 @@ use super::*;
 /// `trigger` and `response` are the P and Q from `always (P implies eventually Q)`.
 /// `fair_events` lists (system, event) pairs with weak fairness.
 /// `entity_var` / `entity_name` are set for entity-quantified patterns.
-#[allow(clippy::implicit_hasher)]
-#[allow(clippy::too_many_arguments)]
-pub fn try_ic3_liveness(
-    ir: &IRProgram,
-    vctx: &VerifyContext,
-    system_names: &[String],
-    trigger: &IRExpr,
-    response: &IRExpr,
-    entity_var: Option<&str>,
-    entity_name_for_binding: Option<&str>,
-    fair_events: &[(String, String)],
-    slots_per_entity: &HashMap<String, usize>,
-    // If true, the trigger fires once and never re-triggers (eventuality).
-    is_oneshot: bool,
-    // For quantified liveness: restrict trigger/response to this specific slot
-    // instead of OR-ing over all slots (which gives existential, not universal).
-    target_slot: Option<usize>,
-    timeout_ms: u64,
-) -> Ic3Result {
+pub fn try_ic3_liveness(input: Ic3LivenessInput<'_>) -> Ic3Result {
+    let Ic3LivenessInput {
+        ir,
+        vctx,
+        system_names,
+        monitor,
+        slots_per_entity,
+        timeout_ms,
+    } = input;
     // Expand scope to include CrossCall-reachable systems
     let mut all_system_names: Vec<String> = system_names.to_vec();
     let mut scanned: HashSet<String> = HashSet::new();
@@ -65,19 +107,13 @@ pub fn try_ic3_liveness(
         .filter(|s| all_system_names.contains(&s.name))
         .collect();
 
-    let chc = match build_liveness_chc(
-        &relevant_entities,
-        &relevant_systems,
+    let chc = match build_liveness_chc(LivenessChcInput {
+        entities: &relevant_entities,
+        systems: &relevant_systems,
         vctx,
-        trigger,
-        is_oneshot,
-        response,
-        entity_var,
-        entity_name_for_binding,
-        fair_events,
+        monitor,
         slots_per_entity,
-        target_slot,
-    ) {
+    }) {
         Ok(s) => s,
         Err(e) => return Ic3Result::Unknown(format!("liveness CHC encoding failed: {e}")),
     };
@@ -103,23 +139,23 @@ pub fn try_ic3_liveness(
 /// - `justice_{i}`: Bool — fair event fired since freeze (coarse: any event satisfies all)
 ///
 /// Error condition: `pending AND state == saved AND all justice` (loop detected).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_liveness_chc(
-    entities: &[&IREntity],
-    systems: &[&IRSystem],
-    vctx: &VerifyContext,
-    trigger: &IRExpr,
-    is_oneshot: bool,
-    response: &IRExpr,
-    entity_var: Option<&str>,
-    entity_name_for_binding: Option<&str>,
-    fair_events: &[(String, String)],
-    slots_per_entity: &HashMap<String, usize>,
-    // For quantified liveness: restrict trigger/response to this specific slot.
-    // None = OR over all slots (existential — only correct for non-quantified).
-    // Some(slot) = single slot (for per-slot iteration that achieves universal).
-    target_slot: Option<usize>,
-) -> Result<String, String> {
+pub(super) fn build_liveness_chc(input: LivenessChcInput<'_>) -> Result<String, String> {
+    let LivenessChcInput {
+        entities,
+        systems,
+        vctx,
+        monitor,
+        slots_per_entity,
+    } = input;
+    let LivenessMonitorInput {
+        trigger,
+        response,
+        entity_var,
+        entity_name_for_binding,
+        fair_events,
+        is_oneshot,
+        target_slot,
+    } = monitor;
     // ── 1. Build column layout ──────────────────────────────────────
     // Entity columns (same as build_system_chc)
     let mut entity_columns: Vec<SlotColumn> = Vec::new();
@@ -519,15 +555,17 @@ pub(super) fn build_liveness_chc(
                 &mut chc,
                 &event.body,
                 &event.guard,
-                entities,
-                vctx,
-                slots_per_entity,
-                &all_vars_str,
-                &monitor_no_freeze_str,
-                &monitor_freeze_str,
-                freeze_guard,
-                systems,
-                &format!("{}_{}", system.name, event.name),
+                LivenessEventCtx {
+                    entities,
+                    vctx,
+                    slots_per_entity,
+                    all_vars_str: &all_vars_str,
+                    monitor_no_freeze_str: &monitor_no_freeze_str,
+                    monitor_freeze_str: &monitor_freeze_str,
+                    freeze_guard,
+                    all_systems: systems,
+                    rule_prefix: &format!("{}_{}", system.name, event.name),
+                },
                 &[],
                 &mut visited,
             )?;
@@ -593,35 +631,34 @@ pub(super) fn build_liveness_chc(
 
 /// Encode system event body into liveness CHC rules with nondeterministic freeze.
 /// Each transition produces two rules: no-freeze and freeze.
-#[allow(clippy::too_many_arguments)]
 fn encode_liveness_event_chc(
     chc: &mut String,
     body: &[IRAction],
     guard: &IRExpr,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    monitor_no_freeze_str: &str,
-    monitor_freeze_str: &str,
-    freeze_guard: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
+    ctx: LivenessEventCtx<'_>,
     extra_guards: &[String],
     visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
+    let entities = ctx.entities;
+    let vctx = ctx.vctx;
+    let slots_per_entity = ctx.slots_per_entity;
+    let all_vars_str = ctx.all_vars_str;
+    let monitor_no_freeze_str = ctx.monitor_no_freeze_str;
+    let monitor_freeze_str = ctx.monitor_freeze_str;
+    let freeze_guard = ctx.freeze_guard;
+    let all_systems = ctx.all_systems;
+    let rule_prefix = ctx.rule_prefix;
     // Helper: emit a CHC rule in both freeze and no-freeze variants.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_dual_rules(
-        chc: &mut String,
-        all_vars_str: &str,
-        guard_str: &str,
-        entity_next_str: &str,
-        monitor_no_freeze_str: &str,
-        monitor_freeze_str: &str,
-        freeze_guard: &str,
-        rule_name: &str,
-    ) {
+    fn emit_dual_rules(chc: &mut String, rule: DualLivenessRule<'_>) {
+        let DualLivenessRule {
+            all_vars_str,
+            guard_str,
+            entity_next_str,
+            monitor_no_freeze_str,
+            monitor_freeze_str,
+            freeze_guard,
+            rule_name,
+        } = rule;
         // No-freeze rule
         chc.push_str(&format!(
             "(rule (=> (and (State {all_vars_str}) {guard_str}) \
@@ -700,13 +737,15 @@ fn encode_liveness_event_chc(
                             };
                             emit_dual_rules(
                                 chc,
-                                all_vars_str,
-                                &guard_str,
-                                &entity_next_str,
-                                monitor_no_freeze_str,
-                                monitor_freeze_str,
-                                freeze_guard,
-                                &format!("{rule_prefix}_choose_{oi}_s{slot}"),
+                                DualLivenessRule {
+                                    all_vars_str,
+                                    guard_str: &guard_str,
+                                    entity_next_str: &entity_next_str,
+                                    monitor_no_freeze_str,
+                                    monitor_freeze_str,
+                                    freeze_guard,
+                                    rule_name: &format!("{rule_prefix}_choose_{oi}_s{slot}"),
+                                },
                             );
                         }
                     }
@@ -752,13 +791,15 @@ fn encode_liveness_event_chc(
                                 let guard_str = format!("(and {})", all_guards.join(" "));
                                 emit_dual_rules(
                                     chc,
-                                    all_vars_str,
-                                    &guard_str,
-                                    &entity_next_str,
-                                    monitor_no_freeze_str,
-                                    monitor_freeze_str,
-                                    freeze_guard,
-                                    &format!("{rule_prefix}_forall_{oi}_s{slot}"),
+                                    DualLivenessRule {
+                                        all_vars_str,
+                                        guard_str: &guard_str,
+                                        entity_next_str: &entity_next_str,
+                                        monitor_no_freeze_str,
+                                        monitor_freeze_str,
+                                        freeze_guard,
+                                        rule_name: &format!("{rule_prefix}_forall_{oi}_s{slot}"),
+                                    },
                                 );
                             }
                         }
@@ -809,13 +850,15 @@ fn encode_liveness_event_chc(
                     let guard_str = format!("(and {})", all_guards.join(" "));
                     emit_dual_rules(
                         chc,
-                        all_vars_str,
-                        &guard_str,
-                        &create_next_str,
-                        monitor_no_freeze_str,
-                        monitor_freeze_str,
-                        freeze_guard,
-                        &format!("{rule_prefix}_create_{slot}"),
+                        DualLivenessRule {
+                            all_vars_str,
+                            guard_str: &guard_str,
+                            entity_next_str: &create_next_str,
+                            monitor_no_freeze_str,
+                            monitor_freeze_str,
+                            freeze_guard,
+                            rule_name: &format!("{rule_prefix}_create_{slot}"),
+                        },
                     );
                 }
             }
@@ -837,19 +880,23 @@ fn encode_liveness_event_chc(
                     })?;
                 let key = (target_sys.clone(), target_evt.clone());
                 if visited.insert(key.clone()) {
+                    let crosscall_rule_prefix =
+                        format!("{rule_prefix}_cc_{target_sys}_{target_evt}");
                     encode_liveness_event_chc(
                         chc,
                         &evt.body,
                         &evt.guard,
-                        entities,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        monitor_no_freeze_str,
-                        monitor_freeze_str,
-                        freeze_guard,
-                        all_systems,
-                        &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
+                        LivenessEventCtx {
+                            entities,
+                            vctx,
+                            slots_per_entity,
+                            all_vars_str,
+                            monitor_no_freeze_str,
+                            monitor_freeze_str,
+                            freeze_guard,
+                            all_systems,
+                            rule_prefix: &crosscall_rule_prefix,
+                        },
                         extra_guards,
                         visited,
                     )?;

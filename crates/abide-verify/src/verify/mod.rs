@@ -10,8 +10,6 @@
 //! - `defenv`: Definition environment for pred/prop/fn expansion
 //! - `mod`: Tiered dispatch (`verify_all`), property encoding, counterexample extraction
 
-#![allow(clippy::too_many_arguments)]
-
 pub mod chc;
 pub mod context;
 pub mod defenv;
@@ -101,15 +99,20 @@ pub enum FairnessStatus {
     NeverEnabled,
 }
 
-/// Weak or strong fairness.
+/// Weak or strong fairness annotation on a fair event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FairnessKind {
+    /// `assume { fair Sys::cmd }`.
     Weak,
+    /// `assume { strong fair Sys::cmd }`.
     Strong,
 }
 
 /// Fairness analysis for a single event in a lasso counterexample.
+///
+/// Attached to liveness counterexamples so users can see *why* a
+/// fairness assumption did or did not save the verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FairnessEventAnalysis {
     pub system: String,
@@ -119,6 +122,9 @@ pub struct FairnessEventAnalysis {
 }
 
 /// Per-event diagnostic for a deadlocked state.
+///
+/// One entry per command on the system at the deadlocked state,
+/// recording why that command was not enabled (`reason`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlockEventDiag {
     pub system: String,
@@ -127,6 +133,12 @@ pub struct DeadlockEventDiag {
 }
 
 /// An assumption that a verification verdict depends on.
+///
+/// Emitted as part of every verification result so users (and Invaria)
+/// can audit exactly what trust the verdict relies on. This is a
+/// disclosure list, not a minimization: every assumption in scope is
+/// listed, including ones the solver did not strictly need. The
+/// distinction matters for review.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TrustedAssumption {
@@ -410,6 +422,15 @@ fn countermodel_evidence(countermodel: Countermodel) -> Result<EvidenceEnvelope,
         .map_err(|err| format!("countermodel evidence validation failed: {err}"))
 }
 
+/// Result of re-executing a counterexample trace independently to
+/// confirm the verifier's verdict.
+///
+/// The replay protocol is part of DDR-042 Phase 3: every reported
+/// counterexample is replayed through the operational simulator (or an
+/// equivalent independent engine) and the property is rechecked. A
+/// `checked: true, property_violated: true` report is the strongest
+/// signal — the violation is observable, not just inferred from a
+/// solver model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterexampleReplayReport {
     pub checked: bool,
@@ -442,7 +463,12 @@ impl CounterexampleReplayReport {
     }
 }
 
-/// Result of checking a single verification target.
+/// Informational diagnostic attached to a [`VerificationResult`]
+/// reporting a backend's outcome at one pipeline phase.
+///
+/// Carries the verifier phase (`bounded_safety`, `unbounded_safety`,
+/// `proof_mode`, …), backend label (`Z3`, `IC3/PDR`, …), severity
+/// (`info`/`warn`/`error`), and a human-readable message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendDiagnostic {
     pub phase: String,
@@ -471,6 +497,16 @@ impl BackendDiagnostic {
     }
 }
 
+/// One verifier verdict.
+///
+/// This is the top-level result type emitted per verification target
+/// (verify/theorem/lemma/scene). Variant selection encodes both the
+/// outcome and which pipeline phase produced it.
+///
+/// Reading the result kind alone is insufficient — the assumptions
+/// list inside each variant declares the trust surface, and a
+/// `Counterexample` with `replay.property_violated` is stronger than
+/// one without (see [`CounterexampleReplayReport`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VerificationResult {
@@ -1049,29 +1085,63 @@ type DeadlockProbeOutcome = (
     Vec<DeadlockEventDiag>,
 );
 
+struct DeadlockProbeCtx<'a> {
+    ir: &'a IRProgram,
+    relevant_entities: &'a [crate::ir::types::IREntity],
+    relevant_systems: &'a [IRSystem],
+    vctx: &'a VerifyContext,
+    scope: &'a HashMap<String, usize>,
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
+    verify_block: &'a IRVerify,
+    bound: usize,
+    config: &'a VerifyConfig,
+    witness_semantics: WitnessSemantics,
+}
+
 // ── Configuration ───────────────────────────────────────────────────
 
+/// Which SMT backend ordinary (non-CHC) verification goes to. `Auto`
+/// picks Z3 by default and falls back per-routing rule; `Both` runs
+/// every check on both and warns on disagreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolverSelection {
+    /// Force Z3.
     Z3,
+    /// Force CVC5 (selected obligations only — most paths fall back to Z3).
     Cvc5,
+    /// Per-obligation routing (Z3 unless a rule routes elsewhere).
     Auto,
+    /// Run every obligation on both solvers.
     Both,
 }
 
+/// Which native witness family the verifier prefers when both
+/// extraction paths apply (e.g. relational and operational checks
+/// converge on the same target).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WitnessSemantics {
+    /// Default. Behavioral traces.
     Operational,
+    /// SAT relational snapshots/lassos.
     Relational,
 }
 
+/// Verification-target kind selector. Used by
+/// [`VerifyTargetSelector`] to narrow `--target` matching when a name
+/// is ambiguous across declaration kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VerifyTargetKind {
+    /// `verify` block.
     Verify,
+    /// `scene` block.
     Scene,
+    /// `theorem` declaration.
     Theorem,
+    /// `lemma` declaration.
     Lemma,
+    /// `prop` (temporal property) declaration.
     Prop,
+    /// `fn` contract verification.
     Fn,
 }
 
@@ -1101,6 +1171,9 @@ impl VerifyTargetKind {
     }
 }
 
+/// Optional `--target` filter. Parsed from the CLI as `[kind:]name`;
+/// when `kind` is `None` the name must resolve unambiguously across
+/// every declaration kind in scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VerifyTargetSelector {
     pub kind: Option<VerifyTargetKind>,
@@ -1108,6 +1181,9 @@ pub struct VerifyTargetSelector {
 }
 
 impl VerifyTargetSelector {
+    /// Returns `true` if the selector matches a target with the given
+    /// `kind` and `name`. A `kind`-less selector matches any kind with
+    /// the same name; ambiguity is resolved at dispatch time.
     #[must_use]
     pub fn matches(&self, kind: VerifyTargetKind, name: &str) -> bool {
         self.name == name && self.kind.is_none_or(|selected| selected == kind)
@@ -1156,6 +1232,13 @@ impl FromStr for VerifyTargetSelector {
 }
 
 /// Configuration for the verification pipeline.
+///
+/// The defaults (see [`Self::default`]) are tuned for the validation
+/// gate in `make check-lang`: Z3 backends, conservative 20-minute
+/// timeouts, IC3 disabled for ordinary verifies, all property and
+/// function verification on. Tooling (the CLI, the LSP, QA's
+/// `verify`) clone-and-tweak this default rather than constructing
+/// the struct directly.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct VerifyConfig {
@@ -1287,6 +1370,9 @@ pub(super) fn verification_timeout_hint(config: &VerifyConfig) -> String {
     )
 }
 
+/// One verifiable target found in an IR program: a (kind, name) pair.
+/// Returned by [`available_verify_targets`] for CLI listing and
+/// `--target` resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyTargetEntry {
     pub kind: VerifyTargetKind,
@@ -1299,6 +1385,8 @@ impl fmt::Display for VerifyTargetEntry {
     }
 }
 
+/// Enumerates every verifiable target in `ir` — every `verify`,
+/// `scene`, `theorem`, `lemma`, `prop`, and contracted `fn`.
 #[must_use]
 pub fn available_verify_targets(ir: &IRProgram) -> Vec<VerifyTargetEntry> {
     let mut targets = Vec::new();
@@ -1650,7 +1738,6 @@ fn check_prop_bmc_fallback(
 /// Processes verify blocks (tiered: induction → IC3 → BMC), scene blocks (SAT),
 /// and theorem blocks (IC3 → induction).
 /// Returns one result per target, each carrying source location for diagnostic rendering.
-#[allow(clippy::too_many_lines)]
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     if let Some(result) = selected_target_error(ir, config) {
         return vec![result];
@@ -1768,7 +1855,6 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn verify_all_single(
     ir: &IRProgram,
     config: &VerifyConfig,
@@ -1792,7 +1878,6 @@ fn verify_all_single(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn verify_all_single_impl(
     ir: &IRProgram,
     config: &VerifyConfig,
@@ -1806,390 +1891,488 @@ fn verify_all_single_impl(
     if let Err(hint) = chc::set_active_chc_family(chc_family) {
         return vec![unavailable_solver_result("chc_backend", hint)];
     }
-    let vctx = context::VerifyContext::from_ir(ir);
-    let mut defs = defenv::DefEnv::from_ir(ir);
-    let mut results = Vec::new();
-    let deadline = verification_deadline(config);
+    VerifyAllRun::new(ir, config, solver_family, scene_solver_family).run()
+}
 
-    // Collect axiom names — axioms are trusted facts that apply globally,
-    // so every verification result that depends on the DefEnv (which now
-    // includes axiom bodies) should disclose them.
-    let axiom_assumptions = build_axiom_assumptions(&ir.axioms);
+struct VerifyAllRun<'a> {
+    ir: &'a IRProgram,
+    config: &'a VerifyConfig,
+    solver_family: SolverFamily,
+    scene_solver_family: SolverFamily,
+    vctx: VerifyContext,
+    defs: defenv::DefEnv,
+    deadline: Option<Instant>,
+    results: Vec<VerificationResult>,
+    axiom_assumptions: Vec<TrustedAssumption>,
+}
 
-    // ── Verify lemmas ─────────────────────────────────────────────
-    // Lemmas are system-independent properties. Each body expression
-    // must be a tautology. Processed first so proved lemmas are
-    // available to verify blocks, scenes, and theorems via DefEnv.
-    for lemma_block in &ir.lemmas {
-        let selected = should_run_target(config, VerifyTargetKind::Lemma, &lemma_block.name);
-        if !selected && !should_prepare_lemma_dependency(config) {
-            continue;
-        }
-        let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-            if selected {
-                results.push(
-                    VerificationResult::Unprovable {
-                        name: lemma_block.name.clone(),
-                        hint: verification_timeout_hint(config),
-                        span: lemma_block.span,
-                        file: lemma_block.file.clone(),
-                    }
-                    .with_source(lemma_block.span, lemma_block.file.clone()),
-                );
-            }
-            continue;
-        };
-        if let Err(hint) = set_active_solver_family(solver_family) {
-            if selected {
-                results.push(
-                    unavailable_solver_result(&lemma_block.name, hint)
-                        .with_source(lemma_block.span, lemma_block.file.clone()),
-                );
-            }
-            continue;
-        }
-        if config.progress && selected {
-            eprint!("Proving lemma {}...", lemma_block.name);
-        }
-        let result = catch_verification_panic(
-            &lemma_block.name,
-            lemma_block.span,
-            lemma_block.file.clone(),
-            "proving lemma",
-            || {
-                check_lemma_block(&vctx, &defs, lemma_block, &effective_config)
-                    .with_source(lemma_block.span, lemma_block.file.clone())
-            },
-        );
-        if config.progress && selected {
-            eprintln!(" done");
-        }
-        // If the lemma proved, add its body to DefEnv under its declared
-        // name so later verify/scene/theorem blocks can reference it.
-        if matches!(&result, VerificationResult::Proved { .. }) {
-            defs.add_lemma_fact(&lemma_block.name, &lemma_block.body);
-        }
-        if selected {
-            results.push(result);
+impl<'a> VerifyAllRun<'a> {
+    fn new(
+        ir: &'a IRProgram,
+        config: &'a VerifyConfig,
+        solver_family: SolverFamily,
+        scene_solver_family: SolverFamily,
+    ) -> Self {
+        Self {
+            ir,
+            config,
+            solver_family,
+            scene_solver_family,
+            vctx: context::VerifyContext::from_ir(ir),
+            defs: defenv::DefEnv::from_ir(ir),
+            deadline: verification_deadline(config),
+            results: Vec::new(),
+            axiom_assumptions: build_axiom_assumptions(&ir.axioms),
         }
     }
 
-    for verify_block in &ir.verifies {
-        if !should_run_target(config, VerifyTargetKind::Verify, &verify_block.name) {
-            continue;
-        }
-        let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-            results.push(VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: verification_timeout_hint(config),
-                span: verify_block.span,
-                file: verify_block.file.clone(),
-            });
-            continue;
-        };
-        if let Err(hint) = set_active_solver_family(solver_family) {
-            results.push(
-                unavailable_solver_result(&verify_block.name, hint)
-                    .with_source(verify_block.span, verify_block.file.clone()),
-            );
-            continue;
-        }
-        if config.progress {
-            eprint!("Checking {}...", verify_block.name);
-        }
-        clear_prop_precondition_obligations();
-        clear_path_guard_stack();
-        let result = catch_verification_panic(
-            &verify_block.name,
-            verify_block.span,
-            verify_block.file.clone(),
-            "checking verify block",
-            || {
-                check_verify_block_tiered(
-                    ir,
-                    &vctx,
-                    &defs,
-                    verify_block,
-                    &effective_config,
-                    deadline,
-                )
-                .with_source(verify_block.span, verify_block.file.clone())
-            },
-        );
-        if config.progress {
-            eprintln!(" done");
-        }
-        if let Some(violation) = check_prop_precondition_obligations() {
-            results.push(VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: violation,
-                span: verify_block.span,
-                file: verify_block.file.clone(),
-            });
+    fn run(mut self) -> Vec<VerificationResult> {
+        self.verify_lemmas();
+        self.verify_blocks();
+        self.verify_scenes();
+        self.verify_theorems();
+        self.verify_function_contracts();
+        self.verify_props();
+        self.finish()
+    }
+
+    fn finish(self) -> Vec<VerificationResult> {
+        if self.axiom_assumptions.is_empty() {
+            self.results
         } else {
-            results.push(result);
+            self.results
+                .into_iter()
+                .map(|result| result.with_axioms(&self.axiom_assumptions))
+                .collect()
         }
     }
 
-    for scene_block in &ir.scenes {
-        if !should_run_target(config, VerifyTargetKind::Scene, &scene_block.name) {
-            continue;
-        }
-        let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-            results.push(VerificationResult::Unprovable {
-                name: scene_block.name.clone(),
-                hint: verification_timeout_hint(config),
-                span: scene_block.span,
-                file: scene_block.file.clone(),
+    fn effective_config_for_target(
+        &mut self,
+        name: &str,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    ) -> Option<VerifyConfig> {
+        let Some(effective_config) = clamp_config_to_deadline(self.config, self.deadline) else {
+            self.results.push(VerificationResult::Unprovable {
+                name: name.to_owned(),
+                hint: verification_timeout_hint(self.config),
+                span,
+                file,
             });
-            continue;
+            return None;
         };
-        if config.progress {
-            eprint!("Checking scene {}...", scene_block.name);
-        }
-        let result = catch_verification_panic(
-            &scene_block.name,
-            scene_block.span,
-            scene_block.file.clone(),
-            "checking scene block",
-            || {
-                if let Some(result) = relational::try_check_scene_block_relational(ir, scene_block)
-                {
-                    result.with_source(scene_block.span, scene_block.file.clone())
-                } else {
-                    if let Err(hint) = set_active_solver_family(scene_solver_family) {
-                        return unavailable_solver_result(&scene_block.name, hint)
-                            .with_source(scene_block.span, scene_block.file.clone());
-                    }
-                    check_scene_block(ir, &vctx, &defs, scene_block, &effective_config, deadline)
-                        .with_source(scene_block.span, scene_block.file.clone())
+        Some(effective_config)
+    }
+
+    fn verify_lemmas(&mut self) {
+        for lemma_block in &self.ir.lemmas {
+            let selected =
+                should_run_target(self.config, VerifyTargetKind::Lemma, &lemma_block.name);
+            if !selected && !should_prepare_lemma_dependency(self.config) {
+                continue;
+            }
+            let Some(effective_config) = self.effective_config_for_selected(
+                selected,
+                &lemma_block.name,
+                lemma_block.span,
+                lemma_block.file.clone(),
+            ) else {
+                continue;
+            };
+            if let Err(hint) = set_active_solver_family(self.solver_family) {
+                if selected {
+                    self.results.push(
+                        unavailable_solver_result(&lemma_block.name, hint)
+                            .with_source(lemma_block.span, lemma_block.file.clone()),
+                    );
                 }
-            },
-        );
-        if config.progress {
-            eprintln!(" done");
-        }
-        results.push(result);
-    }
-
-    for theorem_block in &ir.theorems {
-        if !should_run_target(config, VerifyTargetKind::Theorem, &theorem_block.name) {
-            continue;
-        }
-        let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-            results.push(VerificationResult::Unprovable {
-                name: theorem_block.name.clone(),
-                hint: verification_timeout_hint(config),
-                span: theorem_block.span,
-                file: theorem_block.file.clone(),
-            });
-            continue;
-        };
-        if let Err(hint) = set_active_solver_family(solver_family) {
-            results.push(
-                unavailable_solver_result(&theorem_block.name, hint)
-                    .with_source(theorem_block.span, theorem_block.file.clone()),
-            );
-            continue;
-        }
-        if config.progress {
-            eprint!("Proving {}...", theorem_block.name);
-        }
-        clear_prop_precondition_obligations();
-        clear_path_guard_stack();
-        let result = catch_verification_panic(
-            &theorem_block.name,
-            theorem_block.span,
-            theorem_block.file.clone(),
-            "proving theorem",
-            || {
-                check_theorem_block(ir, &vctx, &defs, theorem_block, &effective_config, deadline)
-                    .with_source(theorem_block.span, theorem_block.file.clone())
-            },
-        );
-        if config.progress {
-            eprintln!(" done");
-        }
-        if let Some(violation) = check_prop_precondition_obligations() {
-            results.push(VerificationResult::Unprovable {
-                name: theorem_block.name.clone(),
-                hint: violation,
-                span: theorem_block.span,
-                file: theorem_block.file.clone(),
-            });
-        } else {
-            results.push(result);
-        }
-    }
-
-    // ── Verify function contracts ───────────────────────────────────
-    // For each fn with ensures, prove that the body satisfies the
-    // postcondition given the precondition.
-    if !config.no_fn_verify
-        && config.target.as_ref().is_none_or(|selector| {
-            selector
-                .kind
-                .is_none_or(|kind| kind == VerifyTargetKind::Fn)
-        })
-    {
-        if let Err(hint) = set_active_solver_family(solver_family) {
-            results.push(unavailable_solver_result("fn_verification", hint));
-        } else {
-            verify_fn_contracts(ir, &vctx, &defs, config, deadline, &mut results);
-        }
-    }
-
-    // ── Auto-verify props ───────────────────────────────────────────
-    // Props with a target system are implicit theorems: declaring a prop
-    // means asserting it must hold (Dafny model).
-    if !config.no_prop_verify
-        && config.target.as_ref().is_none_or(|selector| {
-            selector
-                .kind
-                .is_none_or(|kind| kind == VerifyTargetKind::Prop)
-        })
-    {
-        // Collect prop names already covered by explicit theorems/verify blocks.
-        // Collect from both unexpanded (direct name refs like `Var("prop_name")`)
-        // AND expanded forms (transitive refs: if p2's body references p1,
-        // a theorem proving p2 also covers p1).
-        let mut covered: HashSet<String> = HashSet::new();
-        for thm in &ir.theorems {
-            // Direct references
-            collect_def_refs_in_exprs(&thm.shows, &mut covered);
-            collect_def_refs_in_exprs(&thm.invariants, &mut covered);
-            // Transitive references (after def expansion)
-            let expanded: Vec<IRExpr> = thm
-                .shows
-                .iter()
-                .chain(thm.invariants.iter())
-                .map(|e| expand_through_defs(e, &defs))
-                .collect();
-            collect_def_refs_in_exprs(&expanded, &mut covered);
-        }
-        for vb in &ir.verifies {
-            collect_def_refs_in_exprs(&vb.asserts, &mut covered);
-            let expanded: Vec<IRExpr> = vb
-                .asserts
-                .iter()
-                .map(|e| expand_through_defs(e, &defs))
-                .collect();
-            collect_def_refs_in_exprs(&expanded, &mut covered);
-        }
-
-        for func in &ir.functions {
-            if !should_run_target(config, VerifyTargetKind::Prop, &func.name) {
                 continue;
             }
-            let Some(effective_config) = clamp_config_to_deadline(config, deadline) else {
-                results.push(
-                    VerificationResult::Unprovable {
-                        name: format!("prop_{}", func.name),
-                        hint: verification_timeout_hint(config),
-                        span: func.span,
-                        file: func.file.clone(),
-                    }
-                    .with_source(func.span, func.file.clone()),
-                );
-                continue;
-            };
-            // Props: have prop_target AND return Bool
-            let Some(ref target_system) = func.prop_target else {
-                continue;
-            };
-            if let Err(hint) = set_active_solver_family(solver_family) {
-                results.push(
-                    unavailable_solver_result(&format!("prop_{}", func.name), hint)
-                        .with_source(func.span, func.file.clone()),
-                );
-                continue;
-            }
-            if func.ty != IRType::Bool {
-                results.push(
-                    VerificationResult::Unprovable {
-                        name: format!("prop_{}", func.name),
-                        hint: format!(
-                            "internal error: prop `{}` has non-Bool return type {:?}",
-                            func.name, func.ty
-                        ),
-                        span: None,
-                        file: None,
-                    }
-                    .with_source(func.span, func.file.clone()),
-                );
-                continue;
-            }
-            if config.target.is_none() && covered.contains(&func.name) {
-                continue; // already checked via an explicit theorem/verify
-            }
-
-            if config.progress {
-                eprint!("Verifying prop {}...", func.name);
-            }
+            self.progress_start(selected, &format!("Proving lemma {}", lemma_block.name));
             let result = catch_verification_panic(
-                &format!("prop_{}", func.name),
-                func.span,
-                func.file.clone(),
-                "verifying prop",
+                &lemma_block.name,
+                lemma_block.span,
+                lemma_block.file.clone(),
+                "proving lemma",
                 || {
-                    if effective_config.bounded_only {
-                        return check_prop_bmc_fallback(
-                            ir,
-                            &vctx,
-                            &defs,
-                            func,
-                            target_system,
-                            &effective_config,
-                            deadline,
-                        );
-                    }
-
-                    let synthetic_theorem = synthetic_prop_theorem(func, target_system);
-                    let theorem_result = check_theorem_block(
-                        ir,
-                        &vctx,
-                        &defs,
-                        &synthetic_theorem,
-                        &effective_config,
-                        deadline,
-                    )
-                    .with_source(func.span, func.file.clone());
-
-                    if effective_config.unbounded_only {
-                        return theorem_result;
-                    }
-
-                    match theorem_result {
-                        VerificationResult::Unprovable { .. } => check_prop_bmc_fallback(
-                            ir,
-                            &vctx,
-                            &defs,
-                            func,
-                            target_system,
-                            &effective_config,
-                            deadline,
-                        ),
-                        result => result,
-                    }
+                    check_lemma_block(&self.vctx, &self.defs, lemma_block, &effective_config)
+                        .with_source(lemma_block.span, lemma_block.file.clone())
                 },
             );
-            if config.progress {
-                eprintln!(" done");
+            self.progress_done(selected);
+            if matches!(&result, VerificationResult::Proved { .. }) {
+                self.defs
+                    .add_lemma_fact(&lemma_block.name, &lemma_block.body);
             }
-            results.push(result);
+            if selected {
+                self.results.push(result);
+            }
         }
     }
 
-    // Amend all results with axiom assumptions — axioms are global trusted
-    // facts that every verification result implicitly depends on.
-    if !axiom_assumptions.is_empty() {
-        results = results
-            .into_iter()
-            .map(|r| r.with_axioms(&axiom_assumptions))
-            .collect();
+    fn effective_config_for_selected(
+        &mut self,
+        selected: bool,
+        name: &str,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+    ) -> Option<VerifyConfig> {
+        let Some(effective_config) = clamp_config_to_deadline(self.config, self.deadline) else {
+            if selected {
+                self.results.push(VerificationResult::Unprovable {
+                    name: name.to_owned(),
+                    hint: verification_timeout_hint(self.config),
+                    span,
+                    file,
+                });
+            }
+            return None;
+        };
+        Some(effective_config)
     }
 
-    results
+    fn verify_blocks(&mut self) {
+        for verify_block in &self.ir.verifies {
+            if !should_run_target(self.config, VerifyTargetKind::Verify, &verify_block.name) {
+                continue;
+            }
+            let Some(effective_config) = self.effective_config_for_target(
+                &verify_block.name,
+                verify_block.span,
+                verify_block.file.clone(),
+            ) else {
+                continue;
+            };
+            if let Err(hint) = set_active_solver_family(self.solver_family) {
+                self.results.push(
+                    unavailable_solver_result(&verify_block.name, hint)
+                        .with_source(verify_block.span, verify_block.file.clone()),
+                );
+                continue;
+            }
+            self.progress_start(true, &format!("Checking {}", verify_block.name));
+            clear_prop_precondition_obligations();
+            clear_path_guard_stack();
+            let result = catch_verification_panic(
+                &verify_block.name,
+                verify_block.span,
+                verify_block.file.clone(),
+                "checking verify block",
+                || {
+                    check_verify_block_tiered(
+                        self.ir,
+                        &self.vctx,
+                        &self.defs,
+                        verify_block,
+                        &effective_config,
+                        self.deadline,
+                    )
+                    .with_source(verify_block.span, verify_block.file.clone())
+                },
+            );
+            self.progress_done(true);
+            self.push_result_or_precondition_violation(
+                &verify_block.name,
+                verify_block.span,
+                verify_block.file.clone(),
+                result,
+            );
+        }
+    }
+
+    fn verify_scenes(&mut self) {
+        for scene_block in &self.ir.scenes {
+            if !should_run_target(self.config, VerifyTargetKind::Scene, &scene_block.name) {
+                continue;
+            }
+            let Some(effective_config) = self.effective_config_for_target(
+                &scene_block.name,
+                scene_block.span,
+                scene_block.file.clone(),
+            ) else {
+                continue;
+            };
+            self.progress_start(true, &format!("Checking scene {}", scene_block.name));
+            let result = catch_verification_panic(
+                &scene_block.name,
+                scene_block.span,
+                scene_block.file.clone(),
+                "checking scene block",
+                || self.check_scene(scene_block, &effective_config),
+            );
+            self.progress_done(true);
+            self.results.push(result);
+        }
+    }
+
+    fn check_scene(
+        &self,
+        scene_block: &crate::ir::types::IRScene,
+        config: &VerifyConfig,
+    ) -> VerificationResult {
+        if let Some(result) = relational::try_check_scene_block_relational(self.ir, scene_block) {
+            return result.with_source(scene_block.span, scene_block.file.clone());
+        }
+        if let Err(hint) = set_active_solver_family(self.scene_solver_family) {
+            return unavailable_solver_result(&scene_block.name, hint)
+                .with_source(scene_block.span, scene_block.file.clone());
+        }
+        check_scene_block(
+            self.ir,
+            &self.vctx,
+            &self.defs,
+            scene_block,
+            config,
+            self.deadline,
+        )
+        .with_source(scene_block.span, scene_block.file.clone())
+    }
+
+    fn verify_theorems(&mut self) {
+        for theorem_block in &self.ir.theorems {
+            if !should_run_target(self.config, VerifyTargetKind::Theorem, &theorem_block.name) {
+                continue;
+            }
+            let Some(effective_config) = self.effective_config_for_target(
+                &theorem_block.name,
+                theorem_block.span,
+                theorem_block.file.clone(),
+            ) else {
+                continue;
+            };
+            if let Err(hint) = set_active_solver_family(self.solver_family) {
+                self.results.push(
+                    unavailable_solver_result(&theorem_block.name, hint)
+                        .with_source(theorem_block.span, theorem_block.file.clone()),
+                );
+                continue;
+            }
+            self.progress_start(true, &format!("Proving {}", theorem_block.name));
+            clear_prop_precondition_obligations();
+            clear_path_guard_stack();
+            let result = catch_verification_panic(
+                &theorem_block.name,
+                theorem_block.span,
+                theorem_block.file.clone(),
+                "proving theorem",
+                || {
+                    check_theorem_block(
+                        self.ir,
+                        &self.vctx,
+                        &self.defs,
+                        theorem_block,
+                        &effective_config,
+                        self.deadline,
+                    )
+                    .with_source(theorem_block.span, theorem_block.file.clone())
+                },
+            );
+            self.progress_done(true);
+            self.push_result_or_precondition_violation(
+                &theorem_block.name,
+                theorem_block.span,
+                theorem_block.file.clone(),
+                result,
+            );
+        }
+    }
+
+    fn verify_function_contracts(&mut self) {
+        if self.config.no_fn_verify || !target_kind_matches(self.config, VerifyTargetKind::Fn) {
+            return;
+        }
+        if let Err(hint) = set_active_solver_family(self.solver_family) {
+            self.results
+                .push(unavailable_solver_result("fn_verification", hint));
+        } else {
+            verify_fn_contracts(
+                self.ir,
+                &self.vctx,
+                &self.defs,
+                self.config,
+                self.deadline,
+                &mut self.results,
+            );
+        }
+    }
+
+    fn verify_props(&mut self) {
+        if self.config.no_prop_verify || !target_kind_matches(self.config, VerifyTargetKind::Prop) {
+            return;
+        }
+        let covered = self.covered_prop_names();
+        for func in &self.ir.functions {
+            self.verify_prop_function(func, &covered);
+        }
+    }
+
+    fn covered_prop_names(&self) -> HashSet<String> {
+        let mut covered = HashSet::new();
+        for theorem in &self.ir.theorems {
+            collect_def_refs_in_exprs(&theorem.shows, &mut covered);
+            collect_def_refs_in_exprs(&theorem.invariants, &mut covered);
+            let expanded: Vec<IRExpr> = theorem
+                .shows
+                .iter()
+                .chain(theorem.invariants.iter())
+                .map(|expr| expand_through_defs(expr, &self.defs))
+                .collect();
+            collect_def_refs_in_exprs(&expanded, &mut covered);
+        }
+        for verify in &self.ir.verifies {
+            collect_def_refs_in_exprs(&verify.asserts, &mut covered);
+            let expanded: Vec<IRExpr> = verify
+                .asserts
+                .iter()
+                .map(|expr| expand_through_defs(expr, &self.defs))
+                .collect();
+            collect_def_refs_in_exprs(&expanded, &mut covered);
+        }
+        covered
+    }
+
+    fn verify_prop_function(&mut self, func: &IRFunction, covered: &HashSet<String>) {
+        if !should_run_target(self.config, VerifyTargetKind::Prop, &func.name) {
+            return;
+        }
+        let Some(target_system) = func.prop_target.as_ref() else {
+            return;
+        };
+        if self.config.target.is_none() && covered.contains(&func.name) {
+            return;
+        }
+        let result_name = format!("prop_{}", func.name);
+        let Some(effective_config) =
+            self.effective_config_for_target(&result_name, func.span, func.file.clone())
+        else {
+            return;
+        };
+        if let Some(result) = self.prop_preflight_result(func, &result_name) {
+            self.results.push(result);
+            return;
+        }
+        self.progress_start(true, &format!("Verifying prop {}", func.name));
+        let result = catch_verification_panic(
+            &result_name,
+            func.span,
+            func.file.clone(),
+            "verifying prop",
+            || self.check_prop_function(func, target_system, &effective_config),
+        );
+        self.progress_done(true);
+        self.results.push(result);
+    }
+
+    fn prop_preflight_result(
+        &self,
+        func: &IRFunction,
+        result_name: &str,
+    ) -> Option<VerificationResult> {
+        if let Err(hint) = set_active_solver_family(self.solver_family) {
+            return Some(
+                unavailable_solver_result(result_name, hint)
+                    .with_source(func.span, func.file.clone()),
+            );
+        }
+        if func.ty != IRType::Bool {
+            return Some(
+                VerificationResult::Unprovable {
+                    name: result_name.to_owned(),
+                    hint: format!(
+                        "internal error: prop `{}` has non-Bool return type {:?}",
+                        func.name, func.ty
+                    ),
+                    span: None,
+                    file: None,
+                }
+                .with_source(func.span, func.file.clone()),
+            );
+        }
+        None
+    }
+
+    fn check_prop_function(
+        &self,
+        func: &IRFunction,
+        target_system: &str,
+        config: &VerifyConfig,
+    ) -> VerificationResult {
+        if config.bounded_only {
+            return check_prop_bmc_fallback(
+                self.ir,
+                &self.vctx,
+                &self.defs,
+                func,
+                target_system,
+                config,
+                self.deadline,
+            );
+        }
+        let synthetic_theorem = synthetic_prop_theorem(func, target_system);
+        let theorem_result = check_theorem_block(
+            self.ir,
+            &self.vctx,
+            &self.defs,
+            &synthetic_theorem,
+            config,
+            self.deadline,
+        )
+        .with_source(func.span, func.file.clone());
+        if config.unbounded_only {
+            theorem_result
+        } else if matches!(theorem_result, VerificationResult::Unprovable { .. }) {
+            check_prop_bmc_fallback(
+                self.ir,
+                &self.vctx,
+                &self.defs,
+                func,
+                target_system,
+                config,
+                self.deadline,
+            )
+        } else {
+            theorem_result
+        }
+    }
+
+    fn push_result_or_precondition_violation(
+        &mut self,
+        name: &str,
+        span: Option<crate::span::Span>,
+        file: Option<String>,
+        result: VerificationResult,
+    ) {
+        if let Some(violation) = check_prop_precondition_obligations() {
+            self.results.push(VerificationResult::Unprovable {
+                name: name.to_owned(),
+                hint: violation,
+                span,
+                file,
+            });
+        } else {
+            self.results.push(result);
+        }
+    }
+
+    fn progress_start(&self, selected: bool, message: &str) {
+        if self.config.progress && selected {
+            eprint!("{message}...");
+        }
+    }
+
+    fn progress_done(&self, selected: bool) {
+        if self.config.progress && selected {
+            eprintln!(" done");
+        }
+    }
+}
+
+fn target_kind_matches(config: &VerifyConfig, kind: VerifyTargetKind) -> bool {
+    config
+        .target
+        .as_ref()
+        .is_none_or(|selector| selector.kind.is_none_or(|selected| selected == kind))
 }
 
 /// Extract the source span from an `IRExpr` (top-level only).
@@ -2397,18 +2580,31 @@ fn check_for_deadlock(
 /// and per-event diagnostics at the deadlocked state.
 /// Returns `None` if no confirming UNSAT was found (all probes
 /// returned Unknown or the bound was exhausted without hitting UNSAT).
-fn find_deadlock_step(
-    ir: &IRProgram,
-    relevant_entities: &[crate::ir::types::IREntity],
-    relevant_systems: &[IRSystem],
-    vctx: &VerifyContext,
-    scope: &HashMap<String, usize>,
-    store_ranges: &HashMap<String, VerifyStoreRange>,
-    verify_block: &IRVerify,
-    bound: usize,
-    config: &VerifyConfig,
-    witness_semantics: WitnessSemantics,
-) -> Option<DeadlockProbeOutcome> {
+fn find_deadlock_step(ctx: DeadlockProbeCtx<'_>) -> Option<DeadlockProbeOutcome> {
+    let DeadlockProbeCtx {
+        ir,
+        relevant_entities,
+        relevant_systems,
+        vctx,
+        scope,
+        store_ranges,
+        verify_block,
+        bound,
+        config,
+        witness_semantics,
+    } = ctx;
+    let selected_parts_for_bound = |bound| transition::TransitionSelectedParts {
+        selected_system_names: relevant_systems
+            .iter()
+            .map(|sys| sys.name.clone())
+            .collect(),
+        relevant_entities: relevant_entities.to_vec(),
+        relevant_systems: relevant_systems.to_vec(),
+        slots_per_entity: scope.clone(),
+        bound,
+        store_ranges: store_ranges.clone(),
+    };
+
     // We know step 0 is fine (check_for_deadlock passed).
     // Probe K = 1, 2,... until UNSAT.
     let mut last_sat_solver: Option<AbideSolver> = None;
@@ -2419,15 +2615,7 @@ fn find_deadlock_step(
         let system = transition::TransitionSystemSpec::from_selected(
             ir,
             vctx,
-            relevant_systems
-                .iter()
-                .map(|sys| sys.name.clone())
-                .collect(),
-            relevant_entities.to_vec(),
-            relevant_systems.to_vec(),
-            scope.clone(),
-            k,
-            store_ranges.clone(),
+            selected_parts_for_bound(k),
             &verify_block.assumption_set,
         )?;
         let encoding = transition::TransitionSmtEncoding::from_plan(
@@ -2477,15 +2665,7 @@ fn find_deadlock_step(
             let sat_system = transition::TransitionSystemSpec::from_selected(
                 ir,
                 vctx,
-                relevant_systems
-                    .iter()
-                    .map(|sys| sys.name.clone())
-                    .collect(),
-                relevant_entities.to_vec(),
-                relevant_systems.to_vec(),
-                scope.clone(),
-                sat_steps,
-                store_ranges.clone(),
+                selected_parts_for_bound(sat_steps),
                 &verify_block.assumption_set,
             )?;
             let sat_encoding = transition::TransitionSmtEncoding::from_plan(
@@ -2529,15 +2709,7 @@ fn find_deadlock_step(
             let sat_system = transition::TransitionSystemSpec::from_selected(
                 ir,
                 vctx,
-                relevant_systems
-                    .iter()
-                    .map(|sys| sys.name.clone())
-                    .collect(),
-                relevant_entities.to_vec(),
-                relevant_systems.to_vec(),
-                scope.clone(),
-                sat_steps,
-                store_ranges.clone(),
+                selected_parts_for_bound(sat_steps),
                 &verify_block.assumption_set,
             )?;
             let sat_encoding = transition::TransitionSmtEncoding::from_plan(
@@ -3148,7 +3320,6 @@ fn try_cvc5_sygus_on_verify(
 ///
 /// Returns `Some(Proved)` if all asserts are inductive.
 /// Returns `None` if induction fails, times out, or can't be applied.
-#[allow(clippy::too_many_lines)]
 fn try_induction_on_verify(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -3173,165 +3344,170 @@ fn try_induction_on_verify(
         return None;
     }
 
-    // Pre-check: reject unsupported expressions in asserts AND transitions
+    if !induction_inputs_supported(safety) {
+        return None;
+    }
+
+    if !prove_induction_base(safety, vctx, defs, config)? {
+        return None;
+    }
+    if !prove_induction_step(safety, vctx, defs, config)? {
+        return None;
+    }
+
+    Some(induction_proved_result(
+        ir,
+        verify_block,
+        elapsed_ms(&start),
+    ))
+}
+
+fn induction_inputs_supported(safety: &transition::TransitionSafetySpec<'_>) -> bool {
+    let system = safety.system();
     for expr in safety.step_properties() {
         if find_unsupported_scene_expr(expr).is_some() {
-            return None;
+            return false;
         }
     }
     for entity in system.relevant_entities() {
         for trans in &entity.transitions {
             if find_unsupported_scene_expr(&trans.guard).is_some() {
-                return None;
+                return false;
             }
-            for upd in &trans.updates {
-                if find_unsupported_scene_expr(&upd.value).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    for sys in system.relevant_systems() {
-        for event in &sys.actions {
-            if find_unsupported_scene_expr(&event.guard).is_some() {
-                return None;
-            }
-            if find_unsupported_in_actions(&event.body).is_some() {
-                return None;
+            if trans
+                .updates
+                .iter()
+                .any(|update| find_unsupported_scene_expr(&update.value).is_some())
+            {
+                return false;
             }
         }
     }
+    system.relevant_systems().iter().all(|system| {
+        system.actions.iter().all(|event| {
+            find_unsupported_scene_expr(&event.guard).is_none()
+                && find_unsupported_in_actions(&event.body).is_none()
+        })
+    })
+}
 
-    // ── Base case: P holds at step 0 ───────────────────────────────
-    {
-        let pool = create_slot_pool_with_systems(
-            system.relevant_entities(),
-            system.slots_per_entity(),
-            0,
+fn prove_induction_base(
+    safety: &transition::TransitionSafetySpec<'_>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+) -> Option<bool> {
+    let system = safety.system();
+    let pool = create_slot_pool_with_systems(
+        system.relevant_entities(),
+        system.slots_per_entity(),
+        0,
+        system.relevant_systems(),
+    );
+    let solver = induction_solver(config);
+    for c in initial_state_constraints(&pool, system.store_ranges()) {
+        solver.assert(&c);
+    }
+    for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
+        solver.assert(&c);
+    }
+    for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
+        solver.assert(&c);
+    }
+    assert_negated_induction_properties(&solver, &pool, safety, vctx, defs, 0)?;
+    Some(matches!(solver.check(), SatResult::Unsat))
+}
+
+fn prove_induction_step(
+    safety: &transition::TransitionSafetySpec<'_>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+) -> Option<bool> {
+    let system = safety.system();
+    let encoding = transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
+    )
+    .ok()?;
+    let pool = encoding.pool();
+    let solver = induction_solver(config);
+    for c in encoding.domain_constraints() {
+        solver.assert(c);
+    }
+    assert_induction_properties(&solver, pool, safety, vctx, defs, 0)?;
+    for c in &encoding.fire_tracking().constraints {
+        solver.assert(c);
+    }
+    assert_negated_induction_properties(&solver, pool, safety, vctx, defs, 1)?;
+    Some(matches!(solver.check(), SatResult::Unsat))
+}
+
+fn induction_solver(config: &VerifyConfig) -> AbideSolver {
+    let solver = AbideSolver::new();
+    solver.set_timeout(config.induction_timeout_ms);
+    solver
+}
+
+fn assert_induction_properties(
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    safety: &transition::TransitionSafetySpec<'_>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    step: usize,
+) -> Option<()> {
+    let system = safety.system();
+    for expr in safety.step_properties() {
+        let prop = encode_property_at_step(
+            pool,
+            vctx,
+            defs,
+            expr,
+            step,
+            system.store_ranges(),
             system.relevant_systems(),
-        );
-        let solver = AbideSolver::new();
-        solver.set_timeout(config.induction_timeout_ms);
-
-        for c in initial_state_constraints(&pool, system.store_ranges()) {
-            solver.assert(&c);
-        }
-        for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
-            solver.assert(&c);
-        }
-        for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
-            solver.assert(&c);
-        }
-
-        let mut negated = Vec::new();
-        for expr in safety.step_properties() {
-            let Ok(prop) = encode_property_at_step(
-                &pool,
-                vctx,
-                defs,
-                expr,
-                0,
-                system.store_ranges(),
-                system.relevant_systems(),
-            ) else {
-                return None;
-            };
-            negated.push(smt::bool_not(&prop));
-        }
-        let neg_refs: Vec<&Bool> = negated.iter().collect();
-        if !neg_refs.is_empty() {
-            solver.assert(smt::bool_or(&neg_refs));
-        }
-
-        match solver.check() {
-            SatResult::Unsat => {} // base holds
-            _ => return None,      // base fails or timeout — fall back
-        }
+        )
+        .ok()?;
+        solver.assert(&prop);
     }
+    Some(())
+}
 
-    // ── Step case: P(k) ∧ transition(k→k+1) → P(k+1) ─────────────
-    {
-        let encoding = match transition::TransitionSmtEncoding::from_plan(
-            transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
-        ) {
-            Ok(encoding) => encoding,
-            Err(_) => return None,
-        };
-        let pool = encoding.pool();
-        let fire_tracking = encoding.fire_tracking();
-        let solver = AbideSolver::new();
-        solver.set_timeout(config.induction_timeout_ms);
-
-        for c in encoding.domain_constraints() {
-            solver.assert(c);
-        }
-
-        // Assume P at step 0
-        for expr in safety.step_properties() {
-            let Ok(prop) = encode_property_at_step(
-                pool,
-                vctx,
-                defs,
-                expr,
-                0,
-                system.store_ranges(),
-                system.relevant_systems(),
-            ) else {
-                return None;
-            };
-            solver.assert(&prop);
-        }
-
-        // One transition with command fire tracking. Bounded witness paths use
-        // the command-level fire indicators as native provenance instead of
-        // reconstructing events heuristically from state deltas.
-        for c in &fire_tracking.constraints {
-            solver.assert(c);
-        }
-
-        // when stutter is opted out, the transition relation
-        // can be unsatisfiable from the initial state (no events
-        // enabled, no stutter to fall back on). Without this guard,
-        // induction would prove the property "vacuously" — `P ∧ false
-        // → P'` is trivially true — and silently mask the deadlock.
-        // Bail out to BMC, which has explicit deadlock detection.
-        if !system.assumptions().stutter() {
-            match solver.check() {
-                SatResult::Unsat => return None,
-                SatResult::Sat | SatResult::Unknown(_) => {}
-            }
-        }
-
-        // Assert NOT P at step 1
-        let mut negated = Vec::new();
-        for expr in safety.step_properties() {
-            let Ok(prop) = encode_property_at_step(
-                pool,
-                vctx,
-                defs,
-                expr,
-                1,
-                system.store_ranges(),
-                system.relevant_systems(),
-            ) else {
-                return None;
-            };
-            negated.push(smt::bool_not(&prop));
-        }
-        let neg_refs: Vec<&Bool> = negated.iter().collect();
-        if !neg_refs.is_empty() {
-            solver.assert(smt::bool_or(&neg_refs));
-        }
-
-        match solver.check() {
-            SatResult::Unsat => {} // step holds
-            _ => return None,      // step fails or timeout — fall back
-        }
+fn assert_negated_induction_properties(
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    safety: &transition::TransitionSafetySpec<'_>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    step: usize,
+) -> Option<()> {
+    let system = safety.system();
+    let mut negated = Vec::new();
+    for expr in safety.step_properties() {
+        let prop = encode_property_at_step(
+            pool,
+            vctx,
+            defs,
+            expr,
+            step,
+            system.store_ranges(),
+            system.relevant_systems(),
+        )
+        .ok()?;
+        negated.push(smt::bool_not(&prop));
     }
+    if !negated.is_empty() {
+        solver.assert(smt::bool_or(&negated.iter().collect::<Vec<_>>()));
+    }
+    Some(())
+}
 
-    // Both passed — PROVED
-    let elapsed = elapsed_ms(&start);
-    Some(VerificationResult::Proved {
+fn induction_proved_result(
+    ir: &IRProgram,
+    verify_block: &IRVerify,
+    elapsed: u64,
+) -> VerificationResult {
+    VerificationResult::Proved {
         name: verify_block.name.clone(),
         method: "1-induction".to_owned(),
         time_ms: elapsed,
@@ -3347,7 +3523,7 @@ fn try_induction_on_verify(
         ),
         span: None,
         file: None,
-    })
+    }
 }
 
 // ── Liveness-to-Safety Reduction () ──────────────────────────
@@ -3370,21 +3546,11 @@ fn try_induction_on_verify(
 ///   the additional CHC columns)
 /// - k-liveness (Claessen & Sörensson) which sidesteps BAS entirely
 /// - Manual proof via `axiom... by "file"`
-#[allow(clippy::too_many_arguments)]
-fn try_symmetry_reduction(
+fn quantified_liveness_symmetry_holds(
     ir: &IRProgram,
-    _vctx: &VerifyContext,
-    _defs: &defenv::DefEnv,
     patterns: &[(usize, LivenessPattern)],
-    _safety_obligations: &[IRExpr],
-    _system_names: &[String],
-    _scope: &HashMap<String, usize>,
-    _fair_event_keys: &[(String, String)],
     relevant_systems: &[IRSystem],
-    _config: &VerifyConfig,
-    _start: &Instant,
-    _verify_block: &IRVerify,
-) -> Option<VerificationResult> {
+) -> bool {
     // Validate symmetry for each quantified entity type.
     // Even though we can't PROVE properties here, symmetry validation
     // is still useful for diagnostics and future k-liveness integration.
@@ -3398,13 +3564,13 @@ fn try_symmetry_reduction(
         };
 
         if !validate_symmetry(entity_name, relevant_systems, &ir.systems, pattern) {
-            return None; // symmetry broken
+            return false;
         }
     }
 
     // Cannot prove quantified liveness unboundedly with current IC3 encoding.
     // Fall through to lasso BMC (CHECKED) or UNPROVABLE.
-    None
+    true
 }
 
 /// Try to prove liveness properties in a verify block via
@@ -3416,7 +3582,6 @@ fn try_symmetry_reduction(
 ///
 /// Returns `Some(Proved)` if the safety property holds unboundedly,
 /// or `None` if the proof fails (caller falls back to lasso BMC).
-#[allow(clippy::too_many_lines)]
 pub(super) fn try_liveness_reduction(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -3425,22 +3590,7 @@ pub(super) fn try_liveness_reduction(
     config: &VerifyConfig,
 ) -> Option<VerificationResult> {
     let start = Instant::now();
-
-    // Read fairness from the verification site's normalized assumption set.
-    // Liveness reduction can only prove eventualities under fairness; without
-    // any fair events declared, there is nothing to discharge against.
-    if !verify_block.assumption_set.has_fair_events() {
-        return None; // can't prove liveness without fairness
-    }
-
-    // parameterized fair events default to per-tuple
-    // semantics. The unbounded reduction path here builds one justice
-    // bit per (system, event), not per (event, args) tuple, so it
-    // cannot discharge per-tuple obligations as the user wrote them.
-    // Sound unbounded per-tuple liveness needs a stronger proof engine. Until
-    // then, fall through to bounded lasso BMC and report CHECKED, never PROVED,
-    // when any fair event in scope is parameterized.
-    if !verify_block.assumption_set.per_tuple.is_empty() {
+    if !liveness_reduction_applicable(verify_block) {
         return None;
     }
 
@@ -3448,38 +3598,74 @@ pub(super) fn try_liveness_reduction(
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
     let liveness = obligation.liveness()?;
     let system = obligation.system();
-    let fair_event_keys = obligation.fair_event_keys();
-    let patterns = liveness.patterns();
-    let recipes = liveness.recipes();
     let safety_obligations = liveness.safety_obligations().to_vec();
-
-    // Pre-validate expressions
-    for entity in system.relevant_entities() {
-        for trans in &entity.transitions {
-            if find_unsupported_scene_expr(&trans.guard).is_some() {
-                return None;
-            }
-            for upd in &trans.updates {
-                if find_unsupported_scene_expr(&upd.value).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    for sys in system.relevant_systems() {
-        for event in &sys.actions {
-            if find_unsupported_scene_expr(&event.guard).is_some() {
-                return None;
-            }
-            if find_unsupported_in_actions(&event.body).is_some() {
-                return None;
-            }
-        }
+    if !liveness_transition_inputs_supported(system) {
+        return None;
     }
 
-    // ── Inductive step (the core of the proof) ──────────────────────
-    // For each liveness assert, build a monitor and check
-    // `not accepting(k+1)` given `not accepting(k)` and one transition.
+    let safety_proved = |obligations: &[IRExpr]| {
+        prove_liveness_safety_obligations(ir, vctx, defs, verify_block, config, obligations)
+    };
+    if prove_liveness_by_monitor_induction(
+        vctx,
+        defs,
+        liveness,
+        obligation.fair_event_keys(),
+        config,
+    )? && safety_proved(&safety_obligations)
+    {
+        return Some(liveness_reduction_result(
+            ir,
+            verify_block,
+            crate::messages::LIVENESS_REDUCTION_METHOD,
+            elapsed_ms(&start),
+        ));
+    }
+
+    if prove_liveness_by_ic3(ir, system, liveness, config)? && safety_proved(&safety_obligations) {
+        return Some(liveness_reduction_result(
+            ir,
+            verify_block,
+            "liveness-to-safety (IC3/PDR)",
+            elapsed_ms(&start),
+        ));
+    }
+
+    None
+}
+
+fn liveness_reduction_applicable(verify_block: &IRVerify) -> bool {
+    verify_block.assumption_set.has_fair_events()
+        && verify_block.assumption_set.per_tuple.is_empty()
+}
+
+fn liveness_transition_inputs_supported(system: &transition::TransitionSystemSpec<'_>) -> bool {
+    let entities_supported = system.relevant_entities().iter().all(|entity| {
+        entity.transitions.iter().all(|transition| {
+            find_unsupported_scene_expr(&transition.guard).is_none()
+                && transition
+                    .updates
+                    .iter()
+                    .all(|update| find_unsupported_scene_expr(&update.value).is_none())
+        })
+    });
+    let systems_supported = system.relevant_systems().iter().all(|system| {
+        system.actions.iter().all(|event| {
+            find_unsupported_scene_expr(&event.guard).is_none()
+                && find_unsupported_in_actions(&event.body).is_none()
+        })
+    });
+    entities_supported && systems_supported
+}
+
+fn prove_liveness_by_monitor_induction(
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    liveness: &transition::TransitionLivenessSpec<'_>,
+    fair_event_keys: &[(String, String)],
+    config: &VerifyConfig,
+) -> Option<bool> {
+    let system = liveness.system();
     let encoding = match transition::TransitionSmtEncoding::from_plan(
         transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
     ) {
@@ -3498,397 +3684,366 @@ pub(super) fn try_liveness_reduction(
         solver.assert(c);
     }
 
-    // Build a monitor per liveness assert.
-    //
-    // For QUANTIFIED patterns (all o: E |... eventually...):
-    // Build one monitor PER entity slot. This gives universal semantics:
-    // each slot must independently satisfy the liveness property.
-    // If ANY slot's monitor can accept, the property is violated.
-    //
-    // For NON-QUANTIFIED patterns: one monitor per assert (as before).
-    let mut accepting_vars_step1: Vec<Bool> = Vec::new();
     let true_lit = IRExpr::Lit {
         ty: IRType::Bool,
         value: crate::ir::types::LitVal::Bool { value: true },
         span: None,
     };
-
-    for recipe in recipes {
-        let (quant_var, quant_entity) = recipe.quantified_binding();
-        let slot_count = recipe.slot_count();
-
-        for target_slot in 0..slot_count {
-            // Unique prefix per (assert, slot) to avoid variable name collisions
-            let prefix = if quant_entity.is_some() {
-                format!("mon{}_s{target_slot}", recipe.assert_index())
-            } else {
-                format!("mon{}", recipe.assert_index())
-            };
-
-            let pending_0 = smt::bool_named(&format!("{prefix}_pending_t0"));
-            let pending_1 = smt::bool_named(&format!("{prefix}_pending_t1"));
-
-            // Saved state: one copy per entity/slot/field (constants — captured at trigger)
-            let mut saved_fields: Vec<(String, usize, String, SmtValue)> = Vec::new();
-            let mut saved_active: Vec<(String, usize, SmtValue)> = Vec::new();
-            for entity in system.relevant_entities() {
-                let n_slots = pool.slots_for(&entity.name);
-                for slot in 0..n_slots {
-                    for field in &entity.fields {
-                        let name =
-                            format!("{prefix}_saved_{}_s{}_{}", entity.name, slot, field.name);
-                        let var = match &field.ty {
-                            IRType::Bool => smt::bool_var(&name),
-                            IRType::Real | IRType::Float => smt::real_var(&name),
-                            _ => smt::int_var(&name),
-                        };
-                        saved_fields.push((entity.name.clone(), slot, field.name.clone(), var));
-                    }
-                    let act_name = format!("{prefix}_saved_{}_s{}_active", entity.name, slot);
-                    saved_active.push((entity.name.clone(), slot, smt::bool_var(&act_name)));
-                }
-            }
-
-            // Justice counters: one per fair event, at steps 0 and 1
-            let mut justice_0: Vec<Bool> = Vec::new();
-            let mut justice_1: Vec<Bool> = Vec::new();
-            for (i, _key) in fair_event_keys.iter().enumerate() {
-                justice_0.push(smt::bool_named(&format!("{prefix}_justice{i}_t0")));
-                justice_1.push(smt::bool_named(&format!("{prefix}_justice{i}_t1")));
-            }
-
-            // Build property context: bind quantified variable to this specific slot
-            let ctx = if let (Some(var), Some(ent_name)) = (quant_var, quant_entity) {
-                PropertyCtx::new().with_binding(var, ent_name, target_slot)
-            } else {
-                PropertyCtx::new()
-            };
-
-            let trigger_0 =
-                encode_prop_expr(pool, vctx, defs, &ctx, recipe.trigger(&true_lit), 0).ok()?;
-            let response_0 = encode_prop_expr(pool, vctx, defs, &ctx, recipe.response(), 0).ok()?;
-
-            // Monitor transition: step 0 → step 1
-            //
-            // trigger_fires = NOT pending_0 AND P(0) AND NOT Q(0)
-            let trigger_fires = smt::bool_and(&[
-                &smt::bool_not(&pending_0),
-                &trigger_0,
-                &smt::bool_not(&response_0),
-            ]);
-            // discharge = pending_0 AND Q(0)
-            let discharge = smt::bool_and(&[&pending_0, &response_0]);
-
-            // pending_1 = ITE(trigger_fires, true, ITE(discharge, false, pending_0))
-            let pending_1_val = smt::bool_ite(
-                &trigger_fires,
-                &smt::bool_const(true),
-                &smt::bool_ite(&discharge, &smt::bool_const(false), &pending_0),
-            );
-            solver.assert(smt::bool_eq(&pending_1, &pending_1_val));
-
-            // Saved state capture: on trigger, save current state
-            for (ent, slot, field, saved_var) in &saved_fields {
-                if let Some(current) = pool.field_at(ent, *slot, field, 0) {
-                    let saved_val = smt::smt_ite(&trigger_fires, current, saved_var);
-                    if let Ok(eq) = smt::smt_eq(&saved_val, saved_var) {
-                        solver.assert(&eq);
-                    }
-                }
-            }
-            for (ent, slot, saved_act) in &saved_active {
-                if let Some(SmtValue::Bool(current)) = pool.active_at(ent, *slot, 0) {
-                    let saved_val = smt::bool_ite(
-                        &trigger_fires,
-                        current,
-                        match saved_act {
-                            SmtValue::Bool(b) => b,
-                            _ => continue,
-                        },
-                    );
-                    if let SmtValue::Bool(s) = saved_act {
-                        solver.assert(smt::bool_eq(s, &saved_val));
-                    }
-                }
-            }
-
-            // Justice tracking: on trigger_fires, reset to just this step's fire.
-            // Otherwise, accumulate: justice_1 = justice_0 OR fire_at_0
-            for (i, key) in fair_event_keys.iter().enumerate() {
-                let fired_at_0 = fire_tracking
-                    .fire_vars
-                    .get(key)
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or_else(|| smt::bool_const(false));
-
-                let justice_val = smt::bool_ite(
-                    &trigger_fires,
-                    &fired_at_0,
-                    &smt::bool_or(&[&justice_0[i], &fired_at_0]),
-                );
-                solver.assert(smt::bool_eq(&justice_1[i], &justice_val));
-            }
-
-            // Loop detection: accepting_1 = pending_1 AND state_matches AND all_justice
-            let mut state_match_parts: Vec<Bool> = Vec::new();
-            for (ent, slot, field, saved_var) in &saved_fields {
-                if let Some(current) = pool.field_at(ent, *slot, field, 1) {
-                    if let Ok(eq) = smt::smt_eq(saved_var, current) {
-                        state_match_parts.push(eq);
-                    }
-                }
-            }
-            for (ent, slot, saved_act) in &saved_active {
-                if let Some(SmtValue::Bool(current)) = pool.active_at(ent, *slot, 1) {
-                    if let SmtValue::Bool(s) = saved_act {
-                        state_match_parts.push(smt::bool_eq(s, current));
-                    }
-                }
-            }
-
-            let state_matches = if state_match_parts.is_empty() {
-                smt::bool_const(true)
-            } else {
-                let refs: Vec<&Bool> = state_match_parts.iter().collect();
-                smt::bool_and(&refs)
-            };
-
-            let all_justice = if justice_1.is_empty() {
-                smt::bool_const(true)
-            } else {
-                let refs: Vec<&Bool> = justice_1.iter().collect();
-                smt::bool_and(&refs)
-            };
-
-            let accepting_1 = smt::bool_and(&[&pending_1, &state_matches, &all_justice]);
-            accepting_vars_step1.push(accepting_1);
-        } // end for target_slot
-    }
-
-    // Inductive hypothesis: no monitor is accepting at step 0
-    // (Since we don't assert accepting_0 explicitly, the solver is free to
-    // choose any value. We assert NOT accepting_0 as the hypothesis.)
-    // Actually, we need to assert: none of the monitors are accepting at step 0.
-    // The accepting_0 is not materialized — we just don't constrain it.
-    // The hypothesis is that the safety property holds at step k.
-    // For simplicity, assert that no accepting condition holds at step 0.
-    //
-    // Note: we don't need separate accepting_0 variables. The hypothesis
-    // is implicit: we're checking whether accepting can become true after
-    // one transition from ANY state where it's not true.
-    //
-    // We assert: the negation of the safety property at step 1 (any accepting_1 is true)
-    let any_accepting = if accepting_vars_step1.len() == 1 {
-        accepting_vars_step1[0].clone()
-    } else {
-        let refs: Vec<&Bool> = accepting_vars_step1.iter().collect();
-        smt::bool_or(&refs)
+    let monitor_ctx = LivenessMonitorBuildCtx {
+        pool,
+        vctx,
+        defs,
+        system,
+        fair_event_keys,
+        fire_tracking,
+        solver: &solver,
+        true_lit: &true_lit,
     };
+    let accepting_vars_step1 = liveness_accepting_step1(liveness, &monitor_ctx)?;
+    let any_accepting = bool_or_owned(&accepting_vars_step1);
     solver.assert(&any_accepting);
+    Some(solver.check() == SatResult::Unsat)
+}
 
-    // Check: UNSAT means no transition can make any monitor accepting → PROVED
-    if solver.check() == SatResult::Unsat {
-        // Liveness part proved. Now verify safety obligations (if any).
-        if safety_obligations.is_empty() {
-            let elapsed = elapsed_ms(&start);
-            return Some(VerificationResult::Proved {
-                name: verify_block.name.clone(),
-                method: crate::messages::LIVENESS_REDUCTION_METHOD.to_owned(),
-                time_ms: elapsed,
-                assumptions: build_assumptions_for_system_scope(
-                    ir,
-                    &verify_block
-                        .systems
-                        .iter()
-                        .map(|s| s.name.clone())
-                        .collect::<Vec<_>>(),
-                    &verify_block.assumption_set,
-                    &[],
-                ),
-                span: None,
-                file: None,
-            });
-        }
-        let safety_verify = IRVerify {
-            name: verify_block.name.clone(),
-            depth: None,
-            systems: verify_block.systems.clone(),
-            stores: verify_block.stores.clone(),
-            // Inherit the parent verify's assumption set so safety checks
-            // see the same fairness/stutter context.
-            assumption_set: verify_block.assumption_set.clone(),
-            initial_constraints: vec![],
-            asserts: safety_obligations.clone(),
-            span: verify_block.span,
-            file: verify_block.file.clone(),
-        };
-        // Try induction first, then IC3 for safety
-        let safety_proved = try_induction_on_verify(ir, vctx, defs, &safety_verify, config)
-            .or_else(|| {
-                if config.no_ic3 {
-                    None
-                } else {
-                    try_ic3_on_verify(ir, vctx, defs, &safety_verify, config)
-                }
-            });
-        if let Some(VerificationResult::Proved { .. }) = safety_proved {
-            let elapsed = elapsed_ms(&start);
-            return Some(VerificationResult::Proved {
-                name: verify_block.name.clone(),
-                method: crate::messages::LIVENESS_REDUCTION_METHOD.to_owned(),
-                time_ms: elapsed,
-                assumptions: build_assumptions_for_system_scope(
-                    ir,
-                    &verify_block
-                        .systems
-                        .iter()
-                        .map(|s| s.name.clone())
-                        .collect::<Vec<_>>(),
-                    &verify_block.assumption_set,
-                    &[],
-                ),
-                span: None,
-                file: None,
-            });
-        }
-        // safety couldn't be proved — fall through to IC3
+struct LivenessMonitorBuildCtx<'a> {
+    pool: &'a SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    system: &'a transition::TransitionSystemSpec<'a>,
+    fair_event_keys: &'a [(String, String)],
+    fire_tracking: &'a harness::FireTracking,
+    solver: &'a AbideSolver,
+    true_lit: &'a IRExpr,
+}
+
+fn liveness_accepting_step1(
+    liveness: &transition::TransitionLivenessSpec<'_>,
+    ctx: &LivenessMonitorBuildCtx<'_>,
+) -> Option<Vec<Bool>> {
+    let mut accepting = Vec::new();
+    for recipe in liveness.recipes() {
+        accepting.extend(liveness_recipe_accepting_step1(recipe, ctx)?);
     }
-    // 1-induction failed — try IC3 below
+    Some(accepting)
+}
 
-    // ── IC3/PDR on the reduced safety property ──────────────────────
-    // 1-induction is too weak for most liveness reductions. IC3 can
-    // automatically discover the strengthening invariants needed.
-    // ALL patterns must be proved by IC3. If any fails, the block is not proved.
-    //
-    // For QUANTIFIED patterns: IC3/BAS with coarse justice is not sound for
-    // unbounded liveness proof claims. Symmetry validation remains useful as a
-    // guardrail for the future k-liveness/per-enabled-event implementation, but
-    // it must not produce `Proved` today.
-    let has_quantified =
-        liveness.has_quantified_patterns() || recipes.iter().any(|recipe| recipe.is_quantified());
+fn liveness_recipe_accepting_step1(
+    recipe: &transition::TransitionLivenessMonitorRecipe,
+    ctx: &LivenessMonitorBuildCtx<'_>,
+) -> Option<Vec<Bool>> {
+    (0..recipe.slot_count())
+        .map(|target_slot| liveness_slot_accepting_step1(recipe, target_slot, ctx))
+        .collect()
+}
+
+fn liveness_slot_accepting_step1(
+    recipe: &transition::TransitionLivenessMonitorRecipe,
+    target_slot: usize,
+    ctx: &LivenessMonitorBuildCtx<'_>,
+) -> Option<Bool> {
+    let prefix = liveness_monitor_prefix(recipe, target_slot);
+    let pending_0 = smt::bool_named(&format!("{prefix}_pending_t0"));
+    let pending_1 = smt::bool_named(&format!("{prefix}_pending_t1"));
+    let saved_state = liveness_saved_state(ctx.pool, ctx.system, &prefix);
+    let justice = liveness_justice_vars(ctx.fair_event_keys, &prefix);
+    let prop_ctx = liveness_property_ctx(recipe, target_slot);
+    let trigger_0 = encode_prop_expr(
+        ctx.pool,
+        ctx.vctx,
+        ctx.defs,
+        &prop_ctx,
+        recipe.trigger(ctx.true_lit),
+        0,
+    )
+    .ok()?;
+    let response_0 = encode_prop_expr(
+        ctx.pool,
+        ctx.vctx,
+        ctx.defs,
+        &prop_ctx,
+        recipe.response(),
+        0,
+    )
+    .ok()?;
+    let trigger_fires = smt::bool_and(&[
+        &smt::bool_not(&pending_0),
+        &trigger_0,
+        &smt::bool_not(&response_0),
+    ]);
+    let discharge = smt::bool_and(&[&pending_0, &response_0]);
+    let pending_1_val = smt::bool_ite(
+        &trigger_fires,
+        &smt::bool_const(true),
+        &smt::bool_ite(&discharge, &smt::bool_const(false), &pending_0),
+    );
+    ctx.solver.assert(smt::bool_eq(&pending_1, &pending_1_val));
+    assert_liveness_saved_state_capture(ctx.solver, ctx.pool, &saved_state, &trigger_fires);
+    assert_liveness_justice_progress(
+        ctx.solver,
+        ctx.fire_tracking,
+        ctx.fair_event_keys,
+        &justice,
+        &trigger_fires,
+    );
+    let state_matches = liveness_state_matches(ctx.pool, &saved_state);
+    let all_justice = bool_and_owned(&justice.step1);
+    Some(smt::bool_and(&[&pending_1, &state_matches, &all_justice]))
+}
+
+fn liveness_monitor_prefix(
+    recipe: &transition::TransitionLivenessMonitorRecipe,
+    target_slot: usize,
+) -> String {
+    if recipe.is_quantified() {
+        format!("mon{}_s{target_slot}", recipe.assert_index())
+    } else {
+        format!("mon{}", recipe.assert_index())
+    }
+}
+
+struct LivenessSavedState {
+    fields: Vec<(String, usize, String, SmtValue)>,
+    active: Vec<(String, usize, SmtValue)>,
+}
+
+struct LivenessJusticeVars {
+    step0: Vec<Bool>,
+    step1: Vec<Bool>,
+}
+
+fn liveness_saved_state(
+    pool: &SlotPool,
+    system: &transition::TransitionSystemSpec<'_>,
+    prefix: &str,
+) -> LivenessSavedState {
+    let mut fields = Vec::new();
+    let mut active = Vec::new();
+    for entity in system.relevant_entities() {
+        for slot in 0..pool.slots_for(&entity.name) {
+            for field in &entity.fields {
+                let name = format!("{prefix}_saved_{}_s{}_{}", entity.name, slot, field.name);
+                let var = match &field.ty {
+                    IRType::Bool => smt::bool_var(&name),
+                    IRType::Real | IRType::Float => smt::real_var(&name),
+                    _ => smt::int_var(&name),
+                };
+                fields.push((entity.name.clone(), slot, field.name.clone(), var));
+            }
+            active.push((
+                entity.name.clone(),
+                slot,
+                smt::bool_var(&format!("{prefix}_saved_{}_s{}_active", entity.name, slot)),
+            ));
+        }
+    }
+    LivenessSavedState { fields, active }
+}
+
+fn liveness_justice_vars(
+    fair_event_keys: &[(String, String)],
+    prefix: &str,
+) -> LivenessJusticeVars {
+    let step0 = fair_event_keys
+        .iter()
+        .enumerate()
+        .map(|(i, _key)| smt::bool_named(&format!("{prefix}_justice{i}_t0")))
+        .collect();
+    let step1 = fair_event_keys
+        .iter()
+        .enumerate()
+        .map(|(i, _key)| smt::bool_named(&format!("{prefix}_justice{i}_t1")))
+        .collect();
+    LivenessJusticeVars { step0, step1 }
+}
+
+fn liveness_property_ctx(
+    recipe: &transition::TransitionLivenessMonitorRecipe,
+    target_slot: usize,
+) -> PropertyCtx {
+    if let (Some(var), Some(ent_name)) = recipe.quantified_binding() {
+        PropertyCtx::new().with_binding(var, ent_name, target_slot)
+    } else {
+        PropertyCtx::new()
+    }
+}
+
+fn assert_liveness_saved_state_capture(
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    saved_state: &LivenessSavedState,
+    trigger_fires: &Bool,
+) {
+    for (ent, slot, field, saved_var) in &saved_state.fields {
+        if let Some(current) = pool.field_at(ent, *slot, field, 0) {
+            let saved_val = smt::smt_ite(trigger_fires, current, saved_var);
+            if let Ok(eq) = smt::smt_eq(&saved_val, saved_var) {
+                solver.assert(&eq);
+            }
+        }
+    }
+    for (ent, slot, saved_act) in &saved_state.active {
+        if let (Some(SmtValue::Bool(current)), SmtValue::Bool(saved_bool)) =
+            (pool.active_at(ent, *slot, 0), saved_act)
+        {
+            let saved_val = smt::bool_ite(trigger_fires, current, saved_bool);
+            solver.assert(smt::bool_eq(saved_bool, &saved_val));
+        }
+    }
+}
+
+fn assert_liveness_justice_progress(
+    solver: &AbideSolver,
+    fire_tracking: &harness::FireTracking,
+    fair_event_keys: &[(String, String)],
+    justice: &LivenessJusticeVars,
+    trigger_fires: &Bool,
+) {
+    for (i, key) in fair_event_keys.iter().enumerate() {
+        let fired_at_0 = fire_tracking
+            .fire_vars
+            .get(key)
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or_else(|| smt::bool_const(false));
+        let justice_val = smt::bool_ite(
+            trigger_fires,
+            &fired_at_0,
+            &smt::bool_or(&[&justice.step0[i], &fired_at_0]),
+        );
+        solver.assert(smt::bool_eq(&justice.step1[i], &justice_val));
+    }
+}
+
+fn liveness_state_matches(pool: &SlotPool, saved_state: &LivenessSavedState) -> Bool {
+    let mut parts = Vec::new();
+    for (ent, slot, field, saved_var) in &saved_state.fields {
+        if let Some(current) = pool.field_at(ent, *slot, field, 1) {
+            if let Ok(eq) = smt::smt_eq(saved_var, current) {
+                parts.push(eq);
+            }
+        }
+    }
+    for (ent, slot, saved_act) in &saved_state.active {
+        if let (Some(SmtValue::Bool(current)), SmtValue::Bool(saved_bool)) =
+            (pool.active_at(ent, *slot, 1), saved_act)
+        {
+            parts.push(smt::bool_eq(saved_bool, current));
+        }
+    }
+    bool_and_owned(&parts)
+}
+
+fn prove_liveness_by_ic3(
+    ir: &IRProgram,
+    system: &transition::TransitionSystemSpec<'_>,
+    liveness: &transition::TransitionLivenessSpec<'_>,
+    config: &VerifyConfig,
+) -> Option<bool> {
+    let has_quantified = liveness.has_quantified_patterns()
+        || liveness
+            .recipes()
+            .iter()
+            .any(|recipe| recipe.is_quantified());
     if has_quantified {
-        // Validate symmetry before falling back to lasso BMC/UNPROVABLE.
-        if let Some(result) = try_symmetry_reduction(
-            ir,
-            vctx,
-            defs,
-            patterns,
-            &safety_obligations,
-            system.system_names(),
-            system.slots_per_entity(),
-            fair_event_keys,
-            system.relevant_systems(),
-            config,
-            &start,
-            verify_block,
-        ) {
-            return Some(result);
-        }
-        return None; // symmetry failed — fall back to lasso BMC (CHECKED)
+        let symmetric =
+            quantified_liveness_symmetry_holds(ir, liveness.patterns(), system.relevant_systems());
+        return symmetric.then_some(false);
     }
-
     debug_assert!(
-        recipes.iter().all(|recipe| !recipe.is_quantified()),
+        liveness
+            .recipes()
+            .iter()
+            .all(|recipe| !recipe.is_quantified()),
         "quantified liveness recipes must not reach the IC3/BAS proof path"
     );
-
-    let mut all_proved = true;
-    'pattern_loop: for (recipe_index, recipe) in recipes.iter().enumerate() {
-        let slot_count = recipe.slot_count();
-
-        for target_slot_idx in 0..slot_count {
-            let target_slot = if recipe.is_quantified() {
-                Some(target_slot_idx)
-            } else {
-                None // non-quantified: no per-slot restriction
-            };
-
+    for (recipe_index, recipe) in liveness.recipes().iter().enumerate() {
+        for target_slot_idx in 0..recipe.slot_count() {
+            let target_slot = recipe.is_quantified().then_some(target_slot_idx);
             let ic3_result = transition::solve_transition_obligation(liveness.obligation(
                 recipe_index,
                 target_slot,
                 config.ic3_timeout_ms / 2,
             ));
+            if !matches!(ic3_result, transition::TransitionResult::Proved) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
+}
 
-            if let transition::TransitionResult::Proved = ic3_result {
-                // This slot proved — continue to check remaining slots
+fn prove_liveness_safety_obligations(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+    safety_obligations: &[IRExpr],
+) -> bool {
+    if safety_obligations.is_empty() {
+        return true;
+    }
+    let safety_verify = IRVerify {
+        depth: None,
+        name: verify_block.name.clone(),
+        systems: verify_block.systems.clone(),
+        stores: verify_block.stores.clone(),
+        assumption_set: verify_block.assumption_set.clone(),
+        initial_constraints: vec![],
+        asserts: safety_obligations.to_vec(),
+        span: verify_block.span,
+        file: verify_block.file.clone(),
+    };
+    let safety_proved =
+        try_induction_on_verify(ir, vctx, defs, &safety_verify, config).or_else(|| {
+            if config.no_ic3 {
+                None
             } else {
-                // Any slot failing means the pattern (and block) is not proved
-                all_proved = false;
-                break 'pattern_loop;
+                try_ic3_on_verify(ir, vctx, defs, &safety_verify, config)
             }
-        }
-    }
-
-    if all_proved {
-        // Liveness proved via IC3. Now verify safety obligations (if any).
-        if !safety_obligations.is_empty() {
-            let safety_verify = IRVerify {
-                depth: None,
-                name: verify_block.name.clone(),
-                systems: verify_block.systems.clone(),
-                stores: verify_block.stores.clone(),
-                // Inherit the parent verify's assumption set.
-                assumption_set: verify_block.assumption_set.clone(),
-                initial_constraints: vec![],
-                asserts: safety_obligations,
-                span: verify_block.span,
-                file: verify_block.file.clone(),
-            };
-            let safety_proved = try_induction_on_verify(ir, vctx, defs, &safety_verify, config)
-                .or_else(|| {
-                    if config.no_ic3 {
-                        None
-                    } else {
-                        try_ic3_on_verify(ir, vctx, defs, &safety_verify, config)
-                    }
-                });
-            match safety_proved {
-                Some(VerificationResult::Proved { .. }) => {
-                    let elapsed = elapsed_ms(&start);
-                    return Some(VerificationResult::Proved {
-                        name: verify_block.name.clone(),
-                        method: "liveness-to-safety (IC3/PDR)".to_owned(),
-                        time_ms: elapsed,
-                        assumptions: build_assumptions_for_system_scope(
-                            ir,
-                            &verify_block
-                                .systems
-                                .iter()
-                                .map(|s| s.name.clone())
-                                .collect::<Vec<_>>(),
-                            &verify_block.assumption_set,
-                            &[],
-                        ),
-                        span: None,
-                        file: None,
-                    });
-                }
-                _ => return None, // safety couldn't be proved — whole block not proved
-            }
-        }
-
-        let elapsed = elapsed_ms(&start);
-        return Some(VerificationResult::Proved {
-            name: verify_block.name.clone(),
-            method: "liveness-to-safety (IC3/PDR)".to_owned(),
-            time_ms: elapsed,
-            assumptions: build_assumptions_for_system_scope(
-                ir,
-                &verify_block
-                    .systems
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect::<Vec<_>>(),
-                &verify_block.assumption_set,
-                &[],
-            ),
-            span: None,
-            file: None,
         });
-    }
+    matches!(safety_proved, Some(VerificationResult::Proved { .. }))
+}
 
-    None
+fn liveness_reduction_result(
+    ir: &IRProgram,
+    verify_block: &IRVerify,
+    method: &str,
+    elapsed: u64,
+) -> VerificationResult {
+    VerificationResult::Proved {
+        name: verify_block.name.clone(),
+        method: method.to_owned(),
+        time_ms: elapsed,
+        assumptions: build_assumptions_for_system_scope(
+            ir,
+            &verify_block
+                .systems
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>(),
+            &verify_block.assumption_set,
+            &[],
+        ),
+        span: None,
+        file: None,
+    }
+}
+
+fn bool_or_owned(vars: &[Bool]) -> Bool {
+    if vars.len() == 1 {
+        vars[0].clone()
+    } else {
+        smt::bool_or(&vars.iter().collect::<Vec<_>>())
+    }
+}
+
+fn bool_and_owned(vars: &[Bool]) -> Bool {
+    if vars.is_empty() {
+        smt::bool_const(true)
+    } else {
+        smt::bool_and(&vars.iter().collect::<Vec<_>>())
+    }
 }
 
 /// Try to prove a verify block using IC3/PDR via Z3's Spacer engine.
@@ -3999,7 +4154,6 @@ fn try_ic3_on_verify_with_diagnostics(
 /// 4. Encode properties at every step
 /// 5. Negate to search for counterexample
 /// 6. UNSAT → CHECKED, SAT → COUNTEREXAMPLE
-#[allow(clippy::too_many_lines)]
 fn check_verify_block_with_depth_search(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -4064,7 +4218,6 @@ fn bmc_unknown_result(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn check_verify_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -4073,15 +4226,12 @@ fn check_verify_block(
     config: &VerifyConfig,
 ) -> VerificationResult {
     let start = Instant::now();
-
-    let Some(safety) = transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
-    else {
-        return VerificationResult::Unprovable {
-            name: verify_block.name.clone(),
-            hint: "verify block did not produce a transition-system obligation".to_owned(),
-            span: verify_block.span,
-            file: verify_block.file.clone(),
-        };
+    let Some(safety) = bmc_safety_spec(ir, vctx, defs, verify_block) else {
+        return verify_unprovable(
+            verify_block,
+            "verify block did not produce a transition-system obligation".to_owned(),
+            verify_block.span,
+        );
     };
     let system = safety.system();
     let bound = system.bound();
@@ -4096,326 +4246,391 @@ fn check_verify_block(
         return materialize_relational_verify_outcome(ir, verify_block, bound, result);
     }
 
-    // 2c. Pre-validate unsupported expression forms.
-    // Catches forms like Card(field), SetComp with non-entity domain, etc.
-    // that would panic during encoding. Scans both assert expressions AND
-    // transition/event bodies (guards, updates, create fields).
-    for (assert_expr, property) in verify_block.asserts.iter().zip(safety.step_properties()) {
-        if let Some(kind) = find_unsupported_scene_expr(property) {
-            return VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: format!("unsupported expression kind in verify assert: {kind}"),
-                span: expr_span(assert_expr),
-                file: None,
-            };
-        }
-    }
-    // Scan transition guards and update values for unsupported forms
-    for entity in system.relevant_entities() {
-        for trans in &entity.transitions {
-            if let Some(kind) = find_unsupported_scene_expr(&trans.guard) {
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: format!(
-                        "unsupported expression in {}.{} guard: {kind}",
-                        entity.name, trans.name
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-            for upd in &trans.updates {
-                if let Some(kind) = find_unsupported_scene_expr(&upd.value) {
-                    return VerificationResult::Unprovable {
-                        name: verify_block.name.clone(),
-                        hint: format!(
-                            "unsupported expression in {}.{} update of {}: {kind}",
-                            entity.name, trans.name, upd.field
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-            }
-        }
-    }
-    // Scan event guards and action bodies
-    for sys in system.relevant_systems() {
-        for event in &sys.actions {
-            if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
-                if kind != crate::messages::PRECHECK_UNRESOLVED_FN {
-                    return VerificationResult::Unprovable {
-                        name: verify_block.name.clone(),
-                        hint: format!(
-                            "unsupported expression in {}.{} event guard: {kind}",
-                            sys.name, event.name
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-            }
-            if let Some(kind) = find_unsupported_in_actions(&event.body) {
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: format!(
-                        "unsupported expression in {}.{} event body: {kind}",
-                        sys.name, event.name
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-        }
+    if let Some(result) = validate_bmc_inputs(verify_block, &safety) {
+        return result;
     }
 
-    // ── 3. Create compiled bounded transition encoding ────────────
-    let encoding = match transition::TransitionSmtEncoding::from_plan(
-        transition::TransitionExecutionPlan::for_bmc(system.clone(), bound),
-    ) {
+    let encoding = match bmc_transition_encoding(system, bound) {
         Ok(encoding) => encoding,
         Err(msg) => {
-            return VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: format!("transition encoding error: {msg}"),
-                span: None,
-                file: None,
-            };
+            return verify_unprovable(
+                verify_block,
+                format!("transition encoding error: {msg}"),
+                None,
+            )
         }
     };
     let pool = encoding.pool();
     let fire_tracking = encoding.fire_tracking();
+    let solver = bmc_solver(config, &encoding);
 
-    // ── 4. Build solver and assert constraints ─────────────────────
+    if let Some(result) = detect_bmc_deadlock(
+        DeadlockBmcCtx {
+            ir,
+            vctx,
+            system,
+            verify_block,
+            bound,
+            config,
+        },
+        &solver,
+    ) {
+        return result;
+    }
+
+    let property_at_all_steps = match bmc_properties_all_steps(pool, vctx, defs, &safety) {
+        Ok(prop) => prop,
+        Err(msg) => return verify_unprovable(verify_block, format!("encoding error: {msg}"), None),
+    };
+    solver.assert(smt::bool_not(&property_at_all_steps));
+
+    bmc_solver_result(
+        BmcResultCtx {
+            ir,
+            vctx,
+            system,
+            verify_block,
+            config,
+            bound,
+            started_at: start,
+        },
+        &solver,
+        pool,
+        fire_tracking,
+    )
+}
+
+fn bmc_safety_spec<'a>(
+    ir: &'a IRProgram,
+    vctx: &'a VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+) -> Option<transition::TransitionSafetySpec<'a>> {
+    transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
+}
+
+fn validate_bmc_inputs(
+    verify_block: &IRVerify,
+    safety: &transition::TransitionSafetySpec<'_>,
+) -> Option<VerificationResult> {
+    validate_bmc_asserts(verify_block, safety)
+        .or_else(|| validate_bmc_transitions(verify_block, safety.system()))
+        .or_else(|| validate_bmc_events(verify_block, safety.system()))
+}
+
+fn validate_bmc_asserts(
+    verify_block: &IRVerify,
+    safety: &transition::TransitionSafetySpec<'_>,
+) -> Option<VerificationResult> {
+    for (assert_expr, property) in verify_block.asserts.iter().zip(safety.step_properties()) {
+        if let Some(kind) = find_unsupported_scene_expr(property) {
+            return Some(verify_unprovable(
+                verify_block,
+                format!("unsupported expression kind in verify assert: {kind}"),
+                expr_span(assert_expr),
+            ));
+        }
+    }
+    None
+}
+
+fn validate_bmc_transitions(
+    verify_block: &IRVerify,
+    system: &transition::TransitionSystemSpec<'_>,
+) -> Option<VerificationResult> {
+    for entity in system.relevant_entities() {
+        for transition in &entity.transitions {
+            if let Some(kind) = find_unsupported_scene_expr(&transition.guard) {
+                return Some(verify_unprovable(
+                    verify_block,
+                    format!(
+                        "unsupported expression in {}.{} guard: {kind}",
+                        entity.name, transition.name
+                    ),
+                    None,
+                ));
+            }
+            for update in &transition.updates {
+                if let Some(kind) = find_unsupported_scene_expr(&update.value) {
+                    return Some(verify_unprovable(
+                        verify_block,
+                        format!(
+                            "unsupported expression in {}.{} update of {}: {kind}",
+                            entity.name, transition.name, update.field
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn validate_bmc_events(
+    verify_block: &IRVerify,
+    system: &transition::TransitionSystemSpec<'_>,
+) -> Option<VerificationResult> {
+    for system in system.relevant_systems() {
+        for event in &system.actions {
+            if let Some(kind) = find_unsupported_scene_expr(&event.guard) {
+                if kind != crate::messages::PRECHECK_UNRESOLVED_FN {
+                    return Some(verify_unprovable(
+                        verify_block,
+                        format!(
+                            "unsupported expression in {}.{} event guard: {kind}",
+                            system.name, event.name
+                        ),
+                        None,
+                    ));
+                }
+            }
+            if let Some(kind) = find_unsupported_in_actions(&event.body) {
+                return Some(verify_unprovable(
+                    verify_block,
+                    format!(
+                        "unsupported expression in {}.{} event body: {kind}",
+                        system.name, event.name
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn bmc_transition_encoding<'a>(
+    system: &'a transition::TransitionSystemSpec<'a>,
+    bound: usize,
+) -> Result<transition::TransitionSmtEncoding<'a>, String> {
+    transition::TransitionSmtEncoding::from_plan(transition::TransitionExecutionPlan::for_bmc(
+        system.clone(),
+        bound,
+    ))
+}
+
+fn bmc_solver(
+    config: &VerifyConfig,
+    encoding: &transition::TransitionSmtEncoding<'_>,
+) -> AbideSolver {
     let solver = AbideSolver::new();
     if config.bmc_timeout_ms > 0 {
         solver.set_timeout(config.bmc_timeout_ms);
     }
-
-    // Initial state: all slots inactive at step 0
     for c in encoding.initial_constraints() {
         solver.assert(c);
     }
     for c in encoding.system_initial_constraints() {
         solver.assert(c);
     }
-
-    // Symmetry breaking: slots activated in order to reduce search space
     for c in encoding.symmetry_constraints() {
         solver.assert(c);
     }
-
-    // Domain constraints at every step
     for c in encoding.domain_constraints() {
         solver.assert(c);
     }
-
-    // Transition constraints at every step 0..bound-1 with command fire
-    // tracking. Native operational witnesses are extracted directly from these
-    // indicators, and `saw` encoding also depends on the same named booleans.
-    for c in &fire_tracking.constraints {
+    for c in &encoding.fire_tracking().constraints {
         solver.assert(c);
     }
+    solver
+}
 
-    // ── 4b. Direct deadlock detection ( / revised) ──
-    //
-    // When stutter is opted out, the transition relation reduces to
-    // `event_1 ∨ … ∨ event_N`. If at some reachable step every event
-    // is disabled, that disjunction is unsatisfiable and the BMC's
-    // initial+transition constraints alone become UNSAT — no valid
-    // trace of length `bound` exists. Without an explicit check, the
-    // verifier would silently report CHECKED (no counterexample) and
-    // hide the deadlock. We probe for this by running an explicit SAT
-    // check on the trace constraints before adding the property.
-    if !verify_block.assumption_set.stutter {
-        match solver.check() {
-            SatResult::Unsat => {
-                let elapsed = elapsed_ms(&start);
-                let _ = elapsed; // unused but kept for symmetry with the property path
-                let assert_span = if verify_block.asserts.len() == 1 {
-                    expr_span(&verify_block.asserts[0])
-                } else {
-                    None
-                };
-                // Multi-step deadlock detection: find the exact step
-                // where the system deadlocks and extract a trace prefix.
-                if let Some((
-                    deadlock_step,
-                    evidence,
-                    evidence_extraction_error,
-                    event_diagnostics,
-                )) = find_deadlock_step(
-                    ir,
-                    system.relevant_entities(),
-                    system.relevant_systems(),
-                    vctx,
-                    system.slots_per_entity(),
-                    system.store_ranges(),
-                    verify_block,
-                    bound,
-                    config,
-                    config.witness_semantics,
-                ) {
-                    return VerificationResult::Deadlock {
-                        name: verify_block.name.clone(),
-                        evidence,
-                        evidence_extraction_error,
-                        step: deadlock_step,
-                        reason: format!(
-                            "the system deadlocks at step {deadlock_step} — no events \
-                             are enabled and stutter is opted out"
-                        ),
-                        event_diagnostics,
-                        assumptions: build_assumptions_for_system_scope(
-                            ir,
-                            &verify_block
-                                .systems
-                                .iter()
-                                .map(|s| s.name.clone())
-                                .collect::<Vec<_>>(),
-                            &verify_block.assumption_set,
-                            &[],
-                        ),
-                        span: assert_span,
-                        file: None,
-                    };
-                }
-                // Could not localize the deadlock (solver timeouts).
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: "the full-bound trace is unsatisfiable (possible \
-                           reaching-state deadlock) but the solver could not \
-                           localize the exact step"
-                        .to_owned(),
-                    span: assert_span,
-                    file: None,
-                };
-            }
-            SatResult::Sat | SatResult::Unknown(_) => {
-                // SAT: a valid trace exists, proceed with property check.
-                // Unknown: be conservative and proceed with property check;
-                // if the property check also returns Unknown the verifier
-                // will report TIMEOUT/UNPROVABLE in the standard path.
-            }
-        }
+struct DeadlockBmcCtx<'a> {
+    ir: &'a IRProgram,
+    vctx: &'a VerifyContext,
+    system: &'a transition::TransitionSystemSpec<'a>,
+    verify_block: &'a IRVerify,
+    bound: usize,
+    config: &'a VerifyConfig,
+}
+
+fn detect_bmc_deadlock(
+    ctx: DeadlockBmcCtx<'_>,
+    solver: &AbideSolver,
+) -> Option<VerificationResult> {
+    if ctx.verify_block.assumption_set.stutter {
+        return None;
     }
+    match solver.check() {
+        SatResult::Sat | SatResult::Unknown(_) => None,
+        SatResult::Unsat => Some(localize_bmc_deadlock(ctx)),
+    }
+}
 
-    // ── 5. Encode properties and search for counterexample ─────────
-    // For `always P`: check that P holds at every step 0..bound.
-    // We negate: assert exists some step where P does NOT hold.
-    // If UNSAT → property holds at all steps (CHECKED).
-    // If SAT → counterexample found.
-    let property_at_all_steps = match encode_step_properties_all_steps(
+fn localize_bmc_deadlock(ctx: DeadlockBmcCtx<'_>) -> VerificationResult {
+    let assert_span = single_assert_span(ctx.verify_block);
+    if let Some((deadlock_step, evidence, evidence_extraction_error, event_diagnostics)) =
+        find_deadlock_step(DeadlockProbeCtx {
+            ir: ctx.ir,
+            relevant_entities: ctx.system.relevant_entities(),
+            relevant_systems: ctx.system.relevant_systems(),
+            vctx: ctx.vctx,
+            scope: ctx.system.slots_per_entity(),
+            store_ranges: ctx.system.store_ranges(),
+            verify_block: ctx.verify_block,
+            bound: ctx.bound,
+            config: ctx.config,
+            witness_semantics: ctx.config.witness_semantics,
+        })
+    {
+        return VerificationResult::Deadlock {
+            name: ctx.verify_block.name.clone(),
+            evidence,
+            evidence_extraction_error,
+            step: deadlock_step,
+            reason: format!(
+                "the system deadlocks at step {deadlock_step} — no events are enabled and stutter is opted out"
+            ),
+            event_diagnostics,
+            assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
+            span: assert_span,
+            file: None,
+        };
+    }
+    verify_unprovable(
+        ctx.verify_block,
+        "the full-bound trace is unsatisfiable (possible reaching-state deadlock) but the solver could not localize the exact step".to_owned(),
+        assert_span,
+    )
+}
+
+fn bmc_properties_all_steps(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    safety: &transition::TransitionSafetySpec<'_>,
+) -> Result<Bool, String> {
+    let system = safety.system();
+    encode_step_properties_all_steps(
         pool,
         vctx,
         defs,
         safety.step_properties(),
-        bound,
+        system.bound(),
         system.store_ranges(),
         system.relevant_systems(),
-    ) {
-        Ok(prop) => prop,
-        Err(msg) => {
-            return VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: format!("encoding error: {msg}"),
-                span: None,
-                file: None,
-            };
-        }
-    };
+    )
+}
 
-    // Negate the conjunction of all properties across all steps
-    solver.assert(smt::bool_not(&property_at_all_steps));
+struct BmcResultCtx<'a> {
+    ir: &'a IRProgram,
+    vctx: &'a VerifyContext,
+    system: &'a transition::TransitionSystemSpec<'a>,
+    verify_block: &'a IRVerify,
+    config: &'a VerifyConfig,
+    bound: usize,
+    started_at: Instant,
+}
 
-    // ── 6. Check and return result ─────────────────────────────────
-    let elapsed = elapsed_ms(&start);
+fn bmc_solver_result(
+    ctx: BmcResultCtx<'_>,
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    fire_tracking: &harness::FireTracking,
+) -> VerificationResult {
+    let elapsed = elapsed_ms(&ctx.started_at);
 
     match solver.check() {
         SatResult::Unsat => VerificationResult::Checked {
-            name: verify_block.name.clone(),
-            depth: bound,
+            name: ctx.verify_block.name.clone(),
+            depth: ctx.bound,
             method: None,
             time_ms: elapsed,
-            assumptions: build_assumptions_for_system_scope(
-                ir,
-                &verify_block
-                    .systems
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect::<Vec<_>>(),
-                &verify_block.assumption_set,
-                &[],
-            ),
+            assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
             backend_diagnostics: vec![],
             span: None,
             file: None,
         },
-        SatResult::Sat => {
-            let (evidence, replay) = match config.witness_semantics {
-                WitnessSemantics::Operational => {
-                    match extract_operational_counterexample_with_fire(
-                        &solver,
-                        pool,
-                        vctx,
-                        system.relevant_entities(),
-                        system.relevant_systems(),
-                        fire_tracking,
-                        bound,
-                    ) {
-                        Ok(witness) => {
-                            let replay =
-                                Some(replay_counterexample_witness(ir, verify_block, &witness));
-                            (operational_evidence(witness), replay)
-                        }
-                        Err(err) => (Err(err), None),
-                    }
-                }
-                WitnessSemantics::Relational => (
-                    extract_relational_counterexample(
-                        &solver,
-                        pool,
-                        vctx,
-                        system.relevant_entities(),
-                        system.relevant_systems(),
-                        bound,
-                    )
-                    .and_then(relational_evidence),
-                    None,
-                ),
-            };
-            let (evidence, evidence_extraction_error) = match evidence {
-                Ok(evidence) => (Some(evidence), None),
-                Err(err) => (None, Some(err)),
-            };
-            // Use the first assert's span when there's only one (common case).
-            // For multi-assert blocks, with_source fills in the block span.
-            let assert_span = if verify_block.asserts.len() == 1 {
-                expr_span(&verify_block.asserts[0])
-            } else {
-                None
-            };
-            VerificationResult::Counterexample {
-                name: verify_block.name.clone(),
-                evidence,
-                replay,
-                evidence_extraction_error,
-                assumptions: build_assumptions_for_system_scope(
-                    ir,
-                    &verify_block
-                        .systems
-                        .iter()
-                        .map(|s| s.name.clone())
-                        .collect::<Vec<_>>(),
-                    &verify_block.assumption_set,
-                    &[],
-                ),
-                span: assert_span,
-                file: None,
-            }
-        }
-        SatResult::Unknown(reason) => bmc_unknown_result(verify_block, config, &reason),
+        SatResult::Sat => bmc_counterexample(ctx, solver, pool, fire_tracking),
+        SatResult::Unknown(reason) => bmc_unknown_result(ctx.verify_block, ctx.config, &reason),
     }
+}
+
+fn bmc_counterexample(
+    ctx: BmcResultCtx<'_>,
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    fire_tracking: &harness::FireTracking,
+) -> VerificationResult {
+    let (evidence, replay) = match ctx.config.witness_semantics {
+        WitnessSemantics::Operational => match extract_operational_counterexample_with_fire(
+            solver,
+            pool,
+            ctx.vctx,
+            ctx.system.relevant_entities(),
+            ctx.system.relevant_systems(),
+            fire_tracking,
+            ctx.bound,
+        ) {
+            Ok(witness) => (
+                operational_evidence(witness.clone()),
+                Some(replay_counterexample_witness(
+                    ctx.ir,
+                    ctx.verify_block,
+                    &witness,
+                )),
+            ),
+            Err(err) => (Err(err), None),
+        },
+        WitnessSemantics::Relational => (
+            extract_relational_counterexample(
+                solver,
+                pool,
+                ctx.vctx,
+                ctx.system.relevant_entities(),
+                ctx.system.relevant_systems(),
+                ctx.bound,
+            )
+            .and_then(relational_evidence),
+            None,
+        ),
+    };
+    let (evidence, evidence_extraction_error) = match evidence {
+        Ok(evidence) => (Some(evidence), None),
+        Err(err) => (None, Some(err)),
+    };
+    VerificationResult::Counterexample {
+        name: ctx.verify_block.name.clone(),
+        evidence,
+        replay,
+        evidence_extraction_error,
+        assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
+        span: single_assert_span(ctx.verify_block),
+        file: None,
+    }
+}
+
+fn verify_unprovable(
+    verify_block: &IRVerify,
+    hint: String,
+    span: Option<crate::span::Span>,
+) -> VerificationResult {
+    VerificationResult::Unprovable {
+        name: verify_block.name.clone(),
+        hint,
+        span,
+        file: None,
+    }
+}
+
+fn single_assert_span(verify_block: &IRVerify) -> Option<crate::span::Span> {
+    (verify_block.asserts.len() == 1)
+        .then(|| expr_span(&verify_block.asserts[0]))
+        .flatten()
+}
+
+fn verify_assumptions(ir: &IRProgram, verify_block: &IRVerify) -> Vec<TrustedAssumption> {
+    build_assumptions_for_system_scope(
+        ir,
+        &verify_block
+            .systems
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>(),
+        &verify_block.assumption_set,
+        &[],
+    )
 }
 
 // ── Scene checking (SAT) ────────────────────────────────────────────
@@ -4436,7 +4651,6 @@ fn check_verify_block(
 ///
 /// Fairness: for each fair event, if it is enabled somewhere in the loop,
 /// it must fire somewhere in the loop. This excludes degenerate stutter loops.
-#[allow(clippy::too_many_lines)]
 fn check_verify_block_lasso(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -4445,16 +4659,14 @@ fn check_verify_block_lasso(
     config: &VerifyConfig,
 ) -> VerificationResult {
     let start = Instant::now();
-
     let Some(obligation) =
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)
     else {
-        return VerificationResult::Unprovable {
-            name: verify_block.name.clone(),
-            hint: "verify block did not produce a transition-system obligation".to_owned(),
-            span: verify_block.span,
-            file: verify_block.file.clone(),
-        };
+        return verify_unprovable(
+            verify_block,
+            "verify block did not produce a transition-system obligation".to_owned(),
+            verify_block.span,
+        );
     };
     let system = obligation.system();
 
@@ -4465,26 +4677,70 @@ fn check_verify_block_lasso(
     }
     let bound = system.bound();
 
-    // ── 2. Create pool and solver ───────────────────────────────────
     let encoding = match transition::TransitionSmtEncoding::from_plan(obligation.lasso_plan()) {
         Ok(encoding) => encoding,
         Err(msg) => {
-            return VerificationResult::Unprovable {
-                name: verify_block.name.clone(),
-                hint: format!("lasso transition encoding error: {msg}"),
-                span: None,
-                file: None,
-            };
+            return verify_unprovable(
+                verify_block,
+                format!("lasso transition encoding error: {msg}"),
+                None,
+            )
         }
     };
     let pool = encoding.pool();
     let fire_tracking = encoding.fire_tracking();
+    let solver = lasso_solver(config, &encoding);
+
+    let Some(lasso) = encoding.lasso() else {
+        return verify_unprovable(
+            verify_block,
+            "internal verifier error while encoding lasso loop".to_owned(),
+            verify_block.span,
+        );
+    };
+    for c in &lasso.constraints {
+        solver.assert(c);
+    }
+    for c in encoding.fairness_constraints() {
+        solver.assert(c);
+    }
+
+    let ctx = LassoCheckCtx {
+        ir,
+        vctx,
+        defs,
+        system,
+        verify_block,
+        config,
+        bound,
+        pool,
+        fire_tracking,
+        lasso,
+    };
+    if let Some(result) = check_lasso_asserts(&ctx, &solver) {
+        return result;
+    }
+
+    VerificationResult::Checked {
+        name: verify_block.name.clone(),
+        depth: bound,
+        method: None,
+        time_ms: elapsed_ms(&start),
+        assumptions: verify_assumptions(ir, verify_block),
+        backend_diagnostics: vec![],
+        span: None,
+        file: None,
+    }
+}
+
+fn lasso_solver(
+    config: &VerifyConfig,
+    encoding: &transition::TransitionSmtEncoding<'_>,
+) -> AbideSolver {
     let solver = AbideSolver::new();
     if config.bmc_timeout_ms > 0 {
         solver.set_timeout(config.bmc_timeout_ms);
     }
-
-    // Initial state
     for c in encoding.initial_constraints() {
         solver.assert(c);
     }
@@ -4497,174 +4753,152 @@ fn check_verify_block_lasso(
     for c in encoding.domain_constraints() {
         solver.assert(c);
     }
-    for c in &fire_tracking.constraints {
+    for c in &encoding.fire_tracking().constraints {
         solver.assert(c);
     }
+    solver
+}
 
-    // ── 4. Lasso loop-back ──────────────────────────────────────────
-    let Some(lasso) = encoding.lasso() else {
-        return VerificationResult::Unprovable {
-            name: verify_block.name.clone(),
-            hint: "internal verifier error while encoding lasso loop".to_owned(),
-            span: verify_block.span,
-            file: verify_block.file.clone(),
-        };
-    };
-    for c in &lasso.constraints {
-        solver.assert(c);
-    }
+struct LassoCheckCtx<'a> {
+    ir: &'a IRProgram,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    system: &'a transition::TransitionSystemSpec<'a>,
+    verify_block: &'a IRVerify,
+    config: &'a VerifyConfig,
+    bound: usize,
+    pool: &'a SlotPool,
+    fire_tracking: &'a harness::FireTracking,
+    lasso: &'a harness::LassoLoop,
+}
 
-    // ── 5. Fairness constraints ─────────────────────────────────────
-    for c in encoding.fairness_constraints() {
-        solver.assert(c);
-    }
-
-    // ── 6. Check each liveness assert independently ────────────────
-    // Each assert is checked separately — if ANY assert is violated,
-    // the verify block fails. This matches standard semantics: each
-    // assert is an independent obligation.
-    for assert_expr in &verify_block.asserts {
-        let expanded = expand_through_defs(assert_expr, defs);
+fn check_lasso_asserts(
+    ctx: &LassoCheckCtx<'_>,
+    solver: &AbideSolver,
+) -> Option<VerificationResult> {
+    for assert_expr in &ctx.verify_block.asserts {
+        let expanded = expand_through_defs(assert_expr, ctx.defs);
         let violation = match encode_lasso_liveness_violation(
-            pool,
-            vctx,
-            defs,
+            ctx.pool,
+            ctx.vctx,
+            ctx.defs,
             &expanded,
-            &lasso.loop_indicators,
-            bound,
+            &ctx.lasso.loop_indicators,
+            ctx.bound,
         ) {
-            Ok(v) => v,
+            Ok(violation) => violation,
             Err(msg) => {
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: format!("lasso encoding error: {msg}"),
-                    span: expr_span(assert_expr),
-                    file: None,
-                };
+                return Some(verify_unprovable(
+                    ctx.verify_block,
+                    format!("lasso encoding error: {msg}"),
+                    expr_span(assert_expr),
+                ));
             }
         };
 
-        // Skip non-liveness asserts (violation is false)
-        // Check: push violation, check SAT, pop
         solver.push();
         solver.assert(&violation);
-
-        match solver.check() {
-            SatResult::Sat => {
-                // Found a lasso violating this assert
-                let Some(model) = solver.get_model() else {
-                    solver.pop();
-                    return VerificationResult::Unprovable {
-                        name: verify_block.name.clone(),
-                        hint: "solver reported sat for liveness check but did not provide a model"
-                            .to_owned(),
-                        span: expr_span(assert_expr),
-                        file: None,
-                    };
-                };
-                let mut loop_start = 0;
-                for (l, ind) in lasso.loop_indicators.iter().enumerate() {
-                    if let Some(true) = model.eval(ind, true).and_then(|v| v.as_bool()) {
-                        loop_start = l;
-                        break;
-                    }
-                }
-
-                let evidence = match config.witness_semantics {
-                    WitnessSemantics::Operational => extract_operational_liveness_with_fire(
-                        &solver,
-                        pool,
-                        vctx,
-                        system.relevant_entities(),
-                        system.relevant_systems(),
-                        fire_tracking,
-                        bound,
-                        loop_start,
-                    )
-                    .and_then(operational_evidence),
-                    WitnessSemantics::Relational => extract_relational_liveness(
-                        &solver,
-                        pool,
-                        vctx,
-                        system.relevant_entities(),
-                        system.relevant_systems(),
-                        bound,
-                        loop_start,
-                    )
-                    .and_then(relational_evidence),
-                };
-                let (evidence, evidence_extraction_error) = match evidence {
-                    Ok(evidence) => (Some(evidence), None),
-                    Err(err) => (None, Some(err)),
-                };
-                let fairness_analysis = extract_fairness_analysis(
-                    &solver,
-                    pool,
-                    vctx,
-                    system.relevant_entities(),
-                    system.relevant_systems(),
-                    fire_tracking,
-                    loop_start,
-                    bound,
-                    &verify_block.assumption_set,
-                );
-
-                return VerificationResult::LivenessViolation {
-                    name: verify_block.name.clone(),
-                    evidence,
-                    evidence_extraction_error,
-                    loop_start,
-                    fairness_analysis,
-                    assumptions: build_assumptions_for_system_scope(
-                        ir,
-                        &verify_block
-                            .systems
-                            .iter()
-                            .map(|s| s.name.clone())
-                            .collect::<Vec<_>>(),
-                        &verify_block.assumption_set,
-                        &[],
-                    ),
-                    span: expr_span(assert_expr),
-                    file: None,
-                };
-            }
-            SatResult::Unknown(_) => {
-                solver.pop();
-                return VerificationResult::Unprovable {
-                    name: verify_block.name.clone(),
-                    hint: crate::messages::BMC_UNKNOWN.to_owned(),
-                    span: expr_span(assert_expr),
-                    file: None,
-                };
-            }
-            SatResult::Unsat => {
-                solver.pop();
-                // This assert passes — continue to next
-            }
+        let result = match solver.check() {
+            SatResult::Sat => Some(lasso_violation_result(ctx, solver, assert_expr)),
+            SatResult::Unknown(_) => Some(verify_unprovable(
+                ctx.verify_block,
+                crate::messages::BMC_UNKNOWN.to_owned(),
+                expr_span(assert_expr),
+            )),
+            SatResult::Unsat => None,
+        };
+        solver.pop();
+        if result.is_some() {
+            return result;
         }
     }
+    None
+}
 
-    // All asserts passed
-    let elapsed = elapsed_ms(&start);
-    VerificationResult::Checked {
-        name: verify_block.name.clone(),
-        depth: bound,
-        method: None,
-        time_ms: elapsed,
-        assumptions: build_assumptions_for_system_scope(
-            ir,
-            &verify_block
-                .systems
-                .iter()
-                .map(|s| s.name.clone())
-                .collect::<Vec<_>>(),
-            &verify_block.assumption_set,
-            &[],
-        ),
-        backend_diagnostics: vec![],
-        span: None,
+fn lasso_violation_result(
+    ctx: &LassoCheckCtx<'_>,
+    solver: &AbideSolver,
+    assert_expr: &IRExpr,
+) -> VerificationResult {
+    let Some(loop_start) = lasso_model_loop_start(solver, &ctx.lasso.loop_indicators) else {
+        return verify_unprovable(
+            ctx.verify_block,
+            "solver reported sat for liveness check but did not provide a model".to_owned(),
+            expr_span(assert_expr),
+        );
+    };
+    let evidence = lasso_evidence(ctx, solver, loop_start);
+    let (evidence, evidence_extraction_error) = match evidence {
+        Ok(evidence) => (Some(evidence), None),
+        Err(err) => (None, Some(err)),
+    };
+    VerificationResult::LivenessViolation {
+        name: ctx.verify_block.name.clone(),
+        evidence,
+        evidence_extraction_error,
+        loop_start,
+        fairness_analysis: extract_fairness_analysis(FairnessAnalysisCtx {
+            witness: lasso_witness_ctx(ctx, solver),
+            fire_tracking: ctx.fire_tracking,
+            loop_start,
+            bound: ctx.bound,
+            assumption_set: &ctx.verify_block.assumption_set,
+        }),
+        assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
+        span: expr_span(assert_expr),
         file: None,
+    }
+}
+
+fn lasso_model_loop_start(solver: &AbideSolver, loop_indicators: &[Bool]) -> Option<usize> {
+    let model = solver.get_model()?;
+    for (loop_start, indicator) in loop_indicators.iter().enumerate() {
+        if let Some(true) = model
+            .eval(indicator, true)
+            .and_then(|value| value.as_bool())
+        {
+            return Some(loop_start);
+        }
+    }
+    Some(0)
+}
+
+fn lasso_evidence(
+    ctx: &LassoCheckCtx<'_>,
+    solver: &AbideSolver,
+    loop_start: usize,
+) -> Result<EvidenceEnvelope, String> {
+    match ctx.config.witness_semantics {
+        WitnessSemantics::Operational => extract_operational_liveness_with_fire(
+            &lasso_witness_ctx(ctx, solver),
+            ctx.fire_tracking,
+            ctx.bound,
+            loop_start,
+        )
+        .and_then(operational_evidence),
+        WitnessSemantics::Relational => extract_relational_liveness(
+            solver,
+            ctx.pool,
+            ctx.vctx,
+            ctx.system.relevant_entities(),
+            ctx.system.relevant_systems(),
+            ctx.bound,
+            loop_start,
+        )
+        .and_then(relational_evidence),
+    }
+}
+
+fn lasso_witness_ctx<'a>(
+    ctx: &'a LassoCheckCtx<'a>,
+    solver: &'a AbideSolver,
+) -> WitnessExtractionCtx<'a> {
+    WitnessExtractionCtx {
+        solver,
+        pool: ctx.pool,
+        vctx: ctx.vctx,
+        entities: ctx.system.relevant_entities(),
+        systems: ctx.system.relevant_systems(),
     }
 }
 
@@ -5043,105 +5277,32 @@ fn exactly_one_bool(vars: &[Bool]) -> Bool {
 /// nullary defs with their bodies, and App chains matching parameterized defs
 /// with their beta-reduced bodies. Used to resolve pred/prop references in
 /// given constraints before scanning for field references.
-#[allow(clippy::too_many_lines)]
 pub(super) fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
+    if let Some(expanded) = expand_direct_def(expr, defs) {
+        return expand_through_defs(&expanded, defs);
+    }
+    expand_expr_node(expr, defs)
+}
+
+fn expand_direct_def(expr: &IRExpr, defs: &defenv::DefEnv) -> Option<IRExpr> {
     if let IRExpr::Var { name, .. } = expr {
         if let Some(expanded) = defs.expand_var(name) {
-            return expand_through_defs(&expanded, defs);
+            return Some(expanded);
         }
     }
     if let IRExpr::App { .. } = expr {
         if let Some(expanded) = defs.expand_app(expr) {
-            return expand_through_defs(&expanded, defs);
+            return Some(expanded);
         }
     }
+    None
+}
+
+fn expand_expr_node(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
+    if let Some(expanded) = expand_basic_expr_node(expr, defs) {
+        return expanded;
+    }
     match expr {
-        IRExpr::BinOp {
-            op,
-            left,
-            right,
-            ty,
-            ..
-        } => IRExpr::BinOp {
-            op: op.clone(),
-            left: Box::new(expand_through_defs(left, defs)),
-            right: Box::new(expand_through_defs(right, defs)),
-            ty: ty.clone(),
-            span: None,
-        },
-        IRExpr::UnOp {
-            op, operand, ty, ..
-        } => IRExpr::UnOp {
-            op: op.clone(),
-            operand: Box::new(expand_through_defs(operand, defs)),
-            ty: ty.clone(),
-            span: None,
-        },
-        IRExpr::Forall {
-            var, domain, body, ..
-        } => IRExpr::Forall {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Exists {
-            var, domain, body, ..
-        } => IRExpr::Exists {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::One {
-            var, domain, body, ..
-        } => IRExpr::One {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Lone {
-            var, domain, body, ..
-        } => IRExpr::Lone {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Always { body, .. } => IRExpr::Always {
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Eventually { body, .. } => IRExpr::Eventually {
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Until { left, right, .. } => IRExpr::Until {
-            left: Box::new(expand_through_defs(left, defs)),
-            right: Box::new(expand_through_defs(right, defs)),
-            span: None,
-        },
-        // / — past-time temporal operators recurse
-        // through `expand_through_defs` so prop/pred references inside
-        // them are visible to the BMC encoder.
-        IRExpr::Historically { body, .. } => IRExpr::Historically {
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Once { body, .. } => IRExpr::Once {
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Previously { body, .. } => IRExpr::Previously {
-            body: Box::new(expand_through_defs(body, defs)),
-            span: None,
-        },
-        IRExpr::Since { left, right, .. } => IRExpr::Since {
-            left: Box::new(expand_through_defs(left, defs)),
-            right: Box::new(expand_through_defs(right, defs)),
-            span: None,
-        },
         IRExpr::Field {
             expr: inner,
             field,
@@ -5271,6 +5432,103 @@ pub(super) fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExp
         },
         _ => expr.clone(),
     }
+}
+
+fn expand_basic_expr_node(expr: &IRExpr, defs: &defenv::DefEnv) -> Option<IRExpr> {
+    Some(match expr {
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            ..
+        } => IRExpr::BinOp {
+            op: op.clone(),
+            left: expand_box(left, defs),
+            right: expand_box(right, defs),
+            ty: ty.clone(),
+            span: None,
+        },
+        IRExpr::UnOp {
+            op, operand, ty, ..
+        } => IRExpr::UnOp {
+            op: op.clone(),
+            operand: expand_box(operand, defs),
+            ty: ty.clone(),
+            span: None,
+        },
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => IRExpr::Exists {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::One {
+            var, domain, body, ..
+        } => IRExpr::One {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => IRExpr::Lone {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Always { body, .. } => IRExpr::Always {
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Eventually { body, .. } => IRExpr::Eventually {
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Until { left, right, .. } => IRExpr::Until {
+            left: expand_box(left, defs),
+            right: expand_box(right, defs),
+            span: None,
+        },
+        IRExpr::Historically { body, .. } => IRExpr::Historically {
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Once { body, .. } => IRExpr::Once {
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Previously { body, .. } => IRExpr::Previously {
+            body: expand_box(body, defs),
+            span: None,
+        },
+        IRExpr::Since { left, right, .. } => IRExpr::Since {
+            left: expand_box(left, defs),
+            right: expand_box(right, defs),
+            span: None,
+        },
+        IRExpr::Prime { expr: inner, .. } => IRExpr::Prime {
+            expr: expand_box(inner, defs),
+            span: None,
+        },
+        _ => return None,
+    })
+}
+
+fn expand_box(expr: &IRExpr, defs: &defenv::DefEnv) -> Box<IRExpr> {
+    Box::new(expand_through_defs(expr, defs))
 }
 
 /// Collect variable names referenced in an IR expression (for scene var tracking).

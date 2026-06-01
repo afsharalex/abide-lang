@@ -14,10 +14,16 @@ use super::solver::cvc5_check_chc;
 use super::solver::z3_check_chc;
 
 /// User-facing CHC backend selection.
+///
+/// `Auto` picks the strongest available CHC backend (currently Z3's
+/// Spacer engine); `Z3`/`Cvc5` force a specific family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChcSelection {
+    /// Force Z3's Spacer.
     Z3,
+    /// Force CVC5's CHC engine.
     Cvc5,
+    /// Pick automatically (currently Z3).
     Auto,
 }
 

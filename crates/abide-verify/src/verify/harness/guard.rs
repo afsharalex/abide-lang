@@ -110,49 +110,39 @@ pub(crate) fn try_encode_guard_expr(
     try_encode_guard_inner(pool, vctx, &ctx, expr, step)
 }
 
+pub(super) struct SystemGuardScope<'a> {
+    pub step_params: &'a HashMap<String, SmtValue>,
+    pub system_name: &'a str,
+    pub entity_param_types: &'a HashMap<String, String>,
+    pub store_param_types: &'a HashMap<String, String>,
+}
+
 /// /14: encode guard with system field context and entity param types.
-#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) fn encode_guard_expr_for_system(
     pool: &SlotPool,
     vctx: &VerifyContext,
     expr: &IRExpr,
-    step_params: &HashMap<String, SmtValue>,
     step: usize,
-    system_name: &str,
-    entity_param_types: &HashMap<String, String>,
-    store_param_types: &HashMap<String, String>,
+    scope: SystemGuardScope<'_>,
 ) -> Bool {
-    try_encode_guard_expr_for_system(
-        pool,
-        vctx,
-        expr,
-        step_params,
-        step,
-        system_name,
-        entity_param_types,
-        store_param_types,
-    )
-    .unwrap_or_else(|msg| panic!("{msg}"))
+    try_encode_guard_expr_for_system(pool, vctx, expr, step, scope)
+        .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn try_encode_guard_expr_for_system(
     pool: &SlotPool,
     vctx: &VerifyContext,
     expr: &IRExpr,
-    step_params: &HashMap<String, SmtValue>,
     step: usize,
-    system_name: &str,
-    entity_param_types: &HashMap<String, String>,
-    store_param_types: &HashMap<String, String>,
+    scope: SystemGuardScope<'_>,
 ) -> Result<Bool, String> {
     let ctx = GuardCtx {
         bindings: HashMap::new(),
-        params: step_params.clone(),
-        system_name: system_name.to_owned(),
-        entity_param_types: entity_param_types.clone(),
-        store_param_types: store_param_types.clone(),
+        params: scope.step_params.clone(),
+        system_name: scope.system_name.to_owned(),
+        entity_param_types: scope.entity_param_types.clone(),
+        store_param_types: scope.store_param_types.clone(),
     };
     try_encode_guard_inner(pool, vctx, &ctx, expr, step)
 }

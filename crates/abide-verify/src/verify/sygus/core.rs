@@ -28,6 +28,20 @@ pub(super) struct PayloadAccessorInfo {
     ty: IRType,
 }
 
+pub(super) struct SygusTransitionScope<'a> {
+    pub(super) fields: &'a [IRField],
+    pub(super) derived_fields: &'a [IRDerivedField],
+    pub(super) fsm_decls: &'a [IRFsm],
+    pub(super) curr_vars: &'a HashMap<String, Cvc5Term>,
+    pub(super) next_vars: &'a HashMap<String, Cvc5Term>,
+    pub(super) enum_catalog: &'a EnumCatalog,
+}
+
+struct SygusExprEnv<'a> {
+    vars: &'a HashMap<String, Cvc5Term>,
+    enum_catalog: &'a EnumCatalog,
+}
+
 impl EnumCatalog {
     pub(super) fn new() -> Self {
         Self::default()
@@ -380,12 +394,14 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
             encode_transition(
                 &tm,
                 trans,
-                &entity.fields,
-                &entity.derived_fields,
-                &entity.fsm_decls,
-                &curr_vars,
-                &next_vars,
-                &enum_catalog,
+                SygusTransitionScope {
+                    fields: &entity.fields,
+                    derived_fields: &entity.derived_fields,
+                    fsm_decls: &entity.fsm_decls,
+                    curr_vars: &curr_vars,
+                    next_vars: &next_vars,
+                    enum_catalog: &enum_catalog,
+                },
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -739,13 +755,14 @@ pub(super) fn encode_initial_field(
 pub(super) fn encode_transition(
     tm: &Cvc5Tm,
     trans: &IRTransition,
-    fields: &[IRField],
-    derived_fields: &[IRDerivedField],
-    fsm_decls: &[IRFsm],
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
+    scope: SygusTransitionScope<'_>,
 ) -> Result<Cvc5Term, String> {
+    let fields = scope.fields;
+    let derived_fields = scope.derived_fields;
+    let fsm_decls = scope.fsm_decls;
+    let curr_vars = scope.curr_vars;
+    let next_vars = scope.next_vars;
+    let enum_catalog = scope.enum_catalog;
     if !trans.refs.is_empty() {
         return Err(format!(
             "cvc5 SyGuS single-entity safety does not support transition refs yet (`{}`)",
@@ -1339,16 +1356,17 @@ pub(super) fn one_like(tm: &Cvc5Tm, term: &Cvc5Term) -> Cvc5Term {
     }
 }
 
-pub(super) fn encode_finite_aggregate_expr(
+fn encode_finite_aggregate_expr(
     tm: &Cvc5Tm,
     kind: crate::ir::types::IRAggKind,
     var: &str,
     domain: &IRType,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
-    vars: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
+    env: SygusExprEnv<'_>,
 ) -> Result<Cvc5Term, String> {
+    let vars = env.vars;
+    let enum_catalog = env.enum_catalog;
     let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
         return Err(
             "cvc5 SyGuS only supports finite Bool/enum domains for finite aggregates".to_owned(),
@@ -2713,8 +2731,7 @@ pub(super) fn encode_expr(
             domain,
             body,
             in_filter.as_deref(),
-            vars,
-            enum_catalog,
+            SygusExprEnv { vars, enum_catalog },
         ),
         IRExpr::Card { expr: inner, .. } => {
             encode_finite_card_expr(tm, inner, vars, enum_catalog, |expr, scoped| {

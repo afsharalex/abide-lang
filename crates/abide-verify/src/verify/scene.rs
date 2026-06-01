@@ -12,7 +12,9 @@ use abide_witness::{op, EvidenceEnvelope, WitnessEnvelope};
 
 use super::smt::{self, AbideSolver, Bool, Int, SatResult};
 
-use crate::ir::types::{IRExpr, IRProgram, IRScene, IRSceneEvent, IRSceneGiven, IRSystemAction};
+use crate::ir::types::{
+    IREntity, IRExpr, IRProgram, IRScene, IRSceneEvent, IRSceneGiven, IRSystem, IRSystemAction,
+};
 
 use super::context::VerifyContext;
 use super::defenv;
@@ -37,6 +39,84 @@ use super::{
 use super::{VerificationResult, VerifyConfig};
 
 // ── Scene helpers ────────────────────────────────────────────────────
+
+struct SceneOneBindingCtx<'a> {
+    pool: &'a harness::SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    store_ranges: &'a HashMap<String, (String, usize, usize)>,
+    property_store_ranges: &'a HashMap<String, VerifyStoreRange>,
+    prior_bindings: &'a HashMap<String, (String, usize)>,
+}
+
+struct SceneScopePlan {
+    bound: usize,
+    some_budget: usize,
+    scope: HashMap<String, usize>,
+    relevant_entities: Vec<IREntity>,
+    relevant_systems: Vec<IRSystem>,
+}
+
+struct SceneStores {
+    raw: HashMap<String, (String, usize, usize)>,
+    property: HashMap<String, VerifyStoreRange>,
+}
+
+struct SceneBindings {
+    given: HashMap<String, (String, usize)>,
+    next_slot: HashMap<String, usize>,
+    store_next_slot: HashMap<String, usize>,
+}
+
+struct SceneInitCtx<'a> {
+    scene: &'a IRScene,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    pool: &'a harness::SlotPool,
+    solver: &'a AbideSolver,
+    relevant_entities: &'a [IREntity],
+    stores: &'a SceneStores,
+}
+
+struct EventCard {
+    n_instances: usize,
+    min_fires: usize,
+    has_fire_tracking: bool,
+}
+
+struct SceneFiringPlan<'a> {
+    resolved_events: Vec<ResolvedSceneEvent<'a>>,
+    event_var_names: Vec<String>,
+    event_cards: Vec<EventCard>,
+    event_instance_ranges: Vec<std::ops::Range<usize>>,
+    instances: Vec<FiringInst>,
+}
+
+struct SceneGroupPlan {
+    inst_group: Vec<usize>,
+    inst_group_roots: Vec<usize>,
+}
+
+struct SceneScheduleCtx<'a> {
+    scene: &'a IRScene,
+    solver: &'a AbideSolver,
+    relevant_systems: &'a [IRSystem],
+}
+
+struct SceneTransitionCtx<'a> {
+    scene: &'a IRScene,
+    pool: &'a harness::SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    solver: &'a AbideSolver,
+    relevant_entities: &'a [IREntity],
+    relevant_systems: &'a [IRSystem],
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
+    given_bindings: &'a HashMap<String, (String, usize)>,
+    bound: usize,
+}
+
+type SceneCheckResult<T> = Result<T, Box<VerificationResult>>;
 
 /// Collect event indices referenced by ^| (exclusive choice) in ordering expressions.
 pub(super) fn collect_xor_event_indices(
@@ -354,17 +434,33 @@ pub(super) struct ResolvedSceneEvent<'a> {
     steps: Vec<&'a IRSystemAction>,
 }
 
+pub(super) struct SceneEventParamCtx<'a> {
+    pool: &'a harness::SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    given_bindings: &'a HashMap<String, (String, usize)>,
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
+    step: usize,
+}
+
+struct SceneEvidenceCtx<'a> {
+    solver: &'a AbideSolver,
+    pool: &'a harness::SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    relevant_entities: &'a [crate::ir::types::IREntity],
+    relevant_systems: &'a [crate::ir::types::IRSystem],
+    resolved_events: &'a [ResolvedSceneEvent<'a>],
+    instances: &'a [FiringInst],
+    given_bindings: &'a HashMap<String, (String, usize)>,
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
+    bound: usize,
+}
+
 /// Build `override_params` for a scene event at a given step.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_scene_event_params(
     re: &ResolvedSceneEvent<'_>,
-    pool: &harness::SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    given_bindings: &HashMap<String, (String, usize)>,
-    store_ranges: &HashMap<String, VerifyStoreRange>,
-    step: usize,
-    _scene_name: &str,
+    ctx: &SceneEventParamCtx<'_>,
 ) -> Result<HashMap<String, SmtValue>, String> {
     let mut override_params: HashMap<String, SmtValue> = HashMap::new();
     // Use the first step for param metadata (all steps share the same
@@ -376,7 +472,7 @@ pub(super) fn build_scene_event_params(
             IRExpr::Var { name: arg_name, .. },
         ) = (&param.ty, arg)
         {
-            if let Some((arg_entity, slot)) = given_bindings.get(arg_name) {
+            if let Some((arg_entity, slot)) = ctx.given_bindings.get(arg_name) {
                 if arg_entity != param_entity {
                     return Err(format!(
                         "entity type mismatch in scene event arg for {}::{}: \
@@ -389,30 +485,33 @@ pub(super) fn build_scene_event_params(
             }
         }
 
-        let arg_ctx = PropertyCtx::new().with_store_ranges(store_ranges.clone());
-        let arg_ctx = given_bindings
+        let arg_ctx = PropertyCtx::new().with_store_ranges(ctx.store_ranges.clone());
+        let arg_ctx = ctx
+            .given_bindings
             .iter()
             .fold(arg_ctx, |ctx, (var, (ent, slot))| {
                 ctx.with_binding(var, ent, *slot)
             });
-        if let Some(val) = encode_scene_direct_choose_arg(pool, vctx, defs, &arg_ctx, arg, step)
-            .map_err(|msg| {
-                format!(
-                    "encoding error in scene event arg for {}::{}: {msg}",
-                    re.scene_event.system, re.scene_event.event
-                )
-            })?
+        if let Some(val) =
+            encode_scene_direct_choose_arg(ctx.pool, ctx.vctx, ctx.defs, &arg_ctx, arg, ctx.step)
+                .map_err(|msg| {
+                    format!(
+                        "encoding error in scene event arg for {}::{}: {msg}",
+                        re.scene_event.system, re.scene_event.event
+                    )
+                })?
         {
             override_params.insert(param.name.clone(), val);
             continue;
         }
-        let (val, constraints) = encode_prop_value_with_ctx(pool, vctx, defs, &arg_ctx, arg, step)
-            .map_err(|msg| {
-                format!(
-                    "encoding error in scene event arg for {}::{}: {msg}",
-                    re.scene_event.system, re.scene_event.event
-                )
-            })?;
+        let (val, constraints) =
+            encode_prop_value_with_ctx(ctx.pool, ctx.vctx, ctx.defs, &arg_ctx, arg, ctx.step)
+                .map_err(|msg| {
+                    format!(
+                        "encoding error in scene event arg for {}::{}: {msg}",
+                        re.scene_event.system, re.scene_event.event
+                    )
+                })?;
         if !constraints.is_empty() {
             return Err(format!(
                 "scene event args do not yet support choose witness constraints for {}::{}",
@@ -472,38 +571,26 @@ fn encode_scene_direct_choose_arg(
     Ok(Some(value))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scene_pass_evidence(
-    solver: &AbideSolver,
-    pool: &harness::SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    relevant_entities: &[crate::ir::types::IREntity],
-    relevant_systems: &[crate::ir::types::IRSystem],
-    resolved_events: &[ResolvedSceneEvent<'_>],
-    instances: &[FiringInst],
-    given_bindings: &HashMap<String, (String, usize)>,
-    store_ranges: &HashMap<String, VerifyStoreRange>,
-    bound: usize,
-) -> Result<EvidenceEnvelope, String> {
-    let model = solver
+fn scene_pass_evidence(ctx: &SceneEvidenceCtx<'_>) -> Result<EvidenceEnvelope, String> {
+    let model = ctx
+        .solver
         .get_model()
         .ok_or_else(|| "solver did not provide a model for scene witness extraction".to_owned())?;
     let mut behavior = op::Behavior::builder();
-    for step in 0..=bound {
+    for step in 0..=ctx.bound {
         behavior = behavior.state(extract_state_from_model(
             &model,
-            pool,
-            vctx,
-            relevant_entities,
-            relevant_systems,
+            ctx.pool,
+            ctx.vctx,
+            ctx.relevant_entities,
+            ctx.relevant_systems,
             step,
         )?);
 
-        if step < bound {
+        if step < ctx.bound {
             let mut transition = op::Transition::builder();
             let mut selected = 0usize;
-            for inst in instances {
+            for inst in ctx.instances {
                 let Some(inst_step) = model
                     .eval(&inst.step_var, true)
                     .and_then(|value| value.as_i64())
@@ -519,17 +606,18 @@ fn scene_pass_evidence(
                         continue;
                     };
                 }
-                let re = &resolved_events[inst.event_idx];
+                let re = &ctx.resolved_events[inst.event_idx];
                 let step_ir = re.steps[0];
                 let params = build_scene_event_params(
                     re,
-                    pool,
-                    vctx,
-                    defs,
-                    given_bindings,
-                    store_ranges,
-                    step,
-                    "<scene>",
+                    &SceneEventParamCtx {
+                        pool: ctx.pool,
+                        vctx: ctx.vctx,
+                        defs: ctx.defs,
+                        given_bindings: ctx.given_bindings,
+                        store_ranges: ctx.store_ranges,
+                        step,
+                    },
                 )?;
                 let step_id = op::AtomicStepId::new(format!(
                     "{step}:{}::{}#{}",
@@ -549,7 +637,7 @@ fn scene_pass_evidence(
                         let value = extract_witness_value(
                             &model,
                             value,
-                            &vctx.variants,
+                            &ctx.vctx.variants,
                             &param.ty,
                         )
                         .map_err(|err| {
@@ -641,17 +729,15 @@ pub(super) fn first_ordering_var(
 }
 
 fn encode_scene_one_binding_uniqueness(
-    pool: &harness::SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    scene_store_ranges: &HashMap<String, (String, usize, usize)>,
-    scene_property_store_ranges: &HashMap<String, VerifyStoreRange>,
-    prior_given_bindings: &HashMap<String, (String, usize)>,
+    ctx: SceneOneBindingCtx<'_>,
     given: &IRSceneGiven,
     step: usize,
 ) -> Result<Bool, String> {
+    let pool = ctx.pool;
+    let vctx = ctx.vctx;
+    let defs = ctx.defs;
     let candidate_slots: Vec<usize> = if let Some(store_name) = &given.store_name {
-        let Some((store_entity, start, count)) = scene_store_ranges.get(store_name) else {
+        let Some((store_entity, start, count)) = ctx.store_ranges.get(store_name) else {
             return Err(format!(
                 "unknown store '{store_name}' in given for {}",
                 given.var
@@ -669,8 +755,8 @@ fn encode_scene_one_binding_uniqueness(
     };
 
     let base_ctx = PropertyCtx::new()
-        .with_store_ranges(scene_property_store_ranges.clone())
-        .with_given_bindings(prior_given_bindings);
+        .with_store_ranges(ctx.property_store_ranges.clone())
+        .with_given_bindings(ctx.prior_bindings);
     let zero = smt::int_lit(0);
     let one = smt::int_lit(1);
     let mut terms = Vec::new();
@@ -699,7 +785,6 @@ fn encode_scene_one_binding_uniqueness(
 /// 3. When: encode each event at its step (ordering from assume)
 /// 4. Then: assert all then-expressions at the final step
 /// 5. SAT → `ScenePass`, UNSAT → `SceneFail`
-#[allow(clippy::too_many_lines)]
 pub(super) fn check_scene_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -709,170 +794,282 @@ pub(super) fn check_scene_block(
     deadline: Option<Instant>,
 ) -> VerificationResult {
     let start = Instant::now();
-    let n_events = scene.events.len();
+    let scope = match build_scene_scope(ir, scene) {
+        Ok(scope) => scope,
+        Err(result) => return *result,
+    };
+    let pool = create_slot_pool_with_systems(
+        &scope.relevant_entities,
+        &scope.scope,
+        scope.bound,
+        &scope.relevant_systems,
+    );
+    let solver = match scene_solver(scene, config, deadline) {
+        Ok(solver) => solver,
+        Err(result) => return *result,
+    };
+    assert_scene_domain_constraints(&pool, vctx, &scope.relevant_entities, &solver);
 
-    // Compute bound from cardinalities: total number of firing instances.
-    // This must happen before pool/scope creation so they have enough capacity.
-    let some_budget = n_events.max(2);
-    let bound = {
-        let mut total: usize = 0;
-        for scene_event in &scene.events {
-            total += match &scene_event.cardinality {
-                crate::ir::types::Cardinality::Named(c) => match c.as_str() {
-                    "one" | "lone" => 1,
-                    "no" => 0,
-                    "some" => some_budget,
-                    _ => 1,
-                },
-                crate::ir::types::Cardinality::Exact { exactly } => *exactly as usize,
-            };
-        }
-        total.max(1)
+    let stores = scene_store_ranges(scene);
+    let mut bindings = match encode_scene_initial_state(&SceneInitCtx {
+        scene,
+        vctx,
+        defs,
+        pool: &pool,
+        solver: &solver,
+        relevant_entities: &scope.relevant_entities,
+        stores: &stores,
+    }) {
+        Ok(bindings) => bindings,
+        Err(result) => return *result,
     };
 
-    // ── 1. Build scope from scene systems ──────────────────────────
-    // Each given binding needs one slot. Each entity type referenced
-    // needs at least as many slots as given bindings of that type.
-    let mut scope: HashMap<String, usize> = HashMap::new();
-    let mut system_names: Vec<String> = scene.systems.clone();
+    let plan = match build_scene_firing_plan(
+        scene,
+        defs,
+        &scope.relevant_systems,
+        &mut bindings,
+        scope.some_budget,
+    ) {
+        Ok(plan) => plan,
+        Err(result) => return *result,
+    };
+    debug_assert_eq!(
+        plan.instances.len().max(1),
+        scope.bound,
+        "instance count should match pre-computed bound"
+    );
 
-    // Size entities from per-store declarations (SUM for same-entity-type
-    // stores so each store gets its own slot range).
+    let groups = match assert_scene_schedule_constraints(
+        &SceneScheduleCtx {
+            scene,
+            solver: &solver,
+            relevant_systems: &scope.relevant_systems,
+        },
+        &plan,
+        scope.bound,
+    ) {
+        Ok(groups) => groups,
+        Err(result) => return *result,
+    };
+
+    let transition_ctx = SceneTransitionCtx {
+        scene,
+        pool: &pool,
+        vctx,
+        defs,
+        solver: &solver,
+        relevant_entities: &scope.relevant_entities,
+        relevant_systems: &scope.relevant_systems,
+        store_ranges: &stores.property,
+        given_bindings: &bindings.given,
+        bound: scope.bound,
+    };
+    if let Err(result) = assert_scene_step_transitions(&transition_ctx, &plan, &groups) {
+        return *result;
+    }
+
+    assert_scene_result_activation(scene, &pool, &solver, &bindings.given, &plan, scope.bound);
+    let then_ctx = match assert_scene_then_assertions(&transition_ctx) {
+        Ok(ctx) => ctx,
+        Err(result) => return *result,
+    };
+
+    let elapsed = elapsed_ms(&start);
+
+    match solver.check() {
+        result @ SatResult::Sat => {
+            let evidence = scene_pass_evidence(&SceneEvidenceCtx {
+                solver: &solver,
+                pool: &pool,
+                vctx,
+                defs,
+                relevant_entities: &scope.relevant_entities,
+                relevant_systems: &scope.relevant_systems,
+                resolved_events: &plan.resolved_events,
+                instances: &plan.instances,
+                given_bindings: &bindings.given,
+                store_ranges: &then_ctx.store_ranges,
+                bound: scope.bound,
+            })
+            .ok();
+            scene_solver_result(scene, result, elapsed, evidence)
+        }
+        result @ (SatResult::Unsat | SatResult::Unknown(_)) => {
+            scene_solver_result(scene, result, elapsed, None)
+        }
+    }
+}
+
+fn scene_fail(
+    scene: &IRScene,
+    reason: String,
+    span: Option<crate::span::Span>,
+) -> Box<VerificationResult> {
+    Box::new(VerificationResult::SceneFail {
+        name: scene.name.clone(),
+        reason,
+        span,
+        file: None,
+    })
+}
+
+fn scene_event_bound(scene: &IRScene) -> (usize, usize) {
+    let some_budget = scene.events.len().max(2);
+    let total = scene.events.iter().fold(0usize, |acc, event| {
+        acc + match &event.cardinality {
+            crate::ir::types::Cardinality::Named(cardinality) => match cardinality.as_str() {
+                "one" | "lone" => 1,
+                "no" => 0,
+                "some" => some_budget,
+                _ => 1,
+            },
+            crate::ir::types::Cardinality::Exact { exactly } => *exactly as usize,
+        }
+    });
+    (total.max(1), some_budget)
+}
+
+fn build_scene_scope(ir: &IRProgram, scene: &IRScene) -> SceneCheckResult<SceneScopePlan> {
+    let (bound, some_budget) = scene_event_bound(scene);
+    let mut scope = initial_scene_scope(scene);
+    let mut system_names = scene_system_names(scene);
+    expand_scene_system_scope(ir, scene, bound, &mut scope, &mut system_names);
+    if scope.is_empty() {
+        return Err(scene_fail(
+            scene,
+            crate::messages::SCENE_EMPTY_SCOPE.to_owned(),
+            None,
+        ));
+    }
+    let relevant_entities = ir
+        .entities
+        .iter()
+        .filter(|entity| scope.contains_key(&entity.name))
+        .cloned()
+        .collect();
+    let relevant_systems = ir
+        .systems
+        .iter()
+        .filter(|system| system_names.contains(&system.name))
+        .cloned()
+        .collect();
+    Ok(SceneScopePlan {
+        bound,
+        some_budget,
+        scope,
+        relevant_entities,
+        relevant_systems,
+    })
+}
+
+fn initial_scene_scope(scene: &IRScene) -> HashMap<String, usize> {
+    let mut scope = HashMap::new();
     for store in &scene.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let hi = store.hi.max(1) as usize;
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         scope.insert(store.entity_type.clone(), existing + hi);
     }
-
-    // Count given bindings per entity type
     for given in &scene.givens {
-        let entry = scope.entry(given.entity.clone()).or_insert(0);
-        *entry += 1;
+        *scope.entry(given.entity.clone()).or_insert(0) += 1;
     }
+    scope
+}
 
-    // Include systems referenced directly in scene events (not just the 'for' clause)
+fn scene_system_names(scene: &IRScene) -> Vec<String> {
+    let mut system_names = scene.systems.clone();
     for scene_event in &scene.events {
         if !system_names.contains(&scene_event.system) {
             system_names.push(scene_event.system.clone());
         }
     }
-    for ordering_expr in &scene.ordering {
-        collect_saw_systems_expr(ordering_expr, &mut system_names);
+    for expr in scene
+        .ordering
+        .iter()
+        .chain(scene.assertions.iter())
+        .chain(scene.given_constraints.iter())
+    {
+        collect_saw_systems_expr(expr, &mut system_names);
     }
-    for assertion_expr in &scene.assertions {
-        collect_saw_systems_expr(assertion_expr, &mut system_names);
-    }
-    for given_expr in &scene.given_constraints {
-        collect_saw_systems_expr(given_expr, &mut system_names);
-    }
+    system_names
+}
 
-    // Expand from systems — ensure all system entities are in scope.
-    // Also follow CrossCalls transitively. Non-given entities need enough
-    // slots for creates during the scenario. Use the bound (total firing
-    // instances) which accounts for multi-fire cardinalities like {2}/{some}.
+fn expand_scene_system_scope(
+    ir: &IRProgram,
+    scene: &IRScene,
+    bound: usize,
+    scope: &mut HashMap<String, usize>,
+    system_names: &mut Vec<String>,
+) {
     let default_slots = bound.max(1);
     let mut systems_to_scan = system_names.clone();
-    let mut scanned: HashSet<String> = HashSet::new();
+    let mut scanned = HashSet::new();
     while let Some(sys_name) = systems_to_scan.pop() {
         if !scanned.insert(sys_name.clone()) {
             continue;
         }
-        if let Some(sys) = ir.systems.iter().find(|s| s.name == sys_name) {
-            if !system_names.contains(&sys.name) {
-                system_names.push(sys.name.clone());
-            }
-            for event in &sys.actions {
-                collect_crosscall_systems(&event.body, &mut systems_to_scan);
-            }
-            // Follow let bindings (program composition): a program's
-            // let bindings define which systems it composes, so the
-            // verifier must include those systems in scope.
-            for lb in &sys.let_bindings {
-                if !systems_to_scan.contains(&lb.system_type) {
-                    systems_to_scan.push(lb.system_type.clone());
-                }
-            }
-            for ent_name in &sys.entities {
-                // Ensure enough slots for given bindings PLUS potential creates.
-                // Given bindings occupy fixed slots at step 0; creates need
-                // additional inactive slots. So total = given_count + default_slots.
-                let given_count = scene
-                    .givens
-                    .iter()
-                    .filter(|g| g.entity == *ent_name)
-                    .count();
-                let needed = given_count + default_slots;
-                let entry = scope.entry(ent_name.clone()).or_insert(0);
-                *entry = (*entry).max(needed);
-            }
-        }
-    }
-
-    if scope.is_empty() {
-        return VerificationResult::SceneFail {
-            name: scene.name.clone(),
-            reason: crate::messages::SCENE_EMPTY_SCOPE.to_owned(),
-            span: None,
-            file: None,
+        let Some(sys) = ir.systems.iter().find(|system| system.name == sys_name) else {
+            continue;
         };
-    }
-
-    let relevant_entities: Vec<_> = ir
-        .entities
-        .iter()
-        .filter(|e| scope.contains_key(&e.name))
-        .cloned()
-        .collect();
-
-    let relevant_systems: Vec<_> = ir
-        .systems
-        .iter()
-        .filter(|s| system_names.contains(&s.name))
-        .cloned()
-        .collect();
-
-    // ── 2. Create pool and solver ──────────────────────────────────
-    let pool = create_slot_pool_with_systems(&relevant_entities, &scope, bound, &relevant_systems);
-    let solver = AbideSolver::new();
-    if let Some(timeout_ms) = clamp_timeout_to_deadline(config.bmc_timeout_ms, deadline) {
-        if timeout_ms > 0 {
-            solver.set_timeout(timeout_ms);
+        if !system_names.contains(&sys.name) {
+            system_names.push(sys.name.clone());
         }
-    } else {
-        return VerificationResult::Unprovable {
+        for event in &sys.actions {
+            collect_crosscall_systems(&event.body, &mut systems_to_scan);
+        }
+        for binding in &sys.let_bindings {
+            if !systems_to_scan.contains(&binding.system_type) {
+                systems_to_scan.push(binding.system_type.clone());
+            }
+        }
+        for ent_name in &sys.entities {
+            let given_count = scene
+                .givens
+                .iter()
+                .filter(|given| given.entity == *ent_name)
+                .count();
+            let needed = given_count + default_slots;
+            let entry = scope.entry(ent_name.clone()).or_insert(0);
+            *entry = (*entry).max(needed);
+        }
+    }
+}
+
+fn scene_solver(
+    scene: &IRScene,
+    config: &VerifyConfig,
+    deadline: Option<Instant>,
+) -> SceneCheckResult<AbideSolver> {
+    let solver = AbideSolver::new();
+    let Some(timeout_ms) = clamp_timeout_to_deadline(config.bmc_timeout_ms, deadline) else {
+        return Err(Box::new(VerificationResult::Unprovable {
             name: scene.name.clone(),
             hint: super::verification_timeout_hint(config),
             span: scene.span,
             file: scene.file.clone(),
-        };
-    }
-
-    // Domain constraints at every step
-    for c in domain_constraints(&pool, vctx, &relevant_entities) {
-        solver.assert(&c);
-    }
-
-    // ── 2b. Compute scene store ranges ─────────────────────────────
-    // Each store declaration gets a disjoint slot range within its entity
-    // pool. Stores of the same entity type are SUM'd (not max'd).
-    // store_name → (entity_type, start_slot, slot_count)
-    let scene_store_ranges: HashMap<String, (String, usize, usize)> = {
-        let mut ranges = HashMap::new();
-        let mut running: HashMap<String, usize> = HashMap::new(); // entity_type → next start
-        for store in &scene.stores {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let count = store.hi.max(1) as usize;
-            let start = running.get(&store.entity_type).copied().unwrap_or(0);
-            ranges.insert(
-                store.name.clone(),
-                (store.entity_type.clone(), start, count),
-            );
-            running.insert(store.entity_type.clone(), start + count);
-        }
-        ranges
+        }));
     };
-    let scene_property_store_ranges: HashMap<String, VerifyStoreRange> = scene_store_ranges
+    if timeout_ms > 0 {
+        solver.set_timeout(timeout_ms);
+    }
+    Ok(solver)
+}
+
+fn assert_scene_domain_constraints(
+    pool: &harness::SlotPool,
+    vctx: &VerifyContext,
+    relevant_entities: &[IREntity],
+    solver: &AbideSolver,
+) {
+    for constraint in domain_constraints(pool, vctx, relevant_entities) {
+        solver.assert(&constraint);
+    }
+}
+
+fn scene_store_ranges(scene: &IRScene) -> SceneStores {
+    let raw = raw_scene_store_ranges(scene);
+    let property = raw
         .iter()
         .map(|(store_name, (entity_type, start_slot, slot_count))| {
             (
@@ -881,1161 +1078,1394 @@ pub(super) fn check_scene_block(
                     entity_type: entity_type.clone(),
                     start_slot: *start_slot,
                     slot_count: *slot_count,
-                    min_active: scene
-                        .stores
-                        .iter()
-                        .find(|store| store.name == *store_name)
-                        .map(|store| usize::try_from(store.lo.max(0)).unwrap_or(usize::MAX))
-                        .unwrap_or(0),
-                    max_active: scene
-                        .stores
-                        .iter()
-                        .find(|store| store.name == *store_name)
-                        .map(|store| usize::try_from(store.hi.max(0)).unwrap_or(usize::MAX))
-                        .unwrap_or(*slot_count),
+                    min_active: scene_store_bound(scene, store_name, true).unwrap_or(0),
+                    max_active: scene_store_bound(scene, store_name, false).unwrap_or(*slot_count),
                 },
             )
         })
         .collect();
+    SceneStores { raw, property }
+}
 
-    // ── 3. Encode given bindings ───────────────────────────────────
-    // Each given binding activates one slot at step 0 and constrains its fields.
-    // Track which slot each given variable is bound to.
-    let mut given_bindings: HashMap<String, (String, usize)> = HashMap::new(); // var → (entity, slot)
-    let mut next_slot: HashMap<String, usize> = HashMap::new(); // entity → next available slot
-                                                                // Per-store slot tracking: store_name → next available slot within that store's range.
-    let mut store_next_slot: HashMap<String, usize> = HashMap::new();
+fn raw_scene_store_ranges(scene: &IRScene) -> HashMap<String, (String, usize, usize)> {
+    let mut ranges = HashMap::new();
+    let mut running: HashMap<String, usize> = HashMap::new();
+    for store in &scene.stores {
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let count = store.hi.max(1) as usize;
+        let start = running.get(&store.entity_type).copied().unwrap_or(0);
+        ranges.insert(
+            store.name.clone(),
+            (store.entity_type.clone(), start, count),
+        );
+        running.insert(store.entity_type.clone(), start + count);
+    }
+    ranges
+}
 
+fn scene_store_bound(scene: &IRScene, store_name: &str, lower: bool) -> Option<usize> {
+    scene
+        .stores
+        .iter()
+        .find(|store| store.name == store_name)
+        .map(|store| {
+            let value = if lower { store.lo } else { store.hi };
+            usize::try_from(value.max(0)).unwrap_or(usize::MAX)
+        })
+}
+
+fn encode_scene_initial_state(ctx: &SceneInitCtx<'_>) -> SceneCheckResult<SceneBindings> {
+    validate_scene_givens(ctx.scene, ctx.defs)?;
+    let mut bindings = SceneBindings {
+        given: HashMap::new(),
+        next_slot: HashMap::new(),
+        store_next_slot: HashMap::new(),
+    };
+    for given in &ctx.scene.givens {
+        encode_single_scene_given(ctx, given, &mut bindings)?;
+    }
+    encode_scene_activations(ctx, &mut bindings)?;
+    encode_scene_given_constraints(ctx, &bindings.given)?;
+    constrain_scene_initial_activity(ctx, &bindings.given);
+    for constraint in store_active_cardinality_constraints(ctx.pool, &ctx.stores.property) {
+        ctx.solver.assert(&constraint);
+    }
+    Ok(bindings)
+}
+
+fn validate_scene_givens(scene: &IRScene, defs: &defenv::DefEnv) -> SceneCheckResult<()> {
     for given in &scene.givens {
         let expanded = expand_through_defs(&given.constraint, defs);
         if let Some(kind) = find_unsupported_scene_expr(&expanded) {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!(
+            return Err(scene_fail(
+                scene,
+                format!(
                     "unsupported expression kind in scene given for {}: {kind}",
                     given.var
                 ),
-                span: None,
-                file: None,
-            };
+                None,
+            ));
         }
     }
+    Ok(())
+}
 
-    for given in &scene.givens {
-        // Allocate a slot — either within a named store's range or from
-        // the global pool for the entity type.
-        let current_slot = if let Some(store_name) = &given.store_name {
-            if let Some((store_entity_type, start, count)) = scene_store_ranges.get(store_name) {
-                // Validate entity type matches the store's entity type
-                if *store_entity_type != given.entity {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!(
-                            "entity type mismatch: `let {} = one {} in {}` but store '{}' \
-                             holds `{}`, not `{}`",
-                            given.var,
-                            given.entity,
-                            store_name,
-                            store_name,
-                            store_entity_type,
-                            given.entity,
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-                let next = store_next_slot.entry(store_name.clone()).or_insert(*start);
-                if *next >= start + count {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!(
-                            "store '{}' is full: allocated {} of {} slots",
-                            store_name,
-                            *next - start,
-                            count
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-                let slot = *next;
-                *next += 1;
-                slot
-            } else {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!("unknown store '{}' in given for {}", store_name, given.var),
-                    span: None,
-                    file: None,
-                };
-            }
-        } else {
-            let slot = next_slot.entry(given.entity.clone()).or_insert(0);
-            let current = *slot;
-            *slot += 1;
-            current
-        };
+fn encode_single_scene_given(
+    ctx: &SceneInitCtx<'_>,
+    given: &IRSceneGiven,
+    bindings: &mut SceneBindings,
+) -> SceneCheckResult<()> {
+    let slot = allocate_scene_given_slot(ctx.scene, given, ctx.stores, bindings)?;
+    if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(&given.entity, slot, 0) {
+        ctx.solver.assert(active);
+    }
+    assert_scene_given_constraint(ctx, given, slot)?;
+    assert_scene_given_uniqueness(ctx, given, &bindings.given)?;
+    apply_scene_given_defaults(ctx, given, slot)?;
+    bindings
+        .given
+        .insert(given.var.clone(), (given.entity.clone(), slot));
+    Ok(())
+}
 
-        // Activate this slot at step 0
-        if let Some(SmtValue::Bool(active)) = pool.active_at(&given.entity, current_slot, 0) {
-            solver.assert(active);
-        }
-
-        // Encode the given constraint on this slot's fields at step 0
-        let given_ctx = PropertyCtx::new()
-            .with_store_ranges(scene_property_store_ranges.clone())
-            .with_binding(&given.var, &given.entity, current_slot);
-        let constraint =
-            match encode_prop_expr_with_ctx(&pool, vctx, defs, &given_ctx, &given.constraint, 0) {
-                Ok(c) => c,
-                Err(msg) => {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!(
-                            "encoding error in given constraint for {}: {msg}",
-                            given.var
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-            };
-        solver.assert(&constraint);
-
-        let uniqueness = match encode_scene_one_binding_uniqueness(
-            &pool,
-            vctx,
-            defs,
-            &scene_store_ranges,
-            &scene_property_store_ranges,
-            &given_bindings,
+fn allocate_scene_given_slot(
+    scene: &IRScene,
+    given: &IRSceneGiven,
+    stores: &SceneStores,
+    bindings: &mut SceneBindings,
+) -> SceneCheckResult<usize> {
+    if let Some(store_name) = &given.store_name {
+        allocate_store_scene_slot(
+            scene,
             given,
-            0,
-        ) {
-            Ok(uniqueness) => uniqueness,
-            Err(msg) => {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "encoding error in given uniqueness for {}: {msg}",
-                        given.var
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-        };
-        solver.assert(&uniqueness);
-
-        // Apply entity defaults for fields NOT explicitly constrained by the given block.
-        // Expand the constraint through DefEnv first so that pred/prop references
-        // are resolved, then collect field names to avoid default conflicts.
-        let expanded_constraint = expand_through_defs(&given.constraint, defs);
-        let mut constrained_fields = HashSet::new();
-        collect_field_refs_in_expr(&expanded_constraint, &given.var, &mut constrained_fields);
-        for given_constraint in &scene.given_constraints {
-            let expanded_given_constraint = expand_through_defs(given_constraint, defs);
-            collect_field_refs_in_expr(
-                &expanded_given_constraint,
-                &given.var,
-                &mut constrained_fields,
-            );
-        }
-        if let Some(entity_ir) = relevant_entities.iter().find(|e| e.name == given.entity) {
-            for field in &entity_ir.fields {
-                if constrained_fields.contains(field.name.as_str()) {
-                    continue; // given constraint already sets this field
-                }
-                if let Some(ref default_expr) = field.default {
-                    let empty_ept: HashMap<String, String> = HashMap::new();
-                    let default_ctx = harness::SlotEncodeCtx {
-                        pool: &pool,
-                        vctx,
-                        entity: &given.entity,
-                        slot: current_slot,
-                        params: HashMap::new(),
-                        bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &empty_ept,
-                        store_param_types: &empty_ept,
-                    };
-                    let val = match harness::try_encode_slot_expr(&default_ctx, default_expr, 0) {
-                        Ok(val) => val,
-                        Err(reason) => {
-                            return VerificationResult::SceneFail {
-                                name: scene.name.clone(),
-                                reason: format!("scene default field encoding failed: {reason}"),
-                                span: None,
-                                file: None,
-                            };
-                        }
-                    };
-                    if let Some(field_var) =
-                        pool.field_at(&given.entity, current_slot, &field.name, 0)
-                    {
-                        match (&val, field_var) {
-                            (SmtValue::Int(v), SmtValue::Int(f)) => {
-                                solver.assert(smt::int_eq(f, v))
-                            }
-                            (SmtValue::Bool(v), SmtValue::Bool(f)) => {
-                                solver.assert(smt::bool_eq(f, v));
-                            }
-                            (SmtValue::Real(v), SmtValue::Real(f)) => {
-                                solver.assert(smt::real_eq(f, v));
-                            }
-                            _ => {} // skip Dynamic
-                        }
-                    }
-                }
-            }
-        }
-
-        given_bindings.insert(given.var.clone(), (given.entity.clone(), current_slot));
+            store_name,
+            stores,
+            &mut bindings.store_next_slot,
+        )
+    } else {
+        let slot = bindings.next_slot.entry(given.entity.clone()).or_insert(0);
+        let current = *slot;
+        *slot += 1;
+        Ok(current)
     }
+}
 
-    // ── 3b. Handle activate declarations ─────────────────────────
-    // Each activation pre-activates named entity instances in a store
-    // at step 0 and registers them as given bindings. The store name
-    // is resolved via `scene_store_ranges` to get the entity type and
-    // slot range.
-    for activation in &scene.activations {
-        let Some((entity_type, start, count)) = scene_store_ranges.get(&activation.store_name)
-        else {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!("unknown store '{}'", activation.store_name),
-                span: None,
-                file: None,
-            };
+fn allocate_store_scene_slot(
+    scene: &IRScene,
+    given: &IRSceneGiven,
+    store_name: &str,
+    stores: &SceneStores,
+    store_next_slot: &mut HashMap<String, usize>,
+) -> SceneCheckResult<usize> {
+    let Some((store_entity_type, start, count)) = stores.raw.get(store_name) else {
+        return Err(scene_fail(
+            scene,
+            format!("unknown store '{}' in given for {}", store_name, given.var),
+            None,
+        ));
+    };
+    if *store_entity_type != given.entity {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "entity type mismatch: `let {} = one {} in {}` but store '{}' \
+                 holds `{}`, not `{}`",
+                given.var, given.entity, store_name, store_name, store_entity_type, given.entity,
+            ),
+            None,
+        ));
+    }
+    let next = store_next_slot
+        .entry(store_name.to_owned())
+        .or_insert(*start);
+    if *next >= start + count {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "store '{}' is full: allocated {} of {} slots",
+                store_name,
+                *next - start,
+                count
+            ),
+            None,
+        ));
+    }
+    let slot = *next;
+    *next += 1;
+    Ok(slot)
+}
+
+fn assert_scene_given_constraint(
+    ctx: &SceneInitCtx<'_>,
+    given: &IRSceneGiven,
+    slot: usize,
+) -> SceneCheckResult<()> {
+    let given_ctx = PropertyCtx::new()
+        .with_store_ranges(ctx.stores.property.clone())
+        .with_binding(&given.var, &given.entity, slot);
+    match encode_prop_expr_with_ctx(
+        ctx.pool,
+        ctx.vctx,
+        ctx.defs,
+        &given_ctx,
+        &given.constraint,
+        0,
+    ) {
+        Ok(constraint) => {
+            ctx.solver.assert(&constraint);
+            Ok(())
+        }
+        Err(msg) => Err(scene_fail(
+            ctx.scene,
+            format!(
+                "encoding error in given constraint for {}: {msg}",
+                given.var
+            ),
+            None,
+        )),
+    }
+}
+
+fn assert_scene_given_uniqueness(
+    ctx: &SceneInitCtx<'_>,
+    given: &IRSceneGiven,
+    prior_bindings: &HashMap<String, (String, usize)>,
+) -> SceneCheckResult<()> {
+    let uniqueness = encode_scene_one_binding_uniqueness(
+        SceneOneBindingCtx {
+            pool: ctx.pool,
+            vctx: ctx.vctx,
+            defs: ctx.defs,
+            store_ranges: &ctx.stores.raw,
+            property_store_ranges: &ctx.stores.property,
+            prior_bindings,
+        },
+        given,
+        0,
+    )
+    .map_err(|msg| {
+        scene_fail(
+            ctx.scene,
+            format!(
+                "encoding error in given uniqueness for {}: {msg}",
+                given.var
+            ),
+            None,
+        )
+    })?;
+    ctx.solver.assert(&uniqueness);
+    Ok(())
+}
+
+fn apply_scene_given_defaults(
+    ctx: &SceneInitCtx<'_>,
+    given: &IRSceneGiven,
+    slot: usize,
+) -> SceneCheckResult<()> {
+    let constrained_fields = scene_given_constrained_fields(ctx.scene, ctx.defs, given);
+    let Some(entity_ir) = ctx
+        .relevant_entities
+        .iter()
+        .find(|entity| entity.name == given.entity)
+    else {
+        return Ok(());
+    };
+    for field in &entity_ir.fields {
+        if constrained_fields.contains(field.name.as_str()) {
+            continue;
+        }
+        if let Some(default_expr) = &field.default {
+            assert_scene_default_field(ctx, given, slot, &field.name, default_expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn scene_given_constrained_fields(
+    scene: &IRScene,
+    defs: &defenv::DefEnv,
+    given: &IRSceneGiven,
+) -> HashSet<String> {
+    let expanded_constraint = expand_through_defs(&given.constraint, defs);
+    let mut constrained_fields = HashSet::new();
+    collect_field_refs_in_expr(&expanded_constraint, &given.var, &mut constrained_fields);
+    for given_constraint in &scene.given_constraints {
+        let expanded = expand_through_defs(given_constraint, defs);
+        collect_field_refs_in_expr(&expanded, &given.var, &mut constrained_fields);
+    }
+    constrained_fields
+}
+
+fn assert_scene_default_field(
+    ctx: &SceneInitCtx<'_>,
+    given: &IRSceneGiven,
+    slot: usize,
+    field_name: &str,
+    default_expr: &IRExpr,
+) -> SceneCheckResult<()> {
+    let empty_ept: HashMap<String, String> = HashMap::new();
+    let default_ctx = harness::SlotEncodeCtx {
+        pool: ctx.pool,
+        vctx: ctx.vctx,
+        entity: &given.entity,
+        slot,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "",
+        entity_param_types: &empty_ept,
+        store_param_types: &empty_ept,
+    };
+    let val = harness::try_encode_slot_expr(&default_ctx, default_expr, 0).map_err(|reason| {
+        scene_fail(
+            ctx.scene,
+            format!("scene default field encoding failed: {reason}"),
+            None,
+        )
+    })?;
+    if let Some(field_var) = ctx.pool.field_at(&given.entity, slot, field_name, 0) {
+        assert_scene_value_eq(ctx.solver, &val, field_var);
+    }
+    Ok(())
+}
+
+fn assert_scene_value_eq(solver: &AbideSolver, value: &SmtValue, field_var: &SmtValue) {
+    match (value, field_var) {
+        (SmtValue::Int(v), SmtValue::Int(f)) => solver.assert(smt::int_eq(f, v)),
+        (SmtValue::Bool(v), SmtValue::Bool(f)) => solver.assert(smt::bool_eq(f, v)),
+        (SmtValue::Real(v), SmtValue::Real(f)) => solver.assert(smt::real_eq(f, v)),
+        _ => {}
+    }
+}
+
+fn encode_scene_activations(
+    ctx: &SceneInitCtx<'_>,
+    bindings: &mut SceneBindings,
+) -> SceneCheckResult<()> {
+    for activation in &ctx.scene.activations {
+        let Some((entity_type, start, count)) = ctx.stores.raw.get(&activation.store_name) else {
+            return Err(scene_fail(
+                ctx.scene,
+                format!("unknown store '{}'", activation.store_name),
+                None,
+            ));
         };
-
-        let next = store_next_slot
+        let next = bindings
+            .store_next_slot
             .entry(activation.store_name.clone())
             .or_insert(*start);
         for inst_name in &activation.instances {
-            if *next >= start + count {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "store '{}' is full: allocated {} of {} slots",
-                        activation.store_name,
-                        *next - start,
-                        count
-                    ),
-                    span: None,
-                    file: None,
-                };
+            let slot =
+                allocate_activation_slot(ctx.scene, &activation.store_name, *start, *count, next)?;
+            if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(entity_type, slot, 0) {
+                ctx.solver.assert(active);
             }
-            let current_slot = *next;
-            *next += 1;
-
-            // Activate this slot at step 0
-            if let Some(SmtValue::Bool(active)) = pool.active_at(entity_type, current_slot, 0) {
-                solver.assert(active);
-            }
-
-            // Register the instance name as a given binding
-            given_bindings.insert(inst_name.clone(), (entity_type.clone(), current_slot));
+            bindings
+                .given
+                .insert(inst_name.clone(), (entity_type.clone(), slot));
         }
     }
+    Ok(())
+}
 
-    // ── 3c. Assert given constraints at step 0 ───────────────────
-    // Given constraints are initial-state assumptions, not end-state assertions.
-    for gc in &scene.given_constraints {
-        let expanded = expand_through_defs(gc, defs);
+fn allocate_activation_slot(
+    scene: &IRScene,
+    store_name: &str,
+    start: usize,
+    count: usize,
+    next: &mut usize,
+) -> SceneCheckResult<usize> {
+    if *next >= start + count {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "store '{}' is full: allocated {} of {} slots",
+                store_name,
+                *next - start,
+                count
+            ),
+            None,
+        ));
+    }
+    let slot = *next;
+    *next += 1;
+    Ok(slot)
+}
+
+fn encode_scene_given_constraints(
+    ctx: &SceneInitCtx<'_>,
+    given_bindings: &HashMap<String, (String, usize)>,
+) -> SceneCheckResult<()> {
+    for constraint in &ctx.scene.given_constraints {
+        let expanded = expand_through_defs(constraint, ctx.defs);
         if let Some(kind) = find_unsupported_scene_expr(&expanded) {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!("unsupported expression kind in scene given constraint: {kind}"),
-                span: expr_span(gc),
-                file: None,
-            };
+            return Err(scene_fail(
+                ctx.scene,
+                format!("unsupported expression kind in scene given constraint: {kind}"),
+                expr_span(constraint),
+            ));
         }
-        let gc_ctx = PropertyCtx::new()
-            .with_store_ranges(scene_property_store_ranges.clone())
-            .with_given_bindings(&given_bindings);
-        match encode_prop_expr_with_ctx(&pool, vctx, defs, &gc_ctx, gc, 0) {
-            Ok(c) => solver.assert(&c),
+        let prop_ctx = PropertyCtx::new()
+            .with_store_ranges(ctx.stores.property.clone())
+            .with_given_bindings(given_bindings);
+        match encode_prop_expr_with_ctx(ctx.pool, ctx.vctx, ctx.defs, &prop_ctx, constraint, 0) {
+            Ok(encoded) => ctx.solver.assert(&encoded),
             Err(msg) => {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!("encoding error in given constraint: {msg}"),
-                    span: expr_span(gc),
-                    file: None,
-                };
+                return Err(scene_fail(
+                    ctx.scene,
+                    format!("encoding error in given constraint: {msg}"),
+                    expr_span(constraint),
+                ));
             }
         }
     }
+    Ok(())
+}
 
-    // Deactivate all other slots at step 0.
-    // Collect all activated slots (from both global and store-based allocation)
-    // so we only deactivate the truly unused ones.
+fn constrain_scene_initial_activity(
+    ctx: &SceneInitCtx<'_>,
+    given_bindings: &HashMap<String, (String, usize)>,
+) {
     let activated_slots: HashSet<(String, usize)> = given_bindings
         .values()
         .map(|(entity, slot)| (entity.clone(), *slot))
         .collect();
-    let lower_bound_active_slots: HashSet<(String, usize)> = scene_property_store_ranges
+    let lower_bound_slots = scene_lower_bound_active_slots(&ctx.stores.property);
+    for (entity, slot) in &lower_bound_slots {
+        if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(entity, *slot, 0) {
+            ctx.solver.assert(active);
+        }
+    }
+    for entity in ctx.relevant_entities {
+        for slot in 0..ctx.pool.slots_for(&entity.name) {
+            if activated_slots.contains(&(entity.name.clone(), slot))
+                || lower_bound_slots.contains(&(entity.name.clone(), slot))
+            {
+                continue;
+            }
+            if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(&entity.name, slot, 0) {
+                ctx.solver.assert(smt::bool_not(active));
+            }
+        }
+    }
+}
+
+fn scene_lower_bound_active_slots(
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> HashSet<(String, usize)> {
+    store_ranges
         .values()
         .flat_map(|range| {
             (range.start_slot..range.start_slot + range.min_active)
                 .map(|slot| (range.entity_type.clone(), slot))
         })
-        .collect();
-    for (entity, slot) in &lower_bound_active_slots {
-        if let Some(SmtValue::Bool(active)) = pool.active_at(entity, *slot, 0) {
-            solver.assert(active);
-        }
-    }
-    for entity in &relevant_entities {
-        let n_slots = pool.slots_for(&entity.name);
-        for slot in 0..n_slots {
-            if activated_slots.contains(&(entity.name.clone(), slot)) {
-                continue; // already activated by a given or activate declaration
-            }
-            if lower_bound_active_slots.contains(&(entity.name.clone(), slot)) {
-                continue; // initialized active by the store lower bound
-            }
-            if let Some(SmtValue::Bool(active)) = pool.active_at(&entity.name, slot, 0) {
-                solver.assert(smt::bool_not(active));
-            }
-        }
-    }
+        .collect()
+}
 
-    for c in store_active_cardinality_constraints(&pool, &scene_property_store_ranges) {
-        solver.assert(&c);
-    }
+fn build_scene_firing_plan<'a>(
+    scene: &'a IRScene,
+    defs: &defenv::DefEnv,
+    relevant_systems: &'a [IRSystem],
+    bindings: &mut SceneBindings,
+    some_budget: usize,
+) -> SceneCheckResult<SceneFiringPlan<'a>> {
+    validate_scene_assertions(scene, defs)?;
+    let referenced_vars = referenced_scene_event_vars(scene);
+    let resolved_events = resolve_scene_events(scene, defs, relevant_systems)?;
+    bind_scene_result_vars(
+        scene,
+        &resolved_events,
+        relevant_systems,
+        &referenced_vars,
+        &mut bindings.next_slot,
+        &mut bindings.given,
+    )?;
+    build_scene_firing_instances(scene, resolved_events, some_budget)
+}
 
-    // ── 4a. Validate scene events and determine referenced vars ────
-
+fn validate_scene_assertions(scene: &IRScene, defs: &defenv::DefEnv) -> SceneCheckResult<()> {
     for assertion in &scene.assertions {
         let expanded = expand_through_defs(assertion, defs);
         if let Some(kind) = find_unsupported_scene_expr(&expanded) {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!("unsupported expression kind in scene then assertion: {kind}"),
-                span: expr_span(assertion),
-                file: None,
-            };
+            return Err(scene_fail(
+                scene,
+                format!("unsupported expression kind in scene then assertion: {kind}"),
+                expr_span(assertion),
+            ));
         }
     }
+    Ok(())
+}
 
-    // Collect vars referenced in subsequent event args
-    let referenced_vars: HashSet<String> = {
-        let mut refs = HashSet::new();
-        for ev in &scene.events {
-            for arg in &ev.args {
-                collect_var_refs_in_expr(arg, &mut refs);
-            }
+fn referenced_scene_event_vars(scene: &IRScene) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for event in &scene.events {
+        for arg in &event.args {
+            collect_var_refs_in_expr(arg, &mut refs);
         }
-        refs
-    };
+    }
+    refs
+}
 
-    // ── 4b. Validate events and resolve IR references ───────────────
-    // Pre-validate all events before encoding. Collect the resolved
-    // (system, event IR) pairs and result variable bindings.
-    let mut resolved_events: Vec<ResolvedSceneEvent<'_>> = Vec::new();
-
+fn resolve_scene_events<'a>(
+    scene: &'a IRScene,
+    defs: &defenv::DefEnv,
+    relevant_systems: &'a [IRSystem],
+) -> SceneCheckResult<Vec<ResolvedSceneEvent<'a>>> {
+    let mut resolved = Vec::new();
     for scene_event in &scene.events {
-        let sys = relevant_systems
+        let Some(system) = relevant_systems
             .iter()
-            .find(|s| s.name == scene_event.system);
-        let Some(sys) = sys else {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!(
+            .find(|system| system.name == scene_event.system)
+        else {
+            return Err(scene_fail(
+                scene,
+                format!(
                     "system {} not found for event {}",
                     scene_event.system, scene_event.event
                 ),
-                span: None,
-                file: None,
-            };
+                None,
+            ));
         };
-        let matching_steps: Vec<_> = sys
-            .actions
-            .iter()
-            .filter(|s| s.name == scene_event.event)
-            .collect();
-        if matching_steps.is_empty() {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!(
-                    "event {} not found in system {}",
-                    scene_event.event, scene_event.system
-                ),
-                span: None,
-                file: None,
-            };
-        }
-
-        // Use the first step for arity validation (all steps share the same
-        // params — validated by collect.rs).
-        let first_step = matching_steps[0];
-        if scene_event.args.len() != first_step.params.len() {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason: format!(
-                    "arity mismatch: scene provides {} args for {}::{} but event expects {} params",
-                    scene_event.args.len(),
-                    scene_event.system,
-                    scene_event.event,
-                    first_step.params.len()
-                ),
-                span: None,
-                file: None,
-            };
-        }
-
-        for arg in &scene_event.args {
-            let expanded = expand_through_defs(arg, defs);
-            if let Some(kind) = find_unsupported_scene_expr(&expanded) {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "unsupported expression kind in scene event arg for {}::{}: {kind}",
-                        scene_event.system, scene_event.event
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-        }
-
-        for step in &matching_steps {
-            if let Err(reason) = validate_crosscall_arities(&step.body, &relevant_systems, 0) {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason,
-                    span: None,
-                    file: None,
-                };
-            }
-
-            if let Some(kind) = find_unsupported_in_actions(&step.body) {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "unsupported action in scene event {}::{}: {kind}",
-                        scene_event.system, scene_event.event
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-        }
-
-        resolved_events.push(ResolvedSceneEvent {
-            scene_event,
-            steps: matching_steps,
-        });
+        let steps = resolve_scene_event_steps(scene, defs, relevant_systems, scene_event, system)?;
+        resolved.push(ResolvedSceneEvent { scene_event, steps });
     }
+    Ok(resolved)
+}
 
-    // Pre-compute result variable bindings (Creates from event bodies).
-    // This must happen before the step variable encoding so bindings are
-    // available for argument resolution at all possible steps.
-    // Scan ALL matching steps (multi-clause commands) for Create actions
-    // and validate they agree on the created entity type.
-    for re in &resolved_events {
-        if referenced_vars.contains(&re.scene_event.var) {
-            let mut per_step_creates: Vec<Vec<String>> = Vec::new();
-            for step_ir in &re.steps {
-                per_step_creates.push(scan_event_creates(&step_ir.body, &relevant_systems));
-            }
-            // All steps must agree on create behavior: either all create
-            // or none create. Mixed create/no-create is unsound because the
-            // scene encoder activates the result slot unconditionally.
-            let non_empty: Vec<&Vec<String>> =
-                per_step_creates.iter().filter(|c| !c.is_empty()).collect();
-            if !non_empty.is_empty()
-                && non_empty.len() != per_step_creates.len()
-                && per_step_creates.len() > 1
-            {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: format!(
-                        "multi-clause command {}::{} creates an entity in some steps \
-                         but not others; scene result variable `{}` cannot be bound \
-                         consistently (all implementing steps must create, or none)",
-                        re.scene_event.system, re.scene_event.event, re.scene_event.var,
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-            if let Some(first) = non_empty.first() {
-                let first_entity = &first[0];
-                for other in &non_empty[1..] {
-                    if other[0] != *first_entity {
-                        return VerificationResult::SceneFail {
-                            name: scene.name.clone(),
-                            reason: format!(
-                                "multi-clause command {}::{} creates different entity types \
-                                 across steps (`{}` vs `{}`); scene result variable `{}` \
-                                 cannot be bound consistently",
-                                re.scene_event.system,
-                                re.scene_event.event,
-                                first_entity,
-                                other[0],
-                                re.scene_event.var,
-                            ),
-                            span: None,
-                            file: None,
-                        };
-                    }
-                }
-                let slot = next_slot.entry(first_entity.clone()).or_insert(0);
-                let allocated_slot = *slot;
-                *slot += 1;
-                given_bindings.insert(
-                    re.scene_event.var.clone(),
-                    (first_entity.clone(), allocated_slot),
-                );
-            }
-        }
-    }
-
-    // ── 4c. Resolve cardinalities and build firing instances ────────
-    // Each event's cardinality determines how many firing instances it
-    // gets. Each instance has a step variable (Int) and optionally a
-    // fires variable (Bool) for optional firings.
-    use crate::ir::types::Cardinality;
-
-    let event_var_names: Vec<&str> = scene.events.iter().map(|e| e.var.as_str()).collect();
-    let _n_ev = event_var_names.len();
-
-    let var_to_idx: HashMap<&str, usize> = event_var_names
+fn resolve_scene_event_steps<'a>(
+    scene: &IRScene,
+    defs: &defenv::DefEnv,
+    relevant_systems: &'a [IRSystem],
+    scene_event: &IRSceneEvent,
+    system: &'a IRSystem,
+) -> SceneCheckResult<Vec<&'a IRSystemAction>> {
+    let matching_steps: Vec<_> = system
+        .actions
         .iter()
-        .enumerate()
-        .map(|(i, v)| (*v, i))
+        .filter(|step| step.name == scene_event.event)
         .collect();
+    if matching_steps.is_empty() {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "event {} not found in system {}",
+                scene_event.event, scene_event.system
+            ),
+            None,
+        ));
+    }
+    validate_scene_event_arity(scene, scene_event, matching_steps[0])?;
+    validate_scene_event_args(scene, defs, scene_event)?;
+    validate_scene_event_steps(scene, relevant_systems, scene_event, &matching_steps)?;
+    Ok(matching_steps)
+}
 
-    // Collect events involved in ^| — these need {lone} fire tracking.
-    // If declared as {one}, infer {lone} from ^| usage.
-    let mut xor_events: HashSet<usize> = HashSet::new();
+fn validate_scene_event_arity(
+    scene: &IRScene,
+    scene_event: &IRSceneEvent,
+    first_step: &IRSystemAction,
+) -> SceneCheckResult<()> {
+    if scene_event.args.len() == first_step.params.len() {
+        return Ok(());
+    }
+    Err(scene_fail(
+        scene,
+        format!(
+            "arity mismatch: scene provides {} args for {}::{} but event expects {} params",
+            scene_event.args.len(),
+            scene_event.system,
+            scene_event.event,
+            first_step.params.len()
+        ),
+        None,
+    ))
+}
+
+fn validate_scene_event_args(
+    scene: &IRScene,
+    defs: &defenv::DefEnv,
+    scene_event: &IRSceneEvent,
+) -> SceneCheckResult<()> {
+    for arg in &scene_event.args {
+        let expanded = expand_through_defs(arg, defs);
+        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+            return Err(scene_fail(
+                scene,
+                format!(
+                    "unsupported expression kind in scene event arg for {}::{}: {kind}",
+                    scene_event.system, scene_event.event
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_scene_event_steps(
+    scene: &IRScene,
+    relevant_systems: &[IRSystem],
+    scene_event: &IRSceneEvent,
+    steps: &[&IRSystemAction],
+) -> SceneCheckResult<()> {
+    for step in steps {
+        if let Err(reason) = validate_crosscall_arities(&step.body, relevant_systems, 0) {
+            return Err(scene_fail(scene, reason, None));
+        }
+        if let Some(kind) = find_unsupported_in_actions(&step.body) {
+            return Err(scene_fail(
+                scene,
+                format!(
+                    "unsupported action in scene event {}::{}: {kind}",
+                    scene_event.system, scene_event.event
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bind_scene_result_vars(
+    scene: &IRScene,
+    resolved_events: &[ResolvedSceneEvent<'_>],
+    relevant_systems: &[IRSystem],
+    referenced_vars: &HashSet<String>,
+    next_slot: &mut HashMap<String, usize>,
+    given_bindings: &mut HashMap<String, (String, usize)>,
+) -> SceneCheckResult<()> {
+    for event in resolved_events {
+        if !referenced_vars.contains(&event.scene_event.var) {
+            continue;
+        }
+        if let Some(entity) = scene_result_entity(scene, event, relevant_systems)? {
+            let slot = next_slot.entry(entity.clone()).or_insert(0);
+            let allocated_slot = *slot;
+            *slot += 1;
+            given_bindings.insert(event.scene_event.var.clone(), (entity, allocated_slot));
+        }
+    }
+    Ok(())
+}
+
+fn scene_result_entity(
+    scene: &IRScene,
+    event: &ResolvedSceneEvent<'_>,
+    relevant_systems: &[IRSystem],
+) -> SceneCheckResult<Option<String>> {
+    let per_step_creates: Vec<Vec<String>> = event
+        .steps
+        .iter()
+        .map(|step| scan_event_creates(&step.body, relevant_systems))
+        .collect();
+    let non_empty: Vec<&Vec<String>> = per_step_creates
+        .iter()
+        .filter(|creates| !creates.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return Ok(None);
+    }
+    if non_empty.len() != per_step_creates.len() && per_step_creates.len() > 1 {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "multi-clause command {}::{} creates an entity in some steps \
+                 but not others; scene result variable `{}` cannot be bound \
+                 consistently (all implementing steps must create, or none)",
+                event.scene_event.system, event.scene_event.event, event.scene_event.var,
+            ),
+            None,
+        ));
+    }
+    validate_scene_result_entity_agreement(scene, event, &non_empty)?;
+    Ok(Some(non_empty[0][0].clone()))
+}
+
+fn validate_scene_result_entity_agreement(
+    scene: &IRScene,
+    event: &ResolvedSceneEvent<'_>,
+    creates: &[&Vec<String>],
+) -> SceneCheckResult<()> {
+    let first_entity = &creates[0][0];
+    for other in &creates[1..] {
+        if other[0] != *first_entity {
+            return Err(scene_fail(
+                scene,
+                format!(
+                    "multi-clause command {}::{} creates different entity types \
+                     across steps (`{}` vs `{}`); scene result variable `{}` \
+                     cannot be bound consistently",
+                    event.scene_event.system,
+                    event.scene_event.event,
+                    first_entity,
+                    other[0],
+                    event.scene_event.var,
+                ),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_scene_firing_instances<'a>(
+    scene: &'a IRScene,
+    resolved_events: Vec<ResolvedSceneEvent<'a>>,
+    some_budget: usize,
+) -> SceneCheckResult<SceneFiringPlan<'a>> {
+    let event_var_names: Vec<String> = scene.events.iter().map(|event| event.var.clone()).collect();
+    let var_to_idx = scene_var_to_idx(&event_var_names);
+    let mut xor_events = HashSet::new();
     for ordering_expr in &scene.ordering {
         collect_xor_event_indices(ordering_expr, &var_to_idx, &mut xor_events);
     }
+    let event_cards = scene_event_cards(scene, &resolved_events, &xor_events, some_budget)?;
+    let (instances, event_instance_ranges) = scene_firing_instances(&event_var_names, &event_cards);
+    Ok(SceneFiringPlan {
+        resolved_events,
+        event_var_names,
+        event_cards,
+        event_instance_ranges,
+        instances,
+    })
+}
 
-    // Resolve cardinality for each event.
-    // Returns (n_instances, min_fires, has_fire_tracking).
-    struct EventCard {
-        n_instances: usize,
-        min_fires: usize,
-        has_fire_tracking: bool,
+fn scene_var_to_idx(event_var_names: &[String]) -> HashMap<&str, usize> {
+    event_var_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect()
+}
+
+fn scene_event_cards(
+    scene: &IRScene,
+    resolved_events: &[ResolvedSceneEvent<'_>],
+    xor_events: &HashSet<usize>,
+    some_budget: usize,
+) -> SceneCheckResult<Vec<EventCard>> {
+    resolved_events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            scene_event_card(scene, event, xor_events.contains(&index), some_budget)
+        })
+        .collect()
+}
+
+fn scene_event_card(
+    scene: &IRScene,
+    event: &ResolvedSceneEvent<'_>,
+    is_xor: bool,
+    some_budget: usize,
+) -> SceneCheckResult<EventCard> {
+    use crate::ir::types::Cardinality;
+
+    match &event.scene_event.cardinality {
+        Cardinality::Named(cardinality) => {
+            named_scene_event_card(scene, event, cardinality, is_xor, some_budget)
+        }
+        Cardinality::Exact { exactly } => exact_scene_event_card(scene, event, *exactly, is_xor),
     }
+}
 
-    // some_budget already computed above for bound calculation
-
-    let mut event_cards: Vec<EventCard> = Vec::new();
-    for (ei, re) in resolved_events.iter().enumerate() {
-        let card = &re.scene_event.cardinality;
-        let is_xor = xor_events.contains(&ei);
-        let ec = match card {
-            Cardinality::Named(c) => match c.as_str() {
-                "one" if is_xor => EventCard {
-                    n_instances: 1,
-                    min_fires: 0,
-                    has_fire_tracking: true,
-                },
-                "one" => EventCard {
-                    n_instances: 1,
-                    min_fires: 1,
-                    has_fire_tracking: false,
-                },
-                "lone" => EventCard {
-                    n_instances: 1,
-                    min_fires: 0,
-                    has_fire_tracking: true,
-                },
-                "no" => EventCard {
-                    n_instances: 0,
-                    min_fires: 0,
-                    has_fire_tracking: false,
-                },
-                "some" => EventCard {
-                    n_instances: some_budget,
-                    min_fires: 1,
-                    has_fire_tracking: true,
-                },
-                other => {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!(
-                            "unsupported cardinality '{other}' for scene event {}::{}",
-                            re.scene_event.system, re.scene_event.event
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-            },
-            Cardinality::Exact { exactly } => {
-                let n = *exactly as usize;
-                if is_xor && n > 1 {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!(
-                            "event '{}' has cardinality {{{n}}} but appears in `^|`; \
-                             exclusive choice requires {{lone}} cardinality",
-                            re.scene_event.var
-                        ),
-                        span: None,
-                        file: None,
-                    };
-                }
-                EventCard {
-                    n_instances: n,
-                    // When n==1 and event is in ^|, infer {lone}: min_fires=0
-                    // so the XOR constraint controls whether it fires.
-                    min_fires: if is_xor && n == 1 { 0 } else { n },
-                    has_fire_tracking: is_xor,
-                }
-            }
-        };
-        event_cards.push(ec);
+fn named_scene_event_card(
+    scene: &IRScene,
+    event: &ResolvedSceneEvent<'_>,
+    cardinality: &str,
+    is_xor: bool,
+    some_budget: usize,
+) -> SceneCheckResult<EventCard> {
+    match cardinality {
+        "one" if is_xor => Ok(EventCard {
+            n_instances: 1,
+            min_fires: 0,
+            has_fire_tracking: true,
+        }),
+        "one" => Ok(EventCard {
+            n_instances: 1,
+            min_fires: 1,
+            has_fire_tracking: false,
+        }),
+        "lone" => Ok(EventCard {
+            n_instances: 1,
+            min_fires: 0,
+            has_fire_tracking: true,
+        }),
+        "no" => Ok(EventCard {
+            n_instances: 0,
+            min_fires: 0,
+            has_fire_tracking: false,
+        }),
+        "some" => Ok(EventCard {
+            n_instances: some_budget,
+            min_fires: 1,
+            has_fire_tracking: true,
+        }),
+        other => Err(scene_fail(
+            scene,
+            format!(
+                "unsupported cardinality '{other}' for scene event {}::{}",
+                event.scene_event.system, event.scene_event.event
+            ),
+            None,
+        )),
     }
+}
 
-    // Build firing instances. Each instance has a step variable and
-    // optionally a fires variable.
-    let mut instances: Vec<FiringInst> = Vec::new();
-    // Map event index → range of instance indices
-    let mut event_instance_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+fn exact_scene_event_card(
+    scene: &IRScene,
+    event: &ResolvedSceneEvent<'_>,
+    exactly: i64,
+    is_xor: bool,
+) -> SceneCheckResult<EventCard> {
+    let n = exactly as usize;
+    if is_xor && n > 1 {
+        return Err(scene_fail(
+            scene,
+            format!(
+                "event '{}' has cardinality {{{n}}} but appears in `^|`; \
+                 exclusive choice requires {{lone}} cardinality",
+                event.scene_event.var
+            ),
+            None,
+        ));
+    }
+    Ok(EventCard {
+        n_instances: n,
+        min_fires: if is_xor && n == 1 { 0 } else { n },
+        has_fire_tracking: is_xor,
+    })
+}
 
-    for (ei, ec) in event_cards.iter().enumerate() {
+fn scene_firing_instances(
+    event_var_names: &[String],
+    event_cards: &[EventCard],
+) -> (Vec<FiringInst>, Vec<std::ops::Range<usize>>) {
+    let mut instances = Vec::new();
+    let mut ranges = Vec::new();
+    for (event_idx, card) in event_cards.iter().enumerate() {
         let start = instances.len();
-        for inst_idx in 0..ec.n_instances {
-            let var_name = event_var_names[ei];
-            let step_var = if ec.n_instances == 1 {
-                smt::int_named(&format!("scene_step_{var_name}"))
-            } else {
-                smt::int_named(&format!("scene_step_{var_name}_{inst_idx}"))
-            };
-            let fires_var = if ec.has_fire_tracking {
-                Some(smt::bool_named(&format!(
-                    "scene_fires_{var_name}_{inst_idx}"
-                )))
-            } else {
-                None
-            };
+        for inst_idx in 0..card.n_instances {
             instances.push(FiringInst {
-                event_idx: ei,
+                event_idx,
                 inst_idx,
-                step_var,
-                fires_var,
+                step_var: scene_step_var(&event_var_names[event_idx], card.n_instances, inst_idx),
+                fires_var: card.has_fire_tracking.then(|| {
+                    smt::bool_named(&format!(
+                        "scene_fires_{}_{inst_idx}",
+                        event_var_names[event_idx]
+                    ))
+                }),
             });
         }
-        event_instance_ranges.push(start..instances.len());
+        ranges.push(start..instances.len());
     }
+    (instances, ranges)
+}
 
-    // Verify instance count matches the pre-computed bound
-    debug_assert_eq!(
-        instances.len().max(1),
+fn scene_step_var(var_name: &str, n_instances: usize, inst_idx: usize) -> Int {
+    if n_instances == 1 {
+        smt::int_named(&format!("scene_step_{var_name}"))
+    } else {
+        smt::int_named(&format!("scene_step_{var_name}_{inst_idx}"))
+    }
+}
+
+fn assert_scene_schedule_constraints(
+    ctx: &SceneScheduleCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    bound: usize,
+) -> SceneCheckResult<SceneGroupPlan> {
+    assert_scene_instance_bounds(
+        ctx.solver,
+        &plan.instances,
+        &plan.event_instance_ranges,
         bound,
-        "instance count should match pre-computed bound"
     );
+    assert_scene_fire_constraints(ctx.solver, plan);
+    let mut group_parent: Vec<usize> = (0..plan.instances.len()).collect();
+    assert_scene_same_step_groups(ctx, plan, &mut group_parent)?;
+    validate_scene_same_step_conflicts(ctx, plan, &mut group_parent)?;
+    let groups = scene_group_plan(plan.instances.len(), &mut group_parent);
+    assert_scene_instance_distinctness(ctx.solver, plan, &groups);
+    assert_scene_ordering_constraints(ctx, plan)?;
+    Ok(groups)
+}
 
-    // Assert bounds: each instance step in [0, bound)
-    for inst in &instances {
+fn assert_scene_instance_bounds(
+    solver: &AbideSolver,
+    instances: &[FiringInst],
+    ranges: &[std::ops::Range<usize>],
+    bound: usize,
+) {
+    for inst in instances {
         solver.assert(smt::int_ge(&inst.step_var, &smt::int_lit(0)));
         solver.assert(smt::int_lt(&inst.step_var, &smt::int_lit(bound as i64)));
     }
-
-    // Assert internal ordering for multi-instance events: step_0 < step_1 <...
-    for ec_range in &event_instance_ranges {
-        if ec_range.len() > 1 {
-            for i in ec_range.start..(ec_range.end - 1) {
-                let curr = &instances[i].step_var;
-                let next = &instances[i + 1].step_var;
-                solver.assert(smt::int_lt(curr, next));
+    for range in ranges {
+        if range.len() > 1 {
+            for index in range.start..(range.end - 1) {
+                solver.assert(smt::int_lt(
+                    &instances[index].step_var,
+                    &instances[index + 1].step_var,
+                ));
             }
         }
     }
+}
 
-    // Assert fire constraints
-    for (ei, ec) in event_cards.iter().enumerate() {
-        let range = &event_instance_ranges[ei];
-        if ec.has_fire_tracking && ec.min_fires > 0 {
-            // {some}: at least min_fires instances must fire
-            let fire_vars: Vec<&Bool> = instances[range.clone()]
-                .iter()
-                .filter_map(|inst| inst.fires_var.as_ref())
-                .collect();
-            if !fire_vars.is_empty() {
-                // At least min_fires must be true.
-                // For {some} (min_fires=1): OR of all fires vars
-                if ec.min_fires == 1 {
-                    solver.assert(smt::bool_or(&fire_vars));
-                } else {
-                    // For arbitrary min_fires, encode as: at least N true
-                    // using pairwise: too complex. Since min_fires == n_instances
-                    // for {N} with fire tracking (only via ^|), just assert all.
-                    for fv in &fire_vars {
-                        solver.assert(*fv);
-                    }
-                }
-            }
+fn assert_scene_fire_constraints(solver: &AbideSolver, plan: &SceneFiringPlan<'_>) {
+    for (event_idx, card) in plan.event_cards.iter().enumerate() {
+        if !card.has_fire_tracking || card.min_fires == 0 {
+            continue;
         }
-        if !ec.has_fire_tracking && ec.min_fires > 0 {
-            // {one} or {N} without fire tracking: all instances must fire
-            // (already guaranteed by appearing in the disjunction unconditionally)
-        }
-    }
-
-    // Assert distinctness: all instances at different steps, EXCEPT
-    // same-step groups (from &) share a step.
-    // Build same-step groups from OpSameStep ordering expressions.
-    let mut group_parent: Vec<usize> = (0..instances.len()).collect();
-
-    fn find_root(parent: &mut [usize], i: usize) -> usize {
-        let mut r = i;
-        while parent[r] != r {
-            parent[r] = parent[parent[r]];
-            r = parent[r];
-        }
-        r
-    }
-
-    // For & grouping, map event-level pairs to their first instance
-    // (& only valid for single-instance events)
-    {
-        let mut same_step_event_pairs: Vec<(usize, usize)> = Vec::new();
-        collect_same_step_event_pairs(&scene.ordering, &var_to_idx, &mut same_step_event_pairs);
-        for (a, b) in &same_step_event_pairs {
-            // Validate: & requires single-instance events
-            if event_cards[*a].n_instances != 1 || event_cards[*b].n_instances != 1 {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: crate::messages::scene_same_step_multi_instance(
-                        &scene.name,
-                        event_var_names[*a],
-                        event_cards[*a].n_instances,
-                        event_var_names[*b],
-                        event_cards[*b].n_instances,
-                    ),
-                    span: None,
-                    file: None,
-                };
-            }
-            let inst_a = event_instance_ranges[*a].start;
-            let inst_b = event_instance_ranges[*b].start;
-            let ra = find_root(&mut group_parent, inst_a);
-            let rb = find_root(&mut group_parent, inst_b);
-            if ra != rb {
-                group_parent[rb] = ra;
-            }
-        }
-    }
-
-    // Validate same-step entity conflicts
-    {
-        let inst_group: Vec<usize> = (0..instances.len())
-            .map(|i| find_root(&mut group_parent, i))
+        let range = &plan.event_instance_ranges[event_idx];
+        let fire_vars: Vec<&Bool> = plan.instances[range.clone()]
+            .iter()
+            .filter_map(|inst| inst.fires_var.as_ref())
             .collect();
-        let mut group_roots_set: Vec<usize> = Vec::new();
-        for &g in &inst_group {
-            if !group_roots_set.contains(&g) {
-                group_roots_set.push(g);
-            }
+        if fire_vars.is_empty() {
+            continue;
         }
-        for &root in &group_roots_set {
-            let members: Vec<usize> = (0..instances.len())
-                .filter(|i| inst_group[*i] == root)
-                .collect();
-            if members.len() > 1 {
-                let mut seen_entities: HashSet<String> = HashSet::new();
-                for &ii in &members {
-                    let re = &resolved_events[instances[ii].event_idx];
-                    let mut event_entities = HashSet::new();
-                    let mut visited_calls = HashSet::new();
-                    for step in &re.steps {
-                        collect_event_body_entities(
-                            &step.body,
-                            &relevant_systems,
-                            &mut event_entities,
-                            &mut visited_calls,
-                        );
-                    }
-                    for ent_name in &event_entities {
-                        if !seen_entities.insert(ent_name.clone()) {
-                            return VerificationResult::SceneFail {
-                                name: scene.name.clone(),
-                                reason: crate::messages::scene_same_step_entity_conflict(
-                                    &scene.name,
-                                    ent_name,
-                                ),
-                                span: None,
-                                file: None,
-                            };
-                        }
-                    }
-                }
+        if card.min_fires == 1 {
+            solver.assert(smt::bool_or(&fire_vars));
+        } else {
+            for fire_var in &fire_vars {
+                solver.assert(*fire_var);
             }
         }
     }
+}
 
-    // Assert distinctness between instances NOT in the same group
-    {
-        let inst_group: Vec<usize> = (0..instances.len())
-            .map(|i| find_root(&mut group_parent, i))
-            .collect();
-        for i in 0..instances.len() {
-            for j in (i + 1)..instances.len() {
-                if inst_group[i] == inst_group[j] {
-                    // Same group: assert equal step
-                    solver.assert(smt::int_eq(&instances[i].step_var, &instances[j].step_var));
-                } else {
-                    // Different groups: assert distinct step
-                    solver.assert(smt::bool_not(&smt::int_eq(
-                        &instances[i].step_var,
-                        &instances[j].step_var,
-                    )));
-                }
+fn scene_group_root(parent: &mut [usize], index: usize) -> usize {
+    let mut root = index;
+    while parent[root] != root {
+        parent[root] = parent[parent[root]];
+        root = parent[root];
+    }
+    root
+}
+
+fn assert_scene_same_step_groups(
+    ctx: &SceneScheduleCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    group_parent: &mut [usize],
+) -> SceneCheckResult<()> {
+    let var_to_idx = scene_var_to_idx(&plan.event_var_names);
+    let mut pairs = Vec::new();
+    collect_same_step_event_pairs(&ctx.scene.ordering, &var_to_idx, &mut pairs);
+    for (left, right) in &pairs {
+        validate_scene_same_step_cardinality(ctx.scene, plan, *left, *right)?;
+        let inst_left = plan.event_instance_ranges[*left].start;
+        let inst_right = plan.event_instance_ranges[*right].start;
+        let root_left = scene_group_root(group_parent, inst_left);
+        let root_right = scene_group_root(group_parent, inst_right);
+        if root_left != root_right {
+            group_parent[root_right] = root_left;
+        }
+    }
+    Ok(())
+}
+
+fn validate_scene_same_step_cardinality(
+    scene: &IRScene,
+    plan: &SceneFiringPlan<'_>,
+    left: usize,
+    right: usize,
+) -> SceneCheckResult<()> {
+    if plan.event_cards[left].n_instances == 1 && plan.event_cards[right].n_instances == 1 {
+        return Ok(());
+    }
+    Err(scene_fail(
+        scene,
+        crate::messages::scene_same_step_multi_instance(
+            &scene.name,
+            &plan.event_var_names[left],
+            plan.event_cards[left].n_instances,
+            &plan.event_var_names[right],
+            plan.event_cards[right].n_instances,
+        ),
+        None,
+    ))
+}
+
+fn validate_scene_same_step_conflicts(
+    ctx: &SceneScheduleCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    group_parent: &mut [usize],
+) -> SceneCheckResult<()> {
+    let groups = scene_group_plan(plan.instances.len(), group_parent);
+    for root in &groups.inst_group_roots {
+        let members = scene_group_members(&groups.inst_group, *root);
+        if members.len() > 1 {
+            validate_scene_group_entity_conflicts(ctx, plan, &members)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_scene_group_entity_conflicts(
+    ctx: &SceneScheduleCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    members: &[usize],
+) -> SceneCheckResult<()> {
+    let mut seen_entities = HashSet::new();
+    for index in members {
+        let event = &plan.resolved_events[plan.instances[*index].event_idx];
+        let mut event_entities = HashSet::new();
+        let mut visited_calls = HashSet::new();
+        for step in &event.steps {
+            collect_event_body_entities(
+                &step.body,
+                ctx.relevant_systems,
+                &mut event_entities,
+                &mut visited_calls,
+            );
+        }
+        for entity_name in &event_entities {
+            if !seen_entities.insert(entity_name.clone()) {
+                return Err(scene_fail(
+                    ctx.scene,
+                    crate::messages::scene_same_step_entity_conflict(&ctx.scene.name, entity_name),
+                    None,
+                ));
             }
         }
     }
+    Ok(())
+}
 
-    // Validate ordering expression variable names
-    for ordering_expr in &scene.ordering {
-        let leaf_vars = collect_ordering_leaf_vars(ordering_expr);
-        for var_name in &leaf_vars {
-            if !var_to_idx.contains_key(var_name) {
-                return VerificationResult::SceneFail {
-                    name: scene.name.clone(),
-                    reason: crate::messages::scene_ordering_unknown_var(
-                        &scene.name,
-                        var_name,
-                        &event_var_names.join(", "),
-                    ),
-                    span: None,
-                    file: None,
-                };
+fn scene_group_plan(instance_count: usize, group_parent: &mut [usize]) -> SceneGroupPlan {
+    let inst_group: Vec<usize> = (0..instance_count)
+        .map(|index| scene_group_root(group_parent, index))
+        .collect();
+    let mut inst_group_roots = Vec::new();
+    for group in &inst_group {
+        if !inst_group_roots.contains(group) {
+            inst_group_roots.push(*group);
+        }
+    }
+    SceneGroupPlan {
+        inst_group,
+        inst_group_roots,
+    }
+}
+
+fn scene_group_members(inst_group: &[usize], root: usize) -> Vec<usize> {
+    (0..inst_group.len())
+        .filter(|index| inst_group[*index] == root)
+        .collect()
+}
+
+fn assert_scene_instance_distinctness(
+    solver: &AbideSolver,
+    plan: &SceneFiringPlan<'_>,
+    groups: &SceneGroupPlan,
+) {
+    for left in 0..plan.instances.len() {
+        for right in (left + 1)..plan.instances.len() {
+            let same_step = smt::int_eq(
+                &plan.instances[left].step_var,
+                &plan.instances[right].step_var,
+            );
+            if groups.inst_group[left] == groups.inst_group[right] {
+                solver.assert(same_step);
+            } else {
+                solver.assert(smt::bool_not(&same_step));
             }
         }
     }
+}
 
-    // Parse and assert ordering constraints from scene.ordering.
-    // For multi-instance events, a -> b means: all of a's instances
-    // precede all of b's instances (last_a < first_b).
-    for ordering_expr in &scene.ordering {
+fn assert_scene_ordering_constraints(
+    ctx: &SceneScheduleCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+) -> SceneCheckResult<()> {
+    let var_to_idx = scene_var_to_idx(&plan.event_var_names);
+    validate_scene_ordering_vars(ctx.scene, plan, &var_to_idx)?;
+    for ordering_expr in &ctx.scene.ordering {
         if let Err(reason) = encode_scene_ordering_v2(
             ordering_expr,
             &var_to_idx,
-            &event_instance_ranges,
-            &instances,
-            &solver,
-            &scene.name,
+            &plan.event_instance_ranges,
+            &plan.instances,
+            ctx.solver,
+            &ctx.scene.name,
         ) {
-            return VerificationResult::SceneFail {
-                name: scene.name.clone(),
-                reason,
-                span: None,
-                file: None,
-            };
+            return Err(scene_fail(ctx.scene, reason, None));
         }
     }
+    Ok(())
+}
 
-    // ── 4d. Encode instances at each possible step ──────────────────
-    // At each step k, one instance (or same-step group) fires, or stutter.
-    // Instances with fire tracking only fire when fires_var is true.
-    let inst_group: Vec<usize> = (0..instances.len())
-        .map(|i| find_root(&mut group_parent, i))
-        .collect();
-    let mut inst_group_roots: Vec<usize> = Vec::new();
-    for &g in &inst_group {
-        if !inst_group_roots.contains(&g) {
-            inst_group_roots.push(g);
-        }
-    }
-
-    for step in 0..bound {
-        let mut step_disjuncts: Vec<Bool> = Vec::new();
-
-        for &group_root in &inst_group_roots {
-            let group_members: Vec<usize> = (0..instances.len())
-                .filter(|i| inst_group[*i] == group_root)
-                .collect();
-
-            let step_guard =
-                smt::int_eq(&instances[group_root].step_var, &smt::int_lit(step as i64));
-
-            if group_members.len() == 1 {
-                let ii = group_members[0];
-                let inst = &instances[ii];
-                let re = &resolved_events[inst.event_idx];
-
-                let override_params = match build_scene_event_params(
-                    re,
-                    &pool,
-                    vctx,
-                    defs,
-                    &given_bindings,
-                    &scene_property_store_ranges,
-                    step,
-                    &scene.name,
-                ) {
-                    Ok(p) => p,
-                    Err(reason) => {
-                        return VerificationResult::SceneFail {
-                            name: scene.name.clone(),
-                            reason,
-                            span: None,
-                            file: None,
-                        };
-                    }
-                };
-
-                // Encode a disjunction over all steps implementing this command.
-                let step_formulas = re
-                    .steps
-                    .iter()
-                    .map(|step_ir| {
-                        try_encode_step_with_params(
-                            &pool,
-                            vctx,
-                            &relevant_entities,
-                            &relevant_systems,
-                            step_ir,
-                            step,
-                            override_params.clone(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                let step_formulas = match step_formulas {
-                    Ok(step_formulas) => step_formulas,
-                    Err(reason) => {
-                        return VerificationResult::SceneFail {
-                            name: scene.name.clone(),
-                            reason: format!("transition encoding error: {reason}"),
-                            span: None,
-                            file: None,
-                        };
-                    }
-                };
-                let event_formula = if step_formulas.len() == 1 {
-                    step_formulas.into_iter().next().unwrap()
-                } else {
-                    let refs: Vec<&Bool> = step_formulas.iter().collect();
-                    smt::bool_or(&refs)
-                };
-
-                if let Some(fires) = &inst.fires_var {
-                    // Optional firing: (step_guard ∧ fires ∧ event) ∨ (step_guard ∧ ¬fires ∧ stutter)
-                    let fires_branch = smt::bool_and(&[&step_guard, fires, &event_formula]);
-                    let stutter = harness::stutter_constraint(&pool, &relevant_entities, step);
-                    let skip_branch =
-                        smt::bool_and(&[&step_guard, &smt::bool_not(fires), &stutter]);
-                    step_disjuncts.push(smt::bool_or(&[&fires_branch, &skip_branch]));
-                } else {
-                    // Must fire
-                    step_disjuncts.push(smt::bool_and(&[&step_guard, &event_formula]));
-                }
-            } else {
-                // Same-step group: encode combined with fire-tracking.
-                // {lone} members are conditional: fires_var → event, ¬fires_var → skip.
-                let mut group_formulas: Vec<Bool> = Vec::new();
-                let mut combined_touched: HashSet<(String, usize)> = HashSet::new();
-
-                for &ii in &group_members {
-                    let inst = &instances[ii];
-                    let re = &resolved_events[inst.event_idx];
-                    let override_params = match build_scene_event_params(
-                        re,
-                        &pool,
-                        vctx,
-                        defs,
-                        &given_bindings,
-                        &scene_property_store_ranges,
-                        step,
+fn validate_scene_ordering_vars(
+    scene: &IRScene,
+    plan: &SceneFiringPlan<'_>,
+    var_to_idx: &HashMap<&str, usize>,
+) -> SceneCheckResult<()> {
+    for ordering_expr in &scene.ordering {
+        for var_name in collect_ordering_leaf_vars(ordering_expr) {
+            if !var_to_idx.contains_key(var_name) {
+                return Err(scene_fail(
+                    scene,
+                    crate::messages::scene_ordering_unknown_var(
                         &scene.name,
-                    ) {
-                        Ok(p) => p,
-                        Err(reason) => {
-                            return VerificationResult::SceneFail {
-                                name: scene.name.clone(),
-                                reason,
-                                span: None,
-                                file: None,
-                            };
-                        }
-                    };
-                    // Encode a disjunction over all steps implementing this command,
-                    // with per-branch framing so each branch constrains slots touched
-                    // by other branches but not by itself.
-                    let mut branch_results: Vec<(Bool, HashSet<(String, usize)>)> = Vec::new();
-                    for step_ir in &re.steps {
-                        let (f, t) = match harness::try_encode_step_inner(
-                            &pool,
-                            vctx,
-                            &relevant_entities,
-                            &relevant_systems,
-                            step_ir,
-                            step,
-                            0,
-                            Some(override_params.clone()),
-                        ) {
-                            Ok(v) => v,
-                            Err(reason) => {
-                                return VerificationResult::SceneFail {
-                                    name: scene.name.clone(),
-                                    reason: format!("scene step encoding failed: {reason}"),
-                                    span: None,
-                                    file: None,
-                                };
-                            }
-                        };
-                        branch_results.push((f, t));
-                    }
-                    // Compute union of touched across all branches
-                    let all_branch_touched: HashSet<(String, usize)> = branch_results
-                        .iter()
-                        .flat_map(|(_, t)| t.iter().cloned())
-                        .collect();
-                    // Apply per-branch framing
-                    let framed_branches: Vec<Bool> = branch_results
-                        .into_iter()
-                        .map(|(formula, branch_touched)| {
-                            let extra: HashSet<(String, usize)> = all_branch_touched
-                                .difference(&branch_touched)
-                                .cloned()
-                                .collect();
-                            if extra.is_empty() {
-                                formula
-                            } else {
-                                let frame = harness::frame_specific_slots(
-                                    &pool,
-                                    &relevant_entities,
-                                    &extra,
-                                    step,
-                                );
-                                let mut parts = vec![formula];
-                                parts.extend(frame);
-                                let refs: Vec<&Bool> = parts.iter().collect();
-                                smt::bool_and(&refs)
-                            }
-                        })
-                        .collect();
-                    let formula = if framed_branches.len() == 1 {
-                        framed_branches.into_iter().next().unwrap()
-                    } else {
-                        let refs: Vec<&Bool> = framed_branches.iter().collect();
-                        smt::bool_or(&refs)
-                    };
-                    combined_touched.extend(all_branch_touched);
-                    // For {lone} members, make the formula conditional on fires_var.
-                    if let Some(fires) = &inst.fires_var {
-                        group_formulas.push(smt::bool_implies(fires, &formula));
-                    } else {
-                        group_formulas.push(formula);
-                    }
-                }
-
-                let mut all_parts = vec![step_guard];
-                all_parts.extend(group_formulas);
-                let combined = {
-                    let refs: Vec<&Bool> = all_parts.iter().collect();
-                    smt::bool_and(&refs)
-                };
-                let framed = harness::apply_global_frame(
-                    &pool,
-                    &relevant_entities,
-                    &combined_touched,
-                    step,
-                    combined,
-                );
-                step_disjuncts.push(framed);
-            }
-        }
-
-        // Stutter: no instance fires at this step
-        let mut no_inst_parts: Vec<Bool> = Vec::new();
-        for &root in &inst_group_roots {
-            no_inst_parts.push(smt::bool_not(&smt::int_eq(
-                &instances[root].step_var,
-                &smt::int_lit(step as i64),
-            )));
-        }
-        let stutter = harness::stutter_constraint(&pool, &relevant_entities, step);
-        let no_inst_refs: Vec<&Bool> = no_inst_parts.iter().collect();
-        let no_inst = smt::bool_and(&no_inst_refs);
-        step_disjuncts.push(smt::bool_and(&[&no_inst, &stutter]));
-
-        let refs: Vec<&Bool> = step_disjuncts.iter().collect();
-        solver.assert(smt::bool_or(&refs));
-    }
-
-    // Assert result variable activation for create events
-    for (ei, re) in resolved_events.iter().enumerate() {
-        if let Some((result_entity, allocated_slot)) = given_bindings.get(&re.scene_event.var) {
-            let is_result = scene.givens.iter().all(|g| g.var != re.scene_event.var);
-            if is_result {
-                // Use first instance of this event for result activation
-                let range = &event_instance_ranges[ei];
-                if !range.is_empty() {
-                    let first_inst = &instances[range.start];
-                    for step in 0..bound {
-                        if let Some(SmtValue::Bool(active_next)) =
-                            pool.active_at(result_entity, *allocated_slot, step + 1)
-                        {
-                            let mut guard =
-                                smt::int_eq(&first_inst.step_var, &smt::int_lit(step as i64));
-                            if let Some(fires) = &first_inst.fires_var {
-                                guard = smt::bool_and(&[&guard, fires]);
-                            }
-                            solver.assert(smt::bool_implies(&guard, active_next));
-                        }
-                    }
-                }
+                        var_name,
+                        &plan.event_var_names.join(", "),
+                    ),
+                    None,
+                ));
             }
         }
     }
+    Ok(())
+}
 
-    // ── 5. Encode then assertions at final step ────────────────────
-    let final_step = bound; // after all events
-    let mut then_ctx = PropertyCtx::new().with_store_ranges(scene_property_store_ranges);
-    for (var, (entity, slot)) in &given_bindings {
-        then_ctx = then_ctx.with_binding(var, entity, *slot);
-    }
-
-    for assertion in &scene.assertions {
-        let prop =
-            match encode_prop_expr_with_ctx(&pool, vctx, defs, &then_ctx, assertion, final_step) {
-                Ok(p) => p,
-                Err(msg) => {
-                    return VerificationResult::SceneFail {
-                        name: scene.name.clone(),
-                        reason: format!("encoding error in then assertion: {msg}"),
-                        span: expr_span(assertion),
-                        file: None,
-                    };
-                }
+fn assert_scene_step_transitions(
+    ctx: &SceneTransitionCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    groups: &SceneGroupPlan,
+) -> SceneCheckResult<()> {
+    for step in 0..ctx.bound {
+        let mut disjuncts = Vec::new();
+        for root in &groups.inst_group_roots {
+            let members = scene_group_members(&groups.inst_group, *root);
+            let guard = smt::int_eq(&plan.instances[*root].step_var, &smt::int_lit(step as i64));
+            let branch = if members.len() == 1 {
+                scene_single_instance_branch(ctx, plan, members[0], step, &guard)?
+            } else {
+                scene_same_step_group_branch(ctx, plan, &members, step, guard)?
             };
-        solver.assert(&prop);
+            disjuncts.push(branch);
+        }
+        disjuncts.push(scene_stutter_branch(ctx, groups, plan, step));
+        let refs: Vec<&Bool> = disjuncts.iter().collect();
+        ctx.solver.assert(smt::bool_or(&refs));
     }
+    Ok(())
+}
 
-    // ── 6. Check SAT ───────────────────────────────────────────────
-    let elapsed = elapsed_ms(&start);
+fn scene_single_instance_branch(
+    ctx: &SceneTransitionCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    instance_index: usize,
+    step: usize,
+    step_guard: &Bool,
+) -> SceneCheckResult<Bool> {
+    let inst = &plan.instances[instance_index];
+    let event = &plan.resolved_events[inst.event_idx];
+    let formula = scene_event_formula(ctx, event, step)?;
+    if let Some(fires) = &inst.fires_var {
+        let fires_branch = smt::bool_and(&[step_guard, fires, &formula]);
+        let stutter = harness::stutter_constraint(ctx.pool, ctx.relevant_entities, step);
+        let skip_branch = smt::bool_and(&[step_guard, &smt::bool_not(fires), &stutter]);
+        Ok(smt::bool_or(&[&fires_branch, &skip_branch]))
+    } else {
+        Ok(smt::bool_and(&[step_guard, &formula]))
+    }
+}
 
-    match solver.check() {
-        result @ SatResult::Sat => {
-            let evidence = scene_pass_evidence(
-                &solver,
-                &pool,
-                vctx,
-                defs,
-                &relevant_entities,
-                &relevant_systems,
-                &resolved_events,
-                &instances,
-                &given_bindings,
-                &then_ctx.store_ranges,
-                bound,
+fn scene_event_formula(
+    ctx: &SceneTransitionCtx<'_>,
+    event: &ResolvedSceneEvent<'_>,
+    step: usize,
+) -> SceneCheckResult<Bool> {
+    let override_params = scene_event_params(ctx, event, step)?;
+    let formulas = event
+        .steps
+        .iter()
+        .map(|step_ir| {
+            try_encode_step_with_params(
+                ctx.pool,
+                ctx.vctx,
+                ctx.relevant_entities,
+                ctx.relevant_systems,
+                step_ir,
+                step,
+                override_params.clone(),
             )
-            .ok();
-            scene_solver_result(scene, result, elapsed, evidence)
-        }
-        result @ (SatResult::Unsat | SatResult::Unknown(_)) => {
-            scene_solver_result(scene, result, elapsed, None)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|reason| {
+            scene_fail(
+                ctx.scene,
+                format!("transition encoding error: {reason}"),
+                None,
+            )
+        })?;
+    Ok(bool_or_values(formulas))
+}
+
+fn scene_event_params(
+    ctx: &SceneTransitionCtx<'_>,
+    event: &ResolvedSceneEvent<'_>,
+    step: usize,
+) -> SceneCheckResult<HashMap<String, SmtValue>> {
+    build_scene_event_params(
+        event,
+        &SceneEventParamCtx {
+            pool: ctx.pool,
+            vctx: ctx.vctx,
+            defs: ctx.defs,
+            given_bindings: ctx.given_bindings,
+            store_ranges: ctx.store_ranges,
+            step,
+        },
+    )
+    .map_err(|reason| scene_fail(ctx.scene, reason, None))
+}
+
+fn scene_same_step_group_branch(
+    ctx: &SceneTransitionCtx<'_>,
+    plan: &SceneFiringPlan<'_>,
+    members: &[usize],
+    step: usize,
+    step_guard: Bool,
+) -> SceneCheckResult<Bool> {
+    let mut group_formulas = Vec::new();
+    let mut combined_touched = HashSet::new();
+    for index in members {
+        let inst = &plan.instances[*index];
+        let event = &plan.resolved_events[inst.event_idx];
+        let (formula, touched) = scene_framed_event_formula(ctx, event, step)?;
+        combined_touched.extend(touched);
+        if let Some(fires) = &inst.fires_var {
+            group_formulas.push(smt::bool_implies(fires, &formula));
+        } else {
+            group_formulas.push(formula);
         }
     }
+    let mut parts = vec![step_guard];
+    parts.extend(group_formulas);
+    let combined = bool_and_values(parts);
+    Ok(harness::apply_global_frame(
+        ctx.pool,
+        ctx.relevant_entities,
+        &combined_touched,
+        step,
+        combined,
+    ))
+}
+
+fn scene_framed_event_formula(
+    ctx: &SceneTransitionCtx<'_>,
+    event: &ResolvedSceneEvent<'_>,
+    step: usize,
+) -> SceneCheckResult<(Bool, HashSet<(String, usize)>)> {
+    let override_params = scene_event_params(ctx, event, step)?;
+    let mut branch_results = Vec::new();
+    for step_ir in &event.steps {
+        let encoded = harness::try_encode_step_inner(
+            ctx.pool,
+            ctx.vctx,
+            ctx.relevant_entities,
+            ctx.relevant_systems,
+            step_ir,
+            step,
+            harness::StepEncodingOptions::with_override(0, override_params.clone()),
+        )
+        .map_err(|reason| {
+            scene_fail(
+                ctx.scene,
+                format!("scene step encoding failed: {reason}"),
+                None,
+            )
+        })?;
+        branch_results.push(encoded);
+    }
+    let touched = branch_results
+        .iter()
+        .flat_map(|(_, branch_touched)| branch_touched.iter().cloned())
+        .collect();
+    let formula = scene_framed_branch_formula(ctx, step, branch_results, &touched);
+    Ok((formula, touched))
+}
+
+fn scene_framed_branch_formula(
+    ctx: &SceneTransitionCtx<'_>,
+    step: usize,
+    branch_results: Vec<(Bool, HashSet<(String, usize)>)>,
+    all_touched: &HashSet<(String, usize)>,
+) -> Bool {
+    let branches = branch_results
+        .into_iter()
+        .map(|(formula, branch_touched)| {
+            let extra: HashSet<(String, usize)> =
+                all_touched.difference(&branch_touched).cloned().collect();
+            if extra.is_empty() {
+                formula
+            } else {
+                let frame =
+                    harness::frame_specific_slots(ctx.pool, ctx.relevant_entities, &extra, step);
+                let mut parts = vec![formula];
+                parts.extend(frame);
+                bool_and_values(parts)
+            }
+        })
+        .collect();
+    bool_or_values(branches)
+}
+
+fn scene_stutter_branch(
+    ctx: &SceneTransitionCtx<'_>,
+    groups: &SceneGroupPlan,
+    plan: &SceneFiringPlan<'_>,
+    step: usize,
+) -> Bool {
+    let no_instance_parts: Vec<Bool> = groups
+        .inst_group_roots
+        .iter()
+        .map(|root| {
+            smt::bool_not(&smt::int_eq(
+                &plan.instances[*root].step_var,
+                &smt::int_lit(step as i64),
+            ))
+        })
+        .collect();
+    let no_instance = bool_and_values(no_instance_parts);
+    let stutter = harness::stutter_constraint(ctx.pool, ctx.relevant_entities, step);
+    smt::bool_and(&[&no_instance, &stutter])
+}
+
+fn assert_scene_result_activation(
+    scene: &IRScene,
+    pool: &harness::SlotPool,
+    solver: &AbideSolver,
+    given_bindings: &HashMap<String, (String, usize)>,
+    plan: &SceneFiringPlan<'_>,
+    bound: usize,
+) {
+    for (event_idx, event) in plan.resolved_events.iter().enumerate() {
+        let Some((result_entity, allocated_slot)) = given_bindings.get(&event.scene_event.var)
+        else {
+            continue;
+        };
+        if scene
+            .givens
+            .iter()
+            .any(|given| given.var == event.scene_event.var)
+        {
+            continue;
+        }
+        let range = &plan.event_instance_ranges[event_idx];
+        if !range.is_empty() {
+            assert_scene_first_instance_activation(
+                pool,
+                solver,
+                result_entity,
+                *allocated_slot,
+                &plan.instances[range.start],
+                bound,
+            );
+        }
+    }
+}
+
+fn assert_scene_first_instance_activation(
+    pool: &harness::SlotPool,
+    solver: &AbideSolver,
+    result_entity: &str,
+    allocated_slot: usize,
+    first_inst: &FiringInst,
+    bound: usize,
+) {
+    for step in 0..bound {
+        let Some(SmtValue::Bool(active_next)) =
+            pool.active_at(result_entity, allocated_slot, step + 1)
+        else {
+            continue;
+        };
+        let mut guard = smt::int_eq(&first_inst.step_var, &smt::int_lit(step as i64));
+        if let Some(fires) = &first_inst.fires_var {
+            guard = smt::bool_and(&[&guard, fires]);
+        }
+        solver.assert(smt::bool_implies(&guard, active_next));
+    }
+}
+
+fn assert_scene_then_assertions(ctx: &SceneTransitionCtx<'_>) -> SceneCheckResult<PropertyCtx> {
+    let final_step = ctx.bound;
+    let then_ctx = scene_then_ctx(ctx.store_ranges, ctx.given_bindings);
+    for assertion in &ctx.scene.assertions {
+        let prop = encode_prop_expr_with_ctx(
+            ctx.pool, ctx.vctx, ctx.defs, &then_ctx, assertion, final_step,
+        )
+        .map_err(|msg| {
+            scene_fail(
+                ctx.scene,
+                format!("encoding error in then assertion: {msg}"),
+                expr_span(assertion),
+            )
+        })?;
+        ctx.solver.assert(&prop);
+    }
+    Ok(then_ctx)
+}
+
+fn scene_then_ctx(
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+    given_bindings: &HashMap<String, (String, usize)>,
+) -> PropertyCtx {
+    let mut ctx = PropertyCtx::new().with_store_ranges(store_ranges.clone());
+    for (var, (entity, slot)) in given_bindings {
+        ctx = ctx.with_binding(var, entity, *slot);
+    }
+    ctx
+}
+
+fn bool_or_values(values: Vec<Bool>) -> Bool {
+    if values.len() == 1 {
+        values.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&Bool> = values.iter().collect();
+        smt::bool_or(&refs)
+    }
+}
+
+fn bool_and_values(values: Vec<Bool>) -> Bool {
+    let refs: Vec<&Bool> = values.iter().collect();
+    smt::bool_and(&refs)
 }
 
 #[cfg(test)]
@@ -2655,13 +3085,17 @@ mod tests {
         };
         let params = build_scene_event_params(
             &resolved,
-            &pool,
-            &vctx,
-            &defs,
-            &HashMap::from([("given_copy".to_owned(), ("Copy".to_owned(), 0usize))]),
-            &HashMap::new(),
-            0,
-            "entity_arg_scene",
+            &SceneEventParamCtx {
+                pool: &pool,
+                vctx: &vctx,
+                defs: &defs,
+                given_bindings: &HashMap::from([(
+                    "given_copy".to_owned(),
+                    ("Copy".to_owned(), 0usize),
+                )]),
+                store_ranges: &HashMap::new(),
+                step: 0,
+            },
         )
         .expect("given-bound entity scene arg should encode as slot id");
 
@@ -2721,13 +3155,14 @@ mod tests {
         };
         let params = build_scene_event_params(
             &resolved,
-            &pool,
-            &vctx,
-            &defs,
-            &HashMap::new(),
-            &HashMap::new(),
-            0,
-            "choose_arg_scene",
+            &SceneEventParamCtx {
+                pool: &pool,
+                vctx: &vctx,
+                defs: &defs,
+                given_bindings: &HashMap::new(),
+                store_ranges: &HashMap::new(),
+                step: 0,
+            },
         )
         .expect("direct choose equality scene arg should encode");
 

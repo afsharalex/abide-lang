@@ -1,3 +1,13 @@
+//! Operational simulator for lowered IR.
+//!
+//! Drives an [`IRProgram`] forward step by step, picking enabled
+//! commands and resolving nondeterminism with a seeded PRNG. The
+//! resulting trace materializes as an [`op::Behavior`] so it can be
+//! rendered with the same machinery as a verifier counterexample.
+//!
+//! The simulator is for exploration only — it is not a verifier and
+//! does not soundly refute properties.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -5,13 +15,19 @@ use serde::{Deserialize, Serialize};
 use crate::ir::types::{
     IRAction, IRActionMatchScrutinee, IRCreateField, IREntity, IRExpr, IRField, IRFunction,
     IRMatchArm, IRPattern, IRProgram, IRSystem, IRSystemAction, IRTransition, IRType, IRVariant,
-    LitVal,
+    LetBinding, LitVal,
 };
 use crate::witness::op::{
     self, AtomicStepId, Behavior, Binding, Choice, EntitySlotRef, EntityState,
     TransitionObservation, WitnessValue,
 };
 
+/// User-facing configuration for the simulator.
+///
+/// `slots_per_entity` is the default pool size per entity type;
+/// `entity_slot_overrides` lets callers raise (or lower) it for
+/// specific entity types. `system` optionally narrows simulation to
+/// one system in a multi-system program.
 #[derive(Clone, Debug)]
 pub struct SimulateConfig {
     pub steps: usize,
@@ -33,12 +49,21 @@ impl Default for SimulateConfig {
     }
 }
 
+/// Why the simulator stopped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimulationTermination {
+    /// Reached the requested step count.
     StepLimit,
+    /// Hit a state with no enabled commands; `reasons` lists each
+    /// disabled command and why it failed to fire.
     Deadlock { reasons: Vec<String> },
 }
 
+/// Output of one simulator run.
+///
+/// `violations` collects any contract checks that failed mid-trace
+/// without halting (the simulator runs past violations to surface
+/// later issues too).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimulationResult {
     pub systems: Vec<String>,
@@ -62,6 +87,12 @@ pub struct SimulationViolation {
 impl SimulationResult {
     pub fn render_text(&self) -> String {
         let mut out = String::new();
+        self.render_summary_text(&mut out);
+        self.render_states_text(&mut out);
+        out
+    }
+
+    fn render_summary_text(&self, out: &mut String) {
         out.push_str("Simulation\n");
         out.push_str(&format!("systems: {}\n", self.systems.join(", ")));
         out.push_str(&format!("seed: {}\n", self.seed));
@@ -92,99 +123,123 @@ impl SimulationResult {
                 ));
             }
         }
+    }
 
+    fn render_states_text(&self, out: &mut String) {
         for (index, state) in self.behavior.states().iter().enumerate() {
             out.push('\n');
             out.push_str(&format!("state {index}\n"));
-            for (slot_ref, entity_state) in state.entity_slots() {
-                if !entity_state.active() {
-                    continue;
-                }
-                out.push_str(&format!("  {}[{}]\n", slot_ref.entity(), slot_ref.slot()));
-                for (field, value) in entity_state.fields() {
-                    out.push_str(&format!("    {field} = {}\n", render_value(value)));
-                }
-            }
-            for (system, fields) in state.system_fields() {
-                out.push_str(&format!("  System::{system}\n"));
-                for (field, value) in fields {
-                    out.push_str(&format!("    {field} = {}\n", render_value(value)));
-                }
-            }
+            Self::render_state_text(out, state);
 
             if let Some(transition) = self.behavior.transition_after_state(index) {
-                out.push_str("  ->\n");
-                for atomic in transition.atomic_steps() {
-                    out.push_str(&format!("    {}::{}", atomic.system(), atomic.command()));
-                    if atomic.params().is_empty() {
-                        out.push_str("()");
-                    } else {
-                        let params = atomic
-                            .params()
-                            .iter()
-                            .map(|binding| {
-                                format!("{}={}", binding.name(), render_value(binding.value()))
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        out.push_str(&format!("({params})"));
-                    }
-                    if let Some(step_name) = atomic.step_name() {
-                        out.push_str(&format!(" [{step_name}]"));
-                    }
-                    out.push('\n');
-                    for choice in atomic.choices() {
-                        match choice {
-                            Choice::Choose { binder, selected } => {
-                                out.push_str(&format!(
-                                    "      choose {binder} = {}[{}]\n",
-                                    selected.entity(),
-                                    selected.slot()
-                                ));
-                            }
-                            Choice::ForAll { binder, iterated } => {
-                                let items = iterated
-                                    .iter()
-                                    .map(|slot| format!("{}[{}]", slot.entity(), slot.slot()))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                out.push_str(&format!("      forall {binder} in [{items}]\n"));
-                            }
-                            Choice::Create { created } => {
-                                out.push_str(&format!(
-                                    "      create {}[{}]\n",
-                                    created.entity(),
-                                    created.slot()
-                                ));
-                            }
-                        }
-                    }
-                    if let Some(result) = atomic.result() {
-                        out.push_str(&format!("      result = {}\n", render_value(result)));
-                    }
-                }
-                for observation in transition.observations() {
-                    out.push_str(&format!(
-                        "    observation {} = {}\n",
-                        observation.name(),
-                        render_value(observation.value())
-                    ));
-                }
-                if let Some(next_state) = self.behavior.state(index + 1) {
-                    let changes = render_state_changes(state, next_state);
-                    if changes.is_empty() {
-                        out.push_str("    changes: none\n");
-                    } else {
-                        out.push_str("    changes\n");
-                        for change in changes {
-                            out.push_str(&format!("      {change}\n"));
-                        }
-                    }
-                }
+                self.render_transition_text(out, index, state, transition);
             }
         }
+    }
 
-        out
+    fn render_state_text(out: &mut String, state: &op::State) {
+        for (slot_ref, entity_state) in state.entity_slots() {
+            if !entity_state.active() {
+                continue;
+            }
+            out.push_str(&format!("  {}[{}]\n", slot_ref.entity(), slot_ref.slot()));
+            for (field, value) in entity_state.fields() {
+                out.push_str(&format!("    {field} = {}\n", render_value(value)));
+            }
+        }
+        for (system, fields) in state.system_fields() {
+            out.push_str(&format!("  System::{system}\n"));
+            for (field, value) in fields {
+                out.push_str(&format!("    {field} = {}\n", render_value(value)));
+            }
+        }
+    }
+
+    fn render_transition_text(
+        &self,
+        out: &mut String,
+        index: usize,
+        state: &op::State,
+        transition: &op::Transition,
+    ) {
+        out.push_str("  ->\n");
+        for atomic in transition.atomic_steps() {
+            Self::render_atomic_step_text(out, atomic);
+        }
+        for observation in transition.observations() {
+            out.push_str(&format!(
+                "    observation {} = {}\n",
+                observation.name(),
+                render_value(observation.value())
+            ));
+        }
+        if let Some(next_state) = self.behavior.state(index + 1) {
+            Self::render_state_changes_text(out, state, next_state);
+        }
+    }
+
+    fn render_atomic_step_text(out: &mut String, atomic: &op::AtomicStep) {
+        out.push_str(&format!("    {}::{}", atomic.system(), atomic.command()));
+        if atomic.params().is_empty() {
+            out.push_str("()");
+        } else {
+            let params = atomic
+                .params()
+                .iter()
+                .map(|binding| format!("{}={}", binding.name(), render_value(binding.value())))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("({params})"));
+        }
+        if let Some(step_name) = atomic.step_name() {
+            out.push_str(&format!(" [{step_name}]"));
+        }
+        out.push('\n');
+        for choice in atomic.choices() {
+            Self::render_choice_text(out, choice);
+        }
+        if let Some(result) = atomic.result() {
+            out.push_str(&format!("      result = {}\n", render_value(result)));
+        }
+    }
+
+    fn render_choice_text(out: &mut String, choice: &Choice) {
+        match choice {
+            Choice::Choose { binder, selected } => {
+                out.push_str(&format!(
+                    "      choose {binder} = {}[{}]\n",
+                    selected.entity(),
+                    selected.slot()
+                ));
+            }
+            Choice::ForAll { binder, iterated } => {
+                let items = iterated
+                    .iter()
+                    .map(|slot| format!("{}[{}]", slot.entity(), slot.slot()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("      forall {binder} in [{items}]\n"));
+            }
+            Choice::Create { created } => {
+                out.push_str(&format!(
+                    "      create {}[{}]\n",
+                    created.entity(),
+                    created.slot()
+                ));
+            }
+        }
+    }
+
+    fn render_state_changes_text(out: &mut String, state: &op::State, next_state: &op::State) {
+        let changes = render_state_changes(state, next_state);
+        if changes.is_empty() {
+            out.push_str("    changes: none\n");
+        } else {
+            out.push_str("    changes\n");
+            for change in changes {
+                out.push_str(&format!("      {change}\n"));
+            }
+        }
     }
 }
 
@@ -395,6 +450,18 @@ struct CommandCandidate {
 struct AtomicCapture {
     atomic_step: op::AtomicStep,
     observations: Vec<op::TransitionObservation>,
+}
+
+#[derive(Clone, Copy)]
+struct ActionExecutionCtx<'a> {
+    system: &'a IRSystem,
+    current_system: &'a str,
+    current_slot: Option<&'a EntitySlotRef>,
+}
+
+struct ActionEffects<'a> {
+    choices: &'a mut Vec<Choice>,
+    observations: &'a mut Vec<op::TransitionObservation>,
 }
 
 impl AtomicCapture {
@@ -861,16 +928,19 @@ impl<'a> Runtime<'a> {
         }
 
         let mut observations = Vec::new();
-        for action in &step.body {
-            self.execute_action(
+        {
+            let ctx = ActionExecutionCtx {
                 system,
-                action,
-                &system.name,
-                None,
-                &mut locals,
-                &mut choices,
-                &mut observations,
-            )?;
+                current_system: &system.name,
+                current_slot: None,
+            };
+            let mut effects = ActionEffects {
+                choices: &mut choices,
+                observations: &mut observations,
+            };
+            for action in &step.body {
+                self.execute_action(action, ctx, &mut locals, &mut effects)?;
+            }
         }
         if top_level {
             let observation = TransitionObservation::new(
@@ -904,84 +974,18 @@ impl<'a> Runtime<'a> {
 
     fn execute_action(
         &mut self,
-        system: &IRSystem,
         action: &IRAction,
-        current_system: &str,
-        current_slot: Option<&EntitySlotRef>,
+        ctx: ActionExecutionCtx<'_>,
         locals: &mut BTreeMap<String, WitnessValue>,
-        choices: &mut Vec<Choice>,
-        observations: &mut Vec<op::TransitionObservation>,
+        effects: &mut ActionEffects<'_>,
     ) -> Result<(), String> {
         match action {
-            IRAction::Choose {
-                var,
-                entity,
-                filter,
-                ops,
-            } => {
-                let candidates = self
-                    .active_slots_for_entity(system, entity)
-                    .into_iter()
-                    .filter(|slot| {
-                        let mut local_locals = locals.clone();
-                        local_locals.insert(var.clone(), WitnessValue::SlotRef(slot.clone()));
-                        let local_env = Self::eval_env(current_system, None, &local_locals);
-                        self.eval_bool(filter, &local_env).unwrap_or(false)
-                    })
-                    .collect::<Vec<_>>();
-                if candidates.is_empty() {
-                    return Err(format!(
-                        "choose `{var}: {entity}` found no active matching slot in {}::{current_system}",
-                        system.name
-                    ));
-                }
-                let selected = candidates[self.rng.next_index(candidates.len())].clone();
-                choices.push(Choice::Choose {
-                    binder: var.clone(),
-                    selected: selected.clone(),
-                });
-                let mut local_locals = locals.clone();
-                local_locals.insert(var.clone(), WitnessValue::SlotRef(selected.clone()));
-                for op in ops {
-                    self.execute_action(
-                        system,
-                        op,
-                        current_system,
-                        None,
-                        &mut local_locals,
-                        choices,
-                        observations,
-                    )?;
-                }
-                Ok(())
-            }
-            IRAction::ForAll { var, entity, ops } => {
-                let iterated = self.active_slots_for_entity(system, entity);
-                choices.push(Choice::ForAll {
-                    binder: var.clone(),
-                    iterated: iterated.clone(),
-                });
-                for slot in iterated {
-                    let mut local_locals = locals.clone();
-                    local_locals.insert(var.clone(), WitnessValue::SlotRef(slot.clone()));
-                    for op in ops {
-                        self.execute_action(
-                            system,
-                            op,
-                            current_system,
-                            None,
-                            &mut local_locals,
-                            choices,
-                            observations,
-                        )?;
-                    }
-                }
-                Ok(())
-            }
+            IRAction::Choose { .. } => self.execute_choose_action(action, ctx, locals, effects),
+            IRAction::ForAll { .. } => self.execute_forall_action(action, ctx, locals, effects),
             IRAction::Create { entity, fields } => {
-                let env = Self::eval_env(current_system, current_slot, locals);
+                let env = Self::eval_env(ctx.current_system, ctx.current_slot, locals);
                 let created = self.create_entity(entity, fields, &env)?;
-                choices.push(Choice::Create { created });
+                effects.choices.push(Choice::Create { created });
                 Ok(())
             }
             IRAction::Apply {
@@ -1002,114 +1006,244 @@ impl<'a> Runtime<'a> {
                         ))
                     }
                 };
-                let env = Self::eval_env(current_system, current_slot, locals);
+                let env = Self::eval_env(ctx.current_system, ctx.current_slot, locals);
                 self.apply_entity_transition(&slot, transition, refs, args, &env)
             }
-            IRAction::CrossCall {
-                system: target_system,
-                command,
-                args,
-            } => {
-                let capture = self.execute_cross_call(
-                    target_system,
-                    command,
-                    args,
-                    current_system,
-                    current_slot,
-                    locals,
-                )?;
-                Self::record_cross_call_observations(
-                    target_system,
-                    command,
-                    &capture,
-                    observations,
-                )?;
-                Ok(())
+            IRAction::CrossCall { .. } => {
+                self.execute_cross_call_action(action, ctx, locals, effects)
             }
-            IRAction::LetCrossCall {
-                name,
-                system: target_system,
-                command,
-                args,
-            } => {
-                let capture = self.execute_cross_call(
-                    target_system,
-                    command,
-                    args,
-                    current_system,
-                    current_slot,
-                    locals,
-                )?;
-                Self::record_cross_call_observations(
-                    target_system,
-                    command,
-                    &capture,
-                    observations,
-                )?;
-                locals.insert(name.clone(), capture.result()?.clone());
-                Ok(())
+            IRAction::LetCrossCall { .. } => {
+                self.execute_let_cross_call_action(action, ctx, locals, effects)
             }
-            IRAction::Match { scrutinee, arms } => {
-                let scrutinee_value = match scrutinee {
-                    IRActionMatchScrutinee::Var { name } => locals
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| format!("unknown match scrutinee `{name}`"))?,
-                    IRActionMatchScrutinee::CrossCall {
-                        system: target_system,
-                        command,
-                        args,
-                    } => {
-                        let capture = self.execute_cross_call(
-                            target_system,
-                            command,
-                            args,
-                            current_system,
-                            current_slot,
-                            locals,
-                        )?;
-                        Self::record_cross_call_observations(
-                            target_system,
-                            command,
-                            &capture,
-                            observations,
-                        )?;
-                        capture.result()?.clone()
-                    }
-                };
-                let (locals, body) = self
-                    .select_match_arm(
-                        &scrutinee_value,
-                        arms,
-                        &Self::eval_env(current_system, current_slot, locals),
-                    )?
-                    .ok_or_else(|| "no simulation match arm matched".to_owned())?;
-                let mut local_locals = locals;
-                for op in body {
-                    self.execute_action(
-                        system,
-                        op,
-                        current_system,
-                        None,
-                        &mut local_locals,
-                        choices,
-                        observations,
-                    )?;
-                }
-                Ok(())
-            }
-            IRAction::ExprStmt { expr } => {
-                if !self.try_execute_assignment(expr, current_system, current_slot, locals)? {
-                    let env = Self::eval_env(current_system, current_slot, locals);
-                    let value = self.eval_expr(expr, &env)?;
-                    let observation =
-                        TransitionObservation::new(format!("expr:{}", expr_kind(expr)), value)
-                            .map_err(|err| format!("invalid expr observation: {err}"))?;
-                    observations.push(observation);
-                }
-                Ok(())
+            IRAction::Match { .. } => self.execute_match_action(action, ctx, locals, effects),
+            IRAction::ExprStmt { .. } => {
+                self.execute_expr_stmt_action(action, ctx, locals, effects)
             }
         }
+    }
+
+    fn execute_choose_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::Choose {
+            var,
+            entity,
+            filter,
+            ops,
+        } = action
+        else {
+            return Err("internal simulation error: expected choose action".to_owned());
+        };
+        let candidates = self
+            .active_slots_for_entity(ctx.system, entity)
+            .into_iter()
+            .filter(|slot| {
+                let mut local_locals = locals.clone();
+                local_locals.insert(var.to_owned(), WitnessValue::SlotRef(slot.clone()));
+                let local_env = Self::eval_env(ctx.current_system, None, &local_locals);
+                self.eval_bool(filter, &local_env).unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(format!(
+                "choose `{var}: {entity}` found no active matching slot in {}::{}",
+                ctx.system.name, ctx.current_system
+            ));
+        }
+        let selected = candidates[self.rng.next_index(candidates.len())].clone();
+        effects.choices.push(Choice::Choose {
+            binder: var.to_owned(),
+            selected: selected.clone(),
+        });
+        let mut local_locals = locals.clone();
+        local_locals.insert(var.to_owned(), WitnessValue::SlotRef(selected));
+        let nested_ctx = ActionExecutionCtx {
+            current_slot: None,
+            ..ctx
+        };
+        for op in ops {
+            self.execute_action(op, nested_ctx, &mut local_locals, effects)?;
+        }
+        Ok(())
+    }
+
+    fn execute_forall_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::ForAll { var, entity, ops } = action else {
+            return Err("internal simulation error: expected forall action".to_owned());
+        };
+        let iterated = self.active_slots_for_entity(ctx.system, entity);
+        effects.choices.push(Choice::ForAll {
+            binder: var.to_owned(),
+            iterated: iterated.clone(),
+        });
+        let nested_ctx = ActionExecutionCtx {
+            current_slot: None,
+            ..ctx
+        };
+        for slot in iterated {
+            let mut local_locals = locals.clone();
+            local_locals.insert(var.to_owned(), WitnessValue::SlotRef(slot));
+            for op in ops {
+                self.execute_action(op, nested_ctx, &mut local_locals, effects)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_cross_call_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::CrossCall {
+            system: target_system,
+            command,
+            args,
+        } = action
+        else {
+            return Err("internal simulation error: expected cross-call action".to_owned());
+        };
+        let capture = self.execute_cross_call(
+            target_system,
+            command,
+            args,
+            ctx.current_system,
+            ctx.current_slot,
+            locals,
+        )?;
+        Self::record_cross_call_observations(target_system, command, &capture, effects.observations)
+    }
+
+    fn execute_let_cross_call_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &mut BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::LetCrossCall {
+            name,
+            system: target_system,
+            command,
+            args,
+        } = action
+        else {
+            return Err("internal simulation error: expected let cross-call action".to_owned());
+        };
+        let capture = self.execute_cross_call(
+            target_system,
+            command,
+            args,
+            ctx.current_system,
+            ctx.current_slot,
+            locals,
+        )?;
+        Self::record_cross_call_observations(
+            target_system,
+            command,
+            &capture,
+            effects.observations,
+        )?;
+        locals.insert(name.clone(), capture.result()?.clone());
+        Ok(())
+    }
+
+    fn execute_match_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::Match { scrutinee, arms } = action else {
+            return Err("internal simulation error: expected match action".to_owned());
+        };
+        let scrutinee_value = self.eval_action_match_scrutinee(scrutinee, ctx, locals, effects)?;
+        let (locals, body) = self
+            .select_match_arm(
+                &scrutinee_value,
+                arms,
+                &Self::eval_env(ctx.current_system, ctx.current_slot, locals),
+            )?
+            .ok_or_else(|| "no simulation match arm matched".to_owned())?;
+        let mut local_locals = locals;
+        let nested_ctx = ActionExecutionCtx {
+            current_slot: None,
+            ..ctx
+        };
+        for op in body {
+            self.execute_action(op, nested_ctx, &mut local_locals, effects)?;
+        }
+        Ok(())
+    }
+
+    fn eval_action_match_scrutinee(
+        &mut self,
+        scrutinee: &IRActionMatchScrutinee,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<WitnessValue, String> {
+        match scrutinee {
+            IRActionMatchScrutinee::Var { name } => locals
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unknown match scrutinee `{name}`")),
+            IRActionMatchScrutinee::CrossCall {
+                system: target_system,
+                command,
+                args,
+            } => {
+                let capture = self.execute_cross_call(
+                    target_system,
+                    command,
+                    args,
+                    ctx.current_system,
+                    ctx.current_slot,
+                    locals,
+                )?;
+                Self::record_cross_call_observations(
+                    target_system,
+                    command,
+                    &capture,
+                    effects.observations,
+                )?;
+                Ok(capture.result()?.clone())
+            }
+        }
+    }
+
+    fn execute_expr_stmt_action(
+        &mut self,
+        action: &IRAction,
+        ctx: ActionExecutionCtx<'_>,
+        locals: &mut BTreeMap<String, WitnessValue>,
+        effects: &mut ActionEffects<'_>,
+    ) -> Result<(), String> {
+        let IRAction::ExprStmt { expr } = action else {
+            return Err("internal simulation error: expected expr statement action".to_owned());
+        };
+        if self.try_execute_assignment(expr, ctx.current_system, ctx.current_slot, locals)? {
+            return Ok(());
+        }
+        let env = Self::eval_env(ctx.current_system, ctx.current_slot, locals);
+        let value = self.eval_expr(expr, &env)?;
+        let observation = TransitionObservation::new(format!("expr:{}", expr_kind(expr)), value)
+            .map_err(|err| format!("invalid expr observation: {err}"))?;
+        effects.observations.push(observation);
+        Ok(())
     }
 
     fn execute_cross_call(
@@ -1505,52 +1639,13 @@ impl<'a> Runtime<'a> {
                 LitVal::Bool { value } => WitnessValue::Bool(*value),
                 LitVal::Str { value } => WitnessValue::String(value.clone()),
             }),
-            IRExpr::Var { name, .. } => {
-                if let Some(value) = env.locals.get(name) {
-                    return Ok(value.clone());
-                }
-                if let Some(slot) = &env.current_slot {
-                    if let Some(value) = self.slot_field(slot, name) {
-                        return Ok(value.clone());
-                    }
-                }
-                if let Some(fields) = self.state.system_fields.get(env.current_system) {
-                    if let Some(value) = fields.get(name) {
-                        return Ok(value.clone());
-                    }
-                }
-                if let Some(constant) = self
-                    .program
-                    .constants
-                    .iter()
-                    .find(|constant| constant.name == *name)
-                {
-                    return self.eval_expr(&constant.value, env);
-                }
-                Err(format!("unknown variable `{name}` in simulation"))
-            }
+            IRExpr::Var { name, .. } => self.eval_var_expr(name, env),
             IRExpr::Ctor {
                 enum_name,
                 ctor,
                 args,
                 ..
-            } => {
-                if args.is_empty() {
-                    Ok(WitnessValue::EnumVariant {
-                        enum_name: enum_name.clone(),
-                        variant: ctor.clone(),
-                        fields: BTreeMap::new(),
-                    })
-                } else {
-                    let mut fields = BTreeMap::new();
-                    fields.insert("__ctor".to_owned(), WitnessValue::String(ctor.clone()));
-                    fields.insert("__enum".to_owned(), WitnessValue::String(enum_name.clone()));
-                    for (field, expr) in args {
-                        fields.insert(field.clone(), self.eval_expr(expr, env)?);
-                    }
-                    Ok(WitnessValue::Record(fields))
-                }
-            }
+            } => self.eval_ctor_expr(enum_name, ctor, args, env),
             IRExpr::BinOp {
                 op, left, right, ..
             } => {
@@ -1562,177 +1657,34 @@ impl<'a> Runtime<'a> {
                 let operand = self.eval_expr(operand, env)?;
                 eval_unop(op, &operand)
             }
-            IRExpr::Let { bindings, body, .. } => {
-                let mut locals = env.locals.clone();
-                for binding in bindings {
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals: locals.clone(),
-                    };
-                    let value = self.eval_expr(&binding.expr, &local_env)?;
-                    locals.insert(binding.name.clone(), value);
-                }
-                let local_env = EvalEnv {
-                    current_system: env.current_system,
-                    current_slot: env.current_slot.clone(),
-                    locals,
-                };
-                self.eval_expr(body, &local_env)
-            }
-            IRExpr::Field { expr, field, .. } => {
-                let base = self.eval_expr(expr, env)?;
-                match base {
-                    WitnessValue::SlotRef(slot) => {
-                        self.slot_field(&slot, field).cloned().ok_or_else(|| {
-                            format!(
-                                "missing field `{field}` on {}[{}]",
-                                slot.entity(),
-                                slot.slot()
-                            )
-                        })
-                    }
-                    WitnessValue::Record(fields) => fields
-                        .get(field)
-                        .cloned()
-                        .ok_or_else(|| format!("missing record field `{field}`")),
-                    other => Err(format!(
-                        "cannot project field `{field}` from {}",
-                        render_value(&other)
-                    )),
-                }
-            }
+            IRExpr::Let { bindings, body, .. } => self.eval_let_expr(bindings, body, env),
+            IRExpr::Field { expr, field, .. } => self.eval_field_expr(expr, field, env),
             IRExpr::Exists {
                 var, domain, body, ..
-            } => {
-                for candidate in self.candidate_values_for_quantifier(domain, env) {
-                    let mut locals = env.locals.clone();
-                    locals.insert(var.clone(), candidate);
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals,
-                    };
-                    if self.eval_bool(body, &local_env)? {
-                        return Ok(WitnessValue::Bool(true));
-                    }
-                }
-                Ok(WitnessValue::Bool(false))
-            }
+            } => self.eval_quantifier_expr(var, domain, body, env, EvalQuantifierMode::Exists),
             IRExpr::Forall {
                 var, domain, body, ..
-            } => {
-                for candidate in self.candidate_values_for_quantifier(domain, env) {
-                    let mut locals = env.locals.clone();
-                    locals.insert(var.clone(), candidate);
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals,
-                    };
-                    if !self.eval_bool(body, &local_env)? {
-                        return Ok(WitnessValue::Bool(false));
-                    }
-                }
-                Ok(WitnessValue::Bool(true))
-            }
+            } => self.eval_quantifier_expr(var, domain, body, env, EvalQuantifierMode::Forall),
             IRExpr::One {
                 var, domain, body, ..
-            } => {
-                let mut count = 0usize;
-                for candidate in self.candidate_values_for_quantifier(domain, env) {
-                    let mut locals = env.locals.clone();
-                    locals.insert(var.clone(), candidate);
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals,
-                    };
-                    if self.eval_bool(body, &local_env)? {
-                        count += 1;
-                    }
-                }
-                Ok(WitnessValue::Bool(count == 1))
-            }
+            } => self.eval_quantifier_expr(var, domain, body, env, EvalQuantifierMode::One),
             IRExpr::Lone {
                 var, domain, body, ..
-            } => {
-                let mut count = 0usize;
-                for candidate in self.candidate_values_for_quantifier(domain, env) {
-                    let mut locals = env.locals.clone();
-                    locals.insert(var.clone(), candidate);
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals,
-                    };
-                    if self.eval_bool(body, &local_env)? {
-                        count += 1;
-                    }
-                }
-                Ok(WitnessValue::Bool(count <= 1))
-            }
+            } => self.eval_quantifier_expr(var, domain, body, env, EvalQuantifierMode::Lone),
             IRExpr::Match {
                 scrutinee, arms, ..
-            } => {
-                let scrutinee = self.eval_expr(scrutinee, env)?;
-                let (locals, body) = self
-                    .select_expr_match_arm(&scrutinee, arms, env)?
-                    .ok_or_else(|| "non-exhaustive match in simulation".to_owned())?;
-                let local_env = EvalEnv {
-                    current_system: env.current_system,
-                    current_slot: env.current_slot.clone(),
-                    locals,
-                };
-                self.eval_expr(body, &local_env)
-            }
+            } => self.eval_match_expr(scrutinee, arms, env),
             IRExpr::Choose {
                 var,
                 domain,
                 predicate,
                 ..
-            } => {
-                for candidate in self.candidate_values_for_quantifier(domain, env) {
-                    if let Some(predicate) = predicate {
-                        let mut locals = env.locals.clone();
-                        locals.insert(var.clone(), candidate.clone());
-                        let local_env = EvalEnv {
-                            current_system: env.current_system,
-                            current_slot: env.current_slot.clone(),
-                            locals,
-                        };
-                        if !self.eval_bool(predicate, &local_env)? {
-                            continue;
-                        }
-                    }
-                    return Ok(candidate);
-                }
-                Err(format!(
-                    "pure choose `{var}: {}` found no matching candidate in simulation",
-                    render_type(domain)
-                ))
-            }
+            } => self.eval_choose_expr(var, domain, predicate.as_deref(), env),
             IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => self.eval_expr(expr, env),
             IRExpr::Lam { .. } => {
                 Err("lambda values are not directly executable in simulation".to_owned())
             }
-            IRExpr::Block { exprs, .. } => {
-                let mut last = WitnessValue::Bool(true);
-                let mut locals = env.locals.clone();
-                for expr in exprs {
-                    let local_env = EvalEnv {
-                        current_system: env.current_system,
-                        current_slot: env.current_slot.clone(),
-                        locals: locals.clone(),
-                    };
-                    last = self.eval_expr(expr, &local_env)?;
-                    if let IRExpr::VarDecl { name, init, .. } = expr {
-                        let value = self.eval_expr(init, &local_env)?;
-                        locals.insert(name.clone(), value);
-                    }
-                }
-                Ok(last)
-            }
+            IRExpr::Block { exprs, .. } => self.eval_block_expr(exprs, env),
             IRExpr::IfElse {
                 cond,
                 then_body,
@@ -1748,94 +1700,17 @@ impl<'a> Runtime<'a> {
                 }
             }
             IRExpr::App { .. } => self.eval_app(expr, env),
-            IRExpr::SetLit { elements, .. } => Ok(WitnessValue::Set(
-                elements
-                    .iter()
-                    .map(|element| self.eval_expr(element, env))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            IRExpr::SeqLit { elements, .. } => Ok(WitnessValue::Seq(
-                elements
-                    .iter()
-                    .map(|element| self.eval_expr(element, env))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            IRExpr::MapLit { entries, .. } => Ok(WitnessValue::Map(
-                entries
-                    .iter()
-                    .map(|(key, value)| {
-                        Ok((self.eval_expr(key, env)?, self.eval_expr(value, env)?))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            )),
+            IRExpr::SetLit { elements, .. } => self.eval_set_lit_expr(elements, env),
+            IRExpr::SeqLit { elements, .. } => self.eval_seq_lit_expr(elements, env),
+            IRExpr::MapLit { entries, .. } => self.eval_map_lit_expr(entries, env),
             IRExpr::MapUpdate {
                 map, key, value, ..
-            } => {
-                let map = self.eval_expr(map, env)?;
-                let key = self.eval_expr(key, env)?;
-                let value = self.eval_expr(value, env)?;
-                match map {
-                    WitnessValue::Map(mut entries) => {
-                        if let Some(entry) =
-                            entries.iter_mut().find(|(existing, _)| existing == &key)
-                        {
-                            entry.1 = value;
-                        } else {
-                            entries.push((key, value));
-                        }
-                        Ok(WitnessValue::Map(entries))
-                    }
-                    other => Err(format!(
-                        "cannot update non-map value {}",
-                        render_value(&other)
-                    )),
-                }
-            }
-            IRExpr::Index { map, key, .. } => {
-                let map = self.eval_expr(map, env)?;
-                let key = self.eval_expr(key, env)?;
-                match map {
-                    WitnessValue::Map(entries) => entries
-                        .into_iter()
-                        .find(|(existing, _)| *existing == key)
-                        .map(|(_, value)| value)
-                        .ok_or_else(|| "missing map key during simulation".to_owned()),
-                    WitnessValue::Seq(values) => {
-                        let index = expect_int(&key)? as usize;
-                        values
-                            .get(index)
-                            .cloned()
-                            .ok_or_else(|| format!("sequence index {index} out of bounds"))
-                    }
-                    other => Err(format!("cannot index value {}", render_value(&other))),
-                }
-            }
-            IRExpr::Card { expr, .. } => {
-                let value = self.eval_expr(expr, env)?;
-                match value {
-                    WitnessValue::Set(values) | WitnessValue::Seq(values) => {
-                        Ok(WitnessValue::Int(values.len() as i64))
-                    }
-                    WitnessValue::Map(entries) => Ok(WitnessValue::Int(entries.len() as i64)),
-                    other => Err(format!(
-                        "cannot take cardinality of {}",
-                        render_value(&other)
-                    )),
-                }
-            }
+            } => self.eval_map_update_expr(map, key, value, env),
+            IRExpr::Index { map, key, .. } => self.eval_index_expr(map, key, env),
+            IRExpr::Card { expr, .. } => self.eval_card_expr(expr, env),
             IRExpr::VarDecl {
                 init, rest, name, ..
-            } => {
-                let value = self.eval_expr(init, env)?;
-                let mut locals = env.locals.clone();
-                locals.insert(name.clone(), value);
-                let local_env = EvalEnv {
-                    current_system: env.current_system,
-                    current_slot: env.current_slot.clone(),
-                    locals,
-                };
-                self.eval_expr(rest, &local_env)
-            }
+            } => self.eval_var_decl_expr(name, init, rest, env),
             IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {
                 Err("cannot simulate sorry/todo expressions".to_owned())
             }
@@ -1856,6 +1731,290 @@ impl<'a> Runtime<'a> {
                 expr_kind(expr)
             )),
         }
+    }
+
+    fn eval_var_expr(&self, name: &str, env: &EvalEnv<'_>) -> Result<WitnessValue, String> {
+        if let Some(value) = env.locals.get(name) {
+            return Ok(value.clone());
+        }
+        if let Some(slot) = &env.current_slot {
+            if let Some(value) = self.slot_field(slot, name) {
+                return Ok(value.clone());
+            }
+        }
+        if let Some(fields) = self.state.system_fields.get(env.current_system) {
+            if let Some(value) = fields.get(name) {
+                return Ok(value.clone());
+            }
+        }
+        if let Some(constant) = self
+            .program
+            .constants
+            .iter()
+            .find(|constant| constant.name == *name)
+        {
+            return self.eval_expr(&constant.value, env);
+        }
+        Err(format!("unknown variable `{name}` in simulation"))
+    }
+
+    fn eval_ctor_expr(
+        &self,
+        enum_name: &str,
+        ctor: &str,
+        args: &[(String, IRExpr)],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        if args.is_empty() {
+            return Ok(WitnessValue::EnumVariant {
+                enum_name: enum_name.to_owned(),
+                variant: ctor.to_owned(),
+                fields: BTreeMap::new(),
+            });
+        }
+        let mut fields = BTreeMap::new();
+        fields.insert("__ctor".to_owned(), WitnessValue::String(ctor.to_owned()));
+        fields.insert(
+            "__enum".to_owned(),
+            WitnessValue::String(enum_name.to_owned()),
+        );
+        for (field, expr) in args {
+            fields.insert(field.clone(), self.eval_expr(expr, env)?);
+        }
+        Ok(WitnessValue::Record(fields))
+    }
+
+    fn eval_let_expr(
+        &self,
+        bindings: &[LetBinding],
+        body: &IRExpr,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        let mut locals = env.locals.clone();
+        for binding in bindings {
+            let local_env = env.with_locals(locals.clone());
+            let value = self.eval_expr(&binding.expr, &local_env)?;
+            locals.insert(binding.name.clone(), value);
+        }
+        self.eval_expr(body, &env.with_locals(locals))
+    }
+
+    fn eval_field_expr(
+        &self,
+        expr: &IRExpr,
+        field: &str,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        match self.eval_expr(expr, env)? {
+            WitnessValue::SlotRef(slot) => {
+                self.slot_field(&slot, field).cloned().ok_or_else(|| {
+                    format!(
+                        "missing field `{field}` on {}[{}]",
+                        slot.entity(),
+                        slot.slot()
+                    )
+                })
+            }
+            WitnessValue::Record(fields) => fields
+                .get(field)
+                .cloned()
+                .ok_or_else(|| format!("missing record field `{field}`")),
+            other => Err(format!(
+                "cannot project field `{field}` from {}",
+                render_value(&other)
+            )),
+        }
+    }
+
+    fn eval_quantifier_expr(
+        &self,
+        var: &str,
+        domain: &IRType,
+        body: &IRExpr,
+        env: &EvalEnv<'_>,
+        mode: EvalQuantifierMode,
+    ) -> Result<WitnessValue, String> {
+        let mut count = 0usize;
+        for candidate in self.candidate_values_for_quantifier(domain, env) {
+            let local_env = env.with_binding(var, candidate);
+            let holds = self.eval_bool(body, &local_env)?;
+            match mode {
+                EvalQuantifierMode::Exists if holds => return Ok(WitnessValue::Bool(true)),
+                EvalQuantifierMode::Forall if !holds => return Ok(WitnessValue::Bool(false)),
+                EvalQuantifierMode::One | EvalQuantifierMode::Lone if holds => count += 1,
+                _ => {}
+            }
+        }
+        Ok(WitnessValue::Bool(match mode {
+            EvalQuantifierMode::Exists => false,
+            EvalQuantifierMode::Forall => true,
+            EvalQuantifierMode::One => count == 1,
+            EvalQuantifierMode::Lone => count <= 1,
+        }))
+    }
+
+    fn eval_match_expr(
+        &self,
+        scrutinee: &IRExpr,
+        arms: &[IRMatchArm],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        let scrutinee = self.eval_expr(scrutinee, env)?;
+        let (locals, body) = self
+            .select_expr_match_arm(&scrutinee, arms, env)?
+            .ok_or_else(|| "non-exhaustive match in simulation".to_owned())?;
+        self.eval_expr(body, &env.with_locals(locals))
+    }
+
+    fn eval_choose_expr(
+        &self,
+        var: &str,
+        domain: &IRType,
+        predicate: Option<&IRExpr>,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        for candidate in self.candidate_values_for_quantifier(domain, env) {
+            if let Some(predicate) = predicate {
+                let local_env = env.with_binding(var, candidate.clone());
+                if !self.eval_bool(predicate, &local_env)? {
+                    continue;
+                }
+            }
+            return Ok(candidate);
+        }
+        Err(format!(
+            "pure choose `{var}: {}` found no matching candidate in simulation",
+            render_type(domain)
+        ))
+    }
+
+    fn eval_block_expr(&self, exprs: &[IRExpr], env: &EvalEnv<'_>) -> Result<WitnessValue, String> {
+        let mut last = WitnessValue::Bool(true);
+        let mut locals = env.locals.clone();
+        for expr in exprs {
+            let local_env = env.with_locals(locals.clone());
+            last = self.eval_expr(expr, &local_env)?;
+            if let IRExpr::VarDecl { name, init, .. } = expr {
+                let value = self.eval_expr(init, &local_env)?;
+                locals.insert(name.clone(), value);
+            }
+        }
+        Ok(last)
+    }
+
+    fn eval_set_lit_expr(
+        &self,
+        elements: &[IRExpr],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        Ok(WitnessValue::Set(
+            elements
+                .iter()
+                .map(|element| self.eval_expr(element, env))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    fn eval_seq_lit_expr(
+        &self,
+        elements: &[IRExpr],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        Ok(WitnessValue::Seq(
+            elements
+                .iter()
+                .map(|element| self.eval_expr(element, env))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    fn eval_map_lit_expr(
+        &self,
+        entries: &[(IRExpr, IRExpr)],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        Ok(WitnessValue::Map(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((self.eval_expr(key, env)?, self.eval_expr(value, env)?)))
+                .collect::<Result<Vec<_>, String>>()?,
+        ))
+    }
+
+    fn eval_map_update_expr(
+        &self,
+        map: &IRExpr,
+        key: &IRExpr,
+        value: &IRExpr,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        let map = self.eval_expr(map, env)?;
+        let key = self.eval_expr(key, env)?;
+        let value = self.eval_expr(value, env)?;
+        match map {
+            WitnessValue::Map(mut entries) => {
+                if let Some(entry) = entries.iter_mut().find(|(existing, _)| existing == &key) {
+                    entry.1 = value;
+                } else {
+                    entries.push((key, value));
+                }
+                Ok(WitnessValue::Map(entries))
+            }
+            other => Err(format!(
+                "cannot update non-map value {}",
+                render_value(&other)
+            )),
+        }
+    }
+
+    fn eval_index_expr(
+        &self,
+        map: &IRExpr,
+        key: &IRExpr,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        let map = self.eval_expr(map, env)?;
+        let key = self.eval_expr(key, env)?;
+        match map {
+            WitnessValue::Map(entries) => entries
+                .into_iter()
+                .find(|(existing, _)| *existing == key)
+                .map(|(_, value)| value)
+                .ok_or_else(|| "missing map key during simulation".to_owned()),
+            WitnessValue::Seq(values) => {
+                let index = expect_int(&key)? as usize;
+                values
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("sequence index {index} out of bounds"))
+            }
+            other => Err(format!("cannot index value {}", render_value(&other))),
+        }
+    }
+
+    fn eval_card_expr(&self, expr: &IRExpr, env: &EvalEnv<'_>) -> Result<WitnessValue, String> {
+        match self.eval_expr(expr, env)? {
+            WitnessValue::Set(values) | WitnessValue::Seq(values) => {
+                Ok(WitnessValue::Int(values.len() as i64))
+            }
+            WitnessValue::Map(entries) => Ok(WitnessValue::Int(entries.len() as i64)),
+            other => Err(format!(
+                "cannot take cardinality of {}",
+                render_value(&other)
+            )),
+        }
+    }
+
+    fn eval_var_decl_expr(
+        &self,
+        name: &str,
+        init: &IRExpr,
+        rest: &IRExpr,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        let value = self.eval_expr(init, env)?;
+        let local_env = env.with_binding(name, value);
+        self.eval_expr(rest, &local_env)
     }
 
     fn eval_app(&self, expr: &IRExpr, env: &EvalEnv<'_>) -> Result<WitnessValue, String> {
@@ -2136,6 +2295,30 @@ struct EvalEnv<'a> {
     current_system: &'a str,
     current_slot: Option<EntitySlotRef>,
     locals: BTreeMap<String, WitnessValue>,
+}
+
+impl EvalEnv<'_> {
+    fn with_locals(&self, locals: BTreeMap<String, WitnessValue>) -> Self {
+        Self {
+            current_system: self.current_system,
+            current_slot: self.current_slot.clone(),
+            locals,
+        }
+    }
+
+    fn with_binding(&self, name: &str, value: WitnessValue) -> Self {
+        let mut locals = self.locals.clone();
+        locals.insert(name.to_owned(), value);
+        self.with_locals(locals)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EvalQuantifierMode {
+    Exists,
+    Forall,
+    One,
+    Lone,
 }
 
 #[derive(Clone, Debug)]

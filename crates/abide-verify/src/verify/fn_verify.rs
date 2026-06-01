@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Instant;
 
-use crate::ir::types::{IRExpr, IRProgram};
+use crate::ir::types::{IRExpr, IRFunction, IRProgram};
 
 use super::context::VerifyContext;
 use super::defenv;
@@ -56,6 +56,51 @@ fn new_timed_solver() -> AbideSolver {
 }
 
 type RecursiveCallSite = (Vec<Bool>, Vec<IRExpr>, HashMap<String, SmtValue>);
+
+#[derive(Clone, Copy)]
+pub(super) struct FnBodyCtx<'a> {
+    fn_requires: &'a [IRExpr],
+    extra_assumptions: &'a [Bool],
+    self_fn: Option<&'a IRFunction>,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+}
+
+impl<'a> FnBodyCtx<'a> {
+    fn precheck(self) -> PrecheckCtx<'a> {
+        PrecheckCtx {
+            fn_requires: self.fn_requires,
+            extra_assumptions: self.extra_assumptions,
+            self_fn: self.self_fn,
+        }
+    }
+
+    fn loop_vc(self) -> LoopVcCtx<'a> {
+        LoopVcCtx {
+            fn_requires: self.fn_requires,
+            extra_assumptions: self.extra_assumptions,
+            vctx: self.vctx,
+            defs: self.defs,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LoopVcCtx<'a> {
+    fn_requires: &'a [IRExpr],
+    extra_assumptions: &'a [Bool],
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+}
+
+struct RecursiveCallSearch<'a, 'b> {
+    fn_name: &'a str,
+    params: &'a [(String, crate::ir::types::IRType)],
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    path_conds: &'b mut Vec<Bool>,
+    call_sites: &'b mut Vec<RecursiveCallSite>,
+}
 
 // Thread-local accumulator for lambda definitional axioms.
 // When a lambda is encoded as a Z3 uninterpreted function, its
@@ -308,16 +353,14 @@ pub(super) fn verify_single_fn_contract(
     // by branch conditions when inside if/else
     // - Updates env with fresh post-loop variables
     let mut solver_constraints = Vec::new();
-    let body_val = encode_fn_body(
-        body,
-        &mut env,
-        &mut solver_constraints,
-        &func.requires,
-        &[],
-        Some(func),
+    let body_ctx = FnBodyCtx {
+        fn_requires: &func.requires,
+        extra_assumptions: &[],
+        self_fn: Some(func),
         vctx,
         defs,
-    )?;
+    };
+    let body_val = encode_fn_body(body, &mut env, &mut solver_constraints, body_ctx)?;
 
     // Assert accumulated constraints (post-loop invariants, branch-guarded)
     for c in &solver_constraints {
@@ -398,16 +441,11 @@ pub(super) fn verify_single_fn_contract(
 /// context — e.g., branch conditions from enclosing if/else. These are threaded
 /// to loop verification so that branch-local invariants (like `invariant flag`
 /// inside `if flag {... }`) can be verified.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_fn_body(
     expr: &IRExpr,
     env: &mut HashMap<String, SmtValue>,
     solver_constraints: &mut Vec<Bool>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    self_fn: Option<&crate::ir::types::IRFunction>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: FnBodyCtx<'_>,
 ) -> Result<SmtValue, FnContractError> {
     match expr {
         // Lam: peel off the lambda, bind the param, recurse
@@ -421,35 +459,17 @@ pub(super) fn encode_fn_body(
                 let var = make_z3_var(param, param_type).map_err(FnContractError::EncodingError)?;
                 env.insert(param.clone(), var);
             }
-            encode_fn_body(
-                body,
-                env,
-                solver_constraints,
-                fn_requires,
-                extra_assumptions,
-                self_fn,
-                vctx,
-                defs,
-            )
+            encode_fn_body(body, env, solver_constraints, ctx)
         }
 
         // VarDecl: evaluate init, extend env, recurse into rest
         IRExpr::VarDecl {
             name, init, rest, ..
         } => {
-            let val =
-                encode_pure_expr(init, env, vctx, defs).map_err(FnContractError::EncodingError)?;
+            let val = encode_pure_expr(init, env, ctx.vctx, ctx.defs)
+                .map_err(FnContractError::EncodingError)?;
             env.insert(name.clone(), val);
-            encode_fn_body(
-                rest,
-                env,
-                solver_constraints,
-                fn_requires,
-                extra_assumptions,
-                self_fn,
-                vctx,
-                defs,
-            )
+            encode_fn_body(rest, env, solver_constraints, ctx)
         }
 
         // Block: thread env through each expression sequentially
@@ -459,16 +479,7 @@ pub(super) fn encode_fn_body(
             }
             let mut last = smt::bool_val(true);
             for e in exprs {
-                last = encode_fn_body(
-                    e,
-                    env,
-                    solver_constraints,
-                    fn_requires,
-                    extra_assumptions,
-                    self_fn,
-                    vctx,
-                    defs,
-                )?;
+                last = encode_fn_body(e, env, solver_constraints, ctx)?;
             }
             Ok(last)
         }
@@ -487,10 +498,7 @@ pub(super) fn encode_fn_body(
             body,
             env,
             solver_constraints,
-            fn_requires,
-            extra_assumptions,
-            vctx,
-            defs,
+            ctx,
         ),
 
         // Assignment: BinOp(OpEq, Var(name), expr) in imperative context
@@ -499,13 +507,13 @@ pub(super) fn encode_fn_body(
         } if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) => {
             if let IRExpr::Var { name, .. } = left.as_ref() {
                 if env.contains_key(name) {
-                    let val = encode_pure_expr(right, env, vctx, defs)
+                    let val = encode_pure_expr(right, env, ctx.vctx, ctx.defs)
                         .map_err(FnContractError::EncodingError)?;
                     env.insert(name.clone(), val);
                     return Ok(smt::bool_val(true));
                 }
             }
-            encode_pure_expr(expr, env, vctx, defs).map_err(FnContractError::EncodingError)
+            encode_pure_expr(expr, env, ctx.vctx, ctx.defs).map_err(FnContractError::EncodingError)
         }
 
         // IfElse with possible imperative branches
@@ -524,19 +532,11 @@ pub(super) fn encode_fn_body(
                     else_body.as_deref(),
                     env,
                     solver_constraints,
-                    fn_requires,
-                    extra_assumptions,
-                    self_fn,
-                    vctx,
-                    defs,
+                    ctx,
                 )
             } else {
-                let precheck = PrecheckCtx {
-                    fn_requires,
-                    extra_assumptions,
-                    self_fn,
-                };
-                encode_pure_expr_checked(expr, env, vctx, defs, &precheck)
+                let precheck = ctx.precheck();
+                encode_pure_expr_checked(expr, env, ctx.vctx, ctx.defs, &precheck)
                     .map_err(FnContractError::EncodingError)
             }
         }
@@ -547,7 +547,7 @@ pub(super) fn encode_fn_body(
             expr: assert_expr,
             span,
         } => {
-            let assert_val = encode_pure_expr(assert_expr, env, vctx, defs)
+            let assert_val = encode_pure_expr(assert_expr, env, ctx.vctx, ctx.defs)
                 .map_err(FnContractError::EncodingError)?;
             let assert_bool = assert_val
                 .to_bool()
@@ -557,14 +557,14 @@ pub(super) fn encode_fn_body(
             let vc_solver = new_timed_solver();
             assert_lambda_axioms_on(&vc_solver);
             // Assert function preconditions
-            for req in fn_requires {
-                let req_val = encode_pure_expr(req, env, vctx, defs)
+            for req in ctx.fn_requires {
+                let req_val = encode_pure_expr(req, env, ctx.vctx, ctx.defs)
                     .map_err(FnContractError::EncodingError)?;
                 let req_bool = req_val.to_bool().map_err(FnContractError::EncodingError)?;
                 vc_solver.assert(&req_bool);
             }
             // Assert extra assumptions (e.g., from enclosing branches)
-            for assumption in extra_assumptions {
+            for assumption in ctx.extra_assumptions {
                 vc_solver.assert(assumption);
             }
             // Assert all accumulated solver constraints (loop postconditions, etc.)
@@ -601,7 +601,7 @@ pub(super) fn encode_fn_body(
         IRExpr::Assume {
             expr: assume_expr, ..
         } => {
-            let assume_val = encode_pure_expr(assume_expr, env, vctx, defs)
+            let assume_val = encode_pure_expr(assume_expr, env, ctx.vctx, ctx.defs)
                 .map_err(FnContractError::EncodingError)?;
             let assume_bool = assume_val
                 .to_bool()
@@ -615,12 +615,8 @@ pub(super) fn encode_fn_body(
         // precondition checking enabled. This ensures ALL nested function
         // calls have their preconditions verified, not just top-level ones.
         _ => {
-            let precheck = PrecheckCtx {
-                fn_requires,
-                extra_assumptions,
-                self_fn,
-            };
-            encode_pure_expr_checked(expr, env, vctx, defs, &precheck)
+            let precheck = ctx.precheck();
+            encode_pure_expr_checked(expr, env, ctx.vctx, ctx.defs, &precheck)
                 .map_err(FnContractError::EncodingError)
         }
     }
@@ -635,7 +631,6 @@ pub(super) fn encode_fn_body(
 /// 2. **Preservation**: invariant ∧ cond → invariant[after body]
 /// 3. **Termination** (if decreases): measure ≥ 0 ∧ measure decreases
 /// 4. **Post-loop**: create fresh vars, assert invariant ∧ ¬cond, update env
-#[allow(clippy::too_many_arguments)]
 fn encode_while_hoare(
     cond: &IRExpr,
     invariants: &[IRExpr],
@@ -643,10 +638,7 @@ fn encode_while_hoare(
     body: &IRExpr,
     env: &mut HashMap<String, SmtValue>,
     solver_constraints: &mut Vec<Bool>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: FnBodyCtx<'_>,
 ) -> Result<SmtValue, FnContractError> {
     // ── Step 1: Identify variables modified by the loop body ─────────
     let mut modified = Vec::new();
@@ -662,10 +654,7 @@ fn encode_while_hoare(
         body,
         &modified,
         env,
-        fn_requires,
-        extra_assumptions,
-        vctx,
-        defs,
+        ctx.loop_vc(),
     )?;
 
     // ── Step 3: Post-loop abstraction ───────────────────────────────
@@ -686,15 +675,15 @@ fn encode_while_hoare(
     // These are NOT asserted directly — the caller will assert them,
     // potentially guarded by branch conditions if inside an if/else.
     for inv in invariants {
-        let inv_val =
-            encode_pure_expr(inv, env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        let inv_val = encode_pure_expr(inv, env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         let inv_bool = inv_val.to_bool().map_err(FnContractError::EncodingError)?;
         solver_constraints.push(inv_bool);
     }
 
     // ¬cond (loop exited)
     let cond_val =
-        encode_pure_expr(cond, env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        encode_pure_expr(cond, env, ctx.vctx, ctx.defs).map_err(FnContractError::EncodingError)?;
     let cond_bool = cond_val.to_bool().map_err(FnContractError::EncodingError)?;
     solver_constraints.push(smt::bool_not(&cond_bool));
 
@@ -707,7 +696,6 @@ fn encode_while_hoare(
 /// 1. Invariant initialization
 /// 2. Invariant preservation
 /// 3. Termination (if decreases clause present)
-#[allow(clippy::too_many_arguments)]
 fn verify_loop_conditions(
     cond: &IRExpr,
     invariants: &[IRExpr],
@@ -715,10 +703,7 @@ fn verify_loop_conditions(
     body: &IRExpr,
     modified: &[String],
     env: &HashMap<String, SmtValue>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: LoopVcCtx<'_>,
 ) -> Result<(), FnContractError> {
     if invariants.is_empty() {
         return Err(FnContractError::EncodingError(
@@ -726,33 +711,19 @@ fn verify_loop_conditions(
         ));
     }
 
-    verify_loop_init(invariants, env, fn_requires, extra_assumptions, vctx, defs)?;
-    verify_loop_preservation(
-        cond,
+    verify_loop_init(
         invariants,
-        body,
-        modified,
         env,
-        fn_requires,
-        extra_assumptions,
-        vctx,
-        defs,
+        ctx.fn_requires,
+        ctx.extra_assumptions,
+        ctx.vctx,
+        ctx.defs,
     )?;
+    verify_loop_preservation(cond, invariants, body, modified, env, ctx)?;
 
     if let Some(dec) = decreases {
         if !dec.star {
-            verify_loop_termination(
-                cond,
-                invariants,
-                &dec.measures,
-                body,
-                modified,
-                env,
-                fn_requires,
-                extra_assumptions,
-                vctx,
-                defs,
-            )?;
+            verify_loop_termination(cond, invariants, &dec.measures, body, modified, env, ctx)?;
         }
     }
 
@@ -811,17 +782,13 @@ fn verify_loop_init(
 ///
 /// Check: invariant ∧ cond ∧ body → invariant
 /// Negated: invariant ∧ cond ∧ ¬invariant[`post_body`] is UNSAT
-#[allow(clippy::too_many_arguments)]
 fn verify_loop_preservation(
     cond: &IRExpr,
     invariants: &[IRExpr],
     body: &IRExpr,
     modified: &[String],
     env: &HashMap<String, SmtValue>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: LoopVcCtx<'_>,
 ) -> Result<(), FnContractError> {
     let vc_solver = new_timed_solver();
     assert_lambda_axioms_on(&vc_solver);
@@ -838,37 +805,37 @@ fn verify_loop_preservation(
     }
 
     // Assume function preconditions and outer context
-    for req in fn_requires {
-        let req_val =
-            encode_pure_expr(req, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+    for req in ctx.fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         vc_solver.assert(&req_val.to_bool().map_err(FnContractError::EncodingError)?);
     }
-    for assumption in extra_assumptions {
+    for assumption in ctx.extra_assumptions {
         vc_solver.assert(assumption);
     }
 
     // Assume invariant holds for pre-iteration values.
     // Collect as Bool values too, for inner loop context.
-    let mut inner_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    let mut inner_assumptions: Vec<Bool> = ctx.extra_assumptions.to_vec();
     for inv in invariants {
-        let inv_val =
-            encode_pure_expr(inv, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        let inv_val = encode_pure_expr(inv, &pre_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         let inv_bool = inv_val.to_bool().map_err(FnContractError::EncodingError)?;
         vc_solver.assert(&inv_bool);
         inner_assumptions.push(inv_bool);
     }
 
     // Assume condition holds (we're inside the loop)
-    let cond_val =
-        encode_pure_expr(cond, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+    let cond_val = encode_pure_expr(cond, &pre_env, ctx.vctx, ctx.defs)
+        .map_err(FnContractError::EncodingError)?;
     let cond_bool = cond_val.to_bool().map_err(FnContractError::EncodingError)?;
     vc_solver.assert(&cond_bool);
     inner_assumptions.push(cond_bool);
 
     // Also add fn_requires as Bool for inner loop context
-    for req in fn_requires {
-        let req_val =
-            encode_pure_expr(req, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+    for req in ctx.fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         inner_assumptions.push(req_val.to_bool().map_err(FnContractError::EncodingError)?);
     }
 
@@ -880,8 +847,8 @@ fn verify_loop_preservation(
         &mut post_env,
         &mut body_constraints,
         &inner_assumptions,
-        vctx,
-        defs,
+        ctx.vctx,
+        ctx.defs,
     )?;
 
     // Assert any constraints from nested loops (inner invariant ∧ ¬inner_cond)
@@ -892,8 +859,8 @@ fn verify_loop_preservation(
     // Assert ¬invariant[post] — looking for counterexample to preservation
     let mut post_inv_bools = Vec::new();
     for inv in invariants {
-        let inv_val =
-            encode_pure_expr(inv, &post_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        let inv_val = encode_pure_expr(inv, &post_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         let inv_bool = inv_val.to_bool().map_err(FnContractError::EncodingError)?;
         post_inv_bools.push(inv_bool);
     }
@@ -915,7 +882,6 @@ fn verify_loop_preservation(
 /// VC3: Verify termination — decreases measure is non-negative and strictly decreases.
 ///
 /// Check: invariant ∧ cond → D ≥ 0 ∧ D[post] < D[pre]
-#[allow(clippy::too_many_arguments)]
 fn verify_loop_termination(
     cond: &IRExpr,
     invariants: &[IRExpr],
@@ -923,10 +889,7 @@ fn verify_loop_termination(
     body: &IRExpr,
     modified: &[String],
     env: &HashMap<String, SmtValue>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: LoopVcCtx<'_>,
 ) -> Result<(), FnContractError> {
     let vc_solver = new_timed_solver();
     assert_lambda_axioms_on(&vc_solver);
@@ -943,26 +906,26 @@ fn verify_loop_termination(
     }
 
     // Assume requires ∧ extra_assumptions ∧ invariant ∧ cond
-    let mut inner_assumptions: Vec<Bool> = extra_assumptions.to_vec();
-    for req in fn_requires {
-        let req_val =
-            encode_pure_expr(req, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+    let mut inner_assumptions: Vec<Bool> = ctx.extra_assumptions.to_vec();
+    for req in ctx.fn_requires {
+        let req_val = encode_pure_expr(req, &pre_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         let req_bool = req_val.to_bool().map_err(FnContractError::EncodingError)?;
         vc_solver.assert(&req_bool);
         inner_assumptions.push(req_bool);
     }
-    for assumption in extra_assumptions {
+    for assumption in ctx.extra_assumptions {
         vc_solver.assert(assumption);
     }
     for inv in invariants {
-        let inv_val =
-            encode_pure_expr(inv, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        let inv_val = encode_pure_expr(inv, &pre_env, ctx.vctx, ctx.defs)
+            .map_err(FnContractError::EncodingError)?;
         let inv_bool = inv_val.to_bool().map_err(FnContractError::EncodingError)?;
         vc_solver.assert(&inv_bool);
         inner_assumptions.push(inv_bool);
     }
-    let cond_val =
-        encode_pure_expr(cond, &pre_env, vctx, defs).map_err(FnContractError::EncodingError)?;
+    let cond_val = encode_pure_expr(cond, &pre_env, ctx.vctx, ctx.defs)
+        .map_err(FnContractError::EncodingError)?;
     let cond_bool = cond_val.to_bool().map_err(FnContractError::EncodingError)?;
     vc_solver.assert(&cond_bool);
     inner_assumptions.push(cond_bool);
@@ -970,7 +933,10 @@ fn verify_loop_termination(
     // Evaluate decreases measure before iteration
     let pre_measures: Vec<SmtValue> = measures
         .iter()
-        .map(|m| encode_pure_expr(m, &pre_env, vctx, defs).map_err(FnContractError::EncodingError))
+        .map(|m| {
+            encode_pure_expr(m, &pre_env, ctx.vctx, ctx.defs)
+                .map_err(FnContractError::EncodingError)
+        })
         .collect::<Result<_, _>>()?;
 
     // Execute body
@@ -981,8 +947,8 @@ fn verify_loop_termination(
         &mut post_env,
         &mut body_constraints,
         &inner_assumptions,
-        vctx,
-        defs,
+        ctx.vctx,
+        ctx.defs,
     )?;
 
     // Assert any constraints from nested loops
@@ -993,7 +959,10 @@ fn verify_loop_termination(
     // Evaluate decreases measure after iteration
     let post_measures: Vec<SmtValue> = measures
         .iter()
-        .map(|m| encode_pure_expr(m, &post_env, vctx, defs).map_err(FnContractError::EncodingError))
+        .map(|m| {
+            encode_pure_expr(m, &post_env, ctx.vctx, ctx.defs)
+                .map_err(FnContractError::EncodingError)
+        })
         .collect::<Result<_, _>>()?;
 
     // For single measure: assert ¬(pre ≥ 0 ∧ post < pre)
@@ -1193,10 +1162,12 @@ fn execute_loop_body(
                 inner_body,
                 &inner_modified,
                 env,
-                &[],         // no fn_requires (captured in assumptions)
-                assumptions, // outer context: invariant ∧ cond ∧ requires
-                vctx,
-                defs,
+                LoopVcCtx {
+                    fn_requires: &[], // captured in assumptions
+                    extra_assumptions: assumptions,
+                    vctx,
+                    defs,
+                },
             )?;
 
             // Post-loop abstraction: havoc modified variables, then
@@ -1433,16 +1404,16 @@ fn verify_fn_termination(
     // call_sites: (path_conditions, actual_args, env_at_call_site)
     let mut call_sites: Vec<RecursiveCallSite> = Vec::new();
     let mut body_env = env.clone();
-    collect_recursive_calls(
-        &entry.body,
-        &func.name,
+    let mut path_conds = Vec::new();
+    let mut search = RecursiveCallSearch {
+        fn_name: &func.name,
         params,
-        &mut body_env,
         vctx,
         defs,
-        &mut Vec::new(), // path conditions
-        &mut call_sites,
-    )?;
+        path_conds: &mut path_conds,
+        call_sites: &mut call_sites,
+    };
+    collect_recursive_calls(&entry.body, &mut body_env, &mut search)?;
 
     if call_sites.is_empty() {
         return Ok(()); // no recursive calls — trivially terminating
@@ -1566,34 +1537,26 @@ fn verify_fn_termination(
 /// Collects `(path_conditions, actual_arguments)` for each call to `fn_name`.
 /// The path conditions are Z3 Bool expressions representing the branch
 /// conditions that must hold for the call to be reached.
-#[allow(clippy::too_many_arguments)]
 fn collect_recursive_calls(
     expr: &IRExpr,
-    fn_name: &str,
-    params: &[(String, crate::ir::types::IRType)],
     env: &mut HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    path_conds: &mut Vec<Bool>,
-    call_sites: &mut Vec<RecursiveCallSite>,
+    search: &mut RecursiveCallSearch<'_, '_>,
 ) -> Result<(), String> {
     match expr {
         IRExpr::App { .. } => {
             if let Some((name, args)) = defenv::decompose_app_chain_public(expr) {
-                if name == fn_name && args.len() == params.len() {
+                if name == search.fn_name && args.len() == search.params.len() {
                     // Record the env snapshot at this call site so that
                     // local variables (let/var bindings) are available
                     // when evaluating the actual arguments later.
-                    call_sites.push((path_conds.clone(), args, env.clone()));
+                    search
+                        .call_sites
+                        .push((search.path_conds.clone(), args, env.clone()));
                 }
             }
             if let IRExpr::App { func, arg, .. } = expr {
-                collect_recursive_calls(
-                    func, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                )?;
-                collect_recursive_calls(
-                    arg, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                )?;
+                collect_recursive_calls(func, env, search)?;
+                collect_recursive_calls(arg, env, search)?;
             }
         }
         IRExpr::Lam {
@@ -1608,22 +1571,14 @@ fn collect_recursive_calls(
                     env.insert(param.clone(), var);
                 }
             }
-            collect_recursive_calls(
-                body, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(body, env, search)?;
         }
         IRExpr::BinOp { left, right, .. } => {
-            collect_recursive_calls(
-                left, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
-            collect_recursive_calls(
-                right, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(left, env, search)?;
+            collect_recursive_calls(right, env, search)?;
         }
         IRExpr::UnOp { operand, .. } => {
-            collect_recursive_calls(
-                operand, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(operand, env, search)?;
         }
         IRExpr::IfElse {
             cond,
@@ -1631,30 +1586,24 @@ fn collect_recursive_calls(
             else_body,
             ..
         } => {
-            let cond_val = encode_pure_expr(cond, env, vctx, defs)?;
+            let cond_val = encode_pure_expr(cond, env, search.vctx, search.defs)?;
             let cond_bool = cond_val.to_bool()?;
 
-            path_conds.push(cond_bool.clone());
-            collect_recursive_calls(
-                then_body, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
-            path_conds.pop();
+            search.path_conds.push(cond_bool.clone());
+            collect_recursive_calls(then_body, env, search)?;
+            search.path_conds.pop();
 
             if let Some(eb) = else_body {
-                path_conds.push(smt::bool_not(&cond_bool));
-                collect_recursive_calls(
-                    eb, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                )?;
-                path_conds.pop();
+                search.path_conds.push(smt::bool_not(&cond_bool));
+                collect_recursive_calls(eb, env, search)?;
+                search.path_conds.pop();
             }
         }
         IRExpr::Match {
             scrutinee, arms, ..
         } => {
-            collect_recursive_calls(
-                scrutinee, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
-            let scrut_val = encode_pure_expr(scrutinee, env, vctx, defs)?;
+            collect_recursive_calls(scrutinee, env, search)?;
+            let scrut_val = encode_pure_expr(scrutinee, env, search.vctx, search.defs)?;
 
             // Match arms are sequential: arm k is reached only if all prior
             // arm conditions (pattern ∧ guard) were false. Accumulate the
@@ -1662,9 +1611,9 @@ fn collect_recursive_calls(
             let mut prior_negations: Vec<Bool> = Vec::new();
             for arm in arms {
                 let pat_cond =
-                    encode_pattern_cond(&scrut_val, &arm.pattern, &HashMap::new(), vctx)?;
+                    encode_pattern_cond(&scrut_val, &arm.pattern, &HashMap::new(), search.vctx)?;
                 let full_arm_cond = if let Some(guard) = &arm.guard {
-                    let guard_val = encode_pure_expr(guard, env, vctx, defs)?;
+                    let guard_val = encode_pure_expr(guard, env, search.vctx, search.defs)?;
                     let guard_bool = guard_val.to_bool()?;
                     smt::bool_and(&[&pat_cond, &guard_bool])
                 } else {
@@ -1674,25 +1623,21 @@ fn collect_recursive_calls(
                 // This arm's path: prior arms all failed + this arm matched
                 let n_prior = prior_negations.len();
                 for neg in &prior_negations {
-                    path_conds.push(neg.clone());
+                    search.path_conds.push(neg.clone());
                 }
-                path_conds.push(pat_cond);
+                search.path_conds.push(pat_cond);
                 if let Some(guard) = &arm.guard {
-                    let guard_val = encode_pure_expr(guard, env, vctx, defs)?;
-                    path_conds.push(guard_val.to_bool()?);
-                    collect_recursive_calls(
-                        &arm.body, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                    )?;
-                    path_conds.pop(); // guard
+                    let guard_val = encode_pure_expr(guard, env, search.vctx, search.defs)?;
+                    search.path_conds.push(guard_val.to_bool()?);
+                    collect_recursive_calls(&arm.body, env, search)?;
+                    search.path_conds.pop(); // guard
                 } else {
-                    collect_recursive_calls(
-                        &arm.body, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                    )?;
+                    collect_recursive_calls(&arm.body, env, search)?;
                 }
-                path_conds.pop(); // pattern
-                                  // Pop prior negations
+                search.path_conds.pop(); // pattern
+                                         // Pop prior negations
                 for _ in 0..n_prior {
-                    path_conds.pop();
+                    search.path_conds.pop();
                 }
 
                 // For subsequent arms: this arm's condition was false
@@ -1701,43 +1646,31 @@ fn collect_recursive_calls(
         }
         IRExpr::Let { bindings, body, .. } => {
             for b in bindings {
-                collect_recursive_calls(
-                    &b.expr, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                )?;
+                collect_recursive_calls(&b.expr, env, search)?;
                 // Extend env with the binding so it's available in the body
-                if let Ok(val) = encode_pure_expr(&b.expr, env, vctx, defs) {
+                if let Ok(val) = encode_pure_expr(&b.expr, env, search.vctx, search.defs) {
                     env.insert(b.name.clone(), val);
                 }
             }
-            collect_recursive_calls(
-                body, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(body, env, search)?;
         }
         IRExpr::Block { exprs, .. } => {
             for e in exprs {
-                collect_recursive_calls(
-                    e, fn_name, params, env, vctx, defs, path_conds, call_sites,
-                )?;
+                collect_recursive_calls(e, env, search)?;
             }
         }
         IRExpr::VarDecl {
             name, init, rest, ..
         } => {
-            collect_recursive_calls(
-                init, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(init, env, search)?;
             // Extend env with the var declaration
-            if let Ok(val) = encode_pure_expr(init, env, vctx, defs) {
+            if let Ok(val) = encode_pure_expr(init, env, search.vctx, search.defs) {
                 env.insert(name.clone(), val);
             }
-            collect_recursive_calls(
-                rest, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(rest, env, search)?;
         }
         IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
-            collect_recursive_calls(
-                expr, fn_name, params, env, vctx, defs, path_conds, call_sites,
-            )?;
+            collect_recursive_calls(expr, env, search)?;
         }
         _ => {}
     }
@@ -1748,56 +1681,41 @@ fn collect_recursive_calls(
 ///
 /// Evaluates both branches with cloned environments, then merges
 /// modified variables using ITE on the condition.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_imperative_if_else(
     cond: &IRExpr,
     then_body: &IRExpr,
     else_body: Option<&IRExpr>,
     env: &mut HashMap<String, SmtValue>,
     solver_constraints: &mut Vec<Bool>,
-    fn_requires: &[IRExpr],
-    extra_assumptions: &[Bool],
-    self_fn: Option<&crate::ir::types::IRFunction>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
+    ctx: FnBodyCtx<'_>,
 ) -> Result<SmtValue, FnContractError> {
     let cond_val =
-        encode_pure_expr(cond, env, vctx, defs).map_err(FnContractError::EncodingError)?;
+        encode_pure_expr(cond, env, ctx.vctx, ctx.defs).map_err(FnContractError::EncodingError)?;
     let cond_bool = cond_val.to_bool().map_err(FnContractError::EncodingError)?;
 
     // Then-branch: condition is known true → add it as assumption.
     // Collect constraints separately so they can be guarded by cond.
-    let mut then_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    let mut then_assumptions: Vec<Bool> = ctx.extra_assumptions.to_vec();
     then_assumptions.push(cond_bool.clone());
     let mut then_constraints: Vec<Bool> = Vec::new();
     let mut then_env = env.clone();
-    let then_val = encode_fn_body(
-        then_body,
-        &mut then_env,
-        &mut then_constraints,
-        fn_requires,
-        &then_assumptions,
-        self_fn,
-        vctx,
-        defs,
-    )?;
+    let then_ctx = FnBodyCtx {
+        extra_assumptions: &then_assumptions,
+        ..ctx
+    };
+    let then_val = encode_fn_body(then_body, &mut then_env, &mut then_constraints, then_ctx)?;
 
     // Else-branch: condition is known false → add ¬cond as assumption.
-    let mut else_assumptions: Vec<Bool> = extra_assumptions.to_vec();
+    let mut else_assumptions: Vec<Bool> = ctx.extra_assumptions.to_vec();
     else_assumptions.push(smt::bool_not(&cond_bool));
     let mut else_constraints: Vec<Bool> = Vec::new();
     let mut else_env = env.clone();
     let else_val = if let Some(eb) = else_body {
-        encode_fn_body(
-            eb,
-            &mut else_env,
-            &mut else_constraints,
-            fn_requires,
-            &else_assumptions,
-            self_fn,
-            vctx,
-            defs,
-        )?
+        let else_ctx = FnBodyCtx {
+            extra_assumptions: &else_assumptions,
+            ..ctx
+        };
+        encode_fn_body(eb, &mut else_env, &mut else_constraints, else_ctx)?
     } else {
         smt::bool_val(true)
     };

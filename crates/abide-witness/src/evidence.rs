@@ -21,18 +21,23 @@ pub enum EvidencePayload {
 }
 
 impl EvidencePayload {
+    /// Wraps an operational/relational witness envelope.
     pub fn witness(witness: WitnessEnvelope) -> Self {
         Self::Witness(witness)
     }
 
+    /// Wraps a solver countermodel.
     pub fn countermodel(countermodel: Countermodel) -> Self {
         Self::Countermodel(countermodel)
     }
 
+    /// Wraps a reference to an external proof artifact (Agda/Lean/Rocq).
     pub fn proof_artifact_ref(proof_artifact_ref: ProofArtifactRef) -> Self {
         Self::ProofArtifactRef(proof_artifact_ref)
     }
 
+    /// Re-runs the inner payload's structural validation. Useful at
+    /// importer boundaries.
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::Witness(witness) => witness.validate().map_err(ValidationError::Witness),
@@ -45,6 +50,8 @@ impl EvidencePayload {
         }
     }
 
+    /// Returns the inner witness envelope if this is a `Witness`
+    /// payload, otherwise `None`.
     pub fn as_witness(&self) -> Option<&WitnessEnvelope> {
         match self {
             Self::Witness(witness) => Some(witness),
@@ -52,6 +59,8 @@ impl EvidencePayload {
         }
     }
 
+    /// Returns the inner countermodel if this is a `Countermodel`
+    /// payload, otherwise `None`.
     pub fn as_countermodel(&self) -> Option<&Countermodel> {
         match self {
             Self::Countermodel(countermodel) => Some(countermodel),
@@ -59,6 +68,8 @@ impl EvidencePayload {
         }
     }
 
+    /// Returns the inner proof artifact reference if this is a
+    /// `ProofArtifactRef` payload, otherwise `None`.
     pub fn as_proof_artifact_ref(&self) -> Option<&ProofArtifactRef> {
         match self {
             Self::ProofArtifactRef(proof_artifact_ref) => Some(proof_artifact_ref),
@@ -67,57 +78,73 @@ impl EvidencePayload {
     }
 }
 
+/// Stable result-level envelope around [`EvidencePayload`].
+///
+/// Like [`WitnessEnvelope`], the envelope buys forward-compatibility: a
+/// new payload kind can be added without breaking the surface type
+/// callers depend on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceEnvelope {
     payload: EvidencePayload,
 }
 
 impl EvidenceEnvelope {
+    /// Wraps `payload` after validating it.
     pub fn new(payload: EvidencePayload) -> Result<Self, ValidationError> {
         payload.validate()?;
         Ok(Self { payload })
     }
 
+    /// Convenience: wrap a witness envelope directly.
     pub fn witness(witness: WitnessEnvelope) -> Result<Self, ValidationError> {
         Self::new(EvidencePayload::witness(witness))
     }
 
+    /// Convenience: wrap a countermodel directly.
     pub fn countermodel(countermodel: Countermodel) -> Result<Self, ValidationError> {
         Self::new(EvidencePayload::countermodel(countermodel))
     }
 
+    /// Convenience: wrap a proof-artifact reference directly.
     pub fn proof_artifact_ref(
         proof_artifact_ref: ProofArtifactRef,
     ) -> Result<Self, ValidationError> {
         Self::new(EvidencePayload::proof_artifact_ref(proof_artifact_ref))
     }
 
+    /// Borrows the contained payload.
     pub fn payload(&self) -> &EvidencePayload {
         &self.payload
     }
 
+    /// Returns the contained witness envelope if any.
     pub fn as_witness(&self) -> Option<&WitnessEnvelope> {
         self.payload.as_witness()
     }
 
+    /// Returns the contained countermodel if any.
     pub fn as_countermodel(&self) -> Option<&Countermodel> {
         self.payload.as_countermodel()
     }
 
+    /// Returns the contained proof artifact reference if any.
     pub fn as_proof_artifact_ref(&self) -> Option<&ProofArtifactRef> {
         self.payload.as_proof_artifact_ref()
     }
 
+    /// Re-validates the contained payload.
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.payload.validate()
     }
 
+    /// Parses an envelope from a JSON string and validates it.
     pub fn from_json_validated(json: &str) -> Result<Self, ValidatedJsonError<ValidationError>> {
         let envelope: Self = serde_json::from_str(json).map_err(ValidatedJsonError::deserialize)?;
         envelope.validate().map_err(ValidatedJsonError::validate)?;
         Ok(envelope)
     }
 
+    /// Streaming variant of [`Self::from_json_validated`].
     pub fn from_json_reader_validated<R: Read>(
         reader: R,
     ) -> Result<Self, ValidatedJsonError<ValidationError>> {
@@ -128,17 +155,28 @@ impl EvidenceEnvelope {
     }
 }
 
+/// Countermodel returned by a deductive backend when a proof
+/// obligation is refuted at the SMT level.
+///
+/// A countermodel is a bag of name-to-value bindings; unlike an
+/// operational witness it has no trace structure — it is a snapshot
+/// model that satisfies the negation of the obligation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Countermodel {
+    /// Solver that produced the countermodel (e.g. `"z3"`, `"cvc5"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backend: Option<String>,
+    /// Optional one-line human-readable summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    /// Name-to-value bindings describing the model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bindings: Vec<CountermodelBinding>,
 }
 
 impl Countermodel {
+    /// Constructs an empty countermodel; chain `.backend(..)`,
+    /// `.summary(..)`, and `.binding(..)` to populate it.
     pub fn new() -> Self {
         Self {
             backend: None,
@@ -147,33 +185,40 @@ impl Countermodel {
         }
     }
 
+    /// Records the producing solver name.
     pub fn backend(mut self, backend: impl Into<String>) -> Self {
         self.backend = Some(backend.into());
         self
     }
 
+    /// Attaches a one-line summary.
     pub fn summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = Some(summary.into());
         self
     }
 
+    /// Appends one binding to the countermodel.
     pub fn binding(mut self, binding: CountermodelBinding) -> Self {
         self.bindings.push(binding);
         self
     }
 
+    /// Returns the producing solver name, if recorded.
     pub fn backend_name(&self) -> Option<&str> {
         self.backend.as_deref()
     }
 
+    /// Returns the summary text, if any.
     pub fn summary_text(&self) -> Option<&str> {
         self.summary.as_deref()
     }
 
+    /// Borrows the full binding list.
     pub fn bindings(&self) -> &[CountermodelBinding] {
         &self.bindings
     }
 
+    /// Validates every binding in turn.
     pub fn validate(&self) -> Result<(), CountermodelValidationError> {
         for binding in &self.bindings {
             binding.validate()?;
@@ -188,6 +233,7 @@ impl Default for Countermodel {
     }
 }
 
+/// Single name-to-value binding inside a [`Countermodel`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountermodelBinding {
     name: String,
@@ -195,6 +241,7 @@ pub struct CountermodelBinding {
 }
 
 impl CountermodelBinding {
+    /// Constructs and validates a binding (rejects empty names).
     pub fn new(
         name: impl Into<String>,
         value: WitnessValue,
@@ -207,14 +254,17 @@ impl CountermodelBinding {
         Ok(binding)
     }
 
+    /// Binding name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Bound value.
     pub fn value(&self) -> &WitnessValue {
         &self.value
     }
 
+    /// Rejects bindings whose name is empty or pure whitespace.
     pub fn validate(&self) -> Result<(), CountermodelValidationError> {
         if self.name.trim().is_empty() {
             return Err(CountermodelValidationError::EmptyBindingName);
@@ -223,6 +273,12 @@ impl CountermodelBinding {
     }
 }
 
+/// Reference to an external proof artifact carried by an `axiom`
+/// declaration's `by "file"` clause (Agda, Lean 4, Rocq, …).
+///
+/// `checked` indicates whether the artifact has been validated by the
+/// external prover during this run; the field is informational — the
+/// `axiom` mechanism trusts the artifact regardless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofArtifactRef {
     locator: String,
@@ -235,6 +291,8 @@ pub struct ProofArtifactRef {
 }
 
 impl ProofArtifactRef {
+    /// Constructs and validates an artifact reference (rejects empty
+    /// locators).
     pub fn new(locator: impl Into<String>) -> Result<Self, ProofArtifactRefValidationError> {
         let proof_artifact_ref = Self {
             locator: locator.into(),
@@ -246,37 +304,45 @@ impl ProofArtifactRef {
         Ok(proof_artifact_ref)
     }
 
+    /// Records the external prover that owns the artifact.
     pub fn backend(mut self, backend: impl Into<String>) -> Self {
         self.backend = Some(backend.into());
         self
     }
 
+    /// Attaches a short label (typically the theorem name).
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
     }
 
+    /// Marks whether the artifact was verified during this run.
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
         self
     }
 
+    /// Path or URI pointing at the artifact.
     pub fn locator(&self) -> &str {
         &self.locator
     }
 
+    /// External prover name, if set.
     pub fn backend_name(&self) -> Option<&str> {
         self.backend.as_deref()
     }
 
+    /// Label, if set.
     pub fn label_text(&self) -> Option<&str> {
         self.label.as_deref()
     }
 
+    /// Returns `true` if the producer claims the artifact was checked.
     pub fn is_checked(&self) -> bool {
         self.checked
     }
 
+    /// Rejects refs with an empty or whitespace-only locator.
     pub fn validate(&self) -> Result<(), ProofArtifactRefValidationError> {
         if self.locator.trim().is_empty() {
             return Err(ProofArtifactRefValidationError::EmptyLocator);
@@ -285,10 +351,15 @@ impl ProofArtifactRef {
     }
 }
 
+/// Top-level error returned by [`EvidencePayload::validate`] /
+/// [`EvidenceEnvelope::validate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// Wrapped witness-envelope validation failure.
     Witness(WitnessValidationError),
+    /// Countermodel validation failure.
     Countermodel(CountermodelValidationError),
+    /// Proof-artifact-reference validation failure.
     ProofArtifactRef(ProofArtifactRefValidationError),
 }
 
@@ -304,8 +375,11 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Errors produced while validating a [`Countermodel`] or its
+/// [`CountermodelBinding`]s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CountermodelValidationError {
+    /// A binding's `name` field is empty or whitespace-only.
     EmptyBindingName,
 }
 
@@ -319,8 +393,10 @@ impl fmt::Display for CountermodelValidationError {
 
 impl std::error::Error for CountermodelValidationError {}
 
+/// Errors produced while validating a [`ProofArtifactRef`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofArtifactRefValidationError {
+    /// `locator` is empty or whitespace-only.
     EmptyLocator,
 }
 

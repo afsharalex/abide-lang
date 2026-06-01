@@ -46,7 +46,6 @@ pub(super) fn collect_qualified_call(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 /// Desugar `in expr` on a quantifier body at collection time.
 /// When `in_expr` is Some, wraps the body with a membership guard:
 /// `all`: `(x in S) implies body`

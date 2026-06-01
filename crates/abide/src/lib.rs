@@ -2,8 +2,6 @@
 // historically tolerated via scattered `#[allow]` attributes — consolidating
 // them here keeps `cargo clippy --tests -- -D warnings` clean without
 // changing established conventions:
-// * `too_many_lines` / `too_many_arguments` — large compiler/verifier
-// functions are intentionally flat for review and trace-ability.
 // * `match_same_arms` — verifier and elab match arms are kept distinct
 // for documentation even when bodies coincide.
 // * `items_after_statements` — local helper fns near their first use are
@@ -18,8 +16,6 @@
 // * `doc_list_without_indent` / `doc_markdown` — Markdown style noise.
 // * `ref_option` — `&Option<T>` is used at boundaries we don't control.
 #![allow(
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
     clippy::match_same_arms,
     clippy::items_after_statements,
     clippy::format_push_string,
@@ -42,6 +38,27 @@
     clippy::redundant_closure_call,
     clippy::used_underscore_binding
 )]
+
+//! `abide` — the user-facing CLI and library.
+//!
+//! This crate re-exports the workspace crates under a single name so
+//! downstream tools (notably the LSP binary in `abide-lsp` and
+//! Invaria) can `use abide::ast`, `use abide::ir`, etc. without
+//! tracking the workspace layout.
+//!
+//! Local modules:
+//! - [`cli`] — argument parsing and subcommand dispatch.
+//! - [`driver`] — end-to-end pipeline that turns source into IR plus
+//!   diagnostics.
+//! - [`workspace`] — multi-file source state used by both the CLI and
+//!   the LSP.
+//! - [`ide`] — IDE primitives (workspace index, completion context,
+//!   identifier lookup) shared between the LSP and `abide explain`.
+//! - [`render`] — human-readable rendering of IR and verifier results.
+//! - [`repl`] — interactive shell.
+//! - [`simulate`] — operational simulator used by `abide simulate` and
+//!   QA's `simulate` block.
+//! - [`artifact`] — verification-artifact bundling for JSON emission.
 
 pub use abide_core::{diagnostic, messages, span};
 pub use abide_ir::ir;

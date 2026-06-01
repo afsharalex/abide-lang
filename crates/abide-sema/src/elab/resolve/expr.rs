@@ -294,7 +294,6 @@ fn infer_index_type(map: &EExpr) -> Ty {
 }
 
 /// Resolve names and constructors within an expression tree.
-#[allow(clippy::too_many_lines)]
 pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr) -> EExpr {
     match expr {
         EExpr::Var(_, name, sp) => {

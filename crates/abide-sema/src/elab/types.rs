@@ -10,6 +10,7 @@ pub type VariantRecordFields = Vec<(String, Ty)>;
 pub type EnumVariantFields = Vec<(String, VariantRecordFields)>;
 pub type VariantFieldsMap = HashMap<String, EnumVariantFields>;
 
+/// Elaborated relation-comprehension binding: `var: domain [in source]`.
 #[derive(Clone, Debug)]
 pub struct ERelCompBinding {
     pub var: String,
@@ -82,13 +83,20 @@ impl Ty {
     }
 }
 
+/// Built-in scalar types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinTy {
+    /// `int` — arbitrary-precision integer (encoded as `i64` in IR).
     Int,
+    /// `bool`.
     Bool,
+    /// `string`.
     String,
+    /// `identity` — opaque entity identity.
     Identity,
+    /// `real` — exact rational.
     Real,
+    /// `float` — IEEE-754 double.
     Float,
 }
 
@@ -109,6 +117,7 @@ impl BuiltinTy {
 
 /// Elaborated type declaration.
 #[derive(Debug, Clone)]
+/// Elaborated `type` declaration — record or enum.
 pub struct EType {
     pub name: String,
     pub variants: Vec<EVariant>,
@@ -116,10 +125,16 @@ pub struct EType {
     pub span: Option<crate::span::Span>,
 }
 
+/// One variant of an [`EType`]. Mirrors `ast::TypeVariant` after
+/// resolution (constructor field types are real [`Ty`] values, not
+/// surface [`TypeRef`](crate::ast::TypeRef)s).
 #[derive(Debug, Clone)]
 pub enum EVariant {
+    /// Bare constructor, no payload.
     Simple(String),
+    /// Named-field record constructor.
     Record(String, VariantRecordFields),
+    /// Parameterized variant (used for generic passthroughs).
     Param(String, Vec<Ty>),
 }
 
@@ -219,6 +234,7 @@ pub enum EFieldDefault {
     Where(EExpr),
 }
 
+/// Elaborated field declaration (on an entity or system).
 #[derive(Debug, Clone)]
 pub struct EField {
     pub name: String,
@@ -227,6 +243,12 @@ pub struct EField {
     pub span: Option<crate::span::Span>,
 }
 
+/// Elaborated entity-local action.
+///
+/// `refs` are the entity references (resolved to entity types) the
+/// action operates on; `params` are typed value parameters; `body`
+/// is the lowered statement sequence. `requires`/`ensures` come from
+/// surface `requires`/`ensures` clauses.
 #[derive(Debug, Clone)]
 pub struct EAction {
     pub name: String,
@@ -318,6 +340,8 @@ pub struct EExtern {
     pub span: Option<crate::span::Span>,
 }
 
+/// Elaborated `may CMD -> @r1 | @r2 | ...` declaration inside an
+/// `extern` body.
 #[derive(Debug, Clone)]
 pub struct EMay {
     pub command: String,
@@ -325,10 +349,18 @@ pub struct EMay {
     pub span: Option<crate::span::Span>,
 }
 
+/// One item inside an elaborated extern `assume { ... }` block.
+///
+/// `Fair` / `StrongFair` paths are kept as segment lists (parallel
+/// to [`crate::ast::EventPath`]) until resolution lifts them into
+/// concrete [`EventRef`]s.
 #[derive(Debug, Clone)]
 pub enum EExternAssume {
+    /// `fair PATH` — weak fairness on the named extern command.
     Fair(Vec<String>, Option<crate::span::Span>),
+    /// `strong fair PATH` — strong fairness on the named extern command.
     StrongFair(Vec<String>, Option<crate::span::Span>),
+    /// Bare boolean assumption.
     Expr(EExpr, Option<crate::span::Span>),
 }
 
@@ -369,17 +401,27 @@ pub struct EProcEdge {
     pub condition: EProcDepCond,
 }
 
+/// Elaborated dependency condition on a [`EProcEdge`]. Mirrors the
+/// restricted boolean grammar accepted after `needs`.
 #[derive(Debug, Clone)]
 pub enum EProcDepCond {
+    /// Atomic fact: a node finished with an optional outcome qualifier
+    /// (e.g. `charge.ok`).
     Fact {
         node: String,
         qualifier: Option<String>,
     },
+    /// `not COND`.
     Not(Box<EProcDepCond>),
+    /// `LEFT and RIGHT`.
     And(Box<EProcDepCond>, Box<EProcDepCond>),
+    /// `LEFT or RIGHT`.
     Or(Box<EProcDepCond>, Box<EProcDepCond>),
 }
 
+/// One entity scope: an entity type and the size bounds the verifier
+/// should use for its pool. Carried on legacy `for SYS[lo..hi]`
+/// surfaces and per-store scopes.
 #[derive(Debug, Clone)]
 pub struct EScope {
     pub entity: String,
@@ -420,6 +462,8 @@ pub struct EQuery {
     pub span: Option<crate::span::Span>,
 }
 
+/// Generic structural representation of an event body (commands and
+/// internal actions both lower through this shape during checking).
 #[derive(Debug, Clone)]
 pub struct EEvent {
     pub name: String,
@@ -451,12 +495,18 @@ pub enum EEventAction {
     Expr(EExpr),
 }
 
+/// What an event-body `match` is scrutinizing — either an already-bound
+/// variable (typically a `let r = ...` result) or an inline cross-system
+/// call whose return is matched directly.
 #[derive(Debug, Clone)]
 pub enum EMatchScrutinee {
+    /// Bound variable.
     Var(String),
+    /// Inline `Sys::cmd(args)` call.
     CrossCall(String, String, Vec<EExpr>),
 }
 
+/// One arm of an event-body `match`.
 #[derive(Debug, Clone)]
 pub struct EMatchArm {
     pub pattern: EPattern,
@@ -507,7 +557,11 @@ pub struct EProp {
 
 /// A resolved reference to a command by its (system, command) name pair.
 /// Sortable so that `BTreeSet<EventRef>` gives canonical alphabetical
-/// ordering for `AssumptionSet` normalization.
+/// A qualified reference to a command on a system.
+///
+/// This is the elaborator-side counterpart to
+/// `IRCommandRef`; `Ord` is derived for deterministic
+/// ordering inside `AssumptionSet` normalization.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventRef {
     pub system: String,
@@ -541,6 +595,13 @@ pub enum StutterProvenance {
     ExplicitNoStutter,
 }
 
+/// Normalized assumption set attached to a verification site.
+///
+/// Construct via [`Self::default_for_verify`] /
+/// [`Self::default_for_theorem_or_lemma`] then add fairness via
+/// resolution — direct struct literals are discouraged because the
+/// stutter default is a locked invariant (CLAUDE.md §"locked
+/// invariants" §1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssumptionSet {
     /// Whether stutter steps are admitted at this verification site.
@@ -718,6 +779,8 @@ pub struct EActivation {
     pub store_name: String,
 }
 
+/// Elaborated scene `given` binding: `var: entity_type [in store]
+/// [where cond]`.
 #[derive(Debug, Clone)]
 pub struct ESceneGiven {
     pub var: String,
@@ -729,8 +792,12 @@ pub struct ESceneGiven {
     pub condition: Option<EExpr>,
 }
 
+/// One item in a scene `when` block: either a fired event with
+/// cardinality, or a bare boolean assumption.
 #[derive(Debug, Clone)]
 pub enum ESceneWhen {
+    /// `var: Sys::event(args)` with optional cardinality (`one`, `lone`,
+    /// `some`, `no`, or `exactly N`).
     Action {
         var: String,
         system: String,
@@ -738,6 +805,7 @@ pub enum ESceneWhen {
         args: Vec<EExpr>,
         card: Option<String>,
     },
+    /// `assume expr` clause.
     Assume(EExpr),
 }
 
@@ -859,15 +927,27 @@ pub struct EFn {
 /// Contract clause on fn declarations and while loops.
 #[derive(Debug, Clone)]
 pub enum EContract {
+    /// `requires expr` — precondition.
     Requires(EExpr),
+    /// `ensures expr` — postcondition.
     Ensures(EExpr),
+    /// `decreases m1, m2, ... [*]` — termination measure.
     Decreases { measures: Vec<EExpr>, star: bool },
+    /// `invariant expr` — loop / proof-environment invariant.
     Invariant(EExpr),
 }
 
 // ── Elaborated expressions ───────────────────────────────────────────
 
-/// Type-annotated expression.
+/// Type-annotated expression after elaboration.
+///
+/// Every variant carries the result [`Ty`] as its first field (so type
+/// information is locally available without a separate environment
+/// lookup), the structural fields, and an optional source span.
+/// `Unresolved` is the poison value produced when name resolution
+/// fails — it should be replaced by `Error`-typed forms before lowering
+/// proceeds, but is kept here so the elaborator can report multiple
+/// errors per pass.
 #[derive(Debug, Clone)]
 pub enum EExpr {
     Lit(Ty, Literal, Option<crate::span::Span>),
@@ -1032,11 +1112,20 @@ pub enum EExpr {
     StructCtor(Ty, String, Vec<(String, EExpr)>, Option<crate::span::Span>),
 }
 
+/// Elaborated match pattern.
+///
+/// The surface ambiguity from [`crate::ast::Pattern::Var`] (variable
+/// vs. constructor) is resolved here: `Var` is unambiguously a binder
+/// and `Ctor` is unambiguously a constructor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EPattern {
+    /// Variable binder.
     Var(String),
+    /// Constructor pattern with named field sub-patterns.
     Ctor(String, Vec<(String, EPattern)>),
+    /// `_`.
     Wild,
+    /// `p | q`.
     Or(Box<EPattern>, Box<EPattern>),
 }
 
@@ -1097,6 +1186,8 @@ impl EExpr {
     }
 }
 
+/// Elaborated literal value. `Real` and `Float` are split for
+/// type-directed dispatch even though both are stored as `f64`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Int(i64),
@@ -1106,24 +1197,47 @@ pub enum Literal {
     Bool(bool),
 }
 
+/// Binary operator on elaborated expressions.
+///
+/// Includes both ordinary arithmetic/logical operators and the
+/// composition operators (`Unord`, `Conc`, `Xor`); the elaborator's
+/// contract-vs-event distinction rejects composition operators inside
+/// contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
+    /// `+`.
     Add,
+    /// `-`.
     Sub,
+    /// `*`.
     Mul,
+    /// `/`.
     Div,
+    /// `mod`.
     Mod,
+    /// `=`.
     Eq,
+    /// `!=`.
     NEq,
+    /// `<`.
     Lt,
+    /// `>`.
     Gt,
+    /// `<=`.
     Le,
+    /// `>=`.
     Ge,
+    /// `and`.
     And,
+    /// `or`.
     Or,
+    /// `implies`.
     Implies,
+    /// `||` — concurrent (unordered) composition.
     Unord,
+    /// `|` — choice composition.
     Conc,
+    /// `^|` — exclusive choice.
     Xor,
     /// `<>` — set union, seq concat, map merge (type-directed)
     Diamond,
@@ -1131,25 +1245,40 @@ pub enum BinOp {
     Disjoint,
 }
 
+/// Unary operator on elaborated expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
+    /// `not`.
     Not,
+    /// `-` (numeric negation).
     Neg,
 }
 
+/// Quantifier kind. `Some`, `No`, `One`, `Lone` come from the Alloy-
+/// style multiplicities supported alongside ordinary `All` / `Exists`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quantifier {
+    /// `all`.
     All,
+    /// `exists`.
     Exists,
+    /// `some x: T | P` — at least one.
     Some,
+    /// `no x: T | P` — none.
     No,
+    /// `one x: T | P` — exactly one.
     One,
+    /// `lone x: T | P` — at most one.
     Lone,
 }
 
 // ── Elaboration result ───────────────────────────────────────────────
 
 /// Full elaboration result containing all elaborated declarations.
+///
+/// One [`ElabResult`] represents one elaborated module (or set of
+/// modules merged through `include`). It is the input to `abide-ir`'s
+/// lowering pass.
 #[derive(Debug, Clone)]
 pub struct ElabResult {
     pub module_name: Option<String>,

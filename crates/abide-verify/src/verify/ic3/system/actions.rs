@@ -1,5 +1,61 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SystemActionCtx<'a> {
+    pub(in crate::verify::ic3) entities: &'a [&'a IREntity],
+    pub(in crate::verify::ic3) vctx: &'a VerifyContext,
+    pub(in crate::verify::ic3) slots_per_entity: &'a HashMap<String, usize>,
+    pub(in crate::verify::ic3) all_vars_str: &'a str,
+    pub(in crate::verify::ic3) all_systems: &'a [&'a IRSystem],
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct EncodeStepChcInput<'a> {
+    pub(in crate::verify::ic3) actions: &'a [IRAction],
+    pub(in crate::verify::ic3) event_guard: &'a IRExpr,
+    pub(in crate::verify::ic3) rule_prefix: &'a str,
+    pub(in crate::verify::ic3) extra_guards: &'a [String],
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct BoundActionSlot<'a> {
+    pub(in crate::verify::ic3) entity: &'a IREntity,
+    pub(in crate::verify::ic3) entity_name: &'a str,
+    pub(in crate::verify::ic3) slot: usize,
+    pub(in crate::verify::ic3) var: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct EncodeOpsChcInput<'a> {
+    pub(in crate::verify::ic3) ops: &'a [IRAction],
+    pub(in crate::verify::ic3) bound: BoundActionSlot<'a>,
+    pub(in crate::verify::ic3) rule_prefix: &'a str,
+    pub(in crate::verify::ic3) guards: &'a [String],
+}
+
+struct MacroCallChcInput<'a> {
+    target_sys: &'a str,
+    target_evt: &'a str,
+    rule_prefix: &'a str,
+    guards: &'a [String],
+    local_terms: &'a HashMap<String, String>,
+}
+
+struct ActionMatchScrutineeInput<'a> {
+    scrutinee: &'a crate::ir::types::IRActionMatchScrutinee,
+    rule_prefix: &'a str,
+    action_index: usize,
+    guards: &'a [String],
+    local_terms: &'a HashMap<String, String>,
+}
+
+struct CreateChcInput<'a> {
+    entity_name: &'a str,
+    fields: &'a [IRCreateField],
+    guards: &'a [String],
+    rule_prefix: &'a str,
+}
+
 /// Encode a system event body as CHC transition rules.
 ///
 /// Walks the event action tree and generates composite rules that combine
@@ -13,59 +69,35 @@ use super::*;
 ///
 /// All encoding errors propagate. Missing transitions, systems, events, and
 /// cyclic `CrossCall` graphs produce hard errors.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::format_push_string
-)]
 pub(in crate::verify::ic3) fn encode_step_chc(
     chc: &mut String,
-    actions: &[IRAction],
-    event_guard: &IRExpr,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
-    extra_guards: &[String],
+    ctx: Ic3SystemActionCtx<'_>,
+    input: EncodeStepChcInput<'_>,
     visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
-    encode_step_chc_scoped(
-        chc,
-        actions,
-        event_guard,
-        entities,
-        vctx,
-        slots_per_entity,
-        all_vars_str,
-        all_systems,
-        rule_prefix,
-        extra_guards,
-        visited,
-        &HashMap::new(),
-    )
+    encode_step_chc_scoped(chc, ctx, input, visited, &HashMap::new())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::format_push_string
-)]
 fn encode_step_chc_scoped(
     chc: &mut String,
-    actions: &[IRAction],
-    event_guard: &IRExpr,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
-    extra_guards: &[String],
+    action_ctx: Ic3SystemActionCtx<'_>,
+    input: EncodeStepChcInput<'_>,
     visited: &mut HashSet<(String, String)>,
     local_terms: &HashMap<String, String>,
 ) -> Result<(), String> {
+    let Ic3SystemActionCtx {
+        entities,
+        vctx,
+        slots_per_entity,
+        all_vars_str: _,
+        all_systems,
+    } = action_ctx;
+    let EncodeStepChcInput {
+        actions,
+        event_guard,
+        rule_prefix,
+        extra_guards,
+    } = input;
     let mut local_terms = local_terms.clone();
     for (ai, action) in actions.iter().enumerate() {
         match action {
@@ -93,18 +125,18 @@ fn encode_step_chc_scoped(
 
                     encode_ops_chc_scoped(
                         chc,
-                        ops,
-                        entities,
-                        entity,
-                        ent_name,
-                        slot,
-                        var,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_choose_{ai}_s{slot}"),
-                        &choose_guards,
+                        action_ctx,
+                        EncodeOpsChcInput {
+                            ops,
+                            bound: BoundActionSlot {
+                                entity,
+                                entity_name: ent_name,
+                                slot,
+                                var,
+                            },
+                            rule_prefix: &format!("{rule_prefix}_choose_{ai}_s{slot}"),
+                            guards: &choose_guards,
+                        },
                         visited,
                         &local_terms,
                     )?;
@@ -131,18 +163,18 @@ fn encode_step_chc_scoped(
 
                     encode_ops_chc_scoped(
                         chc,
-                        ops,
-                        entities,
-                        entity,
-                        ent_name,
-                        slot,
-                        var,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_forall_{ai}_s{slot}"),
-                        &forall_guards,
+                        action_ctx,
+                        EncodeOpsChcInput {
+                            ops,
+                            bound: BoundActionSlot {
+                                entity,
+                                entity_name: ent_name,
+                                slot,
+                                var,
+                            },
+                            rule_prefix: &format!("{rule_prefix}_forall_{ai}_s{slot}"),
+                            guards: &forall_guards,
+                        },
                         visited,
                         &local_terms,
                     )?;
@@ -160,14 +192,13 @@ fn encode_step_chc_scoped(
                 }
                 encode_create_chc(
                     chc,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    ent_name,
-                    create_fields,
-                    &guards,
-                    &format!("{rule_prefix}_create_{ai}"),
+                    action_ctx,
+                    CreateChcInput {
+                        entity_name: ent_name,
+                        fields: create_fields,
+                        guards: &guards,
+                        rule_prefix: &format!("{rule_prefix}_create_{ai}"),
+                    },
                 )?;
             }
             IRAction::CrossCall {
@@ -204,15 +235,13 @@ fn encode_step_chc_scoped(
 
                 let result = encode_step_chc_scoped(
                     chc,
-                    &evt.body,
-                    &evt.guard,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
-                    &cc_guards,
+                    action_ctx,
+                    EncodeStepChcInput {
+                        actions: &evt.body,
+                        event_guard: &evt.guard,
+                        rule_prefix: &format!("{rule_prefix}_cc_{target_sys}_{target_evt}"),
+                        extra_guards: &cc_guards,
+                    },
                     visited,
                     &local_terms,
                 );
@@ -231,17 +260,15 @@ fn encode_step_chc_scoped(
                 let call_guards = top_level_action_guards(extra_guards, event_guard, &local_terms)?;
                 let return_value = encode_macro_call_chc(
                     chc,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    target_sys,
-                    target_evt,
-                    &format!("{rule_prefix}_let_{ai}_{target_sys}_{target_evt}"),
-                    &call_guards,
+                    action_ctx,
+                    MacroCallChcInput {
+                        target_sys,
+                        target_evt,
+                        rule_prefix: &format!("{rule_prefix}_let_{ai}_{target_sys}_{target_evt}"),
+                        guards: &call_guards,
+                        local_terms: &local_terms,
+                    },
                     visited,
-                    &local_terms,
                 )?
                 .ok_or_else(|| {
                     format!("macro-step binding requires `{target_sys}::{target_evt}` to return a value")
@@ -253,17 +280,15 @@ fn encode_step_chc_scoped(
                     top_level_action_guards(extra_guards, event_guard, &local_terms)?;
                 let scrut = encode_action_match_scrutinee(
                     chc,
-                    scrutinee,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    rule_prefix,
-                    ai,
-                    &match_guards,
+                    action_ctx,
+                    ActionMatchScrutineeInput {
+                        scrutinee,
+                        rule_prefix,
+                        action_index: ai,
+                        guards: &match_guards,
+                        local_terms: &local_terms,
+                    },
                     visited,
-                    &local_terms,
                 )?;
                 for (arm_index, arm) in arms.iter().enumerate() {
                     let mut arm_guards = extra_guards.to_vec();
@@ -277,15 +302,13 @@ fn encode_step_chc_scoped(
                     }
                     encode_step_chc_scoped(
                         chc,
-                        &arm.body,
-                        event_guard,
-                        entities,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_match_{ai}_arm{arm_index}"),
-                        &arm_guards,
+                        action_ctx,
+                        EncodeStepChcInput {
+                            actions: &arm.body,
+                            event_guard,
+                            rule_prefix: &format!("{rule_prefix}_match_{ai}_arm{arm_index}"),
+                            extra_guards: &arm_guards,
+                        },
                         visited,
                         &arm_locals,
                     )?;
@@ -307,61 +330,42 @@ fn encode_step_chc_scoped(
 /// Context guards from the parent are propagated to every generated rule.
 /// `bound_var` is the variable name from the enclosing Choose/ForAll — Apply
 /// targets are validated against it to catch malformed IR.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[allow(dead_code)]
 pub(in crate::verify::ic3) fn encode_ops_chc(
     chc: &mut String,
-    ops: &[IRAction],
-    entities: &[&IREntity],
-    bound_entity: &IREntity,
-    bound_ent_name: &str,
-    bound_slot: usize,
-    bound_var: &str,
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
-    guards: &[String],
+    ctx: Ic3SystemActionCtx<'_>,
+    input: EncodeOpsChcInput<'_>,
     visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
-    encode_ops_chc_scoped(
-        chc,
-        ops,
+    encode_ops_chc_scoped(chc, ctx, input, visited, &HashMap::new())
+}
+
+fn encode_ops_chc_scoped(
+    chc: &mut String,
+    action_ctx: Ic3SystemActionCtx<'_>,
+    input: EncodeOpsChcInput<'_>,
+    visited: &mut HashSet<(String, String)>,
+    local_terms: &HashMap<String, String>,
+) -> Result<(), String> {
+    let Ic3SystemActionCtx {
         entities,
-        bound_entity,
-        bound_ent_name,
-        bound_slot,
-        bound_var,
         vctx,
         slots_per_entity,
         all_vars_str,
         all_systems,
+    } = action_ctx;
+    let EncodeOpsChcInput {
+        ops,
+        bound,
         rule_prefix,
         guards,
-        visited,
-        &HashMap::new(),
-    )
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn encode_ops_chc_scoped(
-    chc: &mut String,
-    ops: &[IRAction],
-    entities: &[&IREntity],
-    bound_entity: &IREntity,
-    bound_ent_name: &str,
-    bound_slot: usize,
-    bound_var: &str,
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
-    guards: &[String],
-    visited: &mut HashSet<(String, String)>,
-    local_terms: &HashMap<String, String>,
-) -> Result<(), String> {
+    } = input;
+    let BoundActionSlot {
+        entity: bound_entity,
+        entity_name: bound_ent_name,
+        slot: bound_slot,
+        var: bound_var,
+    } = bound;
     let mut local_terms = local_terms.clone();
     // Reject multi-apply on same entity — IC3's per-Apply CHC rules model
     // sequential transitions as separate derivation steps, not atomic
@@ -423,14 +427,13 @@ fn encode_ops_chc_scoped(
             } => {
                 encode_create_chc(
                     chc,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    ent_name,
-                    create_fields,
-                    guards,
-                    &format!("{rule_prefix}_create_{oi}"),
+                    action_ctx,
+                    CreateChcInput {
+                        entity_name: ent_name,
+                        fields: create_fields,
+                        guards,
+                        rule_prefix: &format!("{rule_prefix}_create_{oi}"),
+                    },
                 )?;
             }
             IRAction::CrossCall {
@@ -459,15 +462,13 @@ fn encode_ops_chc_scoped(
                 }
                 let result = encode_step_chc_scoped(
                     chc,
-                    &evt.body,
-                    &evt.guard,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    &format!("{rule_prefix}_cc_{oi}_{target_sys}_{target_evt}"),
-                    guards,
+                    action_ctx,
+                    EncodeStepChcInput {
+                        actions: &evt.body,
+                        event_guard: &evt.guard,
+                        rule_prefix: &format!("{rule_prefix}_cc_{oi}_{target_sys}_{target_evt}"),
+                        extra_guards: guards,
+                    },
                     visited,
                     &local_terms,
                 );
@@ -494,18 +495,18 @@ fn encode_ops_chc_scoped(
                     nested.push(wrap_action_locals(filter_smt, &local_terms));
                     encode_ops_chc_scoped(
                         chc,
-                        inner_ops,
-                        entities,
-                        entity,
-                        ent_name,
-                        slot,
-                        var,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_choose_{oi}_s{slot}"),
-                        &nested,
+                        action_ctx,
+                        EncodeOpsChcInput {
+                            ops: inner_ops,
+                            bound: BoundActionSlot {
+                                entity,
+                                entity_name: ent_name,
+                                slot,
+                                var,
+                            },
+                            rule_prefix: &format!("{rule_prefix}_choose_{oi}_s{slot}"),
+                            guards: &nested,
+                        },
                         visited,
                         &local_terms,
                     )?;
@@ -528,18 +529,18 @@ fn encode_ops_chc_scoped(
                     nested.push(active_var);
                     encode_ops_chc_scoped(
                         chc,
-                        inner_ops,
-                        entities,
-                        entity,
-                        ent_name,
-                        slot,
-                        var,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_forall_{oi}_s{slot}"),
-                        &nested,
+                        action_ctx,
+                        EncodeOpsChcInput {
+                            ops: inner_ops,
+                            bound: BoundActionSlot {
+                                entity,
+                                entity_name: ent_name,
+                                slot,
+                                var,
+                            },
+                            rule_prefix: &format!("{rule_prefix}_forall_{oi}_s{slot}"),
+                            guards: &nested,
+                        },
                         visited,
                         &local_terms,
                     )?;
@@ -556,17 +557,15 @@ fn encode_ops_chc_scoped(
             } => {
                 let return_value = encode_macro_call_chc(
                     chc,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    target_sys,
-                    target_evt,
-                    &format!("{rule_prefix}_let_{oi}_{target_sys}_{target_evt}"),
-                    guards,
+                    action_ctx,
+                    MacroCallChcInput {
+                        target_sys,
+                        target_evt,
+                        rule_prefix: &format!("{rule_prefix}_let_{oi}_{target_sys}_{target_evt}"),
+                        guards,
+                        local_terms: &local_terms,
+                    },
                     visited,
-                    &local_terms,
                 )?
                 .ok_or_else(|| {
                     format!("macro-step binding requires `{target_sys}::{target_evt}` to return a value")
@@ -576,17 +575,15 @@ fn encode_ops_chc_scoped(
             IRAction::Match { scrutinee, arms } => {
                 let scrut = encode_action_match_scrutinee(
                     chc,
-                    scrutinee,
-                    entities,
-                    vctx,
-                    slots_per_entity,
-                    all_vars_str,
-                    all_systems,
-                    rule_prefix,
-                    oi,
-                    guards,
+                    action_ctx,
+                    ActionMatchScrutineeInput {
+                        scrutinee,
+                        rule_prefix,
+                        action_index: oi,
+                        guards,
+                        local_terms: &local_terms,
+                    },
                     visited,
-                    &local_terms,
                 )?;
                 for (arm_index, arm) in arms.iter().enumerate() {
                     let mut arm_guards = guards.to_vec();
@@ -607,18 +604,13 @@ fn encode_ops_chc_scoped(
                     }
                     encode_ops_chc_scoped(
                         chc,
-                        &arm.body,
-                        entities,
-                        bound_entity,
-                        bound_ent_name,
-                        bound_slot,
-                        bound_var,
-                        vctx,
-                        slots_per_entity,
-                        all_vars_str,
-                        all_systems,
-                        &format!("{rule_prefix}_match_{oi}_arm{arm_index}"),
-                        &arm_guards,
+                        action_ctx,
+                        EncodeOpsChcInput {
+                            ops: &arm.body,
+                            bound,
+                            rule_prefix: &format!("{rule_prefix}_match_{oi}_arm{arm_index}"),
+                            guards: &arm_guards,
+                        },
                         visited,
                         &arm_locals,
                     )?;
@@ -642,21 +634,26 @@ fn top_level_action_guards(
     Ok(guards)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_macro_call_chc(
     chc: &mut String,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    target_sys: &str,
-    target_evt: &str,
-    rule_prefix: &str,
-    guards: &[String],
+    ctx: Ic3SystemActionCtx<'_>,
+    input: MacroCallChcInput<'_>,
     visited: &mut HashSet<(String, String)>,
-    local_terms: &HashMap<String, String>,
 ) -> Result<Option<String>, String> {
+    let Ic3SystemActionCtx {
+        entities,
+        vctx,
+        slots_per_entity: _,
+        all_vars_str: _,
+        all_systems,
+    } = ctx;
+    let MacroCallChcInput {
+        target_sys,
+        target_evt,
+        rule_prefix,
+        guards,
+        local_terms,
+    } = input;
     let sys = all_systems
         .iter()
         .find(|s| s.name == *target_sys)
@@ -675,15 +672,13 @@ fn encode_macro_call_chc(
     }
     let result = encode_step_chc_scoped(
         chc,
-        &evt.body,
-        &evt.guard,
-        entities,
-        vctx,
-        slots_per_entity,
-        all_vars_str,
-        all_systems,
-        rule_prefix,
-        guards,
+        ctx,
+        EncodeStepChcInput {
+            actions: &evt.body,
+            event_guard: &evt.guard,
+            rule_prefix,
+            extra_guards: guards,
+        },
         visited,
         local_terms,
     );
@@ -696,21 +691,19 @@ fn encode_macro_call_chc(
         .transpose()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_action_match_scrutinee(
     chc: &mut String,
-    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    all_systems: &[&IRSystem],
-    rule_prefix: &str,
-    action_index: usize,
-    guards: &[String],
+    ctx: Ic3SystemActionCtx<'_>,
+    input: ActionMatchScrutineeInput<'_>,
     visited: &mut HashSet<(String, String)>,
-    local_terms: &HashMap<String, String>,
 ) -> Result<String, String> {
+    let ActionMatchScrutineeInput {
+        scrutinee,
+        rule_prefix,
+        action_index,
+        guards,
+        local_terms,
+    } = input;
     match scrutinee {
         crate::ir::types::IRActionMatchScrutinee::Var { name } => local_terms
             .get(name)
@@ -723,17 +716,17 @@ fn encode_action_match_scrutinee(
         } => {
             let returned = encode_macro_call_chc(
                 chc,
-                entities,
-                vctx,
-                slots_per_entity,
-                all_vars_str,
-                all_systems,
-                target_sys,
-                target_evt,
-                &format!("{rule_prefix}_match_{action_index}_call_{target_sys}_{target_evt}"),
-                guards,
+                ctx,
+                MacroCallChcInput {
+                    target_sys,
+                    target_evt,
+                    rule_prefix: &format!(
+                        "{rule_prefix}_match_{action_index}_call_{target_sys}_{target_evt}"
+                    ),
+                    guards,
+                    local_terms,
+                },
                 visited,
-                local_terms,
             )?;
             returned
                 .ok_or_else(|| "macro-step match requires a returned command outcome".to_owned())
@@ -913,18 +906,24 @@ pub(in crate::verify::ic3) fn build_create_next(
 }
 
 /// Encode a Create action as CHC rules — one rule per available (inactive) slot.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::verify::ic3) fn encode_create_chc(
+fn encode_create_chc(
     chc: &mut String,
-    entities: &[&IREntity],
-    vctx: &VerifyContext,
-    slots_per_entity: &HashMap<String, usize>,
-    all_vars_str: &str,
-    create_ent_name: &str,
-    create_fields: &[IRCreateField],
-    extra_guards: &[String],
-    rule_prefix: &str,
+    ctx: Ic3SystemActionCtx<'_>,
+    input: CreateChcInput<'_>,
 ) -> Result<(), String> {
+    let Ic3SystemActionCtx {
+        entities,
+        vctx,
+        slots_per_entity,
+        all_vars_str,
+        ..
+    } = ctx;
+    let CreateChcInput {
+        entity_name: create_ent_name,
+        fields: create_fields,
+        guards: extra_guards,
+        rule_prefix,
+    } = input;
     let entity = entities
         .iter()
         .find(|e| e.name == create_ent_name)

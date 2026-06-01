@@ -7,6 +7,8 @@ use serde::Serialize;
 
 use super::types::{IREntity, IRStoreDecl, IRType};
 
+/// One column in an [`IRRelationType`]. `name` is optional —
+/// store-extent relations carry unnamed columns.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRRelationColumn {
     pub name: Option<String>,
@@ -27,6 +29,8 @@ impl IRRelationColumn {
     }
 }
 
+/// Type of a relation expression: an ordered list of columns. Arity
+/// is `columns.len()`; zero-arity relations are rejected.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRRelationType {
     pub columns: Vec<IRRelationColumn>,
@@ -70,14 +74,24 @@ impl IRRelationType {
     }
 }
 
+/// Origin of a relation symbol — informs the backend whether the
+/// relation is mutable (extents, fields) or read-only (user / derived).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum IRRelationSource {
+    /// Membership of a `Store<E>`.
     StoreExtent { store: String, entity: String },
+    /// `Entity.field` lifted to a binary relation.
     EntityField { entity: String, field: String },
+    /// Top-level `Rel<...>` declaration.
     UserRelation { name: String },
+    /// Result of a `derived` relation expression.
     Derived,
 }
 
+/// A named relation handle the backend can address.
+///
+/// `mutable` is `true` for store extents and entity fields (rewritten
+/// by transitions), `false` for user and derived relations.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRRelationSymbol {
     pub name: String,
@@ -134,25 +148,44 @@ pub fn relation_symbols_for_entity_fields(entity: &IREntity) -> Vec<IRRelationSy
         .collect()
 }
 
+/// Bounded relation-algebra expression.
+///
+/// This is the IR consumed by the SAT-backed relational fragment of
+/// the verifier. Each variant mirrors a surface `Rel::*` operation or
+/// a literal; [`Self::relation_type`] performs structural type checking
+/// to confirm join/transpose/closure operands are well-shaped.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum IRRelationExpr {
+    /// Reference to a named relation symbol.
     Symbol(IRRelationSymbol),
+    /// Empty relation of the given type.
     Empty(IRRelationType),
+    /// `{ (v1, v2, …) }` literal — a single tuple.
     SingletonTuple {
         tuple_type: IRRelationType,
         values: Vec<String>,
     },
+    /// Set union.
     Union(Box<IRRelationExpr>, Box<IRRelationExpr>),
+    /// Set intersection.
     Intersection(Box<IRRelationExpr>, Box<IRRelationExpr>),
+    /// Set difference (`left \ right`).
     Difference(Box<IRRelationExpr>, Box<IRRelationExpr>),
+    /// Cartesian product — concatenates column lists.
     Product(Box<IRRelationExpr>, Box<IRRelationExpr>),
+    /// Natural join on `left`'s last column and `right`'s first
+    /// column. Drops the joined columns from the result.
     Join(Box<IRRelationExpr>, Box<IRRelationExpr>),
+    /// Column projection by ordered index list.
     Project {
         expr: Box<IRRelationExpr>,
         columns: Vec<usize>,
     },
+    /// Swap columns of a binary relation.
     Transpose(Box<IRRelationExpr>),
+    /// `R^+` — transitive closure of a homogeneous binary relation.
     TransitiveClosure(Box<IRRelationExpr>),
+    /// `R^*` — reflexive transitive closure of a homogeneous binary relation.
     ReflexiveTransitiveClosure(Box<IRRelationExpr>),
 }
 
@@ -244,28 +277,24 @@ impl IRRelationExpr {
     }
 }
 
+/// Errors produced by structural typing of [`IRRelationExpr`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum IRRelationTypeError {
+    /// A relation type was constructed with zero columns.
     ZeroArityRelation,
+    /// Union/intersection/difference operands had different shapes.
     MismatchedRelationTypes {
         left: IRRelationType,
         right: IRRelationType,
     },
-    JoinTypeMismatch {
-        left: IRType,
-        right: IRType,
-    },
-    ColumnOutOfBounds {
-        column: usize,
-        arity: usize,
-    },
-    RequiresBinaryRelation {
-        found: usize,
-    },
-    ClosureTypeMismatch {
-        left: IRType,
-        right: IRType,
-    },
+    /// Join: left's last column type ≠ right's first column type.
+    JoinTypeMismatch { left: IRType, right: IRType },
+    /// `Project` referenced a column index past the source arity.
+    ColumnOutOfBounds { column: usize, arity: usize },
+    /// Transpose/closure was applied to a non-binary relation.
+    RequiresBinaryRelation { found: usize },
+    /// Closure operand wasn't homogeneous (both columns same type).
+    ClosureTypeMismatch { left: IRType, right: IRType },
 }
 
 #[cfg(test)]

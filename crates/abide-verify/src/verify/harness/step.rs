@@ -8,9 +8,9 @@ use crate::verify::{encode, walkers};
 mod branching;
 mod nested;
 
-pub(crate) use self::branching::try_encode_step_inner;
 #[cfg(test)]
 use self::branching::*;
+pub(crate) use self::branching::{try_encode_step_inner, StepEncodingOptions};
 
 /// Encode a system event as a single transition step.
 ///
@@ -23,7 +23,6 @@ use self::branching::*;
 /// - `ExprStmt` — encode as boolean constraint
 ///
 /// Frames all entity slots NOT touched by the event.
-#[allow(clippy::too_many_lines)]
 #[cfg(test)]
 pub fn encode_step(
     pool: &SlotPool,
@@ -37,7 +36,6 @@ pub fn encode_step(
         .unwrap_or_else(|msg| panic!("{msg}"))
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn try_encode_step(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -46,8 +44,15 @@ pub fn try_encode_step(
     event: &IRSystemAction,
     step: usize,
 ) -> Result<Bool, String> {
-    let (formula, touched) =
-        try_encode_step_inner(pool, vctx, entities, all_systems, event, step, 0, None)?;
+    let (formula, touched) = try_encode_step_inner(
+        pool,
+        vctx,
+        entities,
+        all_systems,
+        event,
+        step,
+        StepEncodingOptions::root(),
+    )?;
     Ok(apply_global_frame(pool, entities, &touched, step, formula))
 }
 
@@ -72,8 +77,7 @@ pub fn try_encode_step_with_params(
         all_systems,
         event,
         step,
-        0,
-        Some(params),
+        StepEncodingOptions::with_override(0, params),
     )?;
     Ok(apply_global_frame(pool, entities, &touched, step, formula))
 }
@@ -182,6 +186,28 @@ mod tests {
         })
     }
 
+    fn nested_test_ctx<'a>(
+        pool: &'a SlotPool,
+        vctx: &'a VerifyContext,
+        entity: &'a IREntity,
+        params: &'a HashMap<String, SmtValue>,
+    ) -> nested::NestedOpCtx<'a> {
+        nested::NestedOpCtx {
+            pool,
+            vctx,
+            entities: std::slice::from_ref(entity),
+            all_systems: &[],
+            bound_var: "o",
+            bound_ent_name: "Order",
+            bound_entity_ir: entity,
+            bound_slot: 0,
+            step: 0,
+            base_params: params,
+            depth: 0,
+            outer_bindings: &[],
+        }
+    }
+
     #[test]
     fn contains_macro_actions_recurses_through_nested_blocks() {
         let actions = vec![IRAction::Choose {
@@ -253,13 +279,18 @@ mod tests {
             procs: vec![],
         };
 
-        let (system_name, entity_params, store_params) =
-            step_scope_metadata(std::slice::from_ref(&system), &system.actions[0]);
-        assert_eq!(system_name, "Shop");
-        assert_eq!(entity_params.get("order"), Some(&"Order".to_owned()));
-        assert_eq!(store_params.get("orders"), Some(&"Order".to_owned()));
-        assert!(event_param_is_entity("order", &entity_params));
-        assert!(!event_param_is_entity("limit", &entity_params));
+        let scope = step_scope_metadata(std::slice::from_ref(&system), &system.actions[0]);
+        assert_eq!(scope.owning_system_name, "Shop");
+        assert_eq!(
+            scope.entity_param_types.get("order"),
+            Some(&"Order".to_owned())
+        );
+        assert_eq!(
+            scope.store_param_types.get("orders"),
+            Some(&"Order".to_owned())
+        );
+        assert!(event_param_is_entity("order", &scope.entity_param_types));
+        assert!(!event_param_is_entity("limit", &scope.entity_param_types));
 
         let merged = merged_branch_params(
             &HashMap::from([("x".to_owned(), smt::int_val(1))]),
@@ -477,10 +508,7 @@ mod tests {
         let params = HashMap::from([("o.total".to_owned(), smt::int_val(1))]);
 
         let (expr_formulas, expr_touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested_test_ctx(&pool, &vctx, &entity, &params),
             &IRAction::ExprStmt {
                 expr: IRExpr::Lit {
                     ty: IRType::Bool,
@@ -488,24 +516,13 @@ mod tests {
                     span: None,
                 },
             },
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("expr nested op");
         assert_eq!(expr_formulas.len(), 1);
         assert!(expr_touched.is_empty());
 
         let (create_formulas, create_touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested_test_ctx(&pool, &vctx, &entity, &params),
             &IRAction::Create {
                 entity: "Order".to_owned(),
                 fields: vec![IRCreateField {
@@ -517,14 +534,6 @@ mod tests {
                     },
                 }],
             },
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("create nested op");
         assert!(!create_formulas.is_empty());
@@ -558,46 +567,22 @@ mod tests {
         };
 
         for op in [choose, forall] {
-            let (formulas, touched) = nested::try_encode_nested_op(
-                &pool,
-                &vctx,
-                std::slice::from_ref(&entity),
-                &[],
-                &op,
-                "o",
-                "Order",
-                &entity,
-                0,
-                0,
-                &params,
-                0,
-                &[],
-            )
-            .expect("nested block op");
+            let (formulas, touched) =
+                nested::try_encode_nested_op(nested_test_ctx(&pool, &vctx, &entity, &params), &op)
+                    .expect("nested block op");
             assert!(!formulas.is_empty());
             assert!(touched.contains(&("Order".to_owned(), 0)));
             assert!(touched.contains(&("Order".to_owned(), 1)));
         }
 
         let err = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested_test_ctx(&pool, &vctx, &entity, &params),
             &IRAction::LetCrossCall {
                 name: "x".to_owned(),
                 system: "Missing".to_owned(),
                 command: "noop".to_owned(),
                 args: vec![],
             },
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect_err("let crosscall nested op is unsupported");
         assert!(err.contains("not yet supported"));
@@ -621,19 +606,8 @@ mod tests {
             refs: vec![],
         };
         let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested_test_ctx(&pool, &vctx, &entity, &params),
             &direct_apply,
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("direct bound apply");
         assert!(touched.contains(&("Order".to_owned(), 0)));
@@ -646,19 +620,12 @@ mod tests {
             refs: vec![],
         };
         let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested::NestedOpCtx {
+                bound_var: "inner",
+                outer_bindings: &[("outer", "Order", &entity, 1)],
+                ..nested_test_ctx(&pool, &vctx, &entity, &params)
+            },
             &outer_apply,
-            "inner",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[("outer", "Order", &entity, 1)],
         )
         .expect("outer bound apply");
         assert!(touched.contains(&("Order".to_owned(), 1)));
@@ -671,19 +638,8 @@ mod tests {
             refs: vec![],
         };
         let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
+            nested_test_ctx(&pool, &vctx, &entity, &params),
             &fallback_apply,
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("fallback entity apply");
         assert!(touched.contains(&("Order".to_owned(), 0)));
@@ -733,19 +689,11 @@ mod tests {
             args: vec![int_lit(10)],
         };
         let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            std::slice::from_ref(&relay),
+            nested::NestedOpCtx {
+                all_systems: std::slice::from_ref(&relay),
+                ..nested_test_ctx(&pool, &vctx, &entity, &params)
+            },
             &cross_call,
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("cross call");
         assert!(touched.contains(&("Order".to_owned(), 0)));
@@ -768,22 +716,9 @@ mod tests {
             command: "noop".to_owned(),
             args: vec![],
         };
-        let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            &[],
-            &missing,
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
-        )
-        .expect("missing cross-call target is ignored by encoder");
+        let (formulas, touched) =
+            nested::try_encode_nested_op(nested_test_ctx(&pool, &vctx, &entity, &params), &missing)
+                .expect("missing cross-call target is ignored by encoder");
         assert!(formulas.is_empty());
         assert!(touched.is_empty());
 
@@ -821,19 +756,11 @@ mod tests {
             args: vec![],
         };
         let (formulas, touched) = nested::try_encode_nested_op(
-            &pool,
-            &vctx,
-            std::slice::from_ref(&entity),
-            std::slice::from_ref(&relay),
+            nested::NestedOpCtx {
+                all_systems: std::slice::from_ref(&relay),
+                ..nested_test_ctx(&pool, &vctx, &entity, &params)
+            },
             &mismatched,
-            "o",
-            "Order",
-            &entity,
-            0,
-            0,
-            &params,
-            0,
-            &[],
         )
         .expect("arity mismatch creates false branch");
         assert!(touched.is_empty());
@@ -964,8 +891,7 @@ mod tests {
             std::slice::from_ref(&system),
             &system.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect("forall sequential apply step");
 
@@ -1056,8 +982,7 @@ mod tests {
             &systems,
             &relay.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect("macro step");
         let solver = AbideSolver::new();
@@ -1213,8 +1138,7 @@ mod tests {
             &systems,
             &relay.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect_err("nested macro choose should fail");
         assert!(err.contains("not yet supported inside choose/for blocks"));
@@ -1252,8 +1176,7 @@ mod tests {
             std::slice::from_ref(&system),
             &system.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect_err("unresolved apply should return an encoder error");
         assert!(err.contains("Apply target resolution failed"));
@@ -1324,8 +1247,7 @@ mod tests {
             &systems,
             &relay.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect("macro match step");
         let solver = AbideSolver::new();
@@ -1377,8 +1299,7 @@ mod tests {
             &systems,
             &relay.actions[0],
             0,
-            0,
-            None,
+            StepEncodingOptions::root(),
         )
         .expect_err("binding without return should fail");
         assert!(err.contains("return a value"));

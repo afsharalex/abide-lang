@@ -1,3 +1,17 @@
+//! Cross-crate diagnostic vocabulary.
+//!
+//! This module defines two parallel representations:
+//!
+//! - The [`Diagnostic`] struct — a serializable, format-agnostic record
+//!   that flows through the compiler and out of `verify`/`emit-ir`/`qa`
+//!   in JSON form for external tools (notably Invaria).
+//! - The [`LexError`] / [`ParseError`] enums — `miette`-aware errors
+//!   carried alongside ownership of their source string for direct
+//!   terminal rendering.
+//!
+//! [`Diagnostic`] is the canonical surface; both error enums convert to
+//! it via `to_diagnostic`.
+
 #![allow(unused_assignments)]
 
 use crate::span::Span;
@@ -5,26 +19,43 @@ use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Top-level error enum carried out of the lexer and parser entry points.
+///
+/// The variants are flattened into [`Diagnostic`] for serialization; this
+/// enum exists so `?`-propagation through `miette`-rendered code paths
+/// preserves source-context labels.
 #[derive(Error, MietteDiagnostic, Debug)]
 pub enum AbideError {
+    /// A lexer error — see [`LexError`].
     #[error(transparent)]
     #[diagnostic(transparent)]
     Lex(#[from] LexError),
 
+    /// A parser error — see [`ParseError`].
     #[error(transparent)]
     #[diagnostic(transparent)]
     Parse(#[from] ParseError),
 }
 
+/// Severity classification for diagnostics emitted by the compiler.
+///
+/// Both `Info` and `Hint` map to `miette::Severity::Advice`; the
+/// distinction is preserved here for downstream consumers (LSP, JSON
+/// emit) that want to render hints differently from informational notes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticSeverity {
+    /// Hard failure — compilation cannot proceed past this point.
     Error,
+    /// Non-fatal: code is suspicious but accepted.
     Warning,
+    /// Informational note attached to other output.
     Info,
+    /// Suggestion the user may want to apply.
     Hint,
 }
 
 impl DiagnosticSeverity {
+    /// Returns `true` if this severity is [`Self::Error`].
     #[must_use]
     pub fn is_error(self) -> bool {
         matches!(self, Self::Error)
@@ -42,25 +73,52 @@ impl From<DiagnosticSeverity> for miette::Severity {
     }
 }
 
+/// A secondary location attached to a primary [`Diagnostic`].
+///
+/// Related notes are used to point at a second site that helps explain
+/// the primary error — for example, the original definition when
+/// reporting a redefinition, or the call site when reporting a type
+/// mismatch at a function parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelatedDiagnostic {
+    /// Short message describing this related location.
     pub message: String,
+    /// Optional source span for the related location.
     pub span: Option<Span>,
+    /// Optional file path. When rendering via `miette`, related spans
+    /// from other files are dropped from the label set (a single
+    /// rendered diagnostic only carries labels into one source file).
     pub file: Option<String>,
 }
 
+/// A single compiler diagnostic — error, warning, info, or hint.
+///
+/// `Diagnostic` is the serializable, transport-friendly form. It is the
+/// type emitted by `verify --format json` and consumed by Invaria and
+/// the LSP. Builder methods (`with_*`, `in_file`) consume `self` for
+/// chained construction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
+    /// Severity classification.
     pub severity: DiagnosticSeverity,
+    /// Stable diagnostic code (`abide::lex::unexpected`, etc.), used for
+    /// suppression and external indexing.
     pub code: Option<String>,
+    /// Primary user-facing message.
     pub message: String,
+    /// Span pointing at the offending location in `file`.
     pub span: Option<Span>,
+    /// File path the diagnostic was raised against.
     pub file: Option<String>,
+    /// Optional `help:` line suggesting a fix.
     pub help: Option<String>,
+    /// Secondary annotations — see [`RelatedDiagnostic`].
     pub related: Vec<RelatedDiagnostic>,
 }
 
 impl Diagnostic {
+    /// Constructs a fresh error diagnostic with the given message and no
+    /// span, code, help, or related notes set.
     #[must_use]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
@@ -74,6 +132,7 @@ impl Diagnostic {
         }
     }
 
+    /// Constructs a fresh warning diagnostic with the given message.
     #[must_use]
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
@@ -87,30 +146,37 @@ impl Diagnostic {
         }
     }
 
+    /// Attaches a stable diagnostic code (e.g. `abide::parse::expected`).
     #[must_use]
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
     }
 
+    /// Attaches the primary source span.
     #[must_use]
     pub fn with_span(mut self, span: Span) -> Self {
         self.span = Some(span);
         self
     }
 
+    /// Records the file path this diagnostic targets.
     #[must_use]
     pub fn in_file(mut self, file: impl Into<String>) -> Self {
         self.file = Some(file.into());
         self
     }
 
+    /// Attaches a `help:` line suggesting how the user can resolve the
+    /// issue.
     #[must_use]
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
         self
     }
 
+    /// Appends a secondary annotation pointing at another site involved
+    /// in the diagnostic. See [`RelatedDiagnostic`].
     #[must_use]
     pub fn with_related(
         mut self,
@@ -126,6 +192,7 @@ impl Diagnostic {
         self
     }
 
+    /// Returns `true` if this diagnostic is at error severity.
     #[must_use]
     pub fn is_error(&self) -> bool {
         self.severity.is_error()
@@ -150,6 +217,11 @@ impl std::fmt::Display for Diagnostic {
 
 impl std::error::Error for Diagnostic {}
 
+// Manually implementing `miette::Diagnostic` (rather than deriving)
+// lets us synthesize multiple labels at render time from
+// `self.span` plus each `related` entry, and drop cross-file
+// related spans that would otherwise produce labels into a source
+// file `miette` isn't rendering.
 impl MietteDiagnostic for Diagnostic {
     fn severity(&self) -> Option<miette::Severity> {
         Some(self.severity.into())
@@ -191,21 +263,32 @@ impl MietteDiagnostic for Diagnostic {
     }
 }
 
+/// Collector for diagnostics produced during a single compilation
+/// session.
+///
+/// The sink preserves insertion order until it is drained via
+/// [`Self::into_sorted_deduped`], which is the canonical way to emit
+/// stable, reader-friendly output: diagnostics are sorted by
+/// (file, span, severity, code, message) and exact duplicates are
+/// collapsed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticSink {
     diagnostics: Vec<Diagnostic>,
 }
 
 impl DiagnosticSink {
+    /// Constructs an empty sink.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Appends a single diagnostic.
     pub fn push(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
     }
 
+    /// Appends every diagnostic from `diagnostics` in order.
     pub fn extend<I>(&mut self, diagnostics: I)
     where
         I: IntoIterator<Item = Diagnostic>,
@@ -213,11 +296,19 @@ impl DiagnosticSink {
         self.diagnostics.extend(diagnostics);
     }
 
+    /// Returns `true` if any collected diagnostic has error severity.
+    /// Used as the compilation-failure signal at pipeline boundaries.
     #[must_use]
     pub fn has_errors(&self) -> bool {
         self.diagnostics.iter().any(Diagnostic::is_error)
     }
 
+    /// Drains the sink and returns its diagnostics sorted into a stable
+    /// reporting order with exact duplicates removed.
+    ///
+    /// The sort key is `(file, span.start, span.end, severity_rank,
+    /// code, message)` so output is deterministic across runs — important
+    /// for snapshot tests and for tools that diff diagnostic output.
     #[must_use]
     pub fn into_sorted_deduped(mut self) -> Vec<Diagnostic> {
         self.diagnostics.sort_by(|a, b| {
@@ -252,17 +343,27 @@ fn severity_rank(severity: DiagnosticSeverity) -> u8 {
     }
 }
 
+/// A lexer error carrying its own copy of the source string so
+/// `miette` can render the offending character in context.
+///
+/// Prefer [`Self::to_diagnostic`] when forwarding the error into the
+/// regular [`DiagnosticSink`] pipeline.
 #[derive(Error, MietteDiagnostic, Debug, Clone)]
 #[error("unexpected character")]
 #[diagnostic(code(abide::lex::unexpected))]
 pub struct LexError {
+    /// Owned source text used by `miette` for label rendering.
     #[source_code]
     pub src: String,
+    /// Span pointing at the offending character.
     #[label("here")]
     pub span: miette::SourceSpan,
 }
 
 impl LexError {
+    /// Constructs a `LexError` from a borrowed source string and a span.
+    /// The source is cloned because `miette` needs to hold it past the
+    /// lexer's lifetime.
     pub fn new(src: &str, span: Span) -> Self {
         Self {
             src: src.to_owned(),
@@ -270,6 +371,9 @@ impl LexError {
         }
     }
 
+    /// Converts this lexer error into the cross-crate [`Diagnostic`]
+    /// representation (sheds the source text — the diagnostic carries
+    /// only the span and code).
     #[must_use]
     pub fn to_diagnostic(&self) -> Diagnostic {
         Diagnostic::error("unexpected character")
@@ -278,38 +382,57 @@ impl LexError {
     }
 }
 
+/// Parser-stage errors, classified by shape.
+///
+/// `Expected` is by far the most common — it is produced wherever the
+/// hand-rolled parser fails a token-class match. `UnexpectedEof` is
+/// reserved for the special case where lookahead runs off the input.
+/// `General` is the escape hatch for ad hoc parse errors with custom
+/// messages.
 #[derive(Error, MietteDiagnostic, Debug, Clone)]
 pub enum ParseError {
+    /// A token-class mismatch — the parser wanted one thing, saw another.
     #[error("expected {expected}, found {found}")]
     #[diagnostic(code(abide::parse::expected))]
     Expected {
+        /// Description of what the parser was looking for.
         expected: String,
+        /// Description of what it found instead (token name or literal).
         found: String,
+        /// Span of the offending token.
         #[label("here")]
         span: miette::SourceSpan,
+        /// Optional inline suggestion (e.g. "did you mean `=`?").
         #[help]
         help: Option<String>,
     },
 
+    /// The parser ran off the end of input while still expecting tokens.
     #[error("unexpected end of input")]
     #[diagnostic(code(abide::parse::eof))]
     UnexpectedEof {
+        /// Span pointing at the position past the end of input.
         #[label("here")]
         span: miette::SourceSpan,
     },
 
+    /// Catch-all for ad hoc parser errors that don't fit `Expected`.
     #[error("{msg}")]
     #[diagnostic(code(abide::parse::error))]
     General {
+        /// Free-form error message.
         msg: String,
+        /// Span the message points at.
         #[label("{msg}")]
         span: miette::SourceSpan,
+        /// Optional `help:` line.
         #[help]
         help: Option<String>,
     },
 }
 
 impl ParseError {
+    /// Constructs an [`Self::Expected`] error without a help hint.
     pub fn expected(expected: &str, found: &str, span: Span) -> Self {
         Self::Expected {
             expected: expected.to_owned(),
@@ -319,6 +442,7 @@ impl ParseError {
         }
     }
 
+    /// Constructs an [`Self::Expected`] error with an inline help hint.
     pub fn expected_with_help(expected: &str, found: &str, span: Span, help: &str) -> Self {
         Self::Expected {
             expected: expected.to_owned(),
@@ -328,10 +452,12 @@ impl ParseError {
         }
     }
 
+    /// Constructs an [`Self::UnexpectedEof`] error.
     pub fn eof(span: Span) -> Self {
         Self::UnexpectedEof { span: span.into() }
     }
 
+    /// Constructs a [`Self::General`] error with no help hint.
     pub fn general(msg: &str, span: Span) -> Self {
         Self::General {
             msg: msg.to_owned(),
@@ -340,6 +466,7 @@ impl ParseError {
         }
     }
 
+    /// Constructs a [`Self::General`] error with an inline help hint.
     pub fn general_with_help(msg: &str, span: Span, help: &str) -> Self {
         Self::General {
             msg: msg.to_owned(),
@@ -348,6 +475,9 @@ impl ParseError {
         }
     }
 
+    /// Converts this parser error into the cross-crate [`Diagnostic`]
+    /// representation, preserving the error code, message, span, and
+    /// any help hint.
     #[must_use]
     pub fn to_diagnostic(&self) -> Diagnostic {
         match self {

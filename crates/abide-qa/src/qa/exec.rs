@@ -25,6 +25,10 @@ use super::graph;
 use super::model::{FlowModel, OwnerKind, StateGraph, TransitionEdge};
 
 /// Result of executing a QA query.
+///
+/// Variants are shaped per result-kind rather than wrapping a single
+/// dynamic value so the formatter can render each cleanly without
+/// runtime type checks.
 #[derive(Debug, Clone)]
 pub enum QueryResult {
     /// Boolean result (reachable, cycles, deadlock, etc.)
@@ -57,13 +61,22 @@ pub struct TransitionInfo {
 }
 
 /// The verb that produced this result (for formatting).
+///
+/// The verb governs how the formatter renders output: `Ask` prints
+/// the value, `Explain` adds reasoning trace, `Assert` adds a
+/// pass/fail status line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
+    /// `ask` — print result.
     Ask,
+    /// `explain` — include reasoning trace.
     Explain,
+    /// `assert` — fail (CI gate) when result is false.
     Assert,
 }
 
+/// One executed QA statement: which verb drove it, what the result
+/// was, and any verifier artifact produced as a side effect.
 #[derive(Debug, Clone)]
 pub struct StatementExecution {
     pub verb: Verb,
@@ -135,18 +148,15 @@ fn execute_query_statement(
 }
 
 /// Execute a single query against the `FlowModel`.
-#[allow(clippy::too_many_lines)]
 pub fn execute_query(model: &FlowModel, query: &Query) -> QueryResult {
     execute_query_with_env(model, None, query)
 }
 
 /// Execute a single query with optional semantic evaluation context.
-#[allow(clippy::too_many_lines)]
 pub fn execute_query_with_env(model: &FlowModel, env: Option<&Env>, query: &Query) -> QueryResult {
     execute_query_detailed_with_env(model, env, query).0
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_query_detailed_with_env(
     model: &FlowModel,
     env: Option<&Env>,
@@ -175,229 +185,52 @@ fn execute_query_detailed_with_env(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_query_core_with_env(model: &FlowModel, env: Option<&Env>, query: &Query) -> QueryResult {
     match query {
         Query::Reachable {
             entity,
             field,
             state,
-        } => match lookup_graph(model, entity, field) {
-            Some(sg) => {
-                if let Some(ref init) = sg.initial {
-                    QueryResult::Bool(graph::is_reachable(sg, init, state))
-                } else {
-                    QueryResult::Error(format!("no initial state for {entity}.{field}"))
-                }
-            }
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
+        } => execute_reachable_query(model, entity, field, state),
         Query::Path {
             entity,
             field,
             from,
             to,
-        } => match lookup_graph(model, entity, field) {
-            Some(sg) => match graph::find_path(sg, from, to) {
-                Some(path) => QueryResult::Path(path),
-                None => QueryResult::Path(vec![]),
-            },
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
-        Query::Terminal { entity, field } => match lookup_graph(model, entity, field) {
-            Some(sg) => QueryResult::StateSet(graph::terminal_states(sg)),
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
-        Query::Initial { entity, field } => match lookup_graph(model, entity, field) {
-            Some(sg) => QueryResult::StateSet(graph::initial_states(sg)),
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
-        Query::Cycles { entity, field } => match lookup_graph(model, entity, field) {
-            Some(sg) => QueryResult::Bool(graph::has_cycles(sg)),
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
+        } => execute_path_query(model, entity, field, from, to),
+        Query::Terminal { entity, field } => execute_terminal_query(model, entity, field),
+        Query::Initial { entity, field } => execute_initial_query(model, entity, field),
+        Query::Cycles { entity, field } => execute_cycles_query(model, entity, field),
         Query::Transitions {
             entity,
             field,
             state,
-        } => match lookup_graph(model, entity, field) {
-            Some(sg) => {
-                let edges = graph::transitions_from(sg, state);
-                QueryResult::Transitions(edges.into_iter().map(edge_to_info).collect())
-            }
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
+        } => execute_transitions_query(model, entity, field, state),
         Query::Updates {
             entity,
             field,
             from,
             to,
-        } => match lookup_graph(model, entity, field) {
-            Some(sg) => {
-                let matching: Vec<TransitionInfo> = sg
-                    .transitions
-                    .iter()
-                    .filter(|e| e.from.as_deref() == Some(from.as_str()) && e.to == *to)
-                    .map(edge_to_info)
-                    .collect();
-                QueryResult::Transitions(matching)
-            }
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
+        } => execute_updates_query(model, entity, field, from, to),
 
         Query::Entities => QueryResult::NameList(model.entity_names.clone()),
         Query::Systems => QueryResult::NameList(model.systems.keys().cloned().collect()),
         Query::Types => QueryResult::NameList(model.type_names.clone()),
-        Query::Invariants { entity } => {
-            // Return all action contracts (guards) for the entity as invariants.
-            // These are the requires clauses that constrain entity state transitions.
-            let mut invariants: Vec<String> = Vec::new();
-            for ((ent, action), contract) in &model.action_contracts {
-                if ent == entity && contract.guard != "true" {
-                    invariants.push(format!("{action}: requires {}", contract.guard));
-                }
-            }
-            if invariants.is_empty() {
-                QueryResult::NameList(vec![format!("no action guards found for '{entity}'")])
-            } else {
-                invariants.sort();
-                QueryResult::NameList(invariants)
-            }
+        Query::Invariants { entity } => execute_invariants_query(model, entity),
+        Query::Contracts { entity, action } => execute_contracts_query(model, entity, action),
+        Query::Events { entity, field } => execute_events_query(model, entity, field),
+        Query::MatchCoverage { entity, field } => {
+            execute_match_coverage_query(model, entity, field)
         }
-        Query::Contracts { entity, action } => {
-            match model
-                .action_contracts
-                .get(&(entity.clone(), action.clone()))
-            {
-                Some(contract) => {
-                    let mut parts = Vec::new();
-                    parts.push(format!("requires {}", contract.guard));
-                    if let Some(ref post) = contract.postcondition {
-                        parts.push(format!("ensures {post}"));
-                    }
-                    for update in &contract.updates {
-                        parts.push(format!("updates {update}"));
-                    }
-                    QueryResult::NameList(parts)
-                }
-                None => {
-                    QueryResult::Error(format!("no action '{action}' found on entity '{entity}'"))
-                }
-            }
-        }
-        Query::Events { entity, field } => {
-            let Some(sg) = lookup_graph(model, entity, field) else {
-                return QueryResult::Error(graph_lookup_error(model, entity, field));
-            };
-
-            let mut event_names = Vec::new();
-            match sg.owner_kind {
-                OwnerKind::Entity => {
-                    for sys in model.systems.values() {
-                        for ev in &sys.events {
-                            for apply in &ev.applies {
-                                if sg.transitions.iter().any(|t| t.action == apply.action) {
-                                    event_names.push(format!("{}::{}", sys.name, ev.name));
-                                }
-                            }
-                        }
-                    }
-                }
-                OwnerKind::System => {
-                    if let Some(sys) = model.systems.get(entity) {
-                        for ev in &sys.events {
-                            if sg.transitions.iter().any(|t| t.action == ev.name) {
-                                event_names.push(format!("{}::{}", sys.name, ev.name));
-                            }
-                        }
-                    }
-                }
-            }
-            QueryResult::NameList(event_names)
-        }
-        Query::MatchCoverage { entity, field } => match lookup_graph(model, entity, field) {
-            Some(sg) => {
-                let terminals = graph::terminal_states(sg);
-                if terminals.is_empty() {
-                    QueryResult::Bool(true)
-                } else {
-                    QueryResult::StateSet(terminals)
-                }
-            }
-            None => QueryResult::Error(graph_lookup_error(model, entity, field)),
-        },
-        Query::Fsms { entity } => {
-            // list every fsm field declared on
-            // this owner. Reads from the IRFsm-derived metadata
-            // populated in extract::extract.
-            let mut fields: Vec<String> = model
-                .fsm_decls
-                .iter()
-                .filter_map(|((e, f), _)| if e == entity { Some(f.clone()) } else { None })
-                .collect();
-            if fields.is_empty() {
-                QueryResult::NameList(vec![format!("no fsm declarations on '{entity}'")])
-            } else {
-                fields.sort();
-                QueryResult::NameList(fields)
-            }
-        }
+        Query::Fsms { entity } => execute_fsms_query(model, entity),
         Query::FsmTransitions { entity, field } => {
-            match model.fsm_decls.get(&(entity.clone(), field.clone())) {
-                Some(info) => {
-                    let edges: Vec<TransitionInfo> = info
-                        .transitions
-                        .iter()
-                        .map(|(from, to)| TransitionInfo {
-                            action: format!("fsm {}::{}", info.owner, info.field),
-                            from: from.clone(),
-                            to: to.clone(),
-                        })
-                        .collect();
-                    QueryResult::Transitions(edges)
-                }
-                None => QueryResult::Error(format!("no fsm declaration on `{entity}::{field}`")),
-            }
+            execute_fsm_transitions_query(model, entity, field)
         }
         Query::FsmTerminalStates { entity, field } => {
-            match model.fsm_decls.get(&(entity.clone(), field.clone())) {
-                Some(info) => QueryResult::StateSet(info.terminal_states.clone()),
-                None => QueryResult::Error(format!("no fsm declaration on `{entity}::{field}`")),
-            }
+            execute_fsm_terminal_states_query(model, entity, field)
         }
-        Query::CrossCalls { system } => match model.systems.get(system) {
-            Some(sys) => {
-                let calls: Vec<String> = sys
-                    .events
-                    .iter()
-                    .flat_map(|ev| ev.cross_calls.iter())
-                    .map(|cc| format!("{}::{}", cc.target_system, cc.target_event))
-                    .collect();
-                QueryResult::NameList(calls)
-            }
-            None => QueryResult::Error(format!("no system named '{system}'")),
-        },
-        Query::Deadlock { system } => match model.systems.get(system) {
-            Some(sys) => {
-                let mut has_deadlock = false;
-                for ((owner, _), sg) in &model.state_graphs {
-                    let relevant = owner == system
-                        || sys.entities.iter().any(|entity_name| entity_name == owner);
-                    if relevant {
-                        let terminals = graph::terminal_states(sg);
-                        if let Some(ref init) = sg.initial {
-                            for term in &terminals {
-                                if graph::is_reachable(sg, init, term) {
-                                    has_deadlock = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                QueryResult::Bool(has_deadlock)
-            }
-            None => QueryResult::Error(format!("no system named '{system}'")),
-        },
+        Query::CrossCalls { system } => execute_cross_calls_query(model, system),
+        Query::Deadlock { system } => execute_deadlock_query(model, system),
 
         Query::Not(inner) => match execute_query_with_env(model, env, inner) {
             QueryResult::Bool(b) => QueryResult::Bool(!b),
@@ -413,6 +246,275 @@ fn execute_query_core_with_env(model: &FlowModel, env: Option<&Env>, query: &Que
             select,
         } => execute_block(model, bindings, predicates, select),
     }
+}
+
+fn execute_reachable_query(
+    model: &FlowModel,
+    entity: &str,
+    field: &str,
+    state: &str,
+) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => match &sg.initial {
+            Some(init) => QueryResult::Bool(graph::is_reachable(sg, init, state)),
+            None => QueryResult::Error(format!("no initial state for {entity}.{field}")),
+        },
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_path_query(
+    model: &FlowModel,
+    entity: &str,
+    field: &str,
+    from: &str,
+    to: &str,
+) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => QueryResult::Path(graph::find_path(sg, from, to).unwrap_or_default()),
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_terminal_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => QueryResult::StateSet(graph::terminal_states(sg)),
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_initial_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => QueryResult::StateSet(graph::initial_states(sg)),
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_cycles_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => QueryResult::Bool(graph::has_cycles(sg)),
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_transitions_query(
+    model: &FlowModel,
+    entity: &str,
+    field: &str,
+    state: &str,
+) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => QueryResult::Transitions(
+            graph::transitions_from(sg, state)
+                .into_iter()
+                .map(edge_to_info)
+                .collect(),
+        ),
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_updates_query(
+    model: &FlowModel,
+    entity: &str,
+    field: &str,
+    from: &str,
+    to: &str,
+) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => {
+            let matching = sg
+                .transitions
+                .iter()
+                .filter(|edge| edge.from.as_deref() == Some(from) && edge.to == to)
+                .map(edge_to_info)
+                .collect();
+            QueryResult::Transitions(matching)
+        }
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_invariants_query(model: &FlowModel, entity: &str) -> QueryResult {
+    let mut invariants: Vec<String> = model
+        .action_contracts
+        .iter()
+        .filter_map(|((ent, action), contract)| {
+            if ent == entity && contract.guard != "true" {
+                Some(format!("{action}: requires {}", contract.guard))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if invariants.is_empty() {
+        QueryResult::NameList(vec![format!("no action guards found for '{entity}'")])
+    } else {
+        invariants.sort();
+        QueryResult::NameList(invariants)
+    }
+}
+
+fn execute_contracts_query(model: &FlowModel, entity: &str, action: &str) -> QueryResult {
+    let Some(contract) = model
+        .action_contracts
+        .get(&(entity.to_owned(), action.to_owned()))
+    else {
+        return QueryResult::Error(format!("no action '{action}' found on entity '{entity}'"));
+    };
+
+    let mut parts = vec![format!("requires {}", contract.guard)];
+    if let Some(post) = &contract.postcondition {
+        parts.push(format!("ensures {post}"));
+    }
+    parts.extend(
+        contract
+            .updates
+            .iter()
+            .map(|update| format!("updates {update}")),
+    );
+    QueryResult::NameList(parts)
+}
+
+fn execute_events_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    let Some(sg) = lookup_graph(model, entity, field) else {
+        return QueryResult::Error(graph_lookup_error(model, entity, field));
+    };
+
+    let event_names = match sg.owner_kind {
+        OwnerKind::Entity => entity_event_names(model, sg),
+        OwnerKind::System => system_event_names(model, entity, sg),
+    };
+    QueryResult::NameList(event_names)
+}
+
+fn entity_event_names(model: &FlowModel, sg: &StateGraph) -> Vec<String> {
+    model
+        .systems
+        .values()
+        .flat_map(|sys| {
+            sys.events
+                .iter()
+                .filter(|event| {
+                    event.applies.iter().any(|apply| {
+                        sg.transitions
+                            .iter()
+                            .any(|transition| transition.action == apply.action)
+                    })
+                })
+                .map(|event| format!("{}::{}", sys.name, event.name))
+        })
+        .collect()
+}
+
+fn system_event_names(model: &FlowModel, system: &str, sg: &StateGraph) -> Vec<String> {
+    let Some(sys) = model.systems.get(system) else {
+        return Vec::new();
+    };
+
+    sys.events
+        .iter()
+        .filter(|event| {
+            sg.transitions
+                .iter()
+                .any(|transition| transition.action == event.name)
+        })
+        .map(|event| format!("{}::{}", sys.name, event.name))
+        .collect()
+}
+
+fn execute_match_coverage_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match lookup_graph(model, entity, field) {
+        Some(sg) => {
+            let terminals = graph::terminal_states(sg);
+            if terminals.is_empty() {
+                QueryResult::Bool(true)
+            } else {
+                QueryResult::StateSet(terminals)
+            }
+        }
+        None => QueryResult::Error(graph_lookup_error(model, entity, field)),
+    }
+}
+
+fn execute_fsms_query(model: &FlowModel, entity: &str) -> QueryResult {
+    let mut fields: Vec<String> = model
+        .fsm_decls
+        .iter()
+        .filter(|((owner, _), _)| owner == entity)
+        .map(|((_, field), _)| field.clone())
+        .collect();
+
+    if fields.is_empty() {
+        QueryResult::NameList(vec![format!("no fsm declarations on '{entity}'")])
+    } else {
+        fields.sort();
+        QueryResult::NameList(fields)
+    }
+}
+
+fn execute_fsm_transitions_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match model.fsm_decls.get(&(entity.to_owned(), field.to_owned())) {
+        Some(info) => {
+            let edges = info
+                .transitions
+                .iter()
+                .map(|(from, to)| TransitionInfo {
+                    action: format!("fsm {}::{}", info.owner, info.field),
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .collect();
+            QueryResult::Transitions(edges)
+        }
+        None => QueryResult::Error(format!("no fsm declaration on `{entity}::{field}`")),
+    }
+}
+
+fn execute_fsm_terminal_states_query(model: &FlowModel, entity: &str, field: &str) -> QueryResult {
+    match model.fsm_decls.get(&(entity.to_owned(), field.to_owned())) {
+        Some(info) => QueryResult::StateSet(info.terminal_states.clone()),
+        None => QueryResult::Error(format!("no fsm declaration on `{entity}::{field}`")),
+    }
+}
+
+fn execute_cross_calls_query(model: &FlowModel, system: &str) -> QueryResult {
+    match model.systems.get(system) {
+        Some(sys) => QueryResult::NameList(
+            sys.events
+                .iter()
+                .flat_map(|event| event.cross_calls.iter())
+                .map(|call| format!("{}::{}", call.target_system, call.target_event))
+                .collect(),
+        ),
+        None => QueryResult::Error(format!("no system named '{system}'")),
+    }
+}
+
+fn execute_deadlock_query(model: &FlowModel, system: &str) -> QueryResult {
+    let Some(sys) = model.systems.get(system) else {
+        return QueryResult::Error(format!("no system named '{system}'"));
+    };
+
+    let has_deadlock = model
+        .state_graphs
+        .iter()
+        .filter(|((owner, _), _)| {
+            owner == system || sys.entities.iter().any(|entity| entity == owner)
+        })
+        .any(|(_, sg)| graph_has_reachable_terminal(sg));
+
+    QueryResult::Bool(has_deadlock)
+}
+
+fn graph_has_reachable_terminal(sg: &StateGraph) -> bool {
+    let Some(init) = &sg.initial else {
+        return false;
+    };
+    graph::terminal_states(sg)
+        .iter()
+        .any(|terminal| graph::is_reachable(sg, init, terminal))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

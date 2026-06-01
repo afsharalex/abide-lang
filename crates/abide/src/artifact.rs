@@ -1,3 +1,10 @@
+//! Trace artifact bundling for serialized verification output.
+//!
+//! `abide verify --emit-trace` produces a [`TraceArtifactBundle`] that
+//! ties verification results (verify/scene/theorem) to the source files
+//! they reference plus enough replay metadata for external consumers
+//! (Invaria, oracle harnesses) to re-execute or audit the artifact.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +16,8 @@ use crate::simulate::SimulationResult;
 use crate::verify::{DeadlockEventDiag, VerificationResult};
 use crate::witness::{op, rel, EvidenceEnvelope, EvidencePayload, WitnessPayload, WitnessValue};
 
+/// Top-level trace artifact serialized to JSON. `kind`/`version` form
+/// the schema discriminator that external consumers key off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceArtifactBundle {
     kind: String,

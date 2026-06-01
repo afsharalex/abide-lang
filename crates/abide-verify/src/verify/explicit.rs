@@ -1,6 +1,6 @@
 //! Narrow explicit-state backend for finite transition fragments.
 
-#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+#![allow(clippy::type_complexity)]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
@@ -18,6 +18,7 @@ use crate::ir::types::{
 
 use super::context::{EntityInfo, VerifyContext};
 use super::defenv;
+use super::scope::VerifyStoreRange;
 use super::transition;
 use super::{
     build_assumptions_for_system_scope, verification_timeout_hint, CounterexampleReplayReport,
@@ -27,7 +28,10 @@ use super::{
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ExplicitValue {
     Int(i64),
+    IntDomain(ExplicitIntDomain),
+    Real(String),
     Bool(bool),
+    Str(String),
     Enum {
         enum_name: String,
         variant: String,
@@ -35,6 +39,19 @@ enum ExplicitValue {
     },
     Identity(String),
     SlotRef(op::EntitySlotRef),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ExplicitIntDomain {
+    lower: Option<ExplicitIntBound>,
+    upper: Option<ExplicitIntBound>,
+    representative: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ExplicitIntBound {
+    value: i64,
+    inclusive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -66,6 +83,8 @@ struct ExplicitProductState {
 struct ExplicitFieldRef {
     system: String,
     field: String,
+    ty: IRType,
+    initial_constraint: Option<IRExpr>,
 }
 
 #[derive(Clone)]
@@ -110,6 +129,8 @@ type ExplicitActionState = (
     Vec<op::Choice>,
 );
 
+const EXPLICIT_INITIAL_STATE_LIMIT: usize = 50_000;
+
 #[derive(Clone)]
 enum ExplicitEdge {
     Step {
@@ -129,6 +150,8 @@ struct ExplicitLivenessMonitor {
     slot_binding: Option<(String, ExplicitSlotBinding)>,
 }
 
+/// One store bound used in an explicit-state exploration: `entity_type`
+/// pooled under `name` with `slots` slots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplicitStateSpaceStoreBound {
     pub name: String,
@@ -136,6 +159,8 @@ pub struct ExplicitStateSpaceStoreBound {
     pub slots: usize,
 }
 
+/// One edge in an [`ExplicitStateSpace`] graph: from state index `from`
+/// to state index `to`, labeled with the firing command/action name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplicitStateSpaceTransition {
     pub from: usize,
@@ -143,6 +168,13 @@ pub struct ExplicitStateSpaceTransition {
     pub label: String,
 }
 
+/// Result of an explicit-state exploration: the full set of reachable
+/// states plus the directed transition graph between them.
+///
+/// `states[initial_state]` is the initial state. State indices are
+/// stable within one exploration and form the edge endpoints in
+/// `transitions`. Produced by [`explore_verify_state_space`] and
+/// consumed by QA's `explore` block and the state-graph queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplicitStateSpace {
     pub systems: Vec<String>,
@@ -166,10 +198,51 @@ struct ExplicitModel<'a> {
     safety_properties: Vec<IRExpr>,
     liveness_monitors: Vec<ExplicitLivenessMonitor>,
     extern_assume_exprs: Vec<IRExpr>,
+    initial_constraints: Vec<IRExpr>,
     stutter: bool,
     weak_fair: Vec<(String, String)>,
     strong_fair: Vec<(String, String)>,
     per_tuple_fair: Vec<(String, String)>,
+}
+
+struct CycleSearchCtx<'a> {
+    nodes: &'a [ExplicitProductState],
+    adjacency: &'a [Vec<(usize, ExplicitEdge)>],
+    scc: &'a HashSet<usize>,
+    start: usize,
+}
+
+struct ExplicitValidationCtx<'a, 'spec> {
+    current_system: &'a str,
+    system_fields: &'a HashMap<String, usize>,
+    entity_specs: &'a [ExplicitEntitySpec<'spec>],
+    steps: &'a [ExplicitStepRef<'spec>],
+    step_indices: &'a HashMap<(String, String), usize>,
+}
+
+struct ExplicitValidationScope<'a> {
+    system_field_types: &'a HashMap<String, IRType>,
+    value_locals: &'a HashSet<String>,
+    slot_locals: &'a HashMap<String, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ExplicitEvalCtx<'a, 'spec> {
+    state: &'a ExplicitState,
+    current_system: Option<&'a str>,
+    system_fields: &'a HashMap<String, usize>,
+    entity_specs: &'a [ExplicitEntitySpec<'spec>],
+    value_locals: &'a HashMap<String, ExplicitValue>,
+    slot_locals: &'a HashMap<String, ExplicitSlotBinding>,
+}
+
+#[derive(Clone, Copy)]
+struct ExplicitCrossCall<'a> {
+    system: &'a str,
+    command: &'a str,
+    refs: &'a [String],
+    args: &'a [IRExpr],
+    caller_system: Option<&'a str>,
 }
 
 fn qualified_system_field_name(system: &str, field: &str) -> String {
@@ -315,6 +388,8 @@ impl<'a> ExplicitModel<'a> {
                 system_fields.push(ExplicitFieldRef {
                     system: sys.name.clone(),
                     field: field.name.clone(),
+                    ty: field.ty.clone(),
+                    initial_constraint: field.initial_constraint.clone(),
                 });
                 system_field_indices
                     .insert(qualified_system_field_name(&sys.name, &field.name), idx);
@@ -382,16 +457,21 @@ impl<'a> ExplicitModel<'a> {
                 .map(|param| param.name.clone())
                 .collect::<HashSet<_>>();
             let step_field_types = field_types_with_params(&system_field_types, &step.step.params);
+            let validation = ExplicitValidationCtx {
+                current_system: &step.system,
+                system_fields: &system_field_indices,
+                entity_specs: &entity_specs,
+                steps: &steps,
+                step_indices: &step_indices,
+            };
             let final_locals = validate_actions(
                 &step.step.body,
-                &step.system,
-                &system_field_indices,
-                &step_field_types,
-                &entity_specs,
-                &steps,
-                &step_indices,
-                &param_locals,
-                &HashMap::new(),
+                &validation,
+                ExplicitValidationScope {
+                    system_field_types: &step_field_types,
+                    value_locals: &param_locals,
+                    slot_locals: &HashMap::new(),
+                },
                 &mut active_calls,
             )?;
             if let Some(return_expr) = &step.step.return_expr {
@@ -505,6 +585,20 @@ impl<'a> ExplicitModel<'a> {
                 return Ok(None);
             }
         }
+        let initial_constraints = system.initial_constraints().to_vec();
+        for expr in &initial_constraints {
+            if !supports_state_expr(
+                expr,
+                None,
+                &system_field_indices,
+                &system_field_types,
+                &entity_specs,
+                &HashSet::new(),
+                &HashMap::new(),
+            ) {
+                return Ok(None);
+            }
+        }
         for step in &steps {
             let value_locals: HashSet<String> = step
                 .step
@@ -524,17 +618,23 @@ impl<'a> ExplicitModel<'a> {
             ) {
                 return Ok(None);
             }
+            let validation = ExplicitValidationCtx {
+                current_system: &step.system,
+                system_fields: &system_field_indices,
+                entity_specs: &entity_specs,
+                steps: &steps,
+                step_indices: &step_indices,
+            };
+            let mut active_calls = HashSet::new();
             let final_locals = validate_actions(
                 &step.step.body,
-                &step.system,
-                &system_field_indices,
-                &step_field_types,
-                &entity_specs,
-                &steps,
-                &step_indices,
-                &value_locals,
-                &HashMap::new(),
-                &mut HashSet::new(),
+                &validation,
+                ExplicitValidationScope {
+                    system_field_types: &step_field_types,
+                    value_locals: &value_locals,
+                    slot_locals: &HashMap::new(),
+                },
+                &mut active_calls,
             )?;
             if let Some(return_expr) = &step.step.return_expr {
                 if !supports_state_expr(
@@ -551,17 +651,21 @@ impl<'a> ExplicitModel<'a> {
             }
         }
 
-        let mut active_slots: HashMap<(usize, usize), bool> = HashMap::new();
+        let mut active_slot_options = vec![HashSet::new()];
         for range in system.store_ranges().values() {
-            if range.max_active != range.slot_count {
-                return Ok(None);
-            }
             let Some(&entity_index) = entity_indices.get(&range.entity_type) else {
                 continue;
             };
-            for slot in range.start_slot..range.start_slot + range.min_active {
-                active_slots.insert((entity_index, slot), true);
+            let store_options = active_slot_combinations_for_store_range(entity_index, range)?;
+            let mut next_options = Vec::new();
+            for prefix in &active_slot_options {
+                for store_option in &store_options {
+                    let mut combined = prefix.clone();
+                    combined.extend(store_option.iter().copied());
+                    next_options.push(combined);
+                }
             }
+            active_slot_options = next_options;
         }
 
         let model = Self {
@@ -575,20 +679,32 @@ impl<'a> ExplicitModel<'a> {
             safety_properties,
             liveness_monitors,
             extern_assume_exprs,
+            initial_constraints,
             stutter: system.assumptions().stutter(),
             weak_fair: system.assumptions().weak_fair_event_keys().to_vec(),
             strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
             per_tuple_fair: system.assumptions().per_tuple_fair_event_keys().to_vec(),
         };
-        let initial_states =
-            enumerate_initial_states(&model.entity_specs, &active_slots, initial_system_values)?
-                .into_iter()
-                .filter(|state| {
-                    model
-                        .state_satisfies_extern_assumptions(state)
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>();
+        let initial_int_candidates = collect_initial_int_candidates(&model.initial_constraints);
+        let mut initial_states = Vec::new();
+        for active_slots in active_slot_options {
+            initial_states.extend(enumerate_initial_states(
+                &model.entity_specs,
+                &active_slots,
+                initial_system_values.clone(),
+                &initial_int_candidates,
+            )?);
+        }
+        initial_states.retain(|state| {
+            model
+                .state_satisfies_initial_constraints(state)
+                .unwrap_or(false)
+        });
+        initial_states.retain(|state| {
+            model
+                .state_satisfies_extern_assumptions(state)
+                .unwrap_or(false)
+        });
         if initial_states.is_empty() {
             return Ok(None);
         }
@@ -600,8 +716,30 @@ impl<'a> ExplicitModel<'a> {
         !self.liveness_monitors.is_empty()
     }
 
+    fn has_unbounded_int_state(&self) -> bool {
+        if self.steps.is_empty() {
+            return false;
+        }
+        self.system_fields.iter().any(|field| {
+            is_unbounded_explicit_int_field(&field.ty, field.initial_constraint.as_ref())
+        }) || self.entity_specs.iter().any(|spec| {
+            spec.fields.iter().any(|field| {
+                is_unbounded_explicit_int_field(&field.ty, field.initial_constraint.as_ref())
+            })
+        })
+    }
+
     fn state_satisfies_extern_assumptions(&self, state: &ExplicitState) -> Result<bool, String> {
         for expr in &self.extern_assume_exprs {
+            if !self.eval_bool(state, expr)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn state_satisfies_initial_constraints(&self, state: &ExplicitState) -> Result<bool, String> {
+        for expr in &self.initial_constraints {
             if !self.eval_bool(state, expr)? {
                 return Ok(false);
             }
@@ -1349,11 +1487,14 @@ impl<'a> ExplicitModel<'a> {
             let mut path_nodes = vec![*start];
             let mut path_edges = Vec::new();
             let mut in_path = HashSet::from([*start]);
-            if let Some(found) = self.search_cycle_from(
+            let search = CycleSearchCtx {
                 nodes,
                 adjacency,
                 scc,
-                *start,
+                start: *start,
+            };
+            if let Some(found) = self.search_cycle_from(
+                &search,
                 *start,
                 &mut path_nodes,
                 &mut path_edges,
@@ -1367,25 +1508,25 @@ impl<'a> ExplicitModel<'a> {
 
     fn search_cycle_from(
         &self,
-        nodes: &[ExplicitProductState],
-        adjacency: &[Vec<(usize, ExplicitEdge)>],
-        scc: &HashSet<usize>,
-        start: usize,
+        search: &CycleSearchCtx<'_>,
         current: usize,
         path_nodes: &mut Vec<usize>,
         path_edges: &mut Vec<ExplicitEdge>,
         in_path: &mut HashSet<usize>,
     ) -> Result<Option<(Vec<usize>, Vec<ExplicitEdge>, Vec<FairnessEventAnalysis>)>, String> {
-        for (next, edge) in &adjacency[current] {
-            if !scc.contains(next) {
+        for (next, edge) in &search.adjacency[current] {
+            if !search.scc.contains(next) {
                 continue;
             }
-            if *next == start {
+            if *next == search.start {
                 let mut cycle_edges = path_edges.clone();
                 cycle_edges.push(edge.clone());
-                if let Some(fairness_analysis) =
-                    self.evaluate_fair_cycle(nodes, adjacency, path_nodes, &cycle_edges)?
-                {
+                if let Some(fairness_analysis) = self.evaluate_fair_cycle(
+                    search.nodes,
+                    search.adjacency,
+                    path_nodes,
+                    &cycle_edges,
+                )? {
                     return Ok(Some((path_nodes.clone(), cycle_edges, fairness_analysis)));
                 }
                 continue;
@@ -1396,9 +1537,9 @@ impl<'a> ExplicitModel<'a> {
             in_path.insert(*next);
             path_nodes.push(*next);
             path_edges.push(edge.clone());
-            if let Some(found) = self.search_cycle_from(
-                nodes, adjacency, scc, start, *next, path_nodes, path_edges, in_path,
-            )? {
+            if let Some(found) =
+                self.search_cycle_from(search, *next, path_nodes, path_edges, in_path)?
+            {
                 return Ok(Some(found));
             }
             path_edges.pop();
@@ -1449,6 +1590,13 @@ impl<'a> ExplicitModel<'a> {
     }
 }
 
+/// Runs the explicit-state model checker over `verify_block`'s system
+/// scope, returning the fully enumerated [`ExplicitStateSpace`].
+///
+/// Returns `Ok(None)` when the verify block does not have a finite
+/// transition fragment the explicit backend can handle (the caller
+/// then falls back to a symbolic backend). Returns `Err(reason)` on
+/// internal failure.
 pub fn explore_verify_state_space(
     ir: &IRProgram,
     verify_block: &IRVerify,
@@ -1680,6 +1828,9 @@ fn params_match(expected: &[ExplicitParamBinding], actual: &[op::Binding]) -> bo
 fn witness_to_explicit_value(value: &op::WitnessValue) -> Option<ExplicitValue> {
     match value {
         op::WitnessValue::Int(value) => Some(ExplicitValue::Int(*value)),
+        op::WitnessValue::Real(value) | op::WitnessValue::Float(value) => {
+            Some(ExplicitValue::Real(value.clone()))
+        }
         op::WitnessValue::Bool(value) => Some(ExplicitValue::Bool(*value)),
         op::WitnessValue::Identity(value) => Some(ExplicitValue::Identity(value.clone())),
         op::WitnessValue::SlotRef(slot) => Some(ExplicitValue::SlotRef(slot.clone())),
@@ -1712,6 +1863,9 @@ pub(super) fn try_check_verify_block_explicit(
 ) -> Option<VerificationResult> {
     let obligation =
         transition::TransitionVerifyObligation::for_verify(ir, vctx, verify_block, defs)?;
+    let bounded_depth = verify_block
+        .depth
+        .unwrap_or_else(|| obligation.system().bound());
     let (model, initial_states) = match ExplicitModel::from_obligation(&obligation, vctx) {
         Ok(Some(model)) => model,
         Ok(None) => return None,
@@ -1725,6 +1879,9 @@ pub(super) fn try_check_verify_block_explicit(
         }
         Err(_) => return None,
     };
+    if !config.bounded_only && model.has_unbounded_int_state() {
+        return None;
+    }
 
     let started = Instant::now();
     let assumptions =
@@ -1739,6 +1896,7 @@ pub(super) fn try_check_verify_block_explicit(
         .collect::<Vec<_>>();
     let mut parents: Vec<Option<(usize, ExplicitEdge)>> = vec![None; nodes.len()];
     let mut adjacency: Vec<Vec<(usize, ExplicitEdge)>> = vec![Vec::new(); nodes.len()];
+    let mut depths: Vec<usize> = vec![0; nodes.len()];
     let mut seen: HashMap<ExplicitProductState, usize> = nodes
         .iter()
         .cloned()
@@ -1784,6 +1942,9 @@ pub(super) fn try_check_verify_block_explicit(
                 span: verify_block.span,
                 file: verify_block.file.clone(),
             });
+        }
+        if config.bounded_only && depths[index] >= bounded_depth {
+            continue;
         }
 
         let step_successors = match model.step_successors(&node.state) {
@@ -1840,6 +2001,7 @@ pub(super) fn try_check_verify_block_explicit(
                 nodes.push(next_product);
                 parents.push(Some((index, edge.clone())));
                 adjacency.push(Vec::new());
+                depths.push(depths[index] + 1);
                 queue.push_back(next_index);
                 next_index
             };
@@ -1855,6 +2017,19 @@ pub(super) fn try_check_verify_block_explicit(
         assumptions.clone(),
     ) {
         return Some(result);
+    }
+
+    if config.bounded_only {
+        return Some(VerificationResult::Checked {
+            name: verify_block.name.clone(),
+            depth: bounded_depth,
+            method: Some("explicit-state exhaustive search".to_owned()),
+            time_ms: started.elapsed().as_millis() as u64,
+            assumptions,
+            backend_diagnostics: vec![],
+            span: verify_block.span,
+            file: verify_block.file.clone(),
+        });
     }
 
     Some(VerificationResult::Proved {
@@ -1965,8 +2140,9 @@ fn strongly_connected_components(
 
 fn enumerate_initial_states(
     entity_specs: &[ExplicitEntitySpec<'_>],
-    active_slots: &HashMap<(usize, usize), bool>,
+    active_slots: &HashSet<(usize, usize)>,
     system_value_options: Vec<Vec<ExplicitValue>>,
+    initial_int_candidates: &HashMap<(String, String), Vec<i64>>,
 ) -> Result<Vec<ExplicitState>, String> {
     let mut states = system_value_options
         .into_iter()
@@ -1978,11 +2154,12 @@ fn enumerate_initial_states(
 
     for (entity_index, spec) in entity_specs.iter().enumerate() {
         for slot in 0..spec.slot_count {
-            let active = active_slots.contains_key(&(entity_index, slot));
-            let mut slot_options = enumerate_slot_initial_values(spec, slot)?;
-            if !active {
-                slot_options.truncate(1);
-            }
+            let active = active_slots.contains(&(entity_index, slot));
+            let slot_options = if active {
+                enumerate_slot_initial_values(spec, slot, initial_int_candidates)?
+            } else {
+                vec![inactive_slot_placeholder_values(spec, slot)?]
+            };
             let mut next_states = Vec::new();
             for state in &states {
                 for values in &slot_options {
@@ -1992,6 +2169,11 @@ fn enumerate_initial_states(
                         values: values.clone(),
                     });
                     next_states.push(next);
+                    if next_states.len() > EXPLICIT_INITIAL_STATE_LIMIT {
+                        return Err(format!(
+                            "explicit-state initial state space exceeds {EXPLICIT_INITIAL_STATE_LIMIT} states"
+                        ));
+                    }
                 }
             }
             states = next_states;
@@ -1999,6 +2181,63 @@ fn enumerate_initial_states(
     }
 
     Ok(states)
+}
+
+fn active_slot_combinations_for_store_range(
+    entity_index: usize,
+    range: &VerifyStoreRange,
+) -> Result<Vec<HashSet<(usize, usize)>>, String> {
+    if range.min_active > range.max_active || range.max_active > range.slot_count {
+        return Err(format!(
+            "invalid explicit-state store range `{}`: active bounds {}..{} exceed capacity {}",
+            range.entity_type, range.min_active, range.max_active, range.slot_count
+        ));
+    }
+    let slots = (range.start_slot..range.start_slot + range.slot_count).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    for active_count in range.min_active..=range.max_active {
+        collect_active_slot_combinations(
+            entity_index,
+            &slots,
+            active_count,
+            0,
+            &mut Vec::new(),
+            &mut out,
+        );
+    }
+    Ok(out)
+}
+
+fn collect_active_slot_combinations(
+    entity_index: usize,
+    slots: &[usize],
+    remaining: usize,
+    start: usize,
+    chosen: &mut Vec<usize>,
+    out: &mut Vec<HashSet<(usize, usize)>>,
+) {
+    if remaining == 0 {
+        out.push(
+            chosen
+                .iter()
+                .map(|slot| (entity_index, *slot))
+                .collect::<HashSet<_>>(),
+        );
+        return;
+    }
+    let max_start = slots.len().saturating_sub(remaining);
+    for index in start..=max_start {
+        chosen.push(slots[index]);
+        collect_active_slot_combinations(
+            entity_index,
+            slots,
+            remaining - 1,
+            index + 1,
+            chosen,
+            out,
+        );
+        chosen.pop();
+    }
 }
 
 fn enumerate_system_initial_values(fields: &[IRField]) -> Result<Vec<Vec<ExplicitValue>>, String> {
@@ -2025,9 +2264,9 @@ fn system_field_initial_values(field: &IRField) -> Result<Vec<ExplicitValue>, St
         }
         return Ok(vec![finite_default_value(field)?]);
     };
-    let candidates = finite_values_for_type(&field.ty)?;
+    let candidates = constrained_initial_candidates(field, initial_constraint)?;
     let accepted = field_values_satisfying_constraint(initial_constraint, candidates)?;
-    if accepted.is_empty() {
+    if accepted.is_empty() && !matches!(explicit_runtime_type(&field.ty), IRType::Int) {
         return Err(format!(
             "explicit-state initial constraint for field `{}` has no finite values",
             field.name
@@ -2039,10 +2278,16 @@ fn system_field_initial_values(field: &IRField) -> Result<Vec<ExplicitValue>, St
 fn enumerate_slot_initial_values(
     spec: &ExplicitEntitySpec<'_>,
     slot: usize,
+    initial_int_candidates: &HashMap<(String, String), Vec<i64>>,
 ) -> Result<Vec<Vec<ExplicitValue>>, String> {
     let mut out = vec![Vec::new()];
     for field in &spec.fields {
-        let values = field_initial_values(field, &spec.name, slot)?;
+        let values = field_initial_values_with_initial_candidates(
+            field,
+            &spec.name,
+            slot,
+            initial_int_candidates,
+        )?;
         let mut next = Vec::new();
         for prefix in &out {
             for value in &values {
@@ -2056,6 +2301,84 @@ fn enumerate_slot_initial_values(
     Ok(out)
 }
 
+fn inactive_slot_placeholder_values(
+    spec: &ExplicitEntitySpec<'_>,
+    slot: usize,
+) -> Result<Vec<ExplicitValue>, String> {
+    spec.fields
+        .iter()
+        .map(|field| inactive_field_placeholder_value(field, &spec.name, slot))
+        .collect()
+}
+
+fn inactive_field_placeholder_value(
+    field: &IRField,
+    entity_name: &str,
+    slot: usize,
+) -> Result<ExplicitValue, String> {
+    match explicit_runtime_type(&field.ty) {
+        IRType::Int => Ok(ExplicitValue::Int(0)),
+        IRType::String => Ok(ExplicitValue::Str(String::new())),
+        IRType::Bool => Ok(ExplicitValue::Bool(false)),
+        IRType::Identity => Ok(ExplicitValue::Identity(format!("{entity_name}#{slot}"))),
+        IRType::Enum { name, variants } => {
+            let variant = variants
+                .iter()
+                .find(|variant| variant.fields.is_empty())
+                .or_else(|| variants.first())
+                .ok_or_else(|| format!("enum `{name}` has no variants"))?;
+            let fields = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok((
+                        field.name.clone(),
+                        inactive_field_placeholder_for_type(&field.ty)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ExplicitValue::Enum {
+                enum_name: name.clone(),
+                variant: variant.name.clone(),
+                fields,
+            })
+        }
+        _ => entity_field_default_value(field, entity_name, slot),
+    }
+}
+
+fn inactive_field_placeholder_for_type(ty: &IRType) -> Result<ExplicitValue, String> {
+    match explicit_runtime_type(ty) {
+        IRType::Int => Ok(ExplicitValue::Int(0)),
+        IRType::String => Ok(ExplicitValue::Str(String::new())),
+        IRType::Bool => Ok(ExplicitValue::Bool(false)),
+        IRType::Identity => Ok(ExplicitValue::Identity("__inactive_identity__".to_owned())),
+        IRType::Enum { name, variants } => {
+            let variant = variants
+                .iter()
+                .find(|variant| variant.fields.is_empty())
+                .or_else(|| variants.first())
+                .ok_or_else(|| format!("enum `{name}` has no variants"))?;
+            let fields = variant
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok((
+                        field.name.clone(),
+                        inactive_field_placeholder_for_type(&field.ty)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ExplicitValue::Enum {
+                enum_name: name.clone(),
+                variant: variant.name.clone(),
+                fields,
+            })
+        }
+        _ => Err("unsupported inactive explicit-state placeholder type".to_owned()),
+    }
+}
+
 fn field_initial_values(
     field: &IRField,
     entity_name: &str,
@@ -2067,15 +2390,65 @@ fn field_initial_values(
         }
         return Ok(vec![entity_field_default_value(field, entity_name, slot)?]);
     };
-    let candidates = finite_values_for_type(&field.ty)?;
+    let candidates = constrained_initial_candidates(field, initial_constraint)?;
     let accepted = field_values_satisfying_constraint(initial_constraint, candidates)?;
-    if accepted.is_empty() {
+    if accepted.is_empty() && !matches!(explicit_runtime_type(&field.ty), IRType::Int) {
         return Err(format!(
             "explicit-state initial constraint for field `{}` has no finite values",
             field.name
         ));
     }
     Ok(accepted)
+}
+
+fn field_initial_values_with_initial_candidates(
+    field: &IRField,
+    entity_name: &str,
+    slot: usize,
+    initial_int_candidates: &HashMap<(String, String), Vec<i64>>,
+) -> Result<Vec<ExplicitValue>, String> {
+    let mut values = field_initial_values(field, entity_name, slot)?;
+    if field.default.is_none()
+        && field.initial_constraint.is_none()
+        && matches!(explicit_runtime_type(&field.ty), IRType::Int)
+    {
+        if let Some(candidates) =
+            initial_int_candidates.get(&(entity_name.to_owned(), field.name.clone()))
+        {
+            for candidate in candidates {
+                let value = ExplicitValue::Int(*candidate);
+                if !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn constrained_initial_candidates(
+    field: &IRField,
+    initial_constraint: &IRExpr,
+) -> Result<Vec<ExplicitValue>, String> {
+    if matches!(explicit_runtime_type(&field.ty), IRType::Int) {
+        if let Some(default) = field.default.as_ref() {
+            return Ok(vec![eval_static_finite_expr_for_type(default, &field.ty)?]);
+        }
+        if matches!(
+            initial_constraint,
+            IRExpr::Lit {
+                value: LitVal::Bool { value: false },
+                ..
+            }
+        ) {
+            return Ok(Vec::new());
+        }
+        return match int_domain_from_constraint(initial_constraint)? {
+            Some(domain) => Ok(vec![ExplicitValue::IntDomain(domain)]),
+            None => Ok(Vec::new()),
+        };
+    }
+    finite_values_for_type(explicit_runtime_type(&field.ty))
 }
 
 fn field_create_values(
@@ -2120,6 +2493,273 @@ fn field_values_satisfying_constraint(
     Ok(accepted)
 }
 
+fn int_domain_from_constraint(expr: &IRExpr) -> Result<Option<ExplicitIntDomain>, String> {
+    let mut bounds = ExplicitIntBounds::default();
+    collect_int_domain_bounds(expr, &mut bounds)?;
+    bounds.into_domain()
+}
+
+#[derive(Default)]
+struct ExplicitIntBounds {
+    lower: Option<ExplicitIntBound>,
+    upper: Option<ExplicitIntBound>,
+    saw_bound: bool,
+    unsat: bool,
+}
+
+impl ExplicitIntBounds {
+    fn into_domain(self) -> Result<Option<ExplicitIntDomain>, String> {
+        if self.unsat {
+            return Ok(None);
+        }
+        if !self.saw_bound {
+            return Err("unsupported explicit-state unbounded int constraint".to_owned());
+        }
+        let representative = int_domain_representative(self.lower, self.upper)?;
+        Ok(representative.map(|representative| ExplicitIntDomain {
+            lower: self.lower,
+            upper: self.upper,
+            representative,
+        }))
+    }
+
+    fn apply_lower(&mut self, bound: ExplicitIntBound) {
+        self.saw_bound = true;
+        self.lower = Some(match self.lower {
+            Some(existing) if stronger_lower_bound(existing, bound) == existing => existing,
+            _ => bound,
+        });
+    }
+
+    fn apply_upper(&mut self, bound: ExplicitIntBound) {
+        self.saw_bound = true;
+        self.upper = Some(match self.upper {
+            Some(existing) if stronger_upper_bound(existing, bound) == existing => existing,
+            _ => bound,
+        });
+    }
+}
+
+fn collect_int_domain_bounds(expr: &IRExpr, bounds: &mut ExplicitIntBounds) -> Result<(), String> {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Bool { value: false },
+            ..
+        } => {
+            bounds.unsat = true;
+            Ok(())
+        }
+        IRExpr::Lit {
+            value: LitVal::Bool { value: true },
+            ..
+        } => Ok(()),
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" || op == "and" || op == "&&" => {
+            collect_int_domain_bounds(left, bounds)?;
+            collect_int_domain_bounds(right, bounds)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => apply_int_domain_comparison(bounds, op, left, right),
+        _ => Err("unsupported explicit-state unbounded int constraint".to_owned()),
+    }
+}
+
+fn apply_int_domain_comparison(
+    bounds: &mut ExplicitIntBounds,
+    op: &str,
+    left: &IRExpr,
+    right: &IRExpr,
+) -> Result<(), String> {
+    if is_placeholder_var(left) {
+        let Some(value) = int_literal(right) else {
+            return Err("unsupported explicit-state unbounded int constraint".to_owned());
+        };
+        apply_int_domain_bound(bounds, op, value)
+    } else if is_placeholder_var(right) {
+        let Some(value) = int_literal(left) else {
+            return Err("unsupported explicit-state unbounded int constraint".to_owned());
+        };
+        apply_int_domain_bound(bounds, invert_int_comparison(op), value)
+    } else {
+        Err("unsupported explicit-state unbounded int constraint".to_owned())
+    }
+}
+
+fn apply_int_domain_bound(
+    bounds: &mut ExplicitIntBounds,
+    op: &str,
+    value: i64,
+) -> Result<(), String> {
+    match op {
+        ">" | "OpGt" => bounds.apply_lower(ExplicitIntBound {
+            value,
+            inclusive: false,
+        }),
+        ">=" | "OpGe" => bounds.apply_lower(ExplicitIntBound {
+            value,
+            inclusive: true,
+        }),
+        "<" | "OpLt" => bounds.apply_upper(ExplicitIntBound {
+            value,
+            inclusive: false,
+        }),
+        "<=" | "OpLe" => bounds.apply_upper(ExplicitIntBound {
+            value,
+            inclusive: true,
+        }),
+        "==" | "OpEq" => {
+            bounds.apply_lower(ExplicitIntBound {
+                value,
+                inclusive: true,
+            });
+            bounds.apply_upper(ExplicitIntBound {
+                value,
+                inclusive: true,
+            });
+        }
+        _ => return Err("unsupported explicit-state unbounded int constraint".to_owned()),
+    }
+    Ok(())
+}
+
+fn stronger_lower_bound(left: ExplicitIntBound, right: ExplicitIntBound) -> ExplicitIntBound {
+    match left.value.cmp(&right.value) {
+        std::cmp::Ordering::Greater => left,
+        std::cmp::Ordering::Less => right,
+        std::cmp::Ordering::Equal if !left.inclusive => left,
+        std::cmp::Ordering::Equal => right,
+    }
+}
+
+fn stronger_upper_bound(left: ExplicitIntBound, right: ExplicitIntBound) -> ExplicitIntBound {
+    match left.value.cmp(&right.value) {
+        std::cmp::Ordering::Less => left,
+        std::cmp::Ordering::Greater => right,
+        std::cmp::Ordering::Equal if !left.inclusive => left,
+        std::cmp::Ordering::Equal => right,
+    }
+}
+
+fn int_domain_representative(
+    lower: Option<ExplicitIntBound>,
+    upper: Option<ExplicitIntBound>,
+) -> Result<Option<i64>, String> {
+    let min = match lower {
+        Some(bound) if bound.inclusive => Some(bound.value),
+        Some(bound) => match bound.value.checked_add(1) {
+            Some(value) => Some(value),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let max = match upper {
+        Some(bound) if bound.inclusive => Some(bound.value),
+        Some(bound) => match bound.value.checked_sub(1) {
+            Some(value) => Some(value),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let candidate = min.or_else(|| max.map(|max| max.min(0))).unwrap_or(0);
+    if let Some(max) = max {
+        if candidate > max {
+            return Ok(None);
+        }
+    }
+    Ok(Some(candidate))
+}
+
+fn is_placeholder_var(expr: &IRExpr) -> bool {
+    matches!(expr, IRExpr::Var { name, .. } if name == "$")
+}
+
+fn int_literal(expr: &IRExpr) -> Option<i64> {
+    match expr {
+        IRExpr::Lit {
+            value: LitVal::Int { value },
+            ..
+        } => Some(*value),
+        _ => None,
+    }
+}
+
+fn invert_int_comparison(op: &str) -> &str {
+    match op {
+        ">" => "<",
+        "OpGt" => "OpLt",
+        ">=" => "<=",
+        "OpGe" => "OpLe",
+        "<" => ">",
+        "OpLt" => "OpGt",
+        "<=" => ">=",
+        "OpLe" => "OpGe",
+        other => other,
+    }
+}
+
+fn collect_initial_int_candidates(exprs: &[IRExpr]) -> HashMap<(String, String), Vec<i64>> {
+    let mut out: HashMap<(String, String), Vec<i64>> = HashMap::new();
+    for expr in exprs {
+        collect_initial_int_candidates_from_expr(expr, &mut HashMap::new(), &mut out);
+    }
+    out
+}
+
+fn collect_initial_int_candidates_from_expr(
+    expr: &IRExpr,
+    entity_vars: &mut HashMap<String, String>,
+    out: &mut HashMap<(String, String), Vec<i64>>,
+) {
+    match expr {
+        IRExpr::Forall {
+            var,
+            domain: IRType::Entity { name },
+            body,
+            ..
+        } => {
+            entity_vars.insert(var.clone(), name.clone());
+            collect_initial_int_candidates_from_expr(body, entity_vars, out);
+            entity_vars.remove(var);
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpAnd" || op == "and" || op == "&&" => {
+            collect_initial_int_candidates_from_expr(left, entity_vars, out);
+            collect_initial_int_candidates_from_expr(right, entity_vars, out);
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } if op == "OpEq" || op == "==" => {
+            collect_initial_int_equality_candidate(left, right, entity_vars, out);
+            collect_initial_int_equality_candidate(right, left, entity_vars, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_initial_int_equality_candidate(
+    field_expr: &IRExpr,
+    value_expr: &IRExpr,
+    entity_vars: &HashMap<String, String>,
+    out: &mut HashMap<(String, String), Vec<i64>>,
+) {
+    let IRExpr::Field { expr, field, .. } = field_expr else {
+        return;
+    };
+    let IRExpr::Var { name: var, .. } = expr.as_ref() else {
+        return;
+    };
+    let (Some(entity), Some(value)) = (entity_vars.get(var), int_literal(value_expr)) else {
+        return;
+    };
+    let values = out.entry((entity.clone(), field.clone())).or_default();
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
 fn build_entity_spec<'a>(
     entity: &'a IREntity,
     slot_count: usize,
@@ -2142,10 +2782,10 @@ fn build_entity_spec<'a>(
     let mut field_indices = HashMap::new();
     for (index, field) in fields.iter().enumerate() {
         if let Some(initial_constraint) = &field.initial_constraint {
-            finite_values_for_type(&field.ty)?;
             let value_locals = HashSet::from(["$".to_owned()]);
             let initial_constraint_field_types =
                 HashMap::from([("$".to_owned(), field.ty.clone())]);
+            constrained_initial_candidates(field, initial_constraint)?;
             if !supports_state_expr(
                 initial_constraint,
                 None,
@@ -2184,29 +2824,24 @@ fn build_entity_spec<'a>(
 
 fn validate_actions(
     actions: &[IRAction],
-    current_system: &str,
-    system_fields: &HashMap<String, usize>,
-    system_field_types: &HashMap<String, IRType>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    steps: &[ExplicitStepRef<'_>],
-    step_indices: &HashMap<(String, String), usize>,
-    value_locals: &HashSet<String>,
-    slot_locals: &HashMap<String, usize>,
+    validation: &ExplicitValidationCtx<'_, '_>,
+    scope: ExplicitValidationScope<'_>,
     active_calls: &mut HashSet<(String, String)>,
 ) -> Result<HashSet<String>, String> {
-    let mut current_locals = value_locals.clone();
-    let mut current_field_types = system_field_types.clone();
+    let mut current_locals = scope.value_locals.clone();
+    let mut current_field_types = scope.system_field_types.clone();
     for action in actions {
+        let field_types_snapshot = current_field_types.clone();
+        let action_scope = ExplicitValidationScope {
+            system_field_types: &field_types_snapshot,
+            value_locals: &current_locals,
+            slot_locals: scope.slot_locals,
+        };
         current_locals = validate_action(
             action,
-            current_system,
-            system_fields,
             &mut current_field_types,
-            entity_specs,
-            steps,
-            step_indices,
-            &current_locals,
-            slot_locals,
+            validation,
+            action_scope,
             active_calls,
         )?;
     }
@@ -2215,16 +2850,18 @@ fn validate_actions(
 
 fn validate_action(
     action: &IRAction,
-    current_system: &str,
-    system_fields: &HashMap<String, usize>,
     system_field_types: &mut HashMap<String, IRType>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    steps: &[ExplicitStepRef<'_>],
-    step_indices: &HashMap<(String, String), usize>,
-    value_locals: &HashSet<String>,
-    slot_locals: &HashMap<String, usize>,
+    validation: &ExplicitValidationCtx<'_, '_>,
+    scope: ExplicitValidationScope<'_>,
     active_calls: &mut HashSet<(String, String)>,
 ) -> Result<HashSet<String>, String> {
+    let current_system = validation.current_system;
+    let system_fields = validation.system_fields;
+    let entity_specs = validation.entity_specs;
+    let step_indices = validation.step_indices;
+    let value_locals = scope.value_locals;
+    let slot_locals = scope.slot_locals;
+
     match action {
         IRAction::ExprStmt { expr } => {
             let IRExpr::BinOp {
@@ -2305,14 +2942,12 @@ fn validate_action(
             }
             validate_actions(
                 ops,
-                current_system,
-                system_fields,
-                system_field_types,
-                entity_specs,
-                steps,
-                step_indices,
-                value_locals,
-                &nested_slot_locals,
+                validation,
+                ExplicitValidationScope {
+                    system_field_types,
+                    value_locals,
+                    slot_locals: &nested_slot_locals,
+                },
                 active_calls,
             )?;
             Ok(value_locals.clone())
@@ -2329,14 +2964,12 @@ fn validate_action(
             nested_slot_locals.insert(var.clone(), entity_index);
             validate_actions(
                 ops,
-                current_system,
-                system_fields,
-                system_field_types,
-                entity_specs,
-                steps,
-                step_indices,
-                value_locals,
-                &nested_slot_locals,
+                validation,
+                ExplicitValidationScope {
+                    system_field_types,
+                    value_locals,
+                    slot_locals: &nested_slot_locals,
+                },
                 active_calls,
             )?;
             Ok(value_locals.clone())
@@ -2352,14 +2985,12 @@ fn validate_action(
                 command,
                 &[],
                 args,
-                Some(current_system),
-                system_fields,
-                system_field_types,
-                entity_specs,
-                steps,
-                step_indices,
-                value_locals,
-                slot_locals,
+                validation,
+                ExplicitValidationScope {
+                    system_field_types,
+                    value_locals,
+                    slot_locals,
+                },
                 active_calls,
             )?
             else {
@@ -2384,14 +3015,12 @@ fn validate_action(
                     transition,
                     refs,
                     args,
-                    Some(current_system),
-                    system_fields,
-                    system_field_types,
-                    entity_specs,
-                    steps,
-                    step_indices,
-                    value_locals,
-                    slot_locals,
+                    validation,
+                    ExplicitValidationScope {
+                        system_field_types,
+                        value_locals,
+                        slot_locals,
+                    },
                     active_calls,
                 )?;
                 return Ok(value_locals.clone());
@@ -2518,14 +3147,12 @@ fn validate_action(
                 command,
                 &[],
                 args,
-                Some(current_system),
-                system_fields,
-                system_field_types,
-                entity_specs,
-                steps,
-                step_indices,
-                value_locals,
-                slot_locals,
+                validation,
+                ExplicitValidationScope {
+                    system_field_types,
+                    value_locals,
+                    slot_locals,
+                },
                 active_calls,
             )?;
             Ok(value_locals.clone())
@@ -2547,14 +3174,12 @@ fn validate_action(
                         command,
                         &[],
                         args,
-                        Some(current_system),
-                        system_fields,
-                        system_field_types,
-                        entity_specs,
-                        steps,
-                        step_indices,
-                        value_locals,
-                        slot_locals,
+                        validation,
+                        ExplicitValidationScope {
+                            system_field_types,
+                            value_locals,
+                            slot_locals,
+                        },
                         active_calls,
                     )?
                     .is_none()
@@ -2583,14 +3208,12 @@ fn validate_action(
                 }
                 validate_actions(
                     &arm.body,
-                    current_system,
-                    system_fields,
-                    system_field_types,
-                    entity_specs,
-                    steps,
-                    step_indices,
-                    &arm_value_locals,
-                    slot_locals,
+                    validation,
+                    ExplicitValidationScope {
+                        system_field_types,
+                        value_locals: &arm_value_locals,
+                        slot_locals,
+                    },
                     active_calls,
                 )?;
             }
@@ -2604,16 +3227,19 @@ fn validate_cross_call_like(
     command: &str,
     refs: &[String],
     args: &[IRExpr],
-    caller_system: Option<&str>,
-    system_fields: &HashMap<String, usize>,
-    system_field_types: &HashMap<String, IRType>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    steps: &[ExplicitStepRef<'_>],
-    step_indices: &HashMap<(String, String), usize>,
-    value_locals: &HashSet<String>,
-    slot_locals: &HashMap<String, usize>,
+    validation: &ExplicitValidationCtx<'_, '_>,
+    scope: ExplicitValidationScope<'_>,
     active_calls: &mut HashSet<(String, String)>,
 ) -> Result<Option<IRType>, String> {
+    let caller_system = Some(validation.current_system);
+    let system_fields = validation.system_fields;
+    let system_field_types = scope.system_field_types;
+    let entity_specs = validation.entity_specs;
+    let steps = validation.steps;
+    let step_indices = validation.step_indices;
+    let value_locals = scope.value_locals;
+    let slot_locals = scope.slot_locals;
+
     let Some(step_index) = step_indices.get(&(system.to_owned(), command.to_owned())) else {
         return Err("unsupported cross-call in explicit-state fragment".to_owned());
     };
@@ -2660,14 +3286,18 @@ fn validate_cross_call_like(
     }
     let final_locals = match validate_actions(
         &callee.step.body,
-        &callee.system,
-        system_fields,
-        &callee_field_types,
-        entity_specs,
-        steps,
-        step_indices,
-        &callee_value_locals,
-        &HashMap::new(),
+        &ExplicitValidationCtx {
+            current_system: &callee.system,
+            system_fields,
+            entity_specs,
+            steps,
+            step_indices,
+        },
+        ExplicitValidationScope {
+            system_field_types: &callee_field_types,
+            value_locals: &callee_value_locals,
+            slot_locals: &HashMap::new(),
+        },
         active_calls,
     ) {
         Ok(locals) => locals,
@@ -2966,11 +3596,13 @@ fn execute_action(
             for (next, result, choices) in execute_cross_call_like_result(
                 model,
                 state,
-                system,
-                command,
-                &[],
-                args,
-                Some(current_system),
+                ExplicitCrossCall {
+                    system,
+                    command,
+                    refs: &[],
+                    args,
+                    caller_system: Some(current_system),
+                },
                 value_locals,
                 slot_locals,
             )? {
@@ -2994,11 +3626,13 @@ fn execute_action(
                 return execute_cross_call_like(
                     model,
                     state,
-                    target,
-                    transition,
-                    refs,
-                    args,
-                    Some(current_system),
+                    ExplicitCrossCall {
+                        system: target,
+                        command: transition,
+                        refs,
+                        args,
+                        caller_system: Some(current_system),
+                    },
                     value_locals,
                     slot_locals,
                 );
@@ -3162,11 +3796,13 @@ fn execute_action(
         } => execute_cross_call_like(
             model,
             state,
-            system,
-            command,
-            &[],
-            args,
-            Some(current_system),
+            ExplicitCrossCall {
+                system,
+                command,
+                refs: &[],
+                args,
+                caller_system: Some(current_system),
+            },
             value_locals,
             slot_locals,
         ),
@@ -3187,11 +3823,13 @@ fn execute_action(
                     for (next, result, choices) in execute_cross_call_like_result(
                         model,
                         state,
-                        system,
-                        command,
-                        &[],
-                        args,
-                        Some(current_system),
+                        ExplicitCrossCall {
+                            system,
+                            command,
+                            refs: &[],
+                            args,
+                            caller_system: Some(current_system),
+                        },
                         value_locals,
                         slot_locals,
                     )? {
@@ -3245,41 +3883,30 @@ fn execute_action(
 fn execute_cross_call_like(
     model: &ExplicitModel<'_>,
     state: ExplicitState,
-    system: &str,
-    command: &str,
-    refs: &[String],
-    args: &[IRExpr],
-    caller_system: Option<&str>,
+    call: ExplicitCrossCall<'_>,
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<Vec<ExplicitActionState>, String> {
-    Ok(execute_cross_call_like_result(
-        model,
-        state,
-        system,
-        command,
-        refs,
-        args,
-        caller_system,
-        value_locals,
-        slot_locals,
-    )?
-    .into_iter()
-    .map(|(state, _, choices)| (state, value_locals.clone(), choices))
-    .collect())
+    Ok(
+        execute_cross_call_like_result(model, state, call, value_locals, slot_locals)?
+            .into_iter()
+            .map(|(state, _, choices)| (state, value_locals.clone(), choices))
+            .collect(),
+    )
 }
 
 fn execute_cross_call_like_result(
     model: &ExplicitModel<'_>,
     state: ExplicitState,
-    system: &str,
-    command: &str,
-    refs: &[String],
-    args: &[IRExpr],
-    caller_system: Option<&str>,
+    call: ExplicitCrossCall<'_>,
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<Vec<(ExplicitState, Option<ExplicitValue>, Vec<op::Choice>)>, String> {
+    let system = call.system;
+    let command = call.command;
+    let refs = call.refs;
+    let args = call.args;
+    let caller_system = call.caller_system;
     let callees = model.steps_by_key(system, command);
     if callees.is_empty() {
         return Err("unsupported cross-call in explicit-state fragment".to_owned());
@@ -3755,7 +4382,16 @@ fn supports_state_expr(
     slot_locals: &HashMap<String, usize>,
 ) -> bool {
     match expr {
-        IRExpr::Lit { value, .. } => matches!(value, LitVal::Bool { .. } | LitVal::Int { .. }),
+        IRExpr::Lit { value, .. } => {
+            matches!(
+                value,
+                LitVal::Bool { .. }
+                    | LitVal::Int { .. }
+                    | LitVal::Real { .. }
+                    | LitVal::Float { .. }
+                    | LitVal::Str { .. }
+            )
+        }
         IRExpr::Ctor { args, .. } => args.iter().all(|(_, arg)| {
             supports_state_expr(
                 arg,
@@ -3848,6 +4484,28 @@ fn supports_state_expr(
         IRExpr::BinOp {
             op, left, right, ..
         } => {
+            if matches!(op.as_str(), "==" | "OpEq" | "!=" | "OpNEq")
+                && supports_finite_set_expr(
+                    left,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+                && supports_finite_set_expr(
+                    right,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+            {
+                return true;
+            }
             if matches!(op.as_str(), "OpSetSubset" | "OpDisjoint") {
                 return supports_finite_set_literal_expr(
                     left,
@@ -3866,6 +4524,28 @@ fn supports_state_expr(
                     value_locals,
                     slot_locals,
                 );
+            }
+            if matches!(op.as_str(), "==" | "OpEq" | "!=" | "OpNEq")
+                && supports_finite_set_expr(
+                    left,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+                && supports_finite_set_expr(
+                    right,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+            {
+                return true;
             }
             matches!(
                 op.as_str(),
@@ -4156,6 +4836,34 @@ fn supports_finite_set_literal_expr(
     }
 }
 
+fn supports_finite_set_expr(
+    expr: &IRExpr,
+    current_system: Option<&str>,
+    system_fields: &HashMap<String, usize>,
+    system_field_types: &HashMap<String, IRType>,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+    value_locals: &HashSet<String>,
+    slot_locals: &HashMap<String, usize>,
+) -> bool {
+    supports_finite_set_literal_expr(
+        expr,
+        current_system,
+        system_fields,
+        system_field_types,
+        entity_specs,
+        value_locals,
+        slot_locals,
+    ) || supports_cardinality_expr(
+        expr,
+        current_system,
+        system_fields,
+        system_field_types,
+        entity_specs,
+        value_locals,
+        slot_locals,
+    )
+}
+
 fn supports_cardinality_expr(
     expr: &IRExpr,
     current_system: Option<&str>,
@@ -4275,28 +4983,29 @@ fn eval_expr(
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<ExplicitValue, String> {
+    let eval_ctx = ExplicitEvalCtx {
+        state,
+        current_system,
+        system_fields,
+        entity_specs,
+        value_locals,
+        slot_locals,
+    };
     match expr {
         IRExpr::Lit { value, .. } => match value {
             LitVal::Int { value } => Ok(ExplicitValue::Int(*value)),
+            LitVal::Real { value } | LitVal::Float { value } => {
+                Ok(ExplicitValue::Real(value.to_string()))
+            }
             LitVal::Bool { value } => Ok(ExplicitValue::Bool(*value)),
-            _ => Err("explicit-state only supports bool literals".to_owned()),
+            LitVal::Str { value } => Ok(ExplicitValue::Str(value.clone())),
         },
         IRExpr::Ctor {
             enum_name,
             ctor,
             args,
             ..
-        } => eval_ctor_value(
-            state,
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-            enum_name,
-            ctor,
-            args,
-        ),
+        } => eval_ctor_value(eval_ctx, enum_name, ctor, args),
         IRExpr::Var { name, .. } => {
             if let Some(value) = value_locals.get(name) {
                 return Ok(value.clone());
@@ -4384,20 +5093,44 @@ fn eval_expr(
                 Ok(ExplicitValue::Bool(false))
             }
             IRExpr::SetComp { .. } => Ok(ExplicitValue::Bool(eval_setcomp_membership(
-                state,
-                map,
-                key,
-                current_system,
-                system_fields,
-                entity_specs,
-                value_locals,
-                slot_locals,
+                eval_ctx, map, key,
             )?)),
             _ => Err("unsupported expression in explicit-state fragment".to_owned()),
         },
         IRExpr::BinOp {
             op, left, right, ..
         } => {
+            if matches!(op.as_str(), "==" | "OpEq" | "!=" | "OpNEq")
+                && is_finite_set_expr(left)
+                && is_finite_set_expr(right)
+            {
+                let left = eval_finite_set_values(
+                    state,
+                    left,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?;
+                let right = eval_finite_set_values(
+                    state,
+                    right,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?;
+                let equal = left == right;
+                return Ok(ExplicitValue::Bool(
+                    if matches!(op.as_str(), "!=" | "OpNEq") {
+                        !equal
+                    } else {
+                        equal
+                    },
+                ));
+            }
             if matches!(op.as_str(), "OpSetSubset" | "OpDisjoint") {
                 let left = eval_finite_set_literal_values(
                     state,
@@ -4514,76 +5247,22 @@ fn eval_expr(
         }
         IRExpr::Forall {
             var, domain, body, ..
-        } => eval_quantifier(
-            state,
-            var,
-            domain,
-            body,
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-            QuantifierMode::Forall,
-        ),
+        } => eval_quantifier(eval_ctx, var, domain, body, QuantifierMode::Forall),
         IRExpr::Exists {
             var, domain, body, ..
-        } => eval_quantifier(
-            state,
-            var,
-            domain,
-            body,
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-            QuantifierMode::Exists,
-        ),
+        } => eval_quantifier(eval_ctx, var, domain, body, QuantifierMode::Exists),
         IRExpr::One {
             var, domain, body, ..
-        } => eval_quantifier(
-            state,
-            var,
-            domain,
-            body,
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-            QuantifierMode::One,
-        ),
+        } => eval_quantifier(eval_ctx, var, domain, body, QuantifierMode::One),
         IRExpr::Lone {
             var, domain, body, ..
-        } => eval_quantifier(
-            state,
-            var,
-            domain,
-            body,
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-            QuantifierMode::Lone,
-        ),
+        } => eval_quantifier(eval_ctx, var, domain, body, QuantifierMode::Lone),
         IRExpr::Choose {
             var,
             domain,
             predicate,
             ..
-        } => eval_choose(
-            state,
-            var,
-            domain,
-            predicate.as_deref(),
-            current_system,
-            system_fields,
-            entity_specs,
-            value_locals,
-            slot_locals,
-        ),
+        } => eval_choose(eval_ctx, var, domain, predicate.as_deref()),
         IRExpr::Card { expr, .. } => Ok(ExplicitValue::Int(eval_cardinality_expr(
             state,
             expr,
@@ -4668,16 +5347,100 @@ fn eval_finite_set_literal_values(
     Ok(values)
 }
 
-fn eval_setcomp_membership(
+fn is_finite_set_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::SetComp { .. }
+    )
+}
+
+fn eval_finite_set_values(
     state: &ExplicitState,
-    setcomp: &IRExpr,
-    key: &IRExpr,
+    expr: &IRExpr,
     current_system: Option<&str>,
     system_fields: &HashMap<String, usize>,
     entity_specs: &[ExplicitEntitySpec<'_>],
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
+) -> Result<HashSet<ExplicitValue>, String> {
+    match expr {
+        IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } => eval_finite_set_literal_values(
+            state,
+            expr,
+            current_system,
+            system_fields,
+            entity_specs,
+            value_locals,
+            slot_locals,
+        ),
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            let mut values = HashSet::new();
+            match (domain, source.as_deref()) {
+                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
+                    for element in elements {
+                        let value = eval_expr(
+                            state,
+                            element,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            value_locals,
+                            slot_locals,
+                        )?;
+                        let mut nested_values = value_locals.clone();
+                        nested_values.insert(var.clone(), value.clone());
+                        if eval_bool_with_locals(
+                            state,
+                            filter,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            &nested_values,
+                            slot_locals,
+                        )? {
+                            let projected = if let Some(projection) = projection {
+                                eval_expr(
+                                    state,
+                                    projection,
+                                    current_system,
+                                    system_fields,
+                                    entity_specs,
+                                    &nested_values,
+                                    slot_locals,
+                                )?
+                            } else {
+                                value
+                            };
+                            values.insert(projected);
+                        }
+                    }
+                }
+                _ => return Err("unsupported set expression in explicit-state fragment".to_owned()),
+            }
+            Ok(values)
+        }
+        _ => Err("unsupported set expression in explicit-state fragment".to_owned()),
+    }
+}
+
+fn eval_setcomp_membership(
+    ctx: ExplicitEvalCtx<'_, '_>,
+    setcomp: &IRExpr,
+    key: &IRExpr,
 ) -> Result<bool, String> {
+    let state = ctx.state;
+    let current_system = ctx.current_system;
+    let system_fields = ctx.system_fields;
+    let entity_specs = ctx.entity_specs;
+    let value_locals = ctx.value_locals;
+    let slot_locals = ctx.slot_locals;
     let IRExpr::SetComp {
         var,
         domain,
@@ -4999,16 +5762,17 @@ fn eval_cardinality_expr(
 }
 
 fn eval_ctor_value(
-    state: &ExplicitState,
-    current_system: Option<&str>,
-    system_fields: &HashMap<String, usize>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    value_locals: &HashMap<String, ExplicitValue>,
-    slot_locals: &HashMap<String, ExplicitSlotBinding>,
+    ctx: ExplicitEvalCtx<'_, '_>,
     enum_name: &str,
     ctor: &str,
     args: &[(String, IRExpr)],
 ) -> Result<ExplicitValue, String> {
+    let state = ctx.state;
+    let current_system = ctx.current_system;
+    let system_fields = ctx.system_fields;
+    let entity_specs = ctx.entity_specs;
+    let value_locals = ctx.value_locals;
+    let slot_locals = ctx.slot_locals;
     let fields = args
         .iter()
         .map(|(name, expr)| {
@@ -5040,17 +5804,18 @@ enum QuantifierMode {
 }
 
 fn eval_quantifier(
-    state: &ExplicitState,
+    ctx: ExplicitEvalCtx<'_, '_>,
     var: &str,
     domain: &IRType,
     body: &IRExpr,
-    current_system: Option<&str>,
-    system_fields: &HashMap<String, usize>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    value_locals: &HashMap<String, ExplicitValue>,
-    slot_locals: &HashMap<String, ExplicitSlotBinding>,
     mode: QuantifierMode,
 ) -> Result<ExplicitValue, String> {
+    let state = ctx.state;
+    let current_system = ctx.current_system;
+    let system_fields = ctx.system_fields;
+    let entity_specs = ctx.entity_specs;
+    let value_locals = ctx.value_locals;
+    let slot_locals = ctx.slot_locals;
     let mut matches = 0usize;
     for (nested_values, nested_slots) in
         quantifier_bindings(state, var, domain, entity_specs, value_locals, slot_locals)?
@@ -5086,16 +5851,17 @@ fn eval_quantifier(
 }
 
 fn eval_choose(
-    state: &ExplicitState,
+    ctx: ExplicitEvalCtx<'_, '_>,
     var: &str,
     domain: &IRType,
     predicate: Option<&IRExpr>,
-    current_system: Option<&str>,
-    system_fields: &HashMap<String, usize>,
-    entity_specs: &[ExplicitEntitySpec<'_>],
-    value_locals: &HashMap<String, ExplicitValue>,
-    slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<ExplicitValue, String> {
+    let state = ctx.state;
+    let current_system = ctx.current_system;
+    let system_fields = ctx.system_fields;
+    let entity_specs = ctx.entity_specs;
+    let value_locals = ctx.value_locals;
+    let slot_locals = ctx.slot_locals;
     for (nested_values, nested_slots) in
         quantifier_bindings(state, var, domain, entity_specs, value_locals, slot_locals)?
     {
@@ -5204,12 +5970,11 @@ fn eval_binop(
     right: ExplicitValue,
 ) -> Result<ExplicitValue, String> {
     match op {
-        "==" | "OpEq" => Ok(ExplicitValue::Bool(left == right)),
-        "!=" | "OpNEq" => Ok(ExplicitValue::Bool(left != right)),
-        "<" | "OpLt" => Ok(ExplicitValue::Bool(expect_int(left)? < expect_int(right)?)),
-        "<=" | "OpLe" => Ok(ExplicitValue::Bool(expect_int(left)? <= expect_int(right)?)),
-        ">" | "OpGt" => Ok(ExplicitValue::Bool(expect_int(left)? > expect_int(right)?)),
-        ">=" | "OpGe" => Ok(ExplicitValue::Bool(expect_int(left)? >= expect_int(right)?)),
+        "==" | "OpEq" => eval_eq(left, right),
+        "!=" | "OpNEq" => eval_neq(left, right),
+        "<" | "OpLt" | "<=" | "OpLe" | ">" | "OpGt" | ">=" | "OpGe" => {
+            eval_int_comparison(op, left, right)
+        }
         "+" | "OpAdd" => Ok(ExplicitValue::Int(expect_int(left)? + expect_int(right)?)),
         "-" | "OpSub" => Ok(ExplicitValue::Int(expect_int(left)? - expect_int(right)?)),
         "*" | "OpMul" => Ok(ExplicitValue::Int(expect_int(left)? * expect_int(right)?)),
@@ -5240,6 +6005,137 @@ fn eval_binop(
     }
 }
 
+fn eval_eq(left: ExplicitValue, right: ExplicitValue) -> Result<ExplicitValue, String> {
+    match (left, right) {
+        (ExplicitValue::IntDomain(domain), ExplicitValue::Int(value))
+        | (ExplicitValue::Int(value), ExplicitValue::IntDomain(domain)) => {
+            let result = if int_domain_is_singleton_value(&domain, value) {
+                true
+            } else if !int_domain_contains(&domain, value) {
+                false
+            } else {
+                return Err("explicit-state int domain equality is not determined".to_owned());
+            };
+            Ok(ExplicitValue::Bool(result))
+        }
+        (left, right) => Ok(ExplicitValue::Bool(left == right)),
+    }
+}
+
+fn eval_neq(left: ExplicitValue, right: ExplicitValue) -> Result<ExplicitValue, String> {
+    match eval_eq(left, right)? {
+        ExplicitValue::Bool(value) => Ok(ExplicitValue::Bool(!value)),
+        other => Err(format!("expected bool expression, found {other:?}")),
+    }
+}
+
+fn eval_int_comparison(
+    op: &str,
+    left: ExplicitValue,
+    right: ExplicitValue,
+) -> Result<ExplicitValue, String> {
+    match (left, right) {
+        (ExplicitValue::Int(left), ExplicitValue::Int(right)) => {
+            Ok(ExplicitValue::Bool(compare_ints(op, left, right)?))
+        }
+        (ExplicitValue::Real(left), ExplicitValue::Real(right)) => {
+            Ok(ExplicitValue::Bool(compare_reals(op, &left, &right)?))
+        }
+        (ExplicitValue::IntDomain(domain), ExplicitValue::Int(value)) => {
+            eval_domain_literal_comparison(&domain, op, value).map(ExplicitValue::Bool)
+        }
+        (ExplicitValue::Int(value), ExplicitValue::IntDomain(domain)) => {
+            eval_domain_literal_comparison(&domain, invert_int_comparison(op), value)
+                .map(ExplicitValue::Bool)
+        }
+        (left, right) => Err(format!(
+            "expected int comparison, found {left:?} and {right:?}"
+        )),
+    }
+}
+
+fn compare_ints(op: &str, left: i64, right: i64) -> Result<bool, String> {
+    match op {
+        "<" | "OpLt" => Ok(left < right),
+        "<=" | "OpLe" => Ok(left <= right),
+        ">" | "OpGt" => Ok(left > right),
+        ">=" | "OpGe" => Ok(left >= right),
+        _ => Err(format!("unsupported explicit-state int comparison `{op}`")),
+    }
+}
+
+fn compare_reals(op: &str, left: &str, right: &str) -> Result<bool, String> {
+    let left = left
+        .parse::<f64>()
+        .map_err(|_| format!("invalid explicit-state real literal `{left}`"))?;
+    let right = right
+        .parse::<f64>()
+        .map_err(|_| format!("invalid explicit-state real literal `{right}`"))?;
+    match op {
+        "<" | "OpLt" => Ok(left < right),
+        "<=" | "OpLe" => Ok(left <= right),
+        ">" | "OpGt" => Ok(left > right),
+        ">=" | "OpGe" => Ok(left >= right),
+        _ => Err(format!("unsupported explicit-state real comparison `{op}`")),
+    }
+}
+
+fn eval_domain_literal_comparison(
+    domain: &ExplicitIntDomain,
+    op: &str,
+    value: i64,
+) -> Result<bool, String> {
+    match op {
+        ">" | "OpGt" if int_domain_entails_gt(domain, value) => Ok(true),
+        ">" | "OpGt" if int_domain_entails_le(domain, value) => Ok(false),
+        ">=" | "OpGe" if int_domain_entails_ge(domain, value) => Ok(true),
+        ">=" | "OpGe" if int_domain_entails_lt(domain, value) => Ok(false),
+        "<" | "OpLt" if int_domain_entails_lt(domain, value) => Ok(true),
+        "<" | "OpLt" if int_domain_entails_ge(domain, value) => Ok(false),
+        "<=" | "OpLe" if int_domain_entails_le(domain, value) => Ok(true),
+        "<=" | "OpLe" if int_domain_entails_gt(domain, value) => Ok(false),
+        _ => Err("explicit-state int domain comparison is not determined".to_owned()),
+    }
+}
+
+fn int_domain_entails_gt(domain: &ExplicitIntDomain, value: i64) -> bool {
+    domain.lower.is_some_and(|bound| {
+        if bound.inclusive {
+            bound.value > value
+        } else {
+            bound.value >= value
+        }
+    })
+}
+
+fn int_domain_entails_ge(domain: &ExplicitIntDomain, value: i64) -> bool {
+    domain.lower.is_some_and(|bound| bound.value >= value)
+}
+
+fn int_domain_entails_lt(domain: &ExplicitIntDomain, value: i64) -> bool {
+    domain.upper.is_some_and(|bound| {
+        if bound.inclusive {
+            bound.value < value
+        } else {
+            bound.value <= value
+        }
+    })
+}
+
+fn int_domain_entails_le(domain: &ExplicitIntDomain, value: i64) -> bool {
+    domain.upper.is_some_and(|bound| bound.value <= value)
+}
+
+fn int_domain_contains(domain: &ExplicitIntDomain, value: i64) -> bool {
+    !int_domain_entails_gt(domain, value) && !int_domain_entails_lt(domain, value)
+}
+
+fn int_domain_is_singleton_value(domain: &ExplicitIntDomain, value: i64) -> bool {
+    int_domain_entails_ge(domain, value)
+        && int_domain_entails_le(domain, value)
+        && int_domain_contains(domain, value)
+}
+
 fn expect_int(value: ExplicitValue) -> Result<i64, String> {
     match value {
         ExplicitValue::Int(value) => Ok(value),
@@ -5263,7 +6159,26 @@ fn expect_bool(value: ExplicitValue) -> Result<bool, String> {
 }
 
 fn finite_default_value(field: &IRField) -> Result<ExplicitValue, String> {
-    match (&field.ty, field.default.as_ref()) {
+    let runtime_ty = explicit_runtime_type(&field.ty);
+    match (runtime_ty, field.default.as_ref()) {
+        (IRType::Int, Some(default)) => match eval_static_finite_expr_for_type(default, &field.ty)?
+        {
+            ExplicitValue::Int(value) => Ok(ExplicitValue::Int(value)),
+            _ => Err(format!(
+                "unsupported explicit-state field `{}`; int default must evaluate to int",
+                field.name
+            )),
+        },
+        (IRType::Int, None) => Ok(ExplicitValue::Int(0)),
+        (IRType::String, Some(default)) => {
+            match eval_static_finite_expr_for_type(default, &field.ty)? {
+                ExplicitValue::Str(value) => Ok(ExplicitValue::Str(value)),
+                _ => Err(format!(
+                    "unsupported explicit-state field `{}`; string default must evaluate to string",
+                    field.name
+                )),
+            }
+        }
         (IRType::Bool, Some(default)) => match eval_static_finite_expr_for_type(default, &field.ty)?
         {
             ExplicitValue::Bool(value) => Ok(ExplicitValue::Bool(value)),
@@ -5303,7 +6218,7 @@ fn finite_default_value(field: &IRField) -> Result<ExplicitValue, String> {
         }
         (IRType::Identity, None) => Ok(ExplicitValue::Identity("__explicit_identity__".to_owned())),
         _ => Err(format!(
-            "unsupported explicit-state field `{}`; only Bool, identity, and fieldless enums with deterministic defaults are supported",
+            "unsupported explicit-state field `{}`; only Bool, Int, String with deterministic defaults, identity, and finite enums are supported",
             field.name
         )),
     }
@@ -5336,7 +6251,7 @@ fn unconstrained_payload_initial_values(
 }
 
 fn finite_values_for_type(ty: &IRType) -> Result<Vec<ExplicitValue>, String> {
-    match ty {
+    match explicit_runtime_type(ty) {
         IRType::Bool => Ok(vec![ExplicitValue::Bool(false), ExplicitValue::Bool(true)]),
         IRType::Enum { name, variants }
             if variants.iter().all(|variant| {
@@ -5413,6 +6328,14 @@ fn eval_static_finite_expr_with_locals(
             value: LitVal::Bool { value },
             ..
         } => Ok(ExplicitValue::Bool(*value)),
+        IRExpr::Lit {
+            value: LitVal::Int { value },
+            ..
+        } => Ok(ExplicitValue::Int(*value)),
+        IRExpr::Lit {
+            value: LitVal::Str { value },
+            ..
+        } => Ok(ExplicitValue::Str(value.clone())),
         IRExpr::Ctor {
             enum_name,
             ctor,
@@ -5523,7 +6446,19 @@ fn eval_static_finite_expr_with_locals(
 }
 
 fn supports_explicit_param_type(ty: &IRType) -> bool {
-    matches!(ty, IRType::Entity { .. }) || finite_values_for_type(ty).is_ok()
+    matches!(explicit_runtime_type(ty), IRType::Entity { .. }) || finite_values_for_type(ty).is_ok()
+}
+
+fn explicit_runtime_type(ty: &IRType) -> &IRType {
+    let mut current = ty;
+    while let IRType::Refinement { base, .. } = current {
+        current = base;
+    }
+    current
+}
+
+fn is_unbounded_explicit_int_field(ty: &IRType, initial_constraint: Option<&IRExpr>) -> bool {
+    matches!(explicit_runtime_type(ty), IRType::Int) && initial_constraint.is_none()
 }
 
 fn ensure_supported_explicit_param_type(ty: &IRType) -> Result<(), String> {
@@ -5539,7 +6474,7 @@ fn finite_values_for_param(
     state: &ExplicitState,
     entity_specs: &[ExplicitEntitySpec<'_>],
 ) -> Result<Vec<ExplicitValue>, String> {
-    match ty {
+    match explicit_runtime_type(ty) {
         IRType::Entity { name } => {
             let Some((entity_index, spec)) = entity_specs
                 .iter()
@@ -5602,7 +6537,10 @@ fn enumerate_param_bindings_for_state(
 fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
     match value {
         ExplicitValue::Int(value) => op::WitnessValue::Int(*value),
+        ExplicitValue::IntDomain(domain) => op::WitnessValue::Int(domain.representative),
+        ExplicitValue::Real(value) => op::WitnessValue::Real(value.clone()),
         ExplicitValue::Bool(value) => op::WitnessValue::Bool(*value),
+        ExplicitValue::Str(value) => op::WitnessValue::String(value.clone()),
         ExplicitValue::Enum {
             enum_name,
             variant,
@@ -5653,7 +6591,10 @@ fn render_choice_suffix(tuple: &[ExplicitChoiceBinding]) -> String {
 fn render_explicit_value(value: &ExplicitValue) -> String {
     match value {
         ExplicitValue::Int(value) => value.to_string(),
+        ExplicitValue::IntDomain(domain) => domain.representative.to_string(),
+        ExplicitValue::Real(value) => value.clone(),
         ExplicitValue::Bool(value) => value.to_string(),
+        ExplicitValue::Str(value) => value.clone(),
         ExplicitValue::Enum { variant, .. } => variant.clone(),
         ExplicitValue::Identity(value) => value.clone(),
         ExplicitValue::SlotRef(slot_ref) => format!("{}#{}", slot_ref.entity(), slot_ref.slot()),
@@ -5925,6 +6866,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6121,6 +7063,41 @@ mod tests {
             .unwrap(),
             ExplicitValue::Bool(true)
         );
+
+        let inactive_only = ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![vec![
+                ExplicitEntitySlotState {
+                    active: false,
+                    values: vec![ExplicitValue::Bool(false)],
+                },
+                ExplicitEntitySlotState {
+                    active: false,
+                    values: vec![ExplicitValue::Bool(false)],
+                },
+            ]],
+        };
+        let forall_false = IRExpr::Forall {
+            var: "t".to_owned(),
+            domain: IRType::Entity {
+                name: "Task".to_owned(),
+            },
+            body: Box::new(bool_lit(false)),
+            span: None,
+        };
+        assert_eq!(
+            eval_expr(
+                &inactive_only,
+                &forall_false,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &HashMap::new(),
+            )
+            .unwrap(),
+            ExplicitValue::Bool(true)
+        );
         assert!(eval_expr(
             &state,
             &var("missing", IRType::Bool),
@@ -6152,8 +7129,9 @@ mod tests {
 
         let states = enumerate_initial_states(
             &[spec],
-            &HashMap::from([((0usize, 0usize), true)]),
+            &HashSet::from([(0usize, 0usize)]),
             vec![vec![]],
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -6195,8 +7173,9 @@ mod tests {
             .expect("payload initial constraints should validate as explicit-state finite");
         let states = enumerate_initial_states(
             &[spec],
-            &HashMap::from([((0usize, 0usize), true)]),
+            &HashSet::from([(0usize, 0usize)]),
             vec![vec![]],
+            &HashMap::new(),
         )
         .expect("payload initial constraints should enumerate finite values");
 
@@ -6233,8 +7212,9 @@ mod tests {
             .expect("unconstrained payload fields should validate as finite explicit-state fields");
         let states = enumerate_initial_states(
             &[spec],
-            &HashMap::from([((0usize, 0usize), true)]),
+            &HashSet::from([(0usize, 0usize)]),
             vec![vec![]],
+            &HashMap::new(),
         )
         .expect("unconstrained payload fields should enumerate finite values");
 
@@ -6304,6 +7284,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6511,6 +7492,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6568,6 +7550,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6580,17 +7563,22 @@ mod tests {
             args: vec![],
         };
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             std::slice::from_ref(&action),
-            "Sys",
-            &HashMap::new(),
-            &HashMap::new(),
-            &model.entity_specs,
-            &[],
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Sys",
+                system_fields: &HashMap::new(),
+                entity_specs: &model.entity_specs,
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &HashMap::new(),
+                value_locals: &HashSet::new(),
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("bare entity Apply targets should validate for explicit-state");
 
@@ -6626,6 +7614,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6638,17 +7627,22 @@ mod tests {
             ops: vec![],
         };
 
+        let mut active_calls = HashSet::new();
         let validated = validate_actions(
             std::slice::from_ref(&action),
-            "Sys",
-            &HashMap::new(),
-            &HashMap::new(),
-            &model.entity_specs,
-            &[],
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Sys",
+                system_fields: &HashMap::new(),
+                entity_specs: &model.entity_specs,
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &HashMap::new(),
+                value_locals: &HashSet::new(),
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("empty choose bodies are finite no-op choices");
 
@@ -6694,6 +7688,8 @@ mod tests {
             system_fields: vec![ExplicitFieldRef {
                 system: "Billing".to_owned(),
                 field: "charged".to_owned(),
+                ty: IRType::Bool,
+                initial_constraint: None,
             }],
             system_field_indices: system_fields.clone(),
             entity_specs: vec![],
@@ -6703,6 +7699,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6740,17 +7737,22 @@ mod tests {
             }],
         };
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             std::slice::from_ref(&action),
-            "Billing",
-            &system_fields,
-            &system_field_types,
-            &model.entity_specs,
-            &[],
-            &HashMap::new(),
-            &value_names,
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Billing",
+                system_fields: &system_fields,
+                entity_specs: &model.entity_specs,
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &system_field_types,
+                value_locals: &value_names,
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("action match payload bindings should scope over guards and bodies");
 
@@ -6842,17 +7844,22 @@ mod tests {
         };
         let entity_specs = vec![ticket_spec];
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             std::slice::from_ref(&action),
-            "Queue",
-            &system_fields,
-            &system_field_types,
-            &entity_specs,
-            &steps,
-            &step_indices,
-            &HashSet::new(),
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Queue",
+                system_fields: &system_fields,
+                entity_specs: &entity_specs,
+                steps: &steps,
+                step_indices: &step_indices,
+            },
+            ExplicitValidationScope {
+                system_field_types: &system_field_types,
+                value_locals: &HashSet::new(),
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("cross-call args should validate against choose slot fields");
 
@@ -6861,6 +7868,8 @@ mod tests {
             system_fields: vec![ExplicitFieldRef {
                 system: "Audit".to_owned(),
                 field: "recorded".to_owned(),
+                ty: IRType::Bool,
+                initial_constraint: None,
             }],
             system_field_indices: system_fields,
             entity_specs,
@@ -6870,6 +7879,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -6941,17 +7951,22 @@ mod tests {
         let value_names = HashSet::from(["ticket".to_owned()]);
         let entity_specs = vec![ticket_spec];
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             std::slice::from_ref(&action),
-            "Queue",
-            &HashMap::new(),
-            &system_field_types,
-            &entity_specs,
-            &[],
-            &HashMap::new(),
-            &value_names,
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Queue",
+                system_fields: &HashMap::new(),
+                entity_specs: &entity_specs,
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &system_field_types,
+                value_locals: &value_names,
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("entity step parameters should validate as entity action targets");
 
@@ -6966,6 +7981,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7063,17 +8079,22 @@ mod tests {
         let value_names = HashSet::from(["ticket".to_owned(), "other".to_owned()]);
         let entity_specs = vec![ticket_spec];
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             std::slice::from_ref(&action),
-            "Queue",
-            &HashMap::new(),
-            &system_field_types,
-            &entity_specs,
-            &[],
-            &HashMap::new(),
-            &value_names,
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Queue",
+                system_fields: &HashMap::new(),
+                entity_specs: &entity_specs,
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &system_field_types,
+                value_locals: &value_names,
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("entity step parameters should validate as entity action refs");
 
@@ -7088,6 +8109,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7220,17 +8242,22 @@ mod tests {
             },
         ];
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             &actions,
-            "Queue",
-            &HashMap::new(),
-            &HashMap::new(),
-            &entity_specs,
-            &steps,
-            &step_indices,
-            &HashSet::new(),
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Queue",
+                system_fields: &HashMap::new(),
+                entity_specs: &entity_specs,
+                steps: &steps,
+                step_indices: &step_indices,
+            },
+            ExplicitValidationScope {
+                system_field_types: &HashMap::new(),
+                value_locals: &HashSet::new(),
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("entity choose cross-call returns should validate");
 
@@ -7245,6 +8272,7 @@ mod tests {
             safety_properties: vec![],
             liveness_monitors: vec![],
             extern_assume_exprs: vec![],
+            initial_constraints: vec![],
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7314,17 +8342,22 @@ mod tests {
             ),
         };
 
+        let mut active_calls = HashSet::new();
         validate_actions(
             &[action],
-            "Gate",
-            &system_fields,
-            &system_field_types,
-            &[],
-            &[],
-            &HashMap::new(),
-            &value_names,
-            &HashMap::new(),
-            &mut HashSet::new(),
+            &ExplicitValidationCtx {
+                current_system: "Gate",
+                system_fields: &system_fields,
+                entity_specs: &[],
+                steps: &[],
+                step_indices: &HashMap::new(),
+            },
+            ExplicitValidationScope {
+                system_field_types: &system_field_types,
+                value_locals: &value_names,
+                slot_locals: &HashMap::new(),
+            },
+            &mut active_calls,
         )
         .expect("payload enum step parameters should support payload field projection");
     }

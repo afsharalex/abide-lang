@@ -1,3 +1,11 @@
+//! Relational witnesses — flat (state, relation, tuple) models
+//! produced by the SAT-backed relational fragment of the verifier.
+//!
+//! Unlike operational witnesses, relational witnesses have no time
+//! dimension. A [`RelationalWitness`] is either a single
+//! [`RelationalState`] snapshot, or a pair (`before`, `after`) for
+//! transition obligations on relational specs.
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -6,12 +14,20 @@ use serde::{Deserialize, Serialize};
 use crate::value::{EntitySlotRef, WitnessValue};
 
 /// Identity of a first-class relation inside a relational witness state.
+///
+/// The variants line up with the four sources of relations in an
+/// Abide spec: store membership, entity fields lifted as relations,
+/// explicit relation declarations, and `derived` relations.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RelationId {
+    /// `extent[store]` — membership relation of a `Store<T>`.
     StoreExtent { store: String },
+    /// `owner.field` lifted as a binary relation.
     Field { owner: String, field: String },
+    /// Top-level `Rel<...>` declaration with a name.
     Named { name: String },
+    /// Derived relation introduced by a `derived` declaration.
     Derived { name: String },
 }
 
@@ -57,6 +73,9 @@ impl RelationId {
 }
 
 /// Concrete tuple carried in a relational witness.
+///
+/// Tuples have positional semantics; their arity must match the
+/// arity declared by their containing [`RelationInstance`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TupleValue {
     values: Vec<WitnessValue>,
@@ -76,7 +95,10 @@ impl TupleValue {
     }
 }
 
-/// A finite relation instance.
+/// A finite relation instance — set of tuples of a fixed arity.
+///
+/// Constructed through [`Self::builder`], which validates that every
+/// pushed tuple matches the declared arity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationInstance {
     arity: usize,
@@ -150,6 +172,10 @@ impl RelationInstanceBuilder {
 
 /// One named relation instance inside a relational witness state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One [`RelationInstance`] paired with its [`RelationId`].
+///
+/// `RelationalState` carries a list of these rather than a map so the
+/// serialized order is deterministic.
 pub struct NamedRelationInstance {
     id: RelationId,
     relation: RelationInstance,
@@ -170,6 +196,10 @@ impl NamedRelationInstance {
 }
 
 /// One relational snapshot or temporal state.
+///
+/// Holds the relation instances inhabiting this state plus a flat map
+/// of named scalar evaluations (e.g. `count > 3`). The relation list
+/// is sorted-by-insertion to keep serialization stable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RelationalState {
     relations: Vec<NamedRelationInstance>,
@@ -337,7 +367,12 @@ impl RelationalStateBuilder {
     }
 }
 
-/// Bounded temporal relational witness.
+/// Bounded temporal relational witness — a finite sequence of
+/// [`RelationalState`]s, optionally closed into a lasso.
+///
+/// When `loop_start` is `Some(i)`, the trace conceptually repeats
+/// `states[i..]` forever (modeling a liveness counterexample at the
+/// relational layer). When `None`, the trace is a flat prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalRelationalWitness {
     states: Vec<RelationalState>,
@@ -394,10 +429,17 @@ impl TemporalRelationalWitness {
 }
 
 /// Native relational witness payload.
+///
+/// A `Snapshot` is one [`RelationalState`] — the shape returned by
+/// satisfying a relational scene. `Temporal` is a sequence (optionally
+/// a lasso) — the shape returned when a relational invariant is
+/// refuted across multiple states.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum RelationalWitness {
+    /// Single-state model.
     Snapshot(RelationalState),
+    /// Multi-state (optionally lasso-closed) model.
     Temporal(TemporalRelationalWitness),
 }
 
@@ -434,28 +476,37 @@ impl RelationalWitness {
     }
 }
 
+/// Errors produced when constructing or validating a relational
+/// witness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// Field-relation owner name was empty.
     EmptyFieldOwner,
+    /// Field-relation field name was empty.
     EmptyFieldName,
+    /// Store-extent store name was empty.
     EmptyStoreName,
+    /// Named-relation name was empty.
     EmptyRelationName,
+    /// Derived-relation name was empty.
     EmptyDerivedRelationName,
+    /// Scalar-evaluation key was empty.
     EmptyEvaluationName,
+    /// A temporal witness was constructed with no states.
     EmptyStateSequence,
-    TupleArityMismatch {
-        expected: usize,
-        actual: usize,
-    },
+    /// A tuple pushed into a [`RelationInstance`] had the wrong arity.
+    TupleArityMismatch { expected: usize, actual: usize },
+    /// A relation contained the same tuple twice.
     DuplicateTuple,
+    /// Two relations in one state shared a [`RelationId`].
     DuplicateRelationId,
-    StoreExtentArityMismatch {
-        actual: usize,
-    },
+    /// A `StoreExtent` relation had arity ≠ 1.
+    StoreExtentArityMismatch { actual: usize },
+    /// A `StoreExtent` member was not a [`WitnessValue::SlotRef`].
     StoreExtentMemberMustBeSlotRef,
-    FieldRelationArityMismatch {
-        actual: usize,
-    },
+    /// A `Field` relation had arity ≠ 2.
+    FieldRelationArityMismatch { actual: usize },
+    /// Temporal `loop_start` index points past the end of the states.
     LoopOutOfBounds {
         loop_start: usize,
         states_len: usize,

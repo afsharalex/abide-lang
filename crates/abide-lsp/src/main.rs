@@ -1,3 +1,25 @@
+//! Abide Language Server (`abide-lsp`).
+//!
+//! Implements the Language Server Protocol on top of the `abide`
+//! library's IDE primitives. The server is a thin shim:
+//!
+//! - [`LspState`] holds the compiler workspace and the set of currently
+//!   open documents. Edits flow through `did_open` / `did_change` into
+//!   [`abide::workspace::CompilerWorkspace`].
+//! - [`Backend`] implements [`tower_lsp::LanguageServer`]. Each LSP
+//!   request rebuilds the workspace index on demand via
+//!   [`abide::ide::build_workspace_index`] — there is no incremental
+//!   query layer here, the IDE crate is the authority for symbol and
+//!   completion lookups.
+//! - Diagnostics are republished per-root-file. `published_by_root`
+//!   tracks which URIs each root last pushed diagnostics to so that
+//!   stale diagnostics can be cleared when an error moves out of a
+//!   file.
+//!
+//! The free functions at the bottom translate between Abide's flat
+//! byte-offset [`Span`](abide::span::Span) and LSP's
+//! line/column [`Position`].
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,15 +36,30 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+/// Tracking record for one open editor buffer.
+///
+/// `version` is the monotonic LSP document version — used by
+/// [`LspState::should_accept_document_version`] to drop out-of-order
+/// edits.
 #[derive(Debug)]
 struct OpenDocument {
     file_id: FileId,
     version: i32,
 }
 
+/// Per-server-instance state shared behind a `tokio::Mutex`.
+///
+/// Holds the compiler workspace (source for every file the LSP has
+/// touched), the set of buffers the editor currently has open, and a
+/// publication ledger so we can clear stale diagnostics when files drop
+/// out of the result set.
 struct LspState {
     workspace: CompilerWorkspace,
     documents: HashMap<Url, OpenDocument>,
+    /// For each root file we elaborate, the URIs we last published
+    /// diagnostics to. Needed because a single elaboration may touch
+    /// many files, and when a fix removes errors from one of them we
+    /// must explicitly republish empty diagnostics for that URI.
     published_by_root: HashMap<FileId, HashSet<Url>>,
 }
 
@@ -35,6 +72,9 @@ impl LspState {
         }
     }
 
+    /// Returns `true` if `version` is strictly newer than the version we
+    /// last recorded for `uri`, or if we have no record. Used to drop
+    /// out-of-order edits the editor can send under heavy typing.
     fn should_accept_document_version(&self, uri: &Url, version: i32) -> bool {
         self.documents
             .get(uri)
@@ -45,6 +85,10 @@ impl LspState {
         self.documents.get(uri).map(|doc| doc.version)
     }
 
+    /// Returns `true` if some root file *other than* `root_file_id`
+    /// still owns diagnostics for `uri`. We use this to avoid blanking
+    /// `uri`'s diagnostics when only one of multiple roots stops
+    /// reporting against it.
     fn uri_published_elsewhere(&self, root_file_id: FileId, uri: &Url) -> bool {
         self.published_by_root
             .iter()
@@ -52,6 +96,8 @@ impl LspState {
     }
 }
 
+/// LSP request handler. All async methods serialize through the
+/// `state` mutex.
 struct Backend {
     client: Client,
     state: Arc<Mutex<LspState>>,
@@ -302,6 +348,10 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    /// Registers (or updates) the editor buffer at `uri` with the given
+    /// `version` and `text`, and pushes the new source into the
+    /// workspace. Returns the workspace `FileId` if the update was
+    /// accepted, or `None` if a newer version was already recorded.
     async fn upsert_document(&self, uri: &Url, version: i32, text: String) -> Option<FileId> {
         let path = uri.to_file_path().ok()?;
         let mut state = self.state.lock().await;
@@ -321,6 +371,11 @@ impl Backend {
         Some(file_id)
     }
 
+    /// Re-elaborates `root_file_id`, collects the resulting diagnostics
+    /// grouped by URI, and publishes them. Diagnostics for URIs that
+    /// used to be reported by this root but no longer are get cleared
+    /// (unless another root still reports against them — see
+    /// [`LspState::uri_published_elsewhere`]).
     async fn refresh_diagnostics(&self, root_file_id: FileId) {
         let (publish, stale, versions, log_error) = {
             let mut state = self.state.lock().await;
@@ -605,6 +660,13 @@ fn keyword_completions(context: CompletionContext) -> Vec<CompletionItem> {
         .collect()
 }
 
+/// Translates an LSP (line, character) [`Position`] to a byte offset
+/// into `source`.
+///
+/// LSP characters are UTF-16 code units in spec but most clients emit
+/// UTF-8 code units; we follow the source verbatim using
+/// [`str::char_indices`], which matches the rest of the compiler's
+/// span model. Returns `None` when the position is past EOF.
 fn position_to_offset(source: &str, position: Position) -> Option<usize> {
     let mut line = 0_u32;
     let mut offset = 0_usize;
@@ -635,6 +697,8 @@ fn position_to_offset(source: &str, position: Position) -> Option<usize> {
     }
 }
 
+/// Maps an Abide byte-offset span into an LSP [`Range`] by resolving
+/// each endpoint with [`offset_to_position`].
 fn range_from_span(source: &str, span: abide::span::Span) -> Option<Range> {
     Some(Range {
         start: offset_to_position(source, span.start)?,
@@ -642,6 +706,8 @@ fn range_from_span(source: &str, span: abide::span::Span) -> Option<Range> {
     })
 }
 
+/// Inverse of [`position_to_offset`]: walks `source` counting
+/// newlines to recover the (line, column) coordinates of `offset`.
 fn offset_to_position(source: &str, offset: usize) -> Option<Position> {
     if offset > source.len() {
         return None;

@@ -1,3 +1,12 @@
+//! Multi-file compiler workspace shared by the CLI driver and the LSP.
+//!
+//! The workspace owns the source text and provides cached `parse →
+//! elaborate → lower → verify` queries keyed by [`FileId`] and (for
+//! verify) by [`VerifyConfig`]. Cache entries are invalidated by
+//! tracking each query's dependency set against the per-path version
+//! counter; bumping a file's source bumps its version and forces a
+//! recompute of every downstream cached query.
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -10,6 +19,8 @@ use crate::ir::LowerDiagnostics;
 use crate::loader::{self, SourceProvider};
 use crate::verify::VerifyConfig;
 
+/// Opaque per-workspace identifier for a source file. Issued in
+/// monotonic order from `next_file_id`; never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(u32);
 
@@ -81,6 +92,12 @@ struct VerifyCacheKey {
     config: VerifyConfigKey,
 }
 
+/// Long-lived compiler workspace.
+///
+/// One instance is held by the LSP for a session and by the CLI when
+/// running multiple subcommands against the same source tree. The
+/// caches make repeated queries (e.g. hover after a tiny edit) cheap
+/// when no dependency has changed.
 pub struct CompilerWorkspace {
     root_dir: PathBuf,
     next_file_id: u32,

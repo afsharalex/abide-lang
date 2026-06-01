@@ -2028,12 +2028,14 @@ fn sygus_single_entity_transition_supports_postconditions() {
     encode_transition(
         &tm,
         &entity.transitions[0],
-        &entity.fields,
-        &entity.derived_fields,
-        &entity.fsm_decls,
-        &curr_vars,
-        &next_vars,
-        &enum_catalog,
+        SygusTransitionScope {
+            fields: &entity.fields,
+            derived_fields: &entity.derived_fields,
+            fsm_decls: &entity.fsm_decls,
+            curr_vars: &curr_vars,
+            next_vars: &next_vars,
+            enum_catalog: &enum_catalog,
+        },
     )
     .unwrap_or_else(|err| panic!("single-entity transition postcondition should encode: {err}"));
 }
@@ -2102,12 +2104,14 @@ fn sygus_single_entity_transition_supports_fsm_constraints() {
     encode_transition(
         &tm,
         &entity.transitions[0],
-        &entity.fields,
-        &entity.derived_fields,
-        &entity.fsm_decls,
-        &curr_vars,
-        &next_vars,
-        &enum_catalog,
+        SygusTransitionScope {
+            fields: &entity.fields,
+            derived_fields: &entity.derived_fields,
+            fsm_decls: &entity.fsm_decls,
+            curr_vars: &curr_vars,
+            next_vars: &next_vars,
+            enum_catalog: &enum_catalog,
+        },
     )
     .unwrap_or_else(|err| panic!("single-entity transition FSM constraint should encode: {err}"));
 }

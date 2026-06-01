@@ -1,3 +1,7 @@
+//! IDE primitives shared by `abide-lsp`, `abide explain`, and the
+//! REPL. Provides a flattened symbol index over a workspace plus
+//! offset-keyed lookup (identifier-at, completion-context) routines.
+
 use std::collections::BTreeSet;
 
 use crate::ast::{
@@ -7,6 +11,11 @@ use crate::driver;
 use crate::span::Span;
 use crate::workspace::{CompilerWorkspace, FileId};
 
+/// Kind label for a symbol exposed to the IDE.
+///
+/// Used by the LSP to map symbols to `lsp_types::CompletionItemKind`
+/// and to disambiguate entries with the same name. [`Self::sort_rank`]
+/// orders completion results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdeSymbolKind {
     Module,
@@ -91,13 +100,23 @@ impl IdeSymbolKind {
     }
 }
 
+/// Cursor position context for completion. Determined by looking at
+/// the character just before the cursor: `@` opens enum-constructor
+/// completion, `.` opens field/member completion, anything else falls
+/// through to general completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionContext {
+    /// No special trigger character — show all keywords and top-level
+    /// symbols.
     General,
+    /// Cursor immediately after `@` — show enum constructors.
     AfterAt,
+    /// Cursor immediately after `.` — show field/member names.
     AfterDot,
 }
 
+/// One indexed symbol — a name with a declaration site, kind, and
+/// human-readable `detail` (used as the LSP hover body).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdeSymbol {
     pub name: String,
@@ -107,6 +126,9 @@ pub struct IdeSymbol {
     pub detail: String,
 }
 
+/// One occurrence of a name in source text. Multiple occurrences may
+/// reference the same [`IdeSymbol`]; the LSP uses these for
+/// `references` and `rename`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdeOccurrence {
     pub name: String,
@@ -114,6 +136,9 @@ pub struct IdeOccurrence {
     pub span: Span,
 }
 
+/// Flat per-workspace index of symbols and their textual occurrences.
+/// Rebuilt eagerly each request — there is no incremental layer
+/// (latency is dominated by parsing, not indexing).
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceIndex {
     pub symbols: Vec<IdeSymbol>,
@@ -121,6 +146,8 @@ pub struct WorkspaceIndex {
 }
 
 impl WorkspaceIndex {
+    /// Returns every indexed symbol named `name`, ordered by
+    /// [`IdeSymbolKind::sort_rank`] so highest-priority kinds come first.
     #[must_use]
     pub fn symbols_named(&self, name: &str) -> Vec<&IdeSymbol> {
         let mut matches: Vec<_> = self
@@ -132,6 +159,8 @@ impl WorkspaceIndex {
         matches
     }
 
+    /// Returns the subset of indexed symbols offered as completions in
+    /// the given [`CompletionContext`].
     #[must_use]
     pub fn completion_symbols(&self, context: CompletionContext) -> Vec<&IdeSymbol> {
         self.symbols
@@ -166,6 +195,8 @@ impl WorkspaceIndex {
     }
 }
 
+/// Classifies the trigger character immediately before `offset` in
+/// `source`, returning the relevant [`CompletionContext`].
 #[must_use]
 pub fn completion_context(source: &str, offset: usize) -> CompletionContext {
     let prefix = &source[..offset.min(source.len())];
@@ -177,6 +208,8 @@ pub fn completion_context(source: &str, offset: usize) -> CompletionContext {
     }
 }
 
+/// Rebuilds the full workspace index from scratch by walking every
+/// known file's parsed program and token stream.
 pub fn build_workspace_index(workspace: &mut CompilerWorkspace) -> miette::Result<WorkspaceIndex> {
     let mut index = WorkspaceIndex::default();
     for (file_id, _) in workspace.known_files() {
@@ -205,6 +238,8 @@ pub fn build_workspace_index(workspace: &mut CompilerWorkspace) -> miette::Resul
     Ok(index)
 }
 
+/// Returns the [`IdeOccurrence`] under `offset` in `file_id`, or
+/// `None` if the offset is not on an identifier.
 pub fn identifier_at(
     workspace: &mut CompilerWorkspace,
     file_id: FileId,
@@ -277,455 +312,175 @@ fn collect_program_symbols(
     program: &Program,
     tokens: &[(crate::lex::Token, Span)],
 ) {
-    for decl in &program.decls {
+    SymbolCollector {
+        out,
+        file_id,
+        source,
+        tokens,
+    }
+    .collect_program(program);
+}
+
+struct SymbolCollector<'a> {
+    out: &'a mut Vec<IdeSymbol>,
+    file_id: FileId,
+    source: &'a str,
+    tokens: &'a [(crate::lex::Token, Span)],
+}
+
+impl SymbolCollector<'_> {
+    fn collect_program(&mut self, program: &Program) {
+        for decl in &program.decls {
+            self.collect_top_decl(decl);
+        }
+    }
+
+    fn collect_top_decl(&mut self, decl: &TopDecl) {
         match decl {
-            TopDecl::Module(module) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                module.span,
-                &module.name,
-                IdeSymbolKind::Module,
-            ),
-            TopDecl::Const(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Const,
-            ),
-            TopDecl::Fn(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Function,
-            ),
-            TopDecl::Type(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Type,
-                );
-                for variant in &decl.variants {
-                    match variant {
-                        TypeVariant::Simple { name, span }
-                        | TypeVariant::Tuple { name, span, .. }
-                        | TypeVariant::Record { name, span, .. }
-                        | TypeVariant::Param { name, span, .. } => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                *span,
-                                name,
-                                IdeSymbolKind::Variant,
-                            );
-                        }
-                    }
-                }
-            }
+            TopDecl::Module(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Module),
+            TopDecl::Const(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Const),
+            TopDecl::Fn(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Function),
+            TopDecl::Type(decl) => self.collect_type_decl(decl),
             TopDecl::Record(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Record,
-                );
+                self.symbol(decl.span, &decl.name, IdeSymbolKind::Record);
                 for field in &decl.fields {
-                    push_symbol(
-                        out,
-                        file_id,
-                        source,
-                        tokens,
-                        field.span,
-                        &field.name,
-                        IdeSymbolKind::Field,
-                    );
+                    self.symbol(field.span, &field.name, IdeSymbolKind::Field);
                 }
             }
-            TopDecl::Alias(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Alias,
-            ),
-            TopDecl::Newtype(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Newtype,
-            ),
-            TopDecl::Entity(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Entity,
-                );
-                for item in &decl.items {
-                    match item {
-                        EntityItem::Field(field) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                field.span,
-                                &field.name,
-                                IdeSymbolKind::Field,
-                            );
-                        }
-                        EntityItem::Action(action) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                action.span,
-                                &action.name,
-                                IdeSymbolKind::Action,
-                            );
-                        }
-                        EntityItem::Derived(derived) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                derived.span,
-                                &derived.name,
-                                IdeSymbolKind::Derived,
-                            );
-                        }
-                        EntityItem::Invariant(invariant) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                invariant.span,
-                                &invariant.name,
-                                IdeSymbolKind::Invariant,
-                            );
-                        }
-                        EntityItem::Fsm(fsm) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                fsm.span,
-                                &fsm.field,
-                                IdeSymbolKind::Invariant,
-                            );
-                        }
-                        EntityItem::Error(_) => {}
-                    }
-                }
+            TopDecl::Alias(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Alias),
+            TopDecl::Newtype(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Newtype),
+            TopDecl::Entity(decl) => self.collect_entity_decl(decl),
+            TopDecl::Interface(decl) => self.collect_interface_decl(decl),
+            TopDecl::Extern(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::System),
+            TopDecl::System(decl) => self.collect_system_decl(decl),
+            TopDecl::Proc(decl) => self.collect_proc_decl(decl),
+            TopDecl::Program(decl) => self.collect_program_decl(decl),
+            TopDecl::Pred(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Pred),
+            TopDecl::Prop(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Prop),
+            TopDecl::Verify(VerifyDecl { name, span, .. }) => {
+                self.symbol(*span, name, IdeSymbolKind::Verify);
             }
-            TopDecl::Interface(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Interface,
-                );
-                for item in &decl.items {
-                    match item {
-                        InterfaceItem::Command(command) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                command.span,
-                                &command.name,
-                                IdeSymbolKind::Command,
-                            );
-                        }
-                        InterfaceItem::QuerySig(query) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                query.span,
-                                &query.name,
-                                IdeSymbolKind::Query,
-                            );
-                        }
-                        InterfaceItem::Error(_) => {}
-                    }
-                }
-            }
-            TopDecl::Extern(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::System,
-                );
-            }
-            TopDecl::System(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::System,
-                );
-                for item in &decl.items {
-                    match item {
-                        SystemItem::Field(field) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                field.span,
-                                &field.name,
-                                IdeSymbolKind::Field,
-                            );
-                        }
-                        SystemItem::Dep(_) => {}
-                        SystemItem::Command(command) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                command.span,
-                                &command.name,
-                                IdeSymbolKind::Command,
-                            );
-                        }
-                        SystemItem::Action(action) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                action.span,
-                                &action.name,
-                                IdeSymbolKind::Action,
-                            );
-                        }
-                        SystemItem::Query(query) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                query.span,
-                                &query.name,
-                                IdeSymbolKind::Query,
-                            );
-                        }
-                        SystemItem::Pred(pred) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                pred.span,
-                                &pred.name,
-                                IdeSymbolKind::Pred,
-                            );
-                        }
-                        SystemItem::Derived(derived) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                derived.span,
-                                &derived.name,
-                                IdeSymbolKind::Derived,
-                            );
-                        }
-                        SystemItem::Invariant(invariant) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                invariant.span,
-                                &invariant.name,
-                                IdeSymbolKind::Invariant,
-                            );
-                        }
-                        SystemItem::Fsm(fsm) => {
-                            push_symbol(
-                                out,
-                                file_id,
-                                source,
-                                tokens,
-                                fsm.span,
-                                &fsm.field,
-                                IdeSymbolKind::Invariant,
-                            );
-                        }
-                        SystemItem::Error(_) => {}
-                    }
-                }
-            }
-            TopDecl::Proc(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Proc,
-                );
-                for proc_item in &decl.items {
-                    if let ProcItem::Node { name, span, .. } = proc_item {
-                        push_symbol(
-                            out,
-                            file_id,
-                            source,
-                            tokens,
-                            *span,
-                            name,
-                            IdeSymbolKind::Proc,
-                        );
-                    }
-                }
-            }
-            TopDecl::Program(decl) => {
-                push_symbol(
-                    out,
-                    file_id,
-                    source,
-                    tokens,
-                    decl.span,
-                    &decl.name,
-                    IdeSymbolKind::Program,
-                );
-                for item in &decl.items {
-                    if let crate::ast::ProgramItem::Proc(proc_decl) = item {
-                        push_symbol(
-                            out,
-                            file_id,
-                            source,
-                            tokens,
-                            proc_decl.span,
-                            &proc_decl.name,
-                            IdeSymbolKind::Proc,
-                        );
-                        for proc_item in &proc_decl.items {
-                            if let ProcItem::Node { name, span, .. } = proc_item {
-                                push_symbol(
-                                    out,
-                                    file_id,
-                                    source,
-                                    tokens,
-                                    *span,
-                                    name,
-                                    IdeSymbolKind::Proc,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            TopDecl::Pred(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Pred,
-            ),
-            TopDecl::Prop(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Prop,
-            ),
-            TopDecl::Verify(VerifyDecl { name, span, .. }) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                *span,
-                name,
-                IdeSymbolKind::Verify,
-            ),
-            TopDecl::Theorem(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Theorem,
-            ),
-            TopDecl::Lemma(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Lemma,
-            ),
-            TopDecl::Scene(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Scene,
-            ),
-            TopDecl::Axiom(decl) => push_symbol(
-                out,
-                file_id,
-                source,
-                tokens,
-                decl.span,
-                &decl.name,
-                IdeSymbolKind::Axiom,
-            ),
+            TopDecl::Theorem(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Theorem),
+            TopDecl::Lemma(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Lemma),
+            TopDecl::Scene(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Scene),
+            TopDecl::Axiom(decl) => self.symbol(decl.span, &decl.name, IdeSymbolKind::Axiom),
             TopDecl::Include(_) | TopDecl::Use(_) | TopDecl::Under(_) | TopDecl::Error(_) => {}
         }
+    }
+
+    fn collect_type_decl(&mut self, decl: &crate::ast::TypeDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::Type);
+        for variant in &decl.variants {
+            match variant {
+                TypeVariant::Simple { name, span }
+                | TypeVariant::Tuple { name, span, .. }
+                | TypeVariant::Record { name, span, .. }
+                | TypeVariant::Param { name, span, .. } => {
+                    self.symbol(*span, name, IdeSymbolKind::Variant);
+                }
+            }
+        }
+    }
+
+    fn collect_entity_decl(&mut self, decl: &crate::ast::EntityDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::Entity);
+        for item in &decl.items {
+            match item {
+                EntityItem::Field(field) => {
+                    self.symbol(field.span, &field.name, IdeSymbolKind::Field);
+                }
+                EntityItem::Action(action) => {
+                    self.symbol(action.span, &action.name, IdeSymbolKind::Action);
+                }
+                EntityItem::Derived(derived) => {
+                    self.symbol(derived.span, &derived.name, IdeSymbolKind::Derived);
+                }
+                EntityItem::Invariant(invariant) => {
+                    self.symbol(invariant.span, &invariant.name, IdeSymbolKind::Invariant);
+                }
+                EntityItem::Fsm(fsm) => self.symbol(fsm.span, &fsm.field, IdeSymbolKind::Invariant),
+                EntityItem::Error(_) => {}
+            }
+        }
+    }
+
+    fn collect_interface_decl(&mut self, decl: &crate::ast::InterfaceDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::Interface);
+        for item in &decl.items {
+            match item {
+                InterfaceItem::Command(command) => {
+                    self.symbol(command.span, &command.name, IdeSymbolKind::Command);
+                }
+                InterfaceItem::QuerySig(query) => {
+                    self.symbol(query.span, &query.name, IdeSymbolKind::Query);
+                }
+                InterfaceItem::Error(_) => {}
+            }
+        }
+    }
+
+    fn collect_system_decl(&mut self, decl: &crate::ast::SystemDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::System);
+        for item in &decl.items {
+            match item {
+                SystemItem::Field(field) => {
+                    self.symbol(field.span, &field.name, IdeSymbolKind::Field);
+                }
+                SystemItem::Dep(_) => {}
+                SystemItem::Command(command) => {
+                    self.symbol(command.span, &command.name, IdeSymbolKind::Command);
+                }
+                SystemItem::Action(action) => {
+                    self.symbol(action.span, &action.name, IdeSymbolKind::Action);
+                }
+                SystemItem::Query(query) => {
+                    self.symbol(query.span, &query.name, IdeSymbolKind::Query);
+                }
+                SystemItem::Pred(pred) => self.symbol(pred.span, &pred.name, IdeSymbolKind::Pred),
+                SystemItem::Derived(derived) => {
+                    self.symbol(derived.span, &derived.name, IdeSymbolKind::Derived);
+                }
+                SystemItem::Invariant(invariant) => {
+                    self.symbol(invariant.span, &invariant.name, IdeSymbolKind::Invariant);
+                }
+                SystemItem::Fsm(fsm) => self.symbol(fsm.span, &fsm.field, IdeSymbolKind::Invariant),
+                SystemItem::Error(_) => {}
+            }
+        }
+    }
+
+    fn collect_proc_decl(&mut self, decl: &crate::ast::ProcDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::Proc);
+        self.collect_proc_nodes(&decl.items);
+    }
+
+    fn collect_proc_nodes(&mut self, items: &[ProcItem]) {
+        for proc_item in items {
+            if let ProcItem::Node { name, span, .. } = proc_item {
+                self.symbol(*span, name, IdeSymbolKind::Proc);
+            }
+        }
+    }
+
+    fn collect_program_decl(&mut self, decl: &crate::ast::ProgramDecl) {
+        self.symbol(decl.span, &decl.name, IdeSymbolKind::Program);
+        for item in &decl.items {
+            if let crate::ast::ProgramItem::Proc(proc_decl) = item {
+                self.collect_proc_decl(proc_decl);
+            }
+        }
+    }
+
+    fn symbol(&mut self, span: Span, name: &str, kind: IdeSymbolKind) {
+        push_symbol(
+            self.out,
+            self.file_id,
+            self.source,
+            self.tokens,
+            span,
+            name,
+            kind,
+        );
     }
 }
 

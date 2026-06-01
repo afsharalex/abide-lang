@@ -491,28 +491,49 @@ pub(in crate::verify::ic3) fn ic3_expr_mentions_var(expr: &IRExpr, target: &str)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(in crate::verify::ic3) fn ic3_direct_choose_witness<F>(
-    var: &str,
-    domain: &IRType,
-    predicate: Option<&IRExpr>,
-    locals: &HashSet<String>,
-    mut encode_term: F,
-    mut encode_predicate: impl FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
-    mut match_bindings: impl FnMut(
+pub(in crate::verify::ic3) struct Ic3DirectChooseInput<'a> {
+    pub(in crate::verify::ic3) var: &'a str,
+    pub(in crate::verify::ic3) domain: &'a IRType,
+    pub(in crate::verify::ic3) predicate: Option<&'a IRExpr>,
+    pub(in crate::verify::ic3) locals: &'a HashSet<String>,
+}
+
+pub(in crate::verify::ic3) struct Ic3DirectChooseHooks<F, G, H, J> {
+    pub(in crate::verify::ic3) encode_term: F,
+    pub(in crate::verify::ic3) encode_predicate: G,
+    pub(in crate::verify::ic3) match_bindings: H,
+    pub(in crate::verify::ic3) match_cond: J,
+}
+
+#[derive(Clone, Copy)]
+struct DirectChooseVisitInput<'a> {
+    var: &'a str,
+    domain: &'a IRType,
+    predicate: Option<&'a IRExpr>,
+    locals: &'a HashSet<String>,
+}
+
+pub(in crate::verify::ic3) fn ic3_direct_choose_witness<F, G, H, J>(
+    input: Ic3DirectChooseInput<'_>,
+    mut hooks: Ic3DirectChooseHooks<F, G, H, J>,
+) -> Result<Option<String>, String>
+where
+    F: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+    G: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+    H: FnMut(
         &IRExpr,
         &crate::ir::types::IRPattern,
         &HashSet<String>,
     ) -> Result<Vec<(String, String)>, String>,
-    mut match_cond: impl FnMut(
-        &IRExpr,
-        &crate::ir::types::IRPattern,
-        &HashSet<String>,
-    ) -> Result<String, String>,
-) -> Result<Option<String>, String>
-where
-    F: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+    J: FnMut(&IRExpr, &crate::ir::types::IRPattern, &HashSet<String>) -> Result<String, String>,
 {
+    let Ic3DirectChooseInput {
+        var,
+        domain,
+        predicate,
+        locals,
+    } = input;
+
     #[derive(Clone)]
     enum NumericBound {
         Exact(String),
@@ -737,18 +758,16 @@ where
         }
     }
 
-    fn synthesize_match_var_pattern_witness<F, H, J>(
+    fn synthesize_match_var_pattern_witness<F, G, H, J>(
         domain: &IRType,
         pattern: &crate::ir::types::IRPattern,
         arm_predicate: &IRExpr,
         locals: &HashSet<String>,
-        encode_term: &mut F,
-        encode_predicate: &mut impl FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
-        match_bindings: &mut H,
-        match_cond: &mut J,
+        hooks: &mut Ic3DirectChooseHooks<F, G, H, J>,
     ) -> Result<Option<String>, String>
     where
         F: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+        G: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
         H: FnMut(
             &IRExpr,
             &crate::ir::types::IRPattern,
@@ -764,14 +783,13 @@ where
                 let mut scope = locals.clone();
                 scope.insert(name.clone());
                 visit(
-                    name,
-                    domain,
-                    Some(arm_predicate),
-                    &scope,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        var: name,
+                        domain,
+                        predicate: Some(arm_predicate),
+                        locals: &scope,
+                    },
+                    hooks,
                 )
             }
             IRPattern::PCtor { name, fields } => {
@@ -794,10 +812,7 @@ where
                             &field.pattern,
                             arm_predicate,
                             &scope,
-                            encode_term,
-                            encode_predicate,
-                            match_bindings,
-                            match_cond,
+                            hooks,
                         )?,
                         None => default_witness_for_type(&variant_field.ty),
                     };
@@ -817,19 +832,13 @@ where
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn visit<F, H, J>(
-        var: &str,
-        domain: &IRType,
-        predicate: Option<&IRExpr>,
-        locals: &HashSet<String>,
-        encode_term: &mut F,
-        encode_predicate: &mut impl FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
-        match_bindings: &mut H,
-        match_cond: &mut J,
+    fn visit<F, G, H, J>(
+        input: DirectChooseVisitInput<'_>,
+        hooks: &mut Ic3DirectChooseHooks<F, G, H, J>,
     ) -> Result<Option<String>, String>
     where
         F: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
+        G: FnMut(&IRExpr, &HashSet<String>) -> Result<String, String>,
         H: FnMut(
             &IRExpr,
             &crate::ir::types::IRPattern,
@@ -837,6 +846,12 @@ where
         ) -> Result<Vec<(String, String)>, String>,
         J: FnMut(&IRExpr, &crate::ir::types::IRPattern, &HashSet<String>) -> Result<String, String>,
     {
+        let DirectChooseVisitInput {
+            var,
+            domain,
+            predicate,
+            locals,
+        } = input;
         let Some(predicate) = predicate else {
             return Ok(None);
         };
@@ -847,12 +862,12 @@ where
             } if op == "OpEq" => {
                 if let IRExpr::Var { name, .. } = left.as_ref() {
                     if name == var && !ic3_expr_mentions_var(right, var) {
-                        return Ok(Some(encode_term(right, locals)?));
+                        return Ok(Some((hooks.encode_term)(right, locals)?));
                     }
                 }
                 if let IRExpr::Var { name, .. } = right.as_ref() {
                     if name == var && !ic3_expr_mentions_var(left, var) {
-                        return Ok(Some(encode_term(left, locals)?));
+                        return Ok(Some((hooks.encode_term)(left, locals)?));
                     }
                 }
                 Ok(None)
@@ -862,7 +877,7 @@ where
             } if matches!(op.as_str(), "OpGe" | "OpGt" | "OpLe" | "OpLt") => {
                 if let IRExpr::Var { name, .. } = left.as_ref() {
                     if name == var && !ic3_expr_mentions_var(right, var) {
-                        let base = encode_term(right, locals)?;
+                        let base = (hooks.encode_term)(right, locals)?;
                         return Ok(match op.as_str() {
                             "OpGe" | "OpLe" => Some(base),
                             "OpGt" => smt_numeric_step(domain, base, 1),
@@ -873,7 +888,7 @@ where
                 }
                 if let IRExpr::Var { name, .. } = right.as_ref() {
                     if name == var && !ic3_expr_mentions_var(left, var) {
-                        let base = encode_term(left, locals)?;
+                        let base = (hooks.encode_term)(left, locals)?;
                         return Ok(match op.as_str() {
                             "OpLe" | "OpGe" => Some(base),
                             "OpLt" => smt_numeric_step(domain, base, 1),
@@ -888,50 +903,38 @@ where
                 op, left, right, ..
             } if op == "OpAnd" => {
                 if let Some(witness) = visit(
-                    var,
-                    domain,
-                    Some(left),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(left),
+                        ..input
+                    },
+                    hooks,
                 )? {
                     return Ok(Some(witness));
                 }
                 visit(
-                    var,
-                    domain,
-                    Some(right),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(right),
+                        ..input
+                    },
+                    hooks,
                 )
             }
             IRExpr::BinOp {
                 op, left, right, ..
             } if op == "OpOr" => {
                 let left_witness = visit(
-                    var,
-                    domain,
-                    Some(left),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(left),
+                        ..input
+                    },
+                    hooks,
                 )?;
                 let right_witness = visit(
-                    var,
-                    domain,
-                    Some(right),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(right),
+                        ..input
+                    },
+                    hooks,
                 )?;
                 match (left_witness, right_witness) {
                     (Some(left_witness), Some(right_witness)) => {
@@ -940,7 +943,7 @@ where
                             left,
                             &left_witness,
                             locals,
-                            encode_predicate,
+                            &mut hooks.encode_predicate,
                         )?;
                         Ok(Some(format!(
                             "(ite {left_pred} {left_witness} {right_witness})"
@@ -950,14 +953,11 @@ where
                 }
             }
             IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => visit(
-                var,
-                domain,
-                Some(expr),
-                locals,
-                encode_term,
-                encode_predicate,
-                match_bindings,
-                match_cond,
+                DirectChooseVisitInput {
+                    predicate: Some(expr),
+                    ..input
+                },
+                hooks,
             ),
             IRExpr::IfElse {
                 cond,
@@ -969,28 +969,22 @@ where
                     return Ok(None);
                 };
                 let then_witness = visit(
-                    var,
-                    domain,
-                    Some(then_body),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(then_body),
+                        ..input
+                    },
+                    hooks,
                 )?;
                 let else_witness = visit(
-                    var,
-                    domain,
-                    Some(else_body),
-                    locals,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(else_body),
+                        ..input
+                    },
+                    hooks,
                 )?;
                 match (then_witness, else_witness) {
                     (Some(then_witness), Some(else_witness)) => {
-                        let cond_smt = encode_predicate(cond, locals)?;
+                        let cond_smt = (hooks.encode_predicate)(cond, locals)?;
                         Ok(Some(format!(
                             "(ite {cond_smt} {then_witness} {else_witness})"
                         )))
@@ -1001,23 +995,20 @@ where
             IRExpr::Let { bindings, body, .. } => {
                 let Some((binding, rest)) = bindings.split_first() else {
                     return visit(
-                        var,
-                        domain,
-                        Some(body),
-                        locals,
-                        encode_term,
-                        encode_predicate,
-                        match_bindings,
-                        match_cond,
+                        DirectChooseVisitInput {
+                            predicate: Some(body),
+                            ..input
+                        },
+                        hooks,
                     );
                 };
                 if ic3_expr_mentions_var(&binding.expr, var) {
                     return Ok(None);
                 }
                 let rhs = if binding.ty == IRType::Bool {
-                    encode_predicate(&binding.expr, locals)?
+                    (hooks.encode_predicate)(&binding.expr, locals)?
                 } else {
-                    encode_term(&binding.expr, locals)?
+                    (hooks.encode_term)(&binding.expr, locals)?
                 };
                 let mut scope = locals.clone();
                 scope.insert(binding.name.clone());
@@ -1031,14 +1022,12 @@ where
                     }
                 };
                 let witness = visit(
-                    var,
-                    domain,
-                    Some(&rest_expr),
-                    &scope,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(&rest_expr),
+                        locals: &scope,
+                        ..input
+                    },
+                    hooks,
                 )?;
                 Ok(
                     witness
@@ -1057,10 +1046,7 @@ where
                             &arm.pattern,
                             &arm_predicate,
                             locals,
-                            encode_term,
-                            encode_predicate,
-                            match_bindings,
-                            match_cond,
+                            hooks,
                         )? {
                             candidates.push(candidate);
                         }
@@ -1081,7 +1067,7 @@ where
                             predicate,
                             candidate,
                             locals,
-                            encode_predicate,
+                            &mut hooks.encode_predicate,
                         )?;
                         witness = format!("(ite {pred} {candidate} {witness})");
                     }
@@ -1094,48 +1080,44 @@ where
                     return Ok(None);
                 }
                 let last = arms.last().expect("checked non-empty match arms");
-                let last_bindings = match_bindings(scrutinee, &last.pattern, locals)?;
+                let last_bindings = (hooks.match_bindings)(scrutinee, &last.pattern, locals)?;
                 let mut last_scope = locals.clone();
                 for (name, _) in &last_bindings {
                     last_scope.insert(name.clone());
                 }
                 let Some(last_body) = visit(
-                    var,
-                    domain,
-                    Some(&last.body),
-                    &last_scope,
-                    encode_term,
-                    encode_predicate,
-                    match_bindings,
-                    match_cond,
+                    DirectChooseVisitInput {
+                        predicate: Some(&last.body),
+                        locals: &last_scope,
+                        ..input
+                    },
+                    hooks,
                 )?
                 else {
                     return Ok(None);
                 };
                 let mut acc = wrap_smt_let_bindings(&last_bindings, last_body);
                 for arm in arms[..arms.len() - 1].iter().rev() {
-                    let bindings = match_bindings(scrutinee, &arm.pattern, locals)?;
+                    let bindings = (hooks.match_bindings)(scrutinee, &arm.pattern, locals)?;
                     let mut scope = locals.clone();
                     for (name, _) in &bindings {
                         scope.insert(name.clone());
                     }
                     let Some(body_witness) = visit(
-                        var,
-                        domain,
-                        Some(&arm.body),
-                        &scope,
-                        encode_term,
-                        encode_predicate,
-                        match_bindings,
-                        match_cond,
+                        DirectChooseVisitInput {
+                            predicate: Some(&arm.body),
+                            locals: &scope,
+                            ..input
+                        },
+                        hooks,
                     )?
                     else {
                         return Ok(None);
                     };
                     let body = wrap_smt_let_bindings(&bindings, body_witness);
-                    let pat = match_cond(scrutinee, &arm.pattern, locals)?;
+                    let pat = (hooks.match_cond)(scrutinee, &arm.pattern, locals)?;
                     let cond = if let Some(guard) = &arm.guard {
-                        let guard_smt = encode_predicate(guard, &scope)?;
+                        let guard_smt = (hooks.encode_predicate)(guard, &scope)?;
                         wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
                     } else {
                         wrap_smt_let_bindings(&bindings, pat)
@@ -1153,21 +1135,20 @@ where
         IRType::Int | IRType::Identity | IRType::Real | IRType::Float
     ) {
         if let Some(witness) =
-            synthesize_numeric_witness(var, domain, predicate, locals, &mut encode_term)?
+            synthesize_numeric_witness(var, domain, predicate, locals, &mut hooks.encode_term)?
         {
             return Ok(Some(witness));
         }
     }
 
     if let Some(witness) = visit(
-        var,
-        domain,
-        predicate,
-        locals,
-        &mut encode_term,
-        &mut encode_predicate,
-        &mut match_bindings,
-        &mut match_cond,
+        DirectChooseVisitInput {
+            var,
+            domain,
+            predicate,
+            locals,
+        },
+        &mut hooks,
     )? {
         return Ok(Some(witness));
     }

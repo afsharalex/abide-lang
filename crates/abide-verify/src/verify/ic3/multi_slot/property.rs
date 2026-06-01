@@ -1,5 +1,30 @@
 use super::*;
 
+type Ic3MatchBindings = Vec<(String, String)>;
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SlotBinding<'a> {
+    pub(in crate::verify::ic3) var: &'a str,
+    pub(in crate::verify::ic3) slot: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3TwoSlotPropertyCtx<'a> {
+    pub(in crate::verify::ic3) entity: &'a IREntity,
+    pub(in crate::verify::ic3) vctx: &'a VerifyContext,
+    pub(in crate::verify::ic3) left: Ic3SlotBinding<'a>,
+    pub(in crate::verify::ic3) right: Ic3SlotBinding<'a>,
+    pub(in crate::verify::ic3) n_slots: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SingleSlotPropertyCtx<'a> {
+    pub(in crate::verify::ic3) entity: &'a IREntity,
+    pub(in crate::verify::ic3) vctx: &'a VerifyContext,
+    pub(in crate::verify::ic3) slot: usize,
+    pub(in crate::verify::ic3) n_slots: usize,
+}
+
 /// Negate a property for multi-slot encoding.
 ///
 /// For `all o: Order | P(o)`, violation means some active slot violates `P`.
@@ -32,7 +57,20 @@ pub(in crate::verify::ic3) fn negate_property_smt_multi(
                 for s1 in 0..n_slots {
                     for s2 in 0..n_slots {
                         let neg = negate_inner_property_two_slots(
-                            inner_body, entity, vctx, var, s1, var2, s2, n_slots,
+                            inner_body,
+                            Ic3TwoSlotPropertyCtx {
+                                entity,
+                                vctx,
+                                left: Ic3SlotBinding {
+                                    var: var.as_str(),
+                                    slot: s1,
+                                },
+                                right: Ic3SlotBinding {
+                                    var: var2.as_str(),
+                                    slot: s2,
+                                },
+                                n_slots,
+                            },
                         )?;
                         disjuncts.push(format!("(and s{s1}_active s{s2}_active {neg})"));
                     }
@@ -62,75 +100,39 @@ pub(in crate::verify::ic3) fn negate_property_smt_multi(
 
 /// Negate an inner property with two bound variables mapped to two slots.
 /// For `P(a, b)` where a → slot s1 and b → slot s2.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn negate_inner_property_two_slots(
     property: &IRExpr,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    var1: &str,
-    slot1: usize,
-    var2: &str,
-    slot2: usize,
-    n_slots: usize,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
 ) -> Result<String, String> {
-    let pos = guard_to_smt_two_slots(property, entity, vctx, var1, slot1, var2, slot2, n_slots)?;
+    let pos = guard_to_smt_two_slots(property, ctx)?;
     Ok(format!("(not {pos})"))
 }
 
 /// Encode a guard with two slot bindings (for inter-entity properties).
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_to_smt_two_slots(
     expr: &IRExpr,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    var1: &str,
-    slot1: usize,
-    var2: &str,
-    slot2: usize,
-    n_slots: usize,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
 ) -> Result<String, String> {
-    guard_to_smt_two_slots_scoped(
-        expr,
-        entity,
-        vctx,
-        var1,
-        slot1,
-        var2,
-        slot2,
-        n_slots,
-        &HashSet::new(),
-        &Ic3SlotEntityLocals::new(),
-    )
+    guard_to_smt_two_slots_scoped(expr, ctx, &HashSet::new(), &Ic3SlotEntityLocals::new())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
     bindings: &[crate::ir::types::LetBinding],
     body: &IRExpr,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    var1: &str,
-    slot1: usize,
-    var2: &str,
-    slot2: usize,
-    n_slots: usize,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SlotEntityLocals,
 ) -> Result<String, String> {
+    let entity = ctx.entity;
+    let vctx = ctx.vctx;
+    let var1 = ctx.left.var;
+    let slot1 = ctx.left.slot;
+    let var2 = ctx.right.var;
+    let slot2 = ctx.right.slot;
+    let n_slots = ctx.n_slots;
+
     let Some((binding, rest)) = bindings.split_first() else {
-        return guard_to_smt_two_slots_scoped(
-            body,
-            entity,
-            vctx,
-            var1,
-            slot1,
-            var2,
-            slot2,
-            n_slots,
-            locals,
-            entity_locals,
-        );
+        return guard_to_smt_two_slots_scoped(body, ctx, locals, entity_locals);
     };
 
     if let IRExpr::Choose {
@@ -148,18 +150,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                     let mut pred_entity_locals = entity_locals.clone();
                     pred_entity_locals.insert(var.clone(), chosen_slot);
                     let pred = if let Some(predicate) = predicate {
-                        guard_to_smt_two_slots_scoped(
-                            predicate,
-                            entity,
-                            vctx,
-                            var1,
-                            slot1,
-                            var2,
-                            slot2,
-                            n_slots,
-                            locals,
-                            &pred_entity_locals,
-                        )?
+                        guard_to_smt_two_slots_scoped(predicate, ctx, locals, &pred_entity_locals)?
                     } else {
                         "true".to_owned()
                     };
@@ -168,13 +159,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                     let rest_smt = guard_let_to_smt_two_slots_scoped(
                         rest,
                         body,
-                        entity,
-                        vctx,
-                        var1,
-                        slot1,
-                        var2,
-                        slot2,
-                        n_slots,
+                        ctx,
                         locals,
                         &rest_entity_locals,
                     )?;
@@ -193,37 +178,14 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| {
-                guard_to_smt_two_slots_scoped(
-                    predicate,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_two_slots_scoped(predicate, ctx, scope, entity_locals)
             },
         )?;
 
         let mut scope = locals.clone();
         scope.insert(binding.name.clone());
-        let rest_smt = guard_let_to_smt_two_slots_scoped(
-            rest,
-            body,
-            entity,
-            vctx,
-            var1,
-            slot1,
-            var2,
-            slot2,
-            n_slots,
-            &scope,
-            entity_locals,
-        )?;
+        let rest_smt = guard_let_to_smt_two_slots_scoped(rest, body, ctx, &scope, entity_locals)?;
         if let Some((exists, witness)) = finite {
             return Ok(format!(
                 "(and {exists} (let (({} {})) {}))",
@@ -231,67 +193,33 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| {
-                guard_to_smt_two_slots_scoped(
-                    term,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |predicate, scope| {
-                guard_to_smt_two_slots_scoped(
-                    predicate,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = guard_to_smt_two_slots_scoped(
-                    scrutinee,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = guard_to_smt_two_slots_scoped(
-                    scrutinee,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_two_slots_scoped(term, ctx, scope, entity_locals)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_two_slots_scoped(predicate, ctx, scope, entity_locals)
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut =
+                        guard_to_smt_two_slots_scoped(scrutinee, ctx, scope, entity_locals)?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut =
+                        guard_to_smt_two_slots_scoped(scrutinee, ctx, scope, entity_locals)?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -300,19 +228,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| {
-                    guard_to_smt_two_slots_scoped(
-                        predicate,
-                        entity,
-                        vctx,
-                        var1,
-                        slot1,
-                        var2,
-                        slot2,
-                        n_slots,
-                        scope,
-                        entity_locals,
-                    )
+                |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_two_slots_scoped(predicate, ctx, scope, entity_locals)
                 },
                 rest_smt,
             );
@@ -323,19 +240,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| {
-                guard_to_smt_two_slots_scoped(
-                    predicate,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_two_slots_scoped(predicate, ctx, scope, entity_locals)
             },
             rest_smt.clone(),
         )? {
@@ -352,13 +258,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                 return guard_let_to_smt_two_slots_scoped(
                     rest,
                     body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
+                    ctx,
                     locals,
                     &scope_entity_locals,
                 );
@@ -369,13 +269,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                 return guard_let_to_smt_two_slots_scoped(
                     rest,
                     body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
+                    ctx,
                     locals,
                     &scope_entity_locals,
                 );
@@ -386,13 +280,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
                 return guard_let_to_smt_two_slots_scoped(
                     rest,
                     body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
+                    ctx,
                     locals,
                     &scope_entity_locals,
                 );
@@ -400,49 +288,209 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_two_slots_scoped(
         }
     }
 
-    let rhs = guard_to_smt_two_slots_scoped(
-        &binding.expr,
-        entity,
-        vctx,
-        var1,
-        slot1,
-        var2,
-        slot2,
-        n_slots,
-        locals,
-        entity_locals,
-    )?;
+    let rhs = guard_to_smt_two_slots_scoped(&binding.expr, ctx, locals, entity_locals)?;
     let mut scope = locals.clone();
     scope.insert(binding.name.clone());
-    let rest_smt = guard_let_to_smt_two_slots_scoped(
-        rest,
-        body,
-        entity,
-        vctx,
-        var1,
-        slot1,
-        var2,
-        slot2,
-        n_slots,
-        &scope,
-        entity_locals,
-    )?;
+    let rest_smt = guard_let_to_smt_two_slots_scoped(rest, body, ctx, &scope, entity_locals)?;
     Ok(format!("(let (({} {})) {})", binding.name, rhs, rest_smt))
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(in crate::verify::ic3) fn guard_to_smt_two_slots_scoped(
-    expr: &IRExpr,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    var1: &str,
-    slot1: usize,
-    var2: &str,
-    slot2: usize,
-    n_slots: usize,
+fn two_slot_field_to_smt(
+    inner: &IRExpr,
+    field: &str,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SlotEntityLocals,
 ) -> Result<String, String> {
+    let var1 = ctx.left.var;
+    let slot1 = ctx.left.slot;
+    let var2 = ctx.right.var;
+    let slot2 = ctx.right.slot;
+
+    if let IRExpr::Var { name, .. } = inner {
+        if locals.contains(name) {
+            return Err(format!(
+                "local {name} cannot be used for field projection in inter-entity property"
+            ));
+        }
+        let slot = if let Some(bound_slot) = entity_locals.get(name) {
+            *bound_slot
+        } else if name == var1 {
+            slot1
+        } else if name == var2 {
+            slot2
+        } else {
+            return Err(format!(
+                "unknown variable {name} in inter-entity property (expected {var1}, {var2}, or a bound entity local)"
+            ));
+        };
+        for (i, f) in ctx.entity.fields.iter().enumerate() {
+            if f.name == *field {
+                return Ok(format!("s{slot}_f{i}"));
+            }
+        }
+    }
+
+    Err(format!(
+        "unsupported field access in inter-entity property: {field}"
+    ))
+}
+
+fn two_slot_var_to_smt(
+    name: &str,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    if locals.contains(name) {
+        return Ok(name.to_owned());
+    }
+    if entity_locals.contains_key(name) {
+        return Err(format!(
+            "bare entity local {name} in inter-entity property — use field access (e.g., {name}.field) instead"
+        ));
+    }
+
+    let var1 = ctx.left.var;
+    let var2 = ctx.right.var;
+    if name == var1 || name == var2 {
+        return Err(format!(
+            "bare entity variable {name} in inter-entity property — \
+             use field access (e.g., {name}.field) instead"
+        ));
+    }
+    for (i, f) in ctx.entity.fields.iter().enumerate() {
+        if f.name == *name {
+            return Ok(format!("s{}_f{i}", ctx.left.slot));
+        }
+    }
+    Err(format!("unknown variable {name} in inter-entity property"))
+}
+
+fn two_slot_binop_to_smt(
+    op: &str,
+    left: &IRExpr,
+    right: &IRExpr,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    let l = guard_to_smt_two_slots_scoped(left, ctx, locals, entity_locals)?;
+    let r = guard_to_smt_two_slots_scoped(right, ctx, locals, entity_locals)?;
+    match op {
+        "OpEq" => Ok(format!("(= {l} {r})")),
+        "OpNEq" => Ok(format!("(not (= {l} {r}))")),
+        "OpLt" => Ok(format!("(< {l} {r})")),
+        "OpLe" => Ok(format!("(<= {l} {r})")),
+        "OpGt" => Ok(format!("(> {l} {r})")),
+        "OpGe" => Ok(format!("(>= {l} {r})")),
+        "OpAnd" => Ok(format!("(and {l} {r})")),
+        "OpOr" => Ok(format!("(or {l} {r})")),
+        "OpImplies" => Ok(format!("(=> {l} {r})")),
+        "OpAdd" => Ok(format!("(+ {l} {r})")),
+        "OpSub" => Ok(format!("(- {l} {r})")),
+        "OpMul" => Ok(format!("(* {l} {r})")),
+        _ => Err(format!("unsupported op in inter-entity property: {op}")),
+    }
+}
+
+fn two_slot_match_arm_scope(
+    scrut: &str,
+    arm: &crate::ir::types::IRMatchArm,
+    vctx: &VerifyContext,
+    locals: &HashSet<String>,
+) -> Result<(Ic3MatchBindings, HashSet<String>), String> {
+    let bindings = ic3_match_pattern_bindings(scrut, &arm.pattern, vctx)?;
+    let mut scope = locals.clone();
+    for (name, _) in &bindings {
+        scope.insert(name.clone());
+    }
+    Ok((bindings, scope))
+}
+
+fn two_slot_match_to_smt(
+    scrutinee: &IRExpr,
+    arms: &[crate::ir::types::IRMatchArm],
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    if !ic3_match_has_final_catch_all(arms) {
+        return Err(
+            "non-exhaustive match without final wildcard/var arm is not supported in inter-entity IC3 encoding"
+                .to_owned(),
+        );
+    }
+
+    let scrut = guard_to_smt_two_slots_scoped(scrutinee, ctx, locals, entity_locals)?;
+    let last = arms.last().expect("checked non-empty match arms");
+    let (bindings, scope) = two_slot_match_arm_scope(&scrut, last, ctx.vctx, locals)?;
+    let body = guard_to_smt_two_slots_scoped(&last.body, ctx, &scope, entity_locals)?;
+    let mut acc = wrap_smt_let_bindings(&bindings, body);
+
+    for arm in arms[..arms.len() - 1].iter().rev() {
+        let (bindings, scope) = two_slot_match_arm_scope(&scrut, arm, ctx.vctx, locals)?;
+        let pat = ic3_match_pattern_cond(&scrut, &arm.pattern, ctx.vctx)?;
+        let cond = if let Some(guard) = &arm.guard {
+            let guard_smt = guard_to_smt_two_slots_scoped(guard, ctx, &scope, entity_locals)?;
+            wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
+        } else {
+            wrap_smt_let_bindings(&bindings, pat)
+        };
+        let body = guard_to_smt_two_slots_scoped(&arm.body, ctx, &scope, entity_locals)?;
+        let body = wrap_smt_let_bindings(&bindings, body);
+        acc = format!("(ite {cond} {body} {acc})");
+    }
+    Ok(acc)
+}
+
+fn two_slot_if_else_to_smt(
+    cond: &IRExpr,
+    then_body: &IRExpr,
+    else_body: Option<&IRExpr>,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    let cond_smt = guard_to_smt_two_slots_scoped(cond, ctx, locals, entity_locals)?;
+    let then_smt = guard_to_smt_two_slots_scoped(then_body, ctx, locals, entity_locals)?;
+    if let Some(else_body) = else_body {
+        let else_smt = guard_to_smt_two_slots_scoped(else_body, ctx, locals, entity_locals)?;
+        Ok(format!("(ite {cond_smt} {then_smt} {else_smt})"))
+    } else {
+        Ok(format!("(=> {cond_smt} {then_smt})"))
+    }
+}
+
+fn two_slot_quantifier_to_smt(
+    var: &str,
+    domain: &IRType,
+    body: &IRExpr,
+    kind: &str,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    ic3_finite_quantifier_formula(
+        var,
+        domain,
+        body,
+        ctx.vctx,
+        locals,
+        |body, scope| guard_to_smt_two_slots_scoped(body, ctx, scope, entity_locals),
+        kind,
+    )?
+    .ok_or_else(|| "quantifier domain is not yet supported in inter-entity IC3 encoding".to_owned())
+}
+
+pub(in crate::verify::ic3) fn guard_to_smt_two_slots_scoped(
+    expr: &IRExpr,
+    ctx: Ic3TwoSlotPropertyCtx<'_>,
+    locals: &HashSet<String>,
+    entity_locals: &Ic3SlotEntityLocals,
+) -> Result<String, String> {
+    let vctx = ctx.vctx;
+
     match expr {
         IRExpr::Lit {
             value: LitVal::Bool { value: true },
@@ -454,230 +502,13 @@ pub(in crate::verify::ic3) fn guard_to_smt_two_slots_scoped(
         } => Ok("false".to_owned()),
         IRExpr::Field {
             expr: inner, field, ..
-        } => {
-            // Determine which slot this field access refers to
-            if let IRExpr::Var { name, .. } = inner.as_ref() {
-                if locals.contains(name) {
-                    return Err(format!(
-                        "local {name} cannot be used for field projection in inter-entity property"
-                    ));
-                }
-                let slot = if let Some(bound_slot) = entity_locals.get(name) {
-                    *bound_slot
-                } else if name == var1 {
-                    slot1
-                } else if name == var2 {
-                    slot2
-                } else {
-                    return Err(format!(
-                        "unknown variable {name} in inter-entity property (expected {var1}, {var2}, or a bound entity local)"
-                    ));
-                };
-                for (i, f) in entity.fields.iter().enumerate() {
-                    if f.name == *field {
-                        return Ok(format!("s{slot}_f{i}"));
-                    }
-                }
-            }
-            Err(format!(
-                "unsupported field access in inter-entity property: {field}"
-            ))
-        }
-        IRExpr::Var { name, .. } => {
-            if locals.contains(name) {
-                return Ok(name.clone());
-            }
-            if entity_locals.contains_key(name) {
-                return Err(format!(
-                    "bare entity local {name} in inter-entity property — use field access (e.g., {name}.field) instead"
-                ));
-            }
-            // Bare quantifier variables (a, b) without field access are not valid
-            // value expressions — they represent entity instances, not values.
-            if name == var1 || name == var2 {
-                return Err(format!(
-                    "bare entity variable {name} in inter-entity property — \
-                     use field access (e.g., {name}.field) instead"
-                ));
-            }
-            // Try as a field name (unqualified field access like `status`)
-            for (i, f) in entity.fields.iter().enumerate() {
-                if f.name == *name {
-                    // Ambiguous: which slot does this unqualified field belong to?
-                    // Default to slot1, but this is a spec issue — should use qualified access.
-                    return Ok(format!("s{slot1}_f{i}"));
-                }
-            }
-            Err(format!("unknown variable {name} in inter-entity property"))
-        }
+        } => two_slot_field_to_smt(inner, field, ctx, locals, entity_locals),
+        IRExpr::Var { name, .. } => two_slot_var_to_smt(name, ctx, locals, entity_locals),
         IRExpr::BinOp {
             op, left, right, ..
-        } => match op.as_str() {
-            "OpEq" | "OpNEq" | "OpLt" | "OpLe" | "OpGt" | "OpGe" => {
-                let l = guard_to_smt_two_slots_scoped(
-                    left,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_two_slots_scoped(
-                    right,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let cmp = match op.as_str() {
-                    "OpEq" => format!("(= {l} {r})"),
-                    "OpNEq" => format!("(not (= {l} {r}))"),
-                    "OpLt" => format!("(< {l} {r})"),
-                    "OpLe" => format!("(<= {l} {r})"),
-                    "OpGt" => format!("(> {l} {r})"),
-                    "OpGe" => format!("(>= {l} {r})"),
-                    _ => unreachable!(),
-                };
-                Ok(cmp)
-            }
-            "OpAnd" => {
-                let l = guard_to_smt_two_slots_scoped(
-                    left,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_two_slots_scoped(
-                    right,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                Ok(format!("(and {l} {r})"))
-            }
-            "OpOr" => {
-                let l = guard_to_smt_two_slots_scoped(
-                    left,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_two_slots_scoped(
-                    right,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                Ok(format!("(or {l} {r})"))
-            }
-            "OpImplies" => {
-                let l = guard_to_smt_two_slots_scoped(
-                    left,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_two_slots_scoped(
-                    right,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                Ok(format!("(=> {l} {r})"))
-            }
-            "OpAdd" | "OpSub" | "OpMul" => {
-                let l = guard_to_smt_two_slots_scoped(
-                    left,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_two_slots_scoped(
-                    right,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                let op_sym = match op.as_str() {
-                    "OpAdd" => "+",
-                    "OpSub" => "-",
-                    "OpMul" => "*",
-                    _ => unreachable!(),
-                };
-                Ok(format!("({op_sym} {l} {r})"))
-            }
-            _ => Err(format!("unsupported op in inter-entity property: {op}")),
-        },
+        } => two_slot_binop_to_smt(op, left, right, ctx, locals, entity_locals),
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let inner = guard_to_smt_two_slots_scoped(
-                operand,
-                entity,
-                vctx,
-                var1,
-                slot1,
-                var2,
-                slot2,
-                n_slots,
-                locals,
-                entity_locals,
-            )?;
+            let inner = guard_to_smt_two_slots_scoped(operand, ctx, locals, entity_locals)?;
             Ok(format!("(not {inner})"))
         }
         IRExpr::Lit { value, .. } => match value {
@@ -696,283 +527,42 @@ pub(in crate::verify::ic3) fn guard_to_smt_two_slots_scoped(
             args,
             ..
         } => ic3_ctor_term_with(enum_name, ctor, args, vctx, |arg| {
-            guard_to_smt_two_slots_scoped(
-                arg,
-                entity,
-                vctx,
-                var1,
-                slot1,
-                var2,
-                slot2,
-                n_slots,
-                locals,
-                entity_locals,
-            )
+            guard_to_smt_two_slots_scoped(arg, ctx, locals, entity_locals)
         }),
         IRExpr::Match {
             scrutinee, arms, ..
-        } => {
-            if !ic3_match_has_final_catch_all(arms) {
-                return Err(
-                    "non-exhaustive match without final wildcard/var arm is not supported in inter-entity IC3 encoding"
-                        .to_owned(),
-                );
-            }
-            let scrut = guard_to_smt_two_slots_scoped(
-                scrutinee,
-                entity,
-                vctx,
-                var1,
-                slot1,
-                var2,
-                slot2,
-                n_slots,
-                locals,
-                entity_locals,
-            )?;
-            let mut acc = {
-                let last = arms.last().expect("checked non-empty match arms");
-                let bindings = ic3_match_pattern_bindings(&scrut, &last.pattern, vctx)?;
-                let mut scope = locals.clone();
-                for (name, _) in &bindings {
-                    scope.insert(name.clone());
-                }
-                let body = guard_to_smt_two_slots_scoped(
-                    &last.body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    &scope,
-                    entity_locals,
-                )?;
-                wrap_smt_let_bindings(&bindings, body)
-            };
-            for arm in arms[..arms.len() - 1].iter().rev() {
-                let bindings = ic3_match_pattern_bindings(&scrut, &arm.pattern, vctx)?;
-                let mut scope = locals.clone();
-                for (name, _) in &bindings {
-                    scope.insert(name.clone());
-                }
-                let pat = ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?;
-                let cond = if let Some(guard) = &arm.guard {
-                    let guard_smt = guard_to_smt_two_slots_scoped(
-                        guard,
-                        entity,
-                        vctx,
-                        var1,
-                        slot1,
-                        var2,
-                        slot2,
-                        n_slots,
-                        &scope,
-                        entity_locals,
-                    )?;
-                    wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
-                } else {
-                    wrap_smt_let_bindings(&bindings, pat)
-                };
-                let body = guard_to_smt_two_slots_scoped(
-                    &arm.body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    &scope,
-                    entity_locals,
-                )?;
-                let body = wrap_smt_let_bindings(&bindings, body);
-                acc = format!("(ite {cond} {body} {acc})");
-            }
-            Ok(acc)
-        }
+        } => two_slot_match_to_smt(scrutinee, arms, ctx, locals, entity_locals),
         IRExpr::IfElse {
             cond,
             then_body,
             else_body,
             ..
-        } => {
-            let cond_smt = guard_to_smt_two_slots_scoped(
-                cond,
-                entity,
-                vctx,
-                var1,
-                slot1,
-                var2,
-                slot2,
-                n_slots,
-                locals,
-                entity_locals,
-            )?;
-            let then_smt = guard_to_smt_two_slots_scoped(
-                then_body,
-                entity,
-                vctx,
-                var1,
-                slot1,
-                var2,
-                slot2,
-                n_slots,
-                locals,
-                entity_locals,
-            )?;
-            if let Some(else_body) = else_body {
-                let else_smt = guard_to_smt_two_slots_scoped(
-                    else_body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    locals,
-                    entity_locals,
-                )?;
-                Ok(format!("(ite {cond_smt} {then_smt} {else_smt})"))
-            } else {
-                Ok(format!("(=> {cond_smt} {then_smt})"))
-            }
+        } => two_slot_if_else_to_smt(
+            cond,
+            then_body,
+            else_body.as_deref(),
+            ctx,
+            locals,
+            entity_locals,
+        ),
+        IRExpr::Let { bindings, body, .. } => {
+            guard_let_to_smt_two_slots_scoped(bindings, body, ctx, locals, entity_locals)
         }
-        IRExpr::Let { bindings, body, .. } => guard_let_to_smt_two_slots_scoped(
-            bindings,
-            body,
-            entity,
-            vctx,
-            var1,
-            slot1,
-            var2,
-            slot2,
-            n_slots,
-            locals,
-            entity_locals,
-        ),
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => guard_to_smt_two_slots_scoped(
-            expr,
-            entity,
-            vctx,
-            var1,
-            slot1,
-            var2,
-            slot2,
-            n_slots,
-            locals,
-            entity_locals,
-        ),
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            guard_to_smt_two_slots_scoped(expr, ctx, locals, entity_locals)
+        }
         IRExpr::Forall {
             var, domain, body, ..
-        } => ic3_finite_quantifier_formula(
-            var,
-            domain,
-            body,
-            vctx,
-            locals,
-            |body, scope| {
-                guard_to_smt_two_slots_scoped(
-                    body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            "forall",
-        )?
-        .ok_or_else(|| {
-            "quantifier domain is not yet supported in inter-entity IC3 encoding".to_owned()
-        }),
+        } => two_slot_quantifier_to_smt(var, domain, body, "forall", ctx, locals, entity_locals),
         IRExpr::Exists {
             var, domain, body, ..
-        } => ic3_finite_quantifier_formula(
-            var,
-            domain,
-            body,
-            vctx,
-            locals,
-            |body, scope| {
-                guard_to_smt_two_slots_scoped(
-                    body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            "exists",
-        )?
-        .ok_or_else(|| {
-            "quantifier domain is not yet supported in inter-entity IC3 encoding".to_owned()
-        }),
+        } => two_slot_quantifier_to_smt(var, domain, body, "exists", ctx, locals, entity_locals),
         IRExpr::One {
             var, domain, body, ..
-        } => ic3_finite_quantifier_formula(
-            var,
-            domain,
-            body,
-            vctx,
-            locals,
-            |body, scope| {
-                guard_to_smt_two_slots_scoped(
-                    body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            "one",
-        )?
-        .ok_or_else(|| {
-            "quantifier domain is not yet supported in inter-entity IC3 encoding".to_owned()
-        }),
+        } => two_slot_quantifier_to_smt(var, domain, body, "one", ctx, locals, entity_locals),
         IRExpr::Lone {
             var, domain, body, ..
-        } => ic3_finite_quantifier_formula(
-            var,
-            domain,
-            body,
-            vctx,
-            locals,
-            |body, scope| {
-                guard_to_smt_two_slots_scoped(
-                    body,
-                    entity,
-                    vctx,
-                    var1,
-                    slot1,
-                    var2,
-                    slot2,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            "lone",
-        )?
-        .ok_or_else(|| {
-            "quantifier domain is not yet supported in inter-entity IC3 encoding".to_owned()
-        }),
+        } => two_slot_quantifier_to_smt(var, domain, body, "lone", ctx, locals, entity_locals),
         _ => Err(format!(
             "unsupported expression in inter-entity property: {:?}",
             std::mem::discriminant(expr)
@@ -1011,17 +601,18 @@ pub(in crate::verify::ic3) fn expr_to_smt_slot(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
     bindings: &[crate::ir::types::LetBinding],
     body: &IRExpr,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    slot: usize,
-    n_slots: usize,
+    ctx: Ic3SingleSlotPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SlotEntityLocals,
 ) -> Result<String, String> {
+    let entity = ctx.entity;
+    let vctx = ctx.vctx;
+    let slot = ctx.slot;
+    let n_slots = ctx.n_slots;
+
     let Some((binding, rest)) = bindings.split_first() else {
         return guard_to_smt_slot_scoped(body, entity, vctx, slot, n_slots, locals, entity_locals);
     };
@@ -1055,16 +646,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
                     };
                     let mut rest_entity_locals = entity_locals.clone();
                     rest_entity_locals.insert(binding.name.clone(), chosen_slot);
-                    let rest_smt = guard_let_to_smt_slot_scoped(
-                        rest,
-                        body,
-                        entity,
-                        vctx,
-                        slot,
-                        n_slots,
-                        locals,
-                        &rest_entity_locals,
-                    )?;
+                    let rest_smt =
+                        guard_let_to_smt_slot_scoped(rest, body, ctx, locals, &rest_entity_locals)?;
                     disjuncts.push(format!("(and {active} {pred} {rest_smt})"));
                 }
                 return if disjuncts.is_empty() {
@@ -1080,7 +663,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| {
+            |predicate: &IRExpr, scope: &HashSet<String>| {
                 guard_to_smt_slot_scoped(
                     predicate,
                     entity,
@@ -1095,16 +678,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
 
         let mut scope = locals.clone();
         scope.insert(binding.name.clone());
-        let rest_smt = guard_let_to_smt_slot_scoped(
-            rest,
-            body,
-            entity,
-            vctx,
-            slot,
-            n_slots,
-            &scope,
-            entity_locals,
-        )?;
+        let rest_smt = guard_let_to_smt_slot_scoped(rest, body, ctx, &scope, entity_locals)?;
         if let Some((exists, witness)) = finite {
             return Ok(format!(
                 "(and {exists} (let (({} {})) {}))",
@@ -1112,47 +686,55 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| {
-                expr_to_smt_slot_scoped(term, entity, vctx, slot, n_slots, scope, entity_locals)
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |predicate, scope| {
-                guard_to_smt_slot_scoped(
-                    predicate,
-                    entity,
-                    vctx,
-                    slot,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_slot_scoped(
-                    scrutinee,
-                    entity,
-                    vctx,
-                    slot,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_slot_scoped(
-                    scrutinee,
-                    entity,
-                    vctx,
-                    slot,
-                    n_slots,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    expr_to_smt_slot_scoped(term, entity, vctx, slot, n_slots, scope, entity_locals)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_slot_scoped(
+                        predicate,
+                        entity,
+                        vctx,
+                        slot,
+                        n_slots,
+                        scope,
+                        entity_locals,
+                    )
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_slot_scoped(
+                        scrutinee,
+                        entity,
+                        vctx,
+                        slot,
+                        n_slots,
+                        scope,
+                        entity_locals,
+                    )?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_slot_scoped(
+                        scrutinee,
+                        entity,
+                        vctx,
+                        slot,
+                        n_slots,
+                        scope,
+                        entity_locals,
+                    )?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -1161,7 +743,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| {
+                |predicate: &IRExpr, scope: &HashSet<String>| {
                     guard_to_smt_slot_scoped(
                         predicate,
                         entity,
@@ -1181,7 +763,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| {
+            |predicate: &IRExpr, scope: &HashSet<String>| {
                 guard_to_smt_slot_scoped(
                     predicate,
                     entity,
@@ -1204,16 +786,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
             if let Some(bound_slot) = entity_locals.get(name) {
                 let mut scope_entity_locals = entity_locals.clone();
                 scope_entity_locals.insert(binding.name.clone(), *bound_slot);
-                return guard_let_to_smt_slot_scoped(
-                    rest,
-                    body,
-                    entity,
-                    vctx,
-                    slot,
-                    n_slots,
-                    locals,
-                    &scope_entity_locals,
-                );
+                return guard_let_to_smt_slot_scoped(rest, body, ctx, locals, &scope_entity_locals);
             }
         }
     }
@@ -1241,16 +814,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_slot_scoped(
     };
     let mut scope = locals.clone();
     scope.insert(binding.name.clone());
-    let rest_smt = guard_let_to_smt_slot_scoped(
-        rest,
-        body,
-        entity,
-        vctx,
-        slot,
-        n_slots,
-        &scope,
-        entity_locals,
-    )?;
+    let rest_smt = guard_let_to_smt_slot_scoped(rest, body, ctx, &scope, entity_locals)?;
     Ok(format!("(let (({} {})) {})", binding.name, rhs, rest_smt))
 }
 
@@ -1810,10 +1374,12 @@ pub(in crate::verify::ic3) fn guard_to_smt_slot_scoped(
         IRExpr::Let { bindings, body, .. } => guard_let_to_smt_slot_scoped(
             bindings,
             body,
-            entity,
-            vctx,
-            slot,
-            n_slots,
+            Ic3SingleSlotPropertyCtx {
+                entity,
+                vctx,
+                slot,
+                n_slots,
+            },
             locals,
             entity_locals,
         ),

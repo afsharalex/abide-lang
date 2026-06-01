@@ -1,5 +1,56 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct SystemPropertySlotBinding<'a> {
+    entity: &'a IREntity,
+    entity_name: &'a str,
+    slot: usize,
+    var: &'a str,
+}
+
+struct NegateSystemGuardInput<'a> {
+    expr: &'a IRExpr,
+    entities: &'a [&'a IREntity],
+    slots_per_entity: &'a HashMap<String, usize>,
+    vctx: &'a VerifyContext,
+    binding: SystemPropertySlotBinding<'a>,
+}
+
+struct NegateSystemGuardTwoInput<'a> {
+    expr: &'a IRExpr,
+    entities: &'a [&'a IREntity],
+    slots_per_entity: &'a HashMap<String, usize>,
+    vctx: &'a VerifyContext,
+    left: SystemPropertySlotBinding<'a>,
+    right: SystemPropertySlotBinding<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SystemPropertyCtx<'a> {
+    pub(in crate::verify::ic3) entities: &'a [&'a IREntity],
+    pub(in crate::verify::ic3) slots_per_entity: &'a HashMap<String, usize>,
+    pub(in crate::verify::ic3) current_entity: &'a IREntity,
+    pub(in crate::verify::ic3) vctx: &'a VerifyContext,
+    pub(in crate::verify::ic3) current_ent_name: &'a str,
+    pub(in crate::verify::ic3) current_slot: usize,
+}
+
+impl<'a> Ic3SystemPropertyCtx<'a> {
+    const fn with_current_entity(
+        self,
+        current_entity: &'a IREntity,
+        current_ent_name: &'a str,
+        current_slot: usize,
+    ) -> Self {
+        Self {
+            current_entity,
+            current_ent_name,
+            current_slot,
+            ..self
+        }
+    }
+}
+
 pub(in crate::verify::ic3) fn negate_property_smt_system(
     property: &IRExpr,
     entities: &[&IREntity],
@@ -38,20 +89,24 @@ pub(in crate::verify::ic3) fn negate_property_smt_system(
                 let mut disjuncts = Vec::new();
                 for s1 in 0..n_slots {
                     for s2 in 0..n_slots2 {
-                        let neg = negate_guard_sys_two(
-                            inner,
+                        let neg = negate_guard_sys_two(NegateSystemGuardTwoInput {
+                            expr: inner,
                             entities,
                             slots_per_entity,
-                            entity,
-                            entity2,
                             vctx,
-                            entity_name,
-                            s1,
-                            var,
-                            ent2,
-                            s2,
-                            var2,
-                        )?;
+                            left: SystemPropertySlotBinding {
+                                entity,
+                                entity_name,
+                                slot: s1,
+                                var,
+                            },
+                            right: SystemPropertySlotBinding {
+                                entity: entity2,
+                                entity_name: ent2,
+                                slot: s2,
+                                var: var2,
+                            },
+                        })?;
                         let a1 = format!("{entity_name}_{s1}_active");
                         let a2 = format!("{ent2}_{s2}_active");
                         disjuncts.push(format!("(and {a1} {a2} {neg})"));
@@ -63,16 +118,18 @@ pub(in crate::verify::ic3) fn negate_property_smt_system(
             // Single quantifier
             let mut disjuncts = Vec::new();
             for slot in 0..n_slots {
-                let neg_body = negate_guard_sys(
-                    body,
+                let neg_body = negate_guard_sys(NegateSystemGuardInput {
+                    expr: body,
                     entities,
                     slots_per_entity,
-                    entity,
                     vctx,
-                    entity_name,
-                    slot,
-                    var,
-                )?;
+                    binding: SystemPropertySlotBinding {
+                        entity,
+                        entity_name,
+                        slot,
+                        var,
+                    },
+                })?;
                 let active = format!("{entity_name}_{slot}_active");
                 disjuncts.push(format!("(and {active} {neg_body})"));
             }
@@ -89,12 +146,14 @@ pub(in crate::verify::ic3) fn negate_property_smt_system(
             };
             let pos = guard_to_smt_sys_prop_scoped(
                 property,
-                entities,
-                slots_per_entity,
-                &pure_entity,
-                vctx,
-                "__PureProperty",
-                0,
+                Ic3SystemPropertyCtx {
+                    entities,
+                    slots_per_entity,
+                    current_entity: &pure_entity,
+                    vctx,
+                    current_ent_name: "__PureProperty",
+                    current_slot: 0,
+                },
                 &HashSet::new(),
                 &Ic3SystemEntityLocals::new(),
             )?;
@@ -104,27 +163,29 @@ pub(in crate::verify::ic3) fn negate_property_smt_system(
 }
 
 /// Negate an inner property for a specific entity slot in system context.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::verify::ic3) fn negate_guard_sys(
-    expr: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    entity: &IREntity,
-    vctx: &VerifyContext,
-    ent_name: &str,
-    slot: usize,
-    var: &str,
-) -> Result<String, String> {
-    let mut entity_locals = Ic3SystemEntityLocals::new();
-    entity_locals.insert(var.to_owned(), (ent_name.to_owned(), slot));
-    let pos = guard_to_smt_sys_prop_scoped(
+fn negate_guard_sys(input: NegateSystemGuardInput<'_>) -> Result<String, String> {
+    let NegateSystemGuardInput {
         expr,
         entities,
         slots_per_entity,
-        entity,
         vctx,
-        ent_name,
-        slot,
+        binding,
+    } = input;
+    let mut entity_locals = Ic3SystemEntityLocals::new();
+    entity_locals.insert(
+        binding.var.to_owned(),
+        (binding.entity_name.to_owned(), binding.slot),
+    );
+    let pos = guard_to_smt_sys_prop_scoped(
+        expr,
+        Ic3SystemPropertyCtx {
+            entities,
+            slots_per_entity,
+            current_entity: binding.entity,
+            vctx,
+            current_ent_name: binding.entity_name,
+            current_slot: binding.slot,
+        },
         &HashSet::new(),
         &entity_locals,
     )?;
@@ -132,37 +193,34 @@ pub(in crate::verify::ic3) fn negate_guard_sys(
 }
 
 /// Negate an inner property for two entity slots in system context.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::verify::ic3) fn negate_guard_sys_two(
-    expr: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    entity1: &IREntity,
-    entity2: &IREntity,
-    vctx: &VerifyContext,
-    ent1_name: &str,
-    slot1: usize,
-    var1: &str,
-    ent2_name: &str,
-    slot2: usize,
-    var2: &str,
-) -> Result<String, String> {
-    let mut entity_locals = Ic3SystemEntityLocals::new();
-    entity_locals.insert(var1.to_owned(), (ent1_name.to_owned(), slot1));
-    entity_locals.insert(var2.to_owned(), (ent2_name.to_owned(), slot2));
-    let pos = guard_to_smt_sys_prop_two_scoped(
+fn negate_guard_sys_two(input: NegateSystemGuardTwoInput<'_>) -> Result<String, String> {
+    let NegateSystemGuardTwoInput {
         expr,
         entities,
         slots_per_entity,
-        entity1,
-        entity2,
         vctx,
-        ent1_name,
-        slot1,
-        var1,
-        ent2_name,
-        slot2,
-        var2,
+        left,
+        right,
+    } = input;
+    let mut entity_locals = Ic3SystemEntityLocals::new();
+    entity_locals.insert(
+        left.var.to_owned(),
+        (left.entity_name.to_owned(), left.slot),
+    );
+    entity_locals.insert(
+        right.var.to_owned(),
+        (right.entity_name.to_owned(), right.slot),
+    );
+    let pos = guard_to_smt_sys_prop_two_scoped(
+        expr,
+        Ic3SystemPropertyCtx {
+            entities,
+            slots_per_entity,
+            current_entity: left.entity,
+            vctx,
+            current_ent_name: left.entity_name,
+            current_slot: left.slot,
+        },
         &HashSet::new(),
         &entity_locals,
     )?;
@@ -180,31 +238,21 @@ pub(in crate::verify::ic3) fn ic3_find_entity<'a>(
         .ok_or_else(|| format!("entity {name} not found in IC3 system property scope"))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
     bindings: &[crate::ir::types::LetBinding],
     body: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    current_entity: &IREntity,
-    vctx: &VerifyContext,
-    current_ent_name: &str,
-    current_slot: usize,
+    ctx: Ic3SystemPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SystemEntityLocals,
 ) -> Result<String, String> {
+    let entities = ctx.entities;
+    let slots_per_entity = ctx.slots_per_entity;
+    let vctx = ctx.vctx;
+    let current_ent_name = ctx.current_ent_name;
+    let current_slot = ctx.current_slot;
+
     let Some((binding, rest)) = bindings.split_first() else {
-        return guard_to_smt_sys_prop_scoped(
-            body,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        );
+        return guard_to_smt_sys_prop_scoped(body, ctx, locals, entity_locals);
     };
 
     if let IRExpr::Choose {
@@ -223,17 +271,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
                 let mut pred_entity_locals = entity_locals.clone();
                 pred_entity_locals.insert(var.clone(), (name.clone(), chosen_slot));
                 let pred = if let Some(predicate) = predicate {
-                    guard_to_smt_sys_prop_scoped(
-                        predicate,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        locals,
-                        &pred_entity_locals,
-                    )?
+                    guard_to_smt_sys_prop_scoped(predicate, ctx, locals, &pred_entity_locals)?
                 } else {
                     "true".to_owned()
                 };
@@ -242,12 +280,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
                 let rest_smt = guard_let_to_smt_sys_prop_scoped(
                     rest,
                     body,
-                    entities,
-                    slots_per_entity,
-                    chosen_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
+                    ctx.with_current_entity(chosen_entity, current_ent_name, current_slot),
                     locals,
                     &rest_entity_locals,
                 )?;
@@ -266,35 +299,14 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    predicate,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_sys_prop_scoped(predicate, ctx, scope, entity_locals)
             },
         )?;
 
         let mut scope = locals.clone();
         scope.insert(binding.name.clone());
-        let rest_smt = guard_let_to_smt_sys_prop_scoped(
-            rest,
-            body,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            &scope,
-            entity_locals,
-        )?;
+        let rest_smt = guard_let_to_smt_sys_prop_scoped(rest, body, ctx, &scope, entity_locals)?;
         if let Some((exists, witness)) = finite {
             return Ok(format!(
                 "(and {exists} (let (({} {})) {}))",
@@ -302,63 +314,31 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| {
-                expr_to_smt_sys_prop_scoped(
-                    term,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |predicate, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    predicate,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_sys_prop_scoped(
-                    scrutinee,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_sys_prop_scoped(
-                    scrutinee,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    expr_to_smt_sys_prop_scoped(term, ctx, scope, entity_locals)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_prop_scoped(predicate, ctx, scope, entity_locals)
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_sys_prop_scoped(scrutinee, ctx, scope, entity_locals)?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_sys_prop_scoped(scrutinee, ctx, scope, entity_locals)?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -367,18 +347,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| {
-                    guard_to_smt_sys_prop_scoped(
-                        predicate,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        scope,
-                        entity_locals,
-                    )
+                |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_prop_scoped(predicate, ctx, scope, entity_locals)
                 },
                 rest_smt,
             );
@@ -389,18 +359,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    predicate,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_sys_prop_scoped(predicate, ctx, scope, entity_locals)
             },
             rest_smt.clone(),
         )? {
@@ -420,12 +380,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
                 return guard_let_to_smt_sys_prop_scoped(
                     rest,
                     body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
+                    ctx,
                     locals,
                     &scope_entity_locals,
                 );
@@ -434,59 +389,28 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_prop_scoped(
     }
 
     let rhs = if binding.ty == IRType::Bool {
-        guard_to_smt_sys_prop_scoped(
-            &binding.expr,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        )?
+        guard_to_smt_sys_prop_scoped(&binding.expr, ctx, locals, entity_locals)?
     } else {
-        expr_to_smt_sys_prop_scoped(
-            &binding.expr,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        )?
+        expr_to_smt_sys_prop_scoped(&binding.expr, ctx, locals, entity_locals)?
     };
     let mut scope = locals.clone();
     scope.insert(binding.name.clone());
-    let rest_smt = guard_let_to_smt_sys_prop_scoped(
-        rest,
-        body,
-        entities,
-        slots_per_entity,
-        current_entity,
-        vctx,
-        current_ent_name,
-        current_slot,
-        &scope,
-        entity_locals,
-    )?;
+    let rest_smt = guard_let_to_smt_sys_prop_scoped(rest, body, ctx, &scope, entity_locals)?;
     Ok(format!("(let (({} {})) {})", binding.name, rhs, rest_smt))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
     expr: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    current_entity: &IREntity,
-    vctx: &VerifyContext,
-    current_ent_name: &str,
-    current_slot: usize,
+    ctx: Ic3SystemPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SystemEntityLocals,
 ) -> Result<String, String> {
+    let entities = ctx.entities;
+    let current_entity = ctx.current_entity;
+    let vctx = ctx.vctx;
+    let current_ent_name = ctx.current_ent_name;
+    let current_slot = ctx.current_slot;
+
     match expr {
         IRExpr::Var { name, .. } => {
             for (i, field) in current_entity.fields.iter().enumerate() {
@@ -508,17 +432,7 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             expr: inner, field, ..
         } => {
             if ic3_expr_type(inner).is_some_and(|ty| ic3_enum_payload_type_has_field(ty, field)) {
-                let inner_smt = expr_to_smt_sys_prop_scoped(
-                    inner,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let inner_smt = expr_to_smt_sys_prop_scoped(inner, ctx, locals, entity_locals)?;
                 return Ok(format!("({field} {inner_smt})"));
             }
             if let IRExpr::Var { name, .. } = inner.as_ref() {
@@ -543,28 +457,8 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = expr_to_smt_sys_prop_scoped(
-                left,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let r = expr_to_smt_sys_prop_scoped(
-                right,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let l = expr_to_smt_sys_prop_scoped(left, ctx, locals, entity_locals)?;
+            let r = expr_to_smt_sys_prop_scoped(right, ctx, locals, entity_locals)?;
             match op.as_str() {
                 "OpAdd" => Ok(format!("(+ {l} {r})")),
                 "OpSub" => Ok(format!("(- {l} {r})")),
@@ -575,80 +469,20 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             }
         }
         IRExpr::UnOp { op, operand, .. } if op == "OpNeg" => {
-            let inner = expr_to_smt_sys_prop_scoped(
-                operand,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let inner = expr_to_smt_sys_prop_scoped(operand, ctx, locals, entity_locals)?;
             Ok(format!("(- {inner})"))
         }
         IRExpr::MapUpdate {
             map, key, value, ..
         } => {
-            let m = expr_to_smt_sys_prop_scoped(
-                map,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let k = expr_to_smt_sys_prop_scoped(
-                key,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let v = expr_to_smt_sys_prop_scoped(
-                value,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let m = expr_to_smt_sys_prop_scoped(map, ctx, locals, entity_locals)?;
+            let k = expr_to_smt_sys_prop_scoped(key, ctx, locals, entity_locals)?;
+            let v = expr_to_smt_sys_prop_scoped(value, ctx, locals, entity_locals)?;
             Ok(format!("(store {m} {k} {v})"))
         }
         IRExpr::Index { map, key, .. } => {
-            let m = expr_to_smt_sys_prop_scoped(
-                map,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let k = expr_to_smt_sys_prop_scoped(
-                key,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let m = expr_to_smt_sys_prop_scoped(map, ctx, locals, entity_locals)?;
+            let k = expr_to_smt_sys_prop_scoped(key, ctx, locals, entity_locals)?;
             Ok(format!("(select {m} {k})"))
         }
         IRExpr::Match {
@@ -659,17 +493,7 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                     "non-exhaustive match without final wildcard/var arm is not supported in system IC3 property value encoding".to_owned(),
                 );
             }
-            let scrut = expr_to_smt_sys_prop_scoped(
-                scrutinee,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let scrut = expr_to_smt_sys_prop_scoped(scrutinee, ctx, locals, entity_locals)?;
             let mut acc = {
                 let last = arms.last().expect("checked non-empty match arms");
                 let bindings = ic3_match_pattern_bindings(&scrut, &last.pattern, vctx)?;
@@ -677,17 +501,7 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                 for (name, _) in &bindings {
                     scope.insert(name.clone());
                 }
-                let body = expr_to_smt_sys_prop_scoped(
-                    &last.body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    &scope,
-                    entity_locals,
-                )?;
+                let body = expr_to_smt_sys_prop_scoped(&last.body, ctx, &scope, entity_locals)?;
                 wrap_smt_let_bindings(&bindings, body)
             };
             for arm in arms[..arms.len() - 1].iter().rev() {
@@ -698,32 +512,13 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                 }
                 let pat = ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?;
                 let cond = if let Some(guard) = &arm.guard {
-                    let guard_smt = guard_to_smt_sys_prop_scoped(
-                        guard,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        &scope,
-                        entity_locals,
-                    )?;
+                    let guard_smt =
+                        guard_to_smt_sys_prop_scoped(guard, ctx, &scope, entity_locals)?;
                     wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
                 } else {
                     wrap_smt_let_bindings(&bindings, pat)
                 };
-                let body = expr_to_smt_sys_prop_scoped(
-                    &arm.body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    &scope,
-                    entity_locals,
-                )?;
+                let body = expr_to_smt_sys_prop_scoped(&arm.body, ctx, &scope, entity_locals)?;
                 let body = wrap_smt_let_bindings(&bindings, body);
                 acc = format!("(ite {cond} {body} {acc})");
             }
@@ -735,40 +530,10 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             else_body,
             ..
         } => {
-            let cond_smt = guard_to_smt_sys_prop_scoped(
-                cond,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let then_smt = expr_to_smt_sys_prop_scoped(
-                then_body,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let cond_smt = guard_to_smt_sys_prop_scoped(cond, ctx, locals, entity_locals)?;
+            let then_smt = expr_to_smt_sys_prop_scoped(then_body, ctx, locals, entity_locals)?;
             if let Some(else_body) = else_body {
-                let else_smt = expr_to_smt_sys_prop_scoped(
-                    else_body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let else_smt = expr_to_smt_sys_prop_scoped(else_body, ctx, locals, entity_locals)?;
                 Ok(format!("(ite {cond_smt} {then_smt} {else_smt})"))
             } else {
                 Err(
@@ -782,41 +547,16 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             let mut out = String::new();
             for binding in bindings {
                 let rhs = if binding.ty == IRType::Bool {
-                    guard_to_smt_sys_prop_scoped(
-                        &binding.expr,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        &scope,
-                        entity_locals,
-                    )?
+                    guard_to_smt_sys_prop_scoped(&binding.expr, ctx, &scope, entity_locals)?
                 } else {
-                    expr_to_smt_sys_prop_scoped(
-                        &binding.expr,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        &scope,
-                        entity_locals,
-                    )?
+                    expr_to_smt_sys_prop_scoped(&binding.expr, ctx, &scope, entity_locals)?
                 };
                 out.push_str(&format!("(let (({} {})) ", binding.name, rhs));
                 scope.insert(binding.name.clone());
             }
             out.push_str(&expr_to_smt_sys_prop_scoped(
                 body,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
+                ctx,
                 &scope,
                 entity_locals,
             )?);
@@ -825,17 +565,9 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
             }
             Ok(out)
         }
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => expr_to_smt_sys_prop_scoped(
-            expr,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        ),
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            expr_to_smt_sys_prop_scoped(expr, ctx, locals, entity_locals)
+        }
         IRExpr::Card { expr: inner, .. } => {
             if let Some(cardinality) = ic3_finite_literal_cardinality(inner) {
                 return Ok(cardinality);
@@ -856,19 +588,7 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
                     projection.as_deref(),
                     vctx,
                     locals,
-                    |body, scope| {
-                        guard_to_smt_sys_prop_scoped(
-                            body,
-                            entities,
-                            slots_per_entity,
-                            current_entity,
-                            vctx,
-                            current_ent_name,
-                            current_slot,
-                            scope,
-                            entity_locals,
-                        )
-                    },
+                    |body, scope| guard_to_smt_sys_prop_scoped(body, ctx, scope, entity_locals),
                 )? {
                     return Ok(cardinality);
                 }
@@ -883,18 +603,14 @@ pub(in crate::verify::ic3) fn expr_to_smt_sys_prop_scoped(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
     guard: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    current_entity: &IREntity,
-    vctx: &VerifyContext,
-    current_ent_name: &str,
-    current_slot: usize,
+    ctx: Ic3SystemPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SystemEntityLocals,
 ) -> Result<String, String> {
+    let vctx = ctx.vctx;
+
     match guard {
         IRExpr::Lit {
             value: LitVal::Bool { value: true },
@@ -908,28 +624,8 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             op, left, right, ..
         } => match op.as_str() {
             "OpEq" | "OpNEq" | "OpLt" | "OpLe" | "OpGt" | "OpGe" => {
-                let l = expr_to_smt_sys_prop_scoped(
-                    left,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = expr_to_smt_sys_prop_scoped(
-                    right,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let l = expr_to_smt_sys_prop_scoped(left, ctx, locals, entity_locals)?;
+                let r = expr_to_smt_sys_prop_scoped(right, ctx, locals, entity_locals)?;
                 Ok(match op.as_str() {
                     "OpEq" => format!("(= {l} {r})"),
                     "OpNEq" => format!("(not (= {l} {r}))"),
@@ -941,107 +637,29 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
                 })
             }
             "OpAnd" => {
-                let l = guard_to_smt_sys_prop_scoped(
-                    left,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_sys_prop_scoped(
-                    right,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let l = guard_to_smt_sys_prop_scoped(left, ctx, locals, entity_locals)?;
+                let r = guard_to_smt_sys_prop_scoped(right, ctx, locals, entity_locals)?;
                 Ok(format!("(and {l} {r})"))
             }
             "OpOr" => {
-                let l = guard_to_smt_sys_prop_scoped(
-                    left,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_sys_prop_scoped(
-                    right,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let l = guard_to_smt_sys_prop_scoped(left, ctx, locals, entity_locals)?;
+                let r = guard_to_smt_sys_prop_scoped(right, ctx, locals, entity_locals)?;
                 Ok(format!("(or {l} {r})"))
             }
             "OpImplies" => {
-                let l = guard_to_smt_sys_prop_scoped(
-                    left,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
-                let r = guard_to_smt_sys_prop_scoped(
-                    right,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let l = guard_to_smt_sys_prop_scoped(left, ctx, locals, entity_locals)?;
+                let r = guard_to_smt_sys_prop_scoped(right, ctx, locals, entity_locals)?;
                 Ok(format!("(=> {l} {r})"))
             }
             _ => Err(format!("unsupported op in system IC3 property guard: {op}")),
         },
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let inner = guard_to_smt_sys_prop_scoped(
-                operand,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let inner = guard_to_smt_sys_prop_scoped(operand, ctx, locals, entity_locals)?;
             Ok(format!("(not {inner})"))
         }
-        IRExpr::Field { .. } | IRExpr::Var { .. } => expr_to_smt_sys_prop_scoped(
-            guard,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        ),
+        IRExpr::Field { .. } | IRExpr::Var { .. } => {
+            expr_to_smt_sys_prop_scoped(guard, ctx, locals, entity_locals)
+        }
         IRExpr::Match {
             scrutinee, arms, ..
         } => {
@@ -1050,17 +668,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
                     "non-exhaustive match without final wildcard/var arm is not supported in system IC3 property guard encoding".to_owned(),
                 );
             }
-            let scrut = expr_to_smt_sys_prop_scoped(
-                scrutinee,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let scrut = expr_to_smt_sys_prop_scoped(scrutinee, ctx, locals, entity_locals)?;
             let mut acc = {
                 let last = arms.last().expect("checked non-empty match arms");
                 let bindings = ic3_match_pattern_bindings(&scrut, &last.pattern, vctx)?;
@@ -1068,17 +676,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
                 for (name, _) in &bindings {
                     scope.insert(name.clone());
                 }
-                let body = guard_to_smt_sys_prop_scoped(
-                    &last.body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    &scope,
-                    entity_locals,
-                )?;
+                let body = guard_to_smt_sys_prop_scoped(&last.body, ctx, &scope, entity_locals)?;
                 wrap_smt_let_bindings(&bindings, body)
             };
             for arm in arms[..arms.len() - 1].iter().rev() {
@@ -1089,32 +687,13 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
                 }
                 let pat = ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?;
                 let cond = if let Some(guard) = &arm.guard {
-                    let guard_smt = guard_to_smt_sys_prop_scoped(
-                        guard,
-                        entities,
-                        slots_per_entity,
-                        current_entity,
-                        vctx,
-                        current_ent_name,
-                        current_slot,
-                        &scope,
-                        entity_locals,
-                    )?;
+                    let guard_smt =
+                        guard_to_smt_sys_prop_scoped(guard, ctx, &scope, entity_locals)?;
                     wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
                 } else {
                     wrap_smt_let_bindings(&bindings, pat)
                 };
-                let body = guard_to_smt_sys_prop_scoped(
-                    &arm.body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    &scope,
-                    entity_locals,
-                )?;
+                let body = guard_to_smt_sys_prop_scoped(&arm.body, ctx, &scope, entity_locals)?;
                 let body = wrap_smt_let_bindings(&bindings, body);
                 acc = format!("(ite {cond} {body} {acc})");
             }
@@ -1126,68 +705,21 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             else_body,
             ..
         } => {
-            let cond_smt = guard_to_smt_sys_prop_scoped(
-                cond,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
-            let then_smt = guard_to_smt_sys_prop_scoped(
-                then_body,
-                entities,
-                slots_per_entity,
-                current_entity,
-                vctx,
-                current_ent_name,
-                current_slot,
-                locals,
-                entity_locals,
-            )?;
+            let cond_smt = guard_to_smt_sys_prop_scoped(cond, ctx, locals, entity_locals)?;
+            let then_smt = guard_to_smt_sys_prop_scoped(then_body, ctx, locals, entity_locals)?;
             if let Some(else_body) = else_body {
-                let else_smt = guard_to_smt_sys_prop_scoped(
-                    else_body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    locals,
-                    entity_locals,
-                )?;
+                let else_smt = guard_to_smt_sys_prop_scoped(else_body, ctx, locals, entity_locals)?;
                 Ok(format!("(ite {cond_smt} {then_smt} {else_smt})"))
             } else {
                 Ok(format!("(=> {cond_smt} {then_smt})"))
             }
         }
-        IRExpr::Let { bindings, body, .. } => guard_let_to_smt_sys_prop_scoped(
-            bindings,
-            body,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        ),
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => guard_to_smt_sys_prop_scoped(
-            expr,
-            entities,
-            slots_per_entity,
-            current_entity,
-            vctx,
-            current_ent_name,
-            current_slot,
-            locals,
-            entity_locals,
-        ),
+        IRExpr::Let { bindings, body, .. } => {
+            guard_let_to_smt_sys_prop_scoped(bindings, body, ctx, locals, entity_locals)
+        }
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            guard_to_smt_sys_prop_scoped(expr, ctx, locals, entity_locals)
+        }
         IRExpr::Forall {
             var, domain, body, ..
         } => ic3_finite_quantifier_formula(
@@ -1196,19 +728,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
-            },
+            |body, scope| guard_to_smt_sys_prop_scoped(body, ctx, scope, entity_locals),
             "forall",
         )?
         .ok_or_else(|| {
@@ -1223,19 +743,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
-            },
+            |body, scope| guard_to_smt_sys_prop_scoped(body, ctx, scope, entity_locals),
             "exists",
         )?
         .ok_or_else(|| {
@@ -1250,19 +758,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
-            },
+            |body, scope| guard_to_smt_sys_prop_scoped(body, ctx, scope, entity_locals),
             "one",
         )?
         .ok_or_else(|| {
@@ -1277,19 +773,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_prop_scoped(
-                    body,
-                    entities,
-                    slots_per_entity,
-                    current_entity,
-                    vctx,
-                    current_ent_name,
-                    current_slot,
-                    scope,
-                    entity_locals,
-                )
-            },
+            |body, scope| guard_to_smt_sys_prop_scoped(body, ctx, scope, entity_locals),
             "lone",
         )?
         .ok_or_else(|| {
@@ -1303,33 +787,11 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_scoped(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(in crate::verify::ic3) fn guard_to_smt_sys_prop_two_scoped(
     expr: &IRExpr,
-    entities: &[&IREntity],
-    slots_per_entity: &HashMap<String, usize>,
-    entity1: &IREntity,
-    entity2: &IREntity,
-    vctx: &VerifyContext,
-    ent1_name: &str,
-    slot1: usize,
-    var1: &str,
-    _ent2_name: &str,
-    _slot2: usize,
-    var2: &str,
+    ctx: Ic3SystemPropertyCtx<'_>,
     locals: &HashSet<String>,
     entity_locals: &Ic3SystemEntityLocals,
 ) -> Result<String, String> {
-    let _ = (entity1, entity2, var1, var2);
-    guard_to_smt_sys_prop_scoped(
-        expr,
-        entities,
-        slots_per_entity,
-        ic3_find_entity(entities, ent1_name)?,
-        vctx,
-        ent1_name,
-        slot1,
-        locals,
-        entity_locals,
-    )
+    guard_to_smt_sys_prop_scoped(expr, ctx, locals, entity_locals)
 }

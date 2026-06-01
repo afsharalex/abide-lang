@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use std::collections::HashSet;
 
 use super::*;
@@ -9,6 +7,98 @@ struct PooledSyGuSCtx<'a> {
     active_vars: &'a HashMap<String, HashMap<usize, Cvc5Term>>,
     slot_fields: &'a HashMap<String, Cvc5Term>,
     store_param_types: &'a HashMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+struct PooledFrameVars<'a> {
+    active_curr: &'a HashMap<String, HashMap<usize, Cvc5Term>>,
+    active_next: &'a HashMap<String, HashMap<usize, Cvc5Term>>,
+    slot_curr: &'a HashMap<String, Cvc5Term>,
+    slot_next: &'a HashMap<String, Cvc5Term>,
+}
+
+#[derive(Clone, Copy)]
+struct PooledExprEnv<'a> {
+    vars: &'a HashMap<String, Cvc5Term>,
+    entity_bindings: &'a PooledEntityBindings,
+    pool_ctx: &'a PooledSyGuSCtx<'a>,
+    enum_catalog: &'a EnumCatalog,
+}
+
+#[derive(Clone, Copy)]
+struct PooledSlotTransitionCtx<'a> {
+    vars: &'a HashMap<String, Cvc5Term>,
+    entity_bindings: &'a PooledEntityBindings,
+    frames: PooledFrameVars<'a>,
+    enum_catalog: &'a EnumCatalog,
+    pool_ctx: &'a PooledSyGuSCtx<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct PooledTargetSlot<'a> {
+    var: &'a str,
+    entity: &'a IREntity,
+    slot: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PooledNestedOpsCtx<'a> {
+    systems_by_name: &'a HashMap<String, &'a IRSystem>,
+    entities_by_name: &'a HashMap<String, &'a IREntity>,
+    slots_per_entity: &'a HashMap<String, usize>,
+    vars: &'a HashMap<String, Cvc5Term>,
+    next_vars: &'a HashMap<String, Cvc5Term>,
+    entity_bindings: &'a PooledEntityBindings,
+    frames: PooledFrameVars<'a>,
+    enum_catalog: &'a EnumCatalog,
+    pool_ctx: &'a PooledSyGuSCtx<'a>,
+    call_stack: &'a [String],
+}
+
+#[derive(Clone, Copy)]
+struct PooledEntityPoolTarget<'a> {
+    entity: &'a IREntity,
+    n_slots: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PooledActionCtx<'a> {
+    system: &'a IRSystem,
+    systems_by_name: &'a HashMap<String, &'a IRSystem>,
+    entities_by_name: &'a HashMap<String, &'a IREntity>,
+    slots_per_entity: &'a HashMap<String, usize>,
+    vars: &'a HashMap<String, Cvc5Term>,
+    next_vars: &'a HashMap<String, Cvc5Term>,
+    entity_bindings: &'a PooledEntityBindings,
+    frames: PooledFrameVars<'a>,
+    enum_catalog: &'a EnumCatalog,
+    call_stack: &'a [String],
+}
+
+#[derive(Clone, Copy)]
+struct PooledStepCtx<'a> {
+    system: &'a IRSystem,
+    systems_by_name: &'a HashMap<String, &'a IRSystem>,
+    entities_by_name: &'a HashMap<String, &'a IREntity>,
+    slots_per_entity: &'a HashMap<String, usize>,
+    curr_vars: &'a HashMap<String, Cvc5Term>,
+    next_vars: &'a HashMap<String, Cvc5Term>,
+    frames: PooledFrameVars<'a>,
+    enum_catalog: &'a EnumCatalog,
+    call_stack: &'a [String],
+}
+
+#[derive(Clone, Copy)]
+struct PooledCrossCallCtx<'a> {
+    systems_by_name: &'a HashMap<String, &'a IRSystem>,
+    entities_by_name: &'a HashMap<String, &'a IREntity>,
+    slots_per_entity: &'a HashMap<String, usize>,
+    curr_vars: &'a HashMap<String, Cvc5Term>,
+    next_vars: &'a HashMap<String, Cvc5Term>,
+    entity_bindings: &'a PooledEntityBindings,
+    frames: PooledFrameVars<'a>,
+    enum_catalog: &'a EnumCatalog,
+    call_stack: &'a [String],
 }
 
 type PooledEntityBindings = HashMap<String, (String, usize)>;
@@ -384,18 +474,22 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             encode_pooled_system_step(
                 &tm,
                 step,
-                root_system,
-                &systems_by_name,
-                &entities_by_name,
-                slots_per_entity,
-                &curr_vars,
-                &next_vars,
-                &active_curr,
-                &active_next,
-                &slot_curr,
-                &slot_next,
-                &enum_catalog,
-                std::slice::from_ref(&root_system.name),
+                PooledStepCtx {
+                    system: root_system,
+                    systems_by_name: &systems_by_name,
+                    entities_by_name: &entities_by_name,
+                    slots_per_entity,
+                    curr_vars: &curr_vars,
+                    next_vars: &next_vars,
+                    frames: PooledFrameVars {
+                        active_curr: &active_curr,
+                        active_next: &active_next,
+                        slot_curr: &slot_curr,
+                        slot_next: &slot_next,
+                    },
+                    enum_catalog: &enum_catalog,
+                    call_stack: std::slice::from_ref(&root_system.name),
+                },
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -542,13 +636,18 @@ pub(super) fn encode_pooled_transition_at_slot_for_test(
         entity,
         0,
         &[],
-        &HashMap::new(),
-        &HashMap::new(),
-        &active_next,
-        &slot_curr,
-        &slot_next,
-        enum_catalog,
-        &pool_ctx,
+        PooledSlotTransitionCtx {
+            vars: &HashMap::new(),
+            entity_bindings: &HashMap::new(),
+            frames: PooledFrameVars {
+                active_curr: &active_curr,
+                active_next: &active_next,
+                slot_curr: &slot_curr,
+                slot_next: &slot_next,
+            },
+            enum_catalog,
+            pool_ctx: &pool_ctx,
+        },
     )
 }
 
@@ -655,18 +754,22 @@ pub(super) fn encode_pooled_system_step_for_systems_test(
     encode_pooled_system_step(
         tm,
         step,
-        system,
-        &systems_by_name,
-        &entities_by_name,
-        slots_per_entity,
-        &curr_vars,
-        &next_vars,
-        &active_curr,
-        &active_next,
-        &slot_curr,
-        &slot_next,
-        enum_catalog,
-        std::slice::from_ref(&system.name),
+        PooledStepCtx {
+            system,
+            systems_by_name: &systems_by_name,
+            entities_by_name: &entities_by_name,
+            slots_per_entity,
+            curr_vars: &curr_vars,
+            next_vars: &next_vars,
+            frames: PooledFrameVars {
+                active_curr: &active_curr,
+                active_next: &active_next,
+                slot_curr: &slot_curr,
+                slot_next: &slot_next,
+            },
+            enum_catalog,
+            call_stack: std::slice::from_ref(&system.name),
+        },
     )
 }
 
@@ -728,10 +831,7 @@ fn frame_other_pooled_slots(
     tm: &Cvc5Tm,
     entity: &IREntity,
     excluded_slot: usize,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
+    frame_vars: PooledFrameVars<'_>,
     n_slots: usize,
 ) -> Result<Vec<Cvc5Term>, String> {
     let mut frames = Vec::new();
@@ -743,10 +843,10 @@ fn frame_other_pooled_slots(
             tm,
             entity,
             slot,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
+            frame_vars.active_curr,
+            frame_vars.active_next,
+            frame_vars.slot_curr,
+            frame_vars.slot_next,
         )?);
     }
     Ok(frames)
@@ -757,10 +857,7 @@ fn frame_other_pooled_entities(
     entities_by_name: &HashMap<String, &IREntity>,
     slots_per_entity: &HashMap<String, usize>,
     excluded_entity: &str,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
+    frame_vars: PooledFrameVars<'_>,
 ) -> Result<Vec<Cvc5Term>, String> {
     let mut frames = Vec::new();
     for (entity_name, n_slots) in slots_per_entity {
@@ -775,10 +872,10 @@ fn frame_other_pooled_entities(
                 tm,
                 entity,
                 slot,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
+                frame_vars.active_curr,
+                frame_vars.active_next,
+                frame_vars.slot_curr,
+                frame_vars.slot_next,
             )?);
         }
     }
@@ -1074,28 +1171,26 @@ fn mk_exists(tm: &Cvc5Tm, vars: &[Cvc5Term], body: Cvc5Term) -> Cvc5Term {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_ops_for_target(
     tm: &Cvc5Tm,
-    target_var: &str,
-    target_entity: &IREntity,
-    target_slot: usize,
     ops: &[IRAction],
-    _system: &IRSystem,
-    _systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    _call_stack: &[String],
+    target: PooledTargetSlot<'_>,
+    ctx: PooledNestedOpsCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let target_var = target.var;
+    let target_entity = target.entity;
+    let target_slot = target.slot;
+    let entities_by_name = ctx.entities_by_name;
+    let slots_per_entity = ctx.slots_per_entity;
+    let vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let pool_ctx = ctx.pool_ctx;
     if ops.is_empty() {
         return Err("cvc5 SyGuS pooled system safety requires at least one nested op".to_owned());
     }
@@ -1153,24 +1248,18 @@ fn encode_pooled_ops_for_target(
             };
             conjuncts.push(encode_pooled_ops_for_target(
                 tm,
-                target_var,
-                target_entity,
-                target_slot,
                 std::slice::from_ref(op),
-                _system,
-                _systems_by_name,
-                entities_by_name,
-                slots_per_entity,
-                vars,
-                next_vars,
-                entity_bindings,
-                active_curr,
-                stage_active_next,
-                &stage_read_fields,
-                &stage_write_fields,
-                enum_catalog,
-                &stage_pool_ctx,
-                _call_stack,
+                target,
+                PooledNestedOpsCtx {
+                    frames: PooledFrameVars {
+                        active_curr,
+                        active_next: stage_active_next,
+                        slot_curr: &stage_read_fields,
+                        slot_next: &stage_write_fields,
+                    },
+                    pool_ctx: &stage_pool_ctx,
+                    ..ctx
+                },
             )?);
         }
         return Ok(mk_exists(tm, &bound, mk_and(tm, &conjuncts)));
@@ -1206,13 +1295,18 @@ fn encode_pooled_ops_for_target(
                 target_entity,
                 target_slot,
                 args,
-                vars,
-                &resolved_bindings,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                pool_ctx,
+                PooledSlotTransitionCtx {
+                    vars,
+                    entity_bindings: &resolved_bindings,
+                    frames: PooledFrameVars {
+                        active_curr,
+                        active_next,
+                        slot_curr,
+                        slot_next,
+                    },
+                    enum_catalog,
+                    pool_ctx,
+                },
             )
         }
         IRAction::Choose {
@@ -1254,24 +1348,13 @@ fn encode_pooled_ops_for_target(
                         )?,
                         encode_pooled_ops_for_target(
                             tm,
-                            target_var,
-                            target_entity,
-                            target_slot,
                             inner_ops,
-                            _system,
-                            _systems_by_name,
-                            entities_by_name,
-                            slots_per_entity,
-                            &scoped_vars,
-                            next_vars,
-                            &bindings,
-                            active_curr,
-                            active_next,
-                            slot_curr,
-                            slot_next,
-                            enum_catalog,
-                            pool_ctx,
-                            _call_stack,
+                            target,
+                            PooledNestedOpsCtx {
+                                vars: &scoped_vars,
+                                entity_bindings: &bindings,
+                                ..ctx
+                            },
                         )?,
                     ],
                 ));
@@ -1282,64 +1365,26 @@ fn encode_pooled_ops_for_target(
             var,
             entity: forall_entity,
             ops: inner_ops,
-        } => encode_pooled_ops_forall_for_target(
-            tm,
-            target_var,
-            target_entity,
-            target_slot,
-            var,
-            forall_entity,
-            inner_ops,
-            _system,
-            _systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            vars,
-            next_vars,
-            entity_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
-            _call_stack,
-        ),
-        IRAction::Match { scrutinee, arms } => encode_pooled_ops_match_for_target(
-            tm,
-            target_var,
-            target_entity,
-            target_slot,
-            scrutinee,
-            arms,
-            _system,
-            _systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            vars,
-            next_vars,
-            entity_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
-            _call_stack,
-        ),
+        } => encode_pooled_ops_forall_for_target(tm, var, forall_entity, inner_ops, target, ctx),
+        IRAction::Match { scrutinee, arms } => {
+            encode_pooled_ops_match_for_target(tm, scrutinee, arms, target, ctx)
+        }
         IRAction::ExprStmt { expr } => encode_pooled_entity_exprstmt_at_slot(
             tm,
             expr,
-            target_var,
-            target_entity,
-            target_slot,
-            vars,
-            entity_bindings,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
+            target,
+            PooledSlotTransitionCtx {
+                vars,
+                entity_bindings,
+                frames: PooledFrameVars {
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                },
+                enum_catalog,
+                pool_ctx,
+            },
         ),
         IRAction::CrossCall {
             system: target_system_name,
@@ -1350,18 +1395,22 @@ fn encode_pooled_ops_for_target(
             target_system_name,
             command,
             args,
-            _systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            vars,
-            next_vars,
-            entity_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            _call_stack,
+            PooledCrossCallCtx {
+                systems_by_name: ctx.systems_by_name,
+                entities_by_name,
+                slots_per_entity,
+                curr_vars: vars,
+                next_vars,
+                entity_bindings,
+                frames: PooledFrameVars {
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                },
+                enum_catalog,
+                call_stack: ctx.call_stack,
+            },
         )
         .map(|capture| capture.formula),
         other => Err(format!(
@@ -1370,67 +1419,42 @@ fn encode_pooled_ops_for_target(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_ops_forall_for_target(
     tm: &Cvc5Tm,
-    target_var: &str,
-    target_entity: &IREntity,
-    target_slot: usize,
     var: &str,
     forall_entity: &str,
     ops: &[IRAction],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    call_stack: &[String],
+    target: PooledTargetSlot<'_>,
+    ctx: PooledNestedOpsCtx<'_>,
 ) -> Result<Cvc5Term, String> {
-    entities_by_name
+    ctx.entities_by_name
         .get(forall_entity)
         .ok_or_else(|| format!("unknown pooled entity `{forall_entity}`"))?;
-    let n_slots = *slots_per_entity
+    let n_slots = *ctx
+        .slots_per_entity
         .get(forall_entity)
         .ok_or_else(|| format!("missing slot scope for `{forall_entity}`"))?;
     let mut conjuncts = Vec::with_capacity(n_slots);
     for slot in 0..n_slots {
-        let active = active_curr
+        let active = ctx
+            .frames
+            .active_curr
             .get(forall_entity)
             .and_then(|slots| slots.get(&slot))
             .ok_or_else(|| {
                 format!("missing current active variable for {forall_entity} slot {slot}")
             })?
             .clone();
-        let mut bindings = entity_bindings.clone();
+        let mut bindings = ctx.entity_bindings.clone();
         bindings.insert(var.to_owned(), (forall_entity.to_owned(), slot));
         let body = encode_pooled_ops_for_target(
             tm,
-            target_var,
-            target_entity,
-            target_slot,
             ops,
-            system,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            vars,
-            next_vars,
-            &bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
-            call_stack,
+            target,
+            PooledNestedOpsCtx {
+                entity_bindings: &bindings,
+                ..ctx
+            },
         )?;
         conjuncts.push(tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[active, body]));
     }
@@ -1480,29 +1504,20 @@ fn pooled_target_var_type(entity: &IREntity, name: &str) -> Option<IRType> {
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_ops_match_for_target(
     tm: &Cvc5Tm,
-    target_var: &str,
-    target_entity: &IREntity,
-    target_slot: usize,
     scrutinee: &crate::ir::types::IRActionMatchScrutinee,
     arms: &[crate::ir::types::IRActionMatchArm],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    call_stack: &[String],
+    target: PooledTargetSlot<'_>,
+    ctx: PooledNestedOpsCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let target_entity = target.entity;
+    let target_slot = target.slot;
+    let vars = ctx.vars;
+    let entity_bindings = ctx.entity_bindings;
+    let slot_curr = ctx.frames.slot_curr;
+    let enum_catalog = ctx.enum_catalog;
+    let pool_ctx = ctx.pool_ctx;
     if arms.is_empty() {
         return Err("cvc5 SyGuS pooled nested action match requires at least one arm".to_owned());
     }
@@ -1557,24 +1572,12 @@ fn encode_pooled_ops_match_for_target(
         let arm_cond = mk_and(tm, &[pat_cond, guard_cond]);
         let arm_body = encode_pooled_ops_for_target(
             tm,
-            target_var,
-            target_entity,
-            target_slot,
             &arm.body,
-            system,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            &arm_vars,
-            next_vars,
-            entity_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
-            call_stack,
+            target,
+            PooledNestedOpsCtx {
+                vars: &arm_vars,
+                ..ctx
+            },
         )?;
         fallback = Some(match fallback {
             None => {
@@ -1609,14 +1612,15 @@ fn encode_pooled_transition_at_slot(
     entity: &IREntity,
     slot: usize,
     apply_args: &[IRExpr],
-    vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    pool_ctx: &PooledSyGuSCtx<'_>,
+    ctx: PooledSlotTransitionCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let vars = ctx.vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let pool_ctx = ctx.pool_ctx;
     if trans.params.len() != apply_args.len() {
         return Err(format!(
             "cvc5 SyGuS pooled system safety expected {} args for transition `{}`, got {}",
@@ -1802,21 +1806,22 @@ fn exprstmt_target_field<'a>(expr: &'a IRExpr, target_var: &str) -> Result<&'a s
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_entity_exprstmt_at_slot(
     tm: &Cvc5Tm,
     expr: &IRExpr,
-    target_var: &str,
-    entity: &IREntity,
-    slot: usize,
-    vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    pool_ctx: &PooledSyGuSCtx<'_>,
+    target: PooledTargetSlot<'_>,
+    ctx: PooledSlotTransitionCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let target_var = target.var;
+    let entity = target.entity;
+    let slot = target.slot;
+    let vars = ctx.vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let pool_ctx = ctx.pool_ctx;
     let update_field = exprstmt_target_field(expr, target_var)?;
     if !entity.fields.iter().any(|field| field.name == update_field) {
         return Err(format!(
@@ -1887,21 +1892,21 @@ fn encode_pooled_entity_exprstmt_at_slot(
     Ok(mk_and(tm, &conjuncts))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_create_action(
     tm: &Cvc5Tm,
     create_entity: &str,
     create_fields: &[IRCreateField],
-    system: &IRSystem,
-    entity: &IREntity,
-    vars: &HashMap<String, Cvc5Term>,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    n_slots: usize,
+    target: PooledEntityPoolTarget<'_>,
+    ctx: PooledActionCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let entity = target.entity;
+    let n_slots = target.n_slots;
+    let vars = ctx.vars;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
     if create_entity != entity.name {
         return Err(format!(
             "cvc5 SyGuS pooled system safety only supports creates for `{}`",
@@ -1914,7 +1919,7 @@ fn encode_pooled_create_action(
         .map(|field| (field.name.as_str(), &field.value))
         .collect();
     let local_slots_per_entity = HashMap::from([(entity.name.clone(), n_slots)]);
-    let local_store_param_types = system_store_param_types(system);
+    let local_store_param_types = system_store_param_types(ctx.system);
     let pre_ctx = PooledSyGuSCtx {
         slots_per_entity: &local_slots_per_entity,
         active_vars: active_curr,
@@ -1981,10 +1986,12 @@ fn encode_pooled_create_action(
             tm,
             entity,
             slot,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
+            PooledFrameVars {
+                active_curr,
+                active_next,
+                slot_curr,
+                slot_next,
+            },
             n_slots,
         )?);
         branches.push(mk_and(tm, &conjuncts));
@@ -1992,41 +1999,37 @@ fn encode_pooled_create_action(
     Ok(mk_or(tm, &branches))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_choose_action(
     tm: &Cvc5Tm,
     var: &str,
     choose_entity: &str,
     filter: &IRExpr,
     ops: &[IRAction],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entity: &IREntity,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    n_slots: usize,
-    call_stack: &[String],
+    target: PooledEntityPoolTarget<'_>,
+    ctx: PooledActionCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let entity = target.entity;
+    let n_slots = target.n_slots;
+    let vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
     if choose_entity != entity.name {
         return Err(format!(
             "cvc5 SyGuS pooled system safety only supports chooses over `{}`",
             entity.name
         ));
     }
-    if !system.fields.is_empty() {
+    if !ctx.system.fields.is_empty() {
         // system fields remain framed for this slice
     }
-    let store_param_types = system_store_param_types(system);
+    let store_param_types = system_store_param_types(ctx.system);
     let pool_ctx = PooledSyGuSCtx {
-        slots_per_entity,
+        slots_per_entity: ctx.slots_per_entity,
         active_vars: active_curr,
         slot_fields: slot_curr,
         store_param_types: &store_param_types,
@@ -2050,34 +2053,37 @@ fn encode_pooled_choose_action(
             encode_pooled_expr(tm, filter, &scoped_vars, &bindings, &pool_ctx, enum_catalog)?,
             encode_pooled_ops_for_target(
                 tm,
-                var,
-                entity,
-                slot,
                 ops,
-                system,
-                systems_by_name,
-                entities_by_name,
-                slots_per_entity,
-                &scoped_vars,
-                next_vars,
-                &bindings,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                &pool_ctx,
-                call_stack,
+                PooledTargetSlot { var, entity, slot },
+                PooledNestedOpsCtx {
+                    systems_by_name: ctx.systems_by_name,
+                    entities_by_name: ctx.entities_by_name,
+                    slots_per_entity: ctx.slots_per_entity,
+                    vars: &scoped_vars,
+                    next_vars,
+                    entity_bindings: &bindings,
+                    frames: PooledFrameVars {
+                        active_curr,
+                        active_next,
+                        slot_curr,
+                        slot_next,
+                    },
+                    enum_catalog,
+                    pool_ctx: &pool_ctx,
+                    call_stack: ctx.call_stack,
+                },
             )?,
         ];
         conjuncts.extend(frame_other_pooled_slots(
             tm,
             entity,
             slot,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
+            PooledFrameVars {
+                active_curr,
+                active_next,
+                slot_curr,
+                slot_next,
+            },
             n_slots,
         )?);
         branches.push(mk_and(tm, &conjuncts));
@@ -2085,37 +2091,33 @@ fn encode_pooled_choose_action(
     Ok(mk_or(tm, &branches))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_forall_action(
     tm: &Cvc5Tm,
     var: &str,
     forall_entity: &str,
     ops: &[IRAction],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entity: &IREntity,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    n_slots: usize,
-    call_stack: &[String],
+    target: PooledEntityPoolTarget<'_>,
+    ctx: PooledActionCtx<'_>,
 ) -> Result<Cvc5Term, String> {
+    let entity = target.entity;
+    let n_slots = target.n_slots;
+    let vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
     if forall_entity != entity.name {
         return Err(format!(
             "cvc5 SyGuS pooled system safety only supports forall over `{}`",
             entity.name
         ));
     }
-    let store_param_types = system_store_param_types(system);
+    let store_param_types = system_store_param_types(ctx.system);
     let pool_ctx = PooledSyGuSCtx {
-        slots_per_entity,
+        slots_per_entity: ctx.slots_per_entity,
         active_vars: active_curr,
         slot_fields: slot_curr,
         store_param_types: &store_param_types,
@@ -2140,24 +2142,25 @@ fn encode_pooled_forall_action(
                 active.clone(),
                 encode_pooled_ops_for_target(
                     tm,
-                    var,
-                    entity,
-                    slot,
                     ops,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    vars,
-                    next_vars,
-                    &bindings,
-                    active_curr,
-                    active_next,
-                    slot_curr,
-                    slot_next,
-                    enum_catalog,
-                    &pool_ctx,
-                    call_stack,
+                    PooledTargetSlot { var, entity, slot },
+                    PooledNestedOpsCtx {
+                        systems_by_name: ctx.systems_by_name,
+                        entities_by_name: ctx.entities_by_name,
+                        slots_per_entity: ctx.slots_per_entity,
+                        vars,
+                        next_vars,
+                        entity_bindings: &bindings,
+                        frames: PooledFrameVars {
+                            active_curr,
+                            active_next,
+                            slot_curr,
+                            slot_next,
+                        },
+                        enum_catalog,
+                        pool_ctx: &pool_ctx,
+                        call_stack: ctx.call_stack,
+                    },
                 )?,
             ],
         );
@@ -2233,69 +2236,78 @@ fn encode_pooled_system_exprstmt_update(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_exprstmt_formula(
     tm: &Cvc5Tm,
     expr: &IRExpr,
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
+    ctx: PooledActionCtx<'_>,
     pool_ctx: &PooledSyGuSCtx<'_>,
-    enum_catalog: &EnumCatalog,
 ) -> Result<Cvc5Term, String> {
+    let system = ctx.system;
+    let curr_vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
     if let Some((target_var, entity_name, slot)) =
         exprstmt_bound_entity_target(expr, entity_bindings)?
     {
-        let entity = entities_by_name
+        let entity = ctx
+            .entities_by_name
             .get(&entity_name)
             .ok_or_else(|| format!("unknown pooled entity `{entity_name}`"))?;
         let mut conjuncts = vec![encode_pooled_entity_exprstmt_at_slot(
             tm,
             expr,
-            &target_var,
-            entity,
-            slot,
-            curr_vars,
-            entity_bindings,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            pool_ctx,
+            PooledTargetSlot {
+                var: &target_var,
+                entity,
+                slot,
+            },
+            PooledSlotTransitionCtx {
+                vars: curr_vars,
+                entity_bindings,
+                frames: PooledFrameVars {
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                },
+                enum_catalog,
+                pool_ctx,
+            },
         )?];
         conjuncts.extend(frame_all_system_fields(
             tm,
-            systems_by_name,
+            ctx.systems_by_name,
             curr_vars,
             next_vars,
         )?);
         conjuncts.extend(frame_other_pooled_entities(
             tm,
-            entities_by_name,
-            slots_per_entity,
+            ctx.entities_by_name,
+            ctx.slots_per_entity,
             &entity_name,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
+            PooledFrameVars {
+                active_curr,
+                active_next,
+                slot_curr,
+                slot_next,
+            },
         )?);
         conjuncts.extend(frame_other_pooled_slots(
             tm,
             entity,
             slot,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            *slots_per_entity
+            PooledFrameVars {
+                active_curr,
+                active_next,
+                slot_curr,
+                slot_next,
+            },
+            *ctx.slots_per_entity
                 .get(&entity_name)
                 .ok_or_else(|| format!("missing slot scope for `{entity_name}`"))?,
         )?);
@@ -2314,7 +2326,7 @@ fn encode_pooled_system_exprstmt_formula(
     let mut conjuncts = vec![update];
     conjuncts.extend(frame_system_fields_except(
         tm,
-        systems_by_name,
+        ctx.systems_by_name,
         curr_vars,
         next_vars,
         &touched,
@@ -2329,8 +2341,8 @@ fn encode_pooled_system_exprstmt_formula(
     )?);
     conjuncts.extend(frame_all_pooled_entities(
         tm,
-        entities_by_name,
-        slots_per_entity,
+        ctx.entities_by_name,
+        ctx.slots_per_entity,
         active_curr,
         active_next,
         slot_curr,
@@ -2360,58 +2372,33 @@ fn exprstmt_bound_entity_target(
         .map(|(entity, slot)| (name.clone(), entity.clone(), *slot)))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_action(
     tm: &Cvc5Tm,
     action: &IRAction,
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
+    ctx: PooledActionCtx<'_>,
     local_bindings: &PooledLocalBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    call_stack: &[String],
 ) -> Result<PooledActionResult, String> {
-    let mut merged_vars = vars.clone();
+    let mut merged_vars = ctx.vars.clone();
     merged_vars.extend(
         local_bindings
             .iter()
             .map(|(name, binding)| (name.clone(), binding.term.clone())),
     );
+    let merged_ctx = PooledActionCtx {
+        vars: &merged_vars,
+        ..ctx
+    };
     match action {
         IRAction::ExprStmt { expr } => {
-            let store_param_types = system_store_param_types(system);
+            let store_param_types = system_store_param_types(ctx.system);
             let pool_ctx = PooledSyGuSCtx {
-                slots_per_entity,
-                active_vars: active_curr,
-                slot_fields: slot_curr,
+                slots_per_entity: ctx.slots_per_entity,
+                active_vars: ctx.frames.active_curr,
+                slot_fields: ctx.frames.slot_curr,
                 store_param_types: &store_param_types,
             };
             Ok(PooledActionResult {
-                formula: encode_pooled_system_exprstmt_formula(
-                    tm,
-                    expr,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &merged_vars,
-                    next_vars,
-                    entity_bindings,
-                    active_curr,
-                    active_next,
-                    slot_curr,
-                    slot_next,
-                    &pool_ctx,
-                    enum_catalog,
-                )?,
+                formula: encode_pooled_system_exprstmt_formula(tm, expr, merged_ctx, &pool_ctx)?,
                 locals: local_bindings.clone(),
             })
         }
@@ -2419,35 +2406,30 @@ fn encode_pooled_system_action(
             entity: create_entity,
             fields,
         } => {
-            let create_target = entities_by_name
+            let create_target = ctx
+                .entities_by_name
                 .get(create_entity)
                 .ok_or_else(|| format!("unknown pooled entity `{create_entity}`"))?;
-            let n_slots = *slots_per_entity
+            let n_slots = *ctx
+                .slots_per_entity
                 .get(create_entity)
                 .ok_or_else(|| format!("missing slot scope for `{create_entity}`"))?;
             let mut conjuncts_local = vec![encode_pooled_create_action(
                 tm,
                 create_entity,
                 fields,
-                system,
-                create_target,
-                vars,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                n_slots,
+                PooledEntityPoolTarget {
+                    entity: create_target,
+                    n_slots,
+                },
+                ctx,
             )?];
             conjuncts_local.extend(frame_other_pooled_entities(
                 tm,
-                entities_by_name,
-                slots_per_entity,
+                ctx.entities_by_name,
+                ctx.slots_per_entity,
                 create_entity,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
+                ctx.frames,
             )?);
             Ok(PooledActionResult {
                 formula: mk_and(tm, &conjuncts_local),
@@ -2460,10 +2442,12 @@ fn encode_pooled_system_action(
             filter,
             ops,
         } => {
-            let choose_target = entities_by_name
+            let choose_target = ctx
+                .entities_by_name
                 .get(choose_entity)
                 .ok_or_else(|| format!("unknown pooled entity `{choose_entity}`"))?;
-            let n_slots = *slots_per_entity
+            let n_slots = *ctx
+                .slots_per_entity
                 .get(choose_entity)
                 .ok_or_else(|| format!("missing slot scope for `{choose_entity}`"))?;
             let mut conjuncts_local = vec![encode_pooled_choose_action(
@@ -2472,31 +2456,18 @@ fn encode_pooled_system_action(
                 choose_entity,
                 filter,
                 ops,
-                system,
-                systems_by_name,
-                choose_target,
-                entities_by_name,
-                slots_per_entity,
-                &merged_vars,
-                next_vars,
-                entity_bindings,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                n_slots,
-                call_stack,
+                PooledEntityPoolTarget {
+                    entity: choose_target,
+                    n_slots,
+                },
+                merged_ctx,
             )?];
             conjuncts_local.extend(frame_other_pooled_entities(
                 tm,
-                entities_by_name,
-                slots_per_entity,
+                ctx.entities_by_name,
+                ctx.slots_per_entity,
                 choose_entity,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
+                ctx.frames,
             )?);
             Ok(PooledActionResult {
                 formula: mk_and(tm, &conjuncts_local),
@@ -2508,10 +2479,12 @@ fn encode_pooled_system_action(
             entity: forall_entity,
             ops,
         } => {
-            let forall_target = entities_by_name
+            let forall_target = ctx
+                .entities_by_name
                 .get(forall_entity)
                 .ok_or_else(|| format!("unknown pooled entity `{forall_entity}`"))?;
-            let n_slots = *slots_per_entity
+            let n_slots = *ctx
+                .slots_per_entity
                 .get(forall_entity)
                 .ok_or_else(|| format!("missing slot scope for `{forall_entity}`"))?;
             let mut conjuncts_local = vec![encode_pooled_forall_action(
@@ -2519,31 +2492,18 @@ fn encode_pooled_system_action(
                 var,
                 forall_entity,
                 ops,
-                system,
-                systems_by_name,
-                forall_target,
-                entities_by_name,
-                slots_per_entity,
-                &merged_vars,
-                next_vars,
-                entity_bindings,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                n_slots,
-                call_stack,
+                PooledEntityPoolTarget {
+                    entity: forall_target,
+                    n_slots,
+                },
+                merged_ctx,
             )?];
             conjuncts_local.extend(frame_other_pooled_entities(
                 tm,
-                entities_by_name,
-                slots_per_entity,
+                ctx.entities_by_name,
+                ctx.slots_per_entity,
                 forall_entity,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
+                ctx.frames,
             )?);
             Ok(PooledActionResult {
                 formula: mk_and(tm, &conjuncts_local),
@@ -2559,18 +2519,17 @@ fn encode_pooled_system_action(
             target_system_name,
             command,
             args,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            &merged_vars,
-            next_vars,
-            entity_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            call_stack,
+            PooledCrossCallCtx {
+                systems_by_name: ctx.systems_by_name,
+                entities_by_name: ctx.entities_by_name,
+                slots_per_entity: ctx.slots_per_entity,
+                curr_vars: &merged_vars,
+                next_vars: ctx.next_vars,
+                entity_bindings: ctx.entity_bindings,
+                frames: ctx.frames,
+                enum_catalog: ctx.enum_catalog,
+                call_stack: ctx.call_stack,
+            },
         )
         .map(|capture| PooledActionResult {
             formula: capture.formula,
@@ -2587,18 +2546,17 @@ fn encode_pooled_system_action(
                 target_system_name,
                 command,
                 args,
-                systems_by_name,
-                entities_by_name,
-                slots_per_entity,
-                &merged_vars,
-                next_vars,
-                entity_bindings,
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                call_stack,
+                PooledCrossCallCtx {
+                    systems_by_name: ctx.systems_by_name,
+                    entities_by_name: ctx.entities_by_name,
+                    slots_per_entity: ctx.slots_per_entity,
+                    curr_vars: &merged_vars,
+                    next_vars: ctx.next_vars,
+                    entity_bindings: ctx.entity_bindings,
+                    frames: ctx.frames,
+                    enum_catalog: ctx.enum_catalog,
+                    call_stack: ctx.call_stack,
+                },
             )?;
             let ret = capture.return_value.ok_or_else(|| {
                 format!(
@@ -2622,19 +2580,11 @@ fn encode_pooled_system_action(
             tm,
             scrutinee,
             arms,
-            system,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            &merged_vars,
-            next_vars,
+            PooledActionCtx {
+                vars: &merged_vars,
+                ..ctx
+            },
             local_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            call_stack,
         )
         .map(|formula| PooledActionResult {
             formula,
@@ -2646,99 +2596,48 @@ fn encode_pooled_system_action(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step(
     tm: &Cvc5Tm,
     step: &IRSystemAction,
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    call_stack: &[String],
+    ctx: PooledStepCtx<'_>,
 ) -> Result<Cvc5Term, String> {
-    let param_envs =
-        enumerate_pooled_param_envs(tm, step, &step.params, slots_per_entity, enum_catalog)?;
-    encode_pooled_system_step_with_param_envs(
+    let param_envs = enumerate_pooled_param_envs(
         tm,
         step,
-        system,
-        systems_by_name,
-        entities_by_name,
-        slots_per_entity,
-        curr_vars,
-        next_vars,
-        active_curr,
-        active_next,
-        slot_curr,
-        slot_next,
-        enum_catalog,
-        param_envs,
-        call_stack,
-    )
+        &step.params,
+        ctx.slots_per_entity,
+        ctx.enum_catalog,
+    )?;
+    encode_pooled_system_step_with_param_envs(tm, step, ctx, param_envs)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step_with_bound_params(
     tm: &Cvc5Tm,
     step: &IRSystemAction,
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
     param_env: PooledParamEnv,
-    call_stack: &[String],
+    ctx: PooledStepCtx<'_>,
 ) -> Result<Cvc5Term, String> {
-    encode_pooled_system_step_with_param_envs(
-        tm,
-        step,
-        system,
-        systems_by_name,
-        entities_by_name,
-        slots_per_entity,
-        curr_vars,
-        next_vars,
-        active_curr,
-        active_next,
-        slot_curr,
-        slot_next,
-        enum_catalog,
-        vec![param_env],
-        call_stack,
-    )
+    encode_pooled_system_step_with_param_envs(tm, step, ctx, vec![param_env])
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_step_with_param_envs(
     tm: &Cvc5Tm,
     step: &IRSystemAction,
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
+    ctx: PooledStepCtx<'_>,
     param_envs: Vec<PooledParamEnv>,
-    call_stack: &[String],
 ) -> Result<Cvc5Term, String> {
+    let system = ctx.system;
+    let systems_by_name = ctx.systems_by_name;
+    let entities_by_name = ctx.entities_by_name;
+    let slots_per_entity = ctx.slots_per_entity;
+    let curr_vars = ctx.curr_vars;
+    let next_vars = ctx.next_vars;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let call_stack = ctx.call_stack;
     let mut branches = Vec::new();
     for param_env in param_envs {
         let mut vars = curr_vars.clone();
@@ -2786,19 +2685,24 @@ fn encode_pooled_system_step_with_param_envs(
                 encode_pooled_system_exprstmt_formula(
                     tm,
                     expr,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &vars,
-                    next_vars,
-                    &param_env.entity_bindings,
-                    active_curr,
-                    active_next,
-                    slot_curr,
-                    slot_next,
+                    PooledActionCtx {
+                        system,
+                        systems_by_name,
+                        entities_by_name,
+                        slots_per_entity,
+                        vars: &vars,
+                        next_vars,
+                        entity_bindings: &param_env.entity_bindings,
+                        frames: PooledFrameVars {
+                            active_curr,
+                            active_next,
+                            slot_curr,
+                            slot_next,
+                        },
+                        enum_catalog,
+                        call_stack,
+                    },
                     &pool_ctx,
-                    enum_catalog,
                 )?
             } else {
                 conjuncts.extend(frame_all_system_fields(
@@ -2810,20 +2714,24 @@ fn encode_pooled_system_step_with_param_envs(
                 encode_pooled_system_action(
                     tm,
                     &step.body[0],
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &vars,
-                    next_vars,
-                    &param_env.entity_bindings,
+                    PooledActionCtx {
+                        system,
+                        systems_by_name,
+                        entities_by_name,
+                        slots_per_entity,
+                        vars: &vars,
+                        next_vars,
+                        entity_bindings: &param_env.entity_bindings,
+                        frames: PooledFrameVars {
+                            active_curr,
+                            active_next,
+                            slot_curr,
+                            slot_next,
+                        },
+                        enum_catalog,
+                        call_stack,
+                    },
                     &HashMap::new(),
-                    active_curr,
-                    active_next,
-                    slot_curr,
-                    slot_next,
-                    enum_catalog,
-                    call_stack,
                 )?
                 .formula
             }
@@ -2945,39 +2853,48 @@ fn encode_pooled_system_step_with_param_envs(
                         action_terms.push(encode_pooled_system_exprstmt_formula(
                             tm,
                             expr,
-                            system,
-                            systems_by_name,
-                            entities_by_name,
-                            slots_per_entity,
-                            &stage_vars,
-                            stage_system_next,
-                            &param_entity_bindings,
-                            stage_active_curr,
-                            stage_active_next,
-                            stage_slot_curr,
-                            stage_slot_next,
+                            PooledActionCtx {
+                                system,
+                                systems_by_name,
+                                entities_by_name,
+                                slots_per_entity,
+                                vars: &stage_vars,
+                                next_vars: stage_system_next,
+                                entity_bindings: &param_entity_bindings,
+                                frames: PooledFrameVars {
+                                    active_curr: stage_active_curr,
+                                    active_next: stage_active_next,
+                                    slot_curr: stage_slot_curr,
+                                    slot_next: stage_slot_next,
+                                },
+                                enum_catalog,
+                                call_stack,
+                            },
                             &stage_pool_ctx,
-                            enum_catalog,
                         )?);
                     }
                     _ => {
                         let action_result = encode_pooled_system_action(
                             tm,
                             action,
-                            system,
-                            systems_by_name,
-                            entities_by_name,
-                            slots_per_entity,
-                            &stage_vars,
-                            stage_system_next,
-                            &param_entity_bindings,
+                            PooledActionCtx {
+                                system,
+                                systems_by_name,
+                                entities_by_name,
+                                slots_per_entity,
+                                vars: &stage_vars,
+                                next_vars: stage_system_next,
+                                entity_bindings: &param_entity_bindings,
+                                frames: PooledFrameVars {
+                                    active_curr: stage_active_curr,
+                                    active_next: stage_active_next,
+                                    slot_curr: stage_slot_curr,
+                                    slot_next: stage_slot_next,
+                                },
+                                enum_catalog,
+                                call_stack,
+                            },
                             &locals,
-                            stage_active_curr,
-                            stage_active_next,
-                            stage_slot_curr,
-                            stage_slot_next,
-                            enum_catalog,
-                            call_stack,
                         )?;
                         let mut framed = frame_all_system_fields(
                             tm,
@@ -2999,24 +2916,24 @@ fn encode_pooled_system_step_with_param_envs(
     Ok(mk_or(tm, &branches))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_system_action_sequence(
     tm: &Cvc5Tm,
     actions: &[IRAction],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
+    ctx: PooledActionCtx<'_>,
     local_bindings: &PooledLocalBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    call_stack: &[String],
 ) -> Result<PooledActionResult, String> {
+    let system = ctx.system;
+    let systems_by_name = ctx.systems_by_name;
+    let entities_by_name = ctx.entities_by_name;
+    let slots_per_entity = ctx.slots_per_entity;
+    let curr_vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let call_stack = ctx.call_stack;
     if actions.is_empty() {
         let mut framed = frame_all_system_fields(tm, systems_by_name, curr_vars, next_vars)?;
         framed.extend(frame_all_pooled_entities(
@@ -3034,24 +2951,7 @@ fn encode_pooled_system_action_sequence(
         });
     }
     if actions.len() == 1 {
-        return encode_pooled_system_action(
-            tm,
-            &actions[0],
-            system,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            curr_vars,
-            next_vars,
-            &HashMap::new(),
-            local_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            call_stack,
-        );
+        return encode_pooled_system_action(tm, &actions[0], ctx, local_bindings);
     }
 
     let non_state_vars: HashMap<_, _> = curr_vars
@@ -3166,39 +3066,48 @@ fn encode_pooled_system_action_sequence(
                 action_terms.push(encode_pooled_system_exprstmt_formula(
                     tm,
                     expr,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &stage_vars,
-                    stage_system_next,
-                    &HashMap::new(),
-                    stage_active_curr,
-                    stage_active_next,
-                    stage_slot_curr,
-                    stage_slot_next,
+                    PooledActionCtx {
+                        system,
+                        systems_by_name,
+                        entities_by_name,
+                        slots_per_entity,
+                        vars: &stage_vars,
+                        next_vars: stage_system_next,
+                        entity_bindings: ctx.entity_bindings,
+                        frames: PooledFrameVars {
+                            active_curr: stage_active_curr,
+                            active_next: stage_active_next,
+                            slot_curr: stage_slot_curr,
+                            slot_next: stage_slot_next,
+                        },
+                        enum_catalog,
+                        call_stack,
+                    },
                     &stage_pool_ctx,
-                    enum_catalog,
                 )?);
             }
             _ => {
                 let action_result = encode_pooled_system_action(
                     tm,
                     action,
-                    system,
-                    systems_by_name,
-                    entities_by_name,
-                    slots_per_entity,
-                    &stage_vars,
-                    stage_system_next,
-                    &HashMap::new(),
+                    PooledActionCtx {
+                        system,
+                        systems_by_name,
+                        entities_by_name,
+                        slots_per_entity,
+                        vars: &stage_vars,
+                        next_vars: stage_system_next,
+                        entity_bindings: ctx.entity_bindings,
+                        frames: PooledFrameVars {
+                            active_curr: stage_active_curr,
+                            active_next: stage_active_next,
+                            slot_curr: stage_slot_curr,
+                            slot_next: stage_slot_next,
+                        },
+                        enum_catalog,
+                        call_stack,
+                    },
                     &locals,
-                    stage_active_curr,
-                    stage_active_next,
-                    stage_slot_curr,
-                    stage_slot_next,
-                    enum_catalog,
-                    call_stack,
                 )?;
                 let mut framed =
                     frame_all_system_fields(tm, systems_by_name, &stage_vars, stage_system_next)?;
@@ -3298,11 +3207,12 @@ fn encode_pooled_finite_choose_expr(
     var: &str,
     domain: &IRType,
     predicate: Option<&IRExpr>,
-    vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    enum_catalog: &EnumCatalog,
+    env: PooledExprEnv<'_>,
 ) -> Result<Cvc5Term, String> {
+    let vars = env.vars;
+    let entity_bindings = env.entity_bindings;
+    let pool_ctx = env.pool_ctx;
+    let enum_catalog = env.enum_catalog;
     let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
         return Err(
             "cvc5 SyGuS pooled system safety only supports finite Bool/enum domains for choose"
@@ -3341,11 +3251,12 @@ fn encode_pooled_finite_aggregate_expr(
     domain: &IRType,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
-    vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    enum_catalog: &EnumCatalog,
+    env: PooledExprEnv<'_>,
 ) -> Result<Cvc5Term, String> {
+    let vars = env.vars;
+    let entity_bindings = env.entity_bindings;
+    let pool_ctx = env.pool_ctx;
+    let enum_catalog = env.enum_catalog;
     let Some(candidates) = finite_domain_values(tm, domain, enum_catalog) else {
         return Err(
             "cvc5 SyGuS pooled system safety only supports finite Bool/enum domains for finite aggregates"
@@ -3877,10 +3788,12 @@ fn encode_pooled_expr(
             var,
             domain,
             predicate.as_deref(),
-            vars,
-            entity_bindings,
-            pool_ctx,
-            enum_catalog,
+            PooledExprEnv {
+                vars,
+                entity_bindings,
+                pool_ctx,
+                enum_catalog,
+            },
         ),
         IRExpr::Aggregate {
             kind,
@@ -3896,10 +3809,12 @@ fn encode_pooled_expr(
             domain,
             body,
             in_filter.as_deref(),
-            vars,
-            entity_bindings,
-            pool_ctx,
-            enum_catalog,
+            PooledExprEnv {
+                vars,
+                entity_bindings,
+                pool_ctx,
+                enum_catalog,
+            },
         ),
         IRExpr::Card { expr: inner, .. } => {
             encode_finite_card_expr(tm, inner, vars, enum_catalog, |expr, scoped| {
@@ -4139,12 +4054,13 @@ fn bind_explicit_params(
     tm: &Cvc5Tm,
     params: &[IRTransParam],
     args: &[IRExpr],
-    vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    pool_ctx: &PooledSyGuSCtx<'_>,
-    enum_catalog: &EnumCatalog,
+    env: PooledExprEnv<'_>,
     context: &str,
 ) -> Result<PooledParamEnv, String> {
+    let vars = env.vars;
+    let entity_bindings = env.entity_bindings;
+    let pool_ctx = env.pool_ctx;
+    let enum_catalog = env.enum_catalog;
     if params.len() != args.len() {
         return Err(format!(
             "cvc5 SyGuS pooled cross-call safety expected {} args for `{context}`, got {}",
@@ -4191,25 +4107,25 @@ fn extend_call_stack(call_stack: &[String], target_system_name: &str) -> Vec<Str
     next
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_crosscall_capture(
     tm: &Cvc5Tm,
     target_system_name: &str,
     command: &str,
     args: &[IRExpr],
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    curr_vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
-    entity_bindings: &PooledEntityBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    call_stack: &[String],
+    ctx: PooledCrossCallCtx<'_>,
 ) -> Result<PooledCrossCallCapture, String> {
+    let systems_by_name = ctx.systems_by_name;
+    let entities_by_name = ctx.entities_by_name;
+    let slots_per_entity = ctx.slots_per_entity;
+    let curr_vars = ctx.curr_vars;
+    let next_vars = ctx.next_vars;
+    let entity_bindings = ctx.entity_bindings;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
+    let call_stack = ctx.call_stack;
     if call_stack.iter().any(|name| name == target_system_name) {
         return Err(format!(
             "cvc5 SyGuS pooled cross-call safety does not support recursive cross-call cycles (`{}::{}`)",
@@ -4234,33 +4150,39 @@ fn encode_pooled_crosscall_capture(
         tm,
         &target_step.params,
         args,
-        curr_vars,
-        entity_bindings,
-        &PooledSyGuSCtx {
-            slots_per_entity,
-            active_vars: active_curr,
-            slot_fields: slot_curr,
-            store_param_types: &system_store_param_types(target_system),
+        PooledExprEnv {
+            vars: curr_vars,
+            entity_bindings,
+            pool_ctx: &PooledSyGuSCtx {
+                slots_per_entity,
+                active_vars: active_curr,
+                slot_fields: slot_curr,
+                store_param_types: &system_store_param_types(target_system),
+            },
+            enum_catalog,
         },
-        enum_catalog,
         &format!("{target_system_name}::{command}"),
     )?;
     let formula = encode_pooled_system_step_with_bound_params(
         tm,
         target_step,
-        target_system,
-        systems_by_name,
-        entities_by_name,
-        slots_per_entity,
-        curr_vars,
-        next_vars,
-        active_curr,
-        active_next,
-        slot_curr,
-        slot_next,
-        enum_catalog,
         bound_params.clone(),
-        &extend_call_stack(call_stack, target_system_name),
+        PooledStepCtx {
+            system: target_system,
+            systems_by_name,
+            entities_by_name,
+            slots_per_entity,
+            curr_vars,
+            next_vars,
+            frames: PooledFrameVars {
+                active_curr,
+                active_next,
+                slot_curr,
+                slot_next,
+            },
+            enum_catalog,
+            call_stack: &extend_call_stack(call_stack, target_system_name),
+        },
     )?;
     let return_value = if let Some(ret) = &target_step.return_expr {
         let mut ret_vars = curr_vars.clone();
@@ -4294,25 +4216,21 @@ fn encode_pooled_crosscall_capture(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_pooled_action_match(
     tm: &Cvc5Tm,
     scrutinee: &crate::ir::types::IRActionMatchScrutinee,
     arms: &[crate::ir::types::IRActionMatchArm],
-    system: &IRSystem,
-    systems_by_name: &HashMap<String, &IRSystem>,
-    entities_by_name: &HashMap<String, &IREntity>,
-    slots_per_entity: &HashMap<String, usize>,
-    vars: &HashMap<String, Cvc5Term>,
-    next_vars: &HashMap<String, Cvc5Term>,
+    ctx: PooledActionCtx<'_>,
     local_bindings: &PooledLocalBindings,
-    active_curr: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    active_next: &HashMap<String, HashMap<usize, Cvc5Term>>,
-    slot_curr: &HashMap<String, Cvc5Term>,
-    slot_next: &HashMap<String, Cvc5Term>,
-    enum_catalog: &EnumCatalog,
-    call_stack: &[String],
 ) -> Result<Cvc5Term, String> {
+    let system = ctx.system;
+    let vars = ctx.vars;
+    let next_vars = ctx.next_vars;
+    let active_curr = ctx.frames.active_curr;
+    let active_next = ctx.frames.active_next;
+    let slot_curr = ctx.frames.slot_curr;
+    let slot_next = ctx.frames.slot_next;
+    let enum_catalog = ctx.enum_catalog;
     if arms.is_empty() {
         return Err("cvc5 SyGuS pooled action match requires at least one arm".to_owned());
     }
@@ -4355,18 +4273,17 @@ fn encode_pooled_action_match(
                 target_system_name,
                 command,
                 args,
-                systems_by_name,
-                entities_by_name,
-                slots_per_entity,
-                vars,
-                next_vars,
-                &HashMap::new(),
-                active_curr,
-                active_next,
-                slot_curr,
-                slot_next,
-                enum_catalog,
-                call_stack,
+                PooledCrossCallCtx {
+                    systems_by_name: ctx.systems_by_name,
+                    entities_by_name: ctx.entities_by_name,
+                    slots_per_entity: ctx.slots_per_entity,
+                    curr_vars: vars,
+                    next_vars,
+                    entity_bindings: &HashMap::new(),
+                    frames: ctx.frames,
+                    enum_catalog,
+                    call_stack: ctx.call_stack,
+                },
             )?;
             let scrut_term = capture.return_value.ok_or_else(|| {
                 format!(
@@ -4379,7 +4296,7 @@ fn encode_pooled_action_match(
 
     let guard_store_param_types = system_store_param_types(system);
     let guard_ctx = PooledSyGuSCtx {
-        slots_per_entity,
+        slots_per_entity: ctx.slots_per_entity,
         active_vars: active_curr,
         slot_fields: slot_curr,
         store_param_types: &guard_store_param_types,
@@ -4423,19 +4340,24 @@ fn encode_pooled_action_match(
         let arm_body = encode_pooled_system_action_sequence(
             tm,
             &arm.body,
-            system,
-            systems_by_name,
-            entities_by_name,
-            slots_per_entity,
-            &arm_vars,
-            next_vars,
+            PooledActionCtx {
+                system,
+                systems_by_name: ctx.systems_by_name,
+                entities_by_name: ctx.entities_by_name,
+                slots_per_entity: ctx.slots_per_entity,
+                vars: &arm_vars,
+                next_vars,
+                entity_bindings: &HashMap::new(),
+                frames: PooledFrameVars {
+                    active_curr,
+                    active_next,
+                    slot_curr,
+                    slot_next,
+                },
+                enum_catalog,
+                call_stack: ctx.call_stack,
+            },
             local_bindings,
-            active_curr,
-            active_next,
-            slot_curr,
-            slot_next,
-            enum_catalog,
-            call_stack,
         )?
         .formula;
         fallback = Some(match fallback {

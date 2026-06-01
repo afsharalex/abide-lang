@@ -205,6 +205,28 @@ pub(super) struct PrecheckCtx<'a> {
     pub(super) self_fn: Option<&'a crate::ir::types::IRFunction>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PureEncodingScope<'a> {
+    pub(super) env: &'a HashMap<String, SmtValue>,
+    pub(super) vctx: &'a VerifyContext,
+    pub(super) defs: &'a defenv::DefEnv,
+    pub(super) precheck: Option<&'a PrecheckCtx<'a>>,
+}
+
+impl<'a> PureEncodingScope<'a> {
+    fn with_env<'b>(&'b self, env: &'b HashMap<String, SmtValue>) -> PureEncodingScope<'b>
+    where
+        'a: 'b,
+    {
+        PureEncodingScope {
+            env,
+            vctx: self.vctx,
+            defs: self.defs,
+            precheck: self.precheck,
+        }
+    }
+}
+
 // ── Pure expression entry points ────────────────────────────────────
 
 pub(super) fn encode_pure_expr(
@@ -228,7 +250,6 @@ pub(super) fn encode_pure_expr_checked(
 
 // ── Core expression encoder ─────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn encode_pure_expr_inner(
     expr: &IRExpr,
     env: &HashMap<String, SmtValue>,
@@ -274,92 +295,17 @@ pub(super) fn encode_pure_expr_inner(
 
         IRExpr::Ctor {
             enum_name, ctor, args, ..
-        } => {
- // ADT-encoded enum: use constructor function with field arguments
-            if let Some(dt) = vctx.adt_sorts.get(enum_name) {
-                for variant in &dt.variants {
-                    if smt::func_decl_name(&variant.constructor) == *ctor {
-                        let arity = variant.accessors.len();
-                        if arity > 0 && args.is_empty() {
-                            return Err(format!(
-                                "constructor '{ctor}' of '{enum_name}' requires {arity} \
-                                 field argument(s) — use @{enum_name}::{ctor} {{ ... }}"
-                            ));
-                        }
-                        if args.is_empty() {
- // Nullary constructor (no fields)
-                            let result = smt::func_decl_apply(&variant.constructor, &[]);
-                            return Ok(dynamic_to_smt_value(result));
-                        }
-
- // Validate and reorder field arguments by declared order.
- // Accessor names define the canonical field order.
-                        let declared_names: Vec<std::string::String> = variant
-                            .accessors
-                            .iter()
-                            .map(smt::func_decl_name)
-                            .collect();
-
- // Check for unknown fields
-                        for (field_name, _) in args {
-                            if !declared_names.iter().any(|d| d == field_name) {
-                                return Err(format!(
-                                    "unknown field '{field_name}' in constructor '{ctor}' \
-                                     of '{enum_name}' — declared fields: {}",
-                                    declared_names.join(", ")
-                                ));
-                            }
-                        }
-
- // Check for duplicates
-                        let mut seen = std::collections::HashSet::new();
-                        for (field_name, _) in args {
-                            if !seen.insert(field_name.as_str()) {
-                                return Err(format!(
-                                    "duplicate field '{field_name}' in constructor '{ctor}'"
-                                ));
-                            }
-                        }
-
- // Check arity
-                        if args.len() != arity {
-                            let missing: Vec<&str> = declared_names
-                                .iter()
-                                .filter(|d| !args.iter().any(|(n, _)| n == d.as_str()))
-                                .map(std::string::String::as_str)
-                                .collect();
-                            return Err(format!(
-                                "constructor '{ctor}' of '{enum_name}' requires {arity} \
-                                 field(s) but got {} — missing: {}",
-                                args.len(),
-                                missing.join(", ")
-                            ));
-                        }
-
- // Build args in declared field order (not source order)
-                        let args_map: HashMap<&str, &IRExpr> = args
-                            .iter()
-                            .map(|(n, e)| (n.as_str(), e))
-                            .collect();
-                        let mut z3_args: Vec<Dynamic> = Vec::new();
-                        for decl_name in &declared_names {
-                            let field_expr = args_map[decl_name.as_str()];
-                            let val = encode_pure_expr_inner(
-                                field_expr, env, vctx, defs, precheck,
-                            )?;
-                            z3_args.push(val.to_dynamic());
-                        }
-
-                        let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
-                        let result = smt::func_decl_apply(&variant.constructor, &arg_refs);
-                        return Ok(dynamic_to_smt_value(result));
-                    }
-                }
-            }
- // Flat Int encoding for fieldless enums
-            let id = vctx.variants.try_id_of(enum_name, ctor)?;
-            Ok(smt::int_val(id))
-        }
+        } => encode_pure_ctor(
+            enum_name,
+            ctor,
+            args,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::BinOp {
             op, left, right, ..
@@ -486,112 +432,15 @@ pub(super) fn encode_pure_expr_inner(
             smt::unop(op, &val)
         }
 
-        IRExpr::App { .. } => {
- // Determine if this is a recursive self-call
-            let is_self_call = precheck
-                .and_then(|ctx| ctx.self_fn)
-                .and_then(|sf| {
-                    defenv::decompose_app_chain_name(expr)
-                        .filter(|name| name == &sf.name)
-                })
-                .is_some();
-
- // Check preconditions for NON-self calls.
- // Self-call preconditions are checked by (termination VC)
- // with proper path conditions from the enclosing branch structure.
-            if !is_self_call {
-                if let Some(ctx) = precheck {
-                    if let Some(preconditions) = defs.call_preconditions(expr) {
-                        if !preconditions.is_empty() {
-                            let mut context_bools: Vec<Bool> = Vec::new();
-                            for req in ctx.fn_requires {
-                                let req_val = encode_pure_expr(req, env, vctx, defs)?;
-                                context_bools.push(req_val.to_bool()?);
-                            }
-                            for assumption in ctx.extra_assumptions {
-                                context_bools.push(assumption.clone());
-                            }
-                            for pre in &preconditions {
-                                let pre_val = encode_pure_expr(pre, env, vctx, defs)?;
-                                let pre_bool = pre_val.to_bool()?;
-                                let vc_solver = AbideSolver::new();
-                                super::assert_lambda_axioms_on(&vc_solver);
-                                for ctx_bool in &context_bools {
-                                    vc_solver.assert(ctx_bool);
-                                }
-                                vc_solver.assert(smt::bool_not(&pre_bool));
-                                if vc_solver.check() != SatResult::Unsat {
-                                    return Err(
-                                        crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
- // Handle recursive self-calls: don't expand, return fresh
- // variable constrained by the function's ensures (modular reasoning).
-            if let Some(ctx) = precheck {
-                if let Some(self_f) = ctx.self_fn {
-                    if let Some((call_name, call_args)) =
-                        defenv::decompose_app_chain_public(expr)
-                    {
-                        if call_name == self_f.name {
-                            return super::encode_recursive_self_call(
-                                self_f, &call_args, env, vctx, defs,
-                            );
-                        }
-                    }
-                }
-            }
- // Collect the full curried application chain: App(App(f, a), b) → (f, [a, b])
- // Then check if the base function is a lambda (Func-valued).
-            {
-                let mut base = expr;
-                let mut arg_exprs: Vec<&IRExpr> = Vec::new();
-                while let IRExpr::App { func, arg, .. } = base {
-                    arg_exprs.push(arg);
-                    base = func;
-                }
-                arg_exprs.reverse(); // collected in reverse order
-
- // Try encoding the base function
-                let func_result = encode_pure_expr_inner(base, env, vctx, defs, precheck);
-                if let Ok(SmtValue::Func(ref ft)) = func_result {
-                    let (ref func_decl, ref param_sorts, ref range_sort) = **ft;
-                    let arity = param_sorts.len();
-                    let mut z3_args: Vec<Dynamic> = Vec::new();
-                    for arg_expr in &arg_exprs {
-                        let val = encode_pure_expr_inner(arg_expr, env, vctx, defs, precheck)?;
-                        z3_args.push(val.to_dynamic());
-                    }
-
-                    if arg_exprs.len() == arity {
- // Full application
-                        let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
-                        let result = smt::func_decl_apply(func_decl, &arg_refs);
-                        return Ok(dynamic_to_smt_value(result));
-                    } else if arg_exprs.len() < arity {
- // Partial application
-                        return encode_partial_application(
-                            func_decl, param_sorts, range_sort, &z3_args,
-                        );
-                    }
-                    return Err(format!(
-                        "too many arguments — function expects {arity} but got {}",
-                        arg_exprs.len()
-                    ));
-                }
- // If base is not Func-valued, fall through to DefEnv / self-call
-            }
-
- // Expand via DefEnv
-            if let Some(expanded) = defs.expand_app(expr) {
-                return encode_pure_expr_inner(&expanded, env, vctx, defs, precheck);
-            }
-            Err("could not expand function application in fn contract".to_string())
-        }
+        IRExpr::App { .. } => encode_pure_app(
+            expr,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::Let { bindings, body, .. } => {
             let mut extended_env = env.clone();
@@ -629,19 +478,61 @@ pub(super) fn encode_pure_expr_inner(
 
         IRExpr::Forall {
             var, domain, body, ..
-        } => encode_z3_quantifier(true, var, domain, body, env, vctx, defs, precheck),
+        } => encode_z3_quantifier(
+            true,
+            var,
+            domain,
+            body,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::Exists {
             var, domain, body, ..
-        } => encode_z3_quantifier(false, var, domain, body, env, vctx, defs, precheck),
+        } => encode_z3_quantifier(
+            false,
+            var,
+            domain,
+            body,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::One {
             var, domain, body, ..
-        } => encode_z3_one(var, domain, body, env, vctx, defs, precheck),
+        } => encode_z3_one(
+            var,
+            domain,
+            body,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::Lone {
             var, domain, body, ..
-        } => encode_z3_lone(var, domain, body, env, vctx, defs, precheck),
+        } => encode_z3_lone(
+            var,
+            domain,
+            body,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
 
         IRExpr::Index { map, key, ty, .. } => {
             let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
@@ -721,91 +612,15 @@ pub(super) fn encode_pure_expr_inner(
             Ok(SmtValue::Array(arr))
         }
 
-        IRExpr::Card { expr: inner, .. } => match inner.as_ref() {
- // Set cardinality: count semantically distinct elements.
- // Encode each element to Z3, then use the "first occurrence"
- // pattern: element i is counted iff it differs from all prior
- // elements. This correctly handles `#Set(1, 1 + 0)` = 1.
-            IRExpr::SetLit { elements, .. } => {
-                if elements.is_empty() {
-                    return Ok(smt::int_val(0));
-                }
-                let z3_elems: Vec<SmtValue> = elements
-                    .iter()
-                    .map(|e| encode_pure_expr_inner(e, env, vctx, defs, precheck))
-                    .collect::<Result<_, _>>()?;
-
-                let one = smt::int_lit(1);
-                let zero = smt::int_lit(0);
-                let mut terms: Vec<Int> = Vec::new();
-
-                for (i, vi) in z3_elems.iter().enumerate() {
-                    if i == 0 {
- // First element always counts
-                        terms.push(one.clone());
-                    } else {
- // Count iff different from all prior elements
-                        let mut diff_from_prior: Vec<Bool> = Vec::new();
-                        for vj in &z3_elems[..i] {
-                            let neq = smt::smt_neq(vi, vj)?;
-                            diff_from_prior.push(neq);
-                        }
-                        let refs: Vec<&Bool> = diff_from_prior.iter().collect();
-                        let is_first = smt::bool_and(&refs);
-                        terms.push(smt::int_ite(&is_first, &one, &zero));
-                    }
-                }
-
-                let refs: Vec<&Int> = terms.iter().collect();
-                Ok(SmtValue::Int(smt::int_add(&refs)))
-            }
-            IRExpr::SeqLit { elements, .. } => Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0))),
-            IRExpr::MapLit { entries, .. } => {
-                if entries.is_empty() {
-                    return Ok(smt::int_val(0));
-                }
- // Same first-occurrence pattern for map keys
-                let z3_keys: Vec<SmtValue> = entries
-                    .iter()
-                    .map(|(k, _)| encode_pure_expr_inner(k, env, vctx, defs, precheck))
-                    .collect::<Result<_, _>>()?;
-
-                let one = smt::int_lit(1);
-                let zero = smt::int_lit(0);
-                let mut terms: Vec<Int> = Vec::new();
-
-                for (i, ki) in z3_keys.iter().enumerate() {
-                    if i == 0 {
-                        terms.push(one.clone());
-                    } else {
-                        let mut diff: Vec<Bool> = Vec::new();
-                        for kj in &z3_keys[..i] {
-                            diff.push(smt::smt_neq(ki, kj)?);
-                        }
-                        let refs: Vec<&Bool> = diff.iter().collect();
-                        let is_first = smt::bool_and(&refs);
-                        terms.push(smt::int_ite(&is_first, &one, &zero));
-                    }
-                }
-
-                let refs: Vec<&Int> = terms.iter().collect();
-                Ok(SmtValue::Int(smt::int_add(&refs)))
-            }
- // Cardinality of non-literal: encode the inner expression and
- // reject if it's not a form we can reason about.
-            _ => {
-                if let Some(IRType::Seq { element }) = expr_type(inner) {
-                    let seq = encode_pure_expr_inner(inner, env, vctx, defs, precheck)?;
-                    smt::seq_length(&seq, element)
-                } else {
-                    Err(
-                        "cardinality (#) of non-literal collections not supported in fn contracts — \
-                         use #Set(...), #Seq(...), or #Map(...)"
-                            .to_owned(),
-                    )
-                }
-            }
-        },
+        IRExpr::Card { expr: inner, .. } => encode_pure_card(
+            inner,
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
  // Set comprehension: { x: T where P(x) }
  // Encode as Z3 lambda array with domain restriction:
  // simple: λx. domain_pred(x) ∧ P(x)
@@ -817,92 +632,19 @@ pub(super) fn encode_pure_expr_inner(
             filter,
             projection,
             ..
-        } => {
- // Create a fresh Z3 constant for the comprehension variable
-            let bound_var = make_z3_var(var, domain)?;
-            let mut inner_env = env.clone();
-            inner_env.insert(var.to_owned(), bound_var.clone());
-
- // Encode the filter predicate with the bound variable in scope
-            let filter_val =
-                encode_pure_expr_inner(filter, &inner_env, vctx, defs, precheck)?;
-            let filter_bool = filter_val.to_bool()?;
-
- // Build domain predicate for restricted types (enum, refinement)
-            let domain_pred = build_domain_predicate(
-                domain, &bound_var, &inner_env, vctx, defs, precheck,
-            )?;
-
-            let source_pred = if let Some(source) = source {
-                match expr_type(source) {
-                    Some(IRType::Set { .. }) => {
-                        let source_val =
-                            encode_pure_expr_inner(source, env, vctx, defs, precheck)?;
-                        let source_arr = source_val.as_array()?;
-                        let selected = source_arr.select(&bound_var.to_dynamic());
-                        Some(
-                            smt::dynamic_to_typed_value(selected, &IRType::Bool).to_bool()?,
-                        )
-                    }
-                    Some(other) => {
-                        return Err(format!(
-                            "sourced set comprehension verification currently supports Set sources, got {other:?}"
-                        ));
-                    }
-                    None => {
-                        return Err(
-                            "sourced set comprehension verification requires a typed source"
-                                .to_owned(),
-                        );
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Combine filter with domain/source predicates.
-            let mut restrictions = vec![filter_bool];
-            if let Some(dp) = domain_pred {
-                restrictions.push(dp);
-            }
-            if let Some(sp) = source_pred {
-                restrictions.push(sp);
-            }
-            let restriction_refs = restrictions.iter().collect::<Vec<_>>();
-            let restricted_filter = if restriction_refs.len() == 1 {
-                restrictions[0].clone()
-            } else {
-                smt::bool_and(&restriction_refs)
-            };
-
-            if let Some(proj) = projection {
- // Projection comprehension: { f(x) | x: T where P(x) }
- // Encode as: λy. ∃x. domain_pred(x) ∧ P(x) ∧ f(x) == y
-                let proj_val =
-                    encode_pure_expr_inner(proj, &inner_env, vctx, defs, precheck)?;
-
-                let proj_var_name = format!("{var}__proj");
-                let proj_bound = make_z3_var_from_smt(&proj_var_name, &proj_val);
-
-                let eq = smt::smt_eq(&proj_val, &proj_bound)?;
-                let body = smt::bool_and(&[&restricted_filter, &eq]);
-
-                let bound_dyn = bound_var.to_dynamic();
-                let exists_body = smt::exists(&[&bound_dyn], &body);
-
-                let body_dyn = smt::bool_to_dynamic(&exists_body);
-                let proj_dyn = proj_bound.to_dynamic();
-                let arr = smt::lambda(&[&proj_dyn], &body_dyn);
-                Ok(SmtValue::Array(arr))
-            } else {
- // Simple comprehension: { x: T where P(x) }
- // Encode as: λx. domain_pred(x) ∧ P(x)
-                let body_dyn = smt::bool_to_dynamic(&restricted_filter);
-                let var_dyn = bound_var.to_dynamic();
-                let arr = smt::lambda(&[&var_dyn], &body_dyn);
-                Ok(SmtValue::Array(arr))
-            }
-        }
+        } => encode_pure_set_comp(
+            var,
+            domain,
+            source.as_deref(),
+            filter,
+            projection.as_deref(),
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
         IRExpr::Always { .. }
         | IRExpr::Eventually { .. }
         | IRExpr::Until { .. }
@@ -959,10 +701,418 @@ pub(super) fn encode_pure_expr_inner(
             body,
             in_filter,
             ..
-        } => encode_pure_aggregate(*kind, var, domain, body, in_filter.as_deref(), env, vctx, defs, precheck),
+        } => encode_pure_aggregate(
+            *kind,
+            var,
+            domain,
+            body,
+            in_filter.as_deref(),
+            PureEncodingScope {
+                env,
+                vctx,
+                defs,
+                precheck,
+            },
+        ),
         IRExpr::Sorry { .. } => Ok(smt::bool_val(true)),
         IRExpr::Todo { .. } => Err("todo expression in fn contract body".to_owned()),
     }
+}
+
+fn encode_pure_ctor(
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    if let Some(dt) = scope.vctx.adt_sorts.get(enum_name) {
+        for variant in &dt.variants {
+            if smt::func_decl_name(&variant.constructor) == ctor {
+                return encode_adt_ctor(enum_name, ctor, args, variant, scope);
+            }
+        }
+    }
+    let id = scope.vctx.variants.try_id_of(enum_name, ctor)?;
+    Ok(smt::int_val(id))
+}
+
+fn encode_adt_ctor(
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+    variant: &super::solver::DatatypeVariant<FuncDecl>,
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    let arity = variant.accessors.len();
+    if arity > 0 && args.is_empty() {
+        return Err(format!(
+            "constructor '{ctor}' of '{enum_name}' requires {arity} \
+             field argument(s) — use @{enum_name}::{ctor} {{ ... }}"
+        ));
+    }
+    if args.is_empty() {
+        let result = smt::func_decl_apply(&variant.constructor, &[]);
+        return Ok(dynamic_to_smt_value(result));
+    }
+
+    let declared_names: Vec<String> = variant.accessors.iter().map(smt::func_decl_name).collect();
+    validate_ctor_fields(enum_name, ctor, args, &declared_names)?;
+
+    let args_map: HashMap<&str, &IRExpr> = args.iter().map(|(n, e)| (n.as_str(), e)).collect();
+    let mut z3_args = Vec::new();
+    for decl_name in &declared_names {
+        let field_expr = args_map[decl_name.as_str()];
+        let val = encode_pure_expr_inner(
+            field_expr,
+            scope.env,
+            scope.vctx,
+            scope.defs,
+            scope.precheck,
+        )?;
+        z3_args.push(val.to_dynamic());
+    }
+
+    let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
+    let result = smt::func_decl_apply(&variant.constructor, &arg_refs);
+    Ok(dynamic_to_smt_value(result))
+}
+
+fn validate_ctor_fields(
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+    declared_names: &[String],
+) -> Result<(), String> {
+    for (field_name, _) in args {
+        if !declared_names.iter().any(|d| d == field_name) {
+            return Err(format!(
+                "unknown field '{field_name}' in constructor '{ctor}' \
+                 of '{enum_name}' — declared fields: {}",
+                declared_names.join(", ")
+            ));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (field_name, _) in args {
+        if !seen.insert(field_name.as_str()) {
+            return Err(format!(
+                "duplicate field '{field_name}' in constructor '{ctor}'"
+            ));
+        }
+    }
+
+    let arity = declared_names.len();
+    if args.len() != arity {
+        let missing: Vec<&str> = declared_names
+            .iter()
+            .filter(|d| !args.iter().any(|(n, _)| n == d.as_str()))
+            .map(String::as_str)
+            .collect();
+        return Err(format!(
+            "constructor '{ctor}' of '{enum_name}' requires {arity} \
+             field(s) but got {} — missing: {}",
+            args.len(),
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn encode_pure_app(expr: &IRExpr, scope: PureEncodingScope<'_>) -> Result<SmtValue, String> {
+    verify_call_preconditions(expr, scope)?;
+    if let Some(value) = encode_recursive_app(expr, scope)? {
+        return Ok(value);
+    }
+    if let Some(value) = encode_func_application(expr, scope)? {
+        return Ok(value);
+    }
+    if let Some(expanded) = scope.defs.expand_app(expr) {
+        return encode_pure_expr_inner(
+            &expanded,
+            scope.env,
+            scope.vctx,
+            scope.defs,
+            scope.precheck,
+        );
+    }
+    Err("could not expand function application in fn contract".to_string())
+}
+
+fn verify_call_preconditions(expr: &IRExpr, scope: PureEncodingScope<'_>) -> Result<(), String> {
+    let is_self_call = scope
+        .precheck
+        .and_then(|ctx| ctx.self_fn)
+        .and_then(|sf| defenv::decompose_app_chain_name(expr).filter(|name| name == &sf.name))
+        .is_some();
+    if is_self_call {
+        return Ok(());
+    }
+
+    let Some(ctx) = scope.precheck else {
+        return Ok(());
+    };
+    let Some(preconditions) = scope.defs.call_preconditions(expr) else {
+        return Ok(());
+    };
+    if preconditions.is_empty() {
+        return Ok(());
+    }
+
+    let mut context_bools = Vec::new();
+    for req in ctx.fn_requires {
+        let req_val = encode_pure_expr(req, scope.env, scope.vctx, scope.defs)?;
+        context_bools.push(req_val.to_bool()?);
+    }
+    for assumption in ctx.extra_assumptions {
+        context_bools.push(assumption.clone());
+    }
+    for pre in &preconditions {
+        let pre_val = encode_pure_expr(pre, scope.env, scope.vctx, scope.defs)?;
+        let pre_bool = pre_val.to_bool()?;
+        let vc_solver = AbideSolver::new();
+        super::assert_lambda_axioms_on(&vc_solver);
+        for ctx_bool in &context_bools {
+            vc_solver.assert(ctx_bool);
+        }
+        vc_solver.assert(smt::bool_not(&pre_bool));
+        if vc_solver.check() != SatResult::Unsat {
+            return Err(crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn encode_recursive_app(
+    expr: &IRExpr,
+    scope: PureEncodingScope<'_>,
+) -> Result<Option<SmtValue>, String> {
+    let Some(ctx) = scope.precheck else {
+        return Ok(None);
+    };
+    let Some(self_f) = ctx.self_fn else {
+        return Ok(None);
+    };
+    let Some((call_name, call_args)) = defenv::decompose_app_chain_public(expr) else {
+        return Ok(None);
+    };
+    if call_name != self_f.name {
+        return Ok(None);
+    }
+    super::encode_recursive_self_call(self_f, &call_args, scope.env, scope.vctx, scope.defs)
+        .map(Some)
+}
+
+fn encode_func_application(
+    expr: &IRExpr,
+    scope: PureEncodingScope<'_>,
+) -> Result<Option<SmtValue>, String> {
+    let (base, arg_exprs) = decompose_curried_app(expr);
+    let func_result =
+        encode_pure_expr_inner(base, scope.env, scope.vctx, scope.defs, scope.precheck);
+    let Ok(SmtValue::Func(ref ft)) = func_result else {
+        return Ok(None);
+    };
+
+    let (ref func_decl, ref param_sorts, ref range_sort) = **ft;
+    let arity = param_sorts.len();
+    let mut z3_args = Vec::new();
+    for arg_expr in &arg_exprs {
+        let val =
+            encode_pure_expr_inner(arg_expr, scope.env, scope.vctx, scope.defs, scope.precheck)?;
+        z3_args.push(val.to_dynamic());
+    }
+
+    if arg_exprs.len() == arity {
+        let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
+        let result = smt::func_decl_apply(func_decl, &arg_refs);
+        return Ok(Some(dynamic_to_smt_value(result)));
+    }
+    if arg_exprs.len() < arity {
+        return encode_partial_application(func_decl, param_sorts, range_sort, &z3_args).map(Some);
+    }
+    Err(format!(
+        "too many arguments — function expects {arity} but got {}",
+        arg_exprs.len()
+    ))
+}
+
+fn decompose_curried_app(expr: &IRExpr) -> (&IRExpr, Vec<&IRExpr>) {
+    let mut base = expr;
+    let mut arg_exprs = Vec::new();
+    while let IRExpr::App { func, arg, .. } = base {
+        arg_exprs.push(arg.as_ref());
+        base = func;
+    }
+    arg_exprs.reverse();
+    (base, arg_exprs)
+}
+
+fn encode_pure_card(inner: &IRExpr, scope: PureEncodingScope<'_>) -> Result<SmtValue, String> {
+    match inner {
+        IRExpr::SetLit { elements, .. } => encode_distinct_cardinality(elements.iter(), scope),
+        IRExpr::SeqLit { elements, .. } => {
+            Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0)))
+        }
+        IRExpr::MapLit { entries, .. } => {
+            encode_distinct_cardinality(entries.iter().map(|(key, _)| key), scope)
+        }
+        _ => encode_nonliteral_cardinality(inner, scope),
+    }
+}
+
+fn encode_distinct_cardinality<'a>(
+    elements: impl IntoIterator<Item = &'a IRExpr>,
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    let elements = elements.into_iter().collect::<Vec<_>>();
+    if elements.is_empty() {
+        return Ok(smt::int_val(0));
+    }
+    let values = elements
+        .iter()
+        .map(|e| encode_pure_expr_inner(e, scope.env, scope.vctx, scope.defs, scope.precheck))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let one = smt::int_lit(1);
+    let zero = smt::int_lit(0);
+    let mut terms = Vec::new();
+    for (i, value) in values.iter().enumerate() {
+        if i == 0 {
+            terms.push(one.clone());
+            continue;
+        }
+        let mut diff_from_prior = Vec::new();
+        for prior in &values[..i] {
+            diff_from_prior.push(smt::smt_neq(value, prior)?);
+        }
+        let refs: Vec<&Bool> = diff_from_prior.iter().collect();
+        let is_first = smt::bool_and(&refs);
+        terms.push(smt::int_ite(&is_first, &one, &zero));
+    }
+
+    let refs: Vec<&Int> = terms.iter().collect();
+    Ok(SmtValue::Int(smt::int_add(&refs)))
+}
+
+fn encode_nonliteral_cardinality(
+    inner: &IRExpr,
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    if let Some(IRType::Seq { element }) = expr_type(inner) {
+        let seq = encode_pure_expr_inner(inner, scope.env, scope.vctx, scope.defs, scope.precheck)?;
+        smt::seq_length(&seq, element)
+    } else {
+        Err(
+            "cardinality (#) of non-literal collections not supported in fn contracts — \
+             use #Set(...), #Seq(...), or #Map(...)"
+                .to_owned(),
+        )
+    }
+}
+
+fn encode_pure_set_comp(
+    var: &str,
+    domain: &IRType,
+    source: Option<&IRExpr>,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    let bound_var = make_z3_var(var, domain)?;
+    let mut inner_env = scope.env.clone();
+    inner_env.insert(var.to_owned(), bound_var.clone());
+    let inner_scope = scope.with_env(&inner_env);
+
+    let filter_val = encode_pure_expr_inner(
+        filter,
+        inner_scope.env,
+        inner_scope.vctx,
+        inner_scope.defs,
+        inner_scope.precheck,
+    )?;
+    let filter_bool = filter_val.to_bool()?;
+    let domain_pred = build_domain_predicate(domain, &bound_var, inner_scope)?;
+    let source_pred = encode_set_comp_source_pred(source, &bound_var, scope)?;
+    let restricted_filter = combine_set_comp_restrictions(filter_bool, domain_pred, source_pred);
+
+    if let Some(proj) = projection {
+        encode_projected_set_comp(var, proj, &bound_var, &restricted_filter, inner_scope)
+    } else {
+        let body_dyn = smt::bool_to_dynamic(&restricted_filter);
+        let var_dyn = bound_var.to_dynamic();
+        Ok(SmtValue::Array(smt::lambda(&[&var_dyn], &body_dyn)))
+    }
+}
+
+fn encode_set_comp_source_pred(
+    source: Option<&IRExpr>,
+    bound_var: &SmtValue,
+    scope: PureEncodingScope<'_>,
+) -> Result<Option<Bool>, String> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    match expr_type(source) {
+        Some(IRType::Set { .. }) => {
+            let source_val =
+                encode_pure_expr_inner(source, scope.env, scope.vctx, scope.defs, scope.precheck)?;
+            let source_arr = source_val.as_array()?;
+            let selected = source_arr.select(&bound_var.to_dynamic());
+            Ok(Some(
+                smt::dynamic_to_typed_value(selected, &IRType::Bool).to_bool()?,
+            ))
+        }
+        Some(other) => Err(format!(
+            "sourced set comprehension verification currently supports Set sources, got {other:?}"
+        )),
+        None => Err("sourced set comprehension verification requires a typed source".to_owned()),
+    }
+}
+
+fn combine_set_comp_restrictions(
+    filter_bool: Bool,
+    domain_pred: Option<Bool>,
+    source_pred: Option<Bool>,
+) -> Bool {
+    let mut restrictions = vec![filter_bool];
+    if let Some(dp) = domain_pred {
+        restrictions.push(dp);
+    }
+    if let Some(sp) = source_pred {
+        restrictions.push(sp);
+    }
+    let refs = restrictions.iter().collect::<Vec<_>>();
+    if refs.len() == 1 {
+        restrictions[0].clone()
+    } else {
+        smt::bool_and(&refs)
+    }
+}
+
+fn encode_projected_set_comp(
+    var: &str,
+    projection: &IRExpr,
+    bound_var: &SmtValue,
+    restricted_filter: &Bool,
+    scope: PureEncodingScope<'_>,
+) -> Result<SmtValue, String> {
+    let proj_val = encode_pure_expr_inner(
+        projection,
+        scope.env,
+        scope.vctx,
+        scope.defs,
+        scope.precheck,
+    )?;
+    let proj_var_name = format!("{var}__proj");
+    let proj_bound = make_z3_var_from_smt(&proj_var_name, &proj_val);
+    let eq = smt::smt_eq(&proj_val, &proj_bound)?;
+    let body = smt::bool_and(&[restricted_filter, &eq]);
+    let bound_dyn = bound_var.to_dynamic();
+    let exists_body = smt::exists(&[&bound_dyn], &body);
+    let body_dyn = smt::bool_to_dynamic(&exists_body);
+    let proj_dyn = proj_bound.to_dynamic();
+    Ok(SmtValue::Array(smt::lambda(&[&proj_dyn], &body_dyn)))
 }
 
 // ── Domain predicates ───────────────────────────────────────────────
@@ -972,14 +1122,10 @@ pub(super) fn encode_pure_expr_inner(
 ///
 /// Used by both quantifier encoding and set comprehension encoding to
 /// constrain bound variables to their declared domain.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_domain_predicate(
     domain: &crate::ir::types::IRType,
     bound_var: &SmtValue,
-    inner_env: &HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    precheck: Option<&PrecheckCtx<'_>>,
+    scope: PureEncodingScope<'_>,
 ) -> Result<Option<Bool>, String> {
     use crate::ir::types::IRType;
     match domain {
@@ -993,7 +1139,7 @@ pub(super) fn build_domain_predicate(
             let var_int = bound_var.as_int()?;
             let ids: Vec<i64> = vs
                 .iter()
-                .map(|v| vctx.variants.try_id_of(name, &v.name))
+                .map(|v| scope.vctx.variants.try_id_of(name, &v.name))
                 .collect::<Result<_, _>>()?;
             let min_id = ids
                 .iter()
@@ -1013,9 +1159,15 @@ pub(super) fn build_domain_predicate(
             ])))
         }
         IRType::Refinement { predicate, .. } => {
-            let mut pred_env = inner_env.clone();
+            let mut pred_env = scope.env.clone();
             pred_env.insert("$".to_owned(), bound_var.clone());
-            let pred_val = encode_pure_expr_inner(predicate, &pred_env, vctx, defs, precheck)?;
+            let pred_val = encode_pure_expr_inner(
+                predicate,
+                &pred_env,
+                scope.vctx,
+                scope.defs,
+                scope.precheck,
+            )?;
             Ok(Some(pred_val.to_bool()?))
         }
         _ => Ok(None),
@@ -1027,17 +1179,13 @@ pub(super) fn build_domain_predicate(
 /// encode an aggregate in the pure-expression
 /// context (fn contracts). Supports fieldless enums and Bool domains
 /// via finite unfolding. Other domains are rejected with an error.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_pure_aggregate(
     kind: crate::ir::types::IRAggKind,
     var: &str,
     domain: &crate::ir::types::IRType,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
-    env: &HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    precheck: Option<&PrecheckCtx<'_>>,
+    scope: PureEncodingScope<'_>,
 ) -> Result<SmtValue, String> {
     use crate::ir::types::IRAggKind;
 
@@ -1068,20 +1216,28 @@ pub(super) fn encode_pure_aggregate(
 
     // Collect (filter_flag, body_value) for each domain element.
     let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
-    let mut inner_env = env.clone();
+    let mut inner_env = scope.env.clone();
     for v in &values {
         inner_env.insert(var.to_owned(), v.clone());
         let mut flag = smt::bool_const(true);
         if let Some(filter_expr) = in_filter {
-            let membership = encode_pure_expr_inner(filter_expr, &inner_env, vctx, defs, precheck)?;
+            let membership = encode_pure_expr_inner(
+                filter_expr,
+                &inner_env,
+                scope.vctx,
+                scope.defs,
+                scope.precheck,
+            )?;
             flag = membership.to_bool()?;
         }
         if kind == IRAggKind::Count {
-            let pred = encode_pure_expr_inner(body, &inner_env, vctx, defs, precheck)?;
+            let pred =
+                encode_pure_expr_inner(body, &inner_env, scope.vctx, scope.defs, scope.precheck)?;
             let pred_bool = pred.to_bool()?;
             slot_data.push((smt::bool_and(&[&flag, &pred_bool]), smt::int_val(1)));
         } else {
-            let val = encode_pure_expr_inner(body, &inner_env, vctx, defs, precheck)?;
+            let val =
+                encode_pure_expr_inner(body, &inner_env, scope.vctx, scope.defs, scope.precheck)?;
             slot_data.push((flag, val));
         }
     }
@@ -1153,29 +1309,32 @@ pub(super) fn encode_pure_aggregate(
 /// a domain predicate:
 /// - forall y: E | P(y) → forall y: Int | (y ∈ E) implies P(y)
 /// - exists y: E | P(y) → exists y: Int | (y ∈ E) and P(y)
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_z3_quantifier(
     is_forall: bool,
     var: &str,
     domain: &crate::ir::types::IRType,
     body: &IRExpr,
-    env: &HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    precheck: Option<&PrecheckCtx<'_>>,
+    scope: PureEncodingScope<'_>,
 ) -> Result<SmtValue, String> {
     // Create a solver-native bound variable (ADT-aware via vctx).
-    let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
+    let bound_var = make_z3_bound_var_ctx(var, domain, Some(scope.vctx))?;
 
     // Extend environment with the bound variable
-    let mut inner_env = env.clone();
+    let mut inner_env = scope.env.clone();
     inner_env.insert(var.to_owned(), bound_var.clone());
 
     // Encode the body with the bound variable in scope
-    let body_val = encode_pure_expr_inner(body, &inner_env, vctx, defs, precheck)?;
+    let inner_scope = scope.with_env(&inner_env);
+    let body_val = encode_pure_expr_inner(
+        body,
+        inner_scope.env,
+        inner_scope.vctx,
+        inner_scope.defs,
+        inner_scope.precheck,
+    )?;
     let body_bool = body_val.to_bool()?;
 
-    let domain_pred = build_domain_predicate(domain, &bound_var, &inner_env, vctx, defs, precheck)?;
+    let domain_pred = build_domain_predicate(domain, &bound_var, inner_scope)?;
 
     // Combine body with domain predicate:
     // forall: domain_pred implies body
@@ -1228,26 +1387,30 @@ pub(super) fn build_z3_quantifier(
 /// Semantics: ∃x. D(x) ∧ P(x) ∧ ∀y. D(y) ∧ P(y) → y = x
 ///
 /// where D is the domain predicate (enum range, refinement guard, etc.)
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_z3_one(
     var: &str,
     domain: &crate::ir::types::IRType,
     body: &IRExpr,
-    env: &HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    precheck: Option<&PrecheckCtx<'_>>,
+    scope: PureEncodingScope<'_>,
 ) -> Result<SmtValue, String> {
     // Create bound variable x (ADT-aware via vctx)
-    let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-    let mut x_env = env.clone();
+    let x_var = make_z3_bound_var_ctx(var, domain, Some(scope.vctx))?;
+    let mut x_env = scope.env.clone();
     x_env.insert(var.to_owned(), x_var.clone());
+    let x_scope = scope.with_env(&x_env);
 
     // Encode P(x)
-    let p_x = encode_pure_expr_inner(body, &x_env, vctx, defs, precheck)?.to_bool()?;
+    let p_x = encode_pure_expr_inner(
+        body,
+        x_scope.env,
+        x_scope.vctx,
+        x_scope.defs,
+        x_scope.precheck,
+    )?
+    .to_bool()?;
 
     // Domain predicate for x
-    let d_x = build_domain_predicate(domain, &x_var, &x_env, vctx, defs, precheck)?;
+    let d_x = build_domain_predicate(domain, &x_var, x_scope)?;
 
     // D(x) ∧ P(x)
     let x_satisfies = match &d_x {
@@ -1257,15 +1420,23 @@ pub(super) fn encode_z3_one(
 
     // Create a fresh bound variable y (different Z3 name, ADT-aware)
     let y_name = format!("{var}__unique");
-    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
-    let mut y_env = env.clone();
+    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(scope.vctx))?;
+    let mut y_env = scope.env.clone();
     y_env.insert(var.to_owned(), y_var.clone());
+    let y_scope = scope.with_env(&y_env);
 
     // Encode P(y) — same body, but with y bound to the quantifier variable
-    let p_y = encode_pure_expr_inner(body, &y_env, vctx, defs, precheck)?.to_bool()?;
+    let p_y = encode_pure_expr_inner(
+        body,
+        y_scope.env,
+        y_scope.vctx,
+        y_scope.defs,
+        y_scope.precheck,
+    )?
+    .to_bool()?;
 
     // Domain predicate for y
-    let d_y = build_domain_predicate(domain, &y_var, &y_env, vctx, defs, precheck)?;
+    let d_y = build_domain_predicate(domain, &y_var, y_scope)?;
 
     // D(y) ∧ P(y) → y = x
     let y_satisfies = match &d_y {
@@ -1290,34 +1461,46 @@ pub(super) fn encode_z3_one(
 /// Semantics: ∀x, y. D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
 ///
 /// where D is the domain predicate (enum range, refinement guard, etc.)
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_z3_lone(
     var: &str,
     domain: &crate::ir::types::IRType,
     body: &IRExpr,
-    env: &HashMap<String, SmtValue>,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    precheck: Option<&PrecheckCtx<'_>>,
+    scope: PureEncodingScope<'_>,
 ) -> Result<SmtValue, String> {
     // Create bound variable x (ADT-aware via vctx)
-    let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-    let mut x_env = env.clone();
+    let x_var = make_z3_bound_var_ctx(var, domain, Some(scope.vctx))?;
+    let mut x_env = scope.env.clone();
     x_env.insert(var.to_owned(), x_var.clone());
+    let x_scope = scope.with_env(&x_env);
 
     // Create bound variable y (different Z3 name, ADT-aware)
     let y_name = format!("{var}__unique");
-    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
-    let mut y_env = env.clone();
+    let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(scope.vctx))?;
+    let mut y_env = scope.env.clone();
     y_env.insert(var.to_owned(), y_var.clone());
+    let y_scope = scope.with_env(&y_env);
 
     // Encode P(x) and P(y)
-    let p_x = encode_pure_expr_inner(body, &x_env, vctx, defs, precheck)?.to_bool()?;
-    let p_y = encode_pure_expr_inner(body, &y_env, vctx, defs, precheck)?.to_bool()?;
+    let p_x = encode_pure_expr_inner(
+        body,
+        x_scope.env,
+        x_scope.vctx,
+        x_scope.defs,
+        x_scope.precheck,
+    )?
+    .to_bool()?;
+    let p_y = encode_pure_expr_inner(
+        body,
+        y_scope.env,
+        y_scope.vctx,
+        y_scope.defs,
+        y_scope.precheck,
+    )?
+    .to_bool()?;
 
     // Domain predicates
-    let d_x = build_domain_predicate(domain, &x_var, &x_env, vctx, defs, precheck)?;
-    let d_y = build_domain_predicate(domain, &y_var, &y_env, vctx, defs, precheck)?;
+    let d_x = build_domain_predicate(domain, &x_var, x_scope)?;
+    let d_y = build_domain_predicate(domain, &y_var, y_scope)?;
 
     // D(x) ∧ D(y) ∧ P(x) ∧ P(y)
     let mut antecedents = Vec::new();
@@ -1886,9 +2069,19 @@ mod tests {
             variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
         };
         let bound = smt::int_var("status");
-        let pred = build_domain_predicate(&enum_ty, &bound, &HashMap::new(), &vctx, &defs, None)
-            .expect("enum predicate")
-            .expect("flat enum domain predicate");
+        let env = HashMap::new();
+        let pred = build_domain_predicate(
+            &enum_ty,
+            &bound,
+            PureEncodingScope {
+                env: &env,
+                vctx: &vctx,
+                defs: &defs,
+                precheck: None,
+            },
+        )
+        .expect("enum predicate")
+        .expect("flat enum domain predicate");
 
         let solver = AbideSolver::new();
         solver.assert(&pred);
@@ -1919,10 +2112,12 @@ mod tests {
         let refinement_pred = build_domain_predicate(
             &refinement,
             &smt::int_val(1),
-            &HashMap::new(),
-            &vctx,
-            &defs,
-            None,
+            PureEncodingScope {
+                env: &env,
+                vctx: &vctx,
+                defs: &defs,
+                precheck: None,
+            },
         )
         .expect("refinement predicate")
         .expect("refinement guard");
@@ -1953,10 +2148,12 @@ mod tests {
         let result = build_domain_predicate(
             &empty_ty,
             &smt::int_var("empty"),
-            &HashMap::new(),
-            &vctx,
-            &defs,
-            None,
+            PureEncodingScope {
+                env: &HashMap::new(),
+                vctx: &vctx,
+                defs: &defs,
+                precheck: None,
+            },
         );
 
         assert!(
@@ -1982,10 +2179,12 @@ mod tests {
                 span: None,
             },
             None,
-            &env,
-            &vctx,
-            &defs,
-            None,
+            PureEncodingScope {
+                env: &env,
+                vctx: &vctx,
+                defs: &defs,
+                precheck: None,
+            },
         )
         .expect("count aggregate");
         let solver = AbideSolver::new();
@@ -2008,10 +2207,12 @@ mod tests {
                 span: None,
             },
             None,
-            &env,
-            &vctx,
-            &defs,
-            None,
+            PureEncodingScope {
+                env: &env,
+                vctx: &vctx,
+                defs: &defs,
+                precheck: None,
+            },
         )
         .expect("sum aggregate");
         let solver = AbideSolver::new();

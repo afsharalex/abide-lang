@@ -4,7 +4,7 @@
 //! backend path, but callers should depend on this obligation shape rather than
 //! reaching directly into solver-specific entry points.
 
-#![allow(clippy::large_enum_variant, clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +15,7 @@ use crate::ir::types::{
 
 use super::context::VerifyContext;
 use super::defenv;
+use super::encode::encode_pure_expr;
 use super::harness::{
     create_slot_pool_with_systems, domain_constraints, initial_state_constraints, lasso_loopback,
     store_active_cardinality_constraints, symmetry_breaking_constraints, try_encode_guard_expr,
@@ -27,12 +28,18 @@ use super::property::{encode_prop_expr_with_ctx, PropertyCtx};
 use super::scope::{
     compute_theorem_scope, compute_verify_scope, select_verify_relevant, VerifyStoreRange,
 };
-use super::smt::{Bool, SmtValue};
+use super::smt::{self, AbideSolver, Bool, SatResult, SmtValue};
 use super::solver::{active_solver_family, SolverFamily};
 use super::sygus;
 use super::temporal::{CompiledTemporalFormula, LivenessPattern};
 use super::walkers::count_entity_quantifiers;
 
+/// Backend-neutral assumption set for a transition obligation.
+///
+/// Built from an [`IRAssumptionSet`] plus any extern-boundary
+/// assumption expressions in scope. Event keys are stored as
+/// `(system, command)` pairs because they are projected into the
+/// solver's identifier space before backend encoding.
 #[derive(Debug, Clone)]
 pub struct TransitionAssumptions {
     stutter: bool,
@@ -198,6 +205,9 @@ impl TransitionAssumptions {
     }
 }
 
+/// Backend-neutral transition-system specification at a verification
+/// site. Bundles the IR, verifier context, the selected sub-system
+/// scope, slot bounds, assumption set, and initial constraints.
 #[derive(Clone)]
 pub struct TransitionSystemSpec<'a> {
     pub ir: &'a IRProgram,
@@ -213,18 +223,40 @@ pub struct TransitionSystemSpec<'a> {
     relevant_systems: Vec<IRSystem>,
 }
 
+pub struct TransitionSelectedParts {
+    pub selected_system_names: Vec<String>,
+    pub relevant_entities: Vec<IREntity>,
+    pub relevant_systems: Vec<IRSystem>,
+    pub slots_per_entity: HashMap<String, usize>,
+    pub bound: usize,
+    pub store_ranges: HashMap<String, VerifyStoreRange>,
+}
+
+struct TransitionVerifyScopeParts {
+    selected_system_names: Vec<String>,
+    system_names: Vec<String>,
+    slots_per_entity: HashMap<String, usize>,
+    bound: usize,
+    store_ranges: HashMap<String, VerifyStoreRange>,
+    assumptions: TransitionAssumptions,
+    initial_constraints: Vec<IRExpr>,
+}
+
 impl<'a> TransitionSystemSpec<'a> {
     pub fn from_selected(
         ir: &'a IRProgram,
         vctx: &'a VerifyContext,
-        selected_system_names: Vec<String>,
-        relevant_entities: Vec<IREntity>,
-        relevant_systems: Vec<IRSystem>,
-        slots_per_entity: HashMap<String, usize>,
-        bound: usize,
-        store_ranges: HashMap<String, VerifyStoreRange>,
+        parts: TransitionSelectedParts,
         assumption_set: &IRAssumptionSet,
     ) -> Option<Self> {
+        let TransitionSelectedParts {
+            selected_system_names,
+            relevant_entities,
+            relevant_systems,
+            slots_per_entity,
+            bound,
+            store_ranges,
+        } = parts;
         let system_names: Vec<String> = relevant_systems.iter().map(|s| s.name.clone()).collect();
         if system_names.is_empty() {
             return None;
@@ -249,14 +281,17 @@ impl<'a> TransitionSystemSpec<'a> {
     fn from_verify_scope_parts(
         ir: &'a IRProgram,
         vctx: &'a VerifyContext,
-        selected_system_names: Vec<String>,
-        system_names: Vec<String>,
-        slots_per_entity: HashMap<String, usize>,
-        bound: usize,
-        store_ranges: HashMap<String, VerifyStoreRange>,
-        assumptions: TransitionAssumptions,
-        initial_constraints: Vec<IRExpr>,
+        parts: TransitionVerifyScopeParts,
     ) -> Option<Self> {
+        let TransitionVerifyScopeParts {
+            selected_system_names,
+            system_names,
+            slots_per_entity,
+            bound,
+            store_ranges,
+            assumptions,
+            initial_constraints,
+        } = parts;
         if system_names.is_empty() {
             return None;
         }
@@ -303,17 +338,19 @@ impl<'a> TransitionSystemSpec<'a> {
         Self::from_verify_scope_parts(
             ir,
             vctx,
-            verify_block
-                .systems
-                .iter()
-                .map(|sys| sys.name.clone())
-                .collect(),
-            system_names,
-            slots_per_entity,
-            bound,
-            store_ranges,
-            TransitionAssumptions::from_ir(&verify_block.assumption_set),
-            verify_block.initial_constraints.clone(),
+            TransitionVerifyScopeParts {
+                selected_system_names: verify_block
+                    .systems
+                    .iter()
+                    .map(|sys| sys.name.clone())
+                    .collect(),
+                system_names,
+                slots_per_entity,
+                bound,
+                store_ranges,
+                assumptions: TransitionAssumptions::from_ir(&verify_block.assumption_set),
+                initial_constraints: verify_block.initial_constraints.clone(),
+            },
         )
     }
 
@@ -327,17 +364,19 @@ impl<'a> TransitionSystemSpec<'a> {
         Self::from_verify_scope_parts(
             ir,
             vctx,
-            verify_block
-                .systems
-                .iter()
-                .map(|sys| sys.name.clone())
-                .collect(),
-            system_names,
-            slots_per_entity,
-            bound,
-            store_ranges,
-            TransitionAssumptions::from_ir(&verify_block.assumption_set),
-            verify_block.initial_constraints.clone(),
+            TransitionVerifyScopeParts {
+                selected_system_names: verify_block
+                    .systems
+                    .iter()
+                    .map(|sys| sys.name.clone())
+                    .collect(),
+                system_names,
+                slots_per_entity,
+                bound,
+                store_ranges,
+                assumptions: TransitionAssumptions::from_ir(&verify_block.assumption_set),
+                initial_constraints: verify_block.initial_constraints.clone(),
+            },
         )
     }
 
@@ -410,6 +449,9 @@ impl<'a> TransitionSystemSpec<'a> {
     }
 }
 
+/// Safety obligation: every step of the [`TransitionSystemSpec`] must
+/// satisfy each `step_properties` predicate. Used by ordinary safety
+/// checking (verify blocks, prop targets).
 #[derive(Clone)]
 pub struct TransitionSafetySpec<'a> {
     system: TransitionSystemSpec<'a>,
@@ -429,10 +471,11 @@ impl<'a> TransitionSafetySpec<'a> {
             .iter()
             .map(|assert_expr| {
                 let expanded = super::expand_through_defs(assert_expr, defs);
-                match expanded {
+                let step_property = match expanded {
                     IRExpr::Always { body, .. } => *body,
                     other => other,
-                }
+                };
+                simplify_static_bool_fragments(step_property, vctx, defs)
             })
             .collect();
         Some(Self {
@@ -492,6 +535,247 @@ impl<'a> TransitionSafetySpec<'a> {
     }
 }
 
+fn simplify_static_bool_fragments(
+    expr: IRExpr,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> IRExpr {
+    if let Some(value) = static_bool_value(&expr, vctx, defs) {
+        return bool_lit(value);
+    }
+    match expr {
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            span,
+        } if op == "OpAnd" || op == "and" || op == "&&" => {
+            simplify_static_and(op, *left, *right, ty, span, vctx, defs)
+        }
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            span,
+        } if op == "OpOr" || op == "or" || op == "||" => {
+            simplify_static_or(op, *left, *right, ty, span, vctx, defs)
+        }
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Forall {
+            var,
+            domain,
+            body: Box::new(simplify_static_bool_fragments(*body, vctx, defs)),
+            span,
+        },
+        IRExpr::Exists {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Exists {
+            var,
+            domain,
+            body: Box::new(simplify_static_bool_fragments(*body, vctx, defs)),
+            span,
+        },
+        other => other,
+    }
+}
+
+fn simplify_static_and(
+    op: String,
+    left: IRExpr,
+    right: IRExpr,
+    ty: crate::ir::types::IRType,
+    span: Option<crate::span::Span>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> IRExpr {
+    let left = simplify_static_bool_fragments(left, vctx, defs);
+    let right = simplify_static_bool_fragments(right, vctx, defs);
+    match (literal_bool(&left), literal_bool(&right)) {
+        (Some(false), _) | (_, Some(false)) => bool_lit(false),
+        (Some(true), _) => right,
+        (_, Some(true)) => left,
+        _ => IRExpr::BinOp {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            ty,
+            span,
+        },
+    }
+}
+
+fn simplify_static_or(
+    op: String,
+    left: IRExpr,
+    right: IRExpr,
+    ty: crate::ir::types::IRType,
+    span: Option<crate::span::Span>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+) -> IRExpr {
+    let left = simplify_static_bool_fragments(left, vctx, defs);
+    let right = simplify_static_bool_fragments(right, vctx, defs);
+    match (literal_bool(&left), literal_bool(&right)) {
+        (Some(true), _) | (_, Some(true)) => bool_lit(true),
+        (Some(false), _) => right,
+        (_, Some(false)) => left,
+        _ => IRExpr::BinOp {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            ty,
+            span,
+        },
+    }
+}
+
+fn static_bool_value(expr: &IRExpr, vctx: &VerifyContext, defs: &defenv::DefEnv) -> Option<bool> {
+    if !is_closed_static_expr(expr, &HashSet::new()) {
+        return None;
+    }
+    let encoded = encode_pure_expr(expr, &HashMap::new(), vctx, defs)
+        .ok()?
+        .to_bool()
+        .ok()?;
+    if is_unsat(&smt::bool_not(&encoded)) {
+        return Some(true);
+    }
+    is_unsat(&encoded).then_some(false)
+}
+
+fn is_closed_static_expr(expr: &IRExpr, locals: &HashSet<String>) -> bool {
+    match expr {
+        IRExpr::Lit { .. } => true,
+        IRExpr::Var { name, ty, .. } => {
+            locals.contains(name) || matches!(ty, crate::ir::types::IRType::Enum { .. })
+        }
+        IRExpr::Ctor { args, .. } => args
+            .iter()
+            .all(|(_, arg)| is_closed_static_expr(arg, locals)),
+        IRExpr::Field { expr, .. } => is_closed_static_expr(expr, locals),
+        IRExpr::BinOp { left, right, .. } => {
+            is_closed_static_expr(left, locals) && is_closed_static_expr(right, locals)
+        }
+        IRExpr::UnOp { operand, .. } | IRExpr::Card { expr: operand, .. } => {
+            is_closed_static_expr(operand, locals)
+        }
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements
+            .iter()
+            .all(|element| is_closed_static_expr(element, locals)),
+        IRExpr::MapLit { entries, .. } => entries.iter().all(|(key, value)| {
+            is_closed_static_expr(key, locals) && is_closed_static_expr(value, locals)
+        }),
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            if matches!(domain, crate::ir::types::IRType::Entity { .. }) {
+                return false;
+            }
+            if let Some(source) = source {
+                if !is_closed_static_expr(source, locals) {
+                    return false;
+                }
+            } else if !matches!(
+                domain,
+                crate::ir::types::IRType::Bool | crate::ir::types::IRType::Enum { .. }
+            ) {
+                return false;
+            }
+            let mut nested = locals.clone();
+            nested.insert(var.clone());
+            is_closed_static_expr(filter, &nested)
+                && projection
+                    .as_ref()
+                    .is_none_or(|projection| is_closed_static_expr(projection, &nested))
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            let mut nested = locals.clone();
+            for binding in bindings {
+                if !is_closed_static_expr(&binding.expr, &nested) {
+                    return false;
+                }
+                nested.insert(binding.name.clone());
+            }
+            is_closed_static_expr(body, &nested)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            is_closed_static_expr(cond, locals)
+                && is_closed_static_expr(then_body, locals)
+                && else_body
+                    .as_ref()
+                    .is_none_or(|else_body| is_closed_static_expr(else_body, locals))
+        }
+        IRExpr::Forall {
+            var, domain, body, ..
+        }
+        | IRExpr::Exists {
+            var, domain, body, ..
+        } => {
+            if matches!(domain, crate::ir::types::IRType::Entity { .. }) {
+                return false;
+            }
+            if !matches!(
+                domain,
+                crate::ir::types::IRType::Bool | crate::ir::types::IRType::Enum { .. }
+            ) {
+                return false;
+            }
+            let mut nested = locals.clone();
+            nested.insert(var.clone());
+            is_closed_static_expr(body, &nested)
+        }
+        _ => false,
+    }
+}
+
+fn is_unsat(expr: &Bool) -> bool {
+    let solver = AbideSolver::new();
+    solver.assert(expr);
+    solver.check() == SatResult::Unsat
+}
+
+fn literal_bool(expr: &IRExpr) -> Option<bool> {
+    match expr {
+        IRExpr::Lit {
+            value: crate::ir::types::LitVal::Bool { value },
+            ..
+        } => Some(*value),
+        _ => None,
+    }
+}
+
+fn bool_lit(value: bool) -> IRExpr {
+    IRExpr::Lit {
+        ty: crate::ir::types::IRType::Bool,
+        value: crate::ir::types::LitVal::Bool { value },
+        span: None,
+    }
+}
+
+/// `verify`-block obligation: the system spec plus the compiled
+/// temporal asserts. `safety` projects out the always-prefix shape
+/// suitable for ordinary safety encoding; assertions with stronger
+/// temporal shape (e.g. liveness) are kept in `compiled_asserts` for
+/// the liveness backend.
 #[derive(Clone)]
 pub struct TransitionVerifySpec<'a> {
     system: TransitionSystemSpec<'a>,
@@ -528,6 +812,7 @@ impl<'a> TransitionVerifySpec<'a> {
                 IRExpr::Always { body, .. } => *body,
                 other => other,
             })
+            .map(|property| simplify_static_bool_fragments(property, vctx, defs))
             .collect();
         Some(Self {
             system: system.clone(),
@@ -558,6 +843,9 @@ impl<'a> TransitionVerifySpec<'a> {
     }
 }
 
+/// Fully assembled verify obligation ready to hand to a backend.
+/// Includes the `verify` spec plus precomputed projections (fair
+/// events, etc.) needed by the dispatchers in this module.
 #[derive(Clone)]
 pub struct TransitionVerifyObligation<'a> {
     verify: TransitionVerifySpec<'a>,
@@ -627,6 +915,10 @@ impl<'a> TransitionVerifyObligation<'a> {
     }
 }
 
+/// Pre-built SMT encoding for a transition obligation: slot pool,
+/// initial/domain/symmetry constraints, fire tracking, and the
+/// optional lasso loopback constraint. Plans (`TransitionExecutionPlan`)
+/// pick which subset to assert.
 pub struct TransitionSmtEncoding<'a> {
     system: TransitionSystemSpec<'a>,
     pool: SlotPool,
@@ -663,6 +955,9 @@ fn try_extern_assume_expr_constraints(
     Ok(constraints)
 }
 
+/// One scheduled run of the [`TransitionSmtEncoding`] — narrows the
+/// encoding to the specific shape needed by one tier (deadlock probe,
+/// finite prefix, BMC, lasso liveness).
 #[derive(Clone)]
 pub struct TransitionExecutionPlan<'a> {
     system: TransitionSystemSpec<'a>,
@@ -1216,20 +1511,22 @@ impl TransitionBackend for Ic3TransitionBackend {
                 let response = recipe.response();
                 let (ent_var, ent_name) = recipe.quantified_binding();
                 let fair_event_keys = system.assumptions().all_fair_event_keys();
-                ic3::try_ic3_liveness(
-                    system.ir,
-                    system.vctx,
-                    system.system_names(),
-                    trigger,
-                    response,
-                    ent_var,
-                    ent_name,
-                    &fair_event_keys,
-                    system.slots_per_entity(),
-                    recipe.is_oneshot(),
-                    target_slot,
+                ic3::try_ic3_liveness(ic3::Ic3LivenessInput {
+                    ir: system.ir,
+                    vctx: system.vctx,
+                    system_names: system.system_names(),
+                    monitor: ic3::LivenessMonitorInput {
+                        trigger,
+                        response,
+                        entity_var: ent_var,
+                        entity_name_for_binding: ent_name,
+                        fair_events: &fair_event_keys,
+                        is_oneshot: recipe.is_oneshot(),
+                        target_slot,
+                    },
+                    slots_per_entity: system.slots_per_entity(),
                     timeout_ms,
-                )
+                })
             }
         }
     }
@@ -1808,12 +2105,14 @@ mod tests {
         let system = TransitionSystemSpec::from_selected(
             &ir,
             &vctx,
-            vec!["Orders".to_owned()],
-            vec![],
-            vec![system_ir],
-            HashMap::new(),
-            3,
-            HashMap::new(),
+            TransitionSelectedParts {
+                selected_system_names: vec!["Orders".to_owned()],
+                relevant_entities: vec![],
+                relevant_systems: vec![system_ir],
+                slots_per_entity: HashMap::new(),
+                bound: 3,
+                store_ranges: HashMap::new(),
+            },
             &IRAssumptionSet::default_for_verify(),
         )
         .expect("expected selected system");

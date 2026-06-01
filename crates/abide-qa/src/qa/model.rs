@@ -34,7 +34,9 @@ pub struct FlowModel {
 /// What kind of declaration owns a graph-addressable field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerKind {
+    /// Field is on an `entity`.
     Entity,
+    /// Field is on a `system` (flat state field).
     System,
 }
 

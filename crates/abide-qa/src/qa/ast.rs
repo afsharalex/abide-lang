@@ -37,6 +37,8 @@ pub enum QAStatement {
     ExportArtifact { selector: String, format: String },
 }
 
+/// Parameters for `simulate`: how many steps to run, the PRNG seed,
+/// store sizing, and optional system focus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationRequest {
     pub steps: usize,
@@ -46,6 +48,9 @@ pub struct SimulationRequest {
     pub system: Option<String>,
 }
 
+/// Parameters for `explore`: bounded state-space construction. `depth`
+/// caps the search frontier; `None` means "until exhausted" within the
+/// other bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateSpaceRequest {
     pub depth: Option<usize>,
@@ -54,6 +59,8 @@ pub struct StateSpaceRequest {
     pub system: Option<String>,
 }
 
+/// Bounding parameters shared by temporal queries that explore a
+/// reachable state space implicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TemporalBounds {
     pub slots: Option<usize>,
@@ -61,6 +68,8 @@ pub struct TemporalBounds {
 }
 
 impl TemporalBounds {
+    /// Returns `true` when no bounds have been specified — caller will
+    /// fall back to defaults.
     pub fn is_empty(&self) -> bool {
         self.slots.is_none() && self.scopes.is_empty()
     }

@@ -6,8 +6,6 @@
 //! - bounded relational verify fragments over one pooled entity type with
 //!   finite field domains and narrow create / choose-apply operational steps
 
-#![allow(clippy::too_many_arguments)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
@@ -29,6 +27,35 @@ use super::{defenv, expand_through_defs, VerificationResult, WitnessSemantics};
 
 const STATEFUL_SCENE_SOME_EVENT_BUDGET: usize = 3;
 const STATEFUL_SCENE_MAX_TOTAL_EVENT_INSTANCES: usize = 6;
+
+#[derive(Clone, Copy)]
+struct StageExpansionProgress {
+    idx: usize,
+    total_instances: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SceneOrderingCtx<'a> {
+    var_to_idx: &'a HashMap<&'a str, usize>,
+    event_instance_ranges: &'a [std::ops::Range<usize>],
+    instances: &'a [CreateInstance],
+    scene: &'a IRScene,
+}
+
+#[derive(Clone, Copy)]
+struct RelationalSceneParseCtx<'a> {
+    entities_by_name: &'a HashMap<String, &'a IREntity>,
+    entity_specs: &'a HashMap<String, RelationalEntitySpec>,
+    given_bindings: &'a HashMap<&'a str, &'a str>,
+    param_binding_map: &'a HashMap<&'a str, &'a str>,
+    param_values: &'a HashMap<String, SimpleValue>,
+    defs: &'a defenv::DefEnv,
+}
+
+struct RelationalSceneActionState {
+    bindings: Vec<RelActionBinding>,
+    target_context: Option<(String, String, String)>,
+}
 
 #[derive(Debug, Clone)]
 struct CreateInstance {
@@ -1518,8 +1545,10 @@ fn expand_stage_count_options<'a>(
         events_by_var,
         some_budget,
         max_total_instances,
-        0,
-        0,
+        StageExpansionProgress {
+            idx: 0,
+            total_instances: 0,
+        },
         &mut current,
         &mut all,
     )?;
@@ -1531,11 +1560,12 @@ fn expand_stage_count_options_rec<'a>(
     events_by_var: &HashMap<&'a str, &crate::ir::types::IRSceneEvent>,
     some_budget: usize,
     max_total_instances: usize,
-    idx: usize,
-    total_instances: usize,
+    progress: StageExpansionProgress,
     current: &mut Vec<Vec<&'a str>>,
     out: &mut Vec<Vec<Vec<&'a str>>>,
 ) -> Option<()> {
+    let idx = progress.idx;
+    let total_instances = progress.total_instances;
     if idx == stages.len() {
         out.push(current.clone());
         return Some(());
@@ -1558,8 +1588,10 @@ fn expand_stage_count_options_rec<'a>(
             events_by_var,
             some_budget,
             max_total_instances,
-            idx + 1,
-            total_instances + added_instances,
+            StageExpansionProgress {
+                idx: idx + 1,
+                total_instances: total_instances + added_instances,
+            },
             current,
             out,
         )?;
@@ -1701,10 +1733,12 @@ fn encode_relational_scene_ordering(
                 sat,
                 collect_ordering_leaf_vars(left),
                 collect_ordering_leaf_vars(right),
-                var_to_idx,
-                event_instance_ranges,
-                instances,
-                scene,
+                SceneOrderingCtx {
+                    var_to_idx,
+                    event_instance_ranges,
+                    instances,
+                    scene,
+                },
                 add_position_before_constraint,
             )?;
             encode_relational_scene_ordering(
@@ -1731,10 +1765,12 @@ fn encode_relational_scene_ordering(
                 sat,
                 collect_ordering_leaf_vars(left),
                 collect_ordering_leaf_vars(right),
-                var_to_idx,
-                event_instance_ranges,
-                instances,
-                scene,
+                SceneOrderingCtx {
+                    var_to_idx,
+                    event_instance_ranges,
+                    instances,
+                    scene,
+                },
                 add_position_equal_constraint,
             )?;
             encode_relational_scene_ordering(
@@ -1761,10 +1797,12 @@ fn encode_relational_scene_ordering(
                 sat,
                 collect_ordering_leaf_vars(left),
                 collect_ordering_leaf_vars(right),
-                var_to_idx,
-                event_instance_ranges,
-                instances,
-                scene,
+                SceneOrderingCtx {
+                    var_to_idx,
+                    event_instance_ranges,
+                    instances,
+                    scene,
+                },
                 |sat, left, right| sat.add_binary(!left.fire, !right.fire),
             )?;
             encode_relational_scene_ordering(
@@ -1793,10 +1831,7 @@ fn constrain_scene_ordering_pairs<F>(
     sat: &mut SatInstance,
     left_vars: Vec<&str>,
     right_vars: Vec<&str>,
-    var_to_idx: &HashMap<&str, usize>,
-    event_instance_ranges: &[std::ops::Range<usize>],
-    instances: &[CreateInstance],
-    scene: &IRScene,
+    ctx: SceneOrderingCtx<'_>,
     mut constraint: F,
 ) -> Result<(), String>
 where
@@ -1805,25 +1840,25 @@ where
     if left_vars.is_empty() || right_vars.is_empty() {
         return Err(format!(
             "scene `{}`: ordering expression references unknown event variable",
-            scene.name
+            ctx.scene.name
         ));
     }
     for left_var in left_vars {
-        let Some(&left_idx) = var_to_idx.get(left_var) else {
+        let Some(&left_idx) = ctx.var_to_idx.get(left_var) else {
             return Err(format!(
                 "scene `{}`: unknown ordering event `{left_var}`",
-                scene.name
+                ctx.scene.name
             ));
         };
         for right_var in &right_vars {
-            let Some(&right_idx) = var_to_idx.get(right_var) else {
+            let Some(&right_idx) = ctx.var_to_idx.get(right_var) else {
                 return Err(format!(
                     "scene `{}`: unknown ordering event `{right_var}`",
-                    scene.name
+                    ctx.scene.name
                 ));
             };
-            for left_inst in &instances[event_instance_ranges[left_idx].clone()] {
-                for right_inst in &instances[event_instance_ranges[right_idx].clone()] {
+            for left_inst in &ctx.instances[ctx.event_instance_ranges[left_idx].clone()] {
+                for right_inst in &ctx.instances[ctx.event_instance_ranges[right_idx].clone()] {
                     constraint(sat, left_inst, right_inst);
                 }
             }
@@ -2296,14 +2331,18 @@ fn parse_relational_scene_step(
 
     let Some(action) = parse_relational_scene_action_with_bindings(
         &step.body[0],
-        entities_by_name,
-        entity_specs,
-        given_bindings,
-        &param_binding_map,
-        &param_values,
-        Vec::new(),
-        None,
-        defs,
+        RelationalSceneParseCtx {
+            entities_by_name,
+            entity_specs,
+            given_bindings,
+            param_binding_map: &param_binding_map,
+            param_values: &param_values,
+            defs,
+        },
+        RelationalSceneActionState {
+            bindings: Vec::new(),
+            target_context: None,
+        },
     )?
     else {
         return Ok(None);
@@ -2316,15 +2355,19 @@ fn parse_relational_scene_step(
 
 fn parse_relational_scene_action_with_bindings(
     action: &IRAction,
-    entities_by_name: &HashMap<String, &IREntity>,
-    entity_specs: &HashMap<String, RelationalEntitySpec>,
-    given_bindings: &HashMap<&str, &str>,
-    param_binding_map: &HashMap<&str, &str>,
-    param_values: &HashMap<String, SimpleValue>,
-    bindings: Vec<RelActionBinding>,
-    target_context: Option<(String, String, String)>,
-    defs: &defenv::DefEnv,
+    ctx: RelationalSceneParseCtx<'_>,
+    state: RelationalSceneActionState,
 ) -> Result<Option<RelationalActionSpec>, String> {
+    let entities_by_name = ctx.entities_by_name;
+    let entity_specs = ctx.entity_specs;
+    let given_bindings = ctx.given_bindings;
+    let param_binding_map = ctx.param_binding_map;
+    let param_values = ctx.param_values;
+    let defs = ctx.defs;
+    let RelationalSceneActionState {
+        bindings,
+        target_context,
+    } = state;
     match action {
         IRAction::Create { entity, fields } => {
             if !bindings.is_empty() || target_context.is_some() {
@@ -2415,14 +2458,11 @@ fn parse_relational_scene_action_with_bindings(
 
             parse_relational_scene_action_with_bindings(
                 &ops[0],
-                entities_by_name,
-                entity_specs,
-                given_bindings,
-                param_binding_map,
-                param_values,
-                next_bindings,
-                current_target_context,
-                defs,
+                ctx,
+                RelationalSceneActionState {
+                    bindings: next_bindings,
+                    target_context: current_target_context,
+                },
             )
         }
         IRAction::Apply {
@@ -4590,6 +4630,20 @@ fn collect_relation_domain_tuples(
     }
 }
 
+struct RelationMembershipCtx<'a, 'sat> {
+    entity_states: &'a HashMap<String, EntityStateEncoding>,
+    sat: &'sat mut SatInstance,
+    state_idx: usize,
+    bound: usize,
+}
+
+struct RelationComprehensionCtx<'a> {
+    projection: &'a [RelProjection],
+    bindings: &'a [RelComprehensionBinding],
+    filter: &'a RelScopedPred,
+    tuple: &'a [RelAtomRef],
+}
+
 fn encode_relation_value_membership(
     expr: &RelValueExpr,
     tuple: &[RelAtomRef],
@@ -4628,30 +4682,34 @@ fn encode_relation_value_membership(
             entity,
             field,
             state_ref,
-        } => encode_field_relation_membership(
-            entity,
-            field,
-            *state_ref,
-            tuple,
-            entity_states,
-            sat,
-            state_idx,
-            bound,
-        ),
+        } => {
+            let mut ctx = RelationMembershipCtx {
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            };
+            encode_field_relation_membership(entity, field, *state_ref, tuple, &mut ctx)
+        }
         RelValueExpr::Comprehension {
             projection,
             bindings,
             filter,
-        } => encode_relation_comprehension_membership(
-            projection,
-            bindings,
-            filter,
-            tuple,
-            entity_states,
-            sat,
-            state_idx,
-            bound,
-        ),
+        } => {
+            let mut membership = RelationMembershipCtx {
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            };
+            let comprehension = RelationComprehensionCtx {
+                projection,
+                bindings,
+                filter,
+                tuple,
+            };
+            encode_relation_comprehension_membership(&comprehension, &mut membership)
+        }
         RelValueExpr::Transpose(inner) => {
             if tuple.len() != 2 {
                 return Ok(const_lit(sat, false));
@@ -4802,32 +4860,28 @@ fn encode_relation_value_membership(
             }
             or_lit(sat, &reasons)
         }
-        RelValueExpr::Closure { expr, reflexive } => encode_relation_closure_membership(
-            expr,
-            *reflexive,
-            tuple,
-            entity_states,
-            sat,
-            state_idx,
-            bound,
-        ),
+        RelValueExpr::Closure { expr, reflexive } => {
+            let mut ctx = RelationMembershipCtx {
+                entity_states,
+                sat,
+                state_idx,
+                bound,
+            };
+            encode_relation_closure_membership(expr, *reflexive, tuple, &mut ctx)
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_relation_closure_membership(
     expr: &RelValueExpr,
     reflexive: bool,
     tuple: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
 ) -> Result<rustsat::types::Lit, String> {
     if tuple.len() != 2 {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
-    let domains = relation_value_domains(expr, entity_states)?;
+    let domains = relation_value_domains(expr, ctx.entity_states)?;
     if domains.len() != 2 {
         return Err("Rel::closure requires a binary relation".to_owned());
     }
@@ -4835,13 +4889,13 @@ fn encode_relation_closure_membership(
         return Err("Rel::closure requires a homogeneous binary relation".to_owned());
     }
     if !domains[0].contains(&tuple[0]) || !domains[1].contains(&tuple[1]) {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
 
     let node_count = domains[0].len();
     let mut reasons = Vec::new();
     if reflexive && tuple[0] == tuple[1] {
-        reasons.push(const_lit(sat, true));
+        reasons.push(const_lit(ctx.sat, true));
     }
     if node_count > 0 {
         let mut memo = HashMap::new();
@@ -4851,31 +4905,24 @@ fn encode_relation_closure_membership(
             &tuple[1],
             node_count,
             &domains[0],
-            entity_states,
-            sat,
-            state_idx,
-            bound,
+            ctx,
             &mut memo,
         )?);
     }
-    or_lit(sat, &reasons)
+    or_lit(ctx.sat, &reasons)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_relation_path_within(
     expr: &RelValueExpr,
     start: &RelAtomRef,
     end: &RelAtomRef,
     max_edges: usize,
     nodes: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
     memo: &mut HashMap<(RelAtomRef, RelAtomRef, usize), rustsat::types::Lit>,
 ) -> Result<rustsat::types::Lit, String> {
     if max_edges == 0 {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
     let key = (start.clone(), end.clone(), max_edges);
     if let Some(lit) = memo.get(&key) {
@@ -4885,10 +4932,10 @@ fn encode_relation_path_within(
     let edge = encode_relation_value_membership(
         expr,
         &[start.clone(), end.clone()],
-        entity_states,
-        sat,
-        state_idx,
-        bound,
+        ctx.entity_states,
+        ctx.sat,
+        ctx.state_idx,
+        ctx.bound,
     )?;
     let lit = if max_edges == 1 {
         edge
@@ -4898,66 +4945,53 @@ fn encode_relation_path_within(
             let first = encode_relation_value_membership(
                 expr,
                 &[start.clone(), middle.clone()],
-                entity_states,
-                sat,
-                state_idx,
-                bound,
+                ctx.entity_states,
+                ctx.sat,
+                ctx.state_idx,
+                ctx.bound,
             )?;
-            let rest = encode_relation_path_within(
-                expr,
-                middle,
-                end,
-                max_edges - 1,
-                nodes,
-                entity_states,
-                sat,
-                state_idx,
-                bound,
-                memo,
-            )?;
-            reasons.push(and_lit(sat, &[first, rest])?);
+            let rest =
+                encode_relation_path_within(expr, middle, end, max_edges - 1, nodes, ctx, memo)?;
+            reasons.push(and_lit(ctx.sat, &[first, rest])?);
         }
-        or_lit(sat, &reasons)?
+        or_lit(ctx.sat, &reasons)?
     };
     memo.insert(key, lit);
     Ok(lit)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_field_relation_membership(
     entity: &str,
     field: &str,
     state_ref: RelStateRef,
     tuple: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
 ) -> Result<rustsat::types::Lit, String> {
     if tuple.len() != 2 {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
     let RelAtomRef::EntitySlot {
         entity: tuple_entity,
         slot,
     } = &tuple[0]
     else {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     };
     let RelAtomRef::Value(value) = &tuple[1] else {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     };
     if tuple_entity != entity {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
-    let Some(real_state_idx) = relation_state_index(state_ref, state_idx, bound) else {
-        return Ok(const_lit(sat, false));
+    let Some(real_state_idx) = relation_state_index(state_ref, ctx.state_idx, ctx.bound) else {
+        return Ok(const_lit(ctx.sat, false));
     };
-    let state = entity_states
+    let state = ctx
+        .entity_states
         .get(entity)
         .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
     if *slot >= state.slot_count {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     }
     let encoding = state
         .field_encodings
@@ -4968,10 +5002,10 @@ fn encode_field_relation_membership(
         .iter()
         .position(|candidate| candidate == value)
     else {
-        return Ok(const_lit(sat, false));
+        return Ok(const_lit(ctx.sat, false));
     };
     and_lit(
-        sat,
+        ctx.sat,
         &[
             state.active_by_state[real_state_idx][*slot],
             encoding.state_lits[real_state_idx][*slot][value_idx],
@@ -4979,111 +5013,69 @@ fn encode_field_relation_membership(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_relation_comprehension_membership(
-    projection: &[RelProjection],
-    bindings: &[RelComprehensionBinding],
-    filter: &RelScopedPred,
-    tuple: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    comprehension: &RelationComprehensionCtx<'_>,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
 ) -> Result<rustsat::types::Lit, String> {
-    if projection.len() != tuple.len() {
-        return Ok(const_lit(sat, false));
+    if comprehension.projection.len() != comprehension.tuple.len() {
+        return Ok(const_lit(ctx.sat, false));
     }
     let mut assignments = Vec::new();
     encode_relation_comprehension_assignments(
-        projection,
-        bindings,
-        filter,
-        tuple,
-        entity_states,
-        sat,
-        state_idx,
-        bound,
+        comprehension,
+        ctx,
         0,
         &mut HashMap::new(),
         &mut assignments,
     )?;
-    or_lit(sat, &assignments)
+    or_lit(ctx.sat, &assignments)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_relation_comprehension_assignments(
-    projection: &[RelProjection],
-    bindings: &[RelComprehensionBinding],
-    filter: &RelScopedPred,
-    tuple: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    comprehension: &RelationComprehensionCtx<'_>,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
     index: usize,
     assignment: &mut HashMap<String, (String, usize)>,
     out: &mut Vec<rustsat::types::Lit>,
 ) -> Result<(), String> {
-    if index == bindings.len() {
+    if index == comprehension.bindings.len() {
         out.push(encode_relation_comprehension_assignment(
-            projection,
-            bindings,
-            filter,
-            tuple,
-            entity_states,
-            sat,
-            state_idx,
-            bound,
+            comprehension,
+            ctx,
             assignment,
         )?);
         return Ok(());
     }
-    let binding = &bindings[index];
-    let state = entity_states
+    let binding = &comprehension.bindings[index];
+    let state = ctx
+        .entity_states
         .get(&binding.entity)
         .ok_or_else(|| format!("missing relational entity state for `{}`", binding.entity))?;
     for slot in 0..state.slot_count {
         assignment.insert(binding.var.clone(), (binding.entity.clone(), slot));
-        encode_relation_comprehension_assignments(
-            projection,
-            bindings,
-            filter,
-            tuple,
-            entity_states,
-            sat,
-            state_idx,
-            bound,
-            index + 1,
-            assignment,
-            out,
-        )?;
+        encode_relation_comprehension_assignments(comprehension, ctx, index + 1, assignment, out)?;
     }
     assignment.remove(&binding.var);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_relation_comprehension_assignment(
-    projection: &[RelProjection],
-    bindings: &[RelComprehensionBinding],
-    filter: &RelScopedPred,
-    tuple: &[RelAtomRef],
-    entity_states: &HashMap<String, EntityStateEncoding>,
-    sat: &mut SatInstance,
-    state_idx: usize,
-    bound: usize,
+    comprehension: &RelationComprehensionCtx<'_>,
+    ctx: &mut RelationMembershipCtx<'_, '_>,
     assignment: &HashMap<String, (String, usize)>,
 ) -> Result<rustsat::types::Lit, String> {
     let mut constraints = Vec::new();
-    for binding in bindings {
-        let Some(source_idx) = relation_state_index(binding.source_ref, state_idx, bound) else {
-            return Ok(const_lit(sat, false));
+    for binding in comprehension.bindings {
+        let Some(source_idx) = relation_state_index(binding.source_ref, ctx.state_idx, ctx.bound)
+        else {
+            return Ok(const_lit(ctx.sat, false));
         };
-        let state = entity_states
+        let state = ctx
+            .entity_states
             .get(&binding.entity)
             .ok_or_else(|| format!("missing relational entity state for `{}`", binding.entity))?;
         let Some((_, slot)) = assignment.get(&binding.var) else {
-            return Ok(const_lit(sat, false));
+            return Ok(const_lit(ctx.sat, false));
         };
         constraints.push(state.active_by_state[source_idx][*slot]);
     }
@@ -5091,36 +5083,37 @@ fn encode_relation_comprehension_assignment(
     let binding_slots = assignment
         .iter()
         .map(|(var, (entity, slot))| {
-            let state = entity_states
+            let state = ctx
+                .entity_states
                 .get(entity)
                 .ok_or_else(|| format!("missing relational entity state for `{entity}`"))?;
             let slots = (0..state.slot_count)
-                .map(|candidate| const_lit(sat, candidate == *slot))
+                .map(|candidate| const_lit(ctx.sat, candidate == *slot))
                 .collect::<Vec<_>>();
             Ok((var.clone(), (entity.clone(), slots)))
         })
         .collect::<Result<HashMap<_, _>, String>>()?;
-    let current_fields = fields_for_state(entity_states, state_idx);
+    let current_fields = fields_for_state(ctx.entity_states, ctx.state_idx);
     constraints.push(encode_scoped_pred_with_bindings(
-        sat,
-        filter,
+        ctx.sat,
+        comprehension.filter,
         &binding_slots,
         &current_fields,
-        entity_states,
+        ctx.entity_states,
     )?);
 
-    for (projection, atom) in projection.iter().zip(tuple) {
+    for (projection, atom) in comprehension.projection.iter().zip(comprehension.tuple) {
         constraints.push(encode_projection_matches_atom(
             projection,
             atom,
             assignment,
-            entity_states,
-            sat,
-            state_idx,
+            ctx.entity_states,
+            ctx.sat,
+            ctx.state_idx,
         )?);
     }
 
-    and_lit(sat, &constraints)
+    and_lit(ctx.sat, &constraints)
 }
 
 fn fields_for_state(

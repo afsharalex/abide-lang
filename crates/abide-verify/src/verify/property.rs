@@ -11,8 +11,6 @@
 //!   fieldless enums, and Bool domains
 //! - Thread-local state for precondition obligation tracking and path guards
 
-#![allow(clippy::too_many_arguments)]
-
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +23,7 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::encode::{
     bind_pattern_vars, build_domain_predicate, build_z3_quantifier, encode_ite,
-    encode_pattern_cond, enum_variant_count, make_z3_bound_var_ctx,
+    encode_pattern_cond, enum_variant_count, make_z3_bound_var_ctx, PureEncodingScope,
 };
 use super::harness::SlotPool;
 use super::scope::VerifyStoreRange;
@@ -255,6 +253,42 @@ fn property_ctx_with_locals(ctx: &PropertyCtx, locals: HashMap<String, SmtValue>
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PropertyEncodingCtx<'a> {
+    pool: &'a SlotPool,
+    vctx: &'a VerifyContext,
+    defs: &'a defenv::DefEnv,
+    property: &'a PropertyCtx,
+    step: usize,
+}
+
+impl<'a> PropertyEncodingCtx<'a> {
+    fn with_property<'b>(&'b self, property: &'b PropertyCtx) -> PropertyEncodingCtx<'b> {
+        PropertyEncodingCtx {
+            pool: self.pool,
+            vctx: self.vctx,
+            defs: self.defs,
+            property,
+            step: self.step,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionMembership<'a> {
+    bindings: &'a [crate::ir::types::LetBinding],
+    body: &'a IRExpr,
+    key: &'a SmtValue,
+}
+
+#[derive(Clone, Copy)]
+struct MatchRelation<'a> {
+    match_expr: &'a IRExpr,
+    other: &'a IRExpr,
+    op: &'a str,
+    match_on_left: bool,
+}
+
 impl PropertyCtx {
     pub(super) fn new() -> Self {
         Self {
@@ -367,7 +401,16 @@ pub(super) fn prop_domain_predicate(
 ) -> Result<Option<Bool>, String> {
     // Build a minimal env from PropertyCtx locals for the pure expression encoder
     let env: HashMap<String, SmtValue> = ctx.locals.clone();
-    build_domain_predicate(domain, bound_var, &env, vctx, defs, None)
+    build_domain_predicate(
+        domain,
+        bound_var,
+        PureEncodingScope {
+            env: &env,
+            vctx,
+            defs,
+            precheck: None,
+        },
+    )
 }
 
 pub(super) fn encode_step_properties_all_steps(
@@ -1059,12 +1102,36 @@ pub(super) fn encode_prop_expr(
             op, left, right, ..
         } if !logical_binop(op) && op != "OpMapHas" => {
             if let Some(encoded) = encode_match_relation_with_local_choose(
-                pool, vctx, defs, ctx, left, right, op, true, step,
+                PropertyEncodingCtx {
+                    pool,
+                    vctx,
+                    defs,
+                    property: ctx,
+                    step,
+                },
+                MatchRelation {
+                    match_expr: left,
+                    other: right,
+                    op,
+                    match_on_left: true,
+                },
             )? {
                 return Ok(encoded);
             }
             if let Some(encoded) = encode_match_relation_with_local_choose(
-                pool, vctx, defs, ctx, right, left, op, false, step,
+                PropertyEncodingCtx {
+                    pool,
+                    vctx,
+                    defs,
+                    property: ctx,
+                    step,
+                },
+                MatchRelation {
+                    match_expr: right,
+                    other: left,
+                    op,
+                    match_on_left: false,
+                },
             )? {
                 return Ok(encoded);
             }
@@ -2182,19 +2249,36 @@ fn encode_projection_membership_with_choose(
         return smt::smt_eq(&value, key);
     };
 
-    encode_projection_membership_bindings(pool, vctx, defs, ctx, bindings, body, key, step)
+    encode_projection_membership_bindings(
+        PropertyEncodingCtx {
+            pool,
+            vctx,
+            defs,
+            property: ctx,
+            step,
+        },
+        ProjectionMembership {
+            bindings,
+            body,
+            key,
+        },
+    )
 }
 
 fn encode_projection_membership_bindings(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
-    bindings: &[crate::ir::types::LetBinding],
-    body: &IRExpr,
-    key: &SmtValue,
-    step: usize,
+    enc: PropertyEncodingCtx<'_>,
+    membership: ProjectionMembership<'_>,
 ) -> Result<Bool, String> {
+    let pool = enc.pool;
+    let vctx = enc.vctx;
+    let defs = enc.defs;
+    let ctx = enc.property;
+    let step = enc.step;
+    let ProjectionMembership {
+        bindings,
+        body,
+        key,
+    } = membership;
     let Some((binding, rest)) = bindings.split_first() else {
         let value = encode_prop_value(pool, vctx, defs, ctx, body, step)?;
         return smt::smt_eq(&value, key);
@@ -2220,7 +2304,12 @@ fn encode_projection_membership_bindings(
                 };
                 let body_ctx = ctx.with_binding(&binding.name, entity_name, slot);
                 let rest_bool = encode_projection_membership_bindings(
-                    pool, vctx, defs, &body_ctx, rest, body, key, step,
+                    enc.with_property(&body_ctx),
+                    ProjectionMembership {
+                        bindings: rest,
+                        body,
+                        key,
+                    },
                 )?;
                 disjuncts.push(smt::bool_and(&[active, &predicate_bool, &rest_bool]));
             }
@@ -2256,7 +2345,12 @@ fn encode_projection_membership_bindings(
             }
             let body_ctx = ctx.with_local(&binding.name, witness.clone());
             constraints.push(encode_projection_membership_bindings(
-                pool, vctx, defs, &body_ctx, rest, body, key, step,
+                enc.with_property(&body_ctx),
+                ProjectionMembership {
+                    bindings: rest,
+                    body,
+                    key,
+                },
             )?);
             let refs: Vec<&Bool> = constraints.iter().collect();
             let member = smt::bool_and(&refs);
@@ -2267,14 +2361,24 @@ fn encode_projection_membership_bindings(
                 if let Some((entity, slot)) = ctx.bindings.get(name) {
                     let body_ctx = ctx.with_binding(&binding.name, entity, *slot);
                     return encode_projection_membership_bindings(
-                        pool, vctx, defs, &body_ctx, rest, body, key, step,
+                        enc.with_property(&body_ctx),
+                        ProjectionMembership {
+                            bindings: rest,
+                            body,
+                            key,
+                        },
                     );
                 }
             }
             let val = encode_prop_value(pool, vctx, defs, ctx, &binding.expr, step)?;
             let body_ctx = ctx.with_local(&binding.name, val);
             encode_projection_membership_bindings(
-                pool, vctx, defs, &body_ctx, rest, body, key, step,
+                enc.with_property(&body_ctx),
+                ProjectionMembership {
+                    bindings: rest,
+                    body,
+                    key,
+                },
             )
         }
     }
@@ -2325,16 +2429,20 @@ fn encode_setcomp_projection_membership(
 }
 
 fn encode_match_relation_with_local_choose(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
-    match_expr: &IRExpr,
-    other: &IRExpr,
-    op: &str,
-    match_on_left: bool,
-    step: usize,
+    enc: PropertyEncodingCtx<'_>,
+    relation: MatchRelation<'_>,
 ) -> Result<Option<Bool>, String> {
+    let pool = enc.pool;
+    let vctx = enc.vctx;
+    let defs = enc.defs;
+    let ctx = enc.property;
+    let step = enc.step;
+    let MatchRelation {
+        match_expr,
+        other,
+        op,
+        match_on_left,
+    } = relation;
     let IRExpr::Match {
         scrutinee, arms, ..
     } = match_expr
@@ -2438,7 +2546,6 @@ fn extract_store_membership_range(
 /// Resolves field references like `s.user_id` by looking up `"s"` in the
 /// `PropertyCtx` bindings to find the bound entity and slot index,
 /// then resolves via `pool.field_at(entity, slot, field, step)`.
-#[allow(clippy::too_many_lines)]
 pub(super) fn encode_prop_value(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -2447,402 +2554,722 @@ pub(super) fn encode_prop_value(
     expr: &IRExpr,
     step: usize,
 ) -> Result<SmtValue, String> {
-    // Try def expansion — but only if the name is NOT shadowed by a local binding.
-    if let IRExpr::Var { name, .. } = expr {
-        if !ctx.bindings.contains_key(name) {
-            if let Some(expanded) = defs.expand_var(name) {
-                return encode_prop_value(pool, vctx, defs, ctx, &expanded, step);
-            }
-        }
-    }
-    if let IRExpr::App { .. } = expr {
-        // Record context-sensitive precondition obligations (same as encode_prop_expr)
-        if let Some(preconditions) = defs.call_preconditions(expr) {
-            let fn_name =
-                defenv::decompose_app_chain_name(expr).unwrap_or_else(|| "(unknown)".to_owned());
-            let path_guard = current_path_guard();
-            for pre in &preconditions {
-                if let Ok(pre_bool) = encode_prop_expr(pool, vctx, defs, ctx, pre, step) {
-                    record_prop_precondition_obligation(
-                        smt::bool_implies(&path_guard, &pre_bool),
-                        fn_name.clone(),
-                    );
-                }
-            }
-        }
-        if let Some(expanded) = defs.expand_app(expr) {
-            return encode_prop_value(pool, vctx, defs, ctx, &expanded, step);
-        }
-    }
+    encode_prop_value_expr(
+        PropertyEncodingCtx {
+            pool,
+            vctx,
+            defs,
+            property: ctx,
+            step,
+        },
+        expr,
+    )
+}
 
+fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result<SmtValue, String> {
+    if let Some(expanded) = expand_prop_value_expr(enc, expr) {
+        return encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            &expanded,
+            enc.step,
+        );
+    }
     match expr {
         IRExpr::Choose { .. } => {
             Err("choose is only supported through let-binding in verifier properties".to_owned())
         }
-        IRExpr::Let { bindings, body, .. } => {
-            let mut locals = ctx.locals.clone();
-            for binding in bindings {
-                let binding_ctx = property_ctx_with_locals(ctx, locals.clone());
-                let val = encode_prop_value(pool, vctx, defs, &binding_ctx, &binding.expr, step)?;
-                locals.insert(binding.name.clone(), val);
-            }
-            let body_ctx = property_ctx_with_locals(ctx, locals);
-            encode_prop_value(pool, vctx, defs, &body_ctx, body, step)
-        }
+        IRExpr::Let { bindings, body, .. } => encode_prop_let_value(enc, bindings, body),
         IRExpr::IfElse {
             cond,
             then_body,
             else_body,
             ..
-        } => {
-            let cond_bool = encode_prop_expr(pool, vctx, defs, ctx, cond, step)?;
-            let then_val = encode_prop_value(pool, vctx, defs, ctx, then_body, step)?;
-            if let Some(else_body) = else_body {
-                let else_val = encode_prop_value(pool, vctx, defs, ctx, else_body, step)?;
-                encode_ite(&cond_bool, &then_val, &else_val)
-            } else {
-                let then_bool = then_val.to_bool()?;
-                Ok(SmtValue::Bool(smt::bool_implies(&cond_bool, &then_bool)))
-            }
-        }
+        } => encode_prop_if_value(enc, cond, then_body, else_body.as_deref()),
         IRExpr::Match {
             scrutinee, arms, ..
-        } => {
-            let scrut = encode_prop_value(pool, vctx, defs, ctx, scrutinee, step)?;
-            encode_prop_match(pool, vctx, defs, ctx, &scrut, arms, step)
-        }
-        IRExpr::Lit { value, .. } => match value {
-            crate::ir::types::LitVal::Int { value } => Ok(smt::int_val(*value)),
-            crate::ir::types::LitVal::Bool { value } => Ok(smt::bool_val(*value)),
-            crate::ir::types::LitVal::Real { value }
-            | crate::ir::types::LitVal::Float { value } => {
-                #[allow(clippy::cast_possible_truncation)]
-                let scaled = (*value * 1_000_000.0) as i64;
-                Ok(smt::real_val(scaled, 1_000_000))
-            }
-            crate::ir::types::LitVal::Str { .. } => Ok(smt::int_val(0)),
-        },
-        // Field access: `var.field` — look up var in bindings, resolve field from bound entity
+        } => encode_prop_match_value(enc, scrutinee, arms),
+        IRExpr::Lit { value, .. } => encode_prop_lit_value(value),
         IRExpr::Field {
             expr: recv, field, ..
-        } => {
-            // Try to resolve the receiver as a bound variable
-            if let IRExpr::Var { name, .. } = recv.as_ref() {
-                if let Some((entity, slot)) = ctx.bindings.get(name) {
-                    if let Some(val) = pool.field_at(entity, *slot, field, step) {
-                        return Ok(val.clone());
-                    }
-                    return Err(format!(
-                        "field not found: {entity}.{field} (var={name}, slot={slot}, step={step})"
-                    ));
-                }
-                // struct-typed system field access (e.g., ui.screen)
-                if let Some(sys_name) = ctx.system_struct_bases.get(name.as_str()) {
-                    if sys_name.is_empty() {
-                        return Err(format!(
-                            "ambiguous system struct field `{name}`: exists in multiple in-scope systems"
-                        ));
-                    }
-                    let compound = format!("{name}.{field}");
-                    if let Some(val) = pool.system_field_at(sys_name, &compound, step) {
-                        return Ok(val.clone());
-                    }
-                }
-            }
-            // No binding for receiver — try all bindings to find the field
-            for (entity, slot) in ctx.bindings.values() {
-                if let Some(val) = pool.field_at(entity, *slot, field, step) {
-                    return Ok(val.clone());
-                }
-            }
-            Err(format!(
-                "field not found in any bound entity: {field} (step={step})"
-            ))
-        }
-        // Bare variable: check locals first, then entity bindings, then system fields
-        IRExpr::Var { name, .. } => {
-            // Check non-entity local bindings first (enum/Int/Bool/Real quantifier vars)
-            if let Some(val) = ctx.locals.get(name) {
-                return Ok(val.clone());
-            }
-            // Try as a field in each bound entity — entity bindings take priority
-            // over system fields so that quantified `all o: Order | o.status`
-            // doesn't get shadowed by a same-named system field.
-            let mut matches = Vec::new();
-            for (var, (entity, slot)) in &ctx.bindings {
-                if let Some(val) = pool.field_at(entity, *slot, name, step) {
-                    matches.push((var.clone(), entity.clone(), val.clone()));
-                }
-            }
-            if !matches.is_empty() {
-                return match matches.len() {
-                    1 => Ok(matches.into_iter().next().unwrap().2),
-                    _ => {
-                        Err(format!(
-                        "ambiguous variable {name}: matches fields in entities {:?} (step={step})",
-                        matches.iter().map(|(v, e, _)| format!("{v}:{e}")).collect::<Vec<_>>()
-                    ))
-                    }
-                };
-            }
-            // check system flat state fields (after entity bindings)
-            if let Some(sys_name) = ctx.system_fields.get(name) {
-                if sys_name.is_empty() {
-                    return Err(format!(
-                        "ambiguous system field `{name}`: exists in multiple in-scope systems"
-                    ));
-                }
-                if let Some(val) = pool.system_field_at(sys_name, name, step) {
-                    return Ok(val.clone());
-                }
-            }
-            Err(format!(
-                "variable not found: {name} (bindings: {:?}, step={step})",
-                ctx.bindings.keys().collect::<Vec<_>>()
-            ))
-        }
+        } => encode_prop_field_value(enc, recv, field),
+        IRExpr::Var { name, .. } => encode_prop_var_value(enc, name),
         IRExpr::Ctor {
             enum_name,
             ctor,
             args,
             ..
-        } => {
-            // ADT-encoded enum: use constructor function with field arguments
-            if let Some(dt) = vctx.adt_sorts.get(enum_name) {
-                for variant in &dt.variants {
-                    if smt::func_decl_name(&variant.constructor) == *ctor {
-                        if args.is_empty() {
-                            let result = smt::func_decl_apply(&variant.constructor, &[]);
-                            return Ok(dynamic_to_smt_value(result));
-                        }
-                        // Build args in declared field order
-                        let declared_names: Vec<std::string::String> =
-                            variant.accessors.iter().map(smt::func_decl_name).collect();
-                        let args_map: HashMap<&str, &IRExpr> =
-                            args.iter().map(|(n, e)| (n.as_str(), e)).collect();
-                        let mut z3_args: Vec<Dynamic> = Vec::new();
-                        for decl_name in &declared_names {
-                            if let Some(field_expr) = args_map.get(decl_name.as_str()) {
-                                let val =
-                                    encode_prop_value(pool, vctx, defs, ctx, field_expr, step)?;
-                                z3_args.push(val.to_dynamic());
-                            }
-                        }
-                        let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
-                        let result = smt::func_decl_apply(&variant.constructor, &arg_refs);
-                        return Ok(dynamic_to_smt_value(result));
-                    }
-                }
-            }
-            // Flat Int encoding for fieldless enums
-            let id = vctx.variants.try_id_of(enum_name, ctor)?;
-            Ok(smt::int_val(id))
-        }
+        } => encode_prop_ctor_value(enc, enum_name, ctor, args),
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpSeqConcat" => {
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
-            let Some(IRType::Seq { element }) = expr_type(left) else {
-                return Err("Seq::concat requires sequence operands".to_string());
-            };
-            smt::seq_concat(&l, &r, element)
-        }
-        IRExpr::BinOp {
-            op, left, right, ..
-        } if op == "OpMapHas" => {
-            let map_val = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let key_val = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
-            let Some(IRType::Map { value, .. }) = expr_type(left) else {
-                return Err("Map::has requires a map-typed left operand".to_owned());
-            };
-            smt::map_has(&map_val, &key_val, value)
-        }
-        IRExpr::BinOp {
-            op, left, right, ..
-        } if op == "OpMapMerge" => {
-            let left_val = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let right_val = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
-            let Some(IRType::Map { key, value }) = expr_type(left) else {
-                return Err("Map::merge requires map operands".to_owned());
-            };
-            smt::map_merge(&left_val, &right_val, key, value)
-        }
-        IRExpr::BinOp {
-            op, left, right, ..
-        } => {
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
-            Ok(smt::binop(op, &l, &r)?)
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpSeqHead" => {
-            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-            let Some(IRType::Seq { element }) = expr_type(operand) else {
-                return smt::unop(op, &v);
-            };
-            smt::seq_head(&v, element)
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpSeqTail" => {
-            if let IRExpr::SeqLit { elements, ty, .. } = operand.as_ref() {
-                let tail = IRExpr::SeqLit {
-                    elements: elements.iter().skip(1).cloned().collect(),
-                    ty: ty.clone(),
-                    span: None,
-                };
-                return encode_prop_value(pool, vctx, defs, ctx, &tail, step);
-            }
-            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-            let Some(IRType::Seq { element }) = expr_type(operand) else {
-                return smt::unop(op, &v);
-            };
-            smt::seq_tail(&v, element)
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpSeqLength" => {
-            if let Some(IRType::Seq { element }) = expr_type(operand) {
-                let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-                smt::seq_length(&v, element)
-            } else {
-                encode_card(pool, vctx, defs, ctx, operand, step)
-            }
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpSeqEmpty" => {
-            let len = if let Some(IRType::Seq { element }) = expr_type(operand) {
-                let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-                smt::seq_length(&v, element)?
-            } else {
-                encode_card(pool, vctx, defs, ctx, operand, step)?
-            };
-            Ok(SmtValue::Bool(smt::smt_eq(&len, &smt::int_val(0))?))
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpMapDomain" => {
-            if let IRExpr::MapLit { entries, .. } = operand.as_ref() {
-                let set_lit = IRExpr::SetLit {
-                    elements: entries.iter().map(|(k, _)| k.clone()).collect(),
-                    ty: IRType::Set {
-                        element: Box::new(match expr_type(operand) {
-                            Some(IRType::Map { key, .. }) => key.as_ref().clone(),
-                            _ => IRType::Int,
-                        }),
-                    },
-                    span: None,
-                };
-                return encode_prop_value(pool, vctx, defs, ctx, &set_lit, step);
-            }
-            let map_val = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-            let Some(IRType::Map { key, value }) = expr_type(operand) else {
-                return Err("Map::domain requires a map operand".to_owned());
-            };
-            smt::map_domain(&map_val, key, value)
-        }
-        IRExpr::UnOp { op, operand, .. } if op == "OpMapRange" => {
-            if let IRExpr::MapLit { entries, .. } = operand.as_ref() {
-                let set_lit = IRExpr::SetLit {
-                    elements: entries.iter().map(|(_, v)| v.clone()).collect(),
-                    ty: IRType::Set {
-                        element: Box::new(match expr_type(operand) {
-                            Some(IRType::Map { value, .. }) => value.as_ref().clone(),
-                            _ => IRType::Int,
-                        }),
-                    },
-                    span: None,
-                };
-                return encode_prop_value(pool, vctx, defs, ctx, &set_lit, step);
-            }
-            let map_val = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-            let Some(IRType::Map { key, value }) = expr_type(operand) else {
-                return Err("Map::range requires a map operand".to_owned());
-            };
-            smt::map_range(&map_val, key, value)
-        }
-        IRExpr::UnOp { op, operand, .. } => {
-            let v = encode_prop_value(pool, vctx, defs, ctx, operand, step)?;
-            Ok(smt::unop(op, &v)?)
-        }
-        IRExpr::Prime { expr, .. } => encode_prop_value(pool, vctx, defs, ctx, expr, step + 1),
-        // Nested quantifiers in value position — encode as Bool, wrap as SmtValue
+        } => encode_prop_binop_value(enc, op, left, right),
+        IRExpr::UnOp { op, operand, .. } => encode_prop_unop_value(enc, op, operand),
+        IRExpr::Prime { expr, .. } => encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            expr,
+            enc.step + 1,
+        ),
         IRExpr::Forall { .. }
         | IRExpr::Exists { .. }
         | IRExpr::One { .. }
         | IRExpr::Lone { .. } => Ok(SmtValue::Bool(encode_prop_expr(
-            pool, vctx, defs, ctx, expr, step,
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            expr,
+            enc.step,
         )?)),
         IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_expr(
-            pool, vctx, defs, ctx, body, step,
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            body,
+            enc.step,
         )?)),
         IRExpr::Eventually { .. } | IRExpr::Until { .. } => Err(
             "future-time temporal value reached single-step property encoder; route through lasso/Buchi temporal verification".to_owned(),
         ),
         IRExpr::MapUpdate {
             map, key, value, ..
-        } => {
-            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step)?;
-            let k = encode_prop_value(pool, vctx, defs, ctx, key, step)?;
-            let v = encode_prop_value(pool, vctx, defs, ctx, value, step)?;
-            if let Some(IRType::Map {
-                value: value_ty, ..
-            }) = expr_type(map)
-            {
-                return smt::map_store(&arr, &k, &v, value_ty);
-            }
-            Ok(SmtValue::Array(
-                arr.as_array()?.store(&k.to_dynamic(), &v.to_dynamic()),
-            ))
+        } => encode_prop_map_update_value(enc, map, key, value),
+        IRExpr::Index { map, key, ty, .. } => encode_prop_index_value(enc, map, key, ty),
+        IRExpr::MapLit { entries, ty, .. } => encode_prop_map_lit_value(enc, entries, ty),
+        IRExpr::SetLit { elements, ty, .. } => encode_prop_set_lit_value(enc, elements, ty),
+        IRExpr::SeqLit { elements, ty, .. } => encode_prop_seq_lit_value(enc, elements, ty),
+        IRExpr::SetComp { .. } => encode_prop_set_comp_value(enc, expr),
+        IRExpr::Aggregate { .. } => encode_prop_aggregate_value(enc, expr),
+        IRExpr::Card { expr: inner, .. } => {
+            encode_card(enc.pool, enc.vctx, enc.defs, enc.property, inner, enc.step)
         }
-        IRExpr::Index { map, key, ty, .. } => {
-            let arr = encode_prop_value(pool, vctx, defs, ctx, map, step)?;
-            let k = encode_prop_value(pool, vctx, defs, ctx, key, step)?;
-            if let Some(IRType::Map { value, .. }) = expr_type(map) {
-                return smt::map_lookup(&arr, &k, value);
-            }
-            if let Some(IRType::Seq { element }) = expr_type(map) {
-                return smt::seq_index(&arr, &k, element);
-            }
-            Ok(smt::dynamic_to_typed_value(
-                arr.as_array()?.select(&k.to_dynamic()),
-                ty,
-            ))
+        IRExpr::App { func, .. } => encode_unexpanded_app_error(func, expr),
+        _ => Err(format!("unsupported expression reached encoding: {expr:?}")),
+    }
+}
+
+fn expand_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Option<IRExpr> {
+    match expr {
+        IRExpr::Var { name, .. } if !enc.property.bindings.contains_key(name) => {
+            enc.defs.expand_var(name)
         }
-        IRExpr::MapLit { entries, ty, .. } => {
-            let (key_ty, val_ty) = match ty {
-                IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
-                _ => return Err(format!("MapLit with non-Map type: {ty:?}")),
-            };
-            let key_sort = smt::ir_type_to_sort(key_ty);
-            let default_val = smt::map_none_dynamic(val_ty);
-            let mut arr = smt::const_array(&key_sort, &default_val);
-            for (k_expr, v_expr) in entries {
-                let k = encode_prop_value(pool, vctx, defs, ctx, k_expr, step)?;
-                let v = encode_prop_value(pool, vctx, defs, ctx, v_expr, step)?;
-                arr = arr.store(&k.to_dynamic(), &smt::map_some_dynamic(val_ty, &v));
+        IRExpr::App { .. } => {
+            record_prop_app_preconditions(enc, expr);
+            enc.defs.expand_app(expr)
+        }
+        _ => None,
+    }
+}
+
+fn record_prop_app_preconditions(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) {
+    let Some(preconditions) = enc.defs.call_preconditions(expr) else {
+        return;
+    };
+    let fn_name = defenv::decompose_app_chain_name(expr).unwrap_or_else(|| "(unknown)".to_owned());
+    let path_guard = current_path_guard();
+    for pre in &preconditions {
+        if let Ok(pre_bool) =
+            encode_prop_expr(enc.pool, enc.vctx, enc.defs, enc.property, pre, enc.step)
+        {
+            record_prop_precondition_obligation(
+                smt::bool_implies(&path_guard, &pre_bool),
+                fn_name.clone(),
+            );
+        }
+    }
+}
+
+fn encode_prop_let_value(
+    enc: PropertyEncodingCtx<'_>,
+    bindings: &[crate::ir::types::LetBinding],
+    body: &IRExpr,
+) -> Result<SmtValue, String> {
+    let mut locals = enc.property.locals.clone();
+    for binding in bindings {
+        let binding_ctx = property_ctx_with_locals(enc.property, locals.clone());
+        let val = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            &binding_ctx,
+            &binding.expr,
+            enc.step,
+        )?;
+        locals.insert(binding.name.clone(), val);
+    }
+    let body_ctx = property_ctx_with_locals(enc.property, locals);
+    encode_prop_value(enc.pool, enc.vctx, enc.defs, &body_ctx, body, enc.step)
+}
+
+fn encode_prop_if_value(
+    enc: PropertyEncodingCtx<'_>,
+    cond: &IRExpr,
+    then_body: &IRExpr,
+    else_body: Option<&IRExpr>,
+) -> Result<SmtValue, String> {
+    let cond_bool = encode_prop_expr(enc.pool, enc.vctx, enc.defs, enc.property, cond, enc.step)?;
+    let then_val = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        then_body,
+        enc.step,
+    )?;
+    if let Some(else_body) = else_body {
+        let else_val = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            else_body,
+            enc.step,
+        )?;
+        encode_ite(&cond_bool, &then_val, &else_val)
+    } else {
+        let then_bool = then_val.to_bool()?;
+        Ok(SmtValue::Bool(smt::bool_implies(&cond_bool, &then_bool)))
+    }
+}
+
+fn encode_prop_match_value(
+    enc: PropertyEncodingCtx<'_>,
+    scrutinee: &IRExpr,
+    arms: &[crate::ir::types::IRMatchArm],
+) -> Result<SmtValue, String> {
+    let scrut = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        scrutinee,
+        enc.step,
+    )?;
+    encode_prop_match(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        &scrut,
+        arms,
+        enc.step,
+    )
+}
+
+fn encode_prop_lit_value(value: &crate::ir::types::LitVal) -> Result<SmtValue, String> {
+    match value {
+        crate::ir::types::LitVal::Int { value } => Ok(smt::int_val(*value)),
+        crate::ir::types::LitVal::Bool { value } => Ok(smt::bool_val(*value)),
+        crate::ir::types::LitVal::Real { value } | crate::ir::types::LitVal::Float { value } => {
+            #[allow(clippy::cast_possible_truncation)]
+            let scaled = (*value * 1_000_000.0) as i64;
+            Ok(smt::real_val(scaled, 1_000_000))
+        }
+        crate::ir::types::LitVal::Str { .. } => Ok(smt::int_val(0)),
+    }
+}
+
+fn encode_prop_field_value(
+    enc: PropertyEncodingCtx<'_>,
+    recv: &IRExpr,
+    field: &str,
+) -> Result<SmtValue, String> {
+    if let IRExpr::Var { name, .. } = recv {
+        if let Some((entity, slot)) = enc.property.bindings.get(name) {
+            if let Some(val) = enc.pool.field_at(entity, *slot, field, enc.step) {
+                return Ok(val.clone());
             }
-            Ok(SmtValue::Array(arr))
+            return Err(format!(
+                "field not found: {entity}.{field} (var={name}, slot={slot}, step={step})",
+                step = enc.step,
+            ));
         }
-        IRExpr::SetLit { elements, ty, .. } => {
-            let elem_ty = match ty {
-                IRType::Set { element } => element.as_ref(),
-                _ => return Err(format!("SetLit with non-Set type: {ty:?}")),
-            };
-            let elem_sort = ir_type_to_prop_sort(vctx, elem_ty);
-            let false_val = smt::bool_val(false).to_dynamic();
-            let true_val = smt::bool_val(true).to_dynamic();
-            let mut arr = smt::const_array(&elem_sort, &false_val);
-            for elem in elements {
-                let e = encode_prop_value(pool, vctx, defs, ctx, elem, step)?;
-                arr = arr.store(&e.to_dynamic(), &true_val);
+        if let Some(sys_name) = enc.property.system_struct_bases.get(name.as_str()) {
+            if sys_name.is_empty() {
+                return Err(format!(
+                    "ambiguous system struct field `{name}`: exists in multiple in-scope systems"
+                ));
             }
-            Ok(SmtValue::Array(arr))
+            let compound = format!("{name}.{field}");
+            if let Some(val) = enc.pool.system_field_at(sys_name, &compound, enc.step) {
+                return Ok(val.clone());
+            }
         }
-        IRExpr::SeqLit { elements, ty, .. } => {
-            let elem_ty = match ty {
-                IRType::Seq { element } => element.as_ref(),
-                _ => return Err(format!("SeqLit with non-Seq type: {ty:?}")),
-            };
-            let elems = elements
-                .iter()
-                .map(|elem| encode_prop_value(pool, vctx, defs, ctx, elem, step))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(smt::seq_literal(elem_ty, &elems))
+    }
+    for (entity, slot) in enc.property.bindings.values() {
+        if let Some(val) = enc.pool.field_at(entity, *slot, field, enc.step) {
+            return Ok(val.clone());
         }
+    }
+    Err(format!(
+        "field not found in any bound entity: {field} (step={step})",
+        step = enc.step,
+    ))
+}
+
+fn encode_prop_var_value(enc: PropertyEncodingCtx<'_>, name: &str) -> Result<SmtValue, String> {
+    if let Some(val) = enc.property.locals.get(name) {
+        return Ok(val.clone());
+    }
+    let matches = prop_entity_field_matches(enc, name);
+    if !matches.is_empty() {
+        return match matches.len() {
+            1 => Ok(matches.into_iter().next().unwrap().2),
+            _ => Err(format!(
+                "ambiguous variable {name}: matches fields in entities {:?} (step={step})",
+                matches
+                    .iter()
+                    .map(|(var, entity, _)| format!("{var}:{entity}"))
+                    .collect::<Vec<_>>(),
+                step = enc.step,
+            )),
+        };
+    }
+    if let Some(sys_name) = enc.property.system_fields.get(name) {
+        if sys_name.is_empty() {
+            return Err(format!(
+                "ambiguous system field `{name}`: exists in multiple in-scope systems"
+            ));
+        }
+        if let Some(val) = enc.pool.system_field_at(sys_name, name, enc.step) {
+            return Ok(val.clone());
+        }
+    }
+    Err(format!(
+        "variable not found: {name} (bindings: {:?}, step={step})",
+        enc.property.bindings.keys().collect::<Vec<_>>(),
+        step = enc.step,
+    ))
+}
+
+fn prop_entity_field_matches(
+    enc: PropertyEncodingCtx<'_>,
+    name: &str,
+) -> Vec<(String, String, SmtValue)> {
+    let mut matches = Vec::new();
+    for (var, (entity, slot)) in &enc.property.bindings {
+        if let Some(val) = enc.pool.field_at(entity, *slot, name, enc.step) {
+            matches.push((var.clone(), entity.clone(), val.clone()));
+        }
+    }
+    matches
+}
+
+fn encode_prop_ctor_value(
+    enc: PropertyEncodingCtx<'_>,
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+) -> Result<SmtValue, String> {
+    if let Some(value) = encode_prop_adt_ctor_value(enc, enum_name, ctor, args)? {
+        return Ok(value);
+    }
+    let id = enc.vctx.variants.try_id_of(enum_name, ctor)?;
+    Ok(smt::int_val(id))
+}
+
+fn encode_prop_adt_ctor_value(
+    enc: PropertyEncodingCtx<'_>,
+    enum_name: &str,
+    ctor: &str,
+    args: &[(String, IRExpr)],
+) -> Result<Option<SmtValue>, String> {
+    let Some(dt) = enc.vctx.adt_sorts.get(enum_name) else {
+        return Ok(None);
+    };
+    for variant in &dt.variants {
+        if smt::func_decl_name(&variant.constructor) != ctor {
+            continue;
+        }
+        if args.is_empty() {
+            let result = smt::func_decl_apply(&variant.constructor, &[]);
+            return Ok(Some(dynamic_to_smt_value(result)));
+        }
+        let args_map: HashMap<&str, &IRExpr> = args
+            .iter()
+            .map(|(name, expr)| (name.as_str(), expr))
+            .collect();
+        let mut z3_args: Vec<Dynamic> = Vec::new();
+        for decl_name in variant.accessors.iter().map(smt::func_decl_name) {
+            if let Some(field_expr) = args_map.get(decl_name.as_str()) {
+                let val = encode_prop_value(
+                    enc.pool,
+                    enc.vctx,
+                    enc.defs,
+                    enc.property,
+                    field_expr,
+                    enc.step,
+                )?;
+                z3_args.push(val.to_dynamic());
+            }
+        }
+        let arg_refs: Vec<&Dynamic> = z3_args.iter().collect();
+        let result = smt::func_decl_apply(&variant.constructor, &arg_refs);
+        return Ok(Some(dynamic_to_smt_value(result)));
+    }
+    Ok(None)
+}
+
+fn encode_prop_binop_value(
+    enc: PropertyEncodingCtx<'_>,
+    op: &str,
+    left: &IRExpr,
+    right: &IRExpr,
+) -> Result<SmtValue, String> {
+    match op {
+        "OpSeqConcat" => encode_prop_seq_concat_value(enc, left, right),
+        "OpMapHas" => encode_prop_map_has_value(enc, left, right),
+        "OpMapMerge" => encode_prop_map_merge_value(enc, left, right),
+        _ => {
+            let l = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, left, enc.step)?;
+            let r = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, right, enc.step)?;
+            Ok(smt::binop(op, &l, &r)?)
+        }
+    }
+}
+
+fn encode_prop_seq_concat_value(
+    enc: PropertyEncodingCtx<'_>,
+    left: &IRExpr,
+    right: &IRExpr,
+) -> Result<SmtValue, String> {
+    let l = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, left, enc.step)?;
+    let r = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, right, enc.step)?;
+    let Some(IRType::Seq { element }) = expr_type(left) else {
+        return Err("Seq::concat requires sequence operands".to_string());
+    };
+    smt::seq_concat(&l, &r, element)
+}
+
+fn encode_prop_map_has_value(
+    enc: PropertyEncodingCtx<'_>,
+    left: &IRExpr,
+    right: &IRExpr,
+) -> Result<SmtValue, String> {
+    let map_val = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, left, enc.step)?;
+    let key_val = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, right, enc.step)?;
+    let Some(IRType::Map { value, .. }) = expr_type(left) else {
+        return Err("Map::has requires a map-typed left operand".to_owned());
+    };
+    smt::map_has(&map_val, &key_val, value)
+}
+
+fn encode_prop_map_merge_value(
+    enc: PropertyEncodingCtx<'_>,
+    left: &IRExpr,
+    right: &IRExpr,
+) -> Result<SmtValue, String> {
+    let left_val = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, left, enc.step)?;
+    let right_val = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, right, enc.step)?;
+    let Some(IRType::Map { key, value }) = expr_type(left) else {
+        return Err("Map::merge requires map operands".to_owned());
+    };
+    smt::map_merge(&left_val, &right_val, key, value)
+}
+
+fn encode_prop_unop_value(
+    enc: PropertyEncodingCtx<'_>,
+    op: &str,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    match op {
+        "OpSeqHead" => encode_prop_seq_head_value(enc, op, operand),
+        "OpSeqTail" => encode_prop_seq_tail_value(enc, op, operand),
+        "OpSeqLength" => encode_prop_seq_length_value(enc, operand),
+        "OpSeqEmpty" => encode_prop_seq_empty_value(enc, operand),
+        "OpMapDomain" => encode_prop_map_domain_value(enc, operand),
+        "OpMapRange" => encode_prop_map_range_value(enc, operand),
+        _ => {
+            let value = encode_prop_value(
+                enc.pool,
+                enc.vctx,
+                enc.defs,
+                enc.property,
+                operand,
+                enc.step,
+            )?;
+            Ok(smt::unop(op, &value)?)
+        }
+    }
+}
+
+fn encode_prop_seq_head_value(
+    enc: PropertyEncodingCtx<'_>,
+    op: &str,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    let value = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        operand,
+        enc.step,
+    )?;
+    let Some(IRType::Seq { element }) = expr_type(operand) else {
+        return smt::unop(op, &value);
+    };
+    smt::seq_head(&value, element)
+}
+
+fn encode_prop_seq_tail_value(
+    enc: PropertyEncodingCtx<'_>,
+    op: &str,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    if let IRExpr::SeqLit { elements, ty, .. } = operand {
+        let tail = IRExpr::SeqLit {
+            elements: elements.iter().skip(1).cloned().collect(),
+            ty: ty.clone(),
+            span: None,
+        };
+        return encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, &tail, enc.step);
+    }
+    let value = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        operand,
+        enc.step,
+    )?;
+    let Some(IRType::Seq { element }) = expr_type(operand) else {
+        return smt::unop(op, &value);
+    };
+    smt::seq_tail(&value, element)
+}
+
+fn encode_prop_seq_length_value(
+    enc: PropertyEncodingCtx<'_>,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    if let Some(IRType::Seq { element }) = expr_type(operand) {
+        let value = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            operand,
+            enc.step,
+        )?;
+        smt::seq_length(&value, element)
+    } else {
+        encode_card(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            operand,
+            enc.step,
+        )
+    }
+}
+
+fn encode_prop_seq_empty_value(
+    enc: PropertyEncodingCtx<'_>,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    let len = encode_prop_seq_length_value(enc, operand)?;
+    Ok(SmtValue::Bool(smt::smt_eq(&len, &smt::int_val(0))?))
+}
+
+fn encode_prop_map_domain_value(
+    enc: PropertyEncodingCtx<'_>,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    if let IRExpr::MapLit { entries, .. } = operand {
+        let set_lit = IRExpr::SetLit {
+            elements: entries.iter().map(|(key, _)| key.clone()).collect(),
+            ty: IRType::Set {
+                element: Box::new(match expr_type(operand) {
+                    Some(IRType::Map { key, .. }) => key.as_ref().clone(),
+                    _ => IRType::Int,
+                }),
+            },
+            span: None,
+        };
+        return encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            &set_lit,
+            enc.step,
+        );
+    }
+    let map_val = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        operand,
+        enc.step,
+    )?;
+    let Some(IRType::Map { key, value }) = expr_type(operand) else {
+        return Err("Map::domain requires a map operand".to_owned());
+    };
+    smt::map_domain(&map_val, key, value)
+}
+
+fn encode_prop_map_range_value(
+    enc: PropertyEncodingCtx<'_>,
+    operand: &IRExpr,
+) -> Result<SmtValue, String> {
+    if let IRExpr::MapLit { entries, .. } = operand {
+        let set_lit = IRExpr::SetLit {
+            elements: entries.iter().map(|(_, value)| value.clone()).collect(),
+            ty: IRType::Set {
+                element: Box::new(match expr_type(operand) {
+                    Some(IRType::Map { value, .. }) => value.as_ref().clone(),
+                    _ => IRType::Int,
+                }),
+            },
+            span: None,
+        };
+        return encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            &set_lit,
+            enc.step,
+        );
+    }
+    let map_val = encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        operand,
+        enc.step,
+    )?;
+    let Some(IRType::Map { key, value }) = expr_type(operand) else {
+        return Err("Map::range requires a map operand".to_owned());
+    };
+    smt::map_range(&map_val, key, value)
+}
+
+fn encode_prop_map_update_value(
+    enc: PropertyEncodingCtx<'_>,
+    map: &IRExpr,
+    key: &IRExpr,
+    value: &IRExpr,
+) -> Result<SmtValue, String> {
+    let arr = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, map, enc.step)?;
+    let k = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, key, enc.step)?;
+    let v = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, value, enc.step)?;
+    if let Some(IRType::Map {
+        value: value_ty, ..
+    }) = expr_type(map)
+    {
+        return smt::map_store(&arr, &k, &v, value_ty);
+    }
+    Ok(SmtValue::Array(
+        arr.as_array()?.store(&k.to_dynamic(), &v.to_dynamic()),
+    ))
+}
+
+fn encode_prop_index_value(
+    enc: PropertyEncodingCtx<'_>,
+    map: &IRExpr,
+    key: &IRExpr,
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let arr = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, map, enc.step)?;
+    let k = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, key, enc.step)?;
+    if let Some(IRType::Map { value, .. }) = expr_type(map) {
+        return smt::map_lookup(&arr, &k, value);
+    }
+    if let Some(IRType::Seq { element }) = expr_type(map) {
+        return smt::seq_index(&arr, &k, element);
+    }
+    Ok(smt::dynamic_to_typed_value(
+        arr.as_array()?.select(&k.to_dynamic()),
+        ty,
+    ))
+}
+
+fn encode_prop_map_lit_value(
+    enc: PropertyEncodingCtx<'_>,
+    entries: &[(IRExpr, IRExpr)],
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let (key_ty, val_ty) = match ty {
+        IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
+        _ => return Err(format!("MapLit with non-Map type: {ty:?}")),
+    };
+    let key_sort = smt::ir_type_to_sort(key_ty);
+    let default_val = smt::map_none_dynamic(val_ty);
+    let mut arr = smt::const_array(&key_sort, &default_val);
+    for (key_expr, value_expr) in entries {
+        let key = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            key_expr,
+            enc.step,
+        )?;
+        let value = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            value_expr,
+            enc.step,
+        )?;
+        arr = arr.store(&key.to_dynamic(), &smt::map_some_dynamic(val_ty, &value));
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn encode_prop_set_lit_value(
+    enc: PropertyEncodingCtx<'_>,
+    elements: &[IRExpr],
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let elem_ty = match ty {
+        IRType::Set { element } => element.as_ref(),
+        _ => return Err(format!("SetLit with non-Set type: {ty:?}")),
+    };
+    let elem_sort = ir_type_to_prop_sort(enc.vctx, elem_ty);
+    let false_val = smt::bool_val(false).to_dynamic();
+    let true_val = smt::bool_val(true).to_dynamic();
+    let mut arr = smt::const_array(&elem_sort, &false_val);
+    for elem in elements {
+        let encoded =
+            encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step)?;
+        arr = arr.store(&encoded.to_dynamic(), &true_val);
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn encode_prop_seq_lit_value(
+    enc: PropertyEncodingCtx<'_>,
+    elements: &[IRExpr],
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let elem_ty = match ty {
+        IRType::Seq { element } => element.as_ref(),
+        _ => return Err(format!("SeqLit with non-Seq type: {ty:?}")),
+    };
+    let elems = elements
+        .iter()
+        .map(|elem| encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(smt::seq_literal(elem_ty, &elems))
+}
+
+fn encode_prop_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    expr: &IRExpr,
+) -> Result<SmtValue, String> {
+    match expr {
         IRExpr::SetComp {
             var,
             source: Some(source),
@@ -2851,48 +3278,7 @@ pub(super) fn encode_prop_value(
             ty,
             ..
         } => {
-            let elements = match source.as_ref() {
-                IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
-                _ => {
-                    return Err(
-                        "sourced SetComp in verifier properties currently requires a finite Set or Seq literal source"
-                            .to_owned(),
-                    );
-                }
-            };
-            let IRType::Set { element } = ty else {
-                return Err(format!("SetComp with non-Set result type: {ty:?}"));
-            };
-            let result_elem_sort = ir_type_to_prop_sort(vctx, element);
-            let false_val = smt::bool_val(false).to_dynamic();
-            let true_val = smt::bool_val(true).to_dynamic();
-            let mut arr = smt::const_array(&result_elem_sort, &false_val);
-
-            for element_expr in elements {
-                let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
-                let inner_ctx = ctx.with_local(var, value.clone());
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let (key, projection_constraints) = if let Some(proj_expr) = projection {
-                    let (key, constraints) = encode_prop_value_with_choose_constraints(
-                        pool, vctx, defs, &inner_ctx, proj_expr, step,
-                    )?;
-                    (key.to_dynamic(), constraints)
-                } else {
-                    (value.to_dynamic(), vec![])
-                };
-                let cond = if projection_constraints.is_empty() {
-                    filter_val
-                } else {
-                    let mut conjuncts = vec![filter_val];
-                    conjuncts.extend(projection_constraints);
-                    let refs: Vec<&Bool> = conjuncts.iter().collect();
-                    smt::bool_and(&refs)
-                };
-                let stored = arr.store(&key, &true_val);
-                arr = smt::array_ite(&cond, &stored, &arr);
-            }
-
-            Ok(SmtValue::Array(arr))
+            encode_prop_sourced_set_comp_value(enc, var, source, filter, projection.as_deref(), ty)
         }
         IRExpr::SetComp {
             var,
@@ -2901,59 +3287,14 @@ pub(super) fn encode_prop_value(
             projection,
             ty,
             ..
-        } => {
-            // Set comprehension over entity slots.
-            // Simple: { a: E where P(a) } → Array<Int, Bool> (slot index → member)
-            // Projection: { f(a) | a: E where P(a) } → Array<T, Bool> (value → member)
-            let n_slots = pool.slots_for(entity_name);
-            let result_elem_sort = match (projection.as_ref(), ty) {
-                (Some(_), IRType::Set { element }) => ir_type_to_prop_sort(vctx, element),
-                (Some(_), _) => {
-                    return Err(format!(
-                        "projection SetComp with non-Set result type: {ty:?}"
-                    ))
-                }
-                (None, _) => smt::sort_int(), // simple form: slot indices are Int
-            };
-            let false_val = smt::bool_val(false).to_dynamic();
-            let true_val = smt::bool_val(true).to_dynamic();
-            let mut arr = smt::const_array(&result_elem_sort, &false_val);
-
-            for slot in 0..n_slots {
-                let active = pool.active_at(entity_name, slot, step);
-                let is_active = match active {
-                    Some(SmtValue::Bool(act)) => act.clone(),
-                    _ => continue,
-                };
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                // Condition: slot is active AND filter holds
-
-                // Key: what to store true at
-                let (key, projection_constraints) = if let Some(proj_expr) = projection {
-                    // Projection: store true at the projected value
-                    let (key, constraints) = encode_prop_value_with_choose_constraints(
-                        pool, vctx, defs, &inner_ctx, proj_expr, step,
-                    )?;
-                    (key.to_dynamic(), constraints)
-                } else {
-                    // Simple: store true at the slot index
-                    (
-                        smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic(),
-                        vec![],
-                    )
-                };
-                let mut cond_parts = vec![is_active, filter_val];
-                cond_parts.extend(projection_constraints);
-                let refs: Vec<&Bool> = cond_parts.iter().collect();
-                let cond = smt::bool_and(&refs);
-
-                // Conditional store: ite(cond, store(arr, key, true), arr)
-                let stored = arr.store(&key, &true_val);
-                arr = smt::array_ite(&cond, &stored, &arr);
-            }
-            Ok(SmtValue::Array(arr))
-        }
+        } => encode_prop_entity_set_comp_value(
+            enc,
+            var,
+            entity_name,
+            filter,
+            projection.as_deref(),
+            ty,
+        ),
         IRExpr::SetComp {
             var,
             domain,
@@ -2962,167 +3303,255 @@ pub(super) fn encode_prop_value(
             projection,
             ty,
             ..
-        } if finite_domain_values_with_payloads(vctx, domain).is_some() => {
-            let IRType::Set { element } = ty else {
-                return Err(format!("SetComp with non-Set result type: {ty:?}"));
-            };
-            let result_elem_sort = ir_type_to_prop_sort(vctx, element);
-            let false_val = smt::bool_val(false).to_dynamic();
-            let true_val = smt::bool_val(true).to_dynamic();
-            let mut arr = smt::const_array(&result_elem_sort, &false_val);
-
-            let values = finite_domain_values_with_payloads(vctx, domain).unwrap_or_default();
-            for value in values {
-                let inner_ctx = ctx.with_local(var, value.clone());
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let (key, projection_constraints) = if let Some(proj_expr) = projection {
-                    let (key, constraints) = encode_prop_value_with_choose_constraints(
-                        pool, vctx, defs, &inner_ctx, proj_expr, step,
-                    )?;
-                    (key.to_dynamic(), constraints)
-                } else {
-                    (value.to_dynamic(), vec![])
-                };
-                let cond = if projection_constraints.is_empty() {
-                    filter_val
-                } else {
-                    let mut conjuncts = vec![filter_val];
-                    conjuncts.extend(projection_constraints);
-                    let refs: Vec<&Bool> = conjuncts.iter().collect();
-                    smt::bool_and(&refs)
-                };
-                let stored = arr.store(&key, &true_val);
-                arr = smt::array_ite(&cond, &stored, &arr);
-            }
-
-            Ok(SmtValue::Array(arr))
+        } if finite_domain_values_with_payloads(enc.vctx, domain).is_some() => {
+            encode_prop_finite_set_comp_value(enc, var, domain, filter, projection.as_deref(), ty)
         }
         IRExpr::SetComp { domain, .. } => Err(format!(
             "unsupported SetComp domain in verifier property encoding: {domain:?}"
         )),
-        // arithmetic aggregators over entity pools.
-        //
-        // For entity domains, unfold over all slots:
-        // sum: Σ ite(active(s), body(s), 0)
-        // product: Π ite(active(s), body(s), 1)
-        // count: Σ ite(active(s) ∧ body(s), 1, 0) (body is Bool)
-        // min/max: ite-chain tracking smallest/largest active body
-        //
-        // For fieldless-enum domains, unfold over variant indices.
-        IRExpr::Aggregate {
-            kind,
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            in_filter,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            encode_aggregate_entity(
-                pool,
-                vctx,
-                defs,
-                ctx,
-                *kind,
-                var,
-                entity_name,
-                body,
-                in_filter.as_deref(),
-                n_slots,
-                step,
-            )
+        _ => unreachable!("set-comp dispatcher called with non-SetComp expression"),
+    }
+}
+
+fn encode_prop_sourced_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    var: &str,
+    source: &IRExpr,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let elements = match source {
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
+        _ => {
+            return Err(
+                "sourced SetComp in verifier properties currently requires a finite Set or Seq literal source"
+                    .to_owned(),
+            );
         }
-        // Fieldless-enum domain: unfold over variant indices
+    };
+    let mut arr = empty_set_comp_array(enc.vctx, ty)?;
+    let true_val = smt::bool_val(true).to_dynamic();
+    for element_expr in elements {
+        let value = encode_prop_value(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            enc.property,
+            element_expr,
+            enc.step,
+        )?;
+        let inner_ctx = enc.property.with_local(var, value.clone());
+        let filter_val =
+            encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        let (key, constraints) = encode_set_comp_key(
+            enc.with_property(&inner_ctx),
+            projection,
+            value.to_dynamic(),
+        )?;
+        let cond = set_comp_condition(filter_val, constraints);
+        let stored = arr.store(&key, &true_val);
+        arr = smt::array_ite(&cond, &stored, &arr);
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn encode_prop_entity_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    var: &str,
+    entity_name: &str,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let result_elem_sort = entity_set_comp_sort(enc.vctx, projection, ty)?;
+    let false_val = smt::bool_val(false).to_dynamic();
+    let true_val = smt::bool_val(true).to_dynamic();
+    let mut arr = smt::const_array(&result_elem_sort, &false_val);
+    for slot in 0..enc.pool.slots_for(entity_name) {
+        let Some(SmtValue::Bool(active)) = enc.pool.active_at(entity_name, slot, enc.step) else {
+            continue;
+        };
+        let inner_ctx = enc.property.with_binding(var, entity_name, slot);
+        let filter_val =
+            encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        let fallback = smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic();
+        let (key, constraints) =
+            encode_set_comp_key(enc.with_property(&inner_ctx), projection, fallback)?;
+        let mut cond_parts = vec![active.clone(), filter_val];
+        cond_parts.extend(constraints);
+        let cond = bool_and_values(&cond_parts);
+        let stored = arr.store(&key, &true_val);
+        arr = smt::array_ite(&cond, &stored, &arr);
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn encode_prop_finite_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    var: &str,
+    domain: &IRType,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let mut arr = empty_set_comp_array(enc.vctx, ty)?;
+    let true_val = smt::bool_val(true).to_dynamic();
+    let values = finite_domain_values_with_payloads(enc.vctx, domain).unwrap_or_default();
+    for value in values {
+        let inner_ctx = enc.property.with_local(var, value.clone());
+        let filter_val =
+            encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        let (key, constraints) = encode_set_comp_key(
+            enc.with_property(&inner_ctx),
+            projection,
+            value.to_dynamic(),
+        )?;
+        let cond = set_comp_condition(filter_val, constraints);
+        let stored = arr.store(&key, &true_val);
+        arr = smt::array_ite(&cond, &stored, &arr);
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn empty_set_comp_array(vctx: &VerifyContext, ty: &IRType) -> Result<smt::Array, String> {
+    let IRType::Set { element } = ty else {
+        return Err(format!("SetComp with non-Set result type: {ty:?}"));
+    };
+    let result_elem_sort = ir_type_to_prop_sort(vctx, element);
+    let false_val = smt::bool_val(false).to_dynamic();
+    Ok(smt::const_array(&result_elem_sort, &false_val))
+}
+
+fn entity_set_comp_sort(
+    vctx: &VerifyContext,
+    projection: Option<&IRExpr>,
+    ty: &IRType,
+) -> Result<smt::Sort, String> {
+    match (projection, ty) {
+        (Some(_), IRType::Set { element }) => Ok(ir_type_to_prop_sort(vctx, element)),
+        (Some(_), _) => Err(format!(
+            "projection SetComp with non-Set result type: {ty:?}"
+        )),
+        (None, _) => Ok(smt::sort_int()),
+    }
+}
+
+fn encode_set_comp_key(
+    enc: PropertyEncodingCtx<'_>,
+    projection: Option<&IRExpr>,
+    fallback: Dynamic,
+) -> Result<(Dynamic, Vec<Bool>), String> {
+    let Some(proj_expr) = projection else {
+        return Ok((fallback, Vec::new()));
+    };
+    let (key, constraints) = encode_prop_value_with_choose_constraints(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        proj_expr,
+        enc.step,
+    )?;
+    Ok((key.to_dynamic(), constraints))
+}
+
+fn set_comp_condition(filter_val: Bool, projection_constraints: Vec<Bool>) -> Bool {
+    if projection_constraints.is_empty() {
+        filter_val
+    } else {
+        let mut conjuncts = vec![filter_val];
+        conjuncts.extend(projection_constraints);
+        bool_and_values(&conjuncts)
+    }
+}
+
+fn bool_and_values(values: &[Bool]) -> Bool {
+    let refs: Vec<&Bool> = values.iter().collect();
+    smt::bool_and(&refs)
+}
+
+fn encode_prop_aggregate_value(
+    enc: PropertyEncodingCtx<'_>,
+    expr: &IRExpr,
+) -> Result<SmtValue, String> {
+    match expr {
         IRExpr::Aggregate {
             kind,
             var,
-            domain: domain @ crate::ir::types::IRType::Enum { .. },
+            domain: IRType::Entity { name: entity_name },
             body,
             in_filter,
             ..
-        } if !domain.has_variant_fields() => {
-            let n = enum_variant_count(domain);
+        } => encode_aggregate_entity(
+            enc,
+            *kind,
+            var,
+            entity_name,
+            body,
+            in_filter.as_deref(),
+            enc.pool.slots_for(entity_name),
+        ),
+        IRExpr::Aggregate {
+            kind,
+            var,
+            domain,
+            body,
+            in_filter,
+            ..
+        } if matches!(domain, IRType::Enum { .. }) && !domain.has_variant_fields() => {
             encode_aggregate_enum(
-                pool,
-                vctx,
-                defs,
-                ctx,
+                enc,
                 *kind,
                 var,
                 body,
                 in_filter.as_deref(),
-                n,
-                step,
+                enum_variant_count(domain),
             )
         }
         IRExpr::Aggregate {
             kind,
             var,
-            domain: domain @ crate::ir::types::IRType::Enum { name, .. },
+            domain: domain @ IRType::Enum { name, .. },
             body,
             in_filter,
             ..
         } if domain.has_variant_fields() => {
-            let Some(values) = finite_payload_enum_values(vctx, domain) else {
+            let Some(values) = finite_payload_enum_values(enc.vctx, domain) else {
                 return Err(format!(
                     "{kind:?} aggregator over ADT enum `{name}` is not supported — \
                      constructor fields must themselves have finite Bool/enum domains"
                 ));
             };
-            encode_aggregate_finite_values(
-                pool,
-                vctx,
-                defs,
-                ctx,
-                *kind,
-                var,
-                body,
-                in_filter.as_deref(),
-                &values,
-                step,
-            )
+            encode_aggregate_finite_values(enc, *kind, var, body, in_filter.as_deref(), &values)
         }
-        // Bool domain: unfold over {false, true} with proper Bool binding
         IRExpr::Aggregate {
             kind,
             var,
-            domain: crate::ir::types::IRType::Bool,
+            domain: IRType::Bool,
             body,
             in_filter,
             ..
-        } => encode_aggregate_bool(
-            pool,
-            vctx,
-            defs,
-            ctx,
-            *kind,
-            var,
-            body,
-            in_filter.as_deref(),
-            step,
-        ),
-        // Int, Real, String, refinement, and other unbounded domains:
-        // Z3 has no native aggregator theory here, so reject with a
-        // clear diagnostic suggesting a bounded domain form.
+        } => encode_aggregate_bool(enc, *kind, var, body, in_filter.as_deref()),
         IRExpr::Aggregate { kind, domain, .. } => Err(format!(
             "{kind:?} aggregator over `{domain:?}` domain is not supported — \
              aggregators require a bounded domain (entity pool, fieldless \
              enum, or Bool)"
         )),
-        IRExpr::Card { expr: inner, .. } => encode_card(pool, vctx, defs, ctx, inner, step),
-        IRExpr::App { func, .. } => {
-            if let IRExpr::Var { name, .. } = func.as_ref() {
-                return Err(format!(
-                    "function `{name}` reached encoding without expansion \
-                     (should have been caught by pre-validation)"
-                ));
-            }
-            Err(format!(
-                "unsupported App expression reached encoding: {expr:?}"
-            ))
-        }
-        _ => Err(format!("unsupported expression reached encoding: {expr:?}")),
+        _ => unreachable!("aggregate dispatcher called with non-Aggregate expression"),
     }
+}
+
+fn encode_unexpanded_app_error(func: &IRExpr, expr: &IRExpr) -> Result<SmtValue, String> {
+    if let IRExpr::Var { name, .. } = func {
+        return Err(format!(
+            "function `{name}` reached encoding without expansion \
+             (should have been caught by pre-validation)"
+        ));
+    }
+    Err(format!(
+        "unsupported App expression reached encoding: {expr:?}"
+    ))
 }
 
 fn encode_prop_match(
@@ -3173,19 +3602,14 @@ fn encode_prop_match(
 ///   sound as upper bound for `> 0` checks, not exact for `== N`).
 /// - **Other**: panics (should be caught by `find_unsupported_scene_expr`).
 ///   encode an aggregate over entity pool slots.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_aggregate_entity(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
+    enc: PropertyEncodingCtx<'_>,
     kind: crate::ir::types::IRAggKind,
     var: &str,
     entity_name: &str,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
     n_slots: usize,
-    step: usize,
 ) -> Result<SmtValue, String> {
     use crate::ir::types::IRAggKind;
 
@@ -3194,22 +3618,31 @@ pub(super) fn encode_aggregate_entity(
     // the active flag so only elements in the collection contribute.
     let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
     for slot in 0..n_slots {
-        let active = pool.active_at(entity_name, slot, step);
-        let inner_ctx = ctx.with_binding(var, entity_name, slot);
+        let active = enc.pool.active_at(entity_name, slot, enc.step);
+        let inner_ctx = enc.property.with_binding(var, entity_name, slot);
         if let Some(SmtValue::Bool(act)) = active {
             // Combine active flag with optional membership filter.
             let effective_active = if let Some(filter_expr) = in_filter {
-                let membership = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter_expr, step)?;
+                let membership = encode_prop_expr(
+                    enc.pool,
+                    enc.vctx,
+                    enc.defs,
+                    &inner_ctx,
+                    filter_expr,
+                    enc.step,
+                )?;
                 smt::bool_and(&[&act.clone(), &membership])
             } else {
                 act.clone()
             };
 
             if kind == IRAggKind::Count {
-                let pred = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+                let pred =
+                    encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
                 slot_data.push((smt::bool_and(&[&effective_active, &pred]), smt::int_val(1)));
             } else {
-                let val = encode_prop_value(pool, vctx, defs, &inner_ctx, body, step)?;
+                let val =
+                    encode_prop_value(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
                 slot_data.push((effective_active, val));
             }
         }
@@ -3284,6 +3717,7 @@ pub(super) fn encode_aggregate_entity(
             let undef_name = format!(
                 "__agg_{kind}_{entity_name}_{var}_undef_t{step}",
                 kind = if is_min { "min" } else { "max" },
+                step = enc.step,
             );
             let undef = match &acc {
                 SmtValue::Real(_) => smt::real_var(&undef_name),
@@ -3301,17 +3735,12 @@ pub(super) fn encode_aggregate_entity(
 ///
 /// Binds the variable as `SmtValue::Bool` (not Int) so that body
 /// expressions referencing the variable see a proper Bool value.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_aggregate_bool(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
+    enc: PropertyEncodingCtx<'_>,
     kind: crate::ir::types::IRAggKind,
     var: &str,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
-    step: usize,
 ) -> Result<SmtValue, String> {
     use crate::ir::types::IRAggKind;
     let bool_vals = [smt::bool_val(false), smt::bool_val(true)];
@@ -3320,17 +3749,24 @@ pub(super) fn encode_aggregate_bool(
     // For count, body_value is always int_val(1) and the flag includes the predicate.
     let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
     for bv in &bool_vals {
-        let inner_ctx = ctx.with_local(var, bv.clone());
+        let inner_ctx = enc.property.with_local(var, bv.clone());
         let mut flag = smt::bool_const(true);
         if let Some(filter_expr) = in_filter {
-            let membership = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter_expr, step)?;
+            let membership = encode_prop_expr(
+                enc.pool,
+                enc.vctx,
+                enc.defs,
+                &inner_ctx,
+                filter_expr,
+                enc.step,
+            )?;
             flag = membership;
         }
         if kind == IRAggKind::Count {
-            let pred = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            let pred = encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((smt::bool_and(&[&flag, &pred]), smt::int_val(1)));
         } else {
-            let val = encode_prop_value(pool, vctx, defs, &inner_ctx, body, step)?;
+            let val = encode_prop_value(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((flag, val));
         }
     }
@@ -3377,7 +3813,8 @@ pub(super) fn encode_aggregate_bool(
             }
             let undef_name = format!(
                 "__agg_{}_bool_{var}_undef_t{step}",
-                if is_min { "min" } else { "max" }
+                if is_min { "min" } else { "max" },
+                step = enc.step,
             );
             let undef = if ir_expr_is_real(body) {
                 smt::real_var(&undef_name)
@@ -3390,33 +3827,35 @@ pub(super) fn encode_aggregate_bool(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_aggregate_finite_values(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
+    enc: PropertyEncodingCtx<'_>,
     kind: crate::ir::types::IRAggKind,
     var: &str,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
     values: &[SmtValue],
-    step: usize,
 ) -> Result<SmtValue, String> {
     use crate::ir::types::IRAggKind;
 
     let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
     for value in values {
-        let inner_ctx = ctx.with_local(var, value.clone());
+        let inner_ctx = enc.property.with_local(var, value.clone());
         let mut flag = smt::bool_const(true);
         if let Some(filter_expr) = in_filter {
-            flag = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter_expr, step)?;
+            flag = encode_prop_expr(
+                enc.pool,
+                enc.vctx,
+                enc.defs,
+                &inner_ctx,
+                filter_expr,
+                enc.step,
+            )?;
         }
         if kind == IRAggKind::Count {
-            let pred = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            let pred = encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((smt::bool_and(&[&flag, &pred]), smt::int_val(1)));
         } else {
-            let val = encode_prop_value(pool, vctx, defs, &inner_ctx, body, step)?;
+            let val = encode_prop_value(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((flag, val));
         }
     }
@@ -3462,7 +3901,8 @@ fn encode_aggregate_finite_values(
             }
             let undef_name = format!(
                 "__agg_{}_finite_{var}_undef_t{step}",
-                if is_min { "min" } else { "max" }
+                if is_min { "min" } else { "max" },
+                step = enc.step,
             );
             let undef = if ir_expr_is_real(body) {
                 smt::real_var(&undef_name)
@@ -3474,35 +3914,37 @@ fn encode_aggregate_finite_values(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn encode_aggregate_enum(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    defs: &defenv::DefEnv,
-    ctx: &PropertyCtx,
+    enc: PropertyEncodingCtx<'_>,
     kind: crate::ir::types::IRAggKind,
     var: &str,
     body: &IRExpr,
     in_filter: Option<&IRExpr>,
     n: usize,
-    step: usize,
 ) -> Result<SmtValue, String> {
     use crate::ir::types::IRAggKind;
 
     // Collect (filter_flag, body_value) pairs for each variant.
     let mut slot_data: Vec<(Bool, SmtValue)> = Vec::new();
     for idx in 0..n {
-        let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
+        let inner_ctx = enc.property.with_local(var, smt::int_val(idx as i64));
         let mut flag = smt::bool_const(true);
         if let Some(filter_expr) = in_filter {
-            let membership = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter_expr, step)?;
+            let membership = encode_prop_expr(
+                enc.pool,
+                enc.vctx,
+                enc.defs,
+                &inner_ctx,
+                filter_expr,
+                enc.step,
+            )?;
             flag = membership;
         }
         if kind == IRAggKind::Count {
-            let pred = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+            let pred = encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((smt::bool_and(&[&flag, &pred]), smt::int_val(1)));
         } else {
-            let val = encode_prop_value(pool, vctx, defs, &inner_ctx, body, step)?;
+            let val = encode_prop_value(enc.pool, enc.vctx, enc.defs, &inner_ctx, body, enc.step)?;
             slot_data.push((flag, val));
         }
     }
@@ -3552,6 +3994,7 @@ pub(super) fn encode_aggregate_enum(
             let undef_name = format!(
                 "__agg_{}_enum_{var}_undef_t{step}",
                 if is_min { "min" } else { "max" },
+                step = enc.step,
             );
             let undef = if ir_expr_is_real(body) {
                 smt::real_var(&undef_name)
@@ -4075,15 +4518,17 @@ mod tests {
             span: None,
         };
         let bool_count = encode_aggregate_bool(
-            &pool,
-            &vctx,
-            &defs,
-            &ctx,
+            PropertyEncodingCtx {
+                pool: &pool,
+                vctx: &vctx,
+                defs: &defs,
+                property: &ctx,
+                step: 0,
+            },
             crate::ir::types::IRAggKind::Count,
             "b",
             &bool_var,
             None,
-            0,
         )
         .expect("bool count");
         let solver = AbideSolver::new();
@@ -4108,15 +4553,17 @@ mod tests {
             span: None,
         };
         let bool_max = encode_aggregate_bool(
-            &pool,
-            &vctx,
-            &defs,
-            &ctx,
+            PropertyEncodingCtx {
+                pool: &pool,
+                vctx: &vctx,
+                defs: &defs,
+                property: &ctx,
+                step: 0,
+            },
             crate::ir::types::IRAggKind::Max,
             "b",
             &bool_max_body,
             None,
-            0,
         )
         .expect("bool max");
         let solver = AbideSolver::new();

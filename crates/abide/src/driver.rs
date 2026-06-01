@@ -1,3 +1,11 @@
+//! Top-to-bottom compilation pipeline.
+//!
+//! Each `*Files` struct represents one pipeline stage's output along
+//! with the source map needed to render diagnostics. Stages run
+//! left-to-right: `ParseFileResult` → `ElaboratedFiles` →
+//! `LoweredFiles` → `VerifiedFiles` (or `SimulatedFiles` /
+//! `TemporalExportedFiles`).
+
 use std::path::{Path, PathBuf};
 
 use crate::diagnostic::{Diagnostic, DiagnosticSink};
@@ -13,20 +21,28 @@ use crate::parse::{ParseOutput, Parser};
 use crate::simulate::{self, SimulateConfig, SimulationResult};
 use crate::verify::{self, VerificationResult, VerifyConfig};
 
+/// `(display_path, source)` pairs covering every file the driver
+/// read. Used by `miette` to attach source context to diagnostics.
 pub type SourceMap = Vec<(String, String)>;
 
+/// Result of parsing one file: original source, parsed program, and
+/// any parser-stage diagnostics (recovery still produces a program).
 pub struct ParseFileResult {
     pub source: String,
     pub program: crate::ast::Program,
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Result of elaborating a parsed program: the resolved
+/// [`elab::types::ElabResult`], the source map needed for downstream
+/// diagnostics, and any elaborator diagnostics.
 pub struct ElaboratedFiles {
     pub result: elab::types::ElabResult,
     pub sources: SourceMap,
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Result of lowering an elaborated program to IR.
 pub struct LoweredFiles {
     pub result: elab::types::ElabResult,
     pub sources: SourceMap,
@@ -35,11 +51,13 @@ pub struct LoweredFiles {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// Result of running verification on a lowered program.
 pub struct VerifiedFiles {
     pub lowered: LoweredFiles,
     pub results: Vec<VerificationResult>,
 }
 
+/// Result of running simulation on a lowered program.
 pub struct SimulatedFiles {
     pub lowered: LoweredFiles,
     pub result: SimulationResult,
@@ -276,9 +294,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bad_assumption.ab");
         let mut file = std::fs::File::create(&path).expect("create file");
-        writeln!(
-            file,
-            "{}",
+        file.write_all(
             r"module T
 
 enum Flag = Ready | Done
@@ -301,13 +317,13 @@ verify bad_assumption {
   assert always true
 }
 "
+            .as_bytes(),
         )
         .expect("write file");
 
-        let diagnostics = match verify_files(std::slice::from_ref(&path), &VerifyConfig::default())
-        {
-            Ok(_) => panic!("unresolved fair assumption must block verification"),
-            Err(diagnostics) => diagnostics,
+        let Err(diagnostics) = verify_files(std::slice::from_ref(&path), &VerifyConfig::default())
+        else {
+            panic!("unresolved fair assumption must block verification");
         };
 
         assert!(

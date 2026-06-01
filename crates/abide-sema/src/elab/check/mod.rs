@@ -1726,7 +1726,7 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
 /// Respects variable scoping: a `Var` that is shadowed by a parameter,
 /// quantifier binding, let binding, or lambda parameter is NOT counted
 /// as a dependency reference.
-#[allow(clippy::match_same_arms, clippy::too_many_lines)]
+#[allow(clippy::match_same_arms)]
 fn collect_name_refs(
     expr: &EExpr,
     known_names: &HashSet<String>,

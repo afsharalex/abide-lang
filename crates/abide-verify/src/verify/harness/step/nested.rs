@@ -1,61 +1,46 @@
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(in crate::verify::harness::step) fn encode_nested_op(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
-    op: &IRAction,
-    bound_var: &str,
-    bound_ent_name: &str,
-    bound_entity_ir: &IREntity,
-    bound_slot: usize,
-    step: usize,
-    base_params: &HashMap<String, SmtValue>,
-    depth: usize,
-    // Chain of outer bound variables from enclosing Choose/ForAll scopes.
-    // Each entry is (var_name, entity_name, entity_ir, slot).
-    // Enables Apply targeting an outer variable to resolve to its specific slot
-    // instead of a disjunction over all slots.
-    outer_bindings: &[(&str, &str, &IREntity, usize)],
-) -> (Vec<Bool>, HashSet<(String, usize)>) {
-    try_encode_nested_op(
-        pool,
-        vctx,
-        entities,
-        all_systems,
-        op,
-        bound_var,
-        bound_ent_name,
-        bound_entity_ir,
-        bound_slot,
-        step,
-        base_params,
-        depth,
-        outer_bindings,
-    )
-    .unwrap_or_else(|msg| panic!("{msg}"))
+pub(in crate::verify::harness::step) struct NestedOpCtx<'a> {
+    pub pool: &'a SlotPool,
+    pub vctx: &'a VerifyContext,
+    pub entities: &'a [IREntity],
+    pub all_systems: &'a [IRSystem],
+    pub bound_var: &'a str,
+    pub bound_ent_name: &'a str,
+    pub bound_entity_ir: &'a IREntity,
+    pub bound_slot: usize,
+    pub step: usize,
+    pub base_params: &'a HashMap<String, SmtValue>,
+    pub depth: usize,
+    pub outer_bindings: &'a [(&'a str, &'a str, &'a IREntity, usize)],
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(in crate::verify::harness::step) fn encode_nested_op(
+    ctx: NestedOpCtx<'_>,
+    op: &IRAction,
+) -> (Vec<Bool>, HashSet<(String, usize)>) {
+    try_encode_nested_op(ctx, op).unwrap_or_else(|msg| panic!("{msg}"))
+}
+
 #[allow(clippy::type_complexity)]
 pub(in crate::verify::harness::step) fn try_encode_nested_op(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
+    ctx: NestedOpCtx<'_>,
     op: &IRAction,
-    bound_var: &str,
-    bound_ent_name: &str,
-    bound_entity_ir: &IREntity,
-    bound_slot: usize,
-    step: usize,
-    base_params: &HashMap<String, SmtValue>,
-    depth: usize,
-    outer_bindings: &[(&str, &str, &IREntity, usize)],
 ) -> Result<(Vec<Bool>, HashSet<(String, usize)>), String> {
+    let pool = ctx.pool;
+    let vctx = ctx.vctx;
+    let entities = ctx.entities;
+    let all_systems = ctx.all_systems;
+    let bound_var = ctx.bound_var;
+    let bound_ent_name = ctx.bound_ent_name;
+    let bound_entity_ir = ctx.bound_entity_ir;
+    let bound_slot = ctx.bound_slot;
+    let step = ctx.step;
+    let base_params = ctx.base_params;
+    let depth = ctx.depth;
+    let outer_bindings = ctx.outer_bindings;
+
     let mut formulas = Vec::new();
     let mut additional_touched: HashSet<(String, usize)> = HashSet::new();
 
@@ -141,8 +126,7 @@ pub(in crate::verify::harness::step) fn try_encode_nested_op(
                                 all_systems,
                                 target_step,
                                 step,
-                                depth + 1,
-                                Some(cross_params),
+                                StepEncodingOptions::with_override(depth + 1, cross_params),
                             )?;
                             branch_results.push((cross_formula, cross_touched));
                         } else {
@@ -281,19 +265,21 @@ pub(in crate::verify::harness::step) fn try_encode_nested_op(
                                 // delegate to encode_nested_op which resolves the
                                 // target to the correct entity and slot.
                                 let (nested_f, nested_t) = try_encode_nested_op(
-                                    pool,
-                                    vctx,
-                                    entities,
-                                    all_systems,
+                                    NestedOpCtx {
+                                        pool,
+                                        vctx,
+                                        entities,
+                                        all_systems,
+                                        bound_var: inner_var,
+                                        bound_ent_name: inner_ent,
+                                        bound_entity_ir: inner_ent_ir,
+                                        bound_slot: inner_slot,
+                                        step,
+                                        base_params: &slot_params,
+                                        depth,
+                                        outer_bindings: &inner_bindings,
+                                    },
                                     inner_op,
-                                    inner_var,
-                                    inner_ent,
-                                    inner_ent_ir,
-                                    inner_slot,
-                                    step,
-                                    &slot_params,
-                                    depth,
-                                    &inner_bindings,
                                 )?;
                                 inner_conjuncts.extend(nested_f);
                                 additional_touched.extend(nested_t);
@@ -401,19 +387,21 @@ pub(in crate::verify::harness::step) fn try_encode_nested_op(
                             _ => {
                                 // Cross-entity Apply or other nested action
                                 let (nested_f, nested_t) = try_encode_nested_op(
-                                    pool,
-                                    vctx,
-                                    entities,
-                                    all_systems,
+                                    NestedOpCtx {
+                                        pool,
+                                        vctx,
+                                        entities,
+                                        all_systems,
+                                        bound_var: inner_var,
+                                        bound_ent_name: inner_ent,
+                                        bound_entity_ir: inner_ent_ir,
+                                        bound_slot: inner_slot,
+                                        step,
+                                        base_params: &slot_params,
+                                        depth,
+                                        outer_bindings: &inner_bindings,
+                                    },
                                     inner_op,
-                                    inner_var,
-                                    inner_ent,
-                                    inner_ent_ir,
-                                    inner_slot,
-                                    step,
-                                    &slot_params,
-                                    depth,
-                                    &inner_bindings,
                                 )?;
                                 op_conjuncts.extend(nested_f);
                                 additional_touched.extend(nested_t);

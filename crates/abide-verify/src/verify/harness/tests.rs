@@ -2065,11 +2065,13 @@ fn try_encode_guard_expr_for_system_reads_system_fields_and_empty_quantifiers() 
         &pool,
         &vctx,
         &guard,
-        &HashMap::new(),
         0,
-        "Ui",
-        &HashMap::new(),
-        &HashMap::new(),
+        super::guard::SystemGuardScope {
+            step_params: &HashMap::new(),
+            system_name: "Ui",
+            entity_param_types: &HashMap::new(),
+            store_param_types: &HashMap::new(),
+        },
     )
     .expect("system guard");
 
@@ -2668,11 +2670,13 @@ fn guard_helpers_cover_wrappers_unary_values_and_non_empty_forall() {
             value: LitVal::Bool { value: true },
             span: None,
         },
-        &HashMap::new(),
         0,
-        "Ui",
-        &HashMap::new(),
-        &HashMap::new(),
+        super::guard::SystemGuardScope {
+            step_params: &HashMap::new(),
+            system_name: "Ui",
+            entity_param_types: &HashMap::new(),
+            store_param_types: &HashMap::new(),
+        },
     );
     let system_solver = AbideSolver::new();
     system_solver.assert(&system_guard);
@@ -2987,11 +2991,13 @@ fn try_encode_guard_expr_for_system_supports_entity_param_prime_and_logic() {
         &pool,
         &vctx,
         &guard,
-        &params,
         0,
-        "",
-        &entity_param_types,
-        &HashMap::new(),
+        super::guard::SystemGuardScope {
+            step_params: &params,
+            system_name: "",
+            entity_param_types: &entity_param_types,
+            store_param_types: &HashMap::new(),
+        },
     )
     .expect("entity-param guard");
     let pending = smt::int_val(vctx.variants.try_id_of("OrderStatus", "Pending").unwrap());
@@ -3272,11 +3278,13 @@ fn try_encode_slot_expr_and_guard_support_query_apps() {
         &pool,
         &vctx,
         &query_app,
-        &HashMap::new(),
         0,
-        "Billing",
-        &HashMap::new(),
-        &HashMap::new(),
+        super::guard::SystemGuardScope {
+            step_params: &HashMap::new(),
+            system_name: "Billing",
+            entity_param_types: &HashMap::new(),
+            store_param_types: &HashMap::new(),
+        },
     )
     .expect("query guard");
     let solver = AbideSolver::new();

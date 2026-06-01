@@ -1,3 +1,13 @@
+//! Command-line entry point for the `abide` CLI.
+//!
+//! The clap-derived `Cli` type at the bottom of the file dispatches
+//! subcommands (`parse`, `elaborate`, `lower`, `verify`, `simulate`,
+//! `qa`, `repl`, …) to the [`driver`] module. Most types here are
+//! private — they exist only to give clap stable parsing surfaces.
+//!
+//! The single public entry point is [`run`] (declared further down),
+//! which the `abide-bin` `main` invokes.
+
 use clap::{Args, Parser as ClapParser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, NamedSource, WrapErr};
 use std::collections::BTreeMap;
@@ -7,6 +17,9 @@ use crate::diagnostic::Diagnostic;
 use crate::driver;
 use crate::render;
 
+/// CLI-side host that wires the QA runner's `simulate` and
+/// `explore_state_space` hooks to the in-tree simulator and verifier
+/// backends.
 struct QaRunnerHooks;
 
 impl crate::qa::runner::RunnerHooks for QaRunnerHooks {
@@ -321,76 +334,34 @@ const DEFAULT_BMC_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
 /// Default timeout for IC3/PDR attempts, in seconds.
 const DEFAULT_IC3_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
 
-#[allow(clippy::too_many_lines)]
+/// Parses CLI arguments from the process environment and dispatches
+/// the chosen subcommand. The `main` binary calls this directly.
+///
+/// # Errors
+///
+/// Returns any `miette` diagnostic raised during argument parsing or
+/// subcommand execution. The process exits non-zero on `Err`.
 pub fn run() -> miette::Result<()> {
     let cli = Cli::parse();
+    run_command(cli.command)
+}
 
-    match cli.command {
+fn run_command(command: Command) -> miette::Result<()> {
+    match command {
         Command::Lex { file } => {
-            let src = driver::read_file(&file)?;
-            let tokens =
-                driver::lex_source(&src).map_err(|errors| errors.into_iter().next().unwrap())?;
-            for (token, span) in &tokens {
-                println!("{span:?}  {token}");
-            }
+            run_lex_command(file)?;
         }
         Command::Parse { file } => {
-            let parsed = driver::parse_file(&file)?;
-            let program = parsed.program;
-            let diagnostics = parsed.diagnostics;
-            if !diagnostics.is_empty() {
-                report_diagnostics(&diagnostics, &[(file.display().to_string(), parsed.source)]);
-                std::process::exit(1);
-            }
-            println!("{program:#?}");
+            run_parse_command(file)?;
         }
         Command::Elaborate { files } => {
-            let elaborated = match driver::load_and_elaborate(&files) {
-                Ok(elaborated) => elaborated,
-                Err(diagnostics) => {
-                    report_diagnostics(&diagnostics, &driver::read_sources_for_diagnostics(&files));
-                    std::process::exit(1);
-                }
-            };
-            report_diagnostics(&elaborated.diagnostics, &elaborated.sources);
-            if has_error_diagnostics(&elaborated.diagnostics) {
-                std::process::exit(1);
-            }
-            println!("{:#?}", elaborated.result);
+            run_elaborate_command(files);
         }
         Command::EmitIr { files } => {
-            let lowered = match driver::lower_files(&files) {
-                Ok(lowered) => lowered,
-                Err(diagnostics) => {
-                    report_diagnostics(&diagnostics, &driver::read_sources_for_diagnostics(&files));
-                    std::process::exit(1);
-                }
-            };
-            report_diagnostics(&lowered.diagnostics, &lowered.sources);
-            if has_error_diagnostics(&lowered.diagnostics) {
-                std::process::exit(1);
-            }
-            let json = crate::ir::emit_json(&lowered.ir_program)
-                .into_diagnostic()
-                .wrap_err("failed to serialize IR to JSON")?;
-            println!("{json}");
+            run_emit_ir_command(files)?;
         }
         Command::ExportTemporal { files } => {
-            let exported = match driver::export_temporal_files(&files) {
-                Ok(exported) => exported,
-                Err(diagnostics) => {
-                    report_diagnostics(&diagnostics, &driver::read_sources_for_diagnostics(&files));
-                    std::process::exit(1);
-                }
-            };
-            report_diagnostics(&exported.lowered.diagnostics, &exported.lowered.sources);
-            if has_error_diagnostics(&exported.lowered.diagnostics) {
-                std::process::exit(1);
-            }
-            let json = serde_json::to_string_pretty(&exported.verifies)
-                .into_diagnostic()
-                .wrap_err("failed to serialize compiled temporal formulas")?;
-            println!("{json}");
+            run_export_temporal_command(files)?;
         }
         Command::Verify {
             files,
@@ -417,361 +388,54 @@ pub fn run() -> miette::Result<()> {
             report,
             trace_artifact,
         } => {
-            let solver_selection = match solver {
-                VerifySolver::Z3 => crate::verify::SolverSelection::Z3,
-                VerifySolver::Cvc5 => crate::verify::SolverSelection::Cvc5,
-                VerifySolver::Auto => crate::verify::SolverSelection::Auto,
-                VerifySolver::Both => crate::verify::SolverSelection::Both,
-            };
-            let chc_selection = match chc_solver {
-                VerifyChcSolver::Z3 => crate::verify::ChcSelection::Z3,
-                VerifyChcSolver::Cvc5 => crate::verify::ChcSelection::Cvc5,
-                VerifyChcSolver::Auto => crate::verify::ChcSelection::Auto,
-            };
-            if cvc5_sygus && !matches!(solver, VerifySolver::Cvc5 | VerifySolver::Both) {
-                return Err(miette::miette!(
-                    "--cvc5-sygus requires `--solver cvc5` or `--solver both`"
-                ));
-            }
-            match solver {
-                VerifySolver::Cvc5 | VerifySolver::Both
-                    if !crate::verify::solver::is_solver_family_available(
-                        crate::verify::solver::SolverFamily::Cvc5,
-                    ) =>
-                {
-                    return Err(miette::miette!(
-                        "requested solver `{}` is not available in this build",
-                        match solver {
-                            VerifySolver::Cvc5 => "cvc5",
-                            VerifySolver::Both => "both",
-                            VerifySolver::Z3 | VerifySolver::Auto => unreachable!(),
-                        }
-                    ));
-                }
-                _ => {}
-            }
-            match chc_solver {
-                VerifyChcSolver::Cvc5
-                    if !crate::verify::solver::is_solver_family_available(
-                        crate::verify::solver::SolverFamily::Cvc5,
-                    ) =>
-                {
-                    return Err(miette::miette!(
-                        "requested CHC solver `cvc5` is not available in this build"
-                    ));
-                }
-                _ => {}
-            }
-
-            let witness_semantics = match witness_semantics {
-                VerifyWitnessSemantics::Operational => crate::verify::WitnessSemantics::Operational,
-                VerifyWitnessSemantics::Relational => crate::verify::WitnessSemantics::Relational,
-            };
-            let solver_name = format!("{solver:?}").to_lowercase();
-            let chc_solver_name = format!("{chc_solver:?}").to_lowercase();
-            let witness_semantics_name = format!("{witness_semantics:?}").to_lowercase();
-            let report_request = render::parse_verify_report_request(report)?;
-            let target_selector = target
-                .as_deref()
-                .map(str::parse)
-                .transpose()
-                .map_err(|err| miette::miette!("{err}"))?;
-
-            let no_ic3 = !ic3;
-            let config = crate::verify::VerifyConfig {
-                solver_selection,
-                chc_selection,
-                bounded_only,
-                unbounded_only,
-                overall_timeout_ms: timeout.saturating_mul(1000),
-                induction_timeout_ms: induction_timeout.saturating_mul(1000),
-                bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
-                bmc_iterative_deepening: !no_bmc_iterative_deepening,
-                prop_bmc_depth,
-                cvc5_sygus,
-                ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
-                no_ic3,
-                no_prop_verify,
-                no_fn_verify,
-                progress,
-                witness_semantics,
-                relational_symmetry_breaking: !no_relational_symmetry_breaking,
-                target: target_selector,
-            };
-
-            let verified = match driver::verify_files(&files, &config) {
-                Ok(verified) => verified,
-                Err(diagnostics) => {
-                    if !contains_load_io_diagnostics(&diagnostics) {
-                        if let Some(request) = report_request.as_ref() {
-                            render::write_verification_report(
-                                request,
-                                &files,
-                                &solver_name,
-                                &chc_solver_name,
-                                bounded_only,
-                                unbounded_only,
-                                induction_timeout,
-                                bmc_timeout,
-                                prop_bmc_depth,
-                                !no_bmc_iterative_deepening,
-                                ic3_timeout,
-                                no_ic3,
-                                no_prop_verify,
-                                no_fn_verify,
-                                progress,
-                                &witness_semantics_name,
-                                target.as_deref(),
-                                &diagnostics,
-                                &[],
-                            )?;
-                        }
-                    }
-                    report_diagnostics(&diagnostics, &driver::read_sources_for_diagnostics(&files));
-                    std::process::exit(1);
-                }
-            };
-            report_diagnostics(&verified.lowered.diagnostics, &verified.lowered.sources);
-            let diagnostics = verified.lowered.diagnostics.clone();
-            if has_error_diagnostics(&verified.lowered.diagnostics) {
-                if let Some(request) = report_request.as_ref() {
-                    render::write_verification_report(
-                        request,
-                        &files,
-                        &solver_name,
-                        &chc_solver_name,
-                        bounded_only,
-                        unbounded_only,
-                        induction_timeout,
-                        bmc_timeout,
-                        prop_bmc_depth,
-                        !no_bmc_iterative_deepening,
-                        ic3_timeout,
-                        no_ic3,
-                        no_prop_verify,
-                        no_fn_verify,
-                        progress,
-                        &witness_semantics_name,
-                        target.as_deref(),
-                        &diagnostics,
-                        &[],
-                    )?;
-                }
-                std::process::exit(1);
-            }
-            let results = verified.results;
-            if let Some(request) = report_request.as_ref() {
-                let report_path = render::write_verification_report(
-                    request,
-                    &files,
-                    &solver_name,
-                    &chc_solver_name,
-                    bounded_only,
-                    unbounded_only,
-                    induction_timeout,
-                    bmc_timeout,
+            run_verify_command(VerifyCommand {
+                files,
+                solver,
+                chc_solver,
+                timeouts: VerifyTimeouts {
+                    overall: timeout,
+                    induction: induction_timeout,
+                    bmc: bmc_timeout,
+                    ic3: ic3_timeout,
                     prop_bmc_depth,
-                    !no_bmc_iterative_deepening,
-                    ic3_timeout,
-                    no_ic3,
-                    no_prop_verify,
-                    no_fn_verify,
-                    progress,
-                    &witness_semantics_name,
-                    target.as_deref(),
-                    &diagnostics,
-                    &results,
-                )?;
-                println!("Report written to {}", report_path.display());
-            }
-            if let Some(path) = trace_artifact.as_ref() {
-                let artifact_config = crate::artifact::VerifyArtifactConfig {
-                    solver: &solver_name,
-                    chc_solver: &chc_solver_name,
+                },
+                mode: VerifyModeOptions {
                     bounded_only,
                     unbounded_only,
-                    induction_timeout_ms: induction_timeout.saturating_mul(1000),
-                    bmc_timeout_ms: bmc_timeout.saturating_mul(1000),
                     bmc_iterative_deepening: !no_bmc_iterative_deepening,
-                    ic3_timeout_ms: ic3_timeout.saturating_mul(1000),
-                    no_ic3,
+                },
+                solver_flags: VerifySolverFlags {
+                    cvc5_sygus,
+                    relational_symmetry_breaking: !no_relational_symmetry_breaking,
+                },
+                disabled_checks: VerifyDisabledChecks {
+                    no_ic3: !ic3,
                     no_prop_verify,
                     no_fn_verify,
-                    witness_semantics: &witness_semantics_name,
-                    target: target.as_deref(),
-                };
-                let artifacts =
-                    crate::artifact::verification_trace_artifacts(&results, &artifact_config);
-                let bundle = crate::artifact::TraceArtifactBundle::new(
-                    &files,
-                    crate::artifact::ReplayInfo::from_current_process(),
-                    artifacts,
-                );
-                crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
-                println!(
-                    "Trace artifact written to {} ({} artifact{})",
-                    path.display(),
-                    bundle.artifacts().len(),
-                    if bundle.artifacts().len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                );
-            }
-            if results.is_empty() {
-                println!("No verification targets found.");
-            } else {
-                let mut all_passed = true;
-                for r in &results {
-                    render::report_verification_result(
-                        r,
-                        &verified.lowered.sources,
-                        verbose,
-                        debug_evidence,
-                    );
-                    if r.is_failure() {
-                        all_passed = false;
-                    }
-                }
-                if !all_passed {
-                    std::process::exit(1);
-                }
-            }
+                },
+                output: VerifyOutputOptions {
+                    progress,
+                    verbose,
+                    debug_evidence,
+                    report,
+                    trace_artifact,
+                },
+                witness_semantics,
+                target,
+            })?;
         }
         Command::Run(args) | Command::Simulate(args) => {
-            let SimulateArgs {
-                files,
-                steps,
-                seed,
-                slots,
-                scope,
-                system,
-                trace_artifact,
-            } = args;
-            let entity_slot_overrides = parse_simulation_scope_overrides(&scope)?;
-            let config = crate::simulate::SimulateConfig {
-                steps,
-                seed,
-                slots_per_entity: slots,
-                entity_slot_overrides,
-                system,
-            };
-            let simulated = match driver::simulate_files(&files, &config) {
-                Ok(simulated) => simulated,
-                Err(diagnostics) => {
-                    report_diagnostics(&diagnostics, &driver::read_sources_for_diagnostics(&files));
-                    std::process::exit(1);
-                }
-            };
-            report_diagnostics(&simulated.lowered.diagnostics, &simulated.lowered.sources);
-            if has_error_diagnostics(&simulated.lowered.diagnostics) {
-                std::process::exit(1);
-            }
-            if let Some(path) = trace_artifact.as_ref() {
-                let artifact = crate::artifact::simulation_trace_artifact(
-                    simulated.result.clone(),
-                    &crate::artifact::SimulationArtifactConfig {
-                        slots_per_entity: slots,
-                        system: config.system.clone(),
-                    },
-                );
-                let bundle = crate::artifact::TraceArtifactBundle::new(
-                    &files,
-                    crate::artifact::ReplayInfo::from_current_process(),
-                    vec![artifact],
-                );
-                crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
-                println!("Trace artifact written to {}", path.display());
-            }
-            print!("{}", simulated.result.render_text());
-            if matches!(
-                simulated.result.termination,
-                crate::simulate::SimulationTermination::Deadlock { .. }
-            ) {
-                std::process::exit(1);
-            }
+            run_simulate_command(args)?;
         }
         Command::Trace(args) => {
-            let TraceArgs {
-                file,
-                artifact,
-                command,
-            } = args;
-            let bundle = crate::artifact::read_trace_artifact_bundle(&file)?;
-            match command.unwrap_or(TraceCommand::List) {
-                TraceCommand::List => {
-                    print!("{}", crate::artifact::render_trace_artifact_list(&bundle));
-                }
-                TraceCommand::Draw => {
-                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
-                        .map_err(|err| miette::miette!("{err}"))?;
-                    print!(
-                        "{}",
-                        crate::artifact::render_trace_artifact_draw(selected)
-                            .map_err(|err| miette::miette!("{err}"))?
-                    );
-                }
-                TraceCommand::State { index } => {
-                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
-                        .map_err(|err| miette::miette!("{err}"))?;
-                    print!(
-                        "{}",
-                        crate::artifact::render_trace_artifact_state(selected, index)
-                            .map_err(|err| miette::miette!("{err}"))?
-                    );
-                }
-                TraceCommand::Diff { from, to } => {
-                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
-                        .map_err(|err| miette::miette!("{err}"))?;
-                    print!(
-                        "{}",
-                        crate::artifact::render_trace_artifact_diff(selected, from, to)
-                            .map_err(|err| miette::miette!("{err}"))?
-                    );
-                }
-                TraceCommand::Json => {
-                    let selected = crate::artifact::select_trace_artifact(&bundle, artifact)
-                        .map_err(|err| miette::miette!("{err}"))?;
-                    println!(
-                        "{}",
-                        crate::artifact::render_trace_artifact_json(selected)
-                            .map_err(|err| miette::miette!("{err}"))?
-                    );
-                }
-            }
+            run_trace_command(args)?;
         }
         Command::Qa {
             script,
             spec_dir,
             format,
         } => {
-            let json_mode = format == "json";
-            let mut hooks = QaRunnerHooks;
-            let result = crate::qa::runner::run_qa_script_with_hooks(
-                &script,
-                spec_dir.as_deref(),
-                json_mode,
-                &mut hooks,
-            );
-            for line in &result.output {
-                println!("{line}");
-            }
-            if result.failed > 0 || result.executed == 0 {
-                if !json_mode {
-                    println!(
-                        "\n=== QA: {} passed, {} failed ({} executed) ===",
-                        result.passed, result.failed, result.executed
-                    );
-                }
-                std::process::exit(1);
-            }
-            if !json_mode {
-                println!(
-                    "\n=== QA: {} passed, {} failed ({} executed) ===",
-                    result.passed, result.failed, result.executed
-                );
-            }
+            run_qa_command(script, spec_dir, &format);
         }
         Command::Repl { path, scratch, vi } => {
             crate::repl::run_repl(path.as_deref(), scratch, vi);
@@ -779,6 +443,547 @@ pub fn run() -> miette::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_lex_command(file: PathBuf) -> miette::Result<()> {
+    let src = driver::read_file(&file)?;
+    let tokens = driver::lex_source(&src).map_err(|errors| errors.into_iter().next().unwrap())?;
+    for (token, span) in &tokens {
+        println!("{span:?}  {token}");
+    }
+    Ok(())
+}
+
+fn run_parse_command(file: PathBuf) -> miette::Result<()> {
+    let parsed = driver::parse_file(&file)?;
+    let program = parsed.program;
+    let diagnostics = parsed.diagnostics;
+    if !diagnostics.is_empty() {
+        report_diagnostics(&diagnostics, &[(file.display().to_string(), parsed.source)]);
+        std::process::exit(1);
+    }
+    println!("{program:#?}");
+    Ok(())
+}
+
+fn run_elaborate_command(files: Vec<PathBuf>) {
+    let elaborated = match driver::load_and_elaborate(&files) {
+        Ok(elaborated) => elaborated,
+        Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
+    };
+    report_diagnostics(&elaborated.diagnostics, &elaborated.sources);
+    if has_error_diagnostics(&elaborated.diagnostics) {
+        std::process::exit(1);
+    }
+    println!("{:#?}", elaborated.result);
+}
+
+fn run_emit_ir_command(files: Vec<PathBuf>) -> miette::Result<()> {
+    let lowered = match driver::lower_files(&files) {
+        Ok(lowered) => lowered,
+        Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
+    };
+    report_diagnostics(&lowered.diagnostics, &lowered.sources);
+    if has_error_diagnostics(&lowered.diagnostics) {
+        std::process::exit(1);
+    }
+    let json = crate::ir::emit_json(&lowered.ir_program)
+        .into_diagnostic()
+        .wrap_err("failed to serialize IR to JSON")?;
+    println!("{json}");
+    Ok(())
+}
+
+fn run_export_temporal_command(files: Vec<PathBuf>) -> miette::Result<()> {
+    let exported = match driver::export_temporal_files(&files) {
+        Ok(exported) => exported,
+        Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
+    };
+    report_diagnostics(&exported.lowered.diagnostics, &exported.lowered.sources);
+    if has_error_diagnostics(&exported.lowered.diagnostics) {
+        std::process::exit(1);
+    }
+    let json = serde_json::to_string_pretty(&exported.verifies)
+        .into_diagnostic()
+        .wrap_err("failed to serialize compiled temporal formulas")?;
+    println!("{json}");
+    Ok(())
+}
+
+fn exit_with_diagnostics<T>(diagnostics: &[Diagnostic], files: &[PathBuf]) -> T {
+    report_diagnostics(diagnostics, &driver::read_sources_for_diagnostics(files));
+    std::process::exit(1);
+}
+
+struct VerifyCommand {
+    files: Vec<PathBuf>,
+    solver: VerifySolver,
+    chc_solver: VerifyChcSolver,
+    timeouts: VerifyTimeouts,
+    mode: VerifyModeOptions,
+    solver_flags: VerifySolverFlags,
+    disabled_checks: VerifyDisabledChecks,
+    output: VerifyOutputOptions,
+    witness_semantics: VerifyWitnessSemantics,
+    target: Option<String>,
+}
+
+struct VerifyTimeouts {
+    overall: u64,
+    induction: u64,
+    bmc: u64,
+    ic3: u64,
+    prop_bmc_depth: usize,
+}
+
+struct VerifyModeOptions {
+    bounded_only: bool,
+    unbounded_only: bool,
+    bmc_iterative_deepening: bool,
+}
+
+struct VerifySolverFlags {
+    cvc5_sygus: bool,
+    relational_symmetry_breaking: bool,
+}
+
+struct VerifyDisabledChecks {
+    no_ic3: bool,
+    no_prop_verify: bool,
+    no_fn_verify: bool,
+}
+
+struct VerifyOutputOptions {
+    progress: bool,
+    verbose: bool,
+    debug_evidence: bool,
+    report: Option<Vec<String>>,
+    trace_artifact: Option<PathBuf>,
+}
+
+struct VerifyNames {
+    solver: String,
+    chc_solver: String,
+    witness_semantics: String,
+}
+
+fn run_verify_command(args: VerifyCommand) -> miette::Result<()> {
+    validate_verify_solver_options(&args)?;
+    let names = verify_names(&args);
+    let report_request = render::parse_verify_report_request(args.output.report.clone())?;
+    let config = build_verify_config(&args)?;
+    let verified = match driver::verify_files(&args.files, &config) {
+        Ok(verified) => verified,
+        Err(diagnostics) => {
+            write_failed_verify_report(&args, &names, report_request.as_ref(), &diagnostics)?;
+            exit_with_diagnostics(&diagnostics, &args.files)
+        }
+    };
+    report_diagnostics(&verified.lowered.diagnostics, &verified.lowered.sources);
+    let diagnostics = verified.lowered.diagnostics.clone();
+    if has_error_diagnostics(&diagnostics) {
+        write_verify_report(&args, &names, report_request.as_ref(), &diagnostics, &[])?;
+        std::process::exit(1);
+    }
+    let results = verified.results;
+    write_success_verify_report(
+        &args,
+        &names,
+        report_request.as_ref(),
+        &diagnostics,
+        &results,
+    )?;
+    write_verify_trace_artifact(&args, &names, &results)?;
+    report_verify_results(
+        &results,
+        &verified.lowered.sources,
+        args.output.verbose,
+        args.output.debug_evidence,
+    );
+    Ok(())
+}
+
+fn validate_verify_solver_options(args: &VerifyCommand) -> miette::Result<()> {
+    if args.solver_flags.cvc5_sygus
+        && !matches!(args.solver, VerifySolver::Cvc5 | VerifySolver::Both)
+    {
+        return Err(miette::miette!(
+            "--cvc5-sygus requires `--solver cvc5` or `--solver both`"
+        ));
+    }
+    if matches!(args.solver, VerifySolver::Cvc5 | VerifySolver::Both) && !cvc5_available() {
+        return Err(miette::miette!(
+            "requested solver `{}` is not available in this build",
+            match args.solver {
+                VerifySolver::Cvc5 => "cvc5",
+                VerifySolver::Both => "both",
+                VerifySolver::Z3 | VerifySolver::Auto => unreachable!(),
+            }
+        ));
+    }
+    if matches!(args.chc_solver, VerifyChcSolver::Cvc5) && !cvc5_available() {
+        return Err(miette::miette!(
+            "requested CHC solver `cvc5` is not available in this build"
+        ));
+    }
+    Ok(())
+}
+
+fn cvc5_available() -> bool {
+    crate::verify::solver::is_solver_family_available(crate::verify::solver::SolverFamily::Cvc5)
+}
+
+fn verify_names(args: &VerifyCommand) -> VerifyNames {
+    VerifyNames {
+        solver: format!("{:?}", args.solver).to_lowercase(),
+        chc_solver: format!("{:?}", args.chc_solver).to_lowercase(),
+        witness_semantics: format!("{:?}", args.witness_semantics).to_lowercase(),
+    }
+}
+
+fn build_verify_config(args: &VerifyCommand) -> miette::Result<crate::verify::VerifyConfig> {
+    let target = args
+        .target
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|err| miette::miette!("{err}"))?;
+    Ok(crate::verify::VerifyConfig {
+        solver_selection: solver_selection(args.solver),
+        chc_selection: chc_selection(args.chc_solver),
+        bounded_only: args.mode.bounded_only,
+        unbounded_only: args.mode.unbounded_only,
+        overall_timeout_ms: args.timeouts.overall.saturating_mul(1000),
+        induction_timeout_ms: args.timeouts.induction.saturating_mul(1000),
+        bmc_timeout_ms: args.timeouts.bmc.saturating_mul(1000),
+        bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
+        prop_bmc_depth: args.timeouts.prop_bmc_depth,
+        cvc5_sygus: args.solver_flags.cvc5_sygus,
+        ic3_timeout_ms: args.timeouts.ic3.saturating_mul(1000),
+        no_ic3: args.disabled_checks.no_ic3,
+        no_prop_verify: args.disabled_checks.no_prop_verify,
+        no_fn_verify: args.disabled_checks.no_fn_verify,
+        progress: args.output.progress,
+        witness_semantics: witness_semantics(args.witness_semantics),
+        relational_symmetry_breaking: args.solver_flags.relational_symmetry_breaking,
+        target,
+    })
+}
+
+fn solver_selection(solver: VerifySolver) -> crate::verify::SolverSelection {
+    match solver {
+        VerifySolver::Z3 => crate::verify::SolverSelection::Z3,
+        VerifySolver::Cvc5 => crate::verify::SolverSelection::Cvc5,
+        VerifySolver::Auto => crate::verify::SolverSelection::Auto,
+        VerifySolver::Both => crate::verify::SolverSelection::Both,
+    }
+}
+
+fn chc_selection(chc_solver: VerifyChcSolver) -> crate::verify::ChcSelection {
+    match chc_solver {
+        VerifyChcSolver::Z3 => crate::verify::ChcSelection::Z3,
+        VerifyChcSolver::Cvc5 => crate::verify::ChcSelection::Cvc5,
+        VerifyChcSolver::Auto => crate::verify::ChcSelection::Auto,
+    }
+}
+
+fn witness_semantics(witness_semantics: VerifyWitnessSemantics) -> crate::verify::WitnessSemantics {
+    match witness_semantics {
+        VerifyWitnessSemantics::Operational => crate::verify::WitnessSemantics::Operational,
+        VerifyWitnessSemantics::Relational => crate::verify::WitnessSemantics::Relational,
+    }
+}
+
+fn verify_report_config<'a>(
+    args: &'a VerifyCommand,
+    names: &'a VerifyNames,
+) -> render::VerificationReportConfig<'a> {
+    render::VerificationReportConfig {
+        solver: render::VerificationSolverConfig {
+            solver_name: &names.solver,
+            chc_solver_name: &names.chc_solver,
+        },
+        mode: render::VerificationModeConfig {
+            bounded_only: args.mode.bounded_only,
+            unbounded_only: args.mode.unbounded_only,
+            bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
+        },
+        timeouts: render::VerificationTimeoutConfig {
+            induction_secs: args.timeouts.induction,
+            bmc_secs: args.timeouts.bmc,
+            prop_bmc_depth: args.timeouts.prop_bmc_depth,
+            ic3_secs: args.timeouts.ic3,
+        },
+        disabled_checks: render::VerificationDisabledChecks {
+            no_ic3: args.disabled_checks.no_ic3,
+            no_prop_verify: args.disabled_checks.no_prop_verify,
+            no_fn_verify: args.disabled_checks.no_fn_verify,
+        },
+        progress: args.output.progress,
+        witness_semantics: &names.witness_semantics,
+        target: args.target.as_deref(),
+    }
+}
+
+fn write_failed_verify_report(
+    args: &VerifyCommand,
+    names: &VerifyNames,
+    request: Option<&render::VerifyReportRequest>,
+    diagnostics: &[Diagnostic],
+) -> miette::Result<()> {
+    if !contains_load_io_diagnostics(diagnostics) {
+        write_verify_report(args, names, request, diagnostics, &[])?;
+    }
+    Ok(())
+}
+
+fn write_verify_report(
+    args: &VerifyCommand,
+    names: &VerifyNames,
+    request: Option<&render::VerifyReportRequest>,
+    diagnostics: &[Diagnostic],
+    results: &[crate::verify::VerificationResult],
+) -> miette::Result<Option<PathBuf>> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let path = render::write_verification_report(render::VerificationReportInput {
+        request,
+        files: &args.files,
+        config: verify_report_config(args, names),
+        diagnostics,
+        results,
+    })?;
+    Ok(Some(path))
+}
+
+fn write_success_verify_report(
+    args: &VerifyCommand,
+    names: &VerifyNames,
+    request: Option<&render::VerifyReportRequest>,
+    diagnostics: &[Diagnostic],
+    results: &[crate::verify::VerificationResult],
+) -> miette::Result<()> {
+    if let Some(report_path) = write_verify_report(args, names, request, diagnostics, results)? {
+        println!("Report written to {}", report_path.display());
+    }
+    Ok(())
+}
+
+fn write_verify_trace_artifact(
+    args: &VerifyCommand,
+    names: &VerifyNames,
+    results: &[crate::verify::VerificationResult],
+) -> miette::Result<()> {
+    let Some(path) = args.output.trace_artifact.as_ref() else {
+        return Ok(());
+    };
+    let artifact_config = crate::artifact::VerifyArtifactConfig {
+        solver: &names.solver,
+        chc_solver: &names.chc_solver,
+        bounded_only: args.mode.bounded_only,
+        unbounded_only: args.mode.unbounded_only,
+        induction_timeout_ms: args.timeouts.induction.saturating_mul(1000),
+        bmc_timeout_ms: args.timeouts.bmc.saturating_mul(1000),
+        bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
+        ic3_timeout_ms: args.timeouts.ic3.saturating_mul(1000),
+        no_ic3: args.disabled_checks.no_ic3,
+        no_prop_verify: args.disabled_checks.no_prop_verify,
+        no_fn_verify: args.disabled_checks.no_fn_verify,
+        witness_semantics: &names.witness_semantics,
+        target: args.target.as_deref(),
+    };
+    let artifacts = crate::artifact::verification_trace_artifacts(results, &artifact_config);
+    let bundle = crate::artifact::TraceArtifactBundle::new(
+        &args.files,
+        crate::artifact::ReplayInfo::from_current_process(),
+        artifacts,
+    );
+    crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
+    println!(
+        "Trace artifact written to {} ({} artifact{})",
+        path.display(),
+        bundle.artifacts().len(),
+        if bundle.artifacts().len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    Ok(())
+}
+
+fn report_verify_results(
+    results: &[crate::verify::VerificationResult],
+    sources: &[(String, String)],
+    verbose: bool,
+    debug_evidence: bool,
+) {
+    if results.is_empty() {
+        println!("No verification targets found.");
+        return;
+    }
+    let mut all_passed = true;
+    for result in results {
+        render::report_verification_result(result, sources, verbose, debug_evidence);
+        if result.is_failure() {
+            all_passed = false;
+        }
+    }
+    if !all_passed {
+        std::process::exit(1);
+    }
+}
+
+fn run_simulate_command(args: SimulateArgs) -> miette::Result<()> {
+    let SimulateArgs {
+        files,
+        steps,
+        seed,
+        slots,
+        scope,
+        system,
+        trace_artifact,
+    } = args;
+    let config = crate::simulate::SimulateConfig {
+        steps,
+        seed,
+        slots_per_entity: slots,
+        entity_slot_overrides: parse_simulation_scope_overrides(&scope)?,
+        system,
+    };
+    let simulated = match driver::simulate_files(&files, &config) {
+        Ok(simulated) => simulated,
+        Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
+    };
+    report_diagnostics(&simulated.lowered.diagnostics, &simulated.lowered.sources);
+    if has_error_diagnostics(&simulated.lowered.diagnostics) {
+        std::process::exit(1);
+    }
+    write_simulation_trace_artifact(trace_artifact.as_ref(), &files, slots, &config, &simulated)?;
+    print!("{}", simulated.result.render_text());
+    if matches!(
+        simulated.result.termination,
+        crate::simulate::SimulationTermination::Deadlock { .. }
+    ) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn write_simulation_trace_artifact(
+    path: Option<&PathBuf>,
+    files: &[PathBuf],
+    slots: usize,
+    config: &crate::simulate::SimulateConfig,
+    simulated: &driver::SimulatedFiles,
+) -> miette::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let artifact = crate::artifact::simulation_trace_artifact(
+        simulated.result.clone(),
+        &crate::artifact::SimulationArtifactConfig {
+            slots_per_entity: slots,
+            system: config.system.clone(),
+        },
+    );
+    let bundle = crate::artifact::TraceArtifactBundle::new(
+        files,
+        crate::artifact::ReplayInfo::from_current_process(),
+        vec![artifact],
+    );
+    crate::artifact::write_trace_artifact_bundle(path, &bundle)?;
+    println!("Trace artifact written to {}", path.display());
+    Ok(())
+}
+
+fn run_trace_command(args: TraceArgs) -> miette::Result<()> {
+    let TraceArgs {
+        file,
+        artifact,
+        command,
+    } = args;
+    let bundle = crate::artifact::read_trace_artifact_bundle(&file)?;
+    match command.unwrap_or(TraceCommand::List) {
+        TraceCommand::List => print!("{}", crate::artifact::render_trace_artifact_list(&bundle)),
+        TraceCommand::Draw => print_selected_trace_artifact(&bundle, artifact, TraceRender::Draw)?,
+        TraceCommand::State { index } => {
+            print_selected_trace_artifact(&bundle, artifact, TraceRender::State(index))?;
+        }
+        TraceCommand::Diff { from, to } => {
+            print_selected_trace_artifact(&bundle, artifact, TraceRender::Diff(from, to))?;
+        }
+        TraceCommand::Json => print_selected_trace_artifact(&bundle, artifact, TraceRender::Json)?,
+    }
+    Ok(())
+}
+
+enum TraceRender {
+    Draw,
+    State(usize),
+    Diff(usize, usize),
+    Json,
+}
+
+fn print_selected_trace_artifact(
+    bundle: &crate::artifact::TraceArtifactBundle,
+    artifact: usize,
+    render: TraceRender,
+) -> miette::Result<()> {
+    let selected = crate::artifact::select_trace_artifact(bundle, artifact)
+        .map_err(|err| miette::miette!("{err}"))?;
+    match render {
+        TraceRender::Draw => print!(
+            "{}",
+            crate::artifact::render_trace_artifact_draw(selected)
+                .map_err(|err| miette::miette!("{err}"))?
+        ),
+        TraceRender::State(index) => print!(
+            "{}",
+            crate::artifact::render_trace_artifact_state(selected, index)
+                .map_err(|err| miette::miette!("{err}"))?
+        ),
+        TraceRender::Diff(from, to) => print!(
+            "{}",
+            crate::artifact::render_trace_artifact_diff(selected, from, to)
+                .map_err(|err| miette::miette!("{err}"))?
+        ),
+        TraceRender::Json => println!(
+            "{}",
+            crate::artifact::render_trace_artifact_json(selected)
+                .map_err(|err| miette::miette!("{err}"))?
+        ),
+    }
+    Ok(())
+}
+
+fn run_qa_command(script: PathBuf, spec_dir: Option<PathBuf>, format: &str) {
+    let json_mode = format == "json";
+    let mut hooks = QaRunnerHooks;
+    let result = crate::qa::runner::run_qa_script_with_hooks(
+        &script,
+        spec_dir.as_deref(),
+        json_mode,
+        &mut hooks,
+    );
+    for line in &result.output {
+        println!("{line}");
+    }
+    if result.failed > 0 || result.executed == 0 {
+        print_qa_summary(&result, json_mode);
+        std::process::exit(1);
+    }
+    print_qa_summary(&result, json_mode);
+}
+
+fn print_qa_summary(result: &crate::qa::runner::QARunResult, json_mode: bool) {
+    if !json_mode {
+        println!(
+            "\n=== QA: {} passed, {} failed ({} executed) ===",
+            result.passed, result.failed, result.executed
+        );
+    }
 }
 
 fn parse_simulation_scope_overrides(entries: &[String]) -> miette::Result<BTreeMap<String, usize>> {

@@ -18,14 +18,20 @@ pub enum WitnessPayload {
 }
 
 impl WitnessPayload {
+    /// Wraps an operational witness (counterexample trace, scene
+    /// witness, etc.).
     pub fn operational(witness: op::OperationalWitness) -> Self {
         Self::Operational(witness)
     }
 
+    /// Wraps a relational witness (SAT scene / snapshot model).
     pub fn relational(witness: rel::RelationalWitness) -> Self {
         Self::Relational(witness)
     }
 
+    /// Re-runs structural invariants against the contained witness.
+    /// Use this at importer boundaries; in-process constructions go
+    /// through checked builders that have already validated.
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::Operational(witness) => witness.validate().map_err(ValidationError::Operational),
@@ -33,6 +39,8 @@ impl WitnessPayload {
         }
     }
 
+    /// Returns the operational witness if this payload is operational,
+    /// otherwise `None`.
     pub fn as_operational(&self) -> Option<&op::OperationalWitness> {
         match self {
             Self::Operational(witness) => Some(witness),
@@ -40,6 +48,8 @@ impl WitnessPayload {
         }
     }
 
+    /// Returns the relational witness if this payload is relational,
+    /// otherwise `None`.
     pub fn as_relational(&self) -> Option<&rel::RelationalWitness> {
         match self {
             Self::Operational(_) => None,
@@ -58,41 +68,55 @@ pub struct WitnessEnvelope {
 }
 
 impl WitnessEnvelope {
+    /// Wraps `payload` into a validated envelope, returning a
+    /// validation error if the payload's invariants do not hold.
     pub fn new(payload: WitnessPayload) -> Result<Self, ValidationError> {
         payload.validate()?;
         Ok(Self { payload })
     }
 
+    /// Convenience constructor: wraps an operational witness directly.
     pub fn operational(witness: op::OperationalWitness) -> Result<Self, ValidationError> {
         Self::new(WitnessPayload::operational(witness))
     }
 
+    /// Convenience constructor: wraps a relational witness directly.
     pub fn relational(witness: rel::RelationalWitness) -> Result<Self, ValidationError> {
         Self::new(WitnessPayload::relational(witness))
     }
 
+    /// Borrows the contained payload.
     pub fn payload(&self) -> &WitnessPayload {
         &self.payload
     }
 
+    /// Returns the operational witness if any.
     pub fn as_operational(&self) -> Option<&op::OperationalWitness> {
         self.payload.as_operational()
     }
 
+    /// Returns the relational witness if any.
     pub fn as_relational(&self) -> Option<&rel::RelationalWitness> {
         self.payload.as_relational()
     }
 
+    /// Re-validates the payload. Cheap if the envelope was built via
+    /// [`Self::new`], but provided for callers re-checking after
+    /// mutation through an opaque path.
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.payload.validate()
     }
 
+    /// Parses an envelope from JSON and validates it in one step,
+    /// keeping the deserialization error and validation error
+    /// distinguishable via [`ValidatedJsonError`].
     pub fn from_json_validated(json: &str) -> Result<Self, ValidatedJsonError<ValidationError>> {
         let envelope: Self = serde_json::from_str(json).map_err(ValidatedJsonError::deserialize)?;
         envelope.validate().map_err(ValidatedJsonError::validate)?;
         Ok(envelope)
     }
 
+    /// Streaming variant of [`Self::from_json_validated`].
     pub fn from_json_reader_validated<R: Read>(
         reader: R,
     ) -> Result<Self, ValidatedJsonError<ValidationError>> {
@@ -103,9 +127,12 @@ impl WitnessEnvelope {
     }
 }
 
+/// Top-level error returned by [`WitnessPayload::validate`] / [`WitnessEnvelope::validate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// Operational-witness validation failure.
     Operational(op::ValidationError),
+    /// Relational-witness validation failure.
     Relational(rel::ValidationError),
 }
 

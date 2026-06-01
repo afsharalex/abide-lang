@@ -1,3 +1,21 @@
+//! Operational witnesses — concrete (state, transition, state, …)
+//! sequences produced by the verifier when an obligation fails (or by
+//! a scene when it succeeds).
+//!
+//! The shape is:
+//!
+//! ```text
+//! Behavior = [State, Transition, State, Transition, … State]
+//! Transition = one or more AtomicSteps (event firings) + observations
+//! AtomicStep = system::command + Choice + StepRelation rewrites
+//! State      = per-EntitySlot state + per-system field values
+//! ```
+//!
+//! All public types use checked constructors / builders. The
+//! `validate()` method on [`OperationalWitness`] re-asserts every
+//! invariant — it is run at importer boundaries by
+//! [`crate::WitnessEnvelope`].
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -5,7 +23,10 @@ pub use crate::value::{EntitySlotRef, WitnessValue};
 use abide_core::span::Span;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Concrete state of a single entity slot.
+/// Concrete state of a single entity slot at one [`State`].
+///
+/// `active` distinguishes a slot that has been allocated but not yet
+/// initialized from one carrying real field values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityState {
     active: bool,
@@ -185,23 +206,32 @@ impl Binding {
 }
 
 /// Nondeterministic choice made during an atomic step.
+///
+/// Captures the surface-language constructs that introduce
+/// nondeterminism so the witness can pin down exactly which entity (or
+/// entities) the step touched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Choice {
+    /// `choose x: T` — one entity selected from a store.
     Choose {
         binder: String,
         selected: EntitySlotRef,
     },
+    /// `for x in T` — iteration over many entities at this step.
     ForAll {
         binder: String,
         iterated: Vec<EntitySlotRef>,
     },
-    Create {
-        created: EntitySlotRef,
-    },
+    /// `create T(...)` — a freshly allocated entity.
+    Create { created: EntitySlotRef },
 }
 
 /// Stable identifier for an atomic step inside a transition.
+///
+/// Used to link [`StepRelation`] entries to the [`AtomicStep`]s they
+/// constrain; cross-step references inside one transition resolve
+/// through this id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AtomicStepId(String);
 
@@ -220,6 +250,12 @@ impl AtomicStepId {
 }
 
 /// One atomic operational step inside a witness transition.
+///
+/// An atomic step is the firing of one `system::command`, carrying
+/// concrete parameter bindings, any nondeterministic [`Choice`]s the
+/// step made, and the optional return value. Multiple atomic steps may
+/// appear in a single [`Transition`] when composed via `&` (same-step)
+/// or `||` (concurrent) in the source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtomicStep {
     id: AtomicStepId,
@@ -333,17 +369,25 @@ impl AtomicStepBuilder {
 }
 
 /// Explicit relation among atomic steps in a single transition.
+///
+/// Mirrors the surface composition operators:
+/// - `Ordered` ↔ `->` (sequence within a single transition's bundle)
+/// - `SameStep` ↔ `&` (must fire in the same step)
+/// - `Concurrent` ↔ `||` (interleaving is unconstrained)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepRelation {
+    /// `before` precedes `after`.
     Ordered {
         before: AtomicStepId,
         after: AtomicStepId,
     },
+    /// Both steps fire as part of the same step.
     SameStep {
         first: AtomicStepId,
         second: AtomicStepId,
     },
+    /// Steps may be concurrent; no ordering is asserted.
     Concurrent {
         first: AtomicStepId,
         second: AtomicStepId,
@@ -668,11 +712,21 @@ impl LassoWitness {
 }
 
 /// First-class operational witness object produced by verification.
+///
+/// Variant selection encodes the kind of failure (or scene success)
+/// being represented:
+/// - `Counterexample` — a finite trace that violates a safety property.
+/// - `Deadlock` — same trace ending in a state with no enabled steps.
+/// - `Liveness` — a lasso (finite stem + cycle) witnessing a liveness
+///   counterexample (the loop revisits `loop_start` indefinitely).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationalWitness {
+    /// Safety counterexample.
     Counterexample { behavior: Behavior },
+    /// Deadlock witness — terminal state with no enabled steps.
     Deadlock { witness: DeadlockWitness },
+    /// Liveness counterexample (lasso).
     Liveness { witness: LassoWitness },
 }
 
@@ -763,19 +817,37 @@ impl WitnessOrigin {
     }
 }
 
+/// Errors produced when constructing or validating an operational
+/// witness.
+///
+/// Most variants check shape invariants enforced by the builders;
+/// `TransitionCount` and `LoopStart` are the two structural mismatches
+/// that can only be caught after the full payload is in hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    /// Witness has no states at all where one was required.
     EmptyBehavior,
+    /// Transitions were supplied but no states.
     TransitionsWithoutStates,
+    /// `states.len() - 1 != transitions.len()`.
     TransitionCount { states: usize, transitions: usize },
+    /// `AtomicStepId` constructor saw an empty string.
     EmptyAtomicStepId,
+    /// `AtomicStepBuilder` left the system name empty.
     EmptySystemName,
+    /// `AtomicStepBuilder` left the command name empty.
     EmptyCommandName,
+    /// A [`Binding`] was constructed with an empty name.
     EmptyBindingName,
+    /// A [`TransitionObservation`] was constructed with an empty name.
     EmptyObservationName,
+    /// [`WitnessOrigin::new`] received an empty backend label.
     EmptyBackendName,
+    /// Two atomic steps in the same transition share an id.
     DuplicateAtomicStepId(String),
+    /// A [`StepRelation`] referenced an unknown atomic step id.
     UnknownAtomicStepRef(String),
+    /// Liveness `loop_start` index points past the end of the states.
     LoopStart { loop_start: usize, states: usize },
 }
 

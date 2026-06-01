@@ -981,33 +981,13 @@ fn validate_crosscalls_in_actions(
                 validate_crosscalls_in_actions(ctx, body, errors, &mut scoped_return_types);
             }
             EEventAction::LetCrossCall(name, target, command, args) => {
-                validate_crosscall_target(
-                    ctx.env,
-                    ctx.system_name,
-                    ctx.sys_ctx,
-                    ctx.deps,
-                    target,
-                    command,
-                    args,
-                    errors,
-                    ctx.fallback_span,
-                );
+                validate_crosscall_target(ctx, target, command, args, errors);
                 if let Some(return_type) = command_return_type(ctx.env, target, command) {
                     local_return_types.insert(name.clone(), return_type.clone());
                 }
             }
             EEventAction::CrossCall(target, command, args) => {
-                validate_crosscall_target(
-                    ctx.env,
-                    ctx.system_name,
-                    ctx.sys_ctx,
-                    ctx.deps,
-                    target,
-                    command,
-                    args,
-                    errors,
-                    ctx.fallback_span,
-                );
+                validate_crosscall_target(ctx, target, command, args, errors);
             }
             EEventAction::Match(scrutinee, arms) => {
                 let scrutinee_ty = match scrutinee {
@@ -1034,17 +1014,7 @@ fn validate_crosscalls_in_actions(
                     }
                 }
                 if let EMatchScrutinee::CrossCall(target, command, args) = scrutinee {
-                    validate_crosscall_target(
-                        ctx.env,
-                        ctx.system_name,
-                        ctx.sys_ctx,
-                        ctx.deps,
-                        target,
-                        command,
-                        args,
-                        errors,
-                        ctx.fallback_span,
-                    );
+                    validate_crosscall_target(ctx, target, command, args, errors);
                 }
                 for arm in arms {
                     let mut scoped_return_types = local_return_types.clone();
@@ -1079,44 +1049,44 @@ fn command_return_type<'a>(env: &'a Env, target: &str, command: &str) -> Option<
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_crosscall_target(
-    env: &Env,
-    system_name: &str,
-    sys_ctx: &str,
-    deps: &[String],
+    ctx: &CrossCallValidationCtx<'_>,
     target: &str,
     command: &str,
     args: &[EExpr],
     errors: &mut Vec<ElabError>,
-    fallback_span: Option<crate::span::Span>,
 ) {
-    let is_system = env.systems.contains_key(target);
-    let is_extern = env.externs.contains_key(target);
-    let span = fallback_span.unwrap_or(crate::span::Span { start: 0, end: 0 });
+    let is_system = ctx.env.systems.contains_key(target);
+    let is_extern = ctx.env.externs.contains_key(target);
+    let span = ctx
+        .fallback_span
+        .unwrap_or(crate::span::Span { start: 0, end: 0 });
 
     if is_system && is_extern {
         errors.push(ElabError::with_span(
             ErrorKind::AmbiguousRef,
             format!("cross-call target `{target}` is ambiguous between a system and an extern"),
-            sys_ctx,
+            ctx.sys_ctx,
             span,
         ));
         return;
     }
 
     if is_extern {
-        if !deps.iter().any(|dep| dep == target) {
+        if !ctx.deps.iter().any(|dep| dep == target) {
             errors.push(ElabError::with_span(
                 ErrorKind::InvalidScope,
-                format!("system `{system_name}` calls extern `{target}` without declaring `dep {target}`"),
-                sys_ctx,
+                format!(
+                    "system `{}` calls extern `{target}` without declaring `dep {target}`",
+                    ctx.system_name
+                ),
+                ctx.sys_ctx,
                 span,
             ));
             return;
         }
 
-        if let Some(ext) = env.externs.get(target) {
+        if let Some(ext) = ctx.env.externs.get(target) {
             match ext.commands.iter().find(|c| c.name == command) {
                 Some(cmd) => {
                     if cmd.params.len() != args.len() {
@@ -1127,7 +1097,7 @@ fn validate_crosscall_target(
                                 cmd.params.len(),
                                 args.len()
                             ),
-                            sys_ctx,
+                            ctx.sys_ctx,
                             span,
                         ));
                     }
@@ -1135,13 +1105,13 @@ fn validate_crosscall_target(
                 None => errors.push(ElabError::with_span(
                     ErrorKind::UndefinedRef,
                     format!("extern `{target}` has no command `{command}`"),
-                    sys_ctx,
+                    ctx.sys_ctx,
                     span,
                 )),
             }
         }
     } else if is_system {
-        if let Some(target_sys) = env.systems.get(target) {
+        if let Some(target_sys) = ctx.env.systems.get(target) {
             if let Some(cmd) = target_sys.commands.iter().find(|cmd| cmd.name == *command) {
                 if cmd.params.len() != args.len() {
                     errors.push(ElabError::with_span(
@@ -1151,7 +1121,7 @@ fn validate_crosscall_target(
                             cmd.params.len(),
                             args.len()
                         ),
-                        sys_ctx,
+                        ctx.sys_ctx,
                         span,
                     ));
                 }
@@ -1159,7 +1129,7 @@ fn validate_crosscall_target(
                 errors.push(ElabError::with_span(
                     ErrorKind::UndefinedRef,
                     format!("system `{target}` has no command `{command}`"),
-                    sys_ctx,
+                    ctx.sys_ctx,
                     span,
                 ));
             }
@@ -1168,7 +1138,7 @@ fn validate_crosscall_target(
         errors.push(ElabError::with_span(
             ErrorKind::UndefinedRef,
             format!("cross-call target `{target}` is not a known system or extern"),
-            sys_ctx,
+            ctx.sys_ctx,
             span,
         ));
     }

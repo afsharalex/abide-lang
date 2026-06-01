@@ -1,4 +1,4 @@
-use super::nested::try_encode_nested_op;
+use super::nested::{try_encode_nested_op, NestedOpCtx};
 use super::*;
 
 #[derive(Clone)]
@@ -9,7 +9,37 @@ pub(super) struct MacroBranch {
     return_value: Option<SmtValue>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+pub(super) struct StepEncodingCtx<'a> {
+    pool: &'a SlotPool,
+    vctx: &'a VerifyContext,
+    entities: &'a [IREntity],
+    all_systems: &'a [IRSystem],
+    step: usize,
+    depth: usize,
+}
+
+pub(crate) struct StepEncodingOptions {
+    pub(crate) depth: usize,
+    pub(crate) override_params: Option<HashMap<String, SmtValue>>,
+}
+
+impl StepEncodingOptions {
+    pub(crate) fn root() -> Self {
+        Self {
+            depth: 0,
+            override_params: None,
+        }
+    }
+
+    pub(crate) fn with_override(depth: usize, override_params: HashMap<String, SmtValue>) -> Self {
+        Self {
+            depth,
+            override_params: Some(override_params),
+        }
+    }
+}
+
 pub(super) fn contains_macro_actions(actions: &[IRAction]) -> bool {
     actions.iter().any(|action| match action {
         IRAction::LetCrossCall { .. } | IRAction::Match { .. } => true,
@@ -18,7 +48,6 @@ pub(super) fn contains_macro_actions(actions: &[IRAction]) -> bool {
     })
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn try_encode_step_inner(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -26,1118 +55,1110 @@ pub(crate) fn try_encode_step_inner(
     all_systems: &[IRSystem],
     event: &IRSystemAction,
     step: usize,
-    depth: usize,
-    override_params: Option<HashMap<String, SmtValue>>,
+    options: StepEncodingOptions,
 ) -> Result<(Bool, HashSet<(String, usize)>), String> {
-    try_encode_step_inner_branching(
+    let ctx = StepEncodingCtx {
         pool,
         vctx,
         entities,
         all_systems,
-        event,
         step,
-        depth,
-        override_params,
-    )
+        depth: options.depth,
+    };
+    try_encode_step_inner_branching(&ctx, event, options.override_params)
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn try_encode_step_inner_legacy(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
+    ctx: &StepEncodingCtx<'_>,
     event: &IRSystemAction,
-    step: usize,
-    depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
 ) -> Result<(Bool, HashSet<(String, usize)>), String> {
-    if depth > 10 {
+    validate_legacy_step_context(ctx)?;
+    let scope = step_scope_metadata(ctx.all_systems, event);
+    let mut state = LegacyStepState::new(event, override_params, ctx.step, &scope);
+    if let Some(guard) = encode_legacy_event_guard(ctx, event, &scope, &state.step_params)? {
+        state.conjuncts.push(guard);
+    }
+    let action_ctx = LegacyActionCtx {
+        step: *ctx,
+        scope: &scope,
+    };
+    for action in &event.body {
+        encode_legacy_action(&action_ctx, &mut state, action)?;
+    }
+    Ok((legacy_formula(state.conjuncts), state.touched))
+}
+
+struct LegacyStepState {
+    conjuncts: Vec<Bool>,
+    touched: HashSet<(String, usize)>,
+    chain_id: usize,
+    step_params: HashMap<String, SmtValue>,
+    var_to_entity: HashMap<String, String>,
+    choose_var_params: HashMap<String, SmtValue>,
+}
+
+impl LegacyStepState {
+    fn new(
+        event: &IRSystemAction,
+        override_params: Option<HashMap<String, SmtValue>>,
+        step: usize,
+        scope: &StepScopeMetadata,
+    ) -> Self {
+        Self {
+            conjuncts: Vec::new(),
+            touched: HashSet::new(),
+            chain_id: 0,
+            step_params: override_params.unwrap_or_else(|| build_step_params(&event.params, step)),
+            var_to_entity: scope.entity_param_types.clone(),
+            choose_var_params: HashMap::new(),
+        }
+    }
+
+    fn merged_params(&self) -> HashMap<String, SmtValue> {
+        let mut params = self.step_params.clone();
+        params.extend(self.choose_var_params.clone());
+        params
+    }
+
+    fn mark_entity_slots(&mut self, entity: &str, n_slots: usize) {
+        for slot in 0..n_slots {
+            self.touched.insert((entity.to_owned(), slot));
+        }
+    }
+}
+
+struct LegacyActionCtx<'a> {
+    step: StepEncodingCtx<'a>,
+    scope: &'a StepScopeMetadata,
+}
+
+type LegacyNestedEncoding = (Vec<Bool>, HashSet<(String, usize)>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyBoundKind {
+    Choose,
+    ForAll,
+}
+
+#[derive(Clone, Copy)]
+struct LegacyBoundSlot<'a> {
+    kind: LegacyBoundKind,
+    var: &'a str,
+    entity_name: &'a str,
+    entity: &'a IREntity,
+    slot: usize,
+    ops: &'a [IRAction],
+}
+
+#[derive(Clone, Copy)]
+struct LegacyBoundApply<'a> {
+    transition: &'a str,
+    args: &'a [IRExpr],
+    refs: &'a [String],
+}
+
+fn validate_legacy_step_context(ctx: &StepEncodingCtx<'_>) -> Result<(), String> {
+    if ctx.depth > 10 {
         return Err(format!(
-            "CrossCall recursion depth exceeded (depth {depth}) — possible cyclic cross-system calls"
+            "CrossCall recursion depth exceeded (depth {}) — possible cyclic cross-system calls",
+            ctx.depth
         ));
     }
-    if step >= pool.bound {
+    if ctx.step >= ctx.pool.bound {
         return Err(format!(
-            "step {step} out of bounds for bound {}",
-            pool.bound
+            "step {} out of bounds for bound {}",
+            ctx.step, ctx.pool.bound
         ));
     }
+    Ok(())
+}
 
-    let mut conjuncts = Vec::new();
-    // Track which entity types have ALL their slots handled internally
-    // (Choose/ForAll/bare Apply do their own per-slot framing).
-    let mut touched: HashSet<(String, usize)> = HashSet::new();
-    // Counter for unique chain instance IDs (prevents aliasing when
-    // multiple Choose blocks reuse the same var name in one step).
-    let mut chain_id: usize = 0;
-
-    // Build event parameter Z3 variables once per step, share across all contexts.
-    // If override_params is provided (e.g., from CrossCall), use those instead
-    // so that the caller's argument values are wired into this event.
-    let step_params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
-
-    // build entity param type info for the guard/body encoders.
-    // Maps entity-typed param names to their entity type so that
-    // Field(Var("item"), "status") can resolve at any step by looking up
-    // the param's entity slot in the pool.
-    let entity_param_types: HashMap<String, String> = event
-        .params
-        .iter()
-        .filter_map(|p| match &p.ty {
-            IRType::Entity { name } => Some((p.name.clone(), name.clone())),
-            _ => None,
-        })
-        .collect();
-
-    // derive the owning system for system field and store parameter resolution.
-    let owning_system = all_systems.iter().find(|s| {
-        s.actions
-            .iter()
-            .any(|st| std::ptr::eq(st, event) || st.name == event.name)
-    });
-    let owning_system_name: String = owning_system.map(|s| s.name.clone()).unwrap_or_default();
-    let store_param_types: HashMap<String, String> = owning_system
-        .map(|s| {
-            s.store_params
-                .iter()
-                .map(|p| (p.name.clone(), p.entity_type.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Event guard encoding with support for quantifiers over entity slots.
-    // For guards that are trivially `true`, skip encoding.
-    // For non-trivial guards, use `encode_guard_expr` which handles:
-    // - Quantifiers (`exists o: Order |...`, `forall o: Order |...`) by
-    // expanding over active slots
-    // - Boolean connectives by recursing
-    // - Param-only or literal guards via `encode_slot_expr` with event params
-    if !matches!(
+fn encode_legacy_event_guard(
+    ctx: &StepEncodingCtx<'_>,
+    event: &IRSystemAction,
+    scope: &StepScopeMetadata,
+    step_params: &HashMap<String, SmtValue>,
+) -> Result<Option<Bool>, String> {
+    if matches!(
         &event.guard,
         IRExpr::Lit {
             value: LitVal::Bool { value: true },
             ..
         }
     ) {
-        let guard = if owning_system_name.is_empty() {
-            try_encode_guard_expr(
-                pool,
-                vctx,
-                &event.guard,
-                &step_params,
-                &store_param_types,
-                step,
-            )
-        } else {
-            try_encode_guard_expr_for_system(
-                pool,
-                vctx,
-                &event.guard,
-                &step_params,
-                step,
-                &owning_system_name,
-                &entity_param_types,
-                &store_param_types,
-            )
-        }?;
-        conjuncts.push(guard);
+        return Ok(None);
     }
+    let guard = if scope.owning_system_name.is_empty() {
+        try_encode_guard_expr(
+            ctx.pool,
+            ctx.vctx,
+            &event.guard,
+            step_params,
+            &scope.store_param_types,
+            ctx.step,
+        )
+    } else {
+        try_encode_guard_expr_for_system(
+            ctx.pool,
+            ctx.vctx,
+            &event.guard,
+            ctx.step,
+            SystemGuardScope {
+                step_params,
+                system_name: &scope.owning_system_name,
+                entity_param_types: &scope.entity_param_types,
+                store_param_types: &scope.store_param_types,
+            },
+        )
+    }?;
+    Ok(Some(guard))
+}
 
-    // Map Choose-bound variable names to their entity types for Apply target resolution.
-    let mut var_to_entity: HashMap<String, String> = HashMap::new();
-
-    // Populate var_to_entity from event params with entity types
-    for p in &event.params {
-        if let IRType::Entity { name } = &p.ty {
-            var_to_entity.insert(p.name.clone(), name.clone());
+fn encode_legacy_action(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    action: &IRAction,
+) -> Result<(), String> {
+    match action {
+        IRAction::Choose {
+            var,
+            entity,
+            filter,
+            ops,
+        } => encode_legacy_choose(ctx, state, var, entity, filter, ops),
+        IRAction::Apply {
+            target,
+            transition,
+            args,
+            refs,
+        } => encode_legacy_apply(ctx, state, target, transition, args, refs),
+        IRAction::Create { entity, fields } => encode_legacy_create(ctx, state, entity, fields),
+        IRAction::ForAll { var, entity, ops } => encode_legacy_forall(ctx, state, var, entity, ops),
+        IRAction::CrossCall {
+            system,
+            command,
+            args,
+        } => encode_legacy_cross_call(ctx, state, system, command, args),
+        IRAction::ExprStmt { expr } => encode_legacy_expr_stmt(ctx, state, expr),
+        IRAction::LetCrossCall { .. } | IRAction::Match { .. } => {
+            Err("internal: macro-step actions reached legacy step encoder".to_owned())
         }
     }
+}
 
-    // Accumulated Choose variable params: after a `choose r: Reservation...`
-    // is encoded, fresh Z3 variables for `r`'s fields are created and
-    // constrained to match the chosen slot. Subsequent actions can then
-    // reference `r.product_id` via these shared variables without requiring
-    // a cross-product of slot assignments.
-    let mut choose_var_params: HashMap<String, SmtValue> = HashMap::new();
-
-    for action in &event.body {
-        match action {
-            // Per-slot framing in Choose.
-            // Each disjunct includes framing for all OTHER slots of the same entity,
-            // so non-selected slots cannot take arbitrary values.
-            //
-            // After encoding, creates shared Z3 variables for the Choose-bound
-            // variable's entity fields, constrained to the chosen slot's values.
-            // This enables subsequent Choose blocks to reference cross-entity
-            // fields (e.g., `r.product_id`) efficiently.
-            IRAction::Choose {
-                var,
-                entity: ent_name,
+fn encode_legacy_choose(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    var: &str,
+    entity_name: &str,
+    filter: &IRExpr,
+    ops: &[IRAction],
+) -> Result<(), String> {
+    state
+        .var_to_entity
+        .insert(var.to_owned(), entity_name.to_owned());
+    let n_slots = ctx.step.pool.slots_for(entity_name);
+    let entity = ctx.step.entities.iter().find(|e| e.name == *entity_name);
+    let params = state.merged_params();
+    let mut slot_options = Vec::new();
+    let mut nested_touched = HashSet::new();
+    for slot in 0..n_slots {
+        if let Some(entity) = entity {
+            slot_options.push(encode_legacy_choose_slot(
+                ctx,
+                state,
+                LegacyBoundSlot {
+                    kind: LegacyBoundKind::Choose,
+                    var,
+                    entity_name,
+                    entity,
+                    slot,
+                    ops,
+                },
                 filter,
-                ops,
-            } => {
-                // Track var → entity mapping for Apply target resolution
-                var_to_entity.insert(var.clone(), ent_name.clone());
+                &params,
+                &mut nested_touched,
+            )?);
+        }
+    }
+    if !slot_options.is_empty() {
+        state.conjuncts.push(bool_or_all(slot_options));
+        state.mark_entity_slots(entity_name, n_slots);
+    }
+    state.touched.extend(nested_touched);
+    if let Some(entity) = entity {
+        register_legacy_choose_params(state, var, entity, ctx.step.step);
+    }
+    Ok(())
+}
 
-                let n_slots = pool.slots_for(ent_name);
-                let entity_ir = entities.iter().find(|e| e.name == *ent_name);
-                let mut slot_options = Vec::new();
+fn encode_legacy_choose_slot(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    filter: &IRExpr,
+    params: &HashMap<String, SmtValue>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<Bool, String> {
+    let slot_ctx = legacy_slot_ctx(ctx, bound.entity_name, bound.slot, params.clone(), "");
+    let mut parts = Vec::new();
+    if let Some(SmtValue::Bool(active)) =
+        ctx.step
+            .pool
+            .active_at(bound.entity_name, bound.slot, ctx.step.step)
+    {
+        parts.push(active.clone());
+    }
+    parts.push(try_encode_slot_expr(&slot_ctx, filter, ctx.step.step)?.to_bool()?);
+    encode_legacy_bound_ops(
+        ctx,
+        state,
+        bound,
+        &slot_ctx,
+        params,
+        &mut parts,
+        nested_touched,
+    )?;
+    constrain_legacy_choose_slot_params(ctx, bound, &mut parts);
+    parts.extend(frame_entity_slots_except(
+        ctx.step.pool,
+        bound.entity,
+        bound.slot,
+        ctx.step.step,
+    ));
+    Ok(and_all(parts))
+}
 
-                // Merge event params with accumulated Choose variable params
-                let mut merged_params = step_params.clone();
-                merged_params.extend(choose_var_params.clone());
-                let mut nested_touched: HashSet<(String, usize)> = HashSet::new();
+fn register_legacy_choose_params(
+    state: &mut LegacyStepState,
+    var: &str,
+    entity: &IREntity,
+    step: usize,
+) {
+    for field in &entity.fields {
+        let shared_name = format!("choose_{var}_{}_t{step}", field.name);
+        let shared_var = legacy_fresh_field_value(&shared_name, &field.ty);
+        state
+            .choose_var_params
+            .insert(format!("{var}.{}", field.name), shared_var);
+    }
+}
 
-                for slot in 0..n_slots {
-                    let ctx = SlotEncodeCtx {
-                        pool,
-                        vctx,
-                        entity: ent_name,
-                        slot,
-                        params: merged_params.clone(),
-                        bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &entity_param_types,
-                        store_param_types: &store_param_types,
-                    };
-
-                    let mut slot_conjuncts = Vec::new();
-
-                    // Must be active
-                    if let Some(SmtValue::Bool(active)) = pool.active_at(ent_name, slot, step) {
-                        slot_conjuncts.push(active.clone());
-                    }
-
-                    // Filter must hold
-                    let filt = try_encode_slot_expr(&ctx, filter, step)?;
-                    slot_conjuncts.push(filt.to_bool()?);
-
-                    // Apply nested ops — detect multi-apply chains and use
-                    // intermediate variables for sequential composition.
-                    if let Some(ent) = entity_ir {
-                        // Collect Apply ops targeting the Choose-bound entity
-                        let same_entity_applies: Vec<_> = ops
-                            .iter()
-                            .filter_map(|op| {
-                                if let IRAction::Apply {
-                                    target,
-                                    transition,
-                                    args,
-                                    refs: apply_refs,
-                                } = op
-                                {
-                                    if target == var {
-                                        return Some((transition, args, apply_refs));
-                                    }
-                                }
-                                None
-                            })
-                            .collect();
-
-                        if same_entity_applies.len() <= 1 {
-                            // Single Apply — use standard encoding
-                            for op in ops {
-                                match op {
-                                    IRAction::Apply {
-                                        transition,
-                                        args,
-                                        refs: apply_refs,
-                                        ..
-                                    } => {
-                                        if let Some(trans) =
-                                            ent.transitions.iter().find(|t| t.name == *transition)
-                                        {
-                                            let action_params = try_build_apply_params(
-                                                &ctx, trans, args, apply_refs, step,
-                                            )?;
-                                            let action_formula = try_encode_action(
-                                                pool,
-                                                vctx,
-                                                ent,
-                                                trans,
-                                                slot,
-                                                step,
-                                                &action_params,
-                                            )?;
-                                            slot_conjuncts.push(action_formula);
-                                        }
-                                    }
-                                    _ => {
-                                        if let Some(ent) = entity_ir {
-                                            let (nested_f, nested_t) = try_encode_nested_op(
-                                                pool,
-                                                vctx,
-                                                entities,
-                                                all_systems,
-                                                op,
-                                                var,
-                                                ent_name,
-                                                ent,
-                                                slot,
-                                                step,
-                                                &merged_params,
-                                                depth,
-                                                &[],
-                                            )?;
-                                            slot_conjuncts.extend(nested_f);
-                                            nested_touched.extend(nested_t);
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // Multi-apply chain — create intermediate variables.
-                            // Chain: step_k → inter_0 → inter_1 →... → step_k+1
-                            let n_applies = same_entity_applies.len();
-
-                            // Build variable maps for each stage
-                            // Stage 0 reads: step k fields
-                            // Stage i writes: intermediate_i (or step k+1 if last)
-                            let read_step_k: HashMap<String, SmtValue> = ent
-                                .fields
-                                .iter()
-                                .filter_map(|f| {
-                                    pool.field_at(ent_name, slot, &f.name, step)
-                                        .map(|v| (f.name.clone(), v.clone()))
-                                })
-                                .collect();
-
-                            let write_step_k1: HashMap<String, SmtValue> = ent
-                                .fields
-                                .iter()
-                                .filter_map(|f| {
-                                    pool.field_at(ent_name, slot, &f.name, step + 1)
-                                        .map(|v| (f.name.clone(), v.clone()))
-                                })
-                                .collect();
-
-                            // Create N-1 intermediate variable maps
-                            let intermediates: Vec<HashMap<String, SmtValue>> = (0..n_applies - 1)
-                                .map(|i| {
-                                    ent.fields
-                                        .iter()
-                                        .map(|f| {
- // Fully scoped: entity, slot, field, step,
- // chain instance ID, and stage index.
- // Prevents aliasing across steps, events,
- // and multiple Choose blocks with same var name.
-                                            let name = format!(
-                                                "{}_s{}_{}_t{step}_ch{chain_id}_inter{i}",
-                                                ent_name, slot, f.name
-                                            );
-                                            let var = match &f.ty {
-                                                IRType::Bool => smt::bool_var(&name),
-                                                IRType::Real | IRType::Float => {
-                                                    smt::real_var(&name)
-                                                }
-                                                IRType::Map { .. } | IRType::Set { .. } => {
-                                                    smt::array_var(&name, &f.ty)
-                                                        .expect("internal: array sort expected for Map/Set field")
-                                                }
-                                                IRType::Seq { element } => SmtValue::Dynamic(
-                                                    smt::dynamic_const(
-                                                        &name,
-                                                        &smt::seq_sort(element).sort(),
-                                                    ),
-                                                ),
-                                                _ => smt::int_var(&name),
-                                            };
-                                            (f.name.clone(), var)
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-
-                            for (i, (transition, args, apply_refs)) in
-                                same_entity_applies.iter().enumerate()
-                            {
-                                let Some(trans) =
-                                    ent.transitions.iter().find(|t| t.name == **transition)
-                                else {
-                                    continue;
-                                };
-
-                                // Read from: step k (first) or intermediate_{i-1}
-                                let read_from = if i == 0 {
-                                    &read_step_k
-                                } else {
-                                    &intermediates[i - 1]
-                                };
-
-                                // Build action params from the intermediate state.
-                                // First Apply uses standard build_apply_params (step k).
-                                // Later Applies evaluate args AND refs from intermediate vars.
-                                let action_params = if i == 0 {
-                                    try_build_apply_params(&ctx, trans, args, apply_refs, step)?
-                                } else {
-                                    let mut params = HashMap::new();
-                                    // Positional params
-                                    for (pi, param) in trans.params.iter().enumerate() {
-                                        if let Some(arg_expr) = args.get(pi) {
-                                            let val = try_eval_expr_with_vars(
-                                                arg_expr,
-                                                ent,
-                                                read_from,
-                                                vctx,
-                                                &ctx.params,
-                                            )?;
-                                            params.insert(param.name.clone(), val);
-                                        }
-                                    }
-                                    // Refs: resolve from intermediate vars
-                                    for (ri, tref) in trans.refs.iter().enumerate() {
-                                        if let Some(ref_name) = apply_refs.get(ri) {
-                                            if let Some(val) = read_from.get(ref_name) {
-                                                params.insert(tref.name.clone(), val.clone());
-                                            }
-                                        }
-                                    }
-                                    params
-                                };
-
-                                // Write to: intermediate_i (middle) or step k+1 (last)
-                                let write_to = if i == n_applies - 1 {
-                                    &write_step_k1
-                                } else {
-                                    &intermediates[i]
-                                };
-
-                                let formula = try_encode_action_with_vars(
-                                    ent,
-                                    trans,
-                                    slot,
-                                    read_from,
-                                    write_to,
-                                    vctx,
-                                    &action_params,
-                                )?;
-                                slot_conjuncts.push(formula);
-                            }
-
-                            // Active flag: must be active at step k AND stays active at step k+1
-                            // (matches single-apply semantics in encode_action)
-                            if let (
-                                Some(SmtValue::Bool(act_curr)),
-                                Some(SmtValue::Bool(act_next)),
-                            ) = (
-                                pool.active_at(ent_name, slot, step),
-                                pool.active_at(ent_name, slot, step + 1),
-                            ) {
-                                slot_conjuncts.push(act_curr.clone());
-                                slot_conjuncts.push(act_next.clone());
-                            }
-
-                            // Handle non-Apply ops in the Choose (Create, CrossCall, etc.)
-                            for op in ops {
-                                match op {
-                                    IRAction::Apply { target, .. } if target == var => {
-                                        // Already handled above
-                                    }
-                                    IRAction::Apply { target, .. } => {
-                                        // Apply targeting a different variable inside a Choose
-                                        // is malformed IR — the Apply target should match
-                                        // the Choose-bound variable.
-                                        return Err(format!(
-                                            "Apply target {target} does not match Choose var {var} \
-                                             — cross-target Apply in Choose is not supported"
-                                        ));
-                                    }
-                                    _ => {
-                                        if let Some(ent) = entity_ir {
-                                            let (nested_f, nested_t) = try_encode_nested_op(
-                                                pool,
-                                                vctx,
-                                                entities,
-                                                all_systems,
-                                                op,
-                                                var,
-                                                ent_name,
-                                                ent,
-                                                slot,
-                                                step,
-                                                &merged_params,
-                                                depth,
-                                                &[],
-                                            )?;
-                                            slot_conjuncts.extend(nested_f);
-                                            nested_touched.extend(nested_t);
-                                        }
-                                    }
-                                }
-                            }
-                            chain_id += 1; // unique ID per multi-apply chain
-                        }
-                    }
-
-                    // Constrain shared Choose variable fields to match this slot.
-                    // For each field of the chosen entity, assert that the shared
-                    // variable equals the slot's field at this step.
-                    if let Some(ent) = entity_ir {
-                        for field in &ent.fields {
-                            let shared_name = format!("choose_{var}_{}_t{step}", field.name);
-                            let shared_var = match &field.ty {
-                                IRType::Bool => smt::bool_var(&shared_name),
-                                IRType::Real | IRType::Float => smt::real_var(&shared_name),
-                                _ => smt::int_var(&shared_name),
-                            };
-                            if let Some(slot_val) = pool.field_at(ent_name, slot, &field.name, step)
-                            {
-                                match (&shared_var, slot_val) {
-                                    (SmtValue::Int(s), SmtValue::Int(f)) => {
-                                        slot_conjuncts.push(smt::int_eq(s, f));
-                                    }
-                                    (SmtValue::Bool(s), SmtValue::Bool(f)) => {
-                                        slot_conjuncts.push(smt::bool_eq(s, f));
-                                    }
-                                    (SmtValue::Real(s), SmtValue::Real(f)) => {
-                                        slot_conjuncts.push(smt::real_eq(s, f));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-
-                    // Frame all OTHER slots of this entity within the disjunct.
-                    if let Some(ent) = entity_ir {
-                        let slot_frame = frame_entity_slots_except(pool, ent, slot, step);
-                        slot_conjuncts.extend(slot_frame);
-                    }
-
-                    let refs: Vec<&Bool> = slot_conjuncts.iter().collect();
-                    if !refs.is_empty() {
-                        slot_options.push(smt::bool_and(&refs));
-                    }
-                }
-
-                // At least one slot must satisfy Choose
-                let refs: Vec<&Bool> = slot_options.iter().collect();
-                if !refs.is_empty() {
-                    conjuncts.push(smt::bool_or(&refs));
-                    for slot in 0..n_slots {
-                        touched.insert((ent_name.clone(), slot));
-                    }
-                }
-                // Mark entities touched by nested ops (Create, CrossCall, etc.)
-                touched.extend(nested_touched);
-
-                // Register shared Choose variable fields as params for
-                // subsequent actions to resolve `var.field` references.
-                if let Some(ent) = entity_ir {
-                    for field in &ent.fields {
-                        let shared_name = format!("choose_{var}_{}_t{step}", field.name);
-                        let shared_var = match &field.ty {
-                            IRType::Bool => smt::bool_var(&shared_name),
-                            IRType::Real | IRType::Float => smt::real_var(&shared_name),
-                            _ => smt::int_var(&shared_name),
-                        };
-                        // Register as `var.field` for Field resolution
-                        choose_var_params
-                            .insert(format!("{var}.{}", field.name), shared_var.clone());
-                        // Also register as bare `field` if the var itself is referenced
-                        // (some filters use bare field names from Choose context)
-                    }
-                }
+fn constrain_legacy_choose_slot_params(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    parts: &mut Vec<Bool>,
+) {
+    for field in &bound.entity.fields {
+        let shared_name = format!("choose_{}_{}_t{}", bound.var, field.name, ctx.step.step);
+        let shared_var = legacy_fresh_field_value(&shared_name, &field.ty);
+        if let Some(slot_val) =
+            ctx.step
+                .pool
+                .field_at(bound.entity_name, bound.slot, &field.name, ctx.step.step)
+        {
+            if let Some(eq) = smt_value_eq(&shared_var, slot_val) {
+                parts.push(eq);
             }
+        }
+    }
+}
 
-            // Bare Apply (top-level in event body).
-            // Target may be a variable name (e.g., "o") or entity type name.
-            // IR lowering stores the variable name from the source expression.
-            // We try entity type first; if not found, it's a variable reference
-            // that should have been scoped by an enclosing Choose (which is the
-            // normal pattern — bare Apply without Choose is unusual).
+fn encode_legacy_forall(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    var: &str,
+    entity_name: &str,
+    ops: &[IRAction],
+) -> Result<(), String> {
+    let n_slots = ctx.step.pool.slots_for(entity_name);
+    let Some(entity) = ctx.step.entities.iter().find(|e| e.name == *entity_name) else {
+        return Ok(());
+    };
+    let params = state.merged_params();
+    let mut nested_touched = HashSet::new();
+    for slot in 0..n_slots {
+        let slot_formula = encode_legacy_forall_slot(
+            ctx,
+            state,
+            LegacyBoundSlot {
+                kind: LegacyBoundKind::ForAll,
+                var,
+                entity_name,
+                entity,
+                slot,
+                ops,
+            },
+            &params,
+            &mut nested_touched,
+        )?;
+        state.conjuncts.push(slot_formula);
+        state.touched.insert((entity_name.to_owned(), slot));
+    }
+    state.touched.extend(nested_touched);
+    Ok(())
+}
+
+fn encode_legacy_forall_slot(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    params: &HashMap<String, SmtValue>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<Bool, String> {
+    let slot_ctx = legacy_slot_ctx(ctx, bound.entity_name, bound.slot, params.clone(), "");
+    let mut op_parts = Vec::new();
+    encode_legacy_bound_ops(
+        ctx,
+        state,
+        bound,
+        &slot_ctx,
+        params,
+        &mut op_parts,
+        nested_touched,
+    )?;
+    let Some(SmtValue::Bool(active)) =
+        ctx.step
+            .pool
+            .active_at(bound.entity_name, bound.slot, ctx.step.step)
+    else {
+        return Ok(smt::bool_const(true));
+    };
+    let active_branch = if op_parts.is_empty() {
+        active.clone()
+    } else {
+        let mut parts = vec![active.clone()];
+        parts.extend(op_parts);
+        and_all(parts)
+    };
+    let inactive_branch = legacy_inactive_slot_frame(ctx, bound, active)?;
+    Ok(smt::bool_or(&[&active_branch, &inactive_branch]))
+}
+
+fn encode_legacy_bound_ops(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    base_params: &HashMap<String, SmtValue>,
+    parts: &mut Vec<Bool>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<(), String> {
+    let applies = legacy_bound_applies(bound.var, bound.ops);
+    if applies.len() <= 1 {
+        encode_legacy_single_bound_ops(ctx, bound, slot_ctx, base_params, parts, nested_touched)
+    } else {
+        encode_legacy_multi_bound_ops(ctx, state, bound, slot_ctx, &applies, parts, nested_touched)
+    }
+}
+
+fn encode_legacy_single_bound_ops(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    base_params: &HashMap<String, SmtValue>,
+    parts: &mut Vec<Bool>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<(), String> {
+    for op in bound.ops {
+        if let IRAction::Apply {
+            target,
+            transition,
+            args,
+            refs,
+        } = op
+        {
+            if bound.kind == LegacyBoundKind::Choose || target == bound.var {
+                encode_legacy_direct_bound_apply(
+                    ctx, bound, slot_ctx, transition, args, refs, parts,
+                )?;
+                continue;
+            }
+        }
+        let (nested_f, nested_t) = legacy_nested_op(ctx, bound, base_params, op)?;
+        parts.extend(nested_f);
+        nested_touched.extend(nested_t);
+    }
+    Ok(())
+}
+
+fn encode_legacy_direct_bound_apply(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    transition: &str,
+    args: &[IRExpr],
+    refs: &[String],
+    parts: &mut Vec<Bool>,
+) -> Result<(), String> {
+    if let Some(trans) = bound
+        .entity
+        .transitions
+        .iter()
+        .find(|candidate| candidate.name == transition)
+    {
+        let action_params = try_build_apply_params(slot_ctx, trans, args, refs, ctx.step.step)?;
+        parts.push(try_encode_action(
+            ctx.step.pool,
+            ctx.step.vctx,
+            bound.entity,
+            trans,
+            bound.slot,
+            ctx.step.step,
+            &action_params,
+        )?);
+    }
+    Ok(())
+}
+
+fn encode_legacy_multi_bound_ops(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    applies: &[LegacyBoundApply<'_>],
+    parts: &mut Vec<Bool>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<(), String> {
+    let chain = legacy_chain_state(ctx, state, bound, applies.len());
+    for (index, apply) in applies.iter().enumerate() {
+        encode_legacy_chain_apply(ctx, bound, slot_ctx, &chain, index, *apply, parts)?;
+    }
+    assert_legacy_chain_active(ctx, bound, parts);
+    encode_legacy_multi_non_apply_ops(ctx, bound, &slot_ctx.params, parts, nested_touched)?;
+    state.chain_id += 1;
+    Ok(())
+}
+
+struct LegacyChainState {
+    read_step: HashMap<String, SmtValue>,
+    write_step: HashMap<String, SmtValue>,
+    intermediates: Vec<HashMap<String, SmtValue>>,
+}
+
+fn legacy_chain_state(
+    ctx: &LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    n_applies: usize,
+) -> LegacyChainState {
+    LegacyChainState {
+        read_step: legacy_field_values(
+            ctx.step.pool,
+            bound.entity_name,
+            bound.entity,
+            bound.slot,
+            ctx.step.step,
+        ),
+        write_step: legacy_field_values(
+            ctx.step.pool,
+            bound.entity_name,
+            bound.entity,
+            bound.slot,
+            ctx.step.step + 1,
+        ),
+        intermediates: (0..n_applies - 1)
+            .map(|index| legacy_intermediate_values(ctx, state, bound, index))
+            .collect(),
+    }
+}
+
+fn encode_legacy_chain_apply(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    chain: &LegacyChainState,
+    index: usize,
+    apply: LegacyBoundApply<'_>,
+    parts: &mut Vec<Bool>,
+) -> Result<(), String> {
+    let Some(trans) = bound
+        .entity
+        .transitions
+        .iter()
+        .find(|candidate| candidate.name == apply.transition)
+    else {
+        return Ok(());
+    };
+    let read_from = if index == 0 {
+        &chain.read_step
+    } else {
+        &chain.intermediates[index - 1]
+    };
+    let write_to = if index == chain.intermediates.len() {
+        &chain.write_step
+    } else {
+        &chain.intermediates[index]
+    };
+    let action_params =
+        legacy_chain_apply_params(ctx, bound, slot_ctx, trans, index, apply, read_from)?;
+    parts.push(try_encode_action_with_vars(
+        bound.entity,
+        trans,
+        bound.slot,
+        read_from,
+        write_to,
+        ctx.step.vctx,
+        &action_params,
+    )?);
+    Ok(())
+}
+
+fn legacy_chain_apply_params(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    trans: &IRTransition,
+    index: usize,
+    apply: LegacyBoundApply<'_>,
+    read_from: &HashMap<String, SmtValue>,
+) -> Result<HashMap<String, SmtValue>, String> {
+    if index == 0 {
+        return try_build_apply_params(slot_ctx, trans, apply.args, apply.refs, ctx.step.step);
+    }
+    let mut params = HashMap::new();
+    for (param_index, param) in trans.params.iter().enumerate() {
+        if let Some(arg_expr) = apply.args.get(param_index) {
+            let val = try_eval_expr_with_vars(
+                arg_expr,
+                bound.entity,
+                read_from,
+                ctx.step.vctx,
+                &slot_ctx.params,
+            )?;
+            params.insert(param.name.clone(), val);
+        }
+    }
+    for (ref_index, target_ref) in trans.refs.iter().enumerate() {
+        if let Some(ref_name) = apply.refs.get(ref_index) {
+            if let Some(val) = read_from.get(ref_name) {
+                params.insert(target_ref.name.clone(), val.clone());
+            }
+        }
+    }
+    Ok(params)
+}
+
+fn encode_legacy_multi_non_apply_ops(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    base_params: &HashMap<String, SmtValue>,
+    parts: &mut Vec<Bool>,
+    nested_touched: &mut HashSet<(String, usize)>,
+) -> Result<(), String> {
+    for op in bound.ops {
+        match op {
+            IRAction::Apply { target, .. } if target == bound.var => {}
+            IRAction::Apply { target, .. } if bound.kind == LegacyBoundKind::Choose => {
+                return Err(format!(
+                    "Apply target {target} does not match Choose var {} \
+                     — cross-target Apply in Choose is not supported",
+                    bound.var
+                ));
+            }
+            _ => {
+                let (nested_f, nested_t) = legacy_nested_op(ctx, bound, base_params, op)?;
+                parts.extend(nested_f);
+                nested_touched.extend(nested_t);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_legacy_chain_active(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    parts: &mut Vec<Bool>,
+) {
+    if let (Some(SmtValue::Bool(curr)), Some(SmtValue::Bool(next))) = (
+        ctx.step
+            .pool
+            .active_at(bound.entity_name, bound.slot, ctx.step.step),
+        ctx.step
+            .pool
+            .active_at(bound.entity_name, bound.slot, ctx.step.step + 1),
+    ) {
+        parts.push(curr.clone());
+        parts.push(next.clone());
+    }
+}
+
+fn legacy_bound_applies<'a>(bound_var: &str, ops: &'a [IRAction]) -> Vec<LegacyBoundApply<'a>> {
+    ops.iter()
+        .filter_map(|op| match op {
             IRAction::Apply {
                 target,
                 transition,
                 args,
-                refs: apply_refs,
-            } => {
-                // Resolve target: entity type name → Choose-bound variable → transition-based fallback
-                let resolved_entity = entities.iter().find(|e| e.name == *target).or_else(|| {
-                    // Target is a variable name — check Choose bindings first
-                    if let Some(entity_name) = var_to_entity.get(target.as_str()) {
-                        return entities.iter().find(|e| e.name == *entity_name);
-                    }
-                    // Last resort: find entity with this transition (only if unambiguous)
-                    let matches: Vec<_> = entities
-                        .iter()
-                        .filter(|e| e.transitions.iter().any(|t| t.name == *transition))
-                        .collect();
-                    if matches.len() == 1 {
-                        Some(matches[0])
-                    } else {
-                        None // ambiguous or not found — skip
-                    }
-                });
-                let Some(ent) = resolved_entity else {
-                    return Err(format!(
-                        "Apply target resolution failed: target={target:?}, transition={transition:?} \
-                         — could not resolve entity (var_to_entity keys: {:?}, entity names: {:?})",
-                        var_to_entity.keys().collect::<Vec<_>>(),
-                        entities.iter().map(|e| &e.name).collect::<Vec<_>>()
-                    ));
-                };
-                let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) else {
-                    return Err(format!(
-                        "Apply transition not found: entity={}, transition={transition:?} \
-                         — available transitions: {:?}",
-                        ent.name,
-                        ent.transitions.iter().map(|t| &t.name).collect::<Vec<_>>()
-                    ));
-                };
-                // Use resolved entity name, not the target variable name
-                let ent_name = &ent.name;
-                let n_slots = pool.slots_for(ent_name);
-
-                // If `target` is an entity-typed event parameter, the per-step
-                // `param_<target>_<step>` Z3 var represents the slot index the
-                // event was called with. We tie each slot disjunct to that
-                // value so the SAT solver picks a single slot per fire AND
-                // so per-tuple fairness () can read the param var
-                // to identify which tuple actually fired. Without this tie,
-                // the param var is unconstrained relative to the body's slot
-                // pick — `param_<target>_<step> == k` would not actually mean
-                // "the event acted on slot k", and per-tuple obligations
-                // would be decoupled from real slot mutations.
-                let target_param_eq: Option<&SmtValue> = if event
-                    .params
-                    .iter()
-                    .any(|p| p.name == *target && matches!(p.ty, IRType::Entity { .. }))
-                {
-                    step_params.get(target.as_str())
-                } else {
-                    None
-                };
-
-                let mut slot_options = Vec::new();
-                for slot in 0..n_slots {
-                    let apply_ctx = SlotEncodeCtx {
-                        pool,
-                        vctx,
-                        entity: ent_name,
-                        slot,
-                        params: {
-                            let mut p = step_params.clone();
-                            p.extend(choose_var_params.clone());
-                            p
-                        },
-                        bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &entity_param_types,
-                        store_param_types: &store_param_types,
-                    };
-                    let action_params =
-                        try_build_apply_params(&apply_ctx, trans, args, apply_refs, step)?;
-                    let mut slot_conjuncts = Vec::new();
-                    let formula =
-                        try_encode_action(pool, vctx, ent, trans, slot, step, &action_params)?;
-                    slot_conjuncts.push(formula);
-                    // Tie the param var to this slot index when applicable.
-                    if let Some(param_val) = target_param_eq {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let slot_val = smt::int_val(slot as i64);
-                        if let Ok(eq) = smt::smt_eq(param_val, &slot_val) {
-                            slot_conjuncts.push(eq);
-                        }
-                    }
-                    // Frame all OTHER slots of this entity
-                    let slot_frame = frame_entity_slots_except(pool, ent, slot, step);
-                    slot_conjuncts.extend(slot_frame);
-                    let refs: Vec<&Bool> = slot_conjuncts.iter().collect();
-                    slot_options.push(smt::bool_and(&refs));
-                }
-                let refs: Vec<&Bool> = slot_options.iter().collect();
-                if !refs.is_empty() {
-                    conjuncts.push(smt::bool_or(&refs));
-                }
-                // Mark all slots as touched — per-slot framing handled above
-                for slot in 0..n_slots {
-                    touched.insert((ent_name.clone(), slot));
-                }
-            }
-
-            IRAction::Create {
-                entity: ent_name,
-                fields,
-            } => {
-                let entity_ir = entities.iter().find(|e| e.name == *ent_name);
-                let create_fields: Vec<(String, IRExpr)> = fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.value.clone()))
-                    .collect();
-                let create = try_encode_create(
-                    pool,
-                    vctx,
-                    ent_name,
-                    entity_ir,
-                    &create_fields,
-                    step,
-                    &step_params,
-                )?;
-                conjuncts.push(create);
-                // Mark all slots of this entity as potentially touched
-                let n_slots = pool.slots_for(ent_name);
-                for slot in 0..n_slots {
-                    touched.insert((ent_name.clone(), slot));
-                }
-            }
-
-            // Issue 2: ForAll encoding — conjunction over all active slots.
-            // For each slot:
-            // (active AND ops AND active_next) OR (!active AND frame_this_slot)
-            // This ensures inactive slots are explicitly framed (not left unconstrained).
-            IRAction::ForAll {
-                var,
-                entity: ent_name,
-                ops,
-            } => {
-                let n_slots = pool.slots_for(ent_name);
-                let entity_ir = entities.iter().find(|e| e.name == *ent_name);
-                let mut nested_touched: HashSet<(String, usize)> = HashSet::new();
-                let forall_base_params = {
-                    let mut p = step_params.clone();
-                    p.extend(choose_var_params.clone());
-                    p
-                };
-
-                for slot in 0..n_slots {
-                    let ctx = SlotEncodeCtx {
-                        pool,
-                        vctx,
-                        entity: ent_name,
-                        slot,
-                        params: forall_base_params.clone(),
-                        bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &entity_param_types,
-                        store_param_types: &store_param_types,
-                    };
-
-                    let mut op_conjuncts = Vec::new();
-
-                    if let Some(ent) = entity_ir {
-                        let same_entity_applies: Vec<_> = ops
-                            .iter()
-                            .filter_map(|op| {
-                                if let IRAction::Apply {
-                                    target,
-                                    transition,
-                                    args,
-                                    refs: apply_refs,
-                                } = op
-                                {
-                                    if target == var {
-                                        return Some((transition, args, apply_refs));
-                                    }
-                                }
-                                None
-                            })
-                            .collect();
-
-                        if same_entity_applies.len() <= 1 {
-                            for op in ops {
-                                match op {
-                                    IRAction::Apply {
-                                        target,
-                                        transition,
-                                        args,
-                                        refs: apply_refs,
-                                    } if target == var => {
-                                        if let Some(trans) =
-                                            ent.transitions.iter().find(|t| t.name == *transition)
-                                        {
-                                            let action_params = try_build_apply_params(
-                                                &ctx, trans, args, apply_refs, step,
-                                            )?;
-                                            let action_formula = try_encode_action(
-                                                pool,
-                                                vctx,
-                                                ent,
-                                                trans,
-                                                slot,
-                                                step,
-                                                &action_params,
-                                            )?;
-                                            op_conjuncts.push(action_formula);
-                                        }
-                                    }
-                                    _ => {
-                                        let (nested_f, nested_t) = try_encode_nested_op(
-                                            pool,
-                                            vctx,
-                                            entities,
-                                            all_systems,
-                                            op,
-                                            var,
-                                            ent_name,
-                                            ent,
-                                            slot,
-                                            step,
-                                            &forall_base_params,
-                                            depth,
-                                            &[],
-                                        )?;
-                                        op_conjuncts.extend(nested_f);
-                                        nested_touched.extend(nested_t);
-                                    }
-                                }
-                            }
-                        } else {
-                            let n_applies = same_entity_applies.len();
-                            let read_step_k: HashMap<String, SmtValue> = ent
-                                .fields
-                                .iter()
-                                .filter_map(|f| {
-                                    pool.field_at(ent_name, slot, &f.name, step)
-                                        .map(|v| (f.name.clone(), v.clone()))
-                                })
-                                .collect();
-                            let write_step_k1: HashMap<String, SmtValue> = ent
-                                .fields
-                                .iter()
-                                .filter_map(|f| {
-                                    pool.field_at(ent_name, slot, &f.name, step + 1)
-                                        .map(|v| (f.name.clone(), v.clone()))
-                                })
-                                .collect();
-                            let intermediates: Vec<HashMap<String, SmtValue>> = (0..n_applies - 1)
-                                .map(|i| {
-                                    ent.fields
-                                        .iter()
-                                        .map(|f| {
-                                            let name = format!(
-                                                "{}_s{}_{}_t{step}_forall_ch{chain_id}_inter{i}",
-                                                ent_name, slot, f.name
-                                            );
-                                            let var = match &f.ty {
-                                                IRType::Bool => smt::bool_var(&name),
-                                                IRType::Real | IRType::Float => {
-                                                    smt::real_var(&name)
-                                                }
-                                                IRType::Map { .. } | IRType::Set { .. } => {
-                                                    smt::array_var(&name, &f.ty).expect(
-                                                        "internal: array sort expected for Map/Set field",
-                                                    )
-                                                }
-                                                IRType::Seq { element } => SmtValue::Dynamic(
-                                                    smt::dynamic_const(
-                                                        &name,
-                                                        &smt::seq_sort(element).sort(),
-                                                    ),
-                                                ),
-                                                _ => smt::int_var(&name),
-                                            };
-                                            (f.name.clone(), var)
-                                        })
-                                        .collect()
-                                })
-                                .collect();
-
-                            for (i, (transition, args, apply_refs)) in
-                                same_entity_applies.iter().enumerate()
-                            {
-                                let Some(trans) =
-                                    ent.transitions.iter().find(|t| t.name == **transition)
-                                else {
-                                    continue;
-                                };
-                                let read_from = if i == 0 {
-                                    &read_step_k
-                                } else {
-                                    &intermediates[i - 1]
-                                };
-                                let action_params = if i == 0 {
-                                    try_build_apply_params(&ctx, trans, args, apply_refs, step)?
-                                } else {
-                                    let mut params = HashMap::new();
-                                    for (pi, param) in trans.params.iter().enumerate() {
-                                        if let Some(arg_expr) = args.get(pi) {
-                                            let val = try_eval_expr_with_vars(
-                                                arg_expr,
-                                                ent,
-                                                read_from,
-                                                vctx,
-                                                &ctx.params,
-                                            )?;
-                                            params.insert(param.name.clone(), val);
-                                        }
-                                    }
-                                    for (ri, tref) in trans.refs.iter().enumerate() {
-                                        if let Some(ref_name) = apply_refs.get(ri) {
-                                            if let Some(val) = read_from.get(ref_name) {
-                                                params.insert(tref.name.clone(), val.clone());
-                                            }
-                                        }
-                                    }
-                                    params
-                                };
-                                let write_to = if i == n_applies - 1 {
-                                    &write_step_k1
-                                } else {
-                                    &intermediates[i]
-                                };
-                                let formula = try_encode_action_with_vars(
-                                    ent,
-                                    trans,
-                                    slot,
-                                    read_from,
-                                    write_to,
-                                    vctx,
-                                    &action_params,
-                                )?;
-                                op_conjuncts.push(formula);
-                            }
-
-                            if let (
-                                Some(SmtValue::Bool(act_curr)),
-                                Some(SmtValue::Bool(act_next)),
-                            ) = (
-                                pool.active_at(ent_name, slot, step),
-                                pool.active_at(ent_name, slot, step + 1),
-                            ) {
-                                op_conjuncts.push(act_curr.clone());
-                                op_conjuncts.push(act_next.clone());
-                            }
-
-                            for op in ops {
-                                match op {
-                                    IRAction::Apply { target, .. } if target == var => {}
-                                    _ => {
-                                        let (nested_f, nested_t) = try_encode_nested_op(
-                                            pool,
-                                            vctx,
-                                            entities,
-                                            all_systems,
-                                            op,
-                                            var,
-                                            ent_name,
-                                            ent,
-                                            slot,
-                                            step,
-                                            &forall_base_params,
-                                            depth,
-                                            &[],
-                                        )?;
-                                        op_conjuncts.extend(nested_f);
-                                        nested_touched.extend(nested_t);
-                                    }
-                                }
-                            }
-                            chain_id += 1;
-                        }
-                    }
-
-                    // For each slot: (active AND ops) OR (!active AND frame)
-                    if let Some(SmtValue::Bool(active)) = pool.active_at(ent_name, slot, step) {
-                        // Active branch: active AND ops
-                        let active_branch = if op_conjuncts.is_empty() {
-                            active.clone()
-                        } else {
-                            let mut active_parts = vec![active.clone()];
-                            active_parts.extend(op_conjuncts);
-                            let refs: Vec<&Bool> = active_parts.iter().collect();
-                            smt::bool_and(&refs)
-                        };
-
-                        // Inactive branch: !active AND frame (all fields + active flag unchanged)
-                        let mut frame_parts = vec![smt::bool_not(active)];
-                        // Active flag unchanged
-                        if let Some(SmtValue::Bool(act_next)) =
-                            pool.active_at(ent_name, slot, step + 1)
-                        {
-                            frame_parts.push(smt::bool_eq(act_next, active));
-                        }
-                        // All fields unchanged
-                        if let Some(ent) = entity_ir {
-                            for field in &ent.fields {
-                                if let (Some(curr), Some(next)) = (
-                                    pool.field_at(ent_name, slot, &field.name, step),
-                                    pool.field_at(ent_name, slot, &field.name, step + 1),
-                                ) {
-                                    frame_parts.push(
-                                        smt::smt_eq(curr, next)
-                                            .expect("internal: forall frame smt_eq"),
-                                    );
-                                }
-                            }
-                        }
-
-                        let frame_refs: Vec<&Bool> = frame_parts.iter().collect();
-                        let inactive_branch = smt::bool_and(&frame_refs);
-
-                        conjuncts.push(smt::bool_or(&[&active_branch, &inactive_branch]));
-                    }
-
-                    touched.insert((ent_name.clone(), slot));
-                }
-                // Mark entities touched by nested ops (Create, CrossCall, etc.)
-                touched.extend(nested_touched);
-            }
-
-            IRAction::CrossCall {
-                system: target_system,
-                command: command_name,
-                args: cross_args,
-            } => {
-                // Find the target system and ALL matching steps, then encode
-                // a disjunction with per-branch framing. Multi-clause commands
-                // have multiple steps with the same name but different guards;
-                // each branch may touch different slots, so each disjunct must
-                // frame the slots in the union that it didn't individually touch.
-                if let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) {
-                    let matching_steps: Vec<_> = target_sys
-                        .actions
-                        .iter()
-                        .filter(|s| s.name == *command_name)
-                        .collect();
-                    // Collect (formula, touched) pairs per branch
-                    let mut branch_results: Vec<(Bool, HashSet<(String, usize)>)> = Vec::new();
-                    for target_step in &matching_steps {
-                        if target_step.params.len() != cross_args.len() {
-                            // Arity mismatches are validated in scene checking,
-                            // but keep harness encoding total so verify checks
-                            // never panic during recursive CrossCall expansion.
-                            branch_results.push((smt::bool_const(false), HashSet::new()));
-                            continue;
-                        }
-                        // Build override params: evaluate each CrossCall arg in
-                        // the current step's context (using step_params) and
-                        // bind it to the corresponding target step param name.
-                        let mut cross_params: HashMap<String, SmtValue> = HashMap::new();
-                        let arg_ctx = SlotEncodeCtx {
-                            pool,
-                            vctx,
-                            entity: "",
-                            slot: 0,
-                            params: {
-                                let mut p = step_params.clone();
-                                p.extend(choose_var_params.clone());
-                                p
-                            },
-                            bindings: HashMap::new(),
-                            system_name: "",
-                            entity_param_types: &entity_param_types,
-                            store_param_types: &store_param_types,
-                        };
-                        for (target_param, arg_expr) in
-                            target_step.params.iter().zip(cross_args.iter())
-                        {
-                            let val = try_encode_slot_expr(&arg_ctx, arg_expr, step)?;
-                            cross_params.insert(target_param.name.clone(), val);
-                        }
-
-                        // Recursively encode the target step with wired params.
-                        // The callee does NOT apply its own global frame, so
-                        // per-branch framing is handled below.
-                        let (cross_formula, cross_touched) = try_encode_step_inner(
-                            pool,
-                            vctx,
-                            entities,
-                            all_systems,
-                            target_step,
-                            step,
-                            depth + 1,
-                            Some(cross_params),
-                        )?;
-                        branch_results.push((cross_formula, cross_touched));
-                    }
-                    if !branch_results.is_empty() {
-                        // Compute the union of all touched sets
-                        let all_touched: HashSet<(String, usize)> = branch_results
-                            .iter()
-                            .flat_map(|(_, t)| t.iter().cloned())
-                            .collect();
-                        // Apply per-branch framing: each branch frames slots it didn't touch
-                        let framed_disjuncts: Vec<Bool> = branch_results
-                            .into_iter()
-                            .map(|(formula, branch_touched)| {
-                                let untouched_by_branch: HashSet<(String, usize)> =
-                                    all_touched.difference(&branch_touched).cloned().collect();
-                                if untouched_by_branch.is_empty() {
-                                    formula
-                                } else {
-                                    let frame = frame_specific_slots(
-                                        pool,
-                                        entities,
-                                        &untouched_by_branch,
-                                        step,
-                                    );
-                                    let mut parts = vec![formula];
-                                    parts.extend(frame);
-                                    let refs: Vec<&Bool> = parts.iter().collect();
-                                    smt::bool_and(&refs)
-                                }
-                            })
-                            .collect();
-                        let refs: Vec<&Bool> = framed_disjuncts.iter().collect();
-                        conjuncts.push(smt::bool_or(&refs));
-                        touched.extend(all_touched);
-                    }
-                }
-            }
-
-            IRAction::ExprStmt { expr } => {
-                // Encode the expression and assert it as a boolean constraint
-                let expr_ctx = SlotEncodeCtx {
-                    pool,
-                    vctx,
-                    entity: "",
-                    slot: 0,
-                    params: {
-                        let mut p = step_params.clone();
-                        p.extend(choose_var_params.clone());
-                        p
-                    },
-                    bindings: HashMap::new(),
-                    system_name: &owning_system_name,
-                    entity_param_types: &entity_param_types,
-                    store_param_types: &store_param_types,
-                };
-                let val = try_encode_slot_expr(&expr_ctx, expr, step)?;
-                conjuncts.push(val.to_bool()?);
-            }
-            IRAction::LetCrossCall { .. } | IRAction::Match { .. } => {
-                return Err("internal: macro-step actions reached legacy step encoder".to_owned());
-            }
-        }
-    }
-
-    // Return action formula + touched set. Global framing is applied by the
-    // top-level caller, NOT here — this allows CrossCall to compose without
-    // conflicting frame constraints.
-    let formula = {
-        let refs: Vec<&Bool> = conjuncts.iter().collect();
-        if refs.is_empty() {
-            smt::bool_const(true)
-        } else {
-            smt::bool_and(&refs)
-        }
-    };
-    Ok((formula, touched))
+                refs,
+            } if target == bound_var => Some(LegacyBoundApply {
+                transition,
+                args,
+                refs,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn try_encode_step_inner_branching(
+fn legacy_nested_op(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    base_params: &HashMap<String, SmtValue>,
+    op: &IRAction,
+) -> Result<LegacyNestedEncoding, String> {
+    try_encode_nested_op(
+        NestedOpCtx {
+            pool: ctx.step.pool,
+            vctx: ctx.step.vctx,
+            entities: ctx.step.entities,
+            all_systems: ctx.step.all_systems,
+            bound_var: bound.var,
+            bound_ent_name: bound.entity_name,
+            bound_entity_ir: bound.entity,
+            bound_slot: bound.slot,
+            step: ctx.step.step,
+            base_params,
+            depth: ctx.step.depth,
+            outer_bindings: &[],
+        },
+        op,
+    )
+}
+
+fn encode_legacy_apply(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    target: &str,
+    transition: &str,
+    args: &[IRExpr],
+    refs: &[String],
+) -> Result<(), String> {
+    let entity = resolve_legacy_apply_entity(ctx, state, target, transition)?;
+    let trans = entity
+        .transitions
+        .iter()
+        .find(|candidate| candidate.name == transition)
+        .ok_or_else(|| legacy_apply_transition_error(entity, transition))?;
+    let n_slots = ctx.step.pool.slots_for(&entity.name);
+    let target_param_eq = event_param_is_entity(target, &ctx.scope.entity_param_types)
+        .then(|| state.step_params.get(target))
+        .flatten();
+    let mut slot_options = Vec::new();
+    for slot in 0..n_slots {
+        slot_options.push(encode_legacy_apply_slot(
+            ctx,
+            state,
+            entity,
+            trans,
+            LegacyBoundApply {
+                transition,
+                args,
+                refs,
+            },
+            target_param_eq,
+            slot,
+        )?);
+    }
+    if !slot_options.is_empty() {
+        state.conjuncts.push(bool_or_all(slot_options));
+    }
+    state.mark_entity_slots(&entity.name, n_slots);
+    Ok(())
+}
+
+fn resolve_legacy_apply_entity<'a>(
+    ctx: &'a LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    target: &str,
+    transition: &str,
+) -> Result<&'a IREntity, String> {
+    ctx.step
+        .entities
+        .iter()
+        .find(|entity| entity.name == *target)
+        .or_else(|| {
+            state
+                .var_to_entity
+                .get(target)
+                .and_then(|name| ctx.step.entities.iter().find(|entity| entity.name == *name))
+        })
+        .or_else(|| {
+            let matches: Vec<_> = ctx
+                .step
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .transitions
+                        .iter()
+                        .any(|candidate| candidate.name == *transition)
+                })
+                .collect();
+            (matches.len() == 1).then(|| matches[0])
+        })
+        .ok_or_else(|| {
+            format!(
+                "Apply target resolution failed: target={target:?}, transition={transition:?} \
+                 — could not resolve entity (var_to_entity keys: {:?}, entity names: {:?})",
+                state.var_to_entity.keys().collect::<Vec<_>>(),
+                ctx.step
+                    .entities
+                    .iter()
+                    .map(|e| &e.name)
+                    .collect::<Vec<_>>()
+            )
+        })
+}
+
+fn encode_legacy_apply_slot(
+    ctx: &LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    entity: &IREntity,
+    transition: &IRTransition,
+    apply: LegacyBoundApply<'_>,
+    target_param_eq: Option<&SmtValue>,
+    slot: usize,
+) -> Result<Bool, String> {
+    let params = state.merged_params();
+    let apply_ctx = legacy_slot_ctx(ctx, &entity.name, slot, params, "");
+    let action_params = try_build_apply_params(
+        &apply_ctx,
+        transition,
+        apply.args,
+        apply.refs,
+        ctx.step.step,
+    )?;
+    let mut parts = vec![try_encode_action(
+        ctx.step.pool,
+        ctx.step.vctx,
+        entity,
+        transition,
+        slot,
+        ctx.step.step,
+        &action_params,
+    )?];
+    if let Some(param_val) = target_param_eq {
+        parts.push(smt::smt_eq(
+            param_val,
+            &smt::int_val(i64::try_from(slot).unwrap_or(0)),
+        )?);
+    }
+    parts.extend(frame_entity_slots_except(
+        ctx.step.pool,
+        entity,
+        slot,
+        ctx.step.step,
+    ));
+    Ok(and_all(parts))
+}
+
+fn legacy_apply_transition_error(entity: &IREntity, transition: &str) -> String {
+    format!(
+        "Apply transition not found: entity={}, transition={transition:?} \
+         — available transitions: {:?}",
+        entity.name,
+        entity
+            .transitions
+            .iter()
+            .map(|t| &t.name)
+            .collect::<Vec<_>>()
+    )
+}
+
+fn encode_legacy_create(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    entity_name: &str,
+    fields: &[crate::ir::types::IRCreateField],
+) -> Result<(), String> {
+    let entity_ir = ctx.step.entities.iter().find(|e| e.name == *entity_name);
+    let create_fields: Vec<(String, IRExpr)> = fields
+        .iter()
+        .map(|field| (field.name.clone(), field.value.clone()))
+        .collect();
+    state.conjuncts.push(try_encode_create(
+        ctx.step.pool,
+        ctx.step.vctx,
+        entity_name,
+        entity_ir,
+        &create_fields,
+        ctx.step.step,
+        &state.step_params,
+    )?);
+    state.mark_entity_slots(entity_name, ctx.step.pool.slots_for(entity_name));
+    Ok(())
+}
+
+fn encode_legacy_cross_call(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    target_system: &str,
+    command_name: &str,
+    cross_args: &[IRExpr],
+) -> Result<(), String> {
+    let Some(target_sys) = ctx
+        .step
+        .all_systems
+        .iter()
+        .find(|s| s.name == *target_system)
+    else {
+        return Ok(());
+    };
+    let mut branch_results = Vec::new();
+    for target_step in target_sys
+        .actions
+        .iter()
+        .filter(|s| s.name == *command_name)
+    {
+        branch_results.push(encode_legacy_cross_branch(
+            ctx,
+            state,
+            target_step,
+            cross_args,
+        )?);
+    }
+    if branch_results.is_empty() {
+        return Ok(());
+    }
+    let all_touched: HashSet<(String, usize)> = branch_results
+        .iter()
+        .flat_map(|(_, touched)| touched.iter().cloned())
+        .collect();
+    state.conjuncts.push(framed_branch_disjunction(
+        ctx.step.pool,
+        ctx.step.entities,
+        ctx.step.step,
+        branch_results,
+        &all_touched,
+    ));
+    state.touched.extend(all_touched);
+    Ok(())
+}
+
+fn encode_legacy_cross_branch(
+    ctx: &LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    target_step: &IRSystemAction,
+    cross_args: &[IRExpr],
+) -> Result<(Bool, HashSet<(String, usize)>), String> {
+    if target_step.params.len() != cross_args.len() {
+        return Ok((smt::bool_const(false), HashSet::new()));
+    }
+    let arg_ctx = legacy_slot_ctx(ctx, "", 0, state.merged_params(), "");
+    let mut cross_params = HashMap::new();
+    for (target_param, arg_expr) in target_step.params.iter().zip(cross_args.iter()) {
+        let val = try_encode_slot_expr(&arg_ctx, arg_expr, ctx.step.step)?;
+        cross_params.insert(target_param.name.clone(), val);
+    }
+    try_encode_step_inner(
+        ctx.step.pool,
+        ctx.step.vctx,
+        ctx.step.entities,
+        ctx.step.all_systems,
+        target_step,
+        ctx.step.step,
+        StepEncodingOptions::with_override(ctx.step.depth + 1, cross_params),
+    )
+}
+
+fn encode_legacy_expr_stmt(
+    ctx: &LegacyActionCtx<'_>,
+    state: &mut LegacyStepState,
+    expr: &IRExpr,
+) -> Result<(), String> {
+    let expr_ctx = legacy_slot_ctx(
+        ctx,
+        "",
+        0,
+        state.merged_params(),
+        &ctx.scope.owning_system_name,
+    );
+    state
+        .conjuncts
+        .push(try_encode_slot_expr(&expr_ctx, expr, ctx.step.step)?.to_bool()?);
+    Ok(())
+}
+
+fn legacy_slot_ctx<'a>(
+    ctx: &'a LegacyActionCtx<'a>,
+    entity: &'a str,
+    slot: usize,
+    params: HashMap<String, SmtValue>,
+    system_name: &'a str,
+) -> SlotEncodeCtx<'a> {
+    SlotEncodeCtx {
+        pool: ctx.step.pool,
+        vctx: ctx.step.vctx,
+        entity,
+        slot,
+        params,
+        bindings: HashMap::new(),
+        system_name,
+        entity_param_types: &ctx.scope.entity_param_types,
+        store_param_types: &ctx.scope.store_param_types,
+    }
+}
+
+fn legacy_inactive_slot_frame(
+    ctx: &LegacyActionCtx<'_>,
+    bound: LegacyBoundSlot<'_>,
+    active: &Bool,
+) -> Result<Bool, String> {
+    let mut frame_parts = vec![smt::bool_not(active)];
+    if let Some(SmtValue::Bool(next)) =
+        ctx.step
+            .pool
+            .active_at(bound.entity_name, bound.slot, ctx.step.step + 1)
+    {
+        frame_parts.push(smt::bool_eq(next, active));
+    }
+    for field in &bound.entity.fields {
+        if let (Some(curr), Some(next)) = (
+            ctx.step
+                .pool
+                .field_at(bound.entity_name, bound.slot, &field.name, ctx.step.step),
+            ctx.step.pool.field_at(
+                bound.entity_name,
+                bound.slot,
+                &field.name,
+                ctx.step.step + 1,
+            ),
+        ) {
+            frame_parts.push(smt::smt_eq(curr, next)?);
+        }
+    }
+    Ok(and_all(frame_parts))
+}
+
+fn legacy_field_values(
     pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
-    event: &IRSystemAction,
+    entity_name: &str,
+    entity: &IREntity,
+    slot: usize,
     step: usize,
-    depth: usize,
+) -> HashMap<String, SmtValue> {
+    entity
+        .fields
+        .iter()
+        .filter_map(|field| {
+            pool.field_at(entity_name, slot, &field.name, step)
+                .map(|value| (field.name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+fn legacy_intermediate_values(
+    ctx: &LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    index: usize,
+) -> HashMap<String, SmtValue> {
+    bound
+        .entity
+        .fields
+        .iter()
+        .map(|field| {
+            let name = legacy_intermediate_name(ctx, state, bound, field, index);
+            (
+                field.name.clone(),
+                legacy_fresh_field_value(&name, &field.ty),
+            )
+        })
+        .collect()
+}
+
+fn legacy_intermediate_name(
+    ctx: &LegacyActionCtx<'_>,
+    state: &LegacyStepState,
+    bound: LegacyBoundSlot<'_>,
+    field: &crate::ir::types::IRField,
+    index: usize,
+) -> String {
+    let label = if bound.kind == LegacyBoundKind::ForAll {
+        format!("forall_ch{}", state.chain_id)
+    } else {
+        format!("ch{}", state.chain_id)
+    };
+    format!(
+        "{}_s{}_{}_t{}_{}_inter{index}",
+        bound.entity_name, bound.slot, field.name, ctx.step.step, label
+    )
+}
+
+fn legacy_fresh_field_value(name: &str, ty: &IRType) -> SmtValue {
+    match ty {
+        IRType::Bool => smt::bool_var(name),
+        IRType::Real | IRType::Float => smt::real_var(name),
+        IRType::Map { .. } | IRType::Set { .. } => {
+            smt::array_var(name, ty).expect("internal: array sort expected for Map/Set field")
+        }
+        IRType::Seq { element } => SmtValue::Dynamic(smt::dynamic_const(
+            name,
+            &smt::seq_sort(element.as_ref()).sort(),
+        )),
+        _ => smt::int_var(name),
+    }
+}
+
+fn smt_value_eq(left: &SmtValue, right: &SmtValue) -> Option<Bool> {
+    match (left, right) {
+        (SmtValue::Int(l), SmtValue::Int(r)) => Some(smt::int_eq(l, r)),
+        (SmtValue::Bool(l), SmtValue::Bool(r)) => Some(smt::bool_eq(l, r)),
+        (SmtValue::Real(l), SmtValue::Real(r)) => Some(smt::real_eq(l, r)),
+        _ => None,
+    }
+}
+
+fn framed_branch_disjunction(
+    pool: &SlotPool,
+    entities: &[IREntity],
+    step: usize,
+    branch_results: Vec<(Bool, HashSet<(String, usize)>)>,
+    all_touched: &HashSet<(String, usize)>,
+) -> Bool {
+    let disjuncts = branch_results
+        .into_iter()
+        .map(|(formula, branch_touched)| {
+            let untouched: HashSet<(String, usize)> =
+                all_touched.difference(&branch_touched).cloned().collect();
+            if untouched.is_empty() {
+                formula
+            } else {
+                let mut parts = vec![formula];
+                parts.extend(frame_specific_slots(pool, entities, &untouched, step));
+                and_all(parts)
+            }
+        })
+        .collect();
+    bool_or_all(disjuncts)
+}
+
+fn legacy_formula(conjuncts: Vec<Bool>) -> Bool {
+    if conjuncts.is_empty() {
+        smt::bool_const(true)
+    } else {
+        and_all(conjuncts)
+    }
+}
+
+fn bool_or_all(disjuncts: Vec<Bool>) -> Bool {
+    if disjuncts.is_empty() {
+        smt::bool_const(false)
+    } else {
+        let refs: Vec<&Bool> = disjuncts.iter().collect();
+        smt::bool_or(&refs)
+    }
+}
+
+pub(super) fn try_encode_step_inner_branching(
+    ctx: &StepEncodingCtx<'_>,
+    event: &IRSystemAction,
     override_params: Option<HashMap<String, SmtValue>>,
 ) -> Result<(Bool, HashSet<(String, usize)>), String> {
-    let branches = try_encode_step_branches_dispatch(
-        pool,
-        vctx,
-        entities,
-        all_systems,
-        event,
-        step,
-        depth,
-        override_params,
-    )?;
+    let branches = try_encode_step_branches_dispatch(ctx, event, override_params)?;
     let all_touched: HashSet<(String, usize)> = branches
         .iter()
         .flat_map(|b| b.touched.iter().cloned())
@@ -1150,7 +1171,8 @@ pub(super) fn try_encode_step_inner_branching(
             if untouched_by_branch.is_empty() {
                 branch.formula
             } else {
-                let frame = frame_specific_slots(pool, entities, &untouched_by_branch, step);
+                let frame =
+                    frame_specific_slots(ctx.pool, ctx.entities, &untouched_by_branch, ctx.step);
                 let mut parts = vec![branch.formula];
                 parts.extend(frame);
                 let refs: Vec<&Bool> = parts.iter().collect();
@@ -1169,155 +1191,162 @@ pub(super) fn try_encode_step_inner_branching(
     ))
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn try_encode_step_branches_dispatch(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
+    ctx: &StepEncodingCtx<'_>,
     event: &IRSystemAction,
-    step: usize,
-    depth: usize,
     override_params: Option<HashMap<String, SmtValue>>,
 ) -> Result<Vec<MacroBranch>, String> {
+    let step = ctx.step;
+    let step_params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
+    let scope = step_scope_metadata(ctx.all_systems, event);
+
     if !contains_macro_actions(&event.body) {
-        let step_params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
-        let (formula, touched) = try_encode_step_inner_legacy(
-            pool,
-            vctx,
-            entities,
-            all_systems,
-            event,
-            step,
-            depth,
-            Some(step_params.clone()),
-        )?;
-        let (owning_system_name, entity_param_types, store_param_types) =
-            step_scope_metadata(all_systems, event);
-        let mut branch = MacroBranch {
-            formula,
-            touched,
-            locals: HashMap::new(),
-            return_value: None,
-        };
-        if let Some(ret) = &event.return_expr {
-            let ctx = SlotEncodeCtx {
-                pool,
-                vctx,
-                entity: "",
-                slot: 0,
-                params: step_params,
-                bindings: HashMap::new(),
-                system_name: &owning_system_name,
-                entity_param_types: &entity_param_types,
-                store_param_types: &store_param_types,
-            };
-            let (value, constraints) = try_encode_macro_value_expr(&ctx, ret, step)?;
-            if !constraints.is_empty() {
-                let mut parts = vec![branch.formula.clone()];
-                parts.extend(constraints);
-                let refs: Vec<&Bool> = parts.iter().collect();
-                branch.formula = smt::bool_and(&refs);
-            }
-            branch.return_value = Some(value);
-        }
-        return Ok(vec![branch]);
+        return encode_non_macro_step_branch(ctx, event, step_params, &scope);
     }
 
-    let step_params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
-    let (owning_system_name, entity_param_types, store_param_types) =
-        step_scope_metadata(all_systems, event);
+    let mut branches = vec![MacroBranch {
+        formula: macro_initial_formula(ctx, event, &step_params, &scope)?,
+        touched: HashSet::new(),
+        locals: HashMap::new(),
+        return_value: None,
+    }];
+    let var_to_entity = scope.entity_param_types.clone();
 
-    let mut initial_parts = Vec::new();
-    if !matches!(
+    for action in &event.body {
+        let action_ctx = MacroActionCtx {
+            step: *ctx,
+            step_params: &step_params,
+            owning_system_name: &scope.owning_system_name,
+            entity_param_types: &scope.entity_param_types,
+            store_param_types: &scope.store_param_types,
+            var_to_entity: &var_to_entity,
+        };
+        branches = try_apply_macro_action(&action_ctx, action, branches)?;
+    }
+
+    attach_macro_return_values(
+        ctx,
+        &scope,
+        event.return_expr.as_ref(),
+        &step_params,
+        &mut branches,
+    )?;
+
+    Ok(branches)
+}
+
+pub(super) struct StepScopeMetadata {
+    pub(super) owning_system_name: String,
+    pub(super) entity_param_types: HashMap<String, String>,
+    pub(super) store_param_types: HashMap<String, String>,
+}
+
+fn encode_non_macro_step_branch(
+    ctx: &StepEncodingCtx<'_>,
+    event: &IRSystemAction,
+    step_params: HashMap<String, SmtValue>,
+    scope: &StepScopeMetadata,
+) -> Result<Vec<MacroBranch>, String> {
+    let (formula, touched) = try_encode_step_inner_legacy(ctx, event, Some(step_params.clone()))?;
+    let mut branch = MacroBranch {
+        formula,
+        touched,
+        locals: HashMap::new(),
+        return_value: None,
+    };
+    if let Some(ret) = &event.return_expr {
+        attach_macro_return_value(ctx, scope, ret, step_params, &mut branch)?;
+    }
+    Ok(vec![branch])
+}
+
+fn macro_initial_formula(
+    ctx: &StepEncodingCtx<'_>,
+    event: &IRSystemAction,
+    step_params: &HashMap<String, SmtValue>,
+    scope: &StepScopeMetadata,
+) -> Result<Bool, String> {
+    if matches!(
         &event.guard,
         IRExpr::Lit {
             value: LitVal::Bool { value: true },
             ..
         }
     ) {
-        initial_parts.push(try_encode_guard_expr_for_system(
-            pool,
-            vctx,
-            &event.guard,
-            &step_params,
-            step,
-            &owning_system_name,
-            &entity_param_types,
-            &store_param_types,
-        )?);
+        return Ok(smt::bool_const(true));
     }
-    let initial_formula = if initial_parts.is_empty() {
-        smt::bool_const(true)
-    } else {
-        let refs: Vec<&Bool> = initial_parts.iter().collect();
-        smt::bool_and(&refs)
+    try_encode_guard_expr_for_system(
+        ctx.pool,
+        ctx.vctx,
+        &event.guard,
+        ctx.step,
+        SystemGuardScope {
+            step_params,
+            system_name: &scope.owning_system_name,
+            entity_param_types: &scope.entity_param_types,
+            store_param_types: &scope.store_param_types,
+        },
+    )
+}
+
+fn attach_macro_return_values(
+    ctx: &StepEncodingCtx<'_>,
+    scope: &StepScopeMetadata,
+    ret: Option<&IRExpr>,
+    step_params: &HashMap<String, SmtValue>,
+    branches: &mut [MacroBranch],
+) -> Result<(), String> {
+    let Some(ret) = ret else {
+        return Ok(());
     };
-
-    let mut branches = vec![MacroBranch {
-        formula: initial_formula,
-        touched: HashSet::new(),
-        locals: HashMap::new(),
-        return_value: None,
-    }];
-    let var_to_entity: HashMap<String, String> = event
-        .params
-        .iter()
-        .filter_map(|p| match &p.ty {
-            IRType::Entity { name } => Some((p.name.clone(), name.clone())),
-            _ => None,
-        })
-        .collect();
-
-    for action in &event.body {
-        branches = try_apply_macro_action(
-            pool,
-            vctx,
-            entities,
-            all_systems,
-            action,
-            step,
-            depth,
-            &step_params,
-            &owning_system_name,
-            &entity_param_types,
-            &store_param_types,
-            &var_to_entity,
-            branches,
-        )?;
+    for branch in branches {
+        let params = merged_branch_params(step_params, &branch.locals);
+        attach_macro_return_value(ctx, scope, ret, params, branch)?;
     }
+    Ok(())
+}
 
-    if let Some(ret) = &event.return_expr {
-        for branch in &mut branches {
-            let ctx = SlotEncodeCtx {
-                pool,
-                vctx,
-                entity: "",
-                slot: 0,
-                params: merged_branch_params(&step_params, &branch.locals),
-                bindings: HashMap::new(),
-                system_name: &owning_system_name,
-                entity_param_types: &entity_param_types,
-                store_param_types: &store_param_types,
-            };
-            let (value, constraints) = try_encode_macro_value_expr(&ctx, ret, step)?;
-            if !constraints.is_empty() {
-                let mut parts = vec![branch.formula.clone()];
-                parts.extend(constraints);
-                let refs: Vec<&Bool> = parts.iter().collect();
-                branch.formula = smt::bool_and(&refs);
-            }
-            branch.return_value = Some(value);
-        }
+fn attach_macro_return_value(
+    ctx: &StepEncodingCtx<'_>,
+    scope: &StepScopeMetadata,
+    ret: &IRExpr,
+    params: HashMap<String, SmtValue>,
+    branch: &mut MacroBranch,
+) -> Result<(), String> {
+    let value_ctx = macro_value_slot_ctx(ctx, scope, params);
+    let (value, constraints) = try_encode_macro_value_expr(&value_ctx, ret, ctx.step)?;
+    if !constraints.is_empty() {
+        let mut parts = vec![branch.formula.clone()];
+        parts.extend(constraints);
+        let refs: Vec<&Bool> = parts.iter().collect();
+        branch.formula = smt::bool_and(&refs);
     }
+    branch.return_value = Some(value);
+    Ok(())
+}
 
-    Ok(branches)
+fn macro_value_slot_ctx<'a>(
+    ctx: &'a StepEncodingCtx<'a>,
+    scope: &'a StepScopeMetadata,
+    params: HashMap<String, SmtValue>,
+) -> SlotEncodeCtx<'a> {
+    SlotEncodeCtx {
+        pool: ctx.pool,
+        vctx: ctx.vctx,
+        entity: "",
+        slot: 0,
+        params,
+        bindings: HashMap::new(),
+        system_name: &scope.owning_system_name,
+        entity_param_types: &scope.entity_param_types,
+        store_param_types: &scope.store_param_types,
+    }
 }
 
 pub(super) fn step_scope_metadata(
     all_systems: &[IRSystem],
     event: &IRSystemAction,
-) -> (String, HashMap<String, String>, HashMap<String, String>) {
+) -> StepScopeMetadata {
     let owning_system = all_systems.iter().find(|s| {
         s.actions
             .iter()
@@ -1340,7 +1369,11 @@ pub(super) fn step_scope_metadata(
                 .collect()
         })
         .unwrap_or_default();
-    (owning_system_name, entity_param_types, store_param_types)
+    StepScopeMetadata {
+        owning_system_name,
+        entity_param_types,
+        store_param_types,
+    }
 }
 
 pub(super) fn merged_branch_params(
@@ -1496,22 +1529,22 @@ pub(super) fn try_encode_macro_value_expr(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) struct MacroActionCtx<'a> {
+    step: StepEncodingCtx<'a>,
+    step_params: &'a HashMap<String, SmtValue>,
+    owning_system_name: &'a str,
+    entity_param_types: &'a HashMap<String, String>,
+    store_param_types: &'a HashMap<String, String>,
+    var_to_entity: &'a HashMap<String, String>,
+}
+
 pub(super) fn try_apply_macro_action(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
+    ctx: &MacroActionCtx<'_>,
     action: &IRAction,
-    step: usize,
-    depth: usize,
-    step_params: &HashMap<String, SmtValue>,
-    owning_system_name: &str,
-    entity_param_types: &HashMap<String, String>,
-    store_param_types: &HashMap<String, String>,
-    var_to_entity: &HashMap<String, String>,
     branches: Vec<MacroBranch>,
 ) -> Result<Vec<MacroBranch>, String> {
+    let step_params = ctx.step_params;
+
     let mut next = Vec::new();
     for branch in branches {
         let params = merged_branch_params(step_params, &branch.locals);
@@ -1522,118 +1555,18 @@ pub(super) fn try_apply_macro_action(
                 filter,
                 ops,
             } => {
-                let n_slots = pool.slots_for(entity);
-                let entity_ir = entities.iter().find(|e| e.name == *entity);
-                let mut choose_branches = Vec::new();
-                for slot in 0..n_slots {
-                    let ctx = SlotEncodeCtx {
-                        pool,
-                        vctx,
+                apply_macro_choose(
+                    ctx,
+                    MacroChooseAction {
+                        var,
                         entity,
-                        slot,
-                        params: params.clone(),
-                        bindings: HashMap::new(),
-                        system_name: owning_system_name,
-                        entity_param_types,
-                        store_param_types,
-                    };
-                    let mut conjuncts = vec![branch.formula.clone()];
-                    if let Some(SmtValue::Bool(active)) = pool.active_at(entity, slot, step) {
-                        conjuncts.push(active.clone());
-                    }
-                    conjuncts.push(try_encode_slot_expr(&ctx, filter, step)?.to_bool()?);
-
-                    let mut touched = branch.touched.clone();
-                    let mut slot_has_action = false;
-                    let mut nested_touched = HashSet::new();
-
-                    if let Some(ent_ir) = entity_ir {
-                        for op in ops {
-                            match op {
-                                IRAction::Apply {
-                                    target,
-                                    transition,
-                                    args,
-                                    refs: apply_refs,
-                                } if target == var => {
-                                    if let Some(trans) =
-                                        ent_ir.transitions.iter().find(|t| t.name == *transition)
-                                    {
-                                        let action_params = try_build_apply_params(
-                                            &ctx, trans, args, apply_refs, step,
-                                        )?;
-                                        conjuncts.push(try_encode_action(
-                                            pool,
-                                            vctx,
-                                            ent_ir,
-                                            trans,
-                                            slot,
-                                            step,
-                                            &action_params,
-                                        )?);
-                                        slot_has_action = true;
-                                        touched.insert((entity.clone(), slot));
-                                    }
-                                }
-                                _ => {
-                                    let (nested_f, nested_slots) = try_encode_nested_op(
-                                        pool,
-                                        vctx,
-                                        entities,
-                                        all_systems,
-                                        op,
-                                        var,
-                                        entity,
-                                        ent_ir,
-                                        slot,
-                                        step,
-                                        &params,
-                                        depth,
-                                        &[],
-                                    )?;
-                                    conjuncts.extend(nested_f);
-                                    nested_touched.extend(nested_slots);
-                                }
-                            }
-                        }
-
-                        if !slot_has_action {
-                            for field in &ent_ir.fields {
-                                if let (Some(curr), Some(next_val)) = (
-                                    pool.field_at(entity, slot, &field.name, step),
-                                    pool.field_at(entity, slot, &field.name, step + 1),
-                                ) {
-                                    conjuncts.push(smt::smt_eq(curr, next_val)?);
-                                }
-                            }
-                            if let (
-                                Some(SmtValue::Bool(act_curr)),
-                                Some(SmtValue::Bool(act_next)),
-                            ) = (
-                                pool.active_at(entity, slot, step),
-                                pool.active_at(entity, slot, step + 1),
-                            ) {
-                                conjuncts.push(smt::bool_eq(act_next, act_curr));
-                            }
-                        }
-
-                        conjuncts.extend(frame_entity_slots_except(pool, ent_ir, slot, step));
-                    }
-
-                    touched.extend(nested_touched);
-                    for s in 0..n_slots {
-                        touched.insert((entity.clone(), s));
-                    }
-                    let refs: Vec<&Bool> = conjuncts.iter().collect();
-                    choose_branches.push(MacroBranch {
-                        formula: smt::bool_and(&refs),
-                        touched,
-                        locals: branch.locals.clone(),
-                        return_value: branch.return_value.clone(),
-                    });
-                }
-                next.extend(choose_branches);
-                continue;
+                        filter,
+                        ops,
+                    },
+                    &branch,
+                    &params,
+                    &mut next,
+                )?;
             }
             IRAction::ForAll { .. } => {
                 return Err(
@@ -1642,54 +1575,10 @@ pub(super) fn try_apply_macro_action(
                 );
             }
             IRAction::Create { entity, fields } => {
-                let entity_ir = entities.iter().find(|e| e.name == *entity);
-                let create_fields: Vec<(String, IRExpr)> = fields
-                    .iter()
-                    .map(|f| (f.name.clone(), f.value.clone()))
-                    .collect();
-                let create = try_encode_create(
-                    pool,
-                    vctx,
-                    entity,
-                    entity_ir,
-                    &create_fields,
-                    step,
-                    &params,
-                )?;
-                let parts = [branch.formula.clone(), create];
-                let refs: Vec<&Bool> = parts.iter().collect();
-                let mut touched = branch.touched.clone();
-                for slot in 0..pool.slots_for(entity) {
-                    touched.insert((entity.clone(), slot));
-                }
-                next.push(MacroBranch {
-                    formula: smt::bool_and(&refs),
-                    touched,
-                    locals: branch.locals.clone(),
-                    return_value: branch.return_value.clone(),
-                });
+                apply_macro_create(ctx, entity, fields, &branch, &params, &mut next)?;
             }
             IRAction::ExprStmt { expr } => {
-                let expr_ctx = SlotEncodeCtx {
-                    pool,
-                    vctx,
-                    entity: "",
-                    slot: 0,
-                    params,
-                    bindings: HashMap::new(),
-                    system_name: owning_system_name,
-                    entity_param_types,
-                    store_param_types,
-                };
-                let expr_bool = try_encode_slot_expr(&expr_ctx, expr, step)?.to_bool()?;
-                let parts = [branch.formula.clone(), expr_bool];
-                let refs: Vec<&Bool> = parts.iter().collect();
-                next.push(MacroBranch {
-                    formula: smt::bool_and(&refs),
-                    touched: branch.touched.clone(),
-                    locals: branch.locals.clone(),
-                    return_value: branch.return_value.clone(),
-                });
+                apply_macro_expr_stmt(ctx, expr, &branch, params, &mut next)?;
             }
             IRAction::Apply {
                 target,
@@ -1697,106 +1586,25 @@ pub(super) fn try_apply_macro_action(
                 args,
                 refs: apply_refs,
             } => {
-                let resolved_entity = entities.iter().find(|e| e.name == *target).or_else(|| {
-                    if let Some(entity_name) = var_to_entity.get(target.as_str()) {
-                        return entities.iter().find(|e| e.name == *entity_name);
-                    }
-                    let matches: Vec<_> = entities
-                        .iter()
-                        .filter(|e| e.transitions.iter().any(|t| t.name == *transition))
-                        .collect();
-                    if matches.len() == 1 {
-                        Some(matches[0])
-                    } else {
-                        None
-                    }
-                });
-                let Some(ent) = resolved_entity else {
-                    return Err(format!(
-                        "Apply target resolution failed in macro-step: target={target}, transition={transition}"
-                    ));
-                };
-                let Some(trans) = ent.transitions.iter().find(|t| t.name == *transition) else {
-                    return Err(format!(
-                        "Apply transition not found in macro-step: entity={}, transition={transition}",
-                        ent.name
-                    ));
-                };
-                let ent_name = &ent.name;
-                let target_param_eq: Option<&SmtValue> =
-                    if event_param_is_entity(target, entity_param_types) {
-                        params.get(target.as_str())
-                    } else {
-                        None
-                    };
-                for slot in 0..pool.slots_for(ent_name) {
-                    let apply_ctx = SlotEncodeCtx {
-                        pool,
-                        vctx,
-                        entity: ent_name,
-                        slot,
-                        params: params.clone(),
-                        bindings: HashMap::new(),
-                        system_name: owning_system_name,
-                        entity_param_types,
-                        store_param_types,
-                    };
-                    let action_params =
-                        try_build_apply_params(&apply_ctx, trans, args, apply_refs, step)?;
-                    let mut parts = vec![
-                        branch.formula.clone(),
-                        try_encode_action(pool, vctx, ent, trans, slot, step, &action_params)?,
-                    ];
-                    if let Some(param_val) = target_param_eq {
-                        let slot_val = smt::int_val(slot as i64);
-                        parts.push(smt::smt_eq(param_val, &slot_val)?);
-                    }
-                    let refs: Vec<&Bool> = parts.iter().collect();
-                    let mut touched = branch.touched.clone();
-                    for s in 0..pool.slots_for(ent_name) {
-                        touched.insert((ent_name.clone(), s));
-                    }
-                    next.push(MacroBranch {
-                        formula: smt::bool_and(&refs),
-                        touched,
-                        locals: branch.locals.clone(),
-                        return_value: branch.return_value.clone(),
-                    });
-                }
+                apply_macro_apply(
+                    ctx,
+                    MacroApplyAction {
+                        target,
+                        transition,
+                        args,
+                        refs: apply_refs,
+                    },
+                    &branch,
+                    &params,
+                    &mut next,
+                )?;
             }
             IRAction::CrossCall {
                 system,
                 command,
                 args,
             } => {
-                let call_branches = try_encode_macro_call(
-                    pool,
-                    vctx,
-                    entities,
-                    all_systems,
-                    system,
-                    command,
-                    args,
-                    step,
-                    depth,
-                    &params,
-                    owning_system_name,
-                    entity_param_types,
-                    store_param_types,
-                )?;
-                for call_branch in call_branches {
-                    let mut touched = branch.touched.clone();
-                    touched.extend(call_branch.touched);
-                    let refs: Vec<&Bool> = [&branch.formula, &call_branch.formula]
-                        .into_iter()
-                        .collect();
-                    next.push(MacroBranch {
-                        formula: smt::bool_and(&refs),
-                        touched,
-                        locals: branch.locals.clone(),
-                        return_value: branch.return_value.clone(),
-                    });
-                }
+                apply_macro_cross_call(ctx, system, command, args, &branch, &params, &mut next)?;
             }
             IRAction::LetCrossCall {
                 name,
@@ -1804,151 +1612,587 @@ pub(super) fn try_apply_macro_action(
                 command,
                 args,
             } => {
-                let call_branches = try_encode_macro_call(
-                    pool,
-                    vctx,
-                    entities,
-                    all_systems,
-                    system,
-                    command,
-                    args,
-                    step,
-                    depth,
+                apply_macro_let_cross_call(
+                    ctx,
+                    MacroLetCrossCall {
+                        name,
+                        system,
+                        command,
+                        args,
+                    },
+                    &branch,
                     &params,
-                    owning_system_name,
-                    entity_param_types,
-                    store_param_types,
+                    &mut next,
                 )?;
-                for call_branch in call_branches {
-                    let Some(value) = call_branch.return_value.clone() else {
-                        return Err(format!(
-                            "macro-step binding requires `{system}::{command}` to return a value"
-                        ));
-                    };
-                    let mut touched = branch.touched.clone();
-                    touched.extend(call_branch.touched);
-                    let mut locals = branch.locals.clone();
-                    locals.insert(name.clone(), value);
-                    let refs: Vec<&Bool> = [&branch.formula, &call_branch.formula]
-                        .into_iter()
-                        .collect();
-                    next.push(MacroBranch {
-                        formula: smt::bool_and(&refs),
-                        touched,
-                        locals,
-                        return_value: branch.return_value.clone(),
-                    });
-                }
             }
             IRAction::Match { scrutinee, arms } => {
-                let call_branches = match scrutinee {
-                    crate::ir::types::IRActionMatchScrutinee::Var { name } => vec![MacroBranch {
-                        formula: smt::bool_const(true),
-                        touched: HashSet::new(),
-                        locals: {
-                            let mut m = HashMap::new();
-                            let Some(val) = branch.locals.get(name).cloned() else {
-                                return Err(format!(
-                                    "macro-step match references unknown local `{name}`"
-                                ));
-                            };
-                            m.insert(name.clone(), val);
-                            m
-                        },
-                        return_value: branch.locals.get(name).cloned(),
-                    }],
-                    crate::ir::types::IRActionMatchScrutinee::CrossCall {
-                        system,
-                        command,
-                        args,
-                    } => try_encode_macro_call(
-                        pool,
-                        vctx,
-                        entities,
-                        all_systems,
-                        system,
-                        command,
-                        args,
-                        step,
-                        depth,
-                        &params,
-                        owning_system_name,
-                        entity_param_types,
-                        store_param_types,
-                    )?,
-                };
-                for call_branch in call_branches {
-                    let Some(scrut) = call_branch.return_value.clone() else {
-                        return Err(
-                            "macro-step match requires a returned command outcome".to_owned()
-                        );
-                    };
-                    for arm in arms {
-                        let mut arm_cond = encode::encode_pattern_cond(
-                            &scrut,
-                            &arm.pattern,
-                            &HashMap::new(),
-                            vctx,
-                        )?;
-                        let mut arm_locals = branch.locals.clone();
-                        encode::bind_pattern_vars(&arm.pattern, &scrut, &mut arm_locals, vctx)?;
-                        if let Some(guard) = &arm.guard {
-                            let guard_ctx = SlotEncodeCtx {
-                                pool,
-                                vctx,
-                                entity: "",
-                                slot: 0,
-                                params: merged_branch_params(&params, &arm_locals),
-                                bindings: HashMap::new(),
-                                system_name: owning_system_name,
-                                entity_param_types,
-                                store_param_types,
-                            };
-                            let guard_bool =
-                                try_encode_slot_expr(&guard_ctx, guard, step)?.to_bool()?;
-                            arm_cond = smt::bool_and(&[&arm_cond, &guard_bool]);
-                        }
-                        let arm_start = MacroBranch {
-                            formula: {
-                                let refs: Vec<&Bool> =
-                                    [&branch.formula, &call_branch.formula, &arm_cond]
-                                        .into_iter()
-                                        .collect();
-                                smt::bool_and(&refs)
-                            },
-                            touched: {
-                                let mut touched = branch.touched.clone();
-                                touched.extend(call_branch.touched.clone());
-                                touched
-                            },
-                            locals: arm_locals,
-                            return_value: branch.return_value.clone(),
-                        };
-                        let mut arm_branches = vec![arm_start];
-                        for nested in &arm.body {
-                            arm_branches = try_apply_macro_action(
-                                pool,
-                                vctx,
-                                entities,
-                                all_systems,
-                                nested,
-                                step,
-                                depth,
-                                step_params,
-                                owning_system_name,
-                                entity_param_types,
-                                store_param_types,
-                                var_to_entity,
-                                arm_branches,
-                            )?;
-                        }
-                        next.extend(arm_branches);
-                    }
-                }
+                apply_macro_match(ctx, scrutinee, arms, &branch, &params, &mut next)?;
             }
         }
     }
     Ok(next)
+}
+
+#[derive(Clone, Copy)]
+struct MacroChooseAction<'a> {
+    var: &'a str,
+    entity: &'a str,
+    filter: &'a IRExpr,
+    ops: &'a [IRAction],
+}
+
+#[derive(Clone, Copy)]
+struct MacroApplyAction<'a> {
+    target: &'a str,
+    transition: &'a str,
+    args: &'a [IRExpr],
+    refs: &'a [String],
+}
+
+struct MacroLetCrossCall<'a> {
+    name: &'a str,
+    system: &'a str,
+    command: &'a str,
+    args: &'a [IRExpr],
+}
+
+fn apply_macro_choose(
+    ctx: &MacroActionCtx<'_>,
+    choose: MacroChooseAction<'_>,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let n_slots = ctx.step.pool.slots_for(choose.entity);
+    let entity_ir = ctx.step.entities.iter().find(|e| e.name == *choose.entity);
+    for slot in 0..n_slots {
+        next.push(encode_macro_choose_slot(
+            ctx, choose, branch, params, entity_ir, slot, n_slots,
+        )?);
+    }
+    Ok(())
+}
+
+fn encode_macro_choose_slot(
+    ctx: &MacroActionCtx<'_>,
+    choose: MacroChooseAction<'_>,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    entity_ir: Option<&IREntity>,
+    slot: usize,
+    n_slots: usize,
+) -> Result<MacroBranch, String> {
+    let pool = ctx.step.pool;
+    let step = ctx.step.step;
+    let slot_ctx = macro_action_slot_ctx(ctx, choose.entity, slot, params.clone());
+    let mut conjuncts = vec![branch.formula.clone()];
+    if let Some(SmtValue::Bool(active)) = pool.active_at(choose.entity, slot, step) {
+        conjuncts.push(active.clone());
+    }
+    conjuncts.push(try_encode_slot_expr(&slot_ctx, choose.filter, step)?.to_bool()?);
+
+    let mut touched = branch.touched.clone();
+    let mut slot_has_action = false;
+    let mut nested_touched = HashSet::new();
+    if let Some(ent_ir) = entity_ir {
+        encode_macro_choose_ops(
+            ctx,
+            choose,
+            &slot_ctx,
+            ent_ir,
+            &mut ChooseSlotState {
+                conjuncts: &mut conjuncts,
+                touched: &mut touched,
+                nested_touched: &mut nested_touched,
+                slot_has_action: &mut slot_has_action,
+            },
+        )?;
+        if !slot_has_action {
+            conjuncts.extend(choose_slot_frame_self(pool, ent_ir, slot, step)?);
+        }
+        conjuncts.extend(frame_entity_slots_except(pool, ent_ir, slot, step));
+    }
+
+    touched.extend(nested_touched);
+    for slot in 0..n_slots {
+        touched.insert((choose.entity.to_owned(), slot));
+    }
+    Ok(MacroBranch {
+        formula: and_all(conjuncts),
+        touched,
+        locals: branch.locals.clone(),
+        return_value: branch.return_value.clone(),
+    })
+}
+
+struct ChooseSlotState<'a> {
+    conjuncts: &'a mut Vec<Bool>,
+    touched: &'a mut HashSet<(String, usize)>,
+    nested_touched: &'a mut HashSet<(String, usize)>,
+    slot_has_action: &'a mut bool,
+}
+
+fn encode_macro_choose_ops(
+    ctx: &MacroActionCtx<'_>,
+    choose: MacroChooseAction<'_>,
+    slot_ctx: &SlotEncodeCtx<'_>,
+    entity_ir: &IREntity,
+    state: &mut ChooseSlotState<'_>,
+) -> Result<(), String> {
+    for op in choose.ops {
+        match op {
+            IRAction::Apply {
+                target,
+                transition,
+                args,
+                refs: apply_refs,
+            } if target == choose.var => {
+                if let Some(trans) = entity_ir
+                    .transitions
+                    .iter()
+                    .find(|transition_ir| transition_ir.name == *transition)
+                {
+                    let action_params =
+                        try_build_apply_params(slot_ctx, trans, args, apply_refs, ctx.step.step)?;
+                    state.conjuncts.push(try_encode_action(
+                        ctx.step.pool,
+                        ctx.step.vctx,
+                        entity_ir,
+                        trans,
+                        slot_ctx.slot,
+                        ctx.step.step,
+                        &action_params,
+                    )?);
+                    *state.slot_has_action = true;
+                    state
+                        .touched
+                        .insert((choose.entity.to_owned(), slot_ctx.slot));
+                }
+            }
+            _ => {
+                let (nested_f, nested_slots) = try_encode_nested_op(
+                    NestedOpCtx {
+                        pool: ctx.step.pool,
+                        vctx: ctx.step.vctx,
+                        entities: ctx.step.entities,
+                        all_systems: ctx.step.all_systems,
+                        bound_var: choose.var,
+                        bound_ent_name: choose.entity,
+                        bound_entity_ir: entity_ir,
+                        bound_slot: slot_ctx.slot,
+                        step: ctx.step.step,
+                        base_params: &slot_ctx.params,
+                        depth: ctx.step.depth,
+                        outer_bindings: &[],
+                    },
+                    op,
+                )?;
+                state.conjuncts.extend(nested_f);
+                state.nested_touched.extend(nested_slots);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn choose_slot_frame_self(
+    pool: &SlotPool,
+    entity: &IREntity,
+    slot: usize,
+    step: usize,
+) -> Result<Vec<Bool>, String> {
+    let mut conjuncts = Vec::new();
+    for field in &entity.fields {
+        if let (Some(curr), Some(next_val)) = (
+            pool.field_at(&entity.name, slot, &field.name, step),
+            pool.field_at(&entity.name, slot, &field.name, step + 1),
+        ) {
+            conjuncts.push(smt::smt_eq(curr, next_val)?);
+        }
+    }
+    if let (Some(SmtValue::Bool(act_curr)), Some(SmtValue::Bool(act_next))) = (
+        pool.active_at(&entity.name, slot, step),
+        pool.active_at(&entity.name, slot, step + 1),
+    ) {
+        conjuncts.push(smt::bool_eq(act_next, act_curr));
+    }
+    Ok(conjuncts)
+}
+
+fn apply_macro_create(
+    ctx: &MacroActionCtx<'_>,
+    entity: &str,
+    fields: &[crate::ir::types::IRCreateField],
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let entity_ir = ctx.step.entities.iter().find(|e| e.name == *entity);
+    let create_fields: Vec<(String, IRExpr)> = fields
+        .iter()
+        .map(|field| (field.name.clone(), field.value.clone()))
+        .collect();
+    let create = try_encode_create(
+        ctx.step.pool,
+        ctx.step.vctx,
+        entity,
+        entity_ir,
+        &create_fields,
+        ctx.step.step,
+        params,
+    )?;
+    let mut touched = branch.touched.clone();
+    for slot in 0..ctx.step.pool.slots_for(entity) {
+        touched.insert((entity.to_owned(), slot));
+    }
+    next.push(MacroBranch {
+        formula: branch_and(branch, create),
+        touched,
+        locals: branch.locals.clone(),
+        return_value: branch.return_value.clone(),
+    });
+    Ok(())
+}
+
+fn apply_macro_expr_stmt(
+    ctx: &MacroActionCtx<'_>,
+    expr: &IRExpr,
+    branch: &MacroBranch,
+    params: HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let expr_ctx = macro_action_slot_ctx(ctx, "", 0, params);
+    let expr_bool = try_encode_slot_expr(&expr_ctx, expr, ctx.step.step)?.to_bool()?;
+    next.push(MacroBranch {
+        formula: branch_and(branch, expr_bool),
+        touched: branch.touched.clone(),
+        locals: branch.locals.clone(),
+        return_value: branch.return_value.clone(),
+    });
+    Ok(())
+}
+
+fn apply_macro_apply(
+    ctx: &MacroActionCtx<'_>,
+    apply: MacroApplyAction<'_>,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let ent = resolve_macro_apply_entity(ctx, apply.target, apply.transition)?;
+    let trans = ent
+        .transitions
+        .iter()
+        .find(|transition| transition.name == *apply.transition)
+        .ok_or_else(|| {
+            format!(
+                "Apply transition not found in macro-step: entity={}, transition={}",
+                ent.name, apply.transition
+            )
+        })?;
+    let target_param_eq = event_param_is_entity(apply.target, ctx.entity_param_types)
+        .then(|| params.get(apply.target))
+        .flatten();
+    for slot in 0..ctx.step.pool.slots_for(&ent.name) {
+        next.push(encode_macro_apply_slot(
+            ctx,
+            MacroApplySlot {
+                entity: ent,
+                transition: trans,
+                slot,
+                target_param_eq,
+            },
+            apply,
+            branch,
+            params,
+        )?);
+    }
+    Ok(())
+}
+
+struct MacroApplySlot<'a> {
+    entity: &'a IREntity,
+    transition: &'a IRTransition,
+    slot: usize,
+    target_param_eq: Option<&'a SmtValue>,
+}
+
+fn resolve_macro_apply_entity<'a>(
+    ctx: &'a MacroActionCtx<'_>,
+    target: &str,
+    transition: &str,
+) -> Result<&'a IREntity, String> {
+    ctx.step
+        .entities
+        .iter()
+        .find(|entity| entity.name == *target)
+        .or_else(|| {
+            ctx.var_to_entity
+                .get(target)
+                .and_then(|entity_name| ctx.step.entities.iter().find(|e| e.name == *entity_name))
+        })
+        .or_else(|| {
+            let matches: Vec<_> = ctx
+                .step
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity
+                        .transitions
+                        .iter()
+                        .any(|transition_ir| transition_ir.name == *transition)
+                })
+                .collect();
+            (matches.len() == 1).then(|| matches[0])
+        })
+        .ok_or_else(|| {
+            format!(
+                "Apply target resolution failed in macro-step: target={target}, transition={transition}"
+            )
+        })
+}
+
+fn encode_macro_apply_slot(
+    ctx: &MacroActionCtx<'_>,
+    slot: MacroApplySlot<'_>,
+    apply: MacroApplyAction<'_>,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+) -> Result<MacroBranch, String> {
+    let apply_ctx = macro_action_slot_ctx(ctx, &slot.entity.name, slot.slot, params.clone());
+    let action_params = try_build_apply_params(
+        &apply_ctx,
+        slot.transition,
+        apply.args,
+        apply.refs,
+        ctx.step.step,
+    )?;
+    let mut parts = vec![
+        branch.formula.clone(),
+        try_encode_action(
+            ctx.step.pool,
+            ctx.step.vctx,
+            slot.entity,
+            slot.transition,
+            slot.slot,
+            ctx.step.step,
+            &action_params,
+        )?,
+    ];
+    if let Some(param_val) = slot.target_param_eq {
+        parts.push(smt::smt_eq(
+            param_val,
+            &smt::int_val(i64::try_from(slot.slot).unwrap_or(0)),
+        )?);
+    }
+    let mut touched = branch.touched.clone();
+    for slot_idx in 0..ctx.step.pool.slots_for(&slot.entity.name) {
+        touched.insert((slot.entity.name.clone(), slot_idx));
+    }
+    Ok(MacroBranch {
+        formula: and_all(parts),
+        touched,
+        locals: branch.locals.clone(),
+        return_value: branch.return_value.clone(),
+    })
+}
+
+fn apply_macro_cross_call(
+    ctx: &MacroActionCtx<'_>,
+    system: &str,
+    command: &str,
+    args: &[IRExpr],
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let call_branches = try_encode_macro_call(ctx, system, command, args, params)?;
+    for call_branch in call_branches {
+        next.push(branch_with_macro_call(
+            branch,
+            &call_branch,
+            branch.locals.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_macro_let_cross_call(
+    ctx: &MacroActionCtx<'_>,
+    call: MacroLetCrossCall<'_>,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let call_branches = try_encode_macro_call(ctx, call.system, call.command, call.args, params)?;
+    for call_branch in call_branches {
+        let Some(value) = call_branch.return_value.clone() else {
+            return Err(format!(
+                "macro-step binding requires `{}::{}` to return a value",
+                call.system, call.command
+            ));
+        };
+        let mut locals = branch.locals.clone();
+        locals.insert(call.name.to_owned(), value);
+        next.push(branch_with_macro_call(branch, &call_branch, locals));
+    }
+    Ok(())
+}
+
+fn apply_macro_match(
+    ctx: &MacroActionCtx<'_>,
+    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
+    arms: &[crate::ir::types::IRActionMatchArm],
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+    next: &mut Vec<MacroBranch>,
+) -> Result<(), String> {
+    let call_branches = macro_match_scrutinee_branches(ctx, scrutinee, branch, params)?;
+    for call_branch in call_branches {
+        let Some(scrut) = call_branch.return_value.clone() else {
+            return Err("macro-step match requires a returned command outcome".to_owned());
+        };
+        for arm in arms {
+            next.extend(macro_match_arm_branches(
+                ctx,
+                arm,
+                branch,
+                &call_branch,
+                &scrut,
+                params,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn macro_match_scrutinee_branches(
+    ctx: &MacroActionCtx<'_>,
+    scrutinee: &crate::ir::types::IRActionMatchScrutinee,
+    branch: &MacroBranch,
+    params: &HashMap<String, SmtValue>,
+) -> Result<Vec<MacroBranch>, String> {
+    match scrutinee {
+        crate::ir::types::IRActionMatchScrutinee::Var { name } => {
+            let Some(value) = branch.locals.get(name).cloned() else {
+                return Err(format!(
+                    "macro-step match references unknown local `{name}`"
+                ));
+            };
+            Ok(vec![MacroBranch {
+                formula: smt::bool_const(true),
+                touched: HashSet::new(),
+                locals: HashMap::from([(name.clone(), value.clone())]),
+                return_value: Some(value),
+            }])
+        }
+        crate::ir::types::IRActionMatchScrutinee::CrossCall {
+            system,
+            command,
+            args,
+        } => try_encode_macro_call(ctx, system, command, args, params),
+    }
+}
+
+fn macro_match_arm_branches(
+    ctx: &MacroActionCtx<'_>,
+    arm: &crate::ir::types::IRActionMatchArm,
+    branch: &MacroBranch,
+    call_branch: &MacroBranch,
+    scrut: &SmtValue,
+    params: &HashMap<String, SmtValue>,
+) -> Result<Vec<MacroBranch>, String> {
+    let arm_locals = macro_match_arm_locals(ctx, arm, branch, scrut)?;
+    let arm_cond = macro_match_arm_condition(ctx, arm, scrut, params, &arm_locals)?;
+    let mut arm_branches = vec![MacroBranch {
+        formula: and_all(vec![
+            branch.formula.clone(),
+            call_branch.formula.clone(),
+            arm_cond,
+        ]),
+        touched: {
+            let mut touched = branch.touched.clone();
+            touched.extend(call_branch.touched.clone());
+            touched
+        },
+        locals: arm_locals,
+        return_value: branch.return_value.clone(),
+    }];
+    for nested in &arm.body {
+        arm_branches = try_apply_macro_action(ctx, nested, arm_branches)?;
+    }
+    Ok(arm_branches)
+}
+
+fn macro_match_arm_locals(
+    ctx: &MacroActionCtx<'_>,
+    arm: &crate::ir::types::IRActionMatchArm,
+    branch: &MacroBranch,
+    scrut: &SmtValue,
+) -> Result<HashMap<String, SmtValue>, String> {
+    let mut arm_locals = branch.locals.clone();
+    encode::bind_pattern_vars(&arm.pattern, scrut, &mut arm_locals, ctx.step.vctx)?;
+    Ok(arm_locals)
+}
+
+fn macro_match_arm_condition(
+    ctx: &MacroActionCtx<'_>,
+    arm: &crate::ir::types::IRActionMatchArm,
+    scrut: &SmtValue,
+    params: &HashMap<String, SmtValue>,
+    arm_locals: &HashMap<String, SmtValue>,
+) -> Result<Bool, String> {
+    let mut arm_cond =
+        encode::encode_pattern_cond(scrut, &arm.pattern, &HashMap::new(), ctx.step.vctx)?;
+    if let Some(guard) = &arm.guard {
+        let guard_ctx = macro_action_slot_ctx(ctx, "", 0, merged_branch_params(params, arm_locals));
+        let guard_bool = try_encode_slot_expr(&guard_ctx, guard, ctx.step.step)?.to_bool()?;
+        arm_cond = smt::bool_and(&[&arm_cond, &guard_bool]);
+    }
+    Ok(arm_cond)
+}
+
+fn macro_action_slot_ctx<'a>(
+    ctx: &'a MacroActionCtx<'a>,
+    entity: &'a str,
+    slot: usize,
+    params: HashMap<String, SmtValue>,
+) -> SlotEncodeCtx<'a> {
+    SlotEncodeCtx {
+        pool: ctx.step.pool,
+        vctx: ctx.step.vctx,
+        entity,
+        slot,
+        params,
+        bindings: HashMap::new(),
+        system_name: ctx.owning_system_name,
+        entity_param_types: ctx.entity_param_types,
+        store_param_types: ctx.store_param_types,
+    }
+}
+
+fn branch_with_macro_call(
+    branch: &MacroBranch,
+    call_branch: &MacroBranch,
+    locals: HashMap<String, SmtValue>,
+) -> MacroBranch {
+    let mut touched = branch.touched.clone();
+    touched.extend(call_branch.touched.clone());
+    MacroBranch {
+        formula: and_all(vec![branch.formula.clone(), call_branch.formula.clone()]),
+        touched,
+        locals,
+        return_value: branch.return_value.clone(),
+    }
+}
+
+fn branch_and(branch: &MacroBranch, formula: Bool) -> Bool {
+    and_all(vec![branch.formula.clone(), formula])
+}
+
+fn and_all(parts: Vec<Bool>) -> Bool {
+    let refs: Vec<&Bool> = parts.iter().collect();
+    smt::bool_and(&refs)
 }
 
 pub(super) fn event_param_is_entity(
@@ -1958,22 +2202,18 @@ pub(super) fn event_param_is_entity(
     entity_param_types.contains_key(target)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn try_encode_macro_call(
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    all_systems: &[IRSystem],
+    ctx: &MacroActionCtx<'_>,
     target_system: &str,
     command_name: &str,
     cross_args: &[IRExpr],
-    step: usize,
-    depth: usize,
     params: &HashMap<String, SmtValue>,
-    owning_system_name: &str,
-    entity_param_types: &HashMap<String, String>,
-    store_param_types: &HashMap<String, String>,
 ) -> Result<Vec<MacroBranch>, String> {
+    let pool = ctx.step.pool;
+    let vctx = ctx.step.vctx;
+    let all_systems = ctx.step.all_systems;
+    let step = ctx.step.step;
+
     let Some(target_sys) = all_systems.iter().find(|s| s.name == *target_system) else {
         return Ok(vec![]);
     };
@@ -1989,9 +2229,9 @@ pub(super) fn try_encode_macro_call(
         slot: 0,
         params: params.clone(),
         bindings: HashMap::new(),
-        system_name: owning_system_name,
-        entity_param_types,
-        store_param_types,
+        system_name: ctx.owning_system_name,
+        entity_param_types: ctx.entity_param_types,
+        store_param_types: ctx.store_param_types,
     };
     let mut branches = Vec::new();
     for target_step in &matching_steps {
@@ -2003,14 +2243,13 @@ pub(super) fn try_encode_macro_call(
             let val = try_encode_slot_expr(&arg_ctx, arg_expr, step)?;
             cross_params.insert(target_param.name.clone(), val);
         }
+        let cross_ctx = StepEncodingCtx {
+            depth: ctx.step.depth + 1,
+            ..ctx.step
+        };
         branches.extend(try_encode_step_branches_dispatch(
-            pool,
-            vctx,
-            entities,
-            all_systems,
+            &cross_ctx,
             target_step,
-            step,
-            depth + 1,
             Some(cross_params),
         )?);
     }

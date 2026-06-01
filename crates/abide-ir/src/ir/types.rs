@@ -9,6 +9,12 @@ use crate::span::Span;
 
 // ── Types ────────────────────────────────────────────────────────────
 
+/// Lowered, fully-resolved Abide type.
+///
+/// IR types are erased of surface sugar (generics, path qualifiers).
+/// `Refinement` is the only variant whose semantics involves an
+/// expression — the contained predicate evaluates over a fresh `$`
+/// binding of the base type.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag")]
 pub enum IRType {
@@ -52,9 +58,12 @@ pub enum IRType {
     },
 }
 
+/// Field of a record/struct type.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRRecordField {
+    /// Field name.
     pub name: std::string::String,
+    /// Field type.
     #[serde(rename = "type")]
     pub ty: IRType,
 }
@@ -105,6 +114,20 @@ impl IRType {
 
 // ── Expressions ──────────────────────────────────────────────────────
 
+/// Lowered Abide expression.
+///
+/// `IRExpr` is the post-elaboration expression form. Variable
+/// references carry their resolved type; surface sugar like `|>`,
+/// `where`, and qualified names has been desugared. Logical operators
+/// flow through `BinOp { op: "and" | "or" | "implies", … }` rather
+/// than dedicated variants.
+///
+/// `Span` is preserved out-of-band (it does not serialize) so the
+/// verifier can map counterexamples back to source locations.
+///
+/// Note the deliberate split between [`Self::App`] (pure call) and the
+/// operational nodes in [`IRAction`]: only the former is legal in
+/// contracts and queries.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag")]
 pub enum IRExpr {
@@ -430,16 +453,27 @@ pub enum IRExpr {
     },
 }
 
-/// arithmetic aggregator kind in IR.
+/// Arithmetic aggregator kind in IR.
+///
+/// Mirrors the surface aggregators (`sum`, `product`, `min`, `max`,
+/// `count`); `Count` differs in that its body is constrained to
+/// produce a boolean predicate over the domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum IRAggKind {
+    /// `sum x: T | body`.
     Sum,
+    /// `product x: T | body`.
     Product,
+    /// `min x: T | body`.
     Min,
+    /// `max x: T | body`.
     Max,
+    /// `count x: T | predicate`.
     Count,
 }
 
+/// One arm of an [`IRExpr::Match`] expression: an optional guard
+/// `if cond` plus a body.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRMatchArm {
     pub pattern: IRPattern,
@@ -447,29 +481,38 @@ pub struct IRMatchArm {
     pub body: IRExpr,
 }
 
+/// Pattern in a `match` arm.
+///
+/// `POr` is reserved for surface `p | q` patterns; the elaborator
+/// expands record patterns into a fixed `fields` order so the verifier
+/// can encode them positionally.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag")]
 pub enum IRPattern {
-    PVar {
-        name: std::string::String,
-    },
+    /// Variable binding (`x`).
+    PVar { name: std::string::String },
+    /// Constructor pattern with optional record-field patterns.
     PCtor {
         name: std::string::String,
         fields: Vec<IRFieldPat>,
     },
+    /// `_` wildcard.
     PWild,
+    /// `left | right` — matches if either side matches.
     POr {
         left: Box<IRPattern>,
         right: Box<IRPattern>,
     },
 }
 
+/// One `field: pattern` entry inside an [`IRPattern::PCtor`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRFieldPat {
     pub name: std::string::String,
     pub pattern: IRPattern,
 }
 
+/// One binding inside an [`IRExpr::Let`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LetBinding {
     pub name: std::string::String,
@@ -478,6 +521,8 @@ pub struct LetBinding {
     pub expr: IRExpr,
 }
 
+/// One binding inside an [`IRExpr::RelComp`] (relation
+/// comprehension): `var ∈ domain` (or `var ∈ source` when present).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRRelCompBinding {
     pub var: std::string::String,
@@ -485,18 +530,34 @@ pub struct IRRelCompBinding {
     pub source: Option<Box<IRExpr>>,
 }
 
+/// Literal value carried by [`IRExpr::Lit`].
+///
+/// `Real` and `Float` are split because Abide treats them as separate
+/// numeric types: `Real` is exact, `Float` is IEEE-754. They are both
+/// stored as `f64` here, with disambiguation by the variant tag.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag")]
 pub enum LitVal {
+    /// Integer literal.
     Int { value: i64 },
+    /// Real-number literal.
     Real { value: f64 },
+    /// IEEE float literal.
     Float { value: f64 },
+    /// Boolean literal.
     Bool { value: bool },
+    /// String literal.
     Str { value: std::string::String },
 }
 
 // ── Entities ─────────────────────────────────────────────────────────
 
+/// Lowered `entity` declaration.
+///
+/// Holds the entity's flat fields, its entity-local transitions
+/// (`action`), and any contracts (`invariant`, `derived`, `fsm`)
+/// declared inside the body. Per-entity invariants travel with the
+/// entity into every system that pools it via `Store<E>`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IREntity {
     pub name: std::string::String,
@@ -565,6 +626,14 @@ pub struct IRInvariant {
     pub body: IRExpr,
 }
 
+/// A state field on an entity or system.
+///
+/// The `default`/`initial_constraint` pair encodes the surface
+/// initialization forms: a deterministic default (`= expr`), a
+/// nondeterministic set membership (`in {a, b}`), or a refinement
+/// constraint (`where expr` using `$` as the bound variable). The
+/// verifier uses `initial_constraint` for IC3's initial-state encoding
+/// when present.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRField {
     pub name: std::string::String,
@@ -582,6 +651,12 @@ pub struct IRField {
     pub initial_constraint: Option<IRExpr>,
 }
 
+/// An entity-local transition (`action` on an `entity`).
+///
+/// `refs` names the entity instances the action operates on, `guard`
+/// is the precondition, `updates` is the list of `field' = expr`
+/// rewrites, and `postcondition` is an optional explicit `requires` /
+/// `ensures` clause.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRTransition {
     pub name: std::string::String,
@@ -592,12 +667,14 @@ pub struct IRTransition {
     pub postcondition: Option<IRExpr>,
 }
 
+/// One named entity reference in an entity-local transition.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRTransRef {
     pub name: std::string::String,
     pub entity: std::string::String,
 }
 
+/// One typed parameter of a transition, action, query, or proc.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRTransParam {
     pub name: std::string::String,
@@ -605,6 +682,7 @@ pub struct IRTransParam {
     pub ty: IRType,
 }
 
+/// One `field' = value` rewrite inside a transition's update set.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRUpdate {
     pub field: std::string::String,
@@ -637,6 +715,13 @@ pub struct IRLetBinding {
 
 // ── Systems ──────────────────────────────────────────────────────────
 
+/// Lowered `system` / `program` declaration.
+///
+/// `IRSystem` is the operational unit the verifier reasons about:
+/// state fields, pooled entity stores, executable commands, internal
+/// actions, contracts, and queries. Programs (top-level composition
+/// units) carry `let_bindings` and `procs` for the composition
+/// topology; non-program systems leave both empty.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRSystem {
     pub name: std::string::String,
@@ -684,6 +769,8 @@ pub struct IRSystem {
     pub procs: Vec<IRProc>,
 }
 
+/// A `Store<E>` parameter on a system: the system pools entity type
+/// `entity_type` under the local name `name`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRStoreParam {
     pub name: std::string::String,
@@ -754,6 +841,12 @@ pub struct IRCommand {
 // Fairness is not a step-level property. It lives in `AssumptionSet`
 // data attached to the verification site.
 
+/// A system-level `command` or `action` body.
+///
+/// `body` is a sequence of operational [`IRAction`] steps executed
+/// under the precondition `guard`. `return_expr` carries an outcome
+/// variant used by `proc` composition; the verifier itself ignores
+/// return values.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRSystemAction {
     pub name: std::string::String,
@@ -767,48 +860,68 @@ pub struct IRSystemAction {
     pub return_expr: Option<IRExpr>,
 }
 
+/// One operational step in a system action/command body.
+///
+/// `IRAction` is the imperative IR — it is *not* legal inside
+/// contracts. The split between [`IRExpr::App`] and the call-shaped
+/// variants here (`Apply`, `CrossCall`, `LetCrossCall`) preserves the
+/// pure/effectful distinction across lowering.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag")]
 pub enum IRAction {
+    /// `choose x: Entity where filter` — bind a nondeterministically
+    /// chosen entity instance.
     Choose {
         var: std::string::String,
         entity: std::string::String,
         filter: Box<IRExpr>,
         ops: Vec<IRAction>,
     },
+    /// `for x: Entity { ops }` — iterate ops over every member of the
+    /// store.
     ForAll {
         var: std::string::String,
         entity: std::string::String,
         ops: Vec<IRAction>,
     },
+    /// `create Entity { field: value, ... }` — allocate a new
+    /// entity instance.
     Create {
         entity: std::string::String,
         fields: Vec<IRCreateField>,
     },
+    /// `let name = Sys::cmd(args)` — invoke a cross-system command
+    /// and bind its return value.
     LetCrossCall {
         name: std::string::String,
         system: std::string::String,
         command: std::string::String,
         args: Vec<IRExpr>,
     },
+    /// `target.transition(refs, args)` — fire an entity-local
+    /// transition.
     Apply {
         target: std::string::String,
         transition: std::string::String,
         refs: Vec<std::string::String>,
         args: Vec<IRExpr>,
     },
+    /// `Sys::cmd(args)` — invoke a cross-system command without
+    /// binding its result.
     CrossCall {
         system: std::string::String,
         command: std::string::String,
         args: Vec<IRExpr>,
     },
+    /// `match scrutinee { arms }` — body-level match. Scrutinee is
+    /// either a bound variable or an inline cross-call result.
     Match {
         scrutinee: IRActionMatchScrutinee,
         arms: Vec<IRActionMatchArm>,
     },
-    ExprStmt {
-        expr: IRExpr,
-    },
+    /// Bare expression statement — evaluated for its effect; the
+    /// value is discarded.
+    ExprStmt { expr: IRExpr },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -840,6 +953,13 @@ pub struct IRCreateField {
 
 // ── Verification ─────────────────────────────────────────────────────
 
+/// Lowered `verify` block — a bounded-model-checking obligation.
+///
+/// `verify` is a finite, refutational check; the verifier reports
+/// `CHECKED` / `COUNTEREXAMPLE` / `DEADLOCK` / `TIMEOUT` /
+/// `UNPROVABLE`. The `assumption_set` field carries the post-resolve
+/// stutter/fairness context that determines which backends are
+/// dispatchable.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRVerify {
     pub name: std::string::String,
@@ -878,6 +998,9 @@ pub struct IRStoreDecl {
     pub hi: i64,
 }
 
+/// One entry in `IRVerify::systems`: the system under check and its
+/// scope bounds. The bounds inform how many entity instances the
+/// verifier will materialize for that system.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRVerifySystem {
     pub name: std::string::String,
@@ -907,25 +1030,48 @@ pub struct IRVerifySystem {
 // `try_liveness_reduction` in `verify/mod.rs`. Per-tuple lasso
 // encoding is wired through `assumption_set.per_tuple`.
 
+/// Qualified reference to a system command — the unit of fairness in
+/// assumption sets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IRCommandRef {
     pub system: std::string::String,
     pub command: std::string::String,
 }
 
+/// Source of the stutter setting in an assumption set.
+///
+/// Distinguishing `Default` from an explicit choice matters for
+/// downstream diagnostics: an explicit `no stutter` enables
+/// deadlock-sensitive checking, while the default does not. See
+/// CLAUDE.md "locked invariants" for the K1 step model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IRStutterProvenance {
+    /// User did not mention stutter; default is on.
     Default,
+    /// User wrote `assume { stutter }`.
     ExplicitStutter,
+    /// User wrote `assume { no stutter }`.
     ExplicitNoStutter,
 }
 
+/// Normalized fairness/stutter context attached to a verify, theorem,
+/// or lemma site.
+///
+/// Construct only via [`Self::from_elab`] or the
+/// `default_for_verify`/`default_for_theorem_or_lemma` constructors —
+/// CLAUDE.md locks the stutter defaults to "on" uniformly across all
+/// three site kinds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IRAssumptionSet {
+    /// `true` when stutter edges are added to the encoding.
     pub stutter: bool,
+    /// Source of the stutter setting (default vs explicit).
     pub stutter_provenance: IRStutterProvenance,
+    /// Events under weak fairness (sorted, deduplicated).
     pub weak_fair: Vec<IRCommandRef>,
+    /// Events under strong fairness (sorted, deduplicated). Disjoint
+    /// from `weak_fair` after normalization.
     pub strong_fair: Vec<IRCommandRef>,
     /// Subset of `weak_fair ∪ strong_fair` whose events are
     /// parameterized. Parameterized fair events default to per-tuple
@@ -998,6 +1144,13 @@ impl IRAssumptionSet {
     }
 }
 
+/// Lowered `theorem` block — an unbounded deductive obligation.
+///
+/// Theorems prove `shows` clauses assuming `invariants`, scoped to the
+/// listed `systems`. They report `PROVED` / `COUNTEREXAMPLE` /
+/// `TIMEOUT` / `UNPROVABLE`. The optional `by_file` attaches an
+/// external proof artifact; `by_lemmas` injects previously-proved
+/// lemma conclusions as hypotheses.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRTheorem {
     pub name: std::string::String,
@@ -1021,6 +1174,11 @@ pub struct IRTheorem {
     pub file: Option<std::string::String>,
 }
 
+/// Lowered `axiom` declaration — a trusted hypothesis.
+///
+/// Axioms are accepted without proof. When backed by `by "file"`, the
+/// artifact is checked by an external prover (Agda / Lean / Rocq); the
+/// abide verifier trusts the result either way.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRAxiom {
     pub name: std::string::String,
@@ -1036,6 +1194,11 @@ pub struct IRAxiom {
     pub file: Option<std::string::String>,
 }
 
+/// Lowered `lemma` declaration — a reusable proof step.
+///
+/// Lemmas are proved in isolation and then attached to theorems via
+/// `by lemma_name`, where their conclusions are injected as
+/// hypotheses. Like theorems they default to stutter-on.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRLemma {
     pub name: std::string::String,
@@ -1050,6 +1213,11 @@ pub struct IRLemma {
     pub file: Option<std::string::String>,
 }
 
+/// Lowered `scene` declaration — an existential-witness block.
+///
+/// Unlike `verify` (refute a universal), a scene asks the verifier to
+/// *construct* a witness: a state and trace satisfying the `givens`,
+/// firing the `events` under `ordering`, and matching the `assertions`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRScene {
     pub name: std::string::String,
@@ -1083,6 +1251,7 @@ pub struct IRActivation {
     pub store_name: std::string::String,
 }
 
+/// One `given x: Entity [in store] [where p]` binding in a scene.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRSceneGiven {
     pub var: std::string::String,
@@ -1095,6 +1264,8 @@ pub struct IRSceneGiven {
     pub constraint: IRExpr,
 }
 
+/// One `when` event firing inside a scene: a system command, its
+/// arguments, and an expected cardinality.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRSceneEvent {
     pub var: std::string::String,
@@ -1104,15 +1275,20 @@ pub struct IRSceneEvent {
     pub cardinality: Cardinality,
 }
 
+/// Cardinality constraint on a scene event — either a named multiplicity
+/// (`one`, `lone`, `some`, `no`) or an exact integer count.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Cardinality {
+    /// `one`, `lone`, `some`, `no`.
     Named(std::string::String),
+    /// `exactly N`.
     Exact { exactly: i64 },
 }
 
 // ── Constants and Functions ──────────────────────────────────────────
 
+/// A top-level `const NAME: T = expr` declaration.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRConst {
     pub name: std::string::String,
@@ -1121,6 +1297,12 @@ pub struct IRConst {
     pub value: IRExpr,
 }
 
+/// Lowered top-level callable: `fn`, `pred`, or `prop`.
+///
+/// The three surface forms share one IR shape; the distinguishing
+/// piece is `prop_target`: present for `prop` (the system it tracks),
+/// `None` for `fn` and `pred`. Imperative functions may carry
+/// `requires` / `ensures` / `decreases` clauses.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRFunction {
     pub name: std::string::String,
@@ -1158,20 +1340,38 @@ pub struct IRDecreases {
 
 // ── Top-level program ────────────────────────────────────────────────
 
+/// Root of the lowered IR: every top-level declaration in the
+/// elaborated program, grouped by kind.
+///
+/// The field grouping is deliberately flat so external tools (Invaria,
+/// JSON consumers) can iterate one section at a time without walking a
+/// nested AST. Order within each `Vec` mirrors source order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRProgram {
+    /// Type aliases and named records / enums.
     pub types: Vec<IRTypeEntry>,
+    /// `const` declarations.
     pub constants: Vec<IRConst>,
+    /// `fn`, `pred`, and `prop` declarations.
     pub functions: Vec<IRFunction>,
+    /// `entity` declarations.
     pub entities: Vec<IREntity>,
+    /// `system` and `program` declarations.
     pub systems: Vec<IRSystem>,
+    /// `verify` blocks.
     pub verifies: Vec<IRVerify>,
+    /// `theorem` blocks.
     pub theorems: Vec<IRTheorem>,
+    /// `axiom` declarations.
     pub axioms: Vec<IRAxiom>,
+    /// `lemma` declarations.
     pub lemmas: Vec<IRLemma>,
+    /// `scene` blocks.
     pub scenes: Vec<IRScene>,
 }
 
+/// One `type` declaration entry — a name paired with its lowered
+/// [`IRType`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRTypeEntry {
     pub name: std::string::String,

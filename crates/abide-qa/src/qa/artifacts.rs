@@ -1,3 +1,6 @@
+//! QA artifact store — verifier and simulator results addressable by
+//! id, name, or kind for later `show` / `draw` / `diff` queries.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use abide_verify::verify::{ExplicitStateSpace, VerificationResult};
@@ -7,12 +10,17 @@ use abide_witness::{
 };
 use serde::Serialize;
 
+/// Why a simulation stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SimulationTermination {
+    /// Reached the requested step count.
     StepLimit,
+    /// Hit a deadlock state (no enabled commands).
     Deadlock { reasons: Vec<String> },
 }
 
+/// Result of one `simulate` invocation. The recorded `behavior` is a
+/// concrete operational trace exactly as produced by the simulator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SimulationArtifact {
     pub systems: Vec<String>,
@@ -23,15 +31,26 @@ pub struct SimulationArtifact {
     pub behavior: op::Behavior,
 }
 
+/// Output of `explore` — a bounded explicit state space.
 pub type StateSpaceArtifact = ExplicitStateSpace;
 
+/// Payload of a stored [`Artifact`]: verification evidence, simulation
+/// trace, or explored state space.
 #[derive(Debug, Clone)]
 pub enum ArtifactPayload {
+    /// Verifier evidence envelope (witness / countermodel / proof ref).
     Evidence(EvidenceEnvelope),
+    /// One simulation trace.
     Simulation(SimulationArtifact),
+    /// One bounded state-space exploration.
     StateSpace(StateSpaceArtifact),
 }
 
+/// A stored artifact with display metadata.
+///
+/// `result_kind` and `name` together form the human-facing identity;
+/// `id` is the numeric selector. `evidence_extraction_error` records
+/// any non-fatal degradation during evidence import.
 #[derive(Debug, Clone)]
 pub struct Artifact {
     pub id: usize,
@@ -222,6 +241,11 @@ impl Artifact {
     }
 }
 
+/// In-memory store of [`Artifact`]s for the current QA session.
+///
+/// Identity is per-session: `next_id` is a monotonic counter that
+/// resets only on [`Self::invalidate`]. Artifacts can be addressed by
+/// id (`#3`), name (`my_verify`), or kind (`verify`).
 #[derive(Debug, Default)]
 pub struct ArtifactStore {
     next_id: usize,

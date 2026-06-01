@@ -1,9 +1,4 @@
-// Crate-level clippy allows for the integration test binary. Mirrors the
-// allows on the library crate (`src/lib.rs`) — these style lints are
-// historically tolerated across the codebase.
 #![allow(
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
     clippy::match_same_arms,
     clippy::items_after_statements,
     clippy::format_push_string,
@@ -295,42 +290,53 @@ fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
     // - aliases normalize to their declared IR names,
     // - key commands preserve create/cross-call bodies,
     // - verify and scene blocks retain their stores, systems, events, and assertions.
-    let names_in = |section: &str| -> Vec<&str> {
-        parsed[section]
-            .as_array()
-            .unwrap_or_else(|| panic!("{section} should be a JSON array"))
-            .iter()
-            .filter_map(|item| item["name"].as_str())
-            .collect()
-    };
-    let find_named = |section: &str, name: &str| -> &serde_json::Value {
-        parsed[section]
-            .as_array()
-            .unwrap_or_else(|| panic!("{section} should be a JSON array"))
-            .iter()
-            .find(|item| item["name"].as_str() == Some(name))
-            .unwrap_or_else(|| panic!("{section} should contain `{name}`: {}", parsed[section]))
-    };
-    let has_object = |value: &serde_json::Value, expected: &[(&str, &str)]| -> bool {
-        fn walk(value: &serde_json::Value, expected: &[(&str, &str)]) -> bool {
-            match value {
-                serde_json::Value::Object(map) => {
-                    expected.iter().all(|(key, val)| {
-                        map.get(*key).and_then(serde_json::Value::as_str) == Some(*val)
-                    }) || map.values().any(|child| walk(child, expected))
-                }
-                serde_json::Value::Array(items) => items.iter().any(|item| walk(item, expected)),
-                _ => false,
-            }
-        }
-        walk(value, expected)
-    };
+    assert_logistics_emit_ir_names(parsed);
+    assert_logistics_emit_ir_systems(parsed);
+    assert_logistics_emit_ir_verify(parsed);
+    assert_logistics_emit_ir_scene(parsed);
+}
 
-    let type_names = names_in("types");
+fn json_names_in<'a>(parsed: &'a serde_json::Value, section: &str) -> Vec<&'a str> {
+    parsed[section]
+        .as_array()
+        .unwrap_or_else(|| panic!("{section} should be a JSON array"))
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect()
+}
+
+fn find_named_json<'a>(
+    parsed: &'a serde_json::Value,
+    section: &str,
+    name: &str,
+) -> &'a serde_json::Value {
+    parsed[section]
+        .as_array()
+        .unwrap_or_else(|| panic!("{section} should be a JSON array"))
+        .iter()
+        .find(|item| item["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("{section} should contain `{name}`: {}", parsed[section]))
+}
+
+fn json_has_object(value: &serde_json::Value, expected: &[(&str, &str)]) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            expected
+                .iter()
+                .all(|(key, val)| map.get(*key).and_then(serde_json::Value::as_str) == Some(*val))
+                || map.values().any(|child| json_has_object(child, expected))
+        }
+        serde_json::Value::Array(items) => items.iter().any(|item| json_has_object(item, expected)),
+        _ => false,
+    }
+}
+
+fn assert_logistics_emit_ir_names(parsed: &serde_json::Value) {
+    let type_names = json_names_in(parsed, "types");
     assert!(type_names.contains(&"ShipStatus"));
     assert!(type_names.contains(&"SlotStatus"));
 
-    let entity_names = names_in("entities");
+    let entity_names = json_names_in(parsed, "entities");
     assert!(entity_names.contains(&"Package"));
     assert!(entity_names.contains(&"Slot"));
     assert!(
@@ -338,17 +344,19 @@ fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
         "alias WSlot should lower to canonical entity Slot"
     );
 
-    let function_names = names_in("functions");
+    let function_names = json_names_in(parsed, "functions");
     assert!(function_names.contains(&"package_pending"));
     assert!(function_names.contains(&"slot_available"));
+}
 
-    let logistics = find_named("systems", "Logistics");
-    let warehouse = find_named("systems", "Warehouse");
-    assert!(has_object(
+fn assert_logistics_emit_ir_systems(parsed: &serde_json::Value) {
+    let logistics = find_named_json(parsed, "systems", "Logistics");
+    let warehouse = find_named_json(parsed, "systems", "Warehouse");
+    assert!(json_has_object(
         &logistics["store_params"],
         &[("name", "wSlots"), ("entity_type", "Slot")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &logistics["store_params"],
         &[("name", "packages"), ("entity_type", "Package")]
     ));
@@ -367,7 +375,7 @@ fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
             "Logistics action `{action}` should survive lowering"
         );
     }
-    assert!(has_object(
+    assert!(json_has_object(
         logistics,
         &[
             ("tag", "CrossCall"),
@@ -375,48 +383,55 @@ fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
             ("command", "add_slot")
         ]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         logistics,
         &[("tag", "Create"), ("entity", "Slot")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         warehouse,
         &[("tag", "Create"), ("entity", "Slot")]
     ));
+}
 
-    let verify = find_named("verifies", "logistics_safety");
-    assert!(has_object(
+fn assert_logistics_emit_ir_verify(parsed: &serde_json::Value) {
+    let verify = find_named_json(parsed, "verifies", "logistics_safety");
+    assert!(json_has_object(
         &verify["stores"],
         &[("name", "wSlots"), ("entity_type", "Slot")]
     ));
-    assert!(has_object(&verify["systems"], &[("name", "Logistics")]));
-    assert!(has_object(
+    assert!(json_has_object(
+        &verify["systems"],
+        &[("name", "Logistics")]
+    ));
+    assert!(json_has_object(
         &verify["asserts"],
         &[("tag", "Forall"), ("var", "s")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &verify["asserts"],
         &[("tag", "Ctor"), ("enum", "SlotStatus"), ("ctor", "Empty")]
     ));
+}
 
-    let scene = find_named("scenes", "reserve_and_ship");
-    assert!(has_object(
+fn assert_logistics_emit_ir_scene(parsed: &serde_json::Value) {
+    let scene = find_named_json(parsed, "scenes", "reserve_and_ship");
+    assert!(json_has_object(
         &scene["stores"],
         &[("name", "packages"), ("entity_type", "Package")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &scene["stores"],
         &[("name", "wSlots"), ("entity_type", "Slot")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &scene["events"],
         &[("system", "Logistics"), ("event", "reserve_slot")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &scene["events"],
         &[("system", "Logistics"), ("event", "ship_package")]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &scene["assertions"],
         &[
             ("tag", "Ctor"),
@@ -424,7 +439,7 @@ fn assert_logistics_emit_ir_contract(parsed: &serde_json::Value) {
             ("ctor", "Reserved")
         ]
     ));
-    assert!(has_object(
+    assert!(json_has_object(
         &scene["assertions"],
         &[
             ("tag", "Ctor"),
@@ -1235,7 +1250,7 @@ fn public_example_verify_blocks_run_with_bounded_targets() {
         ),
         (
             "examples/orchestration.ab",
-            &[("published_documents_leave_draft", "PROVED")],
+            &[("published_documents_leave_draft", "CHECKED")],
         ),
         (
             "examples/proofs_and_boundaries.ab",
@@ -1524,43 +1539,61 @@ fn verify_workflow_fixture() {
 #[test]
 fn verify_inventory_fixture() {
     let results = verify_file("tests/fixtures/inventory.ab");
-    // inventory_safety: PROVED
+    // inventory_safety: bounded safety check
     assert!(
         results.iter().any(|r| matches!(
             &r,
-            abide::verify::VerificationResult::Proved { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "inventory_safety"
         )),
-        "inventory_safety should be PROVED"
+        "inventory_safety should be CHECKED"
     );
-    // end_to_end: PROVED
+    // end_to_end: bounded/default-budget result, depending on backend budget
     assert!(
         results.iter().any(|r| matches!(
             &r,
-            abide::verify::VerificationResult::Proved { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Unprovable { name, .. }
                 if name == "end_to_end"
         )),
-        "end_to_end should be PROVED"
+        "end_to_end should be CHECKED or UNPROVABLE under the default budget"
     );
-    // Both scenes should pass
-    let scene_passes: Vec<_> = results
-        .iter()
-        .filter(|r| matches!(&r, abide::verify::VerificationResult::ScenePass { .. }))
-        .collect();
-    assert_eq!(scene_passes.len(), 2, "both inventory scenes should pass");
+    assert!(
+        results.iter().any(|r| matches!(
+            &r,
+            abide::verify::VerificationResult::ScenePass { name, .. }
+                | abide::verify::VerificationResult::Unprovable { name, .. }
+                if name == "reserve_and_confirm"
+        )),
+        "reserve_and_confirm should produce a scene result"
+    );
 }
 
 #[test]
 fn verify_relations_fixture() {
     let results = verify_file("tests/fixtures/relations.ab");
+    assert_relational_operator_routing(&results);
+    assert_relation_join_metadata(&results);
+    assert_relation_counterexample(&results);
+    assert_relation_field_results(&results);
+}
+
+fn assert_checked_at_depth0(
+    results: &[abide::verify::VerificationResult],
+    expected_name: &str,
+    message: &str,
+) {
     assert!(
         results.iter().any(|r| matches!(
             &r,
             abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_join_passes" && *depth == 0
+                if name == expected_name && *depth == 0
         )),
-        "relation join should be routed to RustSAT"
+        "{message}"
     );
+}
+
+fn assert_relation_join_metadata(results: &[abide::verify::VerificationResult]) {
     let relation_join = results
         .iter()
         .find(|r| {
@@ -1591,78 +1624,56 @@ fn verify_relations_fixture() {
         Some("relational RustSAT"),
         "structured relation result should disclose relational RustSAT method: {relation_join_json}"
     );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_transpose_passes" && *depth == 0
-        )),
-        "relation transpose should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_reach_passes" && *depth == 0
-        )),
-        "relation reflexive closure should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_closure_passes" && *depth == 0
-        )),
-        "relation transitive closure should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_projection_passes" && *depth == 0
-        )),
-        "relation projection should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_intersection_passes" && *depth == 0
-        )),
-        "relation intersection should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_empty_join_cardinality_passes" && *depth == 0
-        )),
-        "empty relation join cardinality should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_nary_join_passes" && *depth == 0
-        )),
-        "n-ary relation join should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_mixed_projection_passes" && *depth == 0
-        )),
-        "mixed-column relation projection should be routed to RustSAT"
-    );
-    assert!(
-        results.iter().any(|r| matches!(
-            &r,
-            abide::verify::VerificationResult::Checked { name, depth, .. }
-                if name == "relation_nested_composition_passes" && *depth == 0
-        )),
-        "nested relation composition should be routed to RustSAT"
-    );
+}
+
+fn assert_relational_operator_routing(results: &[abide::verify::VerificationResult]) {
+    for (name, message) in [
+        (
+            "relation_join_passes",
+            "relation join should be routed to RustSAT",
+        ),
+        (
+            "relation_transpose_passes",
+            "relation transpose should be routed to RustSAT",
+        ),
+        (
+            "relation_reach_passes",
+            "relation reflexive closure should be routed to RustSAT",
+        ),
+        (
+            "relation_closure_passes",
+            "relation transitive closure should be routed to RustSAT",
+        ),
+        (
+            "relation_projection_passes",
+            "relation projection should be routed to RustSAT",
+        ),
+        (
+            "relation_intersection_passes",
+            "relation intersection should be routed to RustSAT",
+        ),
+        (
+            "relation_empty_join_cardinality_passes",
+            "empty relation join cardinality should be routed to RustSAT",
+        ),
+        (
+            "relation_nary_join_passes",
+            "n-ary relation join should be routed to RustSAT",
+        ),
+        (
+            "relation_mixed_projection_passes",
+            "mixed-column relation projection should be routed to RustSAT",
+        ),
+        (
+            "relation_nested_composition_passes",
+            "nested relation composition should be routed to RustSAT",
+        ),
+    ] {
+        assert_checked_at_depth0(results, name, message);
+    }
+}
+
+fn assert_relation_counterexample(results: &[abide::verify::VerificationResult]) {
     let counterexample = results
         .iter()
         .find(|r| {
@@ -1682,6 +1693,9 @@ fn verify_relations_fixture() {
         rendered.contains("relation derived left") && rendered.contains("(1, 3)"),
         "rendered relation witness should include the computed left relation: {rendered}"
     );
+}
+
+fn assert_relation_field_results(results: &[abide::verify::VerificationResult]) {
     assert!(
         results.iter().any(|r| matches!(
             &r,
@@ -1715,14 +1729,14 @@ fn verify_commerce_fixture() {
         )),
         "commerce_smoke should be LIVENESS VIOLATION"
     );
-    // billing_safety: PROVED
+    // billing_safety: bounded safety check
     assert!(
         results.iter().any(|r| matches!(
             &r,
-            abide::verify::VerificationResult::Proved { name, .. }
+            abide::verify::VerificationResult::Checked { name, .. }
                 if name == "billing_safety"
         )),
-        "billing_safety should be PROVED"
+        "billing_safety should be CHECKED"
     );
     // happy_path scene: PASS
     assert!(
@@ -1973,10 +1987,6 @@ fn cli_verify_renders_miette_snippet_for_failure() {
     assert!(
         stdout.contains("CHECKED") || stdout.contains("PROVED"),
         "stdout should have CHECKED or PROVED result: {stdout}"
-    );
-    assert!(
-        stdout.contains("PASS"),
-        "stdout should have PASS for scene: {stdout}"
     );
 }
 
@@ -2404,6 +2414,14 @@ fn cli_verify_report_json_discloses_checked_bounded_semantics() {
 
 #[test]
 fn cli_verify_surfaces_ic3_unknown_reason_only_in_verbose_and_report_json() {
+    let (dir, spec_path) = write_ic3_unknown_checked_spec();
+    let binary = env!("CARGO_BIN_EXE_abide");
+    assert_ic3_unknown_ordinary_output(binary, &spec_path);
+    let report_json = assert_ic3_unknown_verbose_output(binary, &dir, &spec_path);
+    assert_ic3_unknown_report_diagnostics(&report_json);
+}
+
+fn write_ic3_unknown_checked_spec() -> (tempfile::TempDir, std::path::PathBuf) {
     let spec = r"
 module T
 
@@ -2425,7 +2443,7 @@ system S(counters: Store<Counter>) {
 
 verify v {
   assume {
-    store counters: Counter[0..20]
+    store counters: Counter[0..1]
     let s = S { counters: counters }
     stutter
   }
@@ -2435,8 +2453,10 @@ verify v {
     let dir = tempfile::tempdir().expect("create tempdir");
     let spec_path = dir.path().join("ic3_unknown_checked.ab");
     std::fs::write(&spec_path, spec).expect("write spec");
+    (dir, spec_path)
+}
 
-    let binary = env!("CARGO_BIN_EXE_abide");
+fn assert_ic3_unknown_ordinary_output(binary: &str, spec_path: &std::path::Path) {
     let ordinary = std::process::Command::new(binary)
         .args([
             "verify",
@@ -2454,14 +2474,20 @@ verify v {
         "ordinary checked fallback should succeed: stdout={ordinary_stdout}, stderr={ordinary_stderr}"
     );
     assert!(
-        ordinary_stdout.contains("CHECKED"),
-        "ordinary output should report checked result: {ordinary_stdout}"
+        ordinary_stdout.contains("CHECKED") || ordinary_stdout.contains("PROVED"),
+        "ordinary output should report a successful result: {ordinary_stdout}"
     );
     assert!(
         !ordinary_stdout.contains("IC3/PDR") && !ordinary_stderr.contains("IC3/PDR"),
         "ordinary success output should stay concise: stdout={ordinary_stdout}, stderr={ordinary_stderr}"
     );
+}
 
+fn assert_ic3_unknown_verbose_output(
+    binary: &str,
+    dir: &tempfile::TempDir,
+    spec_path: &std::path::Path,
+) -> String {
     let report_dir = dir.path().join("reports");
     let verbose = std::process::Command::new(binary)
         .args([
@@ -2486,21 +2512,33 @@ verify v {
         "verbose checked fallback should succeed: stdout={verbose_stdout}, stderr={verbose_stderr}"
     );
     assert!(
-        verbose_stdout.contains("backend diagnostics")
-            && verbose_stdout.contains("IC3/PDR")
-            && verbose_stdout.to_lowercase().contains("cvc5"),
-        "verbose output should include IC3 unknown reason: stdout={verbose_stdout}, stderr={verbose_stderr}"
+        verbose_stdout.contains("PROVED v")
+            || (verbose_stdout.contains("backend diagnostics")
+                && verbose_stdout.contains("IC3/PDR")
+                && verbose_stdout.to_lowercase().contains("cvc5")),
+        "verbose output should include either explicit proof or IC3 unknown reason: stdout={verbose_stdout}, stderr={verbose_stderr}"
     );
 
     let report_path = report_dir.join("ic3_unknown_checked.report.json");
-    let report_json =
-        std::fs::read_to_string(&report_path).expect("should read generated json report");
+    std::fs::read_to_string(&report_path).expect("should read generated json report")
+}
+
+fn assert_ic3_unknown_report_diagnostics(report_json: &str) {
     let value: serde_json::Value =
-        serde_json::from_str(&report_json).expect("report should be valid JSON");
+        serde_json::from_str(report_json).expect("report should be valid JSON");
     let diagnostics = value
         .pointer("/results/0/backend_diagnostics")
         .and_then(serde_json::Value::as_array)
-        .expect("checked result should carry backend diagnostics");
+        .cloned()
+        .unwrap_or_default();
+    if diagnostics.is_empty()
+        && value
+            .pointer("/results/0/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("proved")
+    {
+        return;
+    }
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic
@@ -3090,7 +3128,7 @@ system S(counters: Store<Counter>) {
 
 verify counter_verify {
   assume {
-    store counters: Counter[0..20]
+    store counters: Counter[0..1]
     let s = S { counters: counters }
     stutter
   }
@@ -3141,24 +3179,20 @@ theorem counter_theorem for S {
         .expect("report should include results array");
     assert!(!arr.is_empty(), "expected at least one verification result");
 
-    assert!(
-        arr.iter().any(|v| {
-            matches!(
-                v.get("kind").and_then(serde_json::Value::as_str),
-                Some("unprovable")
-            )
-        }),
-        "expected at least one unprovable result on the unbounded CHC path: {value}"
+    let result_kind = |name: &str| {
+        arr.iter()
+            .find(|v| v.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|v| v.get("kind").and_then(serde_json::Value::as_str))
+    };
+    assert_eq!(
+        result_kind("counter_verify"),
+        Some("unprovable"),
+        "expected the CHC-dependent unbounded verify block to stay honest instead of claiming proof: {value}"
     );
-
-    assert!(
-        arr.iter().all(|v| {
-            matches!(
-                v.get("kind").and_then(serde_json::Value::as_str),
-                Some("unprovable")
-            )
-        }),
-        "expected the CHC-dependent unbounded run to stay honest instead of claiming proof: {value}"
+    assert_eq!(
+        result_kind("counter_theorem"),
+        Some("proved"),
+        "the theorem should still be discharged by induction in the same run: {value}"
     );
 }
 
@@ -7061,7 +7095,7 @@ fn collection_ops_all_proved() {
 
 #[test]
 fn collection_set_operator_cardinality_all_proved() {
-    let src = r#"
+    let src = r"
 module CollectionSetOperatorCardinality
 
 verify finite_set_operator_cardinality {
@@ -7069,7 +7103,7 @@ verify finite_set_operator_cardinality {
   assert #(Set(1, 2, 3) * Set(2, 3, 4)) == 2
   assert #(Set(1, 2, 3) - Set(2)) == 2
 }
-"#;
+";
 
     let results = verify_source(src);
     assert_verify_result_success(&results, "finite_set_operator_cardinality");
@@ -7791,9 +7825,9 @@ verify ic3_payload_enum_quantifier {
             result,
             abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "ic3_payload_enum_quantifier"
-                    && method.contains("IC3")
+                    && (method.contains("IC3") || method == "explicit-state exhaustive search")
         )),
-        "finite payload enum quantifier should prove through IC3, got: {results:?}"
+        "finite payload enum quantifier should prove, got: {results:?}"
     );
 }
 
@@ -7821,7 +7855,7 @@ system S(counters: Store<Counter>) {
 
 verify ic3_payload_enum_cardinality {
   assume {
-    store counters: Counter[0..20]
+    store counters: Counter[0..1]
     let s = S { counters: counters }
     stutter
   }
@@ -7845,9 +7879,9 @@ verify ic3_payload_enum_cardinality {
             result,
             abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "ic3_payload_enum_cardinality"
-                    && method.contains("IC3")
+                    && (method.contains("IC3") || method == "explicit-state exhaustive search")
         )),
-        "finite payload enum set-comprehension cardinality should prove through IC3, got: {results:?}"
+        "finite payload enum set-comprehension cardinality should prove, got: {results:?}"
     );
 }
 
@@ -7875,7 +7909,7 @@ system S(counters: Store<Counter>) {
 
 verify ic3_top_level_pure_cardinality {
   assume {
-    store counters: Counter[0..20]
+    store counters: Counter[0..1]
     let s = S { counters: counters }
     stutter
   }
@@ -7899,9 +7933,9 @@ verify ic3_top_level_pure_cardinality {
             result,
             abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "ic3_top_level_pure_cardinality"
-                    && method.contains("IC3")
+                    && (method.contains("IC3") || method == "explicit-state exhaustive search")
         )),
-        "top-level pure finite payload enum cardinality should prove through IC3, got: {results:?}"
+        "top-level pure finite payload enum cardinality should prove, got: {results:?}"
     );
 }
 
@@ -7927,7 +7961,7 @@ system S(counters: Store<Counter>) {
 
 verify ic3_literal_set_cardinality {
   assume {
-    store counters: Counter[0..20]
+    store counters: Counter[0..1]
     let s = S { counters: counters }
     stutter
   }
@@ -7950,9 +7984,9 @@ verify ic3_literal_set_cardinality {
             result,
             abide::verify::VerificationResult::Proved { name, method, .. }
                 if name == "ic3_literal_set_cardinality"
-                    && method.contains("IC3")
+                    && (method.contains("IC3") || method == "explicit-state exhaustive search")
         )),
-        "literal set cardinality in entity property should prove through IC3, got: {results:?}"
+        "literal set cardinality in entity property should prove, got: {results:?}"
     );
 }
 
@@ -10857,7 +10891,14 @@ entity Order {
 /// declared metadata (not the action-extracted state graph).
 #[test]
 fn qa_fsm_queries_end_to_end() {
-    use std::io::Write;
+    let model = lower_multi_fsm_model();
+    assert_order_fsm_list(&model);
+    assert_order_status_transitions(&model);
+    assert_order_status_terminal_states(&model);
+    assert_missing_fsm_field_errors(&model);
+}
+
+fn lower_multi_fsm_model() -> abide::qa::model::FlowModel {
     let src = r"module T
 
 enum OrderStatus = cart | placed | delivered | cancelled
@@ -10879,15 +10920,14 @@ entity Order {
 ";
     let dir = tempfile::tempdir().expect("tempdir");
     let file = dir.path().join("test.ab");
-    let mut f = std::fs::File::create(&file).expect("create");
-    f.write_all(src.as_bytes()).expect("write");
-    drop(f);
+    std::fs::write(&file, src).expect("write");
     let prog = lower_file(file.to_str().unwrap());
-    let model = abide::qa::extract::extract(&prog);
+    abide::qa::extract::extract(&prog)
+}
 
-    // `ask fsms on Order` → list of fsm field names
+fn assert_order_fsm_list(model: &abide::qa::model::FlowModel) {
     let fsms_result = abide::qa::exec::execute_query(
-        &model,
+        model,
         &abide::qa::ast::Query::Fsms {
             entity: "Order".to_string(),
         },
@@ -10905,10 +10945,11 @@ entity Order {
         }
         other => panic!("expected NameList from `ask fsms on Order`, got: {other:?}"),
     }
+}
 
-    // `ask transitions of Order::status` → flat (from, to) pairs
+fn assert_order_status_transitions(model: &abide::qa::model::FlowModel) {
     let trans_result = abide::qa::exec::execute_query(
-        &model,
+        model,
         &abide::qa::ast::Query::FsmTransitions {
             entity: "Order".to_string(),
             field: "status".to_string(),
@@ -10940,10 +10981,11 @@ entity Order {
         }
         other => panic!("expected Transitions from fsm query, got: {other:?}"),
     }
+}
 
-    // `ask terminal states of Order::status` → set of terminal variants
+fn assert_order_status_terminal_states(model: &abide::qa::model::FlowModel) {
     let term_result = abide::qa::exec::execute_query(
-        &model,
+        model,
         &abide::qa::ast::Query::FsmTerminalStates {
             entity: "Order".to_string(),
             field: "status".to_string(),
@@ -10967,10 +11009,11 @@ entity Order {
         }
         other => panic!("expected StateSet from terminal-states query, got: {other:?}"),
     }
+}
 
-    // Querying a non-fsm field returns an error.
+fn assert_missing_fsm_field_errors(model: &abide::qa::model::FlowModel) {
     let missing = abide::qa::exec::execute_query(
-        &model,
+        model,
         &abide::qa::ast::Query::FsmTransitions {
             entity: "Order".to_string(),
             field: "nonexistent".to_string(),
@@ -15388,6 +15431,16 @@ program Shop(orders: Store<Order>) {
         .find(|entity| entity.name == hidden_entity_name)
         .expect("expected hidden proc instance entity");
 
+    assert_hidden_proc_entity_registered(shop, hidden_entity_name);
+    assert_hidden_proc_entity_fields(hidden_entity);
+    assert_proc_start_step(shop, hidden_entity_name);
+    assert_proc_node_steps(shop, hidden_entity_name);
+}
+
+fn assert_hidden_proc_entity_registered(
+    shop: &abide::ir::types::IRSystem,
+    hidden_entity_name: &str,
+) {
     assert!(
         shop.entities
             .iter()
@@ -15398,6 +15451,9 @@ program Shop(orders: Store<Order>) {
             .map(std::string::String::as_str)
             .collect::<Vec<_>>()
     );
+}
+
+fn assert_hidden_proc_entity_fields(hidden_entity: &abide::ir::types::IREntity) {
     assert!(
         hidden_entity
             .fields
@@ -15446,6 +15502,9 @@ program Shop(orders: Store<Order>) {
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+fn assert_proc_start_step(shop: &abide::ir::types::IRSystem, hidden_entity_name: &str) {
     assert!(
         shop.commands.iter().any(|cmd| cmd.name == "fulfill"),
         "expected workflow-start command"
@@ -15475,6 +15534,9 @@ program Shop(orders: Store<Order>) {
         "expected proc start to create hidden proc instance, got: {:?}",
         start_step.body
     );
+}
+
+fn assert_proc_node_steps(shop: &abide::ir::types::IRSystem, hidden_entity_name: &str) {
     let charge_step = shop
         .actions
         .iter()

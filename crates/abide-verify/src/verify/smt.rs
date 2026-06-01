@@ -1075,321 +1075,274 @@ fn mixed_numeric_reals(lhs: &SmtValue, rhs: &SmtValue) -> Option<(Real, Real)> {
     }
 }
 
+type BinopResult = Result<SmtValue, String>;
+
 /// Apply a binary operation to two `SmtValue`s.
 ///
 /// Returns the result as an `SmtValue`. Operand types must match.
-#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, String> {
-    match (op, lhs, rhs) {
-        // Arithmetic (Int)
-        ("OpAdd", SmtValue::Int(a), SmtValue::Int(b)) => {
-            Ok(SmtValue::Int(backend!(int_add, &[a, b])))
-        }
-        ("OpSub", SmtValue::Int(a), SmtValue::Int(b)) => {
-            Ok(SmtValue::Int(backend!(int_sub, &[a, b])))
-        }
-        ("OpMul", SmtValue::Int(a), SmtValue::Int(b)) => {
-            Ok(SmtValue::Int(backend!(int_mul, &[a, b])))
-        }
-        ("OpDiv", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Int(backend!(int_div, a, b))),
-        ("OpMod", SmtValue::Int(a), SmtValue::Int(b)) => {
-            Ok(SmtValue::Int(backend!(int_modulo, a, b)))
-        }
+    if let Some(result) = int_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = real_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = mixed_numeric_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = bool_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = array_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = collection_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = composition_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = dynamic_binop(op, lhs, rhs) {
+        return result;
+    }
+    Err(format!("unsupported binop: {op} on {lhs:?}, {rhs:?}"))
+}
 
-        // Arithmetic (Real)
-        ("OpAdd", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Real(backend!(real_add, &[a, b])))
-        }
-        ("OpSub", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Real(backend!(real_sub, &[a, b])))
-        }
-        ("OpMul", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Real(backend!(real_mul, &[a, b])))
-        }
-        ("OpDiv", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Real(backend!(real_div, a, b)))
-        }
+fn int_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Int(a), SmtValue::Int(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        "OpAdd" => Ok(SmtValue::Int(backend!(int_add, &[a, b]))),
+        "OpSub" => Ok(SmtValue::Int(backend!(int_sub, &[a, b]))),
+        "OpMul" => Ok(SmtValue::Int(backend!(int_mul, &[a, b]))),
+        "OpDiv" => Ok(SmtValue::Int(backend!(int_div, a, b))),
+        "OpMod" => Ok(SmtValue::Int(backend!(int_modulo, a, b))),
+        "OpEq" => Ok(SmtValue::Bool(backend!(int_eq, a, b))),
+        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(int_eq, a, b)))),
+        "OpLt" => Ok(SmtValue::Bool(backend!(int_lt, a, b))),
+        "OpGt" => Ok(SmtValue::Bool(backend!(int_gt, a, b))),
+        "OpLe" => Ok(SmtValue::Bool(backend!(int_le, a, b))),
+        "OpGe" => Ok(SmtValue::Bool(backend!(int_ge, a, b))),
+        _ => return None,
+    })
+}
 
-        // Arithmetic (mixed Int/Real): lift Int to Real.
-        (
-            "OpAdd" | "OpSub" | "OpMul" | "OpDiv",
-            SmtValue::Real(_) | SmtValue::Int(_),
-            SmtValue::Real(_) | SmtValue::Int(_),
-        ) if matches!(
-            (lhs, rhs),
-            (SmtValue::Real(_), SmtValue::Int(_)) | (SmtValue::Int(_), SmtValue::Real(_))
-        ) =>
-        {
-            let (a, b) = mixed_numeric_reals(lhs, rhs).expect("guard ensures mixed numeric pair");
-            let result = match op {
-                "OpAdd" => backend!(real_add, &[&a, &b]),
-                "OpSub" => backend!(real_sub, &[&a, &b]),
-                "OpMul" => backend!(real_mul, &[&a, &b]),
-                "OpDiv" => backend!(real_div, &a, &b),
-                _ => unreachable!("guard restricts mixed numeric arithmetic ops"),
-            };
-            Ok(SmtValue::Real(result))
-        }
+fn real_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Real(a), SmtValue::Real(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        "OpAdd" => Ok(SmtValue::Real(backend!(real_add, &[a, b]))),
+        "OpSub" => Ok(SmtValue::Real(backend!(real_sub, &[a, b]))),
+        "OpMul" => Ok(SmtValue::Real(backend!(real_mul, &[a, b]))),
+        "OpDiv" => Ok(SmtValue::Real(backend!(real_div, a, b))),
+        "OpEq" => Ok(SmtValue::Bool(backend!(real_eq, a, b))),
+        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(real_eq, a, b)))),
+        "OpLt" => Ok(SmtValue::Bool(backend!(real_lt, a, b))),
+        "OpGt" => Ok(SmtValue::Bool(backend!(real_gt, a, b))),
+        "OpLe" => Ok(SmtValue::Bool(backend!(real_le, a, b))),
+        "OpGe" => Ok(SmtValue::Bool(backend!(real_ge, a, b))),
+        _ => return None,
+    })
+}
 
-        // Comparison (Int)
-        ("OpEq", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_eq, a, b))),
-        ("OpNEq", SmtValue::Int(a), SmtValue::Int(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_not, &backend!(int_eq, a, b))))
-        }
-        ("OpLt", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_lt, a, b))),
-        ("OpGt", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_gt, a, b))),
-        ("OpLe", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_le, a, b))),
-        ("OpGe", SmtValue::Int(a), SmtValue::Int(b)) => Ok(SmtValue::Bool(backend!(int_ge, a, b))),
+fn mixed_numeric_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (a, b) = mixed_numeric_reals(lhs, rhs)?;
+    Some(match op {
+        "OpAdd" => Ok(SmtValue::Real(backend!(real_add, &[&a, &b]))),
+        "OpSub" => Ok(SmtValue::Real(backend!(real_sub, &[&a, &b]))),
+        "OpMul" => Ok(SmtValue::Real(backend!(real_mul, &[&a, &b]))),
+        "OpDiv" => Ok(SmtValue::Real(backend!(real_div, &a, &b))),
+        "OpEq" => Ok(SmtValue::Bool(backend!(real_eq, &a, &b))),
+        "OpNEq" => Ok(SmtValue::Bool(backend!(
+            bool_not,
+            &backend!(real_eq, &a, &b)
+        ))),
+        "OpLt" => Ok(SmtValue::Bool(backend!(real_lt, &a, &b))),
+        "OpLe" => Ok(SmtValue::Bool(backend!(real_le, &a, &b))),
+        "OpGt" => Ok(SmtValue::Bool(backend!(real_gt, &a, &b))),
+        "OpGe" => Ok(SmtValue::Bool(backend!(real_ge, &a, &b))),
+        _ => return None,
+    })
+}
 
-        // Comparison (Real)
-        ("OpEq", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(real_eq, a, b)))
-        }
-        ("OpNEq", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_not, &backend!(real_eq, a, b))))
-        }
-        ("OpLt", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(real_lt, a, b)))
-        }
-        ("OpGt", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(real_gt, a, b)))
-        }
-        ("OpLe", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(real_le, a, b)))
-        }
-        ("OpGe", SmtValue::Real(a), SmtValue::Real(b)) => {
-            Ok(SmtValue::Bool(backend!(real_ge, a, b)))
-        }
+fn bool_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Bool(a), SmtValue::Bool(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        "OpEq" => Ok(SmtValue::Bool(backend!(bool_eq, a, b))),
+        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(bool_eq, a, b)))),
+        "OpAnd" => Ok(SmtValue::Bool(backend!(bool_and, &[a, b]))),
+        "OpOr" => Ok(SmtValue::Bool(backend!(bool_or, &[a, b]))),
+        "OpImplies" => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
+        _ => return None,
+    })
+}
 
-        // Comparison (mixed Int/Real): lift Int to Real.
-        (
-            "OpEq" | "OpNEq" | "OpLt" | "OpLe" | "OpGt" | "OpGe",
-            SmtValue::Real(_) | SmtValue::Int(_),
-            SmtValue::Real(_) | SmtValue::Int(_),
-        ) if matches!(
-            (lhs, rhs),
-            (SmtValue::Real(_), SmtValue::Int(_)) | (SmtValue::Int(_), SmtValue::Real(_))
-        ) =>
-        {
-            let (a, b) = mixed_numeric_reals(lhs, rhs).expect("guard ensures mixed numeric pair");
-            let result = match op {
-                "OpEq" => backend!(real_eq, &a, &b),
-                "OpNEq" => backend!(bool_not, &backend!(real_eq, &a, &b)),
-                "OpLt" => backend!(real_lt, &a, &b),
-                "OpLe" => backend!(real_le, &a, &b),
-                "OpGt" => backend!(real_gt, &a, &b),
-                "OpGe" => backend!(real_ge, &a, &b),
-                _ => unreachable!("guard restricts mixed numeric comparison ops"),
-            };
-            Ok(SmtValue::Bool(result))
-        }
-
-        // Boolean (Bool)
-        ("OpEq", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_eq, a, b)))
-        }
-        ("OpNEq", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_not, &backend!(bool_eq, a, b))))
-        }
-        ("OpAnd", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_and, &[a, b])))
-        }
-        ("OpOr", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_or, &[a, b])))
-        }
-        ("OpImplies", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_implies, a, b)))
-        }
-
-        // Array equality (Map/Set/Seq)
-        ("OpEq", SmtValue::Array(a), SmtValue::Array(b)) => {
-            Ok(SmtValue::Bool(backend!(array_eq, a, b.clone())))
-        }
-        ("OpNEq", SmtValue::Array(a), SmtValue::Array(b)) => Ok(SmtValue::Bool(backend!(
+fn array_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Array(a), SmtValue::Array(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        "OpEq" => Ok(SmtValue::Bool(backend!(array_eq, a, b.clone()))),
+        "OpNEq" => Ok(SmtValue::Bool(backend!(
             bool_not,
             &backend!(array_eq, a, b.clone())
         ))),
+        _ => return None,
+    })
+}
 
-        // ── Collection operations (Set/Seq/Map) ───────────────────────
-        // Sets are Array<T, Bool> (characteristic functions).
-        // Operations use lambda arrays and quantifiers.
+fn composition_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Bool(a), SmtValue::Bool(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        "OpSeq" => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
+        "OpSameStep" | "OpUnord" | "OpConc" => Ok(SmtValue::Bool(backend!(bool_and, &[a, b]))),
+        "OpXor" => Ok(SmtValue::Bool(backend!(bool_xor, a, b))),
+        _ => return None,
+    })
+}
 
-        // ── Set operations (polymorphic over element sort) ────────────
-        // Type-directed overloading (*, -, <=, + on sets) is done at IR
-        // lowering time by checking the EExpr type, NOT here at SMT level.
-        // This avoids confusing Set<T> with Map<K,Bool> or Seq<Bool>.
-        //
-        // Helper: create a fresh quantifier variable matching the array's
-        // domain sort. Uses array_get_sort() to extract the element type.
-        //
-        // Set union (<> or Set::union): lambda x. a[x] OR b[x]
+fn collection_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    match (op, lhs, rhs) {
         ("OpDiamond" | "OpSetUnion", SmtValue::Array(a), SmtValue::Array(b)) => {
-            let sort = backend!(array_get_sort, a);
-            let domain = backend!(sort_array_domain, &sort).unwrap();
-            let x = backend!(dynamic_fresh, "su", &domain);
-            let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
-            let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
-            let body = backend!(bool_or, &[&a_x, &b_x]);
-            let arr = backend!(lambda, &[&x], &backend!(dynamic_from_bool, &body));
-            Ok(SmtValue::Array(arr))
+            Some(Ok(SmtValue::Array(set_lambda_binop("su", a, b, |x, y| {
+                backend!(bool_or, &[x, y])
+            }))))
         }
-        // Set intersection (* or Set::intersect)
         ("OpSetIntersect", SmtValue::Array(a), SmtValue::Array(b)) => {
-            let sort = backend!(array_get_sort, a);
-            let domain = backend!(sort_array_domain, &sort).unwrap();
-            let x = backend!(dynamic_fresh, "si", &domain);
-            let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
-            let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
-            let body = backend!(bool_and, &[&a_x, &b_x]);
-            let arr = backend!(lambda, &[&x], &backend!(dynamic_from_bool, &body));
-            Ok(SmtValue::Array(arr))
+            Some(Ok(SmtValue::Array(set_lambda_binop("si", a, b, |x, y| {
+                backend!(bool_and, &[x, y])
+            }))))
         }
-        // Set difference (- or Set::diff)
         ("OpSetDiff", SmtValue::Array(a), SmtValue::Array(b)) => {
-            let sort = backend!(array_get_sort, a);
-            let domain = backend!(sort_array_domain, &sort).unwrap();
-            let x = backend!(dynamic_fresh, "sd", &domain);
-            let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
-            let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
-            let body = backend!(bool_and, &[&a_x, &backend!(bool_not, &b_x)]);
-            let arr = backend!(lambda, &[&x], &backend!(dynamic_from_bool, &body));
-            Ok(SmtValue::Array(arr))
+            Some(Ok(SmtValue::Array(set_lambda_binop("sd", a, b, |x, y| {
+                backend!(bool_and, &[x, &backend!(bool_not, y)])
+            }))))
         }
-        // Set subset (<= or Set::subset): forall x. a[x] -> b[x]
-        ("OpSetSubset", SmtValue::Array(a), SmtValue::Array(b)) => {
-            let sort = backend!(array_get_sort, a);
-            let domain = backend!(sort_array_domain, &sort).unwrap();
-            let x = backend!(dynamic_fresh, "ss", &domain);
-            let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
-            let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
-            let body = backend!(bool_implies, &a_x, &b_x);
-            let q = backend!(forall, &[&x], &body);
-            Ok(SmtValue::Bool(q))
-        }
-        // Set disjointness (!* or Set::disjoint): forall x. not(a[x] and b[x])
-        ("OpDisjoint" | "OpSetDisjoint", SmtValue::Array(a), SmtValue::Array(b)) => {
-            let sort = backend!(array_get_sort, a);
-            let domain = backend!(sort_array_domain, &sort).unwrap();
-            let x = backend!(dynamic_fresh, "sj", &domain);
-            let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
-            let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
-            let body = backend!(bool_not, &backend!(bool_and, &[&a_x, &b_x]));
-            let q = backend!(forall, &[&x], &body);
-            Ok(SmtValue::Bool(q))
-        }
-        // Seq concat (<> on Seq or Seq::concat): result[i] = if i < #a then a[i] else b[i - #a]
-        // Since we don't track lengths explicitly in the SMT encoding, we use
-        // array equality semantics: two concatenated arrays agree on all indices.
-        // For finite literal concatenation, this works via store chains.
-        // For symbolic concat, we return the merged array (best-effort).
-        ("OpSeqConcat" | "OpSeqCons", SmtValue::Array(_a), SmtValue::Array(_b)) => {
-            // For now: treat <> on sequences the same as on sets (element-wise OR).
-            // This is correct for set-like usage but not for ordered sequences.
-            // Full ordered concat needs length tracking (deferred to ).
-            Err(
-                "Seq::concat on symbolic sequences requires length tracking; \
-                 use Seq literals directly for concrete concatenation"
-                    .to_owned(),
-            )
-        }
-        // Set member (Set::member(elem, set)): select from characteristic function
-        // Argument order: (elem, set) from surface syntax
-        ("OpSetMember", SmtValue::Int(x), SmtValue::Array(s)) => Ok(SmtValue::Bool(
-            backend!(
-                dynamic_as_bool,
-                &backend!(array_select, s, &backend!(dynamic_from_int, x))
-            )
-            .unwrap(),
+        ("OpSetSubset", SmtValue::Array(a), SmtValue::Array(b)) => Some(Ok(SmtValue::Bool(
+            set_quantified_binop("ss", a, b, |x, y| backend!(bool_implies, x, y)),
+        ))),
+        ("OpDisjoint" | "OpSetDisjoint", SmtValue::Array(a), SmtValue::Array(b)) => Some(Ok(
+            SmtValue::Bool(set_quantified_binop("sj", a, b, |x, y| {
+                backend!(bool_not, &backend!(bool_and, &[x, y]))
+            })),
         )),
-        ("OpSetMember", SmtValue::Dynamic(x), SmtValue::Array(s)) => Ok(SmtValue::Bool(
-            backend!(dynamic_as_bool, &backend!(array_select, s, x)).unwrap(),
+        ("OpSeqConcat" | "OpSeqCons", SmtValue::Array(_), SmtValue::Array(_)) => Some(Err(
+            "Seq::concat on symbolic sequences requires length tracking; \
+             use Seq literals directly for concrete concatenation"
+                .to_owned(),
         )),
-        ("OpSetMember", SmtValue::Bool(x), SmtValue::Array(s)) => Ok(SmtValue::Bool(
-            backend!(
-                dynamic_as_bool,
-                &backend!(array_select, s, &backend!(dynamic_from_bool, x))
-            )
-            .unwrap(),
-        )),
-        ("OpSetMember", SmtValue::Real(x), SmtValue::Array(s)) => Ok(SmtValue::Bool(
-            backend!(
-                dynamic_as_bool,
-                &backend!(array_select, s, &backend!(dynamic_from_real, x))
-            )
-            .unwrap(),
-        )),
-        // Map merge/has/domain/range: require domain tracking (a companion
-        // boolean array recording which keys are present). Without it, merge
-        // discards left-only keys, domain misses default-valued keys, and has
-        // is unsound for non-Bool maps. Deferred — see.
+        ("OpSetMember", _, SmtValue::Array(s)) => Some(set_member(lhs, s)),
+        _ => None,
+    }
+}
 
-        // Composition operators
-        ("OpSeq", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_implies, a, b)))
-        }
-        ("OpSameStep", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_and, &[a, b])))
-        }
-        ("OpUnord", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_and, &[a, b])))
-        }
-        ("OpConc", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_and, &[a, b])))
-        }
-        ("OpXor", SmtValue::Bool(a), SmtValue::Bool(b)) => {
-            Ok(SmtValue::Bool(backend!(bool_xor, a, b)))
-        }
+fn set_lambda_binop(
+    prefix: &str,
+    a: &Array,
+    b: &Array,
+    combine: impl FnOnce(&Bool, &Bool) -> Bool,
+) -> Array {
+    let (x, a_x, b_x) = set_operands(prefix, a, b);
+    let body = combine(&a_x, &b_x);
+    backend!(lambda, &[&x], &backend!(dynamic_from_bool, &body))
+}
 
-        // Dynamic operands — from array select, cast to matching type
-        (op, SmtValue::Dynamic(d), other) | (op, other, SmtValue::Dynamic(d)) => {
-            let coerced = match other {
-                SmtValue::Int(_) => SmtValue::Int(
-                    backend!(dynamic_as_int, d)
-                        .ok_or_else(|| format!("type error: Dynamic->Int cast failed in {op}"))?,
-                ),
-                SmtValue::Bool(_) => SmtValue::Bool(
-                    backend!(dynamic_as_bool, d)
-                        .ok_or_else(|| format!("type error: Dynamic->Bool cast failed in {op}"))?,
-                ),
-                SmtValue::Real(_) => SmtValue::Real(
-                    backend!(dynamic_as_real, d)
-                        .ok_or_else(|| format!("type error: Dynamic->Real cast failed in {op}"))?,
-                ),
-                SmtValue::Dynamic(d2) => {
-                    if let Some(i) = backend!(dynamic_as_int, d) {
-                        SmtValue::Int(i)
-                    } else if let Some(b) = backend!(dynamic_as_bool, d) {
-                        SmtValue::Bool(b)
-                    } else {
-                        // Both operands are genuine Dynamic (e.g., ADT sorts) —
-                        // use generic equality/inequality directly.
-                        return match op {
-                            "OpEq" => Ok(SmtValue::Bool(backend!(dynamic_eq, d, d2))),
-                            "OpNEq" => Ok(SmtValue::Bool(backend!(
-                                bool_not,
-                                &backend!(dynamic_eq, d, d2)
-                            ))),
-                            _ => Err(format!(
-                                "type error: cannot apply {op} to ADT/Dynamic operands"
-                            )),
-                        };
-                    }
-                }
-                SmtValue::Array(_) => {
-                    return Err(format!("type error: cannot apply {op} to Array operand"));
-                }
-                SmtValue::Func(_) => {
-                    return Err(format!("type error: cannot apply {op} to function value"));
-                }
-            };
-            if matches!(lhs, SmtValue::Dynamic(_)) {
-                binop(op, &coerced, rhs)
+fn set_quantified_binop(
+    prefix: &str,
+    a: &Array,
+    b: &Array,
+    combine: impl FnOnce(&Bool, &Bool) -> Bool,
+) -> Bool {
+    let (x, a_x, b_x) = set_operands(prefix, a, b);
+    let body = combine(&a_x, &b_x);
+    backend!(forall, &[&x], &body)
+}
+
+fn set_operands(prefix: &str, a: &Array, b: &Array) -> (Dynamic, Bool, Bool) {
+    let sort = backend!(array_get_sort, a);
+    let domain = backend!(sort_array_domain, &sort).unwrap();
+    let x = backend!(dynamic_fresh, prefix, &domain);
+    let a_x = backend!(dynamic_as_bool, &backend!(array_select, a, &x)).unwrap();
+    let b_x = backend!(dynamic_as_bool, &backend!(array_select, b, &x)).unwrap();
+    (x, a_x, b_x)
+}
+
+fn set_member(elem: &SmtValue, set: &Array) -> BinopResult {
+    let elem = match elem {
+        SmtValue::Int(x) => backend!(dynamic_from_int, x),
+        SmtValue::Dynamic(x) => x.clone(),
+        SmtValue::Bool(x) => backend!(dynamic_from_bool, x),
+        SmtValue::Real(x) => backend!(dynamic_from_real, x),
+        other => {
+            return Err(format!(
+                "type error: Set::member element cannot be {other:?}"
+            ));
+        }
+    };
+    Ok(SmtValue::Bool(
+        backend!(dynamic_as_bool, &backend!(array_select, set, &elem)).unwrap(),
+    ))
+}
+
+fn dynamic_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (dynamic, other, dynamic_on_left) = match (lhs, rhs) {
+        (SmtValue::Dynamic(d), other) => (d, other, true),
+        (other, SmtValue::Dynamic(d)) => (d, other, false),
+        _ => return None,
+    };
+    if let SmtValue::Dynamic(d2) = other {
+        if let Some(i) = backend!(dynamic_as_int, dynamic) {
+            return Some(if dynamic_on_left {
+                binop(op, &SmtValue::Int(i), rhs)
             } else {
-                binop(op, lhs, &coerced)
-            }
+                binop(op, lhs, &SmtValue::Int(i))
+            });
         }
+        if let Some(b) = backend!(dynamic_as_bool, dynamic) {
+            return Some(if dynamic_on_left {
+                binop(op, &SmtValue::Bool(b), rhs)
+            } else {
+                binop(op, lhs, &SmtValue::Bool(b))
+            });
+        }
+        return Some(match op {
+            "OpEq" => Ok(SmtValue::Bool(backend!(dynamic_eq, dynamic, d2))),
+            "OpNEq" => Ok(SmtValue::Bool(backend!(
+                bool_not,
+                &backend!(dynamic_eq, dynamic, d2)
+            ))),
+            _ => Err(format!(
+                "type error: cannot apply {op} to ADT/Dynamic operands"
+            )),
+        });
+    }
+    Some(match coerce_dynamic(op, dynamic, other) {
+        Ok(coerced) if dynamic_on_left => binop(op, &coerced, rhs),
+        Ok(coerced) => binop(op, lhs, &coerced),
+        Err(err) => Err(err),
+    })
+}
 
-        _ => Err(format!("unsupported binop: {op} on {lhs:?}, {rhs:?}")),
+fn coerce_dynamic(op: &str, dynamic: &Dynamic, other: &SmtValue) -> BinopResult {
+    match other {
+        SmtValue::Int(_) => backend!(dynamic_as_int, dynamic)
+            .map(SmtValue::Int)
+            .ok_or_else(|| format!("type error: Dynamic->Int cast failed in {op}")),
+        SmtValue::Bool(_) => backend!(dynamic_as_bool, dynamic)
+            .map(SmtValue::Bool)
+            .ok_or_else(|| format!("type error: Dynamic->Bool cast failed in {op}")),
+        SmtValue::Real(_) => backend!(dynamic_as_real, dynamic)
+            .map(SmtValue::Real)
+            .ok_or_else(|| format!("type error: Dynamic->Real cast failed in {op}")),
+        SmtValue::Dynamic(_) => unreachable!("handled by dynamic_binop"),
+        SmtValue::Array(_) => Err(format!("type error: cannot apply {op} to Array operand")),
+        SmtValue::Func(_) => Err(format!("type error: cannot apply {op} to function value")),
     }
 }
 

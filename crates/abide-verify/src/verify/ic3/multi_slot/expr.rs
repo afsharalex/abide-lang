@@ -33,7 +33,9 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| guard_to_smt_scoped(predicate, entity, vctx, scope),
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_scoped(predicate, entity, vctx, scope)
+            },
         )?;
 
         let mut scope = locals.clone();
@@ -46,19 +48,31 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| expr_to_smt_scoped(term, entity, vctx, scope),
-            |predicate, scope| guard_to_smt_scoped(predicate, entity, vctx, scope),
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_scoped(scrutinee, entity, vctx, scope)?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_scoped(scrutinee, entity, vctx, scope)?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    expr_to_smt_scoped(term, entity, vctx, scope)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_scoped(predicate, entity, vctx, scope)
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_scoped(scrutinee, entity, vctx, scope)?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut = expr_to_smt_scoped(scrutinee, entity, vctx, scope)?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -67,7 +81,9 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| guard_to_smt_scoped(predicate, entity, vctx, scope),
+                |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_scoped(predicate, entity, vctx, scope)
+                },
                 rest_smt,
             );
         }
@@ -77,7 +93,9 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| guard_to_smt_scoped(predicate, entity, vctx, scope),
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_scoped(predicate, entity, vctx, scope)
+            },
             rest_smt.clone(),
         )? {
             return Ok(formula);

@@ -13,6 +13,30 @@ use super::harness::{self, FireTracking, SlotPool};
 use super::smt::{self, AbideSolver, Dynamic, Model, SmtValue};
 use super::{DeadlockEventDiag, FairnessEventAnalysis, FairnessKind, FairnessStatus, TraceStep};
 
+pub(super) struct WitnessExtractionCtx<'a> {
+    pub solver: &'a AbideSolver,
+    pub pool: &'a SlotPool,
+    pub vctx: &'a VerifyContext,
+    pub entities: &'a [IREntity],
+    pub systems: &'a [IRSystem],
+}
+
+pub(super) struct FairnessAnalysisCtx<'a> {
+    pub witness: WitnessExtractionCtx<'a>,
+    pub fire_tracking: &'a FireTracking,
+    pub loop_start: usize,
+    pub bound: usize,
+    pub assumption_set: &'a crate::ir::types::IRAssumptionSet,
+}
+
+struct EventFairnessCtx<'a> {
+    model: &'a Model,
+    analysis: &'a FairnessAnalysisCtx<'a>,
+    system: &'a str,
+    event: &'a str,
+    kind: FairnessKind,
+}
+
 // ── Expression analysis predicates ──────────────────────────────────
 
 fn render_enum_witness_value(
@@ -2056,19 +2080,21 @@ pub(super) fn extract_relational_deadlock(
         .map_err(|err| format!("bounded relational deadlock envelope validation failed: {err}"))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn extract_operational_liveness_with_fire(
-    solver: &AbideSolver,
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    systems: &[IRSystem],
+    ctx: &WitnessExtractionCtx<'_>,
     fire_tracking: &FireTracking,
     bound: usize,
     loop_start: usize,
 ) -> Result<op::OperationalWitness, String> {
-    let behavior =
-        extract_behavior_with_fire(solver, pool, vctx, entities, systems, fire_tracking, bound)?;
+    let behavior = extract_behavior_with_fire(
+        ctx.solver,
+        ctx.pool,
+        ctx.vctx,
+        ctx.entities,
+        ctx.systems,
+        fire_tracking,
+        bound,
+    )?;
     op::OperationalWitness::liveness(behavior, loop_start)
         .map_err(|err| format!("operational liveness witness validation failed: {err}"))
 }
@@ -3297,58 +3323,37 @@ mod tests {
 /// - `EnabledAndFired`: event was enabled and fired in the loop
 /// - `EnabledButStarved`: event was enabled but never fired — starved
 /// - `NeverEnabled`: event was never enabled at any loop step
-#[allow(clippy::too_many_arguments)]
 pub(super) fn extract_fairness_analysis(
-    solver: &AbideSolver,
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    systems: &[IRSystem],
-    fire_tracking: &FireTracking,
-    loop_start: usize,
-    bound: usize,
-    assumption_set: &crate::ir::types::IRAssumptionSet,
+    ctx: FairnessAnalysisCtx<'_>,
 ) -> Vec<FairnessEventAnalysis> {
-    let Some(model) = solver.get_model() else {
+    let Some(model) = ctx.witness.solver.get_model() else {
         return Vec::new();
     };
 
     let mut results = Vec::new();
 
     // Process weak fair events
-    for wf in &assumption_set.weak_fair {
-        if let Some(analysis) = analyze_event_fairness(
-            &model,
-            pool,
-            vctx,
-            entities,
-            systems,
-            fire_tracking,
-            &wf.system,
-            &wf.command,
-            FairnessKind::Weak,
-            loop_start,
-            bound,
-        ) {
+    for wf in &ctx.assumption_set.weak_fair {
+        if let Some(analysis) = analyze_event_fairness(EventFairnessCtx {
+            model: &model,
+            analysis: &ctx,
+            system: &wf.system,
+            event: &wf.command,
+            kind: FairnessKind::Weak,
+        }) {
             results.push(analysis);
         }
     }
 
     // Process strong fair events
-    for sf in &assumption_set.strong_fair {
-        if let Some(analysis) = analyze_event_fairness(
-            &model,
-            pool,
-            vctx,
-            entities,
-            systems,
-            fire_tracking,
-            &sf.system,
-            &sf.command,
-            FairnessKind::Strong,
-            loop_start,
-            bound,
-        ) {
+    for sf in &ctx.assumption_set.strong_fair {
+        if let Some(analysis) = analyze_event_fairness(EventFairnessCtx {
+            model: &model,
+            analysis: &ctx,
+            system: &sf.system,
+            event: &sf.command,
+            kind: FairnessKind::Strong,
+        }) {
             results.push(analysis);
         }
     }
@@ -3357,28 +3362,16 @@ pub(super) fn extract_fairness_analysis(
 }
 
 /// Analyze a single event's fairness status in the lasso loop.
-#[allow(clippy::too_many_arguments)]
-fn analyze_event_fairness(
-    model: &Model,
-    pool: &SlotPool,
-    vctx: &VerifyContext,
-    entities: &[IREntity],
-    systems: &[IRSystem],
-    fire_tracking: &FireTracking,
-    sys_name: &str,
-    evt_name: &str,
-    kind: FairnessKind,
-    loop_start: usize,
-    bound: usize,
-) -> Option<FairnessEventAnalysis> {
-    let key = (sys_name.to_owned(), evt_name.to_owned());
-    let fire_vec = fire_tracking.fire_vars.get(&key)?;
+fn analyze_event_fairness(ctx: EventFairnessCtx<'_>) -> Option<FairnessEventAnalysis> {
+    let witness = &ctx.analysis.witness;
+    let key = (ctx.system.to_owned(), ctx.event.to_owned());
+    let fire_vec = ctx.analysis.fire_tracking.fire_vars.get(&key)?;
 
     // Check if the event fired at any step in the loop
     let mut fired = false;
-    for step in loop_start..bound {
+    for step in ctx.analysis.loop_start..ctx.analysis.bound {
         if let Some(fire_bool) = fire_vec.get(step) {
-            if let Some(val) = model.eval(fire_bool, true) {
+            if let Some(val) = ctx.model.eval(fire_bool, true) {
                 if val.as_bool() == Some(true) {
                     fired = true;
                     break;
@@ -3389,23 +3382,28 @@ fn analyze_event_fairness(
 
     // Check enabledness at each loop step. A command may have multiple
     // step clauses — the command is enabled if ANY clause is enabled.
-    let target_sys = systems.iter().find(|s| s.name == sys_name);
+    let target_sys = witness.systems.iter().find(|s| s.name == ctx.system);
     let matching_steps: Vec<&crate::ir::types::IRSystemAction> = target_sys
-        .map(|s| s.actions.iter().filter(|st| st.name == evt_name).collect())
+        .map(|s| s.actions.iter().filter(|st| st.name == ctx.event).collect())
         .unwrap_or_default();
 
     let mut enabled_at_every_step = !matching_steps.is_empty();
     let mut enabled_somewhere = false;
-    for step in loop_start..bound {
+    for step in ctx.analysis.loop_start..ctx.analysis.bound {
         let mut enabled_at_this_step = false;
         for event in &matching_steps {
-            let Ok(enabled_bool) =
-                harness::try_encode_step_enabled(pool, vctx, entities, systems, event, step)
-            else {
+            let Ok(enabled_bool) = harness::try_encode_step_enabled(
+                witness.pool,
+                witness.vctx,
+                witness.entities,
+                witness.systems,
+                event,
+                step,
+            ) else {
                 enabled_at_every_step = false;
                 continue;
             };
-            if let Some(val) = model.eval(&enabled_bool, true) {
+            if let Some(val) = ctx.model.eval(&enabled_bool, true) {
                 if val.as_bool() == Some(true) {
                     enabled_at_this_step = true;
                     break;
@@ -3421,7 +3419,7 @@ fn analyze_event_fairness(
 
     // WF premise: enabled at EVERY loop step.
     // SF premise: enabled at SOME loop step.
-    let fairness_premise_met = match kind {
+    let fairness_premise_met = match ctx.kind {
         FairnessKind::Weak => enabled_at_every_step,
         FairnessKind::Strong => enabled_somewhere,
     };
@@ -3435,9 +3433,9 @@ fn analyze_event_fairness(
     };
 
     Some(FairnessEventAnalysis {
-        system: sys_name.to_owned(),
-        event: evt_name.to_owned(),
-        kind,
+        system: ctx.system.to_owned(),
+        event: ctx.event.to_owned(),
+        kind: ctx.kind,
         status,
     })
 }

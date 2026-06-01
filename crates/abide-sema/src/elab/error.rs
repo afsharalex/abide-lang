@@ -6,19 +6,39 @@
 use crate::span::Span;
 use abide_core::diagnostic::{Diagnostic, DiagnosticSeverity, RelatedDiagnostic};
 
+/// Elaborator error classification.
+///
+/// Each variant has a stable diagnostic code (`E001`..) returned by
+/// [`Self::code`] and a one-line title returned by [`Self::title`].
+/// External tools that surface elaborator output rely on these codes
+/// being stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// Two declarations share a name within the same scope.
     DuplicateDecl,
+    /// A name has no matching declaration in scope.
     UndefinedRef,
+    /// A bare name resolves to two or more declarations.
     AmbiguousRef,
+    /// An expression's type does not match its expected type.
     TypeMismatch,
+    /// A primed variable appears outside a transition or theorem
+    /// context where priming is legal.
     InvalidPrime,
+    /// A call site supplied the wrong number or type of arguments.
     ParamMismatch,
+    /// An initial-value form (`= expr`, `in {...}`, `where expr`) is
+    /// ill-formed for its field type.
     InvalidDefault,
+    /// A use site violates visibility or scope rules.
     InvalidScope,
+    /// A record/constructor expression is missing a required field.
     MissingField,
+    /// Two or more declarations recursively depend on each other.
     CyclicDefinition,
+    /// `include` graph contains a cycle.
     CyclicImport,
+    /// A `match` does not cover every constructor of its scrutinee.
     NonExhaustiveMatch,
 }
 

@@ -4236,6 +4236,14 @@ fn system_property_encoder_supports_payload_field_projection() {
     let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
     let mut entity_locals = Ic3SystemEntityLocals::new();
     entity_locals.insert("o".to_owned(), ("Order".to_owned(), 0));
+    let property_ctx = Ic3SystemPropertyCtx {
+        entities: &entities,
+        slots_per_entity: &slots,
+        current_entity: &entity,
+        vctx: &vctx,
+        current_ent_name: "Order",
+        current_slot: 0,
+    };
 
     let projection = IRExpr::Field {
         expr: Box::new(IRExpr::Field {
@@ -4253,18 +4261,9 @@ fn system_property_encoder_supports_payload_field_projection() {
         span: None,
     };
 
-    let smt = expr_to_smt_sys_prop_scoped(
-        &projection,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        &HashSet::new(),
-        &entity_locals,
-    )
-    .expect("payload field projection should encode through the datatype selector");
+    let smt =
+        expr_to_smt_sys_prop_scoped(&projection, property_ctx, &HashSet::new(), &entity_locals)
+            .expect("payload field projection should encode through the datatype selector");
 
     assert_eq!(smt, "(code Order_0_f0)");
 }
@@ -4281,6 +4280,14 @@ fn system_property_encoder_supports_unary_numeric_negation() {
     let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
     let mut entity_locals = Ic3SystemEntityLocals::new();
     entity_locals.insert("o".to_owned(), ("Order".to_owned(), 0));
+    let property_ctx = Ic3SystemPropertyCtx {
+        entities: &entities,
+        slots_per_entity: &slots,
+        current_entity: &entity,
+        vctx: &vctx,
+        current_ent_name: "Order",
+        current_slot: 0,
+    };
 
     let expr = IRExpr::UnOp {
         op: "OpNeg".to_owned(),
@@ -4289,18 +4296,8 @@ fn system_property_encoder_supports_unary_numeric_negation() {
         span: None,
     };
 
-    let smt = expr_to_smt_sys_prop_scoped(
-        &expr,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        &HashSet::new(),
-        &entity_locals,
-    )
-    .expect("system property value encoder should match other IC3 value encoders for negation");
+    let smt = expr_to_smt_sys_prop_scoped(&expr, property_ctx, &HashSet::new(), &entity_locals)
+        .expect("system property value encoder should match other IC3 value encoders for negation");
 
     assert_eq!(smt, "(- Order_0_f2)");
 }
@@ -6569,19 +6566,22 @@ fn build_liveness_chc_emits_monitor_columns_and_accepting_rule() {
     };
     let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
 
-    let chc = super::liveness::build_liveness_chc(
-        &[&entity],
-        &[],
-        &vctx,
-        &trigger,
-        false,
-        &response,
-        Some("o"),
-        Some("Order"),
-        &[("Shop".to_owned(), "tick".to_owned())],
-        &slots,
-        Some(0),
-    )
+    let fair_events = [("Shop".to_owned(), "tick".to_owned())];
+    let chc = super::liveness::build_liveness_chc(super::liveness::LivenessChcInput {
+        entities: &[&entity],
+        systems: &[],
+        vctx: &vctx,
+        monitor: LivenessMonitorInput {
+            trigger: &trigger,
+            response: &response,
+            entity_var: Some("o"),
+            entity_name_for_binding: Some("Order"),
+            fair_events: &fair_events,
+            is_oneshot: false,
+            target_slot: Some(0),
+        },
+        slots_per_entity: &slots,
+    })
     .expect("liveness chc");
 
     assert!(chc.contains("mon_pending"));
@@ -6618,20 +6618,23 @@ fn try_ic3_liveness_reports_missing_quantified_entity() {
         span: None,
     };
 
-    let result = try_ic3_liveness(
-        &ir,
-        &vctx,
-        &[],
-        &trigger,
-        &response,
-        Some("o"),
-        Some("Missing"),
-        &[],
-        &HashMap::new(),
-        false,
-        Some(0),
-        10,
-    );
+    let slots = HashMap::new();
+    let result = try_ic3_liveness(Ic3LivenessInput {
+        ir: &ir,
+        vctx: &vctx,
+        system_names: &[],
+        monitor: LivenessMonitorInput {
+            trigger: &trigger,
+            response: &response,
+            entity_var: Some("o"),
+            entity_name_for_binding: Some("Missing"),
+            fair_events: &[],
+            is_oneshot: false,
+            target_slot: Some(0),
+        },
+        slots_per_entity: &slots,
+        timeout_ms: 10,
+    });
 
     assert!(
         matches!(result, Ic3Result::Unknown(ref reason) if reason.contains("entity Missing not found")),
@@ -7190,19 +7193,23 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
         span: None,
     };
 
-    let chc = super::liveness::build_liveness_chc(
-        &[&entity],
-        &[&shop, &helper],
-        &vctx,
-        &trigger,
-        false,
-        &response,
-        Some("o"),
-        Some("Order"),
-        &[("Shop".to_owned(), "tick".to_owned())],
-        &HashMap::from([("Order".to_owned(), 1_usize)]),
-        Some(0),
-    )
+    let fair_events = [("Shop".to_owned(), "tick".to_owned())];
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+    let chc = super::liveness::build_liveness_chc(super::liveness::LivenessChcInput {
+        entities: &[&entity],
+        systems: &[&shop, &helper],
+        vctx: &vctx,
+        monitor: LivenessMonitorInput {
+            trigger: &trigger,
+            response: &response,
+            entity_var: Some("o"),
+            entity_name_for_binding: Some("Order"),
+            fair_events: &fair_events,
+            is_oneshot: false,
+            target_slot: Some(0),
+        },
+        slots_per_entity: &slots,
+    })
     .expect("liveness choose/crosscall chc");
     assert!(chc.contains("tick_choose_0_s0"));
     assert!(chc.contains("accepting"));
@@ -7446,18 +7453,24 @@ fn system_action_encoder_supports_nested_macro_step_let_match_routing() {
 
     encode_ops_chc(
         &mut chc,
-        &actions,
-        &[&entity],
-        &entity,
-        "Order",
-        0,
-        "o",
-        &vctx,
-        &HashMap::from([("Order".to_owned(), 1_usize)]),
-        "Order_0_f0 Order_0_f1 Order_0_f2 Order_0_active",
-        &[&helper],
-        "unit",
-        &["Order_0_active".to_owned()],
+        Ic3SystemActionCtx {
+            entities: &[&entity],
+            vctx: &vctx,
+            slots_per_entity: &HashMap::from([("Order".to_owned(), 1_usize)]),
+            all_vars_str: "Order_0_f0 Order_0_f1 Order_0_f2 Order_0_active",
+            all_systems: &[&helper],
+        },
+        EncodeOpsChcInput {
+            ops: &actions,
+            bound: BoundActionSlot {
+                entity: &entity,
+                entity_name: "Order",
+                slot: 0,
+                var: "o",
+            },
+            rule_prefix: "unit",
+            guards: &["Order_0_active".to_owned()],
+        },
         &mut visited,
     )
     .expect("nested action encoder should route macro-step let/match actions");
@@ -7683,15 +7696,21 @@ fn system_scope_translators_cover_scoped_value_guard_and_cross_entity_paths() {
     };
     let cross_smt = guard_to_smt_sys_two_scoped(
         &cross_expr,
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        Ic3SystemTwoSlotCtx {
+            left: Ic3SystemSlotCtx {
+                entity: &entity,
+                ent_name: "Order",
+                slot: 0,
+                var: "lhs",
+            },
+            right: Ic3SystemSlotCtx {
+                entity: &entity,
+                ent_name: "Order",
+                slot: 1,
+                var: "rhs",
+            },
+            vctx: &vctx,
+        },
         &HashSet::new(),
     )
     .expect("cross guard");
@@ -7708,6 +7727,21 @@ fn system_expr_translators_cover_branchy_forms_and_errors() {
     let status_ty = tys[0].ty.clone();
     let entity_ty = IRType::Entity {
         name: "Order".to_owned(),
+    };
+    let cross_ctx = Ic3SystemTwoSlotCtx {
+        left: Ic3SystemSlotCtx {
+            entity: &entity,
+            ent_name: "Order",
+            slot: 0,
+            var: "lhs",
+        },
+        right: Ic3SystemSlotCtx {
+            entity: &entity,
+            ent_name: "Order",
+            slot: 1,
+            var: "rhs",
+        },
+        vctx: &vctx,
     };
     let map_ty = IRType::Map {
         key: Box::new(IRType::Int),
@@ -7891,10 +7925,7 @@ fn system_expr_translators_cover_branchy_forms_and_errors() {
         }),
         span: None,
     };
-    let cross_smt = guard_to_smt_sys_two(
-        &cross, &entity, &entity, &vctx, "Order", 0, "lhs", "Order", 1, "rhs",
-    )
-    .expect("system cross branchy guard");
+    let cross_smt = guard_to_smt_sys_two(&cross, cross_ctx).expect("system cross branchy guard");
     assert!(cross_smt.contains("(let ((threshold 3))"));
     assert!(cross_smt.contains("Order_0_f1"));
     assert!(cross_smt.contains("Order_1_f2"));
@@ -7928,19 +7959,8 @@ fn system_expr_translators_cover_branchy_forms_and_errors() {
         ],
         span: None,
     };
-    let cross_match_smt = guard_to_smt_sys_two(
-        &cross_match,
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
-    )
-    .expect("system cross match");
+    let cross_match_smt =
+        guard_to_smt_sys_two(&cross_match, cross_ctx).expect("system cross match");
     assert!(cross_match_smt.contains("(ite "));
 
     assert!(expr_to_smt_sys(
@@ -7978,32 +7998,13 @@ fn system_expr_translators_cover_branchy_forms_and_errors() {
             ty: IRType::Int,
             span: None,
         },
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        cross_ctx,
     )
     .expect_err("unknown cross field var")
     .contains("unknown var"));
-    assert!(guard_to_smt_sys_two(
-        &ic3_var("lhs", entity_ty),
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
-    )
-    .expect_err("bare cross entity var")
-    .contains("bare entity variable"));
+    assert!(guard_to_smt_sys_two(&ic3_var("lhs", entity_ty), cross_ctx)
+        .expect_err("bare cross entity var")
+        .contains("bare entity variable"));
 }
 
 #[test]
@@ -8014,6 +8015,21 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
     let status_ty = tys[0].ty.clone();
     let entity_ty = IRType::Entity {
         name: "Order".to_owned(),
+    };
+    let cross_ctx = Ic3SystemTwoSlotCtx {
+        left: Ic3SystemSlotCtx {
+            entity: &entity,
+            ent_name: "Order",
+            slot: 0,
+            var: "lhs",
+        },
+        right: Ic3SystemSlotCtx {
+            entity: &entity,
+            ent_name: "Order",
+            slot: 1,
+            var: "rhs",
+        },
+        vctx: &vctx,
     };
 
     let plain_let = guard_let_to_smt_sys_scoped(
@@ -8203,15 +8219,7 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
             ic3_int_lit(2),
             IRType::Bool,
         ),
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        cross_ctx,
         &HashSet::new(),
     )
     .expect("cross quantified choose");
@@ -8236,19 +8244,8 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
         )),
         span: None,
     };
-    let cross_more_smt = guard_to_smt_sys_two(
-        &cross_more,
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
-    )
-    .expect("cross assert/unary/one");
+    let cross_more_smt =
+        guard_to_smt_sys_two(&cross_more, cross_ctx).expect("cross assert/unary/one");
     assert!(cross_more_smt.contains("(or (not false)"));
 
     assert!(guard_to_smt_sys_two_scoped(
@@ -8258,15 +8255,7 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
             ty: IRType::Int,
             span: None,
         },
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        cross_ctx,
         &HashSet::from(["local".to_owned()]),
     )
     .expect_err("cross local field projection")
@@ -8284,15 +8273,7 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
             }],
             span: None,
         },
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        cross_ctx,
     )
     .expect_err("non-exhaustive cross match")
     .contains("non-exhaustive"));
@@ -8357,6 +8338,14 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
 
     let mut entity_locals = Ic3SystemEntityLocals::new();
     entity_locals.insert("bound".to_owned(), ("Order".to_owned(), 1));
+    let system_property_ctx = Ic3SystemPropertyCtx {
+        entities: &entities,
+        slots_per_entity: &slots,
+        current_entity: &entity,
+        vctx: &vctx,
+        current_ent_name: "Order",
+        current_slot: 0,
+    };
     let property_let = IRExpr::Let {
         bindings: vec![
             LetBinding {
@@ -8437,12 +8426,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
     };
     let property_smt = guard_to_smt_sys_prop_scoped(
         &property_let,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -8519,12 +8503,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
     };
     let value_smt = expr_to_smt_sys_prop_scoped(
         &value_expr,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::from(["m".to_owned()]),
         &entity_locals,
     )
@@ -8539,17 +8518,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
             ic3_status_ctor("Pending"),
             IRType::Bool,
         ),
-        &entities,
-        &slots,
-        &entity,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        "lhs",
-        "Order",
-        1,
-        "rhs",
+        system_property_ctx,
         &HashSet::new(),
         &Ic3SystemEntityLocals::from([
             ("lhs".to_owned(), ("Order".to_owned(), 0)),
@@ -8561,12 +8530,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
 
     assert!(expr_to_smt_sys_prop_scoped(
         &ic3_var("bound", entity_ty.clone()),
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -8579,12 +8543,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
             ty: IRType::Int,
             span: None,
         },
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -8597,12 +8556,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
             else_body: None,
             span: None,
         },
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -8621,12 +8575,7 @@ fn system_property_translators_cover_nested_quantifiers_bindings_and_errors() {
             }],
             span: None,
         },
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -8805,6 +8754,19 @@ fn multi_slot_scoped_translators_cover_locals_match_quantifiers_and_two_slot_pat
     .expect("slot guard");
     assert!(guard_smt.contains("(let ((picked"));
     assert!(guard_smt.contains("(ite "));
+    let two_slot_ctx = Ic3TwoSlotPropertyCtx {
+        entity: &entity,
+        vctx: &vctx,
+        left: Ic3SlotBinding {
+            var: "lhs",
+            slot: 0,
+        },
+        right: Ic3SlotBinding {
+            var: "rhs",
+            slot: 1,
+        },
+        n_slots: 2,
+    };
 
     let two_slot = guard_to_smt_two_slots_scoped(
         &IRExpr::BinOp {
@@ -8857,13 +8819,7 @@ fn multi_slot_scoped_translators_cover_locals_match_quantifiers_and_two_slot_pat
             ty: IRType::Bool,
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -9218,12 +9174,14 @@ fn system_property_scoped_choose_over_entities_expands_active_slot_disjunctions(
     let smt = guard_let_to_smt_sys_prop_scoped(
         &bindings,
         &body,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        Ic3SystemPropertyCtx {
+            entities: &entities,
+            slots_per_entity: &slots,
+            current_entity: &entity,
+            vctx: &vctx,
+            current_ent_name: "Order",
+            current_slot: 0,
+        },
         &HashSet::new(),
         &Ic3SystemEntityLocals::new(),
     )
@@ -9306,10 +9264,12 @@ fn multi_slot_choose_over_entities_expands_active_slot_disjunctions() {
     let smt = guard_let_to_smt_slot_scoped(
         &bindings,
         &body,
-        &entity,
-        &vctx,
-        0,
-        2,
+        Ic3SingleSlotPropertyCtx {
+            entity: &entity,
+            vctx: &vctx,
+            slot: 0,
+            n_slots: 2,
+        },
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -9481,27 +9441,36 @@ fn multi_slot_choose_helpers_cover_finite_quantified_and_direct_witness_paths() 
         ty: IRType::Bool,
         span: None,
     };
+    let predicate = IRExpr::BinOp {
+        op: "OpAnd".to_owned(),
+        left: Box::new(lower),
+        right: Box::new(upper),
+        ty: IRType::Bool,
+        span: None,
+    };
     let witness = ic3_direct_choose_witness(
-        "x",
-        &IRType::Int,
-        Some(&IRExpr::BinOp {
-            op: "OpAnd".to_owned(),
-            left: Box::new(lower),
-            right: Box::new(upper),
-            ty: IRType::Bool,
-            span: None,
-        }),
-        &locals,
-        |expr, _| match expr {
-            IRExpr::Lit {
-                value: LitVal::Int { value },
-                ..
-            } => Ok(value.to_string()),
-            other => Ok(format!("{other:?}")),
+        Ic3DirectChooseInput {
+            var: "x",
+            domain: &IRType::Int,
+            predicate: Some(&predicate),
+            locals: &locals,
         },
-        |_, _| Ok("true".to_owned()),
-        |_, _, _| Ok(vec![]),
-        |_, _, _| Ok("true".to_owned()),
+        Ic3DirectChooseHooks {
+            encode_term: |expr: &IRExpr, _: &HashSet<String>| match expr {
+                IRExpr::Lit {
+                    value: LitVal::Int { value },
+                    ..
+                } => Ok(value.to_string()),
+                other => Ok(format!("{other:?}")),
+            },
+            encode_predicate: |_: &IRExpr, _: &HashSet<String>| Ok("true".to_owned()),
+            match_bindings: |_: &IRExpr, _: &crate::ir::types::IRPattern, _: &HashSet<String>| {
+                Ok(vec![])
+            },
+            match_cond: |_: &IRExpr, _: &crate::ir::types::IRPattern, _: &HashSet<String>| {
+                Ok("true".to_owned())
+            },
+        },
     )
     .expect("direct witness")
     .expect("numeric witness");
@@ -9555,19 +9524,18 @@ fn system_expr_and_property_translators_cover_misc_paths_and_errors() {
     let index_smt = expr_to_smt_sys_scoped(&index, &entity, &vctx, "Order", 0, &locals)
         .expect("plain system index");
     assert!(index_smt.contains("(select (store m 1 2) 1)"));
+    let system_property_ctx = Ic3SystemPropertyCtx {
+        entities: &entities,
+        slots_per_entity: &slots,
+        current_entity: &entity,
+        vctx: &vctx,
+        current_ent_name: "Order",
+        current_slot: 0,
+    };
 
-    let index_prop = expr_to_smt_sys_prop_scoped(
-        &index,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
-        &locals,
-        &entity_locals,
-    )
-    .expect("property system index");
+    let index_prop =
+        expr_to_smt_sys_prop_scoped(&index, system_property_ctx, &locals, &entity_locals)
+            .expect("property system index");
     assert_eq!(index_prop, index_smt);
 
     let one_guard = IRExpr::One {
@@ -9593,12 +9561,7 @@ fn system_expr_and_property_translators_cover_misc_paths_and_errors() {
     };
     let one_smt = guard_to_smt_sys_prop_scoped(
         &one_guard,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -9622,12 +9585,7 @@ fn system_expr_and_property_translators_cover_misc_paths_and_errors() {
     };
     let err = expr_to_smt_sys_prop_scoped(
         &if_without_else,
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &entity_locals,
     )
@@ -9644,12 +9602,7 @@ fn system_expr_and_property_translators_cover_misc_paths_and_errors() {
             },
             span: None,
         },
-        &entities,
-        &slots,
-        &entity,
-        &vctx,
-        "Order",
-        0,
+        system_property_ctx,
         &HashSet::new(),
         &scoped_entities,
     )
@@ -9874,6 +9827,19 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
         negate_property_smt_multi(&nested_property, &entity, &vctx, 2).expect("nested property");
     assert!(negated.contains("s0_active s1_active"));
     assert!(negated.contains("(not (>= (+ s0_f2 s1_f2) (- 1)))"));
+    let two_slot_ctx = Ic3TwoSlotPropertyCtx {
+        entity: &entity,
+        vctx: &vctx,
+        left: Ic3SlotBinding {
+            var: "lhs",
+            slot: 0,
+        },
+        right: Ic3SlotBinding {
+            var: "rhs",
+            slot: 1,
+        },
+        n_slots: 2,
+    };
 
     let alias_body = IRExpr::BinOp {
         op: "OpEq".to_owned(),
@@ -9906,13 +9872,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
             },
         ],
         &alias_body,
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -9939,13 +9899,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
     let choose_smt = guard_let_to_smt_two_slots_scoped(
         &[choose_binding],
         &choose_body,
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -9979,13 +9933,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
             ty: IRType::Bool,
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -10018,13 +9966,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
             ty: IRType::Int,
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::from(["scalar".to_owned()]),
         &Ic3SlotEntityLocals::new(),
     )
@@ -10032,13 +9974,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
     .contains("cannot be used for field projection"));
     assert!(guard_to_smt_two_slots_scoped(
         &ic3_var("lhs", entity_ty.clone()),
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -10052,13 +9988,7 @@ fn multi_slot_two_slot_property_translators_cover_aliases_and_errors() {
             ty: IRType::Int,
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
         &HashSet::new(),
         &Ic3SlotEntityLocals::new(),
     )
@@ -10236,9 +10166,21 @@ fn multi_slot_property_translators_cover_branchy_slot_and_two_slot_forms() {
         ],
         span: None,
     };
+    let two_slot_ctx = Ic3TwoSlotPropertyCtx {
+        entity: &entity,
+        vctx: &vctx,
+        left: Ic3SlotBinding {
+            var: "lhs",
+            slot: 0,
+        },
+        right: Ic3SlotBinding {
+            var: "rhs",
+            slot: 1,
+        },
+        n_slots: 2,
+    };
     let two_match_smt =
-        guard_to_smt_two_slots(&two_slot_match, &entity, &vctx, "lhs", 0, "rhs", 1, 2)
-            .expect("two-slot match");
+        guard_to_smt_two_slots(&two_slot_match, two_slot_ctx).expect("two-slot match");
     assert!(two_match_smt.contains("(ite "));
     assert!(two_match_smt.contains("s0_f1"));
     assert!(two_match_smt.contains("s1_f2"));
@@ -10279,8 +10221,7 @@ fn multi_slot_property_translators_cover_branchy_slot_and_two_slot_forms() {
         })),
         span: None,
     };
-    let two_if_smt = guard_to_smt_two_slots(&two_slot_if, &entity, &vctx, "lhs", 0, "rhs", 1, 2)
-        .expect("two-slot if");
+    let two_if_smt = guard_to_smt_two_slots(&two_slot_if, two_slot_ctx).expect("two-slot if");
     assert!(two_if_smt.contains("(ite "));
     assert!(two_if_smt.contains("(=> true"));
 
@@ -10304,8 +10245,7 @@ fn multi_slot_property_translators_cover_branchy_slot_and_two_slot_forms() {
         span: None,
     };
     let two_assert_smt =
-        guard_to_smt_two_slots(&two_slot_assert, &entity, &vctx, "lhs", 0, "rhs", 1, 2)
-            .expect("two-slot assert arithmetic");
+        guard_to_smt_two_slots(&two_slot_assert, two_slot_ctx).expect("two-slot assert arithmetic");
     assert_eq!(two_assert_smt, "(> (* (- s1_f2 1) 2) (- 5))");
 
     assert!(expr_to_smt_slot_scoped(
@@ -10340,13 +10280,7 @@ fn multi_slot_property_translators_cover_branchy_slot_and_two_slot_forms() {
             value: LitVal::Real { value: 1.5 },
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
     )
     .expect_err("unsupported two-slot literal")
     .contains("unsupported literal"));
@@ -10363,13 +10297,7 @@ fn multi_slot_property_translators_cover_branchy_slot_and_two_slot_forms() {
             }],
             span: None,
         },
-        &entity,
-        &vctx,
-        "lhs",
-        0,
-        "rhs",
-        1,
-        2,
+        two_slot_ctx,
     )
     .expect_err("non-exhaustive two-slot match")
     .contains("non-exhaustive"));

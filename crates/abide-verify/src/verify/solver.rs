@@ -43,10 +43,16 @@ use cvc5_rs::{
 // ── Solver-independent result type ──────────────────────────────────
 
 /// Solver-independent satisfiability result.
+///
+/// `Unknown` carries the solver's reason string so timeout vs.
+/// undecidable can be distinguished downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SatResult {
+    /// Solver found a model.
     Sat,
+    /// Solver proved unsatisfiability.
     Unsat,
+    /// Solver did not conclude. Carries the solver's reason string.
     Unknown(String),
 }
 
@@ -345,7 +351,6 @@ fn with_z3_interrupt_after<R>(limits: SolverLimits, f: impl FnOnce() -> R) -> R 
 ///
 /// This trait does NOT need to be object-safe (`dyn SolverBackend`).
 /// All dispatch is compile-time via type aliases.
-#[allow(clippy::too_many_arguments)]
 pub trait SolverBackend {
     /// Which concrete backend family this implementation belongs to.
     fn family() -> SolverFamily;

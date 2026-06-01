@@ -29,7 +29,6 @@ pub(super) fn capitalize(s: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
     match e {
         E::EExpr::Lit(ty, lit, sp) => IRExpr::Lit {
@@ -37,24 +36,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             value: lower_lit(lit),
             span: *sp,
         },
-        E::EExpr::Var(ty, n, sp) => {
-            // Check if this is a constructor of an enum type
-            if let E::Ty::Enum(enum_name, ctors) = ty {
-                if ctors.contains(n) {
-                    return IRExpr::Ctor {
-                        enum_name: enum_name.clone(),
-                        ctor: n.clone(),
-                        args: vec![],
-                        span: *sp,
-                    };
-                }
-            }
-            IRExpr::Var {
-                name: n.clone(),
-                ty: lower_ty(ty, ctx),
-                span: *sp,
-            }
-        }
+        E::EExpr::Var(ty, n, sp) => lower_var_expr(ty, n, *sp, ctx),
         E::EExpr::Field(ty, expr, f, sp) => IRExpr::Field {
             expr: Box::new(lower_expr(expr, ctx)),
             field: f.clone(),
@@ -65,237 +47,20 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             expr: Box::new(lower_expr(expr, ctx)),
             span: *sp,
         },
-        E::EExpr::BinOp(ty, op, a, b, sp) => {
-            // Type-directed operator overloading: when both operands have
-            // Set type, override arithmetic ops to set ops. This is done HERE
-            // (not in the SMT layer) because the elaborated types distinguish
-            // Set<T> from Map<K,Bool> and Seq<Bool>, which are all Array<_,Bool>
-            // at the SMT level.
-            let resolved_op = match (op, a.ty(), b.ty()) {
-                (E::BinOp::Mul, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetIntersect".to_owned(),
-                (E::BinOp::Sub, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetDiff".to_owned(),
-                (E::BinOp::Le, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetSubset".to_owned(),
-                (E::BinOp::Add, E::Ty::Set(_), E::Ty::Set(_)) => "OpSetUnion".to_owned(),
-                (E::BinOp::Mul, E::Ty::Relation(_), E::Ty::Relation(_)) => {
-                    "OpSetIntersect".to_owned()
-                }
-                (E::BinOp::Sub, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetDiff".to_owned(),
-                (E::BinOp::Le, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetSubset".to_owned(),
-                (E::BinOp::Add, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetUnion".to_owned(),
-                _ => format!("{:?}", lower_binop(*op)),
-            };
-            IRExpr::BinOp {
-                op: resolved_op,
-                left: Box::new(lower_expr(a, ctx)),
-                right: Box::new(lower_expr(b, ctx)),
-                ty: lower_ty(ty, ctx),
-                span: *sp,
-            }
-        }
+        E::EExpr::BinOp(ty, op, a, b, sp) => lower_binop_expr(ty, *op, a, b, *sp, ctx),
         E::EExpr::UnOp(ty, op, expr, sp) => IRExpr::UnOp {
             op: format!("{:?}", lower_unop(*op)),
             operand: Box::new(lower_expr(expr, ctx)),
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::Call(ty, f, args, sp) => {
-            // Newtype constructor calls are transparent: UserId("x") → "x".
-            // The constructor is an identity function, so just lower the arg.
-            if args.len() == 1 {
-                if let E::EExpr::Var(_, name, _) = f.as_ref() {
-                    if ctx.newtypes.contains(name.as_str()) {
-                        return lower_expr(&args[0], ctx);
-                    }
-                }
-            }
-            let lowered_f = lower_expr(f, ctx);
-            let ir_ty = lower_ty(ty, ctx);
-            let outer_span = *sp;
-            args.iter().fold(lowered_f, |acc, arg| IRExpr::App {
-                func: Box::new(acc),
-                arg: Box::new(lower_expr(arg, ctx)),
-                ty: ir_ty.clone(),
-                span: outer_span,
-            })
-        }
-        E::EExpr::CallR(ty, f, refs, args, sp) => {
-            let lowered_f = lower_expr(f, ctx);
-            let ir_ty = lower_ty(ty, ctx);
-            let outer_span = *sp;
-            let with_refs = refs.iter().fold(lowered_f, |acc, r| IRExpr::App {
-                func: Box::new(acc),
-                arg: Box::new(lower_expr(r, ctx)),
-                ty: ir_ty.clone(),
-                span: outer_span,
-            });
-            args.iter().fold(with_refs, |acc, arg| IRExpr::App {
-                func: Box::new(acc),
-                arg: Box::new(lower_expr(arg, ctx)),
-                ty: ir_ty.clone(),
-                span: outer_span,
-            })
-        }
+        E::EExpr::Call(ty, f, args, sp) => lower_call_expr(ty, f, args, *sp, ctx),
+        E::EExpr::CallR(ty, f, refs, args, sp) => lower_call_ref_expr(ty, f, refs, args, *sp, ctx),
         E::EExpr::QualCall(ty, type_name, func_name, args, sp) => {
-            if type_name == "Rel" && func_name == "field" {
-                let lowered_store =
-                    args.first()
-                        .map(|arg| lower_expr(arg, ctx))
-                        .unwrap_or_else(|| IRExpr::Var {
-                            name: crate::messages::collection_op_unsupported_arity(
-                                type_name,
-                                func_name,
-                                args.len(),
-                            )
-                            .clone(),
-                            ty: lower_ty(ty, ctx),
-                            span: *sp,
-                        });
-                let selector_name = match args.get(1) {
-                    Some(E::EExpr::Qual(_, owner, field, _)) => format!("{owner}::{field}"),
-                    _ => crate::messages::collection_op_unsupported_arity(
-                        type_name,
-                        func_name,
-                        args.len(),
-                    )
-                    .clone(),
-                };
-                return IRExpr::BinOp {
-                    op: "OpRelationField".to_owned(),
-                    left: Box::new(lowered_store),
-                    right: Box::new(IRExpr::Var {
-                        name: selector_name,
-                        ty: IRType::String,
-                        span: *sp,
-                    }),
-                    ty: lower_ty(ty, ctx),
-                    span: *sp,
-                };
-            }
-            if type_name == "Rel" && func_name == "project" && args.len() >= 2 {
-                let relation = lower_expr(&args[0], ctx);
-                let columns = if args.len() == 2 {
-                    lower_expr(&args[1], ctx)
-                } else {
-                    let lowered_columns: Vec<IRExpr> =
-                        args[1..].iter().map(|arg| lower_expr(arg, ctx)).collect();
-                    let tuple_ty = IRType::Tuple {
-                        elements: vec![IRType::Int; lowered_columns.len()],
-                    };
-                    lowered_columns.into_iter().fold(
-                        IRExpr::Var {
-                            name: "Tuple".to_owned(),
-                            ty: tuple_ty.clone(),
-                            span: *sp,
-                        },
-                        |acc, arg| IRExpr::App {
-                            func: Box::new(acc),
-                            arg: Box::new(arg),
-                            ty: tuple_ty.clone(),
-                            span: *sp,
-                        },
-                    )
-                };
-                return IRExpr::BinOp {
-                    op: "OpRelProject".to_owned(),
-                    left: Box::new(relation),
-                    right: Box::new(columns),
-                    ty: lower_ty(ty, ctx),
-                    span: *sp,
-                };
-            }
-            let op = format!("Op{type_name}{}", capitalize(func_name));
-            let lowered_args: Vec<IRExpr> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-            match lowered_args.len() {
-                1 => IRExpr::UnOp {
-                    op,
-                    operand: Box::new(lowered_args.into_iter().next().unwrap()),
-                    ty: lower_ty(ty, ctx),
-                    span: *sp,
-                },
-                2 => {
-                    let mut iter = lowered_args.into_iter();
-                    IRExpr::BinOp {
-                        op,
-                        left: Box::new(iter.next().unwrap()),
-                        right: Box::new(iter.next().unwrap()),
-                        ty: lower_ty(ty, ctx),
-                        span: *sp,
-                    }
-                }
-                0 | 3.. => {
-                    // Emit the qualified call name as a Var so the verifier
-                    // reports a clear error rather than silently mislowering.
-                    IRExpr::Var {
-                        name: crate::messages::collection_op_unsupported_arity(
-                            type_name,
-                            func_name,
-                            lowered_args.len(),
-                        )
-                        .clone(),
-                        ty: lower_ty(ty, ctx),
-                        span: *sp,
-                    }
-                }
-            }
+            lower_qualified_call_expr(ty, type_name, func_name, args, *sp, ctx)
         }
-        E::EExpr::Qual(ty, s, n, sp) => {
-            if let E::Ty::Enum(enum_name, ctors) = ty {
-                if ctors.contains(n) {
-                    return IRExpr::Ctor {
-                        enum_name: enum_name.clone(),
-                        ctor: n.clone(),
-                        args: vec![],
-                        span: *sp,
-                    };
-                }
-            }
-            IRExpr::Var {
-                name: format!("{s}::{n}"),
-                ty: lower_ty(ty, ctx),
-                span: *sp,
-            }
-        }
-        E::EExpr::Quant(_, q, v, vty, body, sp) => {
-            let lowered = lower_expr(body, ctx);
-            let vt = lower_ty(vty, ctx);
-            match q {
-                E::Quantifier::All => IRExpr::Forall {
-                    var: v.clone(),
-                    domain: vt,
-                    body: Box::new(lowered),
-                    span: *sp,
-                },
-                E::Quantifier::Exists | E::Quantifier::Some => IRExpr::Exists {
-                    var: v.clone(),
-                    domain: vt,
-                    body: Box::new(lowered),
-                    span: *sp,
-                },
-                E::Quantifier::One => IRExpr::One {
-                    var: v.clone(),
-                    domain: vt,
-                    body: Box::new(lowered),
-                    span: *sp,
-                },
-                E::Quantifier::Lone => IRExpr::Lone {
-                    var: v.clone(),
-                    domain: vt,
-                    body: Box::new(lowered),
-                    span: *sp,
-                },
-                E::Quantifier::No => IRExpr::UnOp {
-                    op: "OpNot".to_owned(),
-                    operand: Box::new(IRExpr::Exists {
-                        var: v.clone(),
-                        domain: vt,
-                        body: Box::new(lowered),
-                        span: *sp,
-                    }),
-                    ty: IRType::Bool,
-                    span: *sp,
-                },
-            }
-        }
+        E::EExpr::Qual(ty, s, n, sp) => lower_qualified_expr(ty, s, n, *sp, ctx),
+        E::EExpr::Quant(_, q, v, vty, body, sp) => lower_quant_expr(*q, v, vty, body, *sp, ctx),
         E::EExpr::Always(_, expr, sp) => IRExpr::Always {
             body: Box::new(lower_expr(expr, ctx)),
             span: *sp,
@@ -357,58 +122,14 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::Let(binds, body, sp) => {
-            let bs = binds
-                .iter()
-                .map(|(n, mt, e)| LetBinding {
-                    name: n.clone(),
-                    ty: mt.as_ref().map_or(IRType::String, |t| lower_ty(t, ctx)),
-                    expr: lower_expr(e, ctx),
-                })
-                .collect();
-            IRExpr::Let {
-                bindings: bs,
-                body: Box::new(lower_expr(body, ctx)),
-                span: *sp,
-            }
-        }
-        E::EExpr::Lam(params, _mret, body, sp) => {
-            if params.is_empty() {
-                return lower_expr(body, ctx);
-            }
-            params
-                .iter()
-                .rev()
-                .fold(lower_expr(body, ctx), |acc, (pn, pt)| IRExpr::Lam {
-                    param: pn.clone(),
-                    param_type: lower_ty(pt, ctx),
-                    body: Box::new(acc),
-                    span: *sp,
-                })
-        }
+        E::EExpr::Let(binds, body, sp) => lower_let_expr(binds, body, *sp, ctx),
+        E::EExpr::Lam(params, _mret, body, sp) => lower_lambda_expr(params, body, *sp, ctx),
         E::EExpr::Unresolved(n, sp) => IRExpr::Var {
             name: n.clone(),
             ty: IRType::String,
             span: *sp,
         },
-        E::EExpr::TupleLit(ty, es, sp) => {
-            let lowered: Vec<IRExpr> = es.iter().map(|e| lower_expr(e, ctx)).collect();
-            let tuple_ty = lower_ty(ty, ctx);
-            let outer_span = *sp;
-            lowered.into_iter().fold(
-                IRExpr::Var {
-                    name: "Tuple".to_owned(),
-                    ty: tuple_ty.clone(),
-                    span: outer_span,
-                },
-                |acc, arg| IRExpr::App {
-                    func: Box::new(acc),
-                    arg: Box::new(arg),
-                    ty: tuple_ty.clone(),
-                    span: outer_span,
-                },
-            )
-        }
+        E::EExpr::TupleLit(ty, es, sp) => lower_tuple_lit_expr(ty, es, *sp, ctx),
         E::EExpr::In(_ty, e, s, sp) => {
             // `e in S` → `Index(S, e)` which returns Bool (Set<T> = Array<T, Bool>)
             IRExpr::Index {
@@ -428,21 +149,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::Match(scrutinee, arms, sp) => {
-            let scrut_ty = scrutinee.ty();
-            IRExpr::Match {
-                scrutinee: Box::new(lower_expr(scrutinee, ctx)),
-                arms: arms
-                    .iter()
-                    .map(|(pat, guard, body)| IRMatchArm {
-                        pattern: lower_pattern_for_scrutinee(pat, &scrut_ty),
-                        guard: guard.as_ref().map(|g| lower_expr(g, ctx)),
-                        body: lower_expr(body, ctx),
-                    })
-                    .collect(),
-                span: *sp,
-            }
-        }
+        E::EExpr::Match(scrutinee, arms, sp) => lower_match_expr(scrutinee, arms, *sp, ctx),
         E::EExpr::Choose(ty, binder, domain_ty, predicate, sp) => IRExpr::Choose {
             var: binder.clone(),
             domain: lower_ty(domain_ty, ctx),
@@ -465,34 +172,21 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             ty: lower_ty(ty, ctx),
             span: *sp,
         },
-        E::EExpr::SetComp(ty, proj, var, domain, source, filter, sp) => IRExpr::SetComp {
-            var: var.clone(),
-            domain: lower_ty(domain, ctx),
-            source: source
-                .as_ref()
-                .map(|source| Box::new(lower_expr(source, ctx))),
-            filter: Box::new(lower_expr(filter, ctx)),
-            projection: proj.as_ref().map(|p| Box::new(lower_expr(p, ctx))),
-            ty: lower_ty(ty, ctx),
-            span: *sp,
-        },
-        E::EExpr::RelComp(ty, projection, bindings, filter, sp) => IRExpr::RelComp {
-            projection: Box::new(lower_expr(projection, ctx)),
-            bindings: bindings
-                .iter()
-                .map(|binding| IRRelCompBinding {
-                    var: binding.var.clone(),
-                    domain: lower_ty(&binding.domain, ctx),
-                    source: binding
-                        .source
-                        .as_ref()
-                        .map(|source| Box::new(lower_expr(source, ctx))),
-                })
-                .collect(),
-            filter: Box::new(lower_expr(filter, ctx)),
-            ty: lower_ty(ty, ctx),
-            span: *sp,
-        },
+        E::EExpr::SetComp(ty, proj, var, domain, source, filter, sp) => lower_set_comp_expr(
+            SetCompLowering {
+                ty,
+                projection: proj,
+                var,
+                domain,
+                source,
+                filter,
+                span: *sp,
+            },
+            ctx,
+        ),
+        E::EExpr::RelComp(ty, projection, bindings, filter, sp) => {
+            lower_rel_comp_expr(ty, projection, bindings, filter, *sp, ctx)
+        }
         E::EExpr::SetLit(ty, elems, sp) => IRExpr::SetLit {
             elements: elems.iter().map(|e| lower_expr(e, ctx)).collect(),
             ty: lower_ty(ty, ctx),
@@ -526,14 +220,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             span: *sp,
         },
         E::EExpr::While(cond, contracts, body, sp) => {
-            let (invariants, decreases) = lower_while_contracts(contracts, ctx);
-            IRExpr::While {
-                cond: Box::new(lower_expr(cond, ctx)),
-                invariants,
-                decreases,
-                body: Box::new(lower_expr(body, ctx)),
-                span: *sp,
-            }
+            lower_while_expr(cond, contracts, body, *sp, ctx)
         }
         E::EExpr::IfElse(cond, then_body, else_body, sp) => IRExpr::IfElse {
             cond: Box::new(lower_expr(cond, ctx)),
@@ -543,63 +230,11 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
         },
         // / — arithmetic aggregators.
         E::EExpr::Aggregate(_, kind, var, domain, body, in_filter, sp) => {
-            let ir_kind = match kind {
-                crate::ast::AggKind::Sum => IRAggKind::Sum,
-                crate::ast::AggKind::Product => IRAggKind::Product,
-                crate::ast::AggKind::Min => IRAggKind::Min,
-                crate::ast::AggKind::Max => IRAggKind::Max,
-                crate::ast::AggKind::Count => IRAggKind::Count,
-            };
-            IRExpr::Aggregate {
-                kind: ir_kind,
-                var: var.clone(),
-                domain: lower_ty(domain, ctx),
-                body: Box::new(lower_expr(body, ctx)),
-                in_filter: in_filter.as_ref().map(|f| Box::new(lower_expr(f, ctx))),
-                span: *sp,
-            }
+            lower_aggregate_expr(*kind, var, domain, body, in_filter, *sp, ctx)
         }
-        // / — saw operator.
-        E::EExpr::Saw(_, sys, evt, args, sp) => IRExpr::Saw {
-            system_name: sys.clone(),
-            event_name: evt.clone(),
-            args: args
-                .iter()
-                .map(|a| a.as_ref().map(|e| Box::new(lower_expr(e, ctx))))
-                .collect(),
-            span: *sp,
-        },
+        E::EExpr::Saw(_, sys, evt, args, sp) => lower_saw_expr(sys, evt, args, *sp, ctx),
         E::EExpr::CtorRecord(ty, qual, ctor_name, fields, sp) => {
-            // Determine the enum name from the qualifier or the resolved type
-            let enum_name = if let Some(q) = qual {
-                q.clone()
-            } else if let E::Ty::Enum(en, _) = ty {
-                en.clone()
-            } else {
-                // Search through known enum types for this constructor name
-                ctx.variants
-                    .keys()
-                    .find(|ename| {
-                        ctx.variants.get(*ename).is_some_and(|variants| {
-                            variants.iter().any(|v| match v {
-                                E::EVariant::Simple(n)
-                                | E::EVariant::Record(n, _)
-                                | E::EVariant::Param(n, _) => n == ctor_name,
-                            })
-                        })
-                    })
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            IRExpr::Ctor {
-                enum_name,
-                ctor: ctor_name.clone(),
-                args: fields
-                    .iter()
-                    .map(|(fname, fexpr)| (fname.clone(), lower_expr(fexpr, ctx)))
-                    .collect(),
-                span: *sp,
-            }
+            lower_ctor_record_expr(ty, qual.as_deref(), ctor_name, fields, *sp, ctx)
         }
         E::EExpr::StructCtor(_, name, _, sp) => {
             // StructCtor should only appear in system field defaults, where
@@ -611,6 +246,585 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             )
         }
     }
+}
+
+fn lower_var_expr(
+    ty: &E::Ty,
+    name: &str,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if enum_constructors(ty).is_some_and(|ctors| ctors.iter().any(|ctor| ctor == name)) {
+        let E::Ty::Enum(enum_name, _) = ty else {
+            unreachable!("constructor lookup only succeeds for enum types");
+        };
+        return IRExpr::Ctor {
+            enum_name: enum_name.clone(),
+            ctor: name.to_owned(),
+            args: vec![],
+            span,
+        };
+    }
+    IRExpr::Var {
+        name: name.to_owned(),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn enum_constructors(ty: &E::Ty) -> Option<&[String]> {
+    match ty {
+        E::Ty::Enum(_, ctors) => Some(ctors),
+        _ => None,
+    }
+}
+
+fn lower_binop_expr(
+    ty: &E::Ty,
+    op: E::BinOp,
+    left: &E::EExpr,
+    right: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::BinOp {
+        op: resolved_binop_name(op, left.ty(), right.ty()),
+        left: Box::new(lower_expr(left, ctx)),
+        right: Box::new(lower_expr(right, ctx)),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn resolved_binop_name(op: E::BinOp, left_ty: E::Ty, right_ty: E::Ty) -> String {
+    match (op, left_ty, right_ty) {
+        (E::BinOp::Mul, E::Ty::Set(_), E::Ty::Set(_))
+        | (E::BinOp::Mul, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetIntersect".to_owned(),
+        (E::BinOp::Sub, E::Ty::Set(_), E::Ty::Set(_))
+        | (E::BinOp::Sub, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetDiff".to_owned(),
+        (E::BinOp::Le, E::Ty::Set(_), E::Ty::Set(_))
+        | (E::BinOp::Le, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetSubset".to_owned(),
+        (E::BinOp::Add, E::Ty::Set(_), E::Ty::Set(_))
+        | (E::BinOp::Add, E::Ty::Relation(_), E::Ty::Relation(_)) => "OpSetUnion".to_owned(),
+        _ => format!("{:?}", lower_binop(op)),
+    }
+}
+
+fn lower_call_expr(
+    ty: &E::Ty,
+    func: &E::EExpr,
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if let Some(arg) = transparent_newtype_arg(func, args, ctx) {
+        return lower_expr(arg, ctx);
+    }
+    apply_args(lower_expr(func, ctx), args, lower_ty(ty, ctx), span, ctx)
+}
+
+fn transparent_newtype_arg<'a>(
+    func: &E::EExpr,
+    args: &'a [E::EExpr],
+    ctx: &LowerCtx<'_>,
+) -> Option<&'a E::EExpr> {
+    let [arg] = args else {
+        return None;
+    };
+    match func {
+        E::EExpr::Var(_, name, _) if ctx.newtypes.contains(name.as_str()) => Some(arg),
+        _ => None,
+    }
+}
+
+fn lower_call_ref_expr(
+    ty: &E::Ty,
+    func: &E::EExpr,
+    refs: &[E::EExpr],
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let ir_ty = lower_ty(ty, ctx);
+    let with_refs = apply_args(lower_expr(func, ctx), refs, ir_ty.clone(), span, ctx);
+    apply_args(with_refs, args, ir_ty, span, ctx)
+}
+
+fn apply_args(
+    base: IRExpr,
+    args: &[E::EExpr],
+    ty: IRType,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    args.iter().fold(base, |acc, arg| IRExpr::App {
+        func: Box::new(acc),
+        arg: Box::new(lower_expr(arg, ctx)),
+        ty: ty.clone(),
+        span,
+    })
+}
+
+fn lower_qualified_call_expr(
+    ty: &E::Ty,
+    type_name: &str,
+    func_name: &str,
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if type_name == "Rel" && func_name == "field" {
+        return lower_relation_field_call(ty, type_name, func_name, args, span, ctx);
+    }
+    if type_name == "Rel" && func_name == "project" && args.len() >= 2 {
+        return lower_relation_project_call(ty, args, span, ctx);
+    }
+    lower_builtin_qualified_call(ty, type_name, func_name, args, span, ctx)
+}
+
+fn lower_relation_field_call(
+    ty: &E::Ty,
+    type_name: &str,
+    func_name: &str,
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let unsupported = || {
+        crate::messages::collection_op_unsupported_arity(type_name, func_name, args.len()).clone()
+    };
+    let lowered_store = args
+        .first()
+        .map(|arg| lower_expr(arg, ctx))
+        .unwrap_or_else(|| IRExpr::Var {
+            name: unsupported(),
+            ty: lower_ty(ty, ctx),
+            span,
+        });
+    let selector_name = match args.get(1) {
+        Some(E::EExpr::Qual(_, owner, field, _)) => format!("{owner}::{field}"),
+        _ => unsupported(),
+    };
+    IRExpr::BinOp {
+        op: "OpRelationField".to_owned(),
+        left: Box::new(lowered_store),
+        right: Box::new(IRExpr::Var {
+            name: selector_name,
+            ty: IRType::String,
+            span,
+        }),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn lower_relation_project_call(
+    ty: &E::Ty,
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::BinOp {
+        op: "OpRelProject".to_owned(),
+        left: Box::new(lower_expr(&args[0], ctx)),
+        right: Box::new(lower_relation_projection_columns(&args[1..], span, ctx)),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn lower_relation_projection_columns(
+    columns: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if let [column] = columns {
+        return lower_expr(column, ctx);
+    }
+    let lowered_columns: Vec<IRExpr> = columns.iter().map(|arg| lower_expr(arg, ctx)).collect();
+    let tuple_ty = IRType::Tuple {
+        elements: vec![IRType::Int; lowered_columns.len()],
+    };
+    lowered_columns.into_iter().fold(
+        IRExpr::Var {
+            name: "Tuple".to_owned(),
+            ty: tuple_ty.clone(),
+            span,
+        },
+        |acc, arg| IRExpr::App {
+            func: Box::new(acc),
+            arg: Box::new(arg),
+            ty: tuple_ty.clone(),
+            span,
+        },
+    )
+}
+
+fn lower_builtin_qualified_call(
+    ty: &E::Ty,
+    type_name: &str,
+    func_name: &str,
+    args: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let op = format!("Op{type_name}{}", capitalize(func_name));
+    let lowered_args: Vec<IRExpr> = args.iter().map(|arg| lower_expr(arg, ctx)).collect();
+    match lowered_args.as_slice() {
+        [_] => IRExpr::UnOp {
+            op,
+            operand: Box::new(lowered_args.into_iter().next().unwrap()),
+            ty: lower_ty(ty, ctx),
+            span,
+        },
+        [_, _] => {
+            let mut iter = lowered_args.into_iter();
+            IRExpr::BinOp {
+                op,
+                left: Box::new(iter.next().unwrap()),
+                right: Box::new(iter.next().unwrap()),
+                ty: lower_ty(ty, ctx),
+                span,
+            }
+        }
+        [] | [_, _, ..] => IRExpr::Var {
+            name: crate::messages::collection_op_unsupported_arity(
+                type_name,
+                func_name,
+                lowered_args.len(),
+            )
+            .clone(),
+            ty: lower_ty(ty, ctx),
+            span,
+        },
+    }
+}
+
+fn lower_qualified_expr(
+    ty: &E::Ty,
+    scope: &str,
+    name: &str,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if enum_constructors(ty).is_some_and(|ctors| ctors.iter().any(|ctor| ctor == name)) {
+        let E::Ty::Enum(enum_name, _) = ty else {
+            unreachable!("constructor lookup only succeeds for enum types");
+        };
+        return IRExpr::Ctor {
+            enum_name: enum_name.clone(),
+            ctor: name.to_owned(),
+            args: vec![],
+            span,
+        };
+    }
+    IRExpr::Var {
+        name: format!("{scope}::{name}"),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn lower_quant_expr(
+    quantifier: E::Quantifier,
+    var: &str,
+    var_ty: &E::Ty,
+    body: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let lowered = lower_expr(body, ctx);
+    let domain = lower_ty(var_ty, ctx);
+    match quantifier {
+        E::Quantifier::All => IRExpr::Forall {
+            var: var.to_owned(),
+            domain,
+            body: Box::new(lowered),
+            span,
+        },
+        E::Quantifier::Exists | E::Quantifier::Some => IRExpr::Exists {
+            var: var.to_owned(),
+            domain,
+            body: Box::new(lowered),
+            span,
+        },
+        E::Quantifier::One => IRExpr::One {
+            var: var.to_owned(),
+            domain,
+            body: Box::new(lowered),
+            span,
+        },
+        E::Quantifier::Lone => IRExpr::Lone {
+            var: var.to_owned(),
+            domain,
+            body: Box::new(lowered),
+            span,
+        },
+        E::Quantifier::No => IRExpr::UnOp {
+            op: "OpNot".to_owned(),
+            operand: Box::new(IRExpr::Exists {
+                var: var.to_owned(),
+                domain,
+                body: Box::new(lowered),
+                span,
+            }),
+            ty: IRType::Bool,
+            span,
+        },
+    }
+}
+
+fn lower_let_expr(
+    binds: &[(String, Option<E::Ty>, E::EExpr)],
+    body: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::Let {
+        bindings: binds
+            .iter()
+            .map(|(name, ty, expr)| LetBinding {
+                name: name.clone(),
+                ty: ty.as_ref().map_or(IRType::String, |ty| lower_ty(ty, ctx)),
+                expr: lower_expr(expr, ctx),
+            })
+            .collect(),
+        body: Box::new(lower_expr(body, ctx)),
+        span,
+    }
+}
+
+fn lower_lambda_expr(
+    params: &[(String, E::Ty)],
+    body: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    if params.is_empty() {
+        return lower_expr(body, ctx);
+    }
+    params
+        .iter()
+        .rev()
+        .fold(lower_expr(body, ctx), |acc, (param, ty)| IRExpr::Lam {
+            param: param.clone(),
+            param_type: lower_ty(ty, ctx),
+            body: Box::new(acc),
+            span,
+        })
+}
+
+fn lower_tuple_lit_expr(
+    ty: &E::Ty,
+    elements: &[E::EExpr],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let tuple_ty = lower_ty(ty, ctx);
+    let tuple_ctor = IRExpr::Var {
+        name: "Tuple".to_owned(),
+        ty: tuple_ty.clone(),
+        span,
+    };
+    elements
+        .iter()
+        .map(|element| lower_expr(element, ctx))
+        .fold(tuple_ctor, |acc, arg| IRExpr::App {
+            func: Box::new(acc),
+            arg: Box::new(arg),
+            ty: tuple_ty.clone(),
+            span,
+        })
+}
+
+fn lower_match_expr(
+    scrutinee: &E::EExpr,
+    arms: &[(E::EPattern, Option<E::EExpr>, E::EExpr)],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let scrutinee_ty = scrutinee.ty();
+    IRExpr::Match {
+        scrutinee: Box::new(lower_expr(scrutinee, ctx)),
+        arms: arms
+            .iter()
+            .map(|(pat, guard, body)| IRMatchArm {
+                pattern: lower_pattern_for_scrutinee(pat, &scrutinee_ty),
+                guard: guard.as_ref().map(|guard| lower_expr(guard, ctx)),
+                body: lower_expr(body, ctx),
+            })
+            .collect(),
+        span,
+    }
+}
+
+struct SetCompLowering<'a> {
+    ty: &'a E::Ty,
+    projection: &'a Option<Box<E::EExpr>>,
+    var: &'a str,
+    domain: &'a E::Ty,
+    source: &'a Option<Box<E::EExpr>>,
+    filter: &'a E::EExpr,
+    span: Option<crate::span::Span>,
+}
+
+fn lower_set_comp_expr(input: SetCompLowering<'_>, ctx: &LowerCtx<'_>) -> IRExpr {
+    IRExpr::SetComp {
+        var: input.var.to_owned(),
+        domain: lower_ty(input.domain, ctx),
+        source: input
+            .source
+            .as_ref()
+            .map(|source| Box::new(lower_expr(source, ctx))),
+        filter: Box::new(lower_expr(input.filter, ctx)),
+        projection: input
+            .projection
+            .as_ref()
+            .map(|projection| Box::new(lower_expr(projection, ctx))),
+        ty: lower_ty(input.ty, ctx),
+        span: input.span,
+    }
+}
+
+fn lower_rel_comp_expr(
+    ty: &E::Ty,
+    projection: &E::EExpr,
+    bindings: &[E::ERelCompBinding],
+    filter: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::RelComp {
+        projection: Box::new(lower_expr(projection, ctx)),
+        bindings: bindings
+            .iter()
+            .map(|binding| IRRelCompBinding {
+                var: binding.var.clone(),
+                domain: lower_ty(&binding.domain, ctx),
+                source: binding
+                    .source
+                    .as_ref()
+                    .map(|source| Box::new(lower_expr(source, ctx))),
+            })
+            .collect(),
+        filter: Box::new(lower_expr(filter, ctx)),
+        ty: lower_ty(ty, ctx),
+        span,
+    }
+}
+
+fn lower_while_expr(
+    cond: &E::EExpr,
+    contracts: &[E::EContract],
+    body: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let (invariants, decreases) = lower_while_contracts(contracts, ctx);
+    IRExpr::While {
+        cond: Box::new(lower_expr(cond, ctx)),
+        invariants,
+        decreases,
+        body: Box::new(lower_expr(body, ctx)),
+        span,
+    }
+}
+
+fn lower_aggregate_expr(
+    kind: crate::ast::AggKind,
+    var: &str,
+    domain: &E::Ty,
+    body: &E::EExpr,
+    in_filter: &Option<Box<E::EExpr>>,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::Aggregate {
+        kind: lower_agg_kind(kind),
+        var: var.to_owned(),
+        domain: lower_ty(domain, ctx),
+        body: Box::new(lower_expr(body, ctx)),
+        in_filter: in_filter
+            .as_ref()
+            .map(|filter| Box::new(lower_expr(filter, ctx))),
+        span,
+    }
+}
+
+fn lower_agg_kind(kind: crate::ast::AggKind) -> IRAggKind {
+    match kind {
+        crate::ast::AggKind::Sum => IRAggKind::Sum,
+        crate::ast::AggKind::Product => IRAggKind::Product,
+        crate::ast::AggKind::Min => IRAggKind::Min,
+        crate::ast::AggKind::Max => IRAggKind::Max,
+        crate::ast::AggKind::Count => IRAggKind::Count,
+    }
+}
+
+fn lower_saw_expr(
+    system_name: &str,
+    event_name: &str,
+    args: &[Option<Box<E::EExpr>>],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::Saw {
+        system_name: system_name.to_owned(),
+        event_name: event_name.to_owned(),
+        args: args
+            .iter()
+            .map(|arg| arg.as_ref().map(|expr| Box::new(lower_expr(expr, ctx))))
+            .collect(),
+        span,
+    }
+}
+
+fn lower_ctor_record_expr(
+    ty: &E::Ty,
+    qualifier: Option<&str>,
+    ctor_name: &str,
+    fields: &[(String, E::EExpr)],
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    IRExpr::Ctor {
+        enum_name: resolve_ctor_record_enum_name(ty, qualifier, ctor_name, ctx),
+        ctor: ctor_name.to_owned(),
+        args: fields
+            .iter()
+            .map(|(field, expr)| (field.clone(), lower_expr(expr, ctx)))
+            .collect(),
+        span,
+    }
+}
+
+fn resolve_ctor_record_enum_name(
+    ty: &E::Ty,
+    qualifier: Option<&str>,
+    ctor_name: &str,
+    ctx: &LowerCtx<'_>,
+) -> String {
+    if let Some(qualifier) = qualifier {
+        return qualifier.to_owned();
+    }
+    if let E::Ty::Enum(enum_name, _) = ty {
+        return enum_name.clone();
+    }
+    ctx.variants
+        .keys()
+        .find(|enum_name| variant_list_contains_ctor(ctx, enum_name, ctor_name))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn variant_list_contains_ctor(ctx: &LowerCtx<'_>, enum_name: &str, ctor_name: &str) -> bool {
+    ctx.variants.get(enum_name).is_some_and(|variants| {
+        variants.iter().any(|variant| match variant {
+            E::EVariant::Simple(name)
+            | E::EVariant::Record(name, _)
+            | E::EVariant::Param(name, _) => name == ctor_name,
+        })
+    })
 }
 
 pub(super) fn lower_pattern(pat: &E::EPattern) -> IRPattern {

@@ -26,7 +26,7 @@ mod liveness;
 mod multi_slot;
 mod system;
 mod trace;
-pub use self::liveness::try_ic3_liveness;
+pub use self::liveness::{try_ic3_liveness, Ic3LivenessInput, LivenessMonitorInput};
 use self::multi_slot::*;
 use self::system::*;
 use self::trace::*;

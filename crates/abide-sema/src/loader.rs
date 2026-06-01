@@ -11,8 +11,17 @@ use abide_core::diagnostic::Diagnostic;
 use crate::elab::collect;
 use crate::elab::env::Env;
 
+/// Source-file abstraction used by the loader.
+///
+/// Default implementation reads from the filesystem; the LSP supplies
+/// an alternative that serves open-editor buffers instead so unsaved
+/// edits drive elaboration.
 pub trait SourceProvider {
+    /// Resolves `path` to a canonical absolute path; the loader uses
+    /// this output as the cycle-detection key.
     fn canonicalize(&mut self, path: &Path) -> Result<PathBuf, String>;
+    /// Reads the contents of `path` into a string. Errors are returned
+    /// as plain strings — the loader wraps them in [`LoadError`]s.
     fn read_to_string(&mut self, path: &Path) -> Result<String, String>;
 }
 
@@ -92,7 +101,6 @@ pub fn load_files_with_provider<P: SourceProvider>(
 /// detection). `visited` tracks all files ever loaded (for diamond dedup).
 /// A cycle is a back-edge in the include stack; a diamond is the same file
 /// reached via different paths — only cycles are errors.
-#[allow(clippy::too_many_lines)]
 fn load_file_into(
     provider: &mut impl SourceProvider,
     env: &mut Env,
@@ -115,7 +123,6 @@ fn load_file_into(
 
 /// Inner logic for `load_file_into`, separated so the caller can
 /// guarantee push/pop around every exit path.
-#[allow(clippy::too_many_lines)]
 fn load_file_inner(
     provider: &mut impl SourceProvider,
     env: &mut Env,
@@ -124,6 +131,36 @@ fn load_file_inner(
     include_stack: &mut Vec<PathBuf>,
     parent_module: Option<&str>,
 ) -> Result<(), LoadError> {
+    let (program, parse_error) = read_program(provider, path)?;
+    let file_scope = enter_file_scope(env, path, parent_module);
+    let errors_before = env.errors.len();
+
+    collect::collect_into(env, &program);
+    tag_file_errors(env, errors_before, path);
+
+    let file_module = env.module_name.clone();
+    restore_file_scope(env, file_scope);
+    load_includes(
+        provider,
+        env,
+        path,
+        visited,
+        include_stack,
+        &program,
+        file_module.as_deref(),
+    );
+
+    if let Some(err) = parse_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_program(
+    provider: &mut impl SourceProvider,
+    path: &Path,
+) -> Result<(crate::ast::Program, Option<LoadError>), LoadError> {
     let src = provider
         .read_to_string(path)
         .map_err(|error| LoadError::Io {
@@ -142,118 +179,143 @@ fn load_file_inner(
         path: path.to_owned(),
         errors: parse_errors,
     });
+    Ok((program, parse_error))
+}
 
-    // Scope module context per-file: each file gets its own module context
-    // so declarations are tagged correctly.
+struct FileScope {
+    saved_module: Option<String>,
+    saved_file: Option<String>,
+}
+
+fn enter_file_scope(env: &mut Env, path: &Path, parent_module: Option<&str>) -> FileScope {
     let saved_module = env.module_name.take();
-
-    // If this file is included and the parent has a module, pre-set it
-    // so declarations without their own `module` decl inherit the parent's.
-    // Mark as inherited so the collector allows the file's own `module`
-    // declaration to override it without "conflicting module" error.
-    if let Some(pm) = parent_module {
-        env.module_name = Some(pm.to_string());
+    if let Some(parent) = parent_module {
+        env.module_name = Some(parent.to_string());
         env.module_inherited = true;
     }
 
     let saved_file = env.current_file.take();
     env.current_file = Some(path.display().to_string());
+    FileScope {
+        saved_module,
+        saved_file,
+    }
+}
 
-    let errors_before = env.errors.len();
-    collect::collect_into(env, &program);
-
-    // Tag any new errors from this file's collection with the file path.
+fn tag_file_errors(env: &mut Env, errors_before: usize, path: &Path) {
     let file_str = path.display().to_string();
     for err in &mut env.errors[errors_before..] {
         if err.file.is_none() {
             err.file = Some(file_str.clone());
         }
     }
+}
 
-    // This file's effective module (either from its own `module` decl or inherited)
-    let file_module = env.module_name.clone();
-
-    // Restore the previous module/file context.
-    // For the first file (saved=None), keep the file's module/file as the root.
-    // For subsequent files, restore so each file gets its own scope.
-    if saved_module.is_some() {
-        env.module_name = saved_module;
+fn restore_file_scope(env: &mut Env, scope: FileScope) {
+    if scope.saved_module.is_some() {
+        env.module_name = scope.saved_module;
         env.module_inherited = false;
     }
-    // else: keep file_module (first file sets the root module)
-    if saved_file.is_some() {
-        env.current_file = saved_file;
+    if scope.saved_file.is_some() {
+        env.current_file = scope.saved_file;
     }
-    // else: keep current_file (first file sets the root file for resolve/check tagging)
+}
 
-    // Process include directives: resolve paths relative to this file's directory.
-    // Included files inherit this file's module (: "contents become part
-    // of current module").
+fn load_includes(
+    provider: &mut impl SourceProvider,
+    env: &mut Env,
+    path: &Path,
+    visited: &mut HashSet<PathBuf>,
+    include_stack: &mut Vec<PathBuf>,
+    program: &crate::ast::Program,
+    file_module: Option<&str>,
+) {
     let base_dir = path.parent().unwrap_or(Path::new("."));
-    let include_paths: Vec<String> = program
-        .decls
-        .iter()
-        .filter_map(|d| {
-            if let crate::ast::TopDecl::Include(inc) = d {
-                Some(inc.path.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    for include_path in include_paths(program) {
+        load_include(
+            provider,
+            env,
+            visited,
+            include_stack,
+            file_module,
+            &base_dir.join(&include_path),
+            &include_path,
+        );
+    }
+}
 
-    for inc_path in &include_paths {
-        let resolved = base_dir.join(inc_path);
-        match canonicalize(provider, &resolved) {
-            Ok(canonical) => {
-                // Check for circular include: if the canonical path is already
-                // on the include stack, we have a cycle (A → B → A).
-                // This is distinct from diamond dedup (visited set) — diamonds
-                // are fine, cycles are errors.
-                if include_stack.contains(&canonical) {
-                    let mut chain: Vec<PathBuf> = include_stack
-                        .iter()
-                        .skip_while(|p| **p != canonical)
-                        .cloned()
-                        .collect();
-                    chain.push(canonical);
-                    env.include_load_errors
-                        .push(LoadError::CircularInclude { chain });
-                    continue;
-                }
-                if visited.contains(&canonical) {
-                    continue;
-                }
-                // Included files inherit this file's module.
-                // Don't short-circuit on error — continue processing sibling includes.
-                if let Err(e) = load_file_into(
-                    provider,
-                    env,
-                    &canonical,
-                    visited,
-                    include_stack,
-                    file_module.as_deref(),
-                ) {
-                    // Preserve all include load errors as structured LoadError
-                    // for miette rendering (parse, lex, and IO errors alike).
-                    env.include_load_errors.push(e);
-                }
-            }
-            Err(_) => {
-                // File not found — create a structured Io error
-                env.include_load_errors.push(LoadError::Io {
-                    path: resolved,
-                    error: format!("include file not found: '{inc_path}'"),
-                });
-            }
+fn include_paths(program: &crate::ast::Program) -> impl Iterator<Item = String> + '_ {
+    program.decls.iter().filter_map(|decl| {
+        if let crate::ast::TopDecl::Include(include) = decl {
+            Some(include.path.clone())
+        } else {
+            None
         }
-    }
+    })
+}
 
-    if let Some(err) = parse_error {
-        Err(err)
-    } else {
-        Ok(())
+fn load_include(
+    provider: &mut impl SourceProvider,
+    env: &mut Env,
+    visited: &mut HashSet<PathBuf>,
+    include_stack: &mut Vec<PathBuf>,
+    file_module: Option<&str>,
+    resolved: &Path,
+    include_path: &str,
+) {
+    match canonicalize(provider, resolved) {
+        Ok(canonical) => load_canonical_include(
+            provider,
+            env,
+            visited,
+            include_stack,
+            file_module,
+            canonical,
+        ),
+        Err(_) => env.include_load_errors.push(LoadError::Io {
+            path: resolved.to_owned(),
+            error: format!("include file not found: '{include_path}'"),
+        }),
     }
+}
+
+fn load_canonical_include(
+    provider: &mut impl SourceProvider,
+    env: &mut Env,
+    visited: &mut HashSet<PathBuf>,
+    include_stack: &mut Vec<PathBuf>,
+    file_module: Option<&str>,
+    canonical: PathBuf,
+) {
+    if include_stack.contains(&canonical) {
+        env.include_load_errors.push(LoadError::CircularInclude {
+            chain: cycle_chain(include_stack, canonical),
+        });
+        return;
+    }
+    if visited.contains(&canonical) {
+        return;
+    }
+    if let Err(error) = load_file_into(
+        provider,
+        env,
+        &canonical,
+        visited,
+        include_stack,
+        file_module,
+    ) {
+        env.include_load_errors.push(error);
+    }
+}
+
+fn cycle_chain(include_stack: &[PathBuf], canonical: PathBuf) -> Vec<PathBuf> {
+    let mut chain: Vec<PathBuf> = include_stack
+        .iter()
+        .skip_while(|path| **path != canonical)
+        .cloned()
+        .collect();
+    chain.push(canonical);
+    chain
 }
 
 fn canonicalize(provider: &mut impl SourceProvider, path: &Path) -> Result<PathBuf, LoadError> {

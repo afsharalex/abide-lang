@@ -1,5 +1,20 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SystemSlotCtx<'a> {
+    pub(in crate::verify::ic3) entity: &'a IREntity,
+    pub(in crate::verify::ic3) ent_name: &'a str,
+    pub(in crate::verify::ic3) slot: usize,
+    pub(in crate::verify::ic3) var: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::verify::ic3) struct Ic3SystemTwoSlotCtx<'a> {
+    pub(in crate::verify::ic3) left: Ic3SystemSlotCtx<'a>,
+    pub(in crate::verify::ic3) right: Ic3SystemSlotCtx<'a>,
+    pub(in crate::verify::ic3) vctx: &'a VerifyContext,
+}
+
 pub(in crate::verify::ic3) fn expr_to_smt_sys(
     expr: &IRExpr,
     entity: &IREntity,
@@ -36,7 +51,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| {
+            |predicate: &IRExpr, scope: &HashSet<String>| {
                 guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
             },
         )?;
@@ -52,21 +67,33 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| expr_to_smt_sys_scoped(term, entity, vctx, ent_name, slot, scope),
-            |predicate, scope| {
-                guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    expr_to_smt_sys_scoped(term, entity, vctx, ent_name, slot, scope)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut =
+                        expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut =
+                        expr_to_smt_sys_scoped(scrutinee, entity, vctx, ent_name, slot, scope)?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -75,7 +102,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| {
+                |predicate: &IRExpr, scope: &HashSet<String>| {
                     guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
                 },
                 rest_smt,
@@ -87,7 +114,7 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| {
+            |predicate: &IRExpr, scope: &HashSet<String>| {
                 guard_to_smt_sys_scoped(predicate, entity, vctx, ent_name, slot, scope)
             },
             rest_smt.clone(),
@@ -490,63 +517,25 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_scoped(
 }
 
 /// Encode a guard with two entity-slot bindings for inter-entity system properties.
-#[allow(
-    dead_code,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::similar_names
-)]
+#[allow(dead_code, clippy::similar_names)]
 pub(in crate::verify::ic3) fn guard_to_smt_sys_two(
     expr: &IRExpr,
-    entity1: &IREntity,
-    entity2: &IREntity,
-    vctx: &VerifyContext,
-    ent1_name: &str,
-    slot1: usize,
-    var1: &str,
-    ent2_name: &str,
-    slot2: usize,
-    var2: &str,
+    ctx: Ic3SystemTwoSlotCtx<'_>,
 ) -> Result<String, String> {
-    guard_to_smt_sys_two_scoped(
-        expr,
-        entity1,
-        entity2,
-        vctx,
-        ent1_name,
-        slot1,
-        var1,
-        ent2_name,
-        slot2,
-        var2,
-        &HashSet::new(),
-    )
+    guard_to_smt_sys_two_scoped(expr, ctx, &HashSet::new())
 }
 
-#[allow(
-    dead_code,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::similar_names
-)]
+#[allow(dead_code, clippy::similar_names)]
 pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
     bindings: &[crate::ir::types::LetBinding],
     body: &IRExpr,
-    entity1: &IREntity,
-    entity2: &IREntity,
-    vctx: &VerifyContext,
-    ent1_name: &str,
-    slot1: usize,
-    var1: &str,
-    ent2_name: &str,
-    slot2: usize,
-    var2: &str,
+    ctx: Ic3SystemTwoSlotCtx<'_>,
     locals: &HashSet<String>,
 ) -> Result<String, String> {
+    let vctx = ctx.vctx;
+
     let Some((binding, rest)) = bindings.split_first() else {
-        return guard_to_smt_sys_two_scoped(
-            body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2, locals,
-        );
+        return guard_to_smt_sys_two_scoped(body, ctx, locals);
     };
 
     if let IRExpr::Choose {
@@ -562,20 +551,14 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
             predicate.as_deref(),
             vctx,
             locals,
-            |predicate, scope| {
-                guard_to_smt_sys_two_scoped(
-                    predicate, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, scope,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_sys_two_scoped(predicate, ctx, scope)
             },
         )?;
 
         let mut scope = locals.clone();
         scope.insert(binding.name.clone());
-        let rest_smt = guard_let_to_smt_sys_two_scoped(
-            rest, body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-            &scope,
-        )?;
+        let rest_smt = guard_let_to_smt_sys_two_scoped(rest, body, ctx, &scope)?;
         if let Some((exists, witness)) = finite {
             return Ok(format!(
                 "(and {exists} (let (({} {})) {}))",
@@ -583,35 +566,31 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
             ));
         }
         if let Some(witness) = ic3_direct_choose_witness(
-            var,
-            domain,
-            predicate.as_deref(),
-            locals,
-            |term, scope| {
-                guard_to_smt_sys_two_scoped(
-                    term, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    scope,
-                )
+            Ic3DirectChooseInput {
+                var,
+                domain,
+                predicate: predicate.as_deref(),
+                locals,
             },
-            |predicate, scope| {
-                guard_to_smt_sys_two_scoped(
-                    predicate, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, scope,
-                )
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = guard_to_smt_sys_two_scoped(
-                    scrutinee, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, scope,
-                )?;
-                ic3_match_pattern_bindings(&scrut, pattern, vctx)
-            },
-            |scrutinee, pattern, scope| {
-                let scrut = guard_to_smt_sys_two_scoped(
-                    scrutinee, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, scope,
-                )?;
-                ic3_match_pattern_cond(&scrut, pattern, vctx)
+            Ic3DirectChooseHooks {
+                encode_term: |term: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_two_scoped(term, ctx, scope)
+                },
+                encode_predicate: |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_two_scoped(predicate, ctx, scope)
+                },
+                match_bindings: |scrutinee: &IRExpr,
+                                 pattern: &crate::ir::types::IRPattern,
+                                 scope: &HashSet<String>| {
+                    let scrut = guard_to_smt_sys_two_scoped(scrutinee, ctx, scope)?;
+                    ic3_match_pattern_bindings(&scrut, pattern, vctx)
+                },
+                match_cond: |scrutinee: &IRExpr,
+                             pattern: &crate::ir::types::IRPattern,
+                             scope: &HashSet<String>| {
+                    let scrut = guard_to_smt_sys_two_scoped(scrutinee, ctx, scope)?;
+                    ic3_match_pattern_cond(&scrut, pattern, vctx)
+                },
             },
         )? {
             return ic3_witness_binding_formula(
@@ -620,11 +599,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
                 witness,
                 predicate.as_deref(),
                 locals,
-                |predicate, scope| {
-                    guard_to_smt_sys_two_scoped(
-                        predicate, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name,
-                        slot2, var2, scope,
-                    )
+                |predicate: &IRExpr, scope: &HashSet<String>| {
+                    guard_to_smt_sys_two_scoped(predicate, ctx, scope)
                 },
                 rest_smt,
             );
@@ -635,11 +611,8 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
             domain,
             predicate.as_deref(),
             locals,
-            |predicate, scope| {
-                guard_to_smt_sys_two_scoped(
-                    predicate, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, scope,
-                )
+            |predicate: &IRExpr, scope: &HashSet<String>| {
+                guard_to_smt_sys_two_scoped(predicate, ctx, scope)
             },
             rest_smt.clone(),
         )? {
@@ -648,46 +621,29 @@ pub(in crate::verify::ic3) fn guard_let_to_smt_sys_two_scoped(
         return Err("choose is not yet supported in IC3 CHC encoding for this domain".to_owned());
     }
 
-    let rhs = guard_to_smt_sys_two_scoped(
-        &binding.expr,
-        entity1,
-        entity2,
-        vctx,
-        ent1_name,
-        slot1,
-        var1,
-        ent2_name,
-        slot2,
-        var2,
-        locals,
-    )?;
+    let rhs = guard_to_smt_sys_two_scoped(&binding.expr, ctx, locals)?;
     let mut scope = locals.clone();
     scope.insert(binding.name.clone());
-    let rest_smt = guard_let_to_smt_sys_two_scoped(
-        rest, body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2, &scope,
-    )?;
+    let rest_smt = guard_let_to_smt_sys_two_scoped(rest, body, ctx, &scope)?;
     Ok(format!("(let (({} {})) {})", binding.name, rhs, rest_smt))
 }
 
-#[allow(
-    dead_code,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::similar_names
-)]
+#[allow(dead_code, clippy::similar_names)]
 pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
     expr: &IRExpr,
-    entity1: &IREntity,
-    entity2: &IREntity,
-    vctx: &VerifyContext,
-    ent1_name: &str,
-    slot1: usize,
-    var1: &str,
-    ent2_name: &str,
-    slot2: usize,
-    var2: &str,
+    ctx: Ic3SystemTwoSlotCtx<'_>,
     locals: &HashSet<String>,
 ) -> Result<String, String> {
+    let entity1 = ctx.left.entity;
+    let entity2 = ctx.right.entity;
+    let vctx = ctx.vctx;
+    let ent1_name = ctx.left.ent_name;
+    let slot1 = ctx.left.slot;
+    let var1 = ctx.left.var;
+    let ent2_name = ctx.right.ent_name;
+    let slot2 = ctx.right.slot;
+    let var2 = ctx.right.var;
+
     match expr {
         IRExpr::Lit {
             value: LitVal::Bool { value },
@@ -735,14 +691,8 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             op, left, right, ..
         } => match op.as_str() {
             "OpEq" | "OpNEq" | "OpLt" | "OpLe" | "OpGt" | "OpGe" => {
-                let l = guard_to_smt_sys_two_scoped(
-                    left, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
-                let r = guard_to_smt_sys_two_scoped(
-                    right, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
+                let l = guard_to_smt_sys_two_scoped(left, ctx, locals)?;
+                let r = guard_to_smt_sys_two_scoped(right, ctx, locals)?;
                 Ok(match op.as_str() {
                     "OpEq" => format!("(= {l} {r})"),
                     "OpNEq" => format!("(not (= {l} {r}))"),
@@ -754,37 +704,19 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
                 })
             }
             "OpAnd" => {
-                let l = guard_to_smt_sys_two_scoped(
-                    left, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
-                let r = guard_to_smt_sys_two_scoped(
-                    right, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
+                let l = guard_to_smt_sys_two_scoped(left, ctx, locals)?;
+                let r = guard_to_smt_sys_two_scoped(right, ctx, locals)?;
                 Ok(format!("(and {l} {r})"))
             }
             "OpOr" => {
-                let l = guard_to_smt_sys_two_scoped(
-                    left, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
-                let r = guard_to_smt_sys_two_scoped(
-                    right, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
+                let l = guard_to_smt_sys_two_scoped(left, ctx, locals)?;
+                let r = guard_to_smt_sys_two_scoped(right, ctx, locals)?;
                 Ok(format!("(or {l} {r})"))
             }
             _ => {
                 // Arithmetic: resolve values
-                let l = guard_to_smt_sys_two_scoped(
-                    left, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
-                let r = guard_to_smt_sys_two_scoped(
-                    right, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    locals,
-                )?;
+                let l = guard_to_smt_sys_two_scoped(left, ctx, locals)?;
+                let r = guard_to_smt_sys_two_scoped(right, ctx, locals)?;
                 let op_sym = match op.as_str() {
                     "OpAdd" => "+",
                     "OpSub" => "-",
@@ -795,10 +727,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             }
         },
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => {
-            let inner = guard_to_smt_sys_two_scoped(
-                operand, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                locals,
-            )?;
+            let inner = guard_to_smt_sys_two_scoped(operand, ctx, locals)?;
             Ok(format!("(not {inner})"))
         }
         IRExpr::Lit {
@@ -817,9 +746,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             args,
             ..
         } => ic3_ctor_term_with(enum_name, ctor, args, vctx, |arg| {
-            guard_to_smt_sys_two_scoped(
-                arg, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2, locals,
-            )
+            guard_to_smt_sys_two_scoped(arg, ctx, locals)
         }),
         IRExpr::Match {
             scrutinee, arms, ..
@@ -830,10 +757,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
                         .to_owned(),
                 );
             }
-            let scrut = guard_to_smt_sys_two_scoped(
-                scrutinee, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                locals,
-            )?;
+            let scrut = guard_to_smt_sys_two_scoped(scrutinee, ctx, locals)?;
             let mut acc = {
                 let last = arms.last().expect("checked non-empty match arms");
                 let bindings = ic3_match_pattern_bindings(&scrut, &last.pattern, vctx)?;
@@ -841,10 +765,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
                 for (name, _) in &bindings {
                     scope.insert(name.clone());
                 }
-                let body = guard_to_smt_sys_two_scoped(
-                    &last.body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, &scope,
-                )?;
+                let body = guard_to_smt_sys_two_scoped(&last.body, ctx, &scope)?;
                 wrap_smt_let_bindings(&bindings, body)
             };
             for arm in arms[..arms.len() - 1].iter().rev() {
@@ -855,18 +776,12 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
                 }
                 let pat = ic3_match_pattern_cond(&scrut, &arm.pattern, vctx)?;
                 let cond = if let Some(guard) = &arm.guard {
-                    let guard_smt = guard_to_smt_sys_two_scoped(
-                        guard, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                        var2, &scope,
-                    )?;
+                    let guard_smt = guard_to_smt_sys_two_scoped(guard, ctx, &scope)?;
                     wrap_smt_let_bindings(&bindings, format!("(and {pat} {guard_smt})"))
                 } else {
                     wrap_smt_let_bindings(&bindings, pat)
                 };
-                let body = guard_to_smt_sys_two_scoped(
-                    &arm.body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, &scope,
-                )?;
+                let body = guard_to_smt_sys_two_scoped(&arm.body, ctx, &scope)?;
                 let body = wrap_smt_let_bindings(&bindings, body);
                 acc = format!("(ite {cond} {body} {acc})");
             }
@@ -878,31 +793,21 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             else_body,
             ..
         } => {
-            let cond_smt = guard_to_smt_sys_two_scoped(
-                cond, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                locals,
-            )?;
-            let then_smt = guard_to_smt_sys_two_scoped(
-                then_body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                locals,
-            )?;
+            let cond_smt = guard_to_smt_sys_two_scoped(cond, ctx, locals)?;
+            let then_smt = guard_to_smt_sys_two_scoped(then_body, ctx, locals)?;
             if let Some(else_body) = else_body {
-                let else_smt = guard_to_smt_sys_two_scoped(
-                    else_body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2,
-                    var2, locals,
-                )?;
+                let else_smt = guard_to_smt_sys_two_scoped(else_body, ctx, locals)?;
                 Ok(format!("(ite {cond_smt} {then_smt} {else_smt})"))
             } else {
                 Ok(format!("(=> {cond_smt} {then_smt})"))
             }
         }
-        IRExpr::Let { bindings, body, .. } => guard_let_to_smt_sys_two_scoped(
-            bindings, body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-            locals,
-        ),
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => guard_to_smt_sys_two_scoped(
-            expr, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2, locals,
-        ),
+        IRExpr::Let { bindings, body, .. } => {
+            guard_let_to_smt_sys_two_scoped(bindings, body, ctx, locals)
+        }
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            guard_to_smt_sys_two_scoped(expr, ctx, locals)
+        }
         IRExpr::Forall {
             var, domain, body, ..
         } => ic3_finite_quantifier_formula(
@@ -911,12 +816,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_two_scoped(
-                    body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    scope,
-                )
-            },
+            |body, scope| guard_to_smt_sys_two_scoped(body, ctx, scope),
             "forall",
         )?
         .ok_or_else(|| {
@@ -930,12 +830,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_two_scoped(
-                    body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    scope,
-                )
-            },
+            |body, scope| guard_to_smt_sys_two_scoped(body, ctx, scope),
             "exists",
         )?
         .ok_or_else(|| {
@@ -949,12 +844,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_two_scoped(
-                    body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    scope,
-                )
-            },
+            |body, scope| guard_to_smt_sys_two_scoped(body, ctx, scope),
             "one",
         )?
         .ok_or_else(|| {
@@ -968,12 +858,7 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_two_scoped(
             body,
             vctx,
             locals,
-            |body, scope| {
-                guard_to_smt_sys_two_scoped(
-                    body, entity1, entity2, vctx, ent1_name, slot1, var1, ent2_name, slot2, var2,
-                    scope,
-                )
-            },
+            |body, scope| guard_to_smt_sys_two_scoped(body, ctx, scope),
             "lone",
         )?
         .ok_or_else(|| {

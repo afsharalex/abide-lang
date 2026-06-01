@@ -34,17 +34,28 @@ pub use evidence::{
 pub use shared::{ValidationError as SharedValidationError, WitnessEnvelope, WitnessPayload};
 pub use value::{EntitySlotRef, WitnessValue};
 
+/// Failure modes when parsing a witness/evidence JSON payload at an
+/// importer boundary.
+///
+/// Keeping deserialization and validation distinct lets callers report
+/// "malformed JSON" separately from "well-formed but invalid witness",
+/// which is the distinction Invaria's importer cares about.
 #[derive(Debug)]
 pub enum ValidatedJsonError<V> {
+    /// `serde_json` could not parse the input.
     Deserialize(serde_json::Error),
+    /// Parse succeeded but the payload failed witness/evidence
+    /// invariants (e.g. a binding referenced an unknown entity slot).
     Validate(V),
 }
 
 impl<V> ValidatedJsonError<V> {
+    /// Wraps a serde parse error.
     pub fn deserialize(err: serde_json::Error) -> Self {
         Self::Deserialize(err)
     }
 
+    /// Wraps a payload validation error.
     pub fn validate(err: V) -> Self {
         Self::Validate(err)
     }

@@ -1203,7 +1203,6 @@ fn proc_param_types_compatible(formal: &Ty, actual: &Ty) -> bool {
 /// 3. Import declarations into the bare-name working namespace
 ///    (types, entities, systems, preds, props maps) so downstream
 ///    resolve/check/lower passes can find them by unqualified name.
-#[allow(clippy::too_many_lines)]
 fn resolve_use_declarations(env: &mut Env) {
     // Clear aliases from any prior resolve pass (idempotent reset).
     env.aliases.clear();

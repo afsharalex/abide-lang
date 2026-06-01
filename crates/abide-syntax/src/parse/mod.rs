@@ -1,3 +1,16 @@
+//! Hand-rolled recursive-descent + Pratt parser for Abide.
+//!
+//! Three entry points:
+//! - [`parse_string`] — convenience: fails on the first error.
+//! - [`parse_expr_string`] — parse a single expression (for REPLs).
+//! - [`parse_string_recovering`] — production entry: returns a
+//!   [`ParseOutput`] with both the (possibly incomplete) AST and any
+//!   collected diagnostics.
+//!
+//! Expression precedence is encoded by the `BP_*` binding-power
+//! constants near the top of this file; see the surrounding block
+//! comment for the full ladder.
+
 mod expr;
 mod system;
 mod types;
@@ -199,6 +212,9 @@ fn is_event_item_starter(tok: &Token) -> bool {
         || !matches!(tok, Token::Semi | Token::RBrace | Token::Return)
 }
 
+/// Result of [`parse_string_recovering`]: the (possibly incomplete)
+/// AST plus a list of any diagnostics raised during recovery. An empty
+/// `errors` vector implies a clean parse.
 pub struct ParseOutput {
     pub program: Program,
     pub errors: Vec<ParseError>,
@@ -255,6 +271,10 @@ pub fn parse_string_recovering(
 
 // ── Parser state ─────────────────────────────────────────────────────
 
+/// The hand-rolled parser. Holds the token stream, current position,
+/// and the diagnostic buffer used by recovery. Public so the language
+/// server and tooling can drive it directly when they already have
+/// tokens in hand.
 pub struct Parser {
     tokens: Vec<(Token, Span)>,
     pos: usize,
@@ -266,6 +286,7 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Constructs a fresh parser from a lexed token stream.
     pub fn new(tokens: Vec<(Token, Span)>) -> Self {
         Self {
             tokens,

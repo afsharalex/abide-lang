@@ -44,6 +44,27 @@ fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
     Expr { kind, span }
 }
 
+fn make_set_comp(
+    start: Span,
+    end: Span,
+    projection: Option<Expr>,
+    var: String,
+    domain: Option<crate::ast::TypeRef>,
+    source: Option<Box<Expr>>,
+    filter: Expr,
+) -> Expr {
+    Expr {
+        kind: ExprKind::SetComp {
+            projection: projection.map(Box::new),
+            var,
+            domain,
+            source,
+            filter: Box::new(filter),
+        },
+        span: start.merge(end),
+    }
+}
+
 impl Parser {
     // ── Expressions (Pratt parser) ───────────────────────────────────
 
@@ -519,11 +540,9 @@ impl Parser {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn expr_atom(&mut self) -> Result<Expr, ParseError> {
         let start = self.cur_span();
         match self.peek() {
-            // Refinement placeholder: $
             Some(Token::Dollar) => {
                 self.advance();
                 Ok(Expr {
@@ -531,99 +550,105 @@ impl Parser {
                     span: start,
                 })
             }
-            // State atoms: @Name, @Name::Name, @Name::Name::Name
-            // With optional record fields: @Name { field: expr,... }
-            Some(Token::At) => {
-                self.advance();
-                let (n1, n1_span) = self.expect_name()?;
-                if self.eat(&Token::ColonColon).is_some() {
-                    let (n2, n2_span) = self.expect_name()?;
-                    if self.eat(&Token::ColonColon).is_some() {
-                        let (n3, n3_span) = self.expect_name()?;
-                        Ok(Expr {
-                            kind: ExprKind::State3(n1, n2, n3),
-                            span: start.merge(n3_span),
-                        })
-                    } else if self.is_ctor_record_start() {
-                        let (fields, end) = self.parse_ctor_fields()?;
-                        Ok(Expr {
-                            kind: ExprKind::State2Record(n1, n2, fields),
-                            span: start.merge(end),
-                        })
-                    } else {
-                        Ok(Expr {
-                            kind: ExprKind::State2(n1, n2),
-                            span: start.merge(n2_span),
-                        })
-                    }
-                } else if self.is_ctor_record_start() {
-                    let (fields, end) = self.parse_ctor_fields()?;
-                    Ok(Expr {
-                        kind: ExprKind::State1Record(n1, fields),
-                        span: start.merge(end),
-                    })
-                } else {
-                    Ok(Expr {
-                        kind: ExprKind::State1(n1),
-                        span: start.merge(n1_span),
-                    })
-                }
+            Some(Token::At) => self.expr_state_atom(start),
+            Some(Token::LParen) => self.expr_paren_or_tuple(start),
+            Some(
+                Token::True
+                | Token::False
+                | Token::Sorry
+                | Token::Todo
+                | Token::IntLit(_)
+                | Token::DoubleLit(_)
+                | Token::FloatLit(_)
+                | Token::StringLit(_),
+            ) => self.expr_literal_atom(start),
+            Some(Token::LBrace) => self.expr_set_comprehension(start),
+            Some(Token::Name(_)) => self.expr_name_atom(),
+            Some(tok) => Err(ParseError::expected(
+                "expression",
+                &format!("`{tok}`"),
+                self.cur_span(),
+            )),
+            None => Err(ParseError::eof(self.cur_span())),
+        }
+    }
+
+    fn expr_state_atom(&mut self, start: Span) -> Result<Expr, ParseError> {
+        self.advance();
+        let (n1, n1_span) = self.expect_name()?;
+        if self.eat(&Token::ColonColon).is_some() {
+            return self.expr_scoped_state_atom(start, n1);
+        }
+        if self.is_ctor_record_start() {
+            let (fields, end) = self.parse_ctor_fields()?;
+            Ok(Expr {
+                kind: ExprKind::State1Record(n1, fields),
+                span: start.merge(end),
+            })
+        } else {
+            Ok(Expr {
+                kind: ExprKind::State1(n1),
+                span: start.merge(n1_span),
+            })
+        }
+    }
+
+    fn expr_scoped_state_atom(&mut self, start: Span, n1: String) -> Result<Expr, ParseError> {
+        let (n2, n2_span) = self.expect_name()?;
+        if self.eat(&Token::ColonColon).is_some() {
+            let (n3, n3_span) = self.expect_name()?;
+            Ok(Expr {
+                kind: ExprKind::State3(n1, n2, n3),
+                span: start.merge(n3_span),
+            })
+        } else if self.is_ctor_record_start() {
+            let (fields, end) = self.parse_ctor_fields()?;
+            Ok(Expr {
+                kind: ExprKind::State2Record(n1, n2, fields),
+                span: start.merge(end),
+            })
+        } else {
+            Ok(Expr {
+                kind: ExprKind::State2(n1, n2),
+                span: start.merge(n2_span),
+            })
+        }
+    }
+
+    fn expr_paren_or_tuple(&mut self, start: Span) -> Result<Expr, ParseError> {
+        self.advance();
+        let first = self.expr()?;
+        if self.eat(&Token::Comma).is_some() {
+            return self.expr_tuple_tail(start, first);
+        }
+        let end = self.expect(&Token::RParen)?;
+        Ok(Expr {
+            kind: first.kind,
+            span: start.merge(end),
+        })
+    }
+
+    fn expr_tuple_tail(&mut self, start: Span, first: Expr) -> Result<Expr, ParseError> {
+        let mut elements = vec![first];
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            elements.push(self.expr()?);
+            while self.eat(&Token::Comma).is_some() {
+                elements.push(self.expr()?);
             }
-            // Parenthesized expr or tuple literal
-            Some(Token::LParen) => {
-                self.advance();
-                let first = self.expr()?;
-                if self.eat(&Token::Comma).is_some() {
-                    let mut elements = vec![first];
-                    if !matches!(self.peek(), Some(Token::RParen)) {
-                        elements.push(self.expr()?);
-                        while self.eat(&Token::Comma).is_some() {
-                            elements.push(self.expr()?);
-                        }
-                    }
-                    let end = self.expect(&Token::RParen)?;
-                    Ok(Expr {
-                        kind: ExprKind::TupleLit(elements),
-                        span: start.merge(end),
-                    })
-                } else {
-                    let end = self.expect(&Token::RParen)?;
-                    // Parenthesized expression: just adjust span
-                    Ok(Expr {
-                        kind: first.kind,
-                        span: start.merge(end),
-                    })
-                }
-            }
-            // Literals
-            Some(Token::True) => {
-                self.advance();
-                Ok(Expr {
-                    kind: ExprKind::True,
-                    span: start,
-                })
-            }
-            Some(Token::False) => {
-                self.advance();
-                Ok(Expr {
-                    kind: ExprKind::False,
-                    span: start,
-                })
-            }
-            Some(Token::Sorry) => {
-                self.advance();
-                Ok(Expr {
-                    kind: ExprKind::Sorry,
-                    span: start,
-                })
-            }
-            Some(Token::Todo) => {
-                self.advance();
-                Ok(Expr {
-                    kind: ExprKind::Todo,
-                    span: start,
-                })
-            }
+        }
+        let end = self.expect(&Token::RParen)?;
+        Ok(Expr {
+            kind: ExprKind::TupleLit(elements),
+            span: start.merge(end),
+        })
+    }
+
+    fn expr_literal_atom(&mut self, start: Span) -> Result<Expr, ParseError> {
+        match self.peek() {
+            Some(Token::True) => self.consume_fixed_atom(start, ExprKind::True),
+            Some(Token::False) => self.consume_fixed_atom(start, ExprKind::False),
+            Some(Token::Sorry) => self.consume_fixed_atom(start, ExprKind::Sorry),
+            Some(Token::Todo) => self.consume_fixed_atom(start, ExprKind::Todo),
             Some(Token::IntLit(_)) => {
                 let (n, span) = self.expect_int()?;
                 Ok(Expr {
@@ -633,25 +658,23 @@ impl Parser {
             }
             Some(Token::DoubleLit(_)) => {
                 let (tok, span) = self.advance();
-                if let Token::DoubleLit(v) = tok {
-                    Ok(Expr {
-                        kind: ExprKind::Real(v),
-                        span,
-                    })
-                } else {
-                    unreachable!()
-                }
+                let Token::DoubleLit(v) = tok else {
+                    unreachable!();
+                };
+                Ok(Expr {
+                    kind: ExprKind::Real(v),
+                    span,
+                })
             }
             Some(Token::FloatLit(_)) => {
                 let (tok, span) = self.advance();
-                if let Token::FloatLit(v) = tok {
-                    Ok(Expr {
-                        kind: ExprKind::Float(v),
-                        span,
-                    })
-                } else {
-                    unreachable!()
-                }
+                let Token::FloatLit(v) = tok else {
+                    unreachable!();
+                };
+                Ok(Expr {
+                    kind: ExprKind::Float(v),
+                    span,
+                })
             }
             Some(Token::StringLit(_)) => {
                 let (s, span) = self.expect_string()?;
@@ -660,112 +683,115 @@ impl Parser {
                     span,
                 })
             }
-            // Set comprehension:
-            // `{ var: Type where filter }`
-            // `{ expr | var: Type in source where filter }`
-            // `{ expr | var in source where filter }`
-            Some(Token::LBrace) => {
-                self.advance(); // consume {
-                if matches!(self.peek(), Some(Token::Name(_)))
-                    && matches!(self.peek_at(1), Some(Token::Colon) | Some(Token::In))
-                {
-                    let saved = self.pos;
-                    let (var, _) = self.expect_name()?;
-                    let domain = if self.eat(&Token::Colon).is_some() {
-                        Some(self.type_ref()?)
-                    } else {
-                        None
-                    };
-                    let source = if self.eat(&Token::In).is_some() {
-                        Some(Box::new(self.expr_bp(BP_CHOICE.1)?))
-                    } else {
-                        None
-                    };
-                    if matches!(self.peek(), Some(Token::Where)) {
-                        // Simple form confirmed
-                        self.advance(); // consume where
-                        let filter = self.expr()?;
-                        let end = self.expect(&Token::RBrace)?;
-                        return Ok(Expr {
-                            kind: ExprKind::SetComp {
-                                projection: None,
-                                var,
-                                domain,
-                                source,
-                                filter: Box::new(filter),
-                            },
-                            span: start.merge(end),
-                        });
-                    }
-                    // Not simple form — backtrack and try projection form
-                    self.pos = saved;
-                }
-                // Projection form: expr | var: Type where filter
-                // Parse above choice level to stop before `|`
-                let projection = self.expr_bp(BP_CHOICE.1)?;
-                self.expect(&Token::Pipe)?;
-                let (var, _) = self.expect_name()?;
-                let domain = if self.eat(&Token::Colon).is_some() {
-                    Some(self.type_ref()?)
-                } else {
-                    None
-                };
-                let source = if self.eat(&Token::In).is_some() {
-                    Some(Box::new(self.expr_bp(BP_CHOICE.1)?))
-                } else {
-                    None
-                };
-                self.expect(&Token::Where)?;
-                let filter = self.expr()?;
-                let end = self.expect(&Token::RBrace)?;
-                Ok(Expr {
-                    kind: ExprKind::SetComp {
-                        projection: Some(Box::new(projection)),
-                        var,
-                        domain,
-                        source,
-                        filter: Box::new(filter),
-                    },
-                    span: start.merge(end),
-                })
-            }
-            // Name, qualified ref (Name::Name, Name::Name::Name), or variable
-            Some(Token::Name(_)) => {
-                let (n1, n1_span) = self.expect_name()?;
-                if self.eat(&Token::ColonColon).is_some() {
-                    let (n2, n2_span) = self.expect_qualified_name_segment()?;
-                    if self.eat(&Token::ColonColon).is_some() {
-                        let (n3, n3_span) = self.expect_qualified_name_segment()?;
-                        Ok(Expr {
-                            kind: ExprKind::Qual3(n1, n2, n3),
-                            span: n1_span.merge(n3_span),
-                        })
-                    } else {
-                        Ok(Expr {
-                            kind: ExprKind::Qual2(n1, n2),
-                            span: n1_span.merge(n2_span),
-                        })
-                    }
-                } else if self.is_ctor_record_start() {
-                    // Struct constructor: Name { field: expr,... }
-                    let (fields, end) = self.parse_ctor_fields()?;
-                    Ok(Expr {
-                        kind: ExprKind::StructCtor(n1, fields),
-                        span: n1_span.merge(end),
-                    })
-                } else {
-                    Ok(Expr {
-                        kind: ExprKind::Var(n1),
-                        span: n1_span,
-                    })
-                }
-            }
-            Some(tok) => Err(ParseError::expected(
-                "expression",
-                &format!("`{tok}`"),
-                self.cur_span(),
-            )),
-            None => Err(ParseError::eof(self.cur_span())),
+            _ => unreachable!("literal atom dispatch only calls literal parser for literals"),
+        }
+    }
+
+    fn consume_fixed_atom(&mut self, span: Span, kind: ExprKind) -> Result<Expr, ParseError> {
+        self.advance();
+        Ok(Expr { kind, span })
+    }
+
+    fn expr_set_comprehension(&mut self, start: Span) -> Result<Expr, ParseError> {
+        self.advance();
+        if let Some(simple) = self.try_simple_set_comprehension(start)? {
+            return Ok(simple);
+        }
+        self.expr_projected_set_comprehension(start)
+    }
+
+    fn try_simple_set_comprehension(&mut self, start: Span) -> Result<Option<Expr>, ParseError> {
+        if !matches!(self.peek(), Some(Token::Name(_)))
+            || !matches!(self.peek_at(1), Some(Token::Colon) | Some(Token::In))
+        {
+            return Ok(None);
+        }
+        let saved = self.pos;
+        let (var, _) = self.expect_name()?;
+        let domain = self.parse_optional_comprehension_domain()?;
+        let source = self.parse_optional_comprehension_source()?;
+        if !matches!(self.peek(), Some(Token::Where)) {
+            self.pos = saved;
+            return Ok(None);
+        }
+        self.advance();
+        let filter = self.expr()?;
+        let end = self.expect(&Token::RBrace)?;
+        Ok(Some(make_set_comp(
+            start, end, None, var, domain, source, filter,
+        )))
+    }
+
+    fn expr_projected_set_comprehension(&mut self, start: Span) -> Result<Expr, ParseError> {
+        let projection = self.expr_bp(BP_CHOICE.1)?;
+        self.expect(&Token::Pipe)?;
+        let (var, _) = self.expect_name()?;
+        let domain = self.parse_optional_comprehension_domain()?;
+        let source = self.parse_optional_comprehension_source()?;
+        self.expect(&Token::Where)?;
+        let filter = self.expr()?;
+        let end = self.expect(&Token::RBrace)?;
+        Ok(make_set_comp(
+            start,
+            end,
+            Some(projection),
+            var,
+            domain,
+            source,
+            filter,
+        ))
+    }
+
+    fn parse_optional_comprehension_domain(
+        &mut self,
+    ) -> Result<Option<crate::ast::TypeRef>, ParseError> {
+        if self.eat(&Token::Colon).is_some() {
+            Ok(Some(self.type_ref()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_optional_comprehension_source(&mut self) -> Result<Option<Box<Expr>>, ParseError> {
+        if self.eat(&Token::In).is_some() {
+            Ok(Some(Box::new(self.expr_bp(BP_CHOICE.1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn expr_name_atom(&mut self) -> Result<Expr, ParseError> {
+        let (n1, n1_span) = self.expect_name()?;
+        if self.eat(&Token::ColonColon).is_some() {
+            return self.expr_qualified_name(n1, n1_span);
+        }
+        if self.is_ctor_record_start() {
+            let (fields, end) = self.parse_ctor_fields()?;
+            Ok(Expr {
+                kind: ExprKind::StructCtor(n1, fields),
+                span: n1_span.merge(end),
+            })
+        } else {
+            Ok(Expr {
+                kind: ExprKind::Var(n1),
+                span: n1_span,
+            })
+        }
+    }
+
+    fn expr_qualified_name(&mut self, n1: String, n1_span: Span) -> Result<Expr, ParseError> {
+        let (n2, n2_span) = self.expect_qualified_name_segment()?;
+        if self.eat(&Token::ColonColon).is_some() {
+            let (n3, n3_span) = self.expect_qualified_name_segment()?;
+            Ok(Expr {
+                kind: ExprKind::Qual3(n1, n2, n3),
+                span: n1_span.merge(n3_span),
+            })
+        } else {
+            Ok(Expr {
+                kind: ExprKind::Qual2(n1, n2),
+                span: n1_span.merge(n2_span),
+            })
         }
     }
 

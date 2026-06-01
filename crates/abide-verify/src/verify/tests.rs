@@ -76,6 +76,17 @@ fn bool_lit(value: bool) -> IRExpr {
     }
 }
 
+fn no_initial_active_entities(entity: &str) -> IRExpr {
+    IRExpr::Forall {
+        var: "slot".to_owned(),
+        domain: IRType::Entity {
+            name: entity.to_owned(),
+        },
+        body: Box::new(bool_lit(false)),
+        span: None,
+    }
+}
+
 fn int_lit(value: i64) -> IRExpr {
     IRExpr::Lit {
         ty: IRType::Int,
@@ -2033,6 +2044,7 @@ fn make_explicit_entity_store_counterexample_ir() -> IRProgram {
         variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
     };
     ir.verifies[0].name = "tickets_stay_pending".to_owned();
+    ir.verifies[0].initial_constraints = vec![no_initial_active_entities("Ticket")];
     ir.verifies[0].asserts = vec![IRExpr::Always {
         body: Box::new(IRExpr::Forall {
             var: "t".to_owned(),
@@ -2365,7 +2377,7 @@ fn make_explicit_entity_store_transition_arg_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
-        initial_constraints: vec![],
+        initial_constraints: vec![no_initial_active_entities("Ticket")],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
                 var: "t".to_owned(),
@@ -2603,7 +2615,7 @@ fn make_explicit_entity_store_ref_counterexample_ir() -> IRProgram {
             strong_fair: Vec::new(),
             per_tuple: Vec::new(),
         },
-        initial_constraints: vec![],
+        initial_constraints: vec![no_initial_active_entities("Ticket")],
         asserts: vec![IRExpr::Always {
             body: Box::new(IRExpr::Forall {
                 var: "t".to_owned(),
@@ -25655,8 +25667,8 @@ fn relational_verify_fragment_checks_nested_cross_entity_quantifiers() {
     let ir = lower_source_file(
         "rel_verify_nested_quantifiers.ab",
         "module RelVerify\n\n\
-         entity Order {\n  paid: bool = false\n}\n\n\
-         entity Payment {\n  captured: bool = false\n}\n\n\
+         entity Order {\n  paid: bool = true\n}\n\n\
+         entity Payment {\n  captured: bool = true\n}\n\n\
          system Commerce(orders: Store<Order>, payments: Store<Payment>) {\n\
            command seed() {\n\
              create Order { paid = true }\n\

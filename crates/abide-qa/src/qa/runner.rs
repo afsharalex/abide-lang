@@ -33,7 +33,15 @@ pub struct QARunResult {
     pub output: Vec<String>,
 }
 
+/// Pluggable hooks for the runner to defer expensive work to a host.
+///
+/// `simulate` is unimplemented by default — embeddings that need the
+/// simulator (e.g. the CLI binary) override it. `explore_state_space`
+/// has a working in-tree default backed by the verifier, but hosts can
+/// override it to inject custom bounds or instrumentation.
 pub trait RunnerHooks {
+    /// Run one seeded forward simulation and produce a
+    /// [`SimulationArtifact`]. Default implementation refuses.
     fn simulate(
         &mut self,
         _ir_program: &ir::types::IRProgram,
@@ -42,6 +50,8 @@ pub trait RunnerHooks {
         Err("simulation is not available in this QA runner".to_owned())
     }
 
+    /// Build a bounded composite state-space artifact. The default
+    /// implementation calls into the verifier's explicit-state backend.
     fn explore_state_space(
         &mut self,
         ir_program: &ir::types::IRProgram,
@@ -60,7 +70,6 @@ impl RunnerHooks for NoopRunnerHooks {}
 ///
 /// If `spec_dir` is provided, it's loaded before the script's `load` statements.
 /// Returns the run result with pass/fail counts and output.
-#[allow(clippy::too_many_lines)]
 pub fn run_qa_script(script_path: &Path, spec_dir: Option<&Path>, json_mode: bool) -> QARunResult {
     let mut hooks = NoopRunnerHooks;
     run_qa_script_with_hooks(script_path, spec_dir, json_mode, &mut hooks)

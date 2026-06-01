@@ -787,7 +787,6 @@ fn free_vars(expr: &IRExpr) -> HashSet<String> {
     fv
 }
 
-#[allow(clippy::too_many_lines)]
 fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<String>) {
     match expr {
         IRExpr::Var { name, .. } => {
@@ -809,11 +808,7 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             free_vars_inner(arg, bound, fv);
         }
         IRExpr::Lam { param, body, .. } => {
-            let was_new = bound.insert(param.clone());
-            free_vars_inner(body, bound, fv);
-            if was_new {
-                bound.remove(param);
-            }
+            free_vars_under_binder(param, body, bound, fv);
         }
         IRExpr::Let { bindings, body, .. } => {
             let mut added = Vec::new();
@@ -832,20 +827,10 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
         | IRExpr::Exists { var, body, .. }
         | IRExpr::One { var, body, .. }
         | IRExpr::Lone { var, body, .. } => {
-            let was_new = bound.insert(var.clone());
-            free_vars_inner(body, bound, fv);
-            if was_new {
-                bound.remove(var);
-            }
+            free_vars_under_binder(var, body, bound, fv);
         }
         IRExpr::Choose { var, predicate, .. } => {
-            let was_new = bound.insert(var.clone());
-            if let Some(pred) = predicate {
-                free_vars_inner(pred, bound, fv);
-            }
-            if was_new {
-                bound.remove(var);
-            }
+            free_vars_optional_under_binder(var, predicate.as_deref(), bound, fv);
         }
         IRExpr::Always { body, .. }
         | IRExpr::Eventually { body, .. }
@@ -859,17 +844,7 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
         }
         IRExpr::Match {
             scrutinee, arms, ..
-        } => {
-            free_vars_inner(scrutinee, bound, fv);
-            for arm in arms {
-                let mut arm_bound = bound.clone();
-                collect_pattern_vars(&arm.pattern, &mut arm_bound);
-                if let Some(g) = &arm.guard {
-                    free_vars_inner(g, &mut arm_bound, fv);
-                }
-                free_vars_inner(&arm.body, &mut arm_bound, fv);
-            }
-        }
+        } => free_vars_match(scrutinee, arms, bound, fv),
         IRExpr::MapUpdate {
             map, key, value, ..
         } => {
@@ -887,40 +862,20 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             filter,
             projection,
             ..
-        } => {
-            if let Some(source) = source {
-                free_vars_inner(source, bound, fv);
-            }
-            let was_new = bound.insert(var.clone());
-            free_vars_inner(filter, bound, fv);
-            if let Some(p) = projection {
-                free_vars_inner(p, bound, fv);
-            }
-            if was_new {
-                bound.remove(var);
-            }
-        }
+        } => free_vars_set_comp(
+            var,
+            source.as_deref(),
+            filter,
+            projection.as_deref(),
+            bound,
+            fv,
+        ),
         IRExpr::RelComp {
             projection,
             bindings,
             filter,
             ..
-        } => {
-            let mut added = Vec::new();
-            for binding in bindings {
-                if let Some(source) = &binding.source {
-                    free_vars_inner(source, bound, fv);
-                }
-                if bound.insert(binding.var.clone()) {
-                    added.push(binding.var.clone());
-                }
-            }
-            free_vars_inner(projection, bound, fv);
-            free_vars_inner(filter, bound, fv);
-            for name in added {
-                bound.remove(&name);
-            }
-        }
+        } => free_vars_rel_comp(projection, bindings, filter, bound, fv),
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
             for e in elements {
                 free_vars_inner(e, bound, fv);
@@ -941,11 +896,7 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             name, init, rest, ..
         } => {
             free_vars_inner(init, bound, fv);
-            let was_new = bound.insert(name.clone());
-            free_vars_inner(rest, bound, fv);
-            if was_new {
-                bound.remove(name);
-            }
+            free_vars_under_binder(name, rest, bound, fv);
         }
         IRExpr::While {
             cond,
@@ -978,14 +929,8 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             in_filter,
             ..
         } => {
-            let was_new = bound.insert(var.clone());
-            free_vars_inner(body, bound, fv);
-            if let Some(f) = in_filter {
-                free_vars_inner(f, bound, fv);
-            }
-            if was_new {
-                bound.remove(var);
-            }
+            free_vars_under_binder(var, body, bound, fv);
+            free_vars_optional(in_filter.as_deref(), bound, fv);
         }
         // / — saw operator: recurse into non-wildcard args.
         IRExpr::Saw { args, .. } => {
@@ -993,6 +938,95 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
                 free_vars_inner(e, bound, fv);
             }
         }
+    }
+}
+
+fn free_vars_under_binder(
+    var: &str,
+    body: &IRExpr,
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    let was_new = bound.insert(var.to_owned());
+    free_vars_inner(body, bound, fv);
+    if was_new {
+        bound.remove(var);
+    }
+}
+
+fn free_vars_optional(
+    expr: Option<&IRExpr>,
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    if let Some(expr) = expr {
+        free_vars_inner(expr, bound, fv);
+    }
+}
+
+fn free_vars_optional_under_binder(
+    var: &str,
+    expr: Option<&IRExpr>,
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    let was_new = bound.insert(var.to_owned());
+    free_vars_optional(expr, bound, fv);
+    if was_new {
+        bound.remove(var);
+    }
+}
+
+fn free_vars_match(
+    scrutinee: &IRExpr,
+    arms: &[crate::ir::types::IRMatchArm],
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    free_vars_inner(scrutinee, bound, fv);
+    for arm in arms {
+        let mut arm_bound = bound.clone();
+        collect_pattern_vars(&arm.pattern, &mut arm_bound);
+        free_vars_optional(arm.guard.as_ref(), &mut arm_bound, fv);
+        free_vars_inner(&arm.body, &mut arm_bound, fv);
+    }
+}
+
+fn free_vars_set_comp(
+    var: &str,
+    source: Option<&IRExpr>,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    free_vars_optional(source, bound, fv);
+    let was_new = bound.insert(var.to_owned());
+    free_vars_inner(filter, bound, fv);
+    free_vars_optional(projection, bound, fv);
+    if was_new {
+        bound.remove(var);
+    }
+}
+
+fn free_vars_rel_comp(
+    projection: &IRExpr,
+    bindings: &[IRRelCompBinding],
+    filter: &IRExpr,
+    bound: &mut HashSet<String>,
+    fv: &mut HashSet<String>,
+) {
+    let mut added = Vec::new();
+    for binding in bindings {
+        free_vars_optional(binding.source.as_deref(), bound, fv);
+        if bound.insert(binding.var.clone()) {
+            added.push(binding.var.clone());
+        }
+    }
+    free_vars_inner(projection, bound, fv);
+    free_vars_inner(filter, bound, fv);
+    for name in added {
+        bound.remove(&name);
     }
 }
 
@@ -1005,13 +1039,17 @@ fn substitute_var(expr: IRExpr, var_name: &str, replacement: &IRExpr) -> IRExpr 
     substitute_var_inner(expr, var_name, replacement, &repl_fv)
 }
 
-#[allow(clippy::too_many_lines)]
 fn substitute_var_inner(
     expr: IRExpr,
     var_name: &str,
     replacement: &IRExpr,
     repl_fv: &HashSet<String>,
 ) -> IRExpr {
+    let subst = SubstCtx {
+        var_name,
+        replacement,
+        repl_fv,
+    };
     match expr {
         IRExpr::Var { ref name, .. } if name == var_name => replacement.clone(),
         IRExpr::Var { .. }
@@ -1067,207 +1105,15 @@ fn substitute_var_inner(
             param_type,
             body,
             ..
-        } => {
-            if param == var_name {
-                // Shadowed — don't substitute into body
-                IRExpr::Lam {
-                    param,
-                    param_type,
-                    body,
-                    span: None,
-                }
-            } else if repl_fv.contains(&param) {
-                // Capture risk: binder name appears free in replacement.
-                // Alpha-rename: Lam(x, body) → Lam(x', body[x:= Var(x')])
-                let fresh = fresh_name(&param);
-                let fresh_var = IRExpr::Var {
-                    name: fresh.clone(),
-                    ty: param_type.clone(),
-                    span: None,
-                };
-                let renamed_body =
-                    substitute_var_inner(*body, &param, &fresh_var, &free_vars(&fresh_var));
-                IRExpr::Lam {
-                    param: fresh,
-                    param_type,
-                    body: Box::new(substitute_var_inner(
-                        renamed_body,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    )),
-                    span: None,
-                }
-            } else {
-                IRExpr::Lam {
-                    param,
-                    param_type,
-                    body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
-                    span: None,
-                }
-            }
-        }
+        } => subst_lam(param, param_type, *body, subst),
         IRExpr::Choose {
             var,
             domain,
             predicate,
             ty,
             ..
-        } => {
-            if var == var_name {
-                IRExpr::Choose {
-                    var,
-                    domain,
-                    predicate,
-                    ty,
-                    span: None,
-                }
-            } else if repl_fv.contains(&var) {
-                let fresh = fresh_name(&var);
-                let fresh_var = IRExpr::Var {
-                    name: fresh.clone(),
-                    ty: domain.clone(),
-                    span: None,
-                };
-                let renamed_predicate = predicate.map(|pred| {
-                    Box::new(substitute_var_inner(
-                        *pred,
-                        &var,
-                        &fresh_var,
-                        &free_vars(&fresh_var),
-                    ))
-                });
-                IRExpr::Choose {
-                    var: fresh,
-                    domain,
-                    predicate: renamed_predicate.map(|pred| {
-                        Box::new(substitute_var_inner(*pred, var_name, replacement, repl_fv))
-                    }),
-                    ty,
-                    span: None,
-                }
-            } else {
-                IRExpr::Choose {
-                    var,
-                    domain,
-                    predicate: predicate.map(|pred| {
-                        Box::new(substitute_var_inner(*pred, var_name, replacement, repl_fv))
-                    }),
-                    ty,
-                    span: None,
-                }
-            }
-        }
-        IRExpr::Let { bindings, body, .. } => {
-            let mut shadowed = false;
-            let mut needs_rename = false;
-            // Check if any binding name appears free in replacement
-            for b in &bindings {
-                if b.name == var_name {
-                    break; // will shadow before we need to worry about capture
-                }
-                if repl_fv.contains(&b.name) {
-                    needs_rename = true;
-                    break;
-                }
-            }
-            if needs_rename {
-                // Alpha-rename conflicting let bindings
-                let mut renamed_bindings = Vec::new();
-                let mut renames: Vec<(String, String)> = Vec::new();
-                let mut current_body = *body;
-
-                for b in bindings {
-                    let new_name = if repl_fv.contains(&b.name) && b.name != var_name {
-                        let fresh = fresh_name(&b.name);
-                        renames.push((b.name.clone(), fresh.clone()));
-                        fresh
-                    } else {
-                        b.name.clone()
-                    };
-
-                    let mut new_expr = b.expr;
-                    // Apply prior renames to this binding's expr
-                    for (old, new) in &renames {
-                        if old != &b.name {
-                            let fresh_var = IRExpr::Var {
-                                name: new.clone(),
-                                ty: b.ty.clone(),
-                                span: None,
-                            };
-                            new_expr = substitute_var_inner(
-                                new_expr,
-                                old,
-                                &fresh_var,
-                                &free_vars(&fresh_var),
-                            );
-                        }
-                    }
-
-                    if !shadowed {
-                        new_expr = substitute_var_inner(new_expr, var_name, replacement, repl_fv);
-                    }
-                    if b.name == var_name {
-                        shadowed = true;
-                    }
-
-                    renamed_bindings.push(crate::ir::types::LetBinding {
-                        name: new_name,
-                        ty: b.ty,
-                        expr: new_expr,
-                    });
-                }
-
-                // Apply renames to body
-                for (old, new) in &renames {
-                    let fresh_var = IRExpr::Var {
-                        name: new.clone(),
-                        ty: IRType::Int, // type doesn't matter for name substitution
-                        span: None,
-                    };
-                    current_body =
-                        substitute_var_inner(current_body, old, &fresh_var, &free_vars(&fresh_var));
-                }
-                if !shadowed {
-                    current_body =
-                        substitute_var_inner(current_body, var_name, replacement, repl_fv);
-                }
-
-                IRExpr::Let {
-                    bindings: renamed_bindings,
-                    body: Box::new(current_body),
-                    span: None,
-                }
-            } else {
-                let new_bindings = bindings
-                    .into_iter()
-                    .map(|b| {
-                        let new_expr = if shadowed {
-                            b.expr
-                        } else {
-                            substitute_var_inner(b.expr, var_name, replacement, repl_fv)
-                        };
-                        if b.name == var_name {
-                            shadowed = true;
-                        }
-                        crate::ir::types::LetBinding {
-                            name: b.name,
-                            ty: b.ty,
-                            expr: new_expr,
-                        }
-                    })
-                    .collect();
-                IRExpr::Let {
-                    bindings: new_bindings,
-                    span: None,
-                    body: if shadowed {
-                        body
-                    } else {
-                        Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv))
-                    },
-                }
-            }
-        }
+        } => subst_choose(var, domain, predicate, ty, subst),
+        IRExpr::Let { bindings, body, .. } => subst_let(bindings, *body, subst),
         IRExpr::Forall {
             var, domain, body, ..
         } => subst_quantifier(
@@ -1357,78 +1203,7 @@ fn substitute_var_inner(
         },
         IRExpr::Match {
             scrutinee, arms, ..
-        } => {
-            let new_scrutinee = substitute_var_inner(*scrutinee, var_name, replacement, repl_fv);
-            let new_arms = arms
-                .into_iter()
-                .map(|a| {
-                    let mut pat_vars = HashSet::new();
-                    collect_ir_pattern_vars(&a.pattern, &mut pat_vars);
-                    if pat_vars.contains(var_name) {
-                        // Shadowed by pattern — don't substitute in guard/body
-                        a
-                    } else {
-                        // Check for capture: pattern vars that collide with replacement free vars
-                        let captures: Vec<String> = pat_vars
-                            .iter()
-                            .filter(|v| repl_fv.contains(v.as_str()))
-                            .cloned()
-                            .collect();
-                        if captures.is_empty() {
-                            // No capture risk — substitute directly
-                            crate::ir::types::IRMatchArm {
-                                pattern: a.pattern,
-                                guard: a.guard.map(|g| {
-                                    substitute_var_inner(g, var_name, replacement, repl_fv)
-                                }),
-                                body: substitute_var_inner(a.body, var_name, replacement, repl_fv),
-                            }
-                        } else {
-                            // Alpha-rename capturing pattern vars in pattern + guard + body
-                            let mut pattern = a.pattern;
-                            let mut guard = a.guard;
-                            let mut body = a.body;
-                            for old_name in &captures {
-                                let fresh = fresh_name(old_name);
-                                pattern = rename_in_pattern(pattern, old_name, &fresh);
-                                // Recover the type from the first occurrence in body/guard,
-                                // falling back to Bool (pattern vars are typically entity/enum typed
-                                // but the type is only carried structurally — not consumed by subst).
-                                let ty = find_var_type(&body, old_name)
-                                    .or_else(|| {
-                                        guard.as_ref().and_then(|g| find_var_type(g, old_name))
-                                    })
-                                    .unwrap_or(IRType::Bool);
-                                let fresh_var = IRExpr::Var {
-                                    name: fresh.clone(),
-                                    ty,
-                                    span: None,
-                                };
-                                let fv_fresh = free_vars(&fresh_var);
-                                if let Some(g) = guard {
-                                    guard = Some(substitute_var_inner(
-                                        g, old_name, &fresh_var, &fv_fresh,
-                                    ));
-                                }
-                                body = substitute_var_inner(body, old_name, &fresh_var, &fv_fresh);
-                            }
-                            crate::ir::types::IRMatchArm {
-                                pattern,
-                                guard: guard.map(|g| {
-                                    substitute_var_inner(g, var_name, replacement, repl_fv)
-                                }),
-                                body: substitute_var_inner(body, var_name, replacement, repl_fv),
-                            }
-                        }
-                    }
-                })
-                .collect();
-            IRExpr::Match {
-                scrutinee: Box::new(new_scrutinee),
-                arms: new_arms,
-                span: None,
-            }
-        }
+        } => subst_match(*scrutinee, arms, subst),
         IRExpr::MapUpdate {
             map,
             key,
@@ -1456,129 +1231,14 @@ fn substitute_var_inner(
             projection,
             ty,
             ..
-        } => {
-            let source = source.map(|source| {
-                Box::new(substitute_var_inner(
-                    *source,
-                    var_name,
-                    replacement,
-                    repl_fv,
-                ))
-            });
-            if var == var_name {
-                IRExpr::SetComp {
-                    var,
-                    domain,
-                    source,
-                    filter,
-                    projection,
-                    ty,
-                    span: None,
-                }
-            } else if repl_fv.contains(&var) {
-                let fresh = fresh_name(&var);
-                let fresh_var = IRExpr::Var {
-                    name: fresh.clone(),
-                    ty: domain.clone(),
-                    span: None,
-                };
-                let fv_fresh = free_vars(&fresh_var);
-                let renamed_filter = substitute_var_inner(*filter, &var, &fresh_var, &fv_fresh);
-                let renamed_proj = projection
-                    .map(|p| Box::new(substitute_var_inner(*p, &var, &fresh_var, &fv_fresh)));
-                IRExpr::SetComp {
-                    var: fresh,
-                    domain,
-                    source,
-                    span: None,
-                    filter: Box::new(substitute_var_inner(
-                        renamed_filter,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    )),
-                    projection: renamed_proj.map(|p| {
-                        Box::new(substitute_var_inner(*p, var_name, replacement, repl_fv))
-                    }),
-                    ty,
-                }
-            } else {
-                IRExpr::SetComp {
-                    var,
-                    domain,
-                    source,
-                    span: None,
-                    filter: Box::new(substitute_var_inner(
-                        *filter,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    )),
-                    projection: projection.map(|p| {
-                        Box::new(substitute_var_inner(*p, var_name, replacement, repl_fv))
-                    }),
-                    ty,
-                }
-            }
-        }
+        } => subst_set_comp(var, domain, source, *filter, projection, ty, subst),
         IRExpr::RelComp {
             projection,
             bindings,
             filter,
             ty,
             ..
-        } => {
-            let mut shadowed = false;
-            let mut new_bindings = Vec::new();
-            for binding in bindings {
-                let source = binding.source.map(|source| {
-                    if shadowed {
-                        source
-                    } else {
-                        Box::new(substitute_var_inner(
-                            *source,
-                            var_name,
-                            replacement,
-                            repl_fv,
-                        ))
-                    }
-                });
-                if binding.var == var_name {
-                    shadowed = true;
-                }
-                new_bindings.push(IRRelCompBinding {
-                    var: binding.var,
-                    domain: binding.domain,
-                    source,
-                });
-            }
-
-            IRExpr::RelComp {
-                projection: if shadowed {
-                    projection
-                } else {
-                    Box::new(substitute_var_inner(
-                        *projection,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    ))
-                },
-                bindings: new_bindings,
-                filter: if shadowed {
-                    filter
-                } else {
-                    Box::new(substitute_var_inner(
-                        *filter,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    ))
-                },
-                ty,
-                span: None,
-            }
-        }
+        } => subst_rel_comp(projection, bindings, filter, ty, subst),
         IRExpr::SetLit { elements, ty, .. } => IRExpr::SetLit {
             elements: elements
                 .into_iter()
@@ -1687,62 +1347,7 @@ fn substitute_var_inner(
             body,
             in_filter,
             ..
-        } => {
-            if var == var_name {
-                // Shadowed — don't substitute into body or in_filter
-                IRExpr::Aggregate {
-                    kind,
-                    var,
-                    domain,
-                    body,
-                    in_filter,
-                    span: None,
-                }
-            } else if repl_fv.contains(&var) {
-                // Capture risk: alpha-rename the aggregate variable
-                let fresh = fresh_name(&var);
-                let fresh_var = IRExpr::Var {
-                    name: fresh.clone(),
-                    ty: domain.clone(),
-                    span: None,
-                };
-                let fv_fresh = free_vars(&fresh_var);
-                let renamed_body = substitute_var_inner(*body, &var, &fresh_var, &fv_fresh);
-                let renamed_filter = in_filter.map(|f| {
-                    let renamed = substitute_var_inner(*f, &var, &fresh_var, &fv_fresh);
-                    Box::new(substitute_var_inner(
-                        renamed,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    ))
-                });
-                IRExpr::Aggregate {
-                    kind,
-                    var: fresh,
-                    domain,
-                    body: Box::new(substitute_var_inner(
-                        renamed_body,
-                        var_name,
-                        replacement,
-                        repl_fv,
-                    )),
-                    in_filter: renamed_filter,
-                    span: None,
-                }
-            } else {
-                let subst_filter = in_filter
-                    .map(|f| Box::new(substitute_var_inner(*f, var_name, replacement, repl_fv)));
-                IRExpr::Aggregate {
-                    kind,
-                    var,
-                    domain,
-                    body: Box::new(substitute_var_inner(*body, var_name, replacement, repl_fv)),
-                    in_filter: subst_filter,
-                    span: None,
-                }
-            }
-        }
+        } => subst_aggregate(kind, var, domain, *body, in_filter, subst),
         // / — saw operator: substitute into non-wildcard args.
         IRExpr::Saw {
             system_name,
@@ -1760,6 +1365,557 @@ fn substitute_var_inner(
                 .collect(),
             span,
         },
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SubstCtx<'a> {
+    var_name: &'a str,
+    replacement: &'a IRExpr,
+    repl_fv: &'a HashSet<String>,
+}
+
+fn subst_lam(param: String, param_type: IRType, body: IRExpr, subst: SubstCtx<'_>) -> IRExpr {
+    if param == subst.var_name {
+        return IRExpr::Lam {
+            param,
+            param_type,
+            body: Box::new(body),
+            span: None,
+        };
+    }
+    if subst.repl_fv.contains(&param) {
+        let fresh = fresh_name(&param);
+        let fresh_var = IRExpr::Var {
+            name: fresh.clone(),
+            ty: param_type.clone(),
+            span: None,
+        };
+        let renamed_body = substitute_var_inner(body, &param, &fresh_var, &free_vars(&fresh_var));
+        return IRExpr::Lam {
+            param: fresh,
+            param_type,
+            body: Box::new(substitute_var_inner(
+                renamed_body,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            )),
+            span: None,
+        };
+    }
+    IRExpr::Lam {
+        param,
+        param_type,
+        body: Box::new(substitute_var_inner(
+            body,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        )),
+        span: None,
+    }
+}
+
+fn subst_choose(
+    var: String,
+    domain: IRType,
+    predicate: Option<Box<IRExpr>>,
+    ty: IRType,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    if var == subst.var_name {
+        return IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ty,
+            span: None,
+        };
+    }
+    if subst.repl_fv.contains(&var) {
+        let fresh = fresh_name(&var);
+        let fresh_var = IRExpr::Var {
+            name: fresh.clone(),
+            ty: domain.clone(),
+            span: None,
+        };
+        let renamed_predicate = predicate.map(|pred| {
+            Box::new(substitute_var_inner(
+                *pred,
+                &var,
+                &fresh_var,
+                &free_vars(&fresh_var),
+            ))
+        });
+        return IRExpr::Choose {
+            var: fresh,
+            domain,
+            predicate: renamed_predicate.map(|pred| {
+                Box::new(substitute_var_inner(
+                    *pred,
+                    subst.var_name,
+                    subst.replacement,
+                    subst.repl_fv,
+                ))
+            }),
+            ty,
+            span: None,
+        };
+    }
+    IRExpr::Choose {
+        var,
+        domain,
+        predicate: predicate.map(|pred| {
+            Box::new(substitute_var_inner(
+                *pred,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            ))
+        }),
+        ty,
+        span: None,
+    }
+}
+
+fn subst_let(
+    bindings: Vec<crate::ir::types::LetBinding>,
+    body: IRExpr,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let mut shadowed = false;
+    let mut needs_rename = false;
+    for b in &bindings {
+        if b.name == subst.var_name {
+            break;
+        }
+        if subst.repl_fv.contains(&b.name) {
+            needs_rename = true;
+            break;
+        }
+    }
+    if needs_rename {
+        return subst_renamed_let(bindings, body, subst);
+    }
+
+    let new_bindings = bindings
+        .into_iter()
+        .map(|b| {
+            let new_expr = if shadowed {
+                b.expr
+            } else {
+                substitute_var_inner(b.expr, subst.var_name, subst.replacement, subst.repl_fv)
+            };
+            if b.name == subst.var_name {
+                shadowed = true;
+            }
+            crate::ir::types::LetBinding {
+                name: b.name,
+                ty: b.ty,
+                expr: new_expr,
+            }
+        })
+        .collect();
+    IRExpr::Let {
+        bindings: new_bindings,
+        span: None,
+        body: if shadowed {
+            Box::new(body)
+        } else {
+            Box::new(substitute_var_inner(
+                body,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            ))
+        },
+    }
+}
+
+fn subst_renamed_let(
+    bindings: Vec<crate::ir::types::LetBinding>,
+    body: IRExpr,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let mut shadowed = false;
+    let mut renamed_bindings = Vec::new();
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let mut current_body = body;
+
+    for b in bindings {
+        let new_name = if subst.repl_fv.contains(&b.name) && b.name != subst.var_name {
+            let fresh = fresh_name(&b.name);
+            renames.push((b.name.clone(), fresh.clone()));
+            fresh
+        } else {
+            b.name.clone()
+        };
+        let mut new_expr = subst_prior_renames(b.expr, &b.ty, &b.name, &renames);
+        if !shadowed {
+            new_expr =
+                substitute_var_inner(new_expr, subst.var_name, subst.replacement, subst.repl_fv);
+        }
+        if b.name == subst.var_name {
+            shadowed = true;
+        }
+        renamed_bindings.push(crate::ir::types::LetBinding {
+            name: new_name,
+            ty: b.ty,
+            expr: new_expr,
+        });
+    }
+
+    for (old, new) in &renames {
+        let fresh_var = IRExpr::Var {
+            name: new.clone(),
+            ty: IRType::Int,
+            span: None,
+        };
+        current_body = substitute_var_inner(current_body, old, &fresh_var, &free_vars(&fresh_var));
+    }
+    if !shadowed {
+        current_body = substitute_var_inner(
+            current_body,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        );
+    }
+
+    IRExpr::Let {
+        bindings: renamed_bindings,
+        body: Box::new(current_body),
+        span: None,
+    }
+}
+
+fn subst_prior_renames(
+    mut expr: IRExpr,
+    ty: &IRType,
+    current_name: &str,
+    renames: &[(String, String)],
+) -> IRExpr {
+    for (old, new) in renames {
+        if old != current_name {
+            let fresh_var = IRExpr::Var {
+                name: new.clone(),
+                ty: ty.clone(),
+                span: None,
+            };
+            expr = substitute_var_inner(expr, old, &fresh_var, &free_vars(&fresh_var));
+        }
+    }
+    expr
+}
+
+fn subst_match(
+    scrutinee: IRExpr,
+    arms: Vec<crate::ir::types::IRMatchArm>,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let new_scrutinee =
+        substitute_var_inner(scrutinee, subst.var_name, subst.replacement, subst.repl_fv);
+    let new_arms = arms
+        .into_iter()
+        .map(|arm| subst_match_arm(arm, subst))
+        .collect();
+    IRExpr::Match {
+        scrutinee: Box::new(new_scrutinee),
+        arms: new_arms,
+        span: None,
+    }
+}
+
+fn subst_match_arm(
+    arm: crate::ir::types::IRMatchArm,
+    subst: SubstCtx<'_>,
+) -> crate::ir::types::IRMatchArm {
+    let mut pat_vars = HashSet::new();
+    collect_ir_pattern_vars(&arm.pattern, &mut pat_vars);
+    if pat_vars.contains(subst.var_name) {
+        return arm;
+    }
+    let captures: Vec<String> = pat_vars
+        .iter()
+        .filter(|v| subst.repl_fv.contains(v.as_str()))
+        .cloned()
+        .collect();
+    if captures.is_empty() {
+        return crate::ir::types::IRMatchArm {
+            pattern: arm.pattern,
+            guard: arm
+                .guard
+                .map(|g| substitute_var_inner(g, subst.var_name, subst.replacement, subst.repl_fv)),
+            body: substitute_var_inner(arm.body, subst.var_name, subst.replacement, subst.repl_fv),
+        };
+    }
+    subst_capturing_match_arm(arm, &captures, subst)
+}
+
+fn subst_capturing_match_arm(
+    arm: crate::ir::types::IRMatchArm,
+    captures: &[String],
+    subst: SubstCtx<'_>,
+) -> crate::ir::types::IRMatchArm {
+    let mut pattern = arm.pattern;
+    let mut guard = arm.guard;
+    let mut body = arm.body;
+    for old_name in captures {
+        let fresh = fresh_name(old_name);
+        pattern = rename_in_pattern(pattern, old_name, &fresh);
+        let ty = find_var_type(&body, old_name)
+            .or_else(|| guard.as_ref().and_then(|g| find_var_type(g, old_name)))
+            .unwrap_or(IRType::Bool);
+        let fresh_var = IRExpr::Var {
+            name: fresh,
+            ty,
+            span: None,
+        };
+        let fv_fresh = free_vars(&fresh_var);
+        if let Some(g) = guard {
+            guard = Some(substitute_var_inner(g, old_name, &fresh_var, &fv_fresh));
+        }
+        body = substitute_var_inner(body, old_name, &fresh_var, &fv_fresh);
+    }
+    crate::ir::types::IRMatchArm {
+        pattern,
+        guard: guard
+            .map(|g| substitute_var_inner(g, subst.var_name, subst.replacement, subst.repl_fv)),
+        body: substitute_var_inner(body, subst.var_name, subst.replacement, subst.repl_fv),
+    }
+}
+
+fn subst_set_comp(
+    var: String,
+    domain: IRType,
+    source: Option<Box<IRExpr>>,
+    filter: IRExpr,
+    projection: Option<Box<IRExpr>>,
+    ty: IRType,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let source = source.map(|source| {
+        Box::new(substitute_var_inner(
+            *source,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        ))
+    });
+    if var == subst.var_name {
+        return IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter: Box::new(filter),
+            projection,
+            ty,
+            span: None,
+        };
+    }
+    if subst.repl_fv.contains(&var) {
+        return subst_renamed_set_comp(var, domain, source, filter, projection, ty, subst);
+    }
+    IRExpr::SetComp {
+        var,
+        domain,
+        source,
+        span: None,
+        filter: Box::new(substitute_var_inner(
+            filter,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        )),
+        projection: projection.map(|p| {
+            Box::new(substitute_var_inner(
+                *p,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            ))
+        }),
+        ty,
+    }
+}
+
+fn subst_renamed_set_comp(
+    var: String,
+    domain: IRType,
+    source: Option<Box<IRExpr>>,
+    filter: IRExpr,
+    projection: Option<Box<IRExpr>>,
+    ty: IRType,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let fresh = fresh_name(&var);
+    let fresh_var = IRExpr::Var {
+        name: fresh.clone(),
+        ty: domain.clone(),
+        span: None,
+    };
+    let fv_fresh = free_vars(&fresh_var);
+    let renamed_filter = substitute_var_inner(filter, &var, &fresh_var, &fv_fresh);
+    let renamed_proj =
+        projection.map(|p| Box::new(substitute_var_inner(*p, &var, &fresh_var, &fv_fresh)));
+    IRExpr::SetComp {
+        var: fresh,
+        domain,
+        source,
+        span: None,
+        filter: Box::new(substitute_var_inner(
+            renamed_filter,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        )),
+        projection: renamed_proj.map(|p| {
+            Box::new(substitute_var_inner(
+                *p,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            ))
+        }),
+        ty,
+    }
+}
+
+fn subst_rel_comp(
+    projection: Box<IRExpr>,
+    bindings: Vec<IRRelCompBinding>,
+    filter: Box<IRExpr>,
+    ty: IRType,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let mut shadowed = false;
+    let mut new_bindings = Vec::new();
+    for binding in bindings {
+        let source = binding.source.map(|source| {
+            if shadowed {
+                source
+            } else {
+                Box::new(substitute_var_inner(
+                    *source,
+                    subst.var_name,
+                    subst.replacement,
+                    subst.repl_fv,
+                ))
+            }
+        });
+        if binding.var == subst.var_name {
+            shadowed = true;
+        }
+        new_bindings.push(IRRelCompBinding {
+            var: binding.var,
+            domain: binding.domain,
+            source,
+        });
+    }
+
+    IRExpr::RelComp {
+        projection: subst_unless_shadowed(projection, shadowed, subst),
+        bindings: new_bindings,
+        filter: subst_unless_shadowed(filter, shadowed, subst),
+        ty,
+        span: None,
+    }
+}
+
+fn subst_unless_shadowed(expr: Box<IRExpr>, shadowed: bool, subst: SubstCtx<'_>) -> Box<IRExpr> {
+    if shadowed {
+        expr
+    } else {
+        Box::new(substitute_var_inner(
+            *expr,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        ))
+    }
+}
+
+fn subst_aggregate(
+    kind: crate::ir::types::IRAggKind,
+    var: String,
+    domain: IRType,
+    body: IRExpr,
+    in_filter: Option<Box<IRExpr>>,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    if var == subst.var_name {
+        return IRExpr::Aggregate {
+            kind,
+            var,
+            domain,
+            body: Box::new(body),
+            in_filter,
+            span: None,
+        };
+    }
+    if subst.repl_fv.contains(&var) {
+        return subst_renamed_aggregate(kind, var, domain, body, in_filter, subst);
+    }
+    IRExpr::Aggregate {
+        kind,
+        var,
+        domain,
+        body: Box::new(substitute_var_inner(
+            body,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        )),
+        in_filter: in_filter.map(|f| {
+            Box::new(substitute_var_inner(
+                *f,
+                subst.var_name,
+                subst.replacement,
+                subst.repl_fv,
+            ))
+        }),
+        span: None,
+    }
+}
+
+fn subst_renamed_aggregate(
+    kind: crate::ir::types::IRAggKind,
+    var: String,
+    domain: IRType,
+    body: IRExpr,
+    in_filter: Option<Box<IRExpr>>,
+    subst: SubstCtx<'_>,
+) -> IRExpr {
+    let fresh = fresh_name(&var);
+    let fresh_var = IRExpr::Var {
+        name: fresh.clone(),
+        ty: domain.clone(),
+        span: None,
+    };
+    let fv_fresh = free_vars(&fresh_var);
+    let renamed_body = substitute_var_inner(body, &var, &fresh_var, &fv_fresh);
+    let renamed_filter = in_filter.map(|f| {
+        let renamed = substitute_var_inner(*f, &var, &fresh_var, &fv_fresh);
+        Box::new(substitute_var_inner(
+            renamed,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        ))
+    });
+    IRExpr::Aggregate {
+        kind,
+        var: fresh,
+        domain,
+        body: Box::new(substitute_var_inner(
+            renamed_body,
+            subst.var_name,
+            subst.replacement,
+            subst.repl_fv,
+        )),
+        in_filter: renamed_filter,
+        span: None,
     }
 }
 

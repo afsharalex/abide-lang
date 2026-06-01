@@ -1,19 +1,44 @@
+//! Abide AST.
+//!
+//! The AST stays close to the surface form: composition operators
+//! survive as [`Expr::Compose`], qualified paths as [`Expr::PathRef`],
+//! and refinement predicates as [`TypeRef`] / [`TypeVariant::Refinement`]
+//! children. Later passes in `abide-sema` and `abide-ir` resolve these
+//! into typed and flat forms.
+//!
+//! Every node carries a [`Span`] so error reporting and IDE features
+//! can map back to source. `ErrorNode` is the parser's recovery
+//! placeholder when local resync skipped tokens.
+//!
+//! The 90+ public types here are organized in sections (Module / Const /
+//! Type / Entity / System / Verify / Theorem / Scene / Expr / Type).
+//! Each section's grouping enum carries its own doc comment; individual
+//! `*Decl` structs mirror their named surface form.
+
 use crate::span::Span;
 
 // ── Program ──────────────────────────────────────────────────────────
 
+/// Root of a parsed `.ab` file: the ordered list of top-level
+/// declarations plus the file's full span.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub decls: Vec<TopDecl>,
     pub span: Span,
 }
 
+/// Placeholder left in the AST when the parser skipped one or more
+/// tokens during error recovery. The `skipped_tokens` field is kept
+/// for diagnostic context — it is not interpreted.
 #[derive(Debug, Clone)]
 pub struct ErrorNode {
     pub skipped_tokens: Vec<String>,
     pub span: Span,
 }
 
+/// A top-level declaration. The variant order is documentation, not
+/// significance — the parser preserves source order via the
+/// surrounding `Vec<TopDecl>`.
 #[derive(Debug, Clone)]
 pub enum TopDecl {
     Module(ModuleDecl),
@@ -56,12 +81,21 @@ pub struct IncludeDecl {
     pub span: Span,
 }
 
+/// Visibility marker for declarations that support `pub`.
+///
+/// `Private` is the default; `Public` is set when the declaration was
+/// preceded by the `pub` keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
+    /// `pub` declaration — accessible from outside the module.
     Public,
+    /// Module-local default.
     Private,
 }
 
+/// A `use` import. The variants distinguish the four shapes the surface
+/// syntax accepts: `use M::*`, `use M::{a, b}`, `use M::name`, and
+/// `use M::name as alias`.
 #[derive(Debug, Clone)]
 pub enum UseDecl {
     All {
@@ -101,6 +135,7 @@ pub enum UseItem {
 
 // ── Constants and Pure Functions ─────────────────────────────────────
 
+/// `[pub] const NAME = expr` — a top-level constant.
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
@@ -109,6 +144,11 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
+/// `[pub] fn NAME(params): Ret { body }` — a pure function.
+///
+/// The `body` is a single expression (block bodies are
+/// [`Expr::Block`]). `contracts` carries any `requires` / `ensures` /
+/// `decreases` clauses attached at the surface.
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
@@ -129,6 +169,11 @@ pub struct TypedParam {
 
 // ── Type Declarations ────────────────────────────────────────────────
 
+/// `[pub] type Name[T, …] { variants }` — an algebraic type.
+///
+/// `RecordDecl` covers the struct/record form; this type covers the
+/// enum/sum form. `type_params` carries any leading `[T, ...]`
+/// declaration.
 #[derive(Debug, Clone)]
 pub struct TypeDecl {
     pub name: String,
@@ -139,23 +184,27 @@ pub struct TypeDecl {
     pub span: Span,
 }
 
+/// One variant inside a [`TypeDecl`]. Mirrors the four surface forms a
+/// constructor can take: bare, positional fields, named fields, or a
+/// type-parameter pass-through used by generics.
 #[derive(Debug, Clone)]
 pub enum TypeVariant {
-    Simple {
-        name: String,
-        span: Span,
-    },
+    /// `Name` — no payload.
+    Simple { name: String, span: Span },
     /// Tuple payload variant: `ok(Int)`, `ok(Int, String)`
     Tuple {
         name: String,
         fields: Vec<TypeRef>,
         span: Span,
     },
+    /// `Name { f: T, ... }` — named-field constructor.
     Record {
         name: String,
         fields: Vec<RecField>,
         span: Span,
     },
+    /// `Name<T1, T2, ...>` — parameterized variant (used in generic
+    /// type passthroughs).
     Param {
         name: String,
         types: Vec<TypeRef>,
@@ -163,6 +212,7 @@ pub enum TypeVariant {
     },
 }
 
+/// `[pub] struct Name { fields }` — a record/struct declaration.
 #[derive(Debug, Clone)]
 pub struct RecordDecl {
     pub name: String,
@@ -171,6 +221,7 @@ pub struct RecordDecl {
     pub span: Span,
 }
 
+/// One field of a record (struct decl or named-variant constructor).
 #[derive(Debug, Clone)]
 pub struct RecField {
     pub name: String,
@@ -199,12 +250,17 @@ pub struct NewtypeDecl {
 
 // ── Type References ──────────────────────────────────────────────────
 
+/// A reference to a type at a use site. Wraps a [`TypeRefKind`] with
+/// a [`Span`] for diagnostic mapping.
 #[derive(Debug, Clone)]
 pub struct TypeRef {
     pub kind: TypeRefKind,
     pub span: Span,
 }
 
+/// The shape of a [`TypeRef`]. Function types are right-associative
+/// (`A -> B -> C` ≡ `A -> (B -> C)`); refinement forms close over `$`
+/// (or a named binder) for the underlying value.
 #[derive(Debug, Clone)]
 pub enum TypeRefKind {
     /// `A -> B` (right-associative function type)
@@ -227,6 +283,9 @@ pub enum TypeRefKind {
 
 // ── Entity Declarations ──────────────────────────────────────────────
 
+/// `[pub] entity Name { items }` — an entity type declaration. Items
+/// preserve source order so the elaborator can rebuild the entity
+/// surface verbatim for diagnostics.
 #[derive(Debug, Clone)]
 pub struct EntityDecl {
     pub name: String,
@@ -235,6 +294,7 @@ pub struct EntityDecl {
     pub span: Span,
 }
 
+/// One declaration inside an `entity` body.
 #[derive(Debug, Clone)]
 pub enum EntityItem {
     Field(FieldDecl),
@@ -312,6 +372,9 @@ pub enum FieldDefault {
     Where(Expr),
 }
 
+/// A field declaration inside an entity or system body. The optional
+/// `default` matches one of the surface forms — `= expr`, `in { … }`,
+/// or `where expr`.
 #[derive(Debug, Clone)]
 pub struct FieldDecl {
     pub name: String,
@@ -320,6 +383,10 @@ pub struct FieldDecl {
     pub span: Span,
 }
 
+/// An `action NAME(refs)(params) { body }` declaration inside an
+/// entity. `ref_params` are the entity references the action operates
+/// on; `params` are the value parameters; `contracts` carries any
+/// `requires` / `ensures`.
 #[derive(Debug, Clone)]
 pub struct EntityAction {
     pub name: String,
@@ -339,25 +406,26 @@ pub struct Param {
     pub span: Span,
 }
 
+/// One contract clause: `requires`, `ensures`, or `decreases`.
+///
+/// `Decreases`'s `star` flag is set when the user wrote
+/// `decreases *` (the catch-all that defers to lexicographic ordering).
 #[derive(Debug, Clone)]
 pub enum Contract {
-    Requires {
-        expr: Expr,
-        span: Span,
-    },
-    Ensures {
-        expr: Expr,
-        span: Span,
-    },
+    /// `requires expr` — precondition.
+    Requires { expr: Expr, span: Span },
+    /// `ensures expr` — postcondition.
+    Ensures { expr: Expr, span: Span },
+    /// `decreases m1, m2, ... [*]` — termination measure for recursive
+    /// functions.
     Decreases {
         measures: Vec<Expr>,
         star: bool,
         span: Span,
     },
-    Invariant {
-        expr: Expr,
-        span: Span,
-    },
+    /// `invariant expr` — appears on theorem/lemma contracts as a
+    /// hypothesis (state invariant assumed across the proof).
+    Invariant { expr: Expr, span: Span },
 }
 
 // ── System Declarations ──────────────────────────────────────────────
@@ -384,6 +452,7 @@ pub struct StoreDecl {
     pub span: Span,
 }
 
+/// Inclusive size bounds `[lo..hi]` attached to a [`StoreParam`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreBounds {
     pub lo: i64,
@@ -422,6 +491,12 @@ pub struct ActivateDecl {
     pub span: Span,
 }
 
+/// `[pub] system Name(params) [implements I] { items }` — a system
+/// declaration.
+///
+/// `params` are the system's `Store<T>` constructor parameters; the
+/// optional `implements` names an interface the system claims to
+/// implement (verified by the elaborator).
 #[derive(Debug, Clone)]
 pub struct SystemDecl {
     pub name: String,
@@ -434,6 +509,8 @@ pub struct SystemDecl {
     pub span: Span,
 }
 
+/// `interface Name { items }` — abstract capability surface a system
+/// can `implements`. Items are signature-only (no executable bodies).
 #[derive(Debug, Clone)]
 pub struct InterfaceDecl {
     pub name: String,
@@ -441,6 +518,9 @@ pub struct InterfaceDecl {
     pub span: Span,
 }
 
+/// `extern Name { items }` — boundary surface for capabilities owned
+/// by something outside the spec. May declarations describe possible
+/// returns; assume items pin down fairness/behavior at the boundary.
 #[derive(Debug, Clone)]
 pub struct ExternDecl {
     pub name: String,
@@ -448,22 +528,34 @@ pub struct ExternDecl {
     pub span: Span,
 }
 
+/// One item inside an `interface` body.
 #[derive(Debug, Clone)]
 pub enum InterfaceItem {
+    /// Command signature.
     Command(CommandDecl),
+    /// Query signature.
     QuerySig(QuerySigDecl),
+    /// Parser error recovery placeholder.
     Error(ErrorNode),
 }
 
+/// One item inside an `extern` body. `CommandDecl` here is
+/// signature-only — the body field is left `None` by the parser.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum ExternItem {
+    /// Command signature.
     Command(CommandDecl),
+    /// `may Cmd -> @ok | @err` — enumeration of possible returns.
     May(MayDecl),
+    /// `assume { ... }` — boundary assumptions (fairness, behavior).
     Assume(ExternAssumeBlock),
+    /// Parser error recovery placeholder.
     Error(ErrorNode),
 }
 
+/// `may CMD -> @r1 | @r2 | ...` — declares the possible return atoms
+/// of an `extern` command.
 #[derive(Debug, Clone)]
 pub struct MayDecl {
     pub command: String,
@@ -471,16 +563,21 @@ pub struct MayDecl {
     pub span: Span,
 }
 
+/// `assume { items }` body inside an `extern` declaration.
 #[derive(Debug, Clone)]
 pub struct ExternAssumeBlock {
     pub items: Vec<ExternAssumeItem>,
     pub span: Span,
 }
 
+/// One item inside an [`ExternAssumeBlock`].
 #[derive(Debug, Clone)]
 pub enum ExternAssumeItem {
+    /// `fair PATH` — weak fairness on the named extern command.
     Fair { path: EventPath, span: Span },
+    /// `strong fair PATH` — strong fairness on the named extern command.
     StrongFair { path: EventPath, span: Span },
+    /// Bare boolean assumption.
     Expr { expr: Expr, span: Span },
 }
 
@@ -568,12 +665,20 @@ pub enum ProcDepCond {
     Or(Box<ProcDepCond>, Box<ProcDepCond>),
 }
 
+/// One declaration inside a `system` body. Cf. [`ProgramItem`] for
+/// the more restricted set legal in `program` bodies.
 #[derive(Debug, Clone)]
 pub enum SystemItem {
+    /// Flat state field.
     Field(FieldDecl),
+    /// `dep Other` — declares a dependency on another system (used by
+    /// program composition).
     Dep(DepDecl),
+    /// Public command (`command name(...)`).
     Command(CommandDecl),
+    /// Private internal action (`action name(...)`).
     Action(SystemActionDecl),
+    /// Public query.
     Query(QueryDecl),
     /// System-internal predicate (). Not cross-system callable.
     Pred(PredDecl),
@@ -581,11 +686,16 @@ pub enum SystemItem {
     /// direct system field. This remains a narrow field-lifecycle
     /// contract, not a workflow/process construct.
     Fsm(FsmDecl),
+    /// `derived NAME = expr`.
     Derived(DerivedDecl),
+    /// `invariant NAME { expr }`.
     Invariant(InvariantDecl),
+    /// Parser error recovery placeholder.
     Error(ErrorNode),
 }
 
+/// `dep Other` — declares this system depends on another system.
+/// Used by program composition.
 #[derive(Debug, Clone)]
 pub struct DepDecl {
     pub name: String,
@@ -639,14 +749,23 @@ pub struct QueryDecl {
     pub span: Span,
 }
 
+/// One statement inside a command/action body — the operational
+/// surface.
 #[derive(Debug, Clone)]
 pub enum EventItem {
+    /// `choose x: T where p { body }`.
     Choose(ChooseBlock),
+    /// `for x: T { body }`.
     For(ForBlock),
+    /// `create T { f: v, ... }`.
     Create(CreateBlock),
+    /// `let name = Sys::cmd(args)`.
     LetCall(EventLetCall),
+    /// Body-level `match` over a command result or local variable.
     Match(EventMatchBlock),
+    /// Bare expression statement.
     Expr(Expr),
+    /// Parser error recovery placeholder.
     Error(ErrorNode),
 }
 
@@ -730,6 +849,8 @@ pub struct CreateField {
 
 // ── Predicates and Properties ────────────────────────────────────────
 
+/// `[pub] pred NAME(params) = body` — a boolean function used inside
+/// contracts and verification blocks.
 #[derive(Debug, Clone)]
 pub struct PredDecl {
     pub name: String,
@@ -739,6 +860,8 @@ pub struct PredDecl {
     pub span: Span,
 }
 
+/// `[pub] prop NAME for Sys1, Sys2, ... = body` — a temporal
+/// property scoped to one or more systems.
 #[derive(Debug, Clone)]
 pub struct PropDecl {
     pub name: String,
@@ -811,6 +934,8 @@ pub struct VerifyDecl {
 
 // ── Theorem Blocks () ─────────────────────────────────────────
 
+/// `theorem NAME for Sys [assume { ... }] { invariant ...; show ...; by file/lemmas }`
+/// — an unbounded proof obligation.
 #[derive(Debug, Clone)]
 pub struct TheoremDecl {
     pub name: String,
@@ -856,6 +981,8 @@ pub struct UnderBlock {
     pub span: Span,
 }
 
+/// `lemma NAME [assume { ... }] { body }` — a reusable proof step,
+/// attached to theorems via `by NAME`.
 #[derive(Debug, Clone)]
 pub struct LemmaDecl {
     pub name: String,
@@ -867,6 +994,8 @@ pub struct LemmaDecl {
 
 // ── Axiom Declarations () ─────────────────────────────────────
 
+/// `axiom NAME { body } [by "file"]` — a trusted hypothesis, optionally
+/// backed by an external proof artifact.
 #[derive(Debug, Clone)]
 pub struct AxiomDecl {
     pub name: String,
@@ -1014,19 +1143,26 @@ pub struct ThenItem {
 
 // ── Expressions ──────────────────────────────────────────────────────
 
+/// An expression: kind plus its source span.
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
-/// Kind of arithmetic aggregator (, ).
+/// Surface aggregator kind. Mirrors the IR-level
+/// [`IRAggKind`](crate::ast).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggKind {
+    /// `sum x: T | body`.
     Sum,
+    /// `product x: T | body`.
     Product,
+    /// `min x: T | body`.
     Min,
+    /// `max x: T | body`.
     Max,
+    /// `count x: T | predicate`.
     Count,
 }
 
@@ -1038,20 +1174,37 @@ pub enum SawArg {
     Expr(Expr),
 }
 
+/// Surface expression vocabulary.
+///
+/// Variants are grouped by precedence level (Level 0 = loosest), which
+/// mirrors the parser's recursive descent layering. Most variants are
+/// directly the parsed form — desugaring happens in `abide-sema` and
+/// `abide-ir`. The composition operators (`Pipe`, `Unord`, `Conc`,
+/// `Xor`, `Seq`, `SameStep`) are illegal inside contracts; the
+/// elaborator enforces that constraint.
 #[derive(Debug, Clone)]
 pub enum ExprKind {
+    /// Parser error recovery placeholder.
     Error(ErrorNode),
     // Level 0: composition, pipe
+    /// `a |> b` — pipeline operator.
     Pipe(Box<Expr>, Box<Expr>),
+    /// `a || b` — concurrent (unordered) composition.
     Unord(Box<Expr>, Box<Expr>),
+    /// `a | b` — choice composition.
     Conc(Box<Expr>, Box<Expr>),
+    /// `a ^| b` — exclusive choice.
     Xor(Box<Expr>, Box<Expr>),
+    /// `name: expr` — named pair (used inside composition forms).
     NamedPair(String, Box<Expr>),
 
     // Level 1: sequence
+    /// `a -> b` — sequence composition. **Not implication**; use
+    /// `Impl` for that.
     Seq(Box<Expr>, Box<Expr>),
 
     // Level 2: same-step
+    /// `a & b` — same-step composition.
     SameStep(Box<Expr>, Box<Expr>),
 
     // Level 3: implies, temporal, quantifiers, let, lambda
@@ -1230,6 +1383,12 @@ pub struct MatchArm {
     pub span: Span,
 }
 
+/// Surface pattern used in `match` arms.
+///
+/// `Var(name)` is intentionally ambiguous at parse time: it may bind
+/// `name` or match the constructor named `name`. The elaborator
+/// disambiguates by checking whether `name` resolves to a constructor
+/// in scope. `Ctor`'s trailing `bool` marks the `..` rest-pattern.
 #[derive(Debug, Clone)]
 pub enum Pattern {
     /// Variable or simple constructor name (disambiguated during elaboration)

@@ -9,23 +9,39 @@ use super::types::{
 };
 use crate::ast::{UseDecl, Visibility};
 
-/// What kind of top-level declaration.
+/// Classification tag for a top-level declaration recorded in the
+/// symbol table. Used by visibility and name-resolution dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclKind {
+    /// `type Name = ...` declaration (records, enums, aliases, newtypes).
     Type,
+    /// `entity Name { ... }`.
     Entity,
+    /// `interface Name { ... }`.
     Interface,
+    /// `extern Name { ... }`.
     Extern,
+    /// `system Name(...) { ... }`.
     System,
+    /// `proc Name(...) { ... }` (program-scope).
     Proc,
+    /// `pred Name(...) = ...`.
     Pred,
+    /// `prop Name for Sys = ...`.
     Prop,
+    /// `verify Name { ... }`.
     Verify,
+    /// `scene Name { ... }`.
     Scene,
+    /// `theorem Name for Sys { ... }`.
     Theorem,
+    /// `axiom Name { ... }`.
     Axiom,
+    /// `lemma Name { ... }`.
     Lemma,
+    /// `const Name = ...`.
     Const,
+    /// `fn Name(...): T { ... }`.
     Fn,
 }
 
