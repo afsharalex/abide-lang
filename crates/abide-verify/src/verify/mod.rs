@@ -65,6 +65,7 @@ use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use abide_core::diagnostic::Diagnostic;
 use abide_witness::{op, rel, Countermodel, EvidenceEnvelope, ProofArtifactRef, WitnessEnvelope};
 use serde::{Deserialize, Serialize};
 
@@ -929,6 +930,91 @@ impl VerificationResult {
         }
     }
 
+    /// Convert function verification outcomes into transport-friendly diagnostics.
+    ///
+    /// Successful proof/check results intentionally return `None`; callers can
+    /// render those as ordinary verification results. This adapter is the shared
+    /// surface for CLI/report/LSP diagnostics that need stable codes, severity,
+    /// source location, and user-facing messages for failed or admitted function
+    /// obligations.
+    #[must_use]
+    pub fn to_diagnostic(&self) -> Option<Diagnostic> {
+        match self {
+            Self::FnContractFailed {
+                name,
+                counterexample,
+                span,
+                file,
+            } => Some(attach_diagnostic_source(
+                Diagnostic::error(format!("function `{name}` violates its ensures contract"))
+                    .with_code("abide::verify::fn_ensures_failed")
+                    .with_help(fn_counterexample_help(counterexample)),
+                *span,
+                file.as_deref(),
+            )),
+            Self::FnContractAdmitted {
+                name,
+                reason,
+                span,
+                file,
+                ..
+            } => {
+                let code = if reason.contains("sorry") {
+                    "abide::verify::fn_admitted_sorry"
+                } else if reason.contains("todo") {
+                    "abide::verify::fn_admitted_todo"
+                } else if reason.contains("assume") {
+                    "abide::verify::fn_admitted_assume"
+                } else {
+                    "abide::verify::fn_admitted"
+                };
+                Some(attach_diagnostic_source(
+                    Diagnostic::warning(format!(
+                        "function `{name}` verification is admitted: {reason}"
+                    ))
+                    .with_code(code)
+                    .with_help(
+                        "admitted function obligations are trusted locally; other functions are still verified",
+                    ),
+                    *span,
+                    file.as_deref(),
+                ))
+            }
+            Self::Admitted {
+                name,
+                reason,
+                span,
+                file,
+                ..
+            } => Some(attach_diagnostic_source(
+                Diagnostic::warning(format!("verification `{name}` is admitted: {reason}"))
+                    .with_code("abide::verify::proof_admitted")
+                    .with_help(
+                        "admitted proof obligations are trusted; run full CLI or REPL verification before relying on them",
+                    ),
+                *span,
+                file.as_deref(),
+            )),
+            Self::Unprovable {
+                name,
+                hint,
+                span,
+                file,
+            } if name.starts_with("fn_") => {
+                let function_name = name.strip_prefix("fn_").unwrap_or(name);
+                let (code, message) = classify_function_unprovable(function_name, hint);
+                Some(attach_diagnostic_source(
+                    Diagnostic::error(message)
+                        .with_code(code)
+                        .with_help(hint.clone()),
+                    *span,
+                    file.as_deref(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Result-level evidence payload, when available.
     pub fn evidence(&self) -> Option<&EvidenceEnvelope> {
         match self {
@@ -1022,6 +1108,89 @@ impl VerificationResult {
             _ => &[],
         }
     }
+}
+
+fn attach_diagnostic_source(
+    mut diagnostic: Diagnostic,
+    span: Option<crate::span::Span>,
+    file: Option<&str>,
+) -> Diagnostic {
+    if let Some(span) = span {
+        diagnostic = diagnostic.with_span(span);
+    }
+    if let Some(file) = file {
+        diagnostic = diagnostic.in_file(file.to_owned());
+    }
+    diagnostic
+}
+
+fn fn_counterexample_help(counterexample: &[(String, String)]) -> String {
+    if counterexample.is_empty() {
+        "the solver found inputs that violate the ensures clause".to_owned()
+    } else {
+        format!(
+            "counterexample: {}",
+            counterexample
+                .iter()
+                .map(|(name, value)| format!("{name} = {value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn classify_function_unprovable(function_name: &str, hint: &str) -> (&'static str, String) {
+    if hint.contains(crate::messages::FN_CALL_PRECONDITION_FAILED) || hint.contains("precondition")
+    {
+        (
+            "abide::verify::fn_precondition_failed",
+            format!("function `{function_name}` may call another function without satisfying its requires clause"),
+        )
+    } else if hint.contains(crate::messages::FN_TERMINATION_FAILED)
+        || hint.contains(crate::messages::FN_LOOP_TERMINATION_FAILED)
+        || hint.contains("termination")
+        || hint.contains("decreases")
+    {
+        (
+            "abide::verify::fn_decreases_failed",
+            format!(
+                "function `{function_name}` has an unproved decreases or termination obligation"
+            ),
+        )
+    } else if hint.contains(crate::messages::FN_LOOP_NO_INVARIANT)
+        || hint.contains(crate::messages::FN_LOOP_INIT_FAILED)
+        || hint.contains(crate::messages::FN_LOOP_PRESERVATION_FAILED)
+        || hint.contains("loop invariant")
+    {
+        (
+            "abide::verify::fn_loop_invariant_failed",
+            format!("function `{function_name}` has an unproved loop invariant obligation"),
+        )
+    } else if hint.contains(crate::messages::FN_ASSERT_FAILED) || hint.contains("assertion") {
+        (
+            "abide::verify::fn_assertion_failed",
+            format!("function `{function_name}` has an assertion that may not hold"),
+        )
+    } else {
+        (
+            "abide::verify::fn_unprovable",
+            format!("function `{function_name}` has an unproved verification obligation"),
+        )
+    }
+}
+
+/// Collect transport-friendly diagnostics from verifier results.
+///
+/// This is intentionally lossy for successful proof/check results: successes
+/// remain ordinary [`VerificationResult`] values, while failed or admitted
+/// function obligations become diagnostics that editor and report surfaces can
+/// display with stable codes and source locations.
+#[must_use]
+pub fn verification_diagnostics(results: &[VerificationResult]) -> Vec<Diagnostic> {
+    results
+        .iter()
+        .filter_map(VerificationResult::to_diagnostic)
+        .collect()
 }
 
 fn attach_backend_diagnostics(
@@ -1264,10 +1433,7 @@ pub struct VerifyConfig {
     pub cvc5_sygus: bool,
     /// Timeout for IC3/PDR attempts, in milliseconds.
     pub ic3_timeout_ms: u64,
-    /// Skip IC3/PDR for ordinary verify blocks.
-    ///
-    /// Theorems remain proof-oriented and may use IC3 unless a theorem-specific
-    /// strategy gate is added. Scene and run/simulate paths do not use IC3.
+    /// Skip IC3/PDR for ordinary verify blocks and theorem proof attempts.
     pub no_ic3: bool,
     /// Skip automatic prop verification.
     pub no_prop_verify: bool,
@@ -1736,8 +1902,10 @@ fn check_prop_bmc_fallback(
 
 /// Verify all targets in an IR program.
 ///
-/// Processes verify blocks (tiered: induction → IC3 → BMC), scene blocks (SAT),
-/// and theorem blocks (IC3 → induction).
+/// Processes function-contract preflight first, then verify blocks
+/// (tiered: induction → IC3 → BMC), scene blocks (SAT), and theorem blocks
+/// (IC3 → induction). Hard function preflight failures gate later targets;
+/// admitted obligations remain visible but allow later verification to run.
 /// Returns one result per target, each carrying source location for diagnostic rendering.
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
     if let Some(result) = selected_target_error(ir, config) {
@@ -1856,6 +2024,94 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
     }
 }
 
+/// Verify only function contracts in an IR program.
+///
+/// This is intended for latency-sensitive editor feedback. It runs the same
+/// function preflight used by [`verify_all`] but does not dispatch verify
+/// blocks, scenes, lemmas, theorems, or props.
+pub fn verify_function_contracts_only(
+    ir: &IRProgram,
+    config: &VerifyConfig,
+) -> Vec<VerificationResult> {
+    let solver_family = match config.solver_selection {
+        SolverSelection::Cvc5 => {
+            if !is_solver_family_available(SolverFamily::Cvc5) {
+                return vec![unavailable_solver_result(
+                    "verification",
+                    "requested solver `cvc5` is not available in this build".to_owned(),
+                )];
+            }
+            SolverFamily::Cvc5
+        }
+        SolverSelection::Z3 | SolverSelection::Auto | SolverSelection::Both => SolverFamily::Z3,
+    };
+
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family);
+        run.verify_function_contracts();
+        run.finish()
+    })) {
+        Ok(results) => results,
+        Err(payload) => vec![VerificationResult::Unprovable {
+            name: "fn_verification".to_owned(),
+            hint: internal_verifier_hint(
+                &format!(
+                    "running {} function verification",
+                    solver_label(solver_family)
+                ),
+                &panic_message(payload),
+            ),
+            span: None,
+            file: None,
+        }],
+    }
+}
+
+/// Verify only theorem and lemma proof obligations in an IR program.
+///
+/// This focused entry point is intended for explicit editor or REPL preflight
+/// commands. It does not dispatch verify blocks, scenes, props, or function
+/// contract checks. Expensive proof search follows the supplied
+/// [`VerifyConfig`], so IC3/PDR remains disabled unless `no_ic3` is false.
+pub fn verify_proof_obligations_only(
+    ir: &IRProgram,
+    config: &VerifyConfig,
+) -> Vec<VerificationResult> {
+    let solver_family = match config.solver_selection {
+        SolverSelection::Cvc5 => {
+            if !is_solver_family_available(SolverFamily::Cvc5) {
+                return vec![unavailable_solver_result(
+                    "proof_verification",
+                    "requested solver `cvc5` is not available in this build".to_owned(),
+                )];
+            }
+            SolverFamily::Cvc5
+        }
+        SolverSelection::Z3 | SolverSelection::Auto | SolverSelection::Both => SolverFamily::Z3,
+    };
+
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family);
+        run.verify_lemmas();
+        run.verify_theorems();
+        run.finish()
+    })) {
+        Ok(results) => results,
+        Err(payload) => vec![VerificationResult::Unprovable {
+            name: "proof_verification".to_owned(),
+            hint: internal_verifier_hint(
+                &format!(
+                    "running {} proof obligation verification",
+                    solver_label(solver_family)
+                ),
+                &panic_message(payload),
+            ),
+            span: None,
+            file: None,
+        }],
+    }
+}
+
 fn verify_all_single(
     ir: &IRProgram,
     config: &VerifyConfig,
@@ -1928,11 +2184,14 @@ impl<'a> VerifyAllRun<'a> {
     }
 
     fn run(mut self) -> Vec<VerificationResult> {
+        self.verify_function_contracts();
+        if self.has_blocking_function_preflight_failure() {
+            return self.finish();
+        }
         self.verify_lemmas();
         self.verify_blocks();
         self.verify_scenes();
         self.verify_theorems();
-        self.verify_function_contracts();
         self.verify_props();
         self.finish()
     }
@@ -2180,7 +2439,7 @@ impl<'a> VerifyAllRun<'a> {
     }
 
     fn verify_function_contracts(&mut self) {
-        if self.config.no_fn_verify || !target_kind_matches(self.config, VerifyTargetKind::Fn) {
+        if self.config.no_fn_verify {
             return;
         }
         if let Err(hint) = set_active_solver_family(self.solver_family) {
@@ -2191,11 +2450,40 @@ impl<'a> VerifyAllRun<'a> {
                 self.ir,
                 &self.vctx,
                 &self.defs,
-                self.config,
+                &self.function_preflight_config(),
                 self.deadline,
                 &mut self.results,
             );
         }
+    }
+
+    fn function_preflight_config(&self) -> VerifyConfig {
+        let mut config = self.config.clone();
+        if self.selected_target_kind() != Some(VerifyTargetKind::Fn) {
+            config.target = None;
+        }
+        config
+    }
+
+    fn selected_target_kind(&self) -> Option<VerifyTargetKind> {
+        let selector = self.config.target.as_ref()?;
+        let matches: Vec<_> = available_verify_targets(self.ir)
+            .into_iter()
+            .filter(|entry| selector.matches(entry.kind, &entry.name))
+            .collect();
+        match matches.as_slice() {
+            [entry] => Some(entry.kind),
+            _ => None,
+        }
+    }
+
+    fn has_blocking_function_preflight_failure(&self) -> bool {
+        self.results.iter().any(|result| {
+            matches!(
+                result,
+                VerificationResult::FnContractFailed { .. } | VerificationResult::Unprovable { .. }
+            )
+        })
     }
 
     fn verify_props(&mut self) {
@@ -2332,6 +2620,24 @@ impl<'a> VerifyAllRun<'a> {
                 config,
                 self.deadline,
             )
+        } else if matches!(
+            &theorem_result,
+            VerificationResult::Proved { method, .. } if method == "1-induction"
+        ) {
+            let bounded_result = check_prop_bmc_fallback(
+                self.ir,
+                &self.vctx,
+                &self.defs,
+                func,
+                target_system,
+                config,
+                self.deadline,
+            );
+            if bounded_result.is_failure() {
+                bounded_result
+            } else {
+                theorem_result
+            }
         } else {
             theorem_result
         }

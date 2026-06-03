@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use abide_witness::{Countermodel, EvidenceEnvelope, WitnessEnvelope};
 
-use crate::ir::types::{IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify};
+use crate::ir::types::{
+    IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify, IRVerifySystem,
+};
 
 use super::context::VerifyContext;
 use super::defenv;
@@ -24,7 +26,7 @@ use super::{
 use super::{
     clamp_timeout_to_deadline, elapsed_ms, encode_property_at_step, expand_through_defs, expr_span,
     find_unsupported_in_actions, find_unsupported_scene_expr, try_liveness_reduction,
-    verification_timeout_hint, VerificationResult, VerifyConfig,
+    verification_timeout_hint, VerificationResult, VerifyConfig, WitnessSemantics,
 };
 
 fn encode_pure_property_expr(
@@ -166,9 +168,10 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
     }
 }
 
-// ── Theorem proving (IC3 → 1-induction) ─────────────────────────────
+// ── Theorem proving (optional IC3 → 1-induction) ────────────────────
 
 struct TheoremInductionCtx<'a> {
+    ir: &'a IRProgram,
     theorem: &'a IRTheorem,
     vctx: &'a VerifyContext,
     defs: &'a defenv::DefEnv,
@@ -251,12 +254,14 @@ pub(super) fn check_theorem_block(
         };
     }
 
-    // ── Try IC3/PDR (more powerful than 1-induction) ───────────────
+    // ── Try IC3/PDR when explicitly enabled ───────────────────────
     // IC3 discovers strengthening invariants automatically. If it proves
     // the property, we're done. If not, fall through to staged induction
     // which can leverage user-provided invariants.
-    if let Some(result) = try_ic3_on_theorem(ir, vctx, defs, theorem, config, _deadline) {
-        return result;
+    if !config.no_ic3 {
+        if let Some(result) = try_ic3_on_theorem(ir, vctx, defs, theorem, config, _deadline) {
+            return result;
+        }
     }
 
     let lemma_bools = match encode_theorem_lemma_assumptions(vctx, defs, theorem) {
@@ -264,6 +269,7 @@ pub(super) fn check_theorem_block(
         Err(result) => return *result,
     };
     if let Some(result) = run_theorem_induction(TheoremInductionCtx {
+        ir,
         theorem,
         vctx,
         defs,
@@ -663,6 +669,9 @@ fn encode_theorem_lemma_assumptions(
 }
 
 fn run_theorem_induction(ctx: TheoremInductionCtx<'_>) -> Option<VerificationResult> {
+    if let Some(result) = assert_non_vacuous_no_stutter(&ctx) {
+        return Some(result);
+    }
     if !ctx.theorem.invariants.is_empty() {
         if let Some(result) = prove_invariant_base(&ctx) {
             return Some(result);
@@ -715,7 +724,6 @@ fn prove_invariant_step(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationRes
     assert_domain_and_lemmas(ctx, &pool, &solver);
     assert_properties(ctx, &pool, &solver, &ctx.theorem.invariants, 0, "invariant")?;
     assert_transition_step(ctx, &pool, &solver)?;
-    assert_non_vacuous_no_stutter(ctx, &solver)?;
     assert_negated_properties(ctx, &pool, &solver, &ctx.theorem.invariants, 1, "invariant")?;
     match solver.check() {
         SatResult::Unsat => None,
@@ -790,7 +798,6 @@ fn prove_theorem_step(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
         "show expression",
     )?;
     assert_transition_step(ctx, &pool, &solver)?;
-    assert_non_vacuous_no_stutter(ctx, &solver)?;
     assert_negated_properties(
         ctx,
         &pool,
@@ -948,13 +955,64 @@ fn assert_transition_step(
     None
 }
 
-fn assert_non_vacuous_no_stutter(
-    ctx: &TheoremInductionCtx<'_>,
-    solver: &AbideSolver,
-) -> Option<VerificationResult> {
+fn assert_non_vacuous_no_stutter(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResult> {
     if ctx.theorem.assumption_set.stutter {
         return None;
     }
+    let deadlock_probe = IRVerify {
+        name: ctx.theorem.name.clone(),
+        depth: Some(1),
+        systems: ctx
+            .theorem
+            .systems
+            .iter()
+            .map(|name| IRVerifySystem {
+                name: name.clone(),
+                lo: 0,
+                hi: 1,
+            })
+            .collect(),
+        stores: vec![],
+        assumption_set: ctx.theorem.assumption_set.clone(),
+        activations: vec![],
+        initial_constraints: vec![],
+        asserts: vec![],
+        span: ctx.theorem.span,
+        file: ctx.theorem.file.clone(),
+    };
+    if matches!(
+        super::check_for_deadlock(
+            // The deadlock probe only reads the IR graph and synthesized
+            // verification site; it does not dispatch verify blocks.
+            ctx.ir,
+            ctx.vctx,
+            &deadlock_probe,
+            ctx.config,
+            ctx.deadline,
+            WitnessSemantics::Operational,
+        ),
+        Some(VerificationResult::Deadlock { .. })
+    ) {
+        return Some(VerificationResult::Unprovable {
+            name: ctx.theorem.name.clone(),
+            hint: crate::messages::THEOREM_VACUOUS_UNDER_NO_STUTTER.to_owned(),
+            span: None,
+            file: None,
+        });
+    }
+    let pool =
+        create_slot_pool_with_systems(ctx.relevant_entities, ctx.scope, 1, ctx.relevant_systems);
+    let solver = match induction_solver(ctx) {
+        Ok(solver) => solver,
+        Err(result) => return Some(*result),
+    };
+    for c in initial_state_constraints(&pool, &HashSet::new()) {
+        solver.assert(&c);
+    }
+    for c in domain_constraints(&pool, ctx.vctx, ctx.relevant_entities) {
+        solver.assert(&c);
+    }
+    assert_transition_step(ctx, &pool, &solver)?;
     if matches!(solver.check(), SatResult::Unsat) {
         return Some(VerificationResult::Unprovable {
             name: ctx.theorem.name.clone(),

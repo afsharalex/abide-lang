@@ -1,5 +1,6 @@
 //! Pure expression encoding — maps IR expressions to Z3 AST in a local variable environment.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::smt::{AbideSolver, Bool, Dynamic, FuncDecl, Int, SatResult, Sort};
@@ -13,6 +14,28 @@ use super::walkers::dynamic_to_smt_value;
 
 /// Counter for generating unique lambda function names.
 static LAMBDA_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static FN_PRECONDITION_FAILURE_SPAN: RefCell<Option<crate::span::Span>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn clear_fn_precondition_failure_span() {
+    FN_PRECONDITION_FAILURE_SPAN.with(|span| *span.borrow_mut() = None);
+}
+
+pub(super) fn take_fn_precondition_failure_span() -> Option<crate::span::Span> {
+    FN_PRECONDITION_FAILURE_SPAN.with(|span| span.borrow_mut().take())
+}
+
+fn record_fn_precondition_failure_span(span: Option<crate::span::Span>) {
+    FN_PRECONDITION_FAILURE_SPAN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = span;
+        }
+    });
+}
 
 // ── Z3 variable creation ────────────────────────────────────────────
 
@@ -877,6 +900,7 @@ fn verify_call_preconditions(expr: &IRExpr, scope: PureEncodingScope<'_>) -> Res
         }
         vc_solver.assert(smt::bool_not(&pre_bool));
         if vc_solver.check() != SatResult::Unsat {
+            record_fn_precondition_failure_span(super::expr_span(expr));
             return Err(crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned());
         }
     }

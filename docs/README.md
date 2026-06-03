@@ -21,6 +21,7 @@
 | [CLI Reference](cli.md) | Current command surface, flags, reporting modes, and file conventions |
 | [REPL](repl.md) | Interactive specification authoring, verification, simulation, and artifact exploration |
 | [QA Language](qa-language.md) | Structural query language plus verification/simulation artifact scripting |
+| [Editor Integration](editor-integration.md) | LSP verification policy, freshness guarantees, and editor status codes |
 | [Roadmap](roadmap.md) | What works now, what's next, what's deferred |
 | [Error Reference](errors.md) | Error codes (E001–E010), descriptions, and fix guidance |
 | [FAQ](faq.md) | Common questions and clarifications |

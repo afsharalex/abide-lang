@@ -3615,6 +3615,421 @@ fn verify_contracts_failing_ensures() {
     );
 }
 
+#[test]
+fn failing_fn_contract_gates_verify_blocks() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_gate.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightGate\n\n\
+         fn bad(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+         verify should_not_run {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { name, .. }
+                if name == "bad"
+        )),
+        "failing function contract should be reported: {results:#?}"
+    );
+    assert!(
+        !results.iter().any(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    | abide::verify::VerificationResult::Checked { name, .. }
+                    | abide::verify::VerificationResult::Counterexample { name, .. }
+                    | abide::verify::VerificationResult::Unprovable { name, .. }
+                    if name == "should_not_run"
+            )
+        }),
+        "verify block should not run after a failing function preflight: {results:#?}"
+    );
+}
+
+#[test]
+fn cli_targeted_verify_runs_fn_preflight_before_verify_block() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_target.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightTarget\n\n\
+         fn bad(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+         verify should_not_run {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg("--target")
+        .arg("verify:should_not_run")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "CLI should fail before the selected verify block when fn preflight fails\n{combined}"
+    );
+    assert!(
+        combined.contains("bad"),
+        "CLI output should name the failing function\n{combined}"
+    );
+    assert!(
+        !combined.contains("should_not_run"),
+        "selected verify block should not run after a failing function preflight\n{combined}"
+    );
+}
+
+#[test]
+fn admitted_fn_contract_allows_verify_blocks_with_disclosure() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_sorry.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightSorry\n\n\
+         fn admitted(x: int): int\n  ensures result > x\n{\n  sorry\n}\n\n\
+         verify still_runs {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let admitted_index = results
+        .iter()
+        .position(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                    if name == "admitted" && reason.contains("sorry")
+            )
+        })
+        .unwrap_or_else(|| panic!("sorry admission should be disclosed: {results:#?}"));
+    let verify_index = results
+        .iter()
+        .position(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    | abide::verify::VerificationResult::Checked { name, .. }
+                    if name == "still_runs"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("verify block should run after admitted preflight: {results:#?}")
+        });
+
+    assert!(
+        admitted_index < verify_index,
+        "function preflight disclosure should appear before verify block results: {results:#?}"
+    );
+}
+
+#[test]
+fn admitted_fn_contract_is_scoped_to_its_function() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_scoped_sorry.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightScopedSorry\n\n\
+         fn admitted(x: int): int\n  ensures result > x\n{\n  sorry\n}\n\n\
+         fn bad(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+         verify should_not_run {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("sorry")
+        )),
+        "sorry should admit only the function containing it: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { name, .. }
+                if name == "bad"
+        )),
+        "other functions must still be checked after a scoped sorry: {results:#?}"
+    );
+    assert!(
+        !results.iter().any(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    | abide::verify::VerificationResult::Checked { name, .. }
+                    | abide::verify::VerificationResult::Counterexample { name, .. }
+                    | abide::verify::VerificationResult::Unprovable { name, .. }
+                    if name == "should_not_run"
+            )
+        }),
+        "hard failures in other functions should still gate verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn todo_fn_contract_allows_verify_blocks_with_disclosure() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_todo.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightTodo\n\n\
+         fn admitted(x: int): int\n  ensures result > x\n{\n  todo\n}\n\n\
+         verify still_runs {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let admitted_index = results
+        .iter()
+        .position(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                    if name == "admitted" && reason.contains("todo")
+            )
+        })
+        .unwrap_or_else(|| panic!("todo admission should be disclosed: {results:#?}"));
+    let verify_index = results
+        .iter()
+        .position(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    | abide::verify::VerificationResult::Checked { name, .. }
+                    if name == "still_runs"
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("verify block should run after admitted preflight: {results:#?}")
+        });
+
+    assert!(
+        admitted_index < verify_index,
+        "function preflight disclosure should appear before verify block results: {results:#?}"
+    );
+}
+
+#[test]
+fn cli_verify_discloses_todo_admission_and_runs_verify_block() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_cli_todo.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightCliTodo\n\n\
+         fn admitted(x: int): int\n  ensures result > x\n{\n  todo\n}\n\n\
+         verify still_runs {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output.status.success(),
+        "CLI should continue after scoped todo admission\n{combined}"
+    );
+    assert!(
+        combined.contains("todo") && combined.contains("ADMITTED"),
+        "CLI should disclose the todo admission\n{combined}"
+    );
+    assert!(
+        combined.contains("still_runs"),
+        "verify block should run after admitted todo preflight\n{combined}"
+    );
+}
+
+#[test]
+fn todo_fn_contract_is_scoped_to_its_function() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("fn_preflight_scoped_todo.ab");
+    std::fs::write(
+        &file,
+        "module FnPreflightScopedTodo\n\n\
+         fn admitted(x: int): int\n  ensures result > x\n{\n  todo\n}\n\n\
+         fn bad(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+         verify should_not_run {\n  assert true\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("todo")
+        )),
+        "todo should admit only the function containing it: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { name, .. }
+                if name == "bad"
+        )),
+        "other functions must still be checked after a scoped todo: {results:#?}"
+    );
+    assert!(
+        !results.iter().any(|r| {
+            matches!(
+                r,
+                abide::verify::VerificationResult::Proved { name, .. }
+                    | abide::verify::VerificationResult::Checked { name, .. }
+                    | abide::verify::VerificationResult::Counterexample { name, .. }
+                    | abide::verify::VerificationResult::Unprovable { name, .. }
+                    if name == "should_not_run"
+            )
+        }),
+        "hard failures in other functions should still gate verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn function_verification_results_expose_diagnostics() {
+    let src = "module FnDiagnostics\n\n\
+        fn bad_ensures(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+        fn positive(x: int): int\n  requires x > 0\n{\n  x\n}\n\n\
+        fn caller_bad(x: int): int\n  ensures result == positive(x)\n{\n  positive(x)\n}\n\n\
+        fn bad_decreases(n: int): int\n  ensures result >= 0\n  decreases n\n{\n  if n <= 0 { 0 } else { bad_decreases(n + 1) }\n}\n\n\
+        fn admitted(x: int): int\n  ensures result > x\n{\n  sorry\n}\n";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("fn_diagnostics.ab");
+    std::fs::write(&file, src).expect("write spec");
+    let path = file.to_str().expect("utf8 source path");
+    let prog = lower_files(&[path]);
+
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let diagnostics = abide::verify::verification_diagnostics(&results);
+
+    let assert_code = |code: &str, severity: abide::diagnostic::DiagnosticSeverity| {
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some(code))
+            .unwrap_or_else(|| panic!("expected diagnostic code {code}: {diagnostics:#?}"));
+        assert_eq!(diagnostic.severity, severity, "{diagnostic:#?}");
+        assert!(
+            diagnostic.file.is_some(),
+            "diagnostic should carry source file: {diagnostic:#?}"
+        );
+        assert!(
+            diagnostic.span.is_some(),
+            "diagnostic should carry source span: {diagnostic:#?}"
+        );
+        diagnostic
+    };
+
+    let ensures = assert_code(
+        "abide::verify::fn_ensures_failed",
+        abide::diagnostic::DiagnosticSeverity::Error,
+    );
+    assert!(ensures.message.contains("bad_ensures"), "{ensures:#?}");
+
+    let precondition = assert_code(
+        "abide::verify::fn_precondition_failed",
+        abide::diagnostic::DiagnosticSeverity::Error,
+    );
+    assert!(
+        precondition.message.contains("caller_bad"),
+        "{precondition:#?}"
+    );
+
+    let decreases = assert_code(
+        "abide::verify::fn_decreases_failed",
+        abide::diagnostic::DiagnosticSeverity::Error,
+    );
+    assert!(
+        decreases.message.contains("bad_decreases"),
+        "{decreases:#?}"
+    );
+
+    let admitted = assert_code(
+        "abide::verify::fn_admitted_sorry",
+        abide::diagnostic::DiagnosticSeverity::Warning,
+    );
+    assert!(admitted.message.contains("admitted"), "{admitted:#?}");
+}
+
+#[test]
+fn function_verification_diagnostics_use_obligation_spans() {
+    let src = "module FnObligationSpans\n\n\
+        fn positive(x: int): int\n  requires x > 0\n{\n  x\n}\n\n\
+        fn caller_bad(x: int): int\n  ensures result == positive(x)\n{\n  positive(x)\n}\n\n\
+        fn assert_bad(x: int): int\n{\n  assert x > 0\n  x\n}\n\n\
+        fn bad_decreases(n: int): int\n  ensures result >= 0\n  decreases n\n{\n  if n <= 0 { 0 } else { bad_decreases(n + 1) }\n}\n";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("fn_obligation_spans.ab");
+    std::fs::write(&file, src).expect("write spec");
+    let path = file.to_str().expect("utf8 source path");
+    let prog = lower_files(&[path]);
+
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+    let diagnostics = abide::verify::verification_diagnostics(&results);
+
+    let assert_span_start = |code: &str, expected_fragment: &str, broader_fragment: &str| {
+        let expected_start = src.rfind(expected_fragment).expect(expected_fragment);
+        let broader_start = src.find(broader_fragment).expect(broader_fragment);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some(code))
+            .unwrap_or_else(|| panic!("expected diagnostic code {code}: {diagnostics:#?}"));
+        let span = diagnostic
+            .span
+            .unwrap_or_else(|| panic!("diagnostic should carry a span: {diagnostic:#?}"));
+
+        assert!(
+            span.start <= expected_start && expected_start < span.end,
+            "{code} should cover `{expected_fragment}`, got {span:?}"
+        );
+        assert_ne!(
+            span.start, broader_start,
+            "{code} should not fall back to the broader function span"
+        );
+    };
+
+    assert_span_start(
+        "abide::verify::fn_precondition_failed",
+        "positive(x)",
+        "fn caller_bad",
+    );
+    assert_span_start(
+        "abide::verify::fn_assertion_failed",
+        "assert x > 0",
+        "fn assert_bad",
+    );
+    assert_span_start(
+        "abide::verify::fn_decreases_failed",
+        "bad_decreases(n + 1)",
+        "fn bad_decreases",
+    );
+}
+
 // ── Imperative while-loop verification tests ────────────────────────
 
 #[test]

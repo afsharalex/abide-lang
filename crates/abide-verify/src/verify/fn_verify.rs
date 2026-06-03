@@ -55,7 +55,12 @@ fn new_timed_solver() -> AbideSolver {
     solver
 }
 
-type RecursiveCallSite = (Vec<Bool>, Vec<IRExpr>, HashMap<String, SmtValue>);
+type RecursiveCallSite = (
+    Vec<Bool>,
+    Vec<IRExpr>,
+    HashMap<String, SmtValue>,
+    Option<crate::span::Span>,
+);
 
 #[derive(Clone, Copy)]
 pub(super) struct FnBodyCtx<'a> {
@@ -178,25 +183,32 @@ pub(super) fn verify_fn_contracts(
             continue;
         }
 
-        // Skip fns without ensures clauses AND without assert/assume/sorry.
+        // Skip fns without ensures clauses AND without assert/assume/sorry/todo.
         // Functions with assert must be verified even without ensures — the
-        // assert itself is a verification obligation. Functions with sorry
-        // should report ADMITTED even without ensures.
+        // assert itself is a verification obligation. Functions with sorry or
+        // todo should report ADMITTED even without ensures.
         let has_asserts = body_contains_assert(&func.body);
-        let has_sorry = body_contains_sorry(&func.body);
-        if func.ensures.is_empty() && !has_asserts && !has_sorry {
+        let admitted_stub = if body_contains_sorry(&func.body) {
+            Some("sorry")
+        } else if body_contains_todo(&func.body) {
+            Some("todo")
+        } else {
+            None
+        };
+        if func.ensures.is_empty() && !has_asserts && admitted_stub.is_none() {
             continue;
         }
 
-        // Sorry in body: admit the entire proof obligation — postcondition,
+        // Sorry/todo in body: admit the entire proof obligation — postcondition,
         // termination, everything — without attempting any verification.
         // Sorry means "I know this is unproved" (like Lean's sorry or Agda's
-        // postulate). Checked before termination so that `sorry` in a
-        // recursive body doesn't report spurious termination failures.
-        if has_sorry {
+        // postulate); todo is the same scoped admission with a different
+        // disclosure. Checked before termination so recursive bodies don't
+        // report spurious termination failures.
+        if let Some(keyword) = admitted_stub {
             results.push(VerificationResult::FnContractAdmitted {
                 name: func.name.clone(),
-                reason: "sorry in body".to_owned(),
+                reason: format!("{keyword} in body"),
                 time_ms: 0,
                 span: func.span,
                 file: func.file.clone(),
@@ -217,20 +229,23 @@ pub(super) fn verify_fn_contracts(
                     verify_fn_termination(func, vctx, defs)
                 }))
                 .unwrap_or_else(|payload| {
-                    Err(super::internal_verifier_hint(
-                        "checking function termination",
-                        &super::panic_message(payload),
+                    Err(FnContractError::EncodingError(
+                        super::internal_verifier_hint(
+                            "checking function termination",
+                            &super::panic_message(payload),
+                        ),
                     ))
                 });
                 let _time_ms = elapsed_ms(&start);
                 if config.progress {
                     eprintln!(" done");
                 }
-                if let Err(msg) = term_result {
+                if let Err(err) = term_result {
+                    let (hint, obligation_span) = err.into_message_and_span();
                     results.push(VerificationResult::Unprovable {
                         name: format!("fn_{}", func.name),
-                        hint: msg,
-                        span: func.span,
+                        hint,
+                        span: obligation_span.or(func.span),
                         file: func.file.clone(),
                     });
                     termination_failed = true;
@@ -284,12 +299,15 @@ pub(super) fn verify_fn_contracts(
                 span: func.span,
                 file: func.file.clone(),
             },
-            Err(FnContractError::EncodingError(msg)) => VerificationResult::Unprovable {
-                name: format!("fn_{}", func.name),
-                hint: msg,
-                span: func.span,
-                file: func.file.clone(),
-            },
+            Err(err) => {
+                let (hint, obligation_span) = err.into_message_and_span();
+                VerificationResult::Unprovable {
+                    name: format!("fn_{}", func.name),
+                    hint,
+                    span: obligation_span.or(func.span),
+                    file: func.file.clone(),
+                }
+            }
         };
 
         if config.progress {
@@ -305,6 +323,39 @@ pub(super) enum FnContractError {
     Counterexample(Vec<(String, String)>),
     /// Encoding error: couldn't translate the expression to Z3.
     EncodingError(String),
+    /// Encoding or proof error tied to a more specific obligation span.
+    SpannedEncodingError {
+        message: String,
+        span: Option<crate::span::Span>,
+    },
+}
+
+impl FnContractError {
+    fn spanned(message: impl Into<String>, span: Option<crate::span::Span>) -> Self {
+        Self::SpannedEncodingError {
+            message: message.into(),
+            span,
+        }
+    }
+
+    fn into_message_and_span(self) -> (String, Option<crate::span::Span>) {
+        match self {
+            Self::EncodingError(message) => (message, None),
+            Self::SpannedEncodingError { message, span } => (message, span),
+            Self::Counterexample(_) => unreachable!("counterexamples are handled separately"),
+        }
+    }
+}
+
+impl From<String> for FnContractError {
+    fn from(message: String) -> Self {
+        let span = take_fn_precondition_failure_span();
+        if span.is_some() {
+            Self::spanned(message, span)
+        } else {
+            Self::EncodingError(message)
+        }
+    }
 }
 
 /// Verify a single function's ensures clauses against its body.
@@ -322,6 +373,7 @@ pub(super) fn verify_single_fn_contract(
 
     // Clear lambda axioms from any prior verification target
     clear_lambda_axioms();
+    clear_fn_precondition_failure_span();
 
     // Uncurry the function to get params and body
     let entry = defs.get(&func.name).ok_or_else(|| {
@@ -581,18 +633,10 @@ pub(super) fn encode_fn_body(
                     solver_constraints.push(assert_bool);
                     Ok(smt::bool_val(true))
                 }
-                SatResult::Sat | SatResult::Unknown(_) => {
-                    Err(FnContractError::EncodingError(if let Some(sp) = span {
-                        format!(
-                            "{} (at byte offset {}..{})",
-                            crate::messages::FN_ASSERT_FAILED,
-                            sp.start,
-                            sp.end,
-                        )
-                    } else {
-                        crate::messages::FN_ASSERT_FAILED.to_owned()
-                    }))
-                }
+                SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::spanned(
+                    crate::messages::FN_ASSERT_FAILED,
+                    *span,
+                )),
             }
         }
 
@@ -617,7 +661,7 @@ pub(super) fn encode_fn_body(
         _ => {
             let precheck = ctx.precheck();
             encode_pure_expr_checked(expr, env, ctx.vctx, ctx.defs, &precheck)
-                .map_err(FnContractError::EncodingError)
+                .map_err(FnContractError::from)
         }
     }
 }
@@ -772,8 +816,9 @@ fn verify_loop_init(
 
     match vc_solver.check() {
         SatResult::Unsat => Ok(()),
-        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::EncodingError(
-            crate::messages::FN_LOOP_INIT_FAILED.to_owned(),
+        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::spanned(
+            crate::messages::FN_LOOP_INIT_FAILED,
+            invariants.first().and_then(super::expr_span),
         )),
     }
 }
@@ -873,8 +918,9 @@ fn verify_loop_preservation(
 
     match vc_solver.check() {
         SatResult::Unsat => Ok(()),
-        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::EncodingError(
-            crate::messages::FN_LOOP_PRESERVATION_FAILED.to_owned(),
+        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::spanned(
+            crate::messages::FN_LOOP_PRESERVATION_FAILED,
+            invariants.first().and_then(super::expr_span),
         )),
     }
 }
@@ -1016,8 +1062,9 @@ fn verify_loop_termination(
 
     match vc_solver.check() {
         SatResult::Unsat => Ok(()),
-        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::EncodingError(
-            crate::messages::FN_LOOP_TERMINATION_FAILED.to_owned(),
+        SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::spanned(
+            crate::messages::FN_LOOP_TERMINATION_FAILED,
+            measures.first().and_then(super::expr_span),
         )),
     }
 }
@@ -1228,18 +1275,10 @@ fn execute_loop_body(
                     constraints.push(assert_bool);
                     Ok(())
                 }
-                SatResult::Sat | SatResult::Unknown(_) => {
-                    Err(FnContractError::EncodingError(if let Some(sp) = span {
-                        format!(
-                            "{} (at byte offset {}..{})",
-                            crate::messages::FN_ASSERT_FAILED,
-                            sp.start,
-                            sp.end,
-                        )
-                    } else {
-                        crate::messages::FN_ASSERT_FAILED.to_owned()
-                    }))
-                }
+                SatResult::Sat | SatResult::Unknown(_) => Err(FnContractError::spanned(
+                    crate::messages::FN_ASSERT_FAILED,
+                    *span,
+                )),
             }
         }
 
@@ -1379,7 +1418,7 @@ fn verify_fn_termination(
     func: &crate::ir::types::IRFunction,
     vctx: &VerifyContext,
     defs: &defenv::DefEnv,
-) -> Result<(), String> {
+) -> Result<(), FnContractError> {
     let dec = func.decreases.as_ref().ok_or_else(|| {
         "internal error: verify_fn_termination called without decreases".to_owned()
     })?;
@@ -1434,7 +1473,7 @@ fn verify_fn_termination(
         .collect::<Result<_, _>>()?;
 
     // Check each recursive call site
-    for (path_conds, actual_args, call_env) in &call_sites {
+    for (path_conds, actual_args, call_env, call_span) in &call_sites {
         // Evaluate actual arg values in the call-site env
         let mut substituted_env = env.clone();
         for (i, (param_name, _)) in params.iter().enumerate() {
@@ -1474,7 +1513,10 @@ fn verify_fn_termination(
             let all_callee_req = smt::bool_and(&callee_refs);
             vc_solver.assert(smt::bool_not(&all_callee_req));
             if vc_solver.check() != SatResult::Unsat {
-                return Err(crate::messages::FN_CALL_PRECONDITION_FAILED.to_owned());
+                return Err(FnContractError::spanned(
+                    crate::messages::FN_CALL_PRECONDITION_FAILED,
+                    *call_span,
+                ));
             }
         }
 
@@ -1523,7 +1565,10 @@ fn verify_fn_termination(
             match vc_solver.check() {
                 SatResult::Unsat => {}
                 _ => {
-                    return Err(crate::messages::FN_TERMINATION_FAILED.to_owned());
+                    return Err(FnContractError::spanned(
+                        crate::messages::FN_TERMINATION_FAILED,
+                        *call_span,
+                    ));
                 }
             }
         }
@@ -1549,9 +1594,12 @@ fn collect_recursive_calls(
                     // Record the env snapshot at this call site so that
                     // local variables (let/var bindings) are available
                     // when evaluating the actual arguments later.
-                    search
-                        .call_sites
-                        .push((search.path_conds.clone(), args, env.clone()));
+                    search.call_sites.push((
+                        search.path_conds.clone(),
+                        args,
+                        env.clone(),
+                        super::expr_span(expr),
+                    ));
                 }
             }
             if let IRExpr::App { func, arg, .. } = expr {

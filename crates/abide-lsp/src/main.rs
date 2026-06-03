@@ -47,6 +47,134 @@ struct OpenDocument {
     version: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorVerificationTrigger {
+    OnChange,
+    OnSave,
+    Manual,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorVerificationPolicy {
+    trigger: EditorVerificationTrigger,
+    debounce_ms: u64,
+    timeout_ms: u64,
+}
+
+impl Default for EditorVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            trigger: EditorVerificationTrigger::OnChange,
+            debounce_ms: 300,
+            timeout_ms: 1_500,
+        }
+    }
+}
+
+impl EditorVerificationPolicy {
+    fn from_initialization_options(options: Option<&serde_json::Value>) -> Self {
+        let mut policy = Self::default();
+        let Some(config) = verification_options(options) else {
+            return policy;
+        };
+
+        if config.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            policy.trigger = EditorVerificationTrigger::Disabled;
+        }
+        if let Some(mode) = config.get("mode").and_then(serde_json::Value::as_str) {
+            policy.trigger = match mode {
+                "change" | "onChange" | "on_change" => EditorVerificationTrigger::OnChange,
+                "save" | "onSave" | "on_save" => EditorVerificationTrigger::OnSave,
+                "manual" => EditorVerificationTrigger::Manual,
+                "disabled" | "off" => EditorVerificationTrigger::Disabled,
+                _ => policy.trigger,
+            };
+        }
+        if let Some(debounce_ms) = config.get("debounceMs").and_then(serde_json::Value::as_u64) {
+            policy.debounce_ms = debounce_ms;
+        }
+        if let Some(timeout_ms) = config.get("timeoutMs").and_then(serde_json::Value::as_u64) {
+            policy.timeout_ms = timeout_ms;
+        }
+        policy
+    }
+
+    fn should_schedule_on_change(self) -> bool {
+        matches!(self.trigger, EditorVerificationTrigger::OnChange)
+    }
+
+    fn should_schedule_on_save(self) -> bool {
+        matches!(self.trigger, EditorVerificationTrigger::OnSave)
+    }
+
+    fn should_run_automatically(self) -> bool {
+        matches!(
+            self.trigger,
+            EditorVerificationTrigger::OnChange | EditorVerificationTrigger::OnSave
+        )
+    }
+}
+
+fn verification_options(
+    options: Option<&serde_json::Value>,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    options
+        .and_then(|value| value.get("abide"))
+        .and_then(|value| value.get("verification"))
+        .or_else(|| options.and_then(|value| value.get("verification")))?
+        .as_object()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum EditorVerificationStatus {
+    Verifying,
+    Verified,
+    Failed,
+    Admitted,
+    Disabled,
+    TimedOut,
+    Cancelled,
+    Stale,
+}
+
+impl EditorVerificationStatus {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Verifying => "abide.lsp.verification.verifying",
+            Self::Verified => "abide.lsp.verification.verified",
+            Self::Failed => "abide.lsp.verification.failed",
+            Self::Admitted => "abide.lsp.verification.admitted",
+            Self::Disabled => "abide.lsp.verification.disabled",
+            Self::TimedOut => "abide.lsp.verification.timeout",
+            Self::Cancelled => "abide.lsp.verification.cancelled",
+            Self::Stale => "abide.lsp.verification.stale",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Verifying => "Abide verification is running",
+            Self::Verified => "Abide verification passed",
+            Self::Failed => "Abide verification found failures",
+            Self::Admitted => "Abide verification has admitted obligations",
+            Self::Disabled => "Abide editor verification is disabled",
+            Self::TimedOut => "Abide verification timed out",
+            Self::Cancelled => "Abide verification was cancelled",
+            Self::Stale => "Abide verification result is stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorVerificationRequest {
+    root_file_id: FileId,
+    root_uri: Url,
+    version: i32,
+    generation: u64,
+}
+
 /// Per-server-instance state shared behind a `tokio::Mutex`.
 ///
 /// Holds the compiler workspace (source for every file the LSP has
@@ -61,14 +189,22 @@ struct LspState {
     /// many files, and when a fix removes errors from one of them we
     /// must explicitly republish empty diagnostics for that URI.
     published_by_root: HashMap<FileId, HashSet<Url>>,
+    verification_policy: EditorVerificationPolicy,
+    verification_generations: HashMap<FileId, u64>,
 }
 
 impl LspState {
     fn new(root_dir: PathBuf) -> Self {
+        Self::new_with_policy(root_dir, EditorVerificationPolicy::default())
+    }
+
+    fn new_with_policy(root_dir: PathBuf, verification_policy: EditorVerificationPolicy) -> Self {
         Self {
             workspace: CompilerWorkspace::with_root_dir(root_dir),
             documents: HashMap::new(),
             published_by_root: HashMap::new(),
+            verification_policy,
+            verification_generations: HashMap::new(),
         }
     }
 
@@ -94,6 +230,36 @@ impl LspState {
             .iter()
             .any(|(other_root, uris)| *other_root != root_file_id && uris.contains(uri))
     }
+
+    fn begin_verification_request(
+        &mut self,
+        root_file_id: FileId,
+    ) -> Option<EditorVerificationRequest> {
+        let root_uri = Url::from_file_path(self.workspace.path(root_file_id)?).ok()?;
+        let version = self.document_version(&root_uri)?;
+        let generation = self
+            .verification_generations
+            .entry(root_file_id)
+            .and_modify(|generation| *generation += 1)
+            .or_insert(1);
+        Some(EditorVerificationRequest {
+            root_file_id,
+            root_uri,
+            version,
+            generation: *generation,
+        })
+    }
+
+    fn should_publish_verification_result(&self, request: &EditorVerificationRequest) -> bool {
+        self.verification_policy.trigger != EditorVerificationTrigger::Disabled
+            && self
+                .verification_generations
+                .get(&request.root_file_id)
+                .is_some_and(|generation| *generation == request.generation)
+            && self.documents.get(&request.root_uri).is_some_and(|doc| {
+                doc.file_id == request.root_file_id && doc.version == request.version
+            })
+    }
 }
 
 /// LSP request handler. All async methods serialize through the
@@ -106,12 +272,15 @@ struct Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let verification_policy = EditorVerificationPolicy::from_initialization_options(
+            params.initialization_options.as_ref(),
+        );
         let root_dir = params
             .root_uri
             .and_then(|uri| uri.to_file_path().ok())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        *self.state.lock().await = LspState::new(root_dir);
+        *self.state.lock().await = LspState::new_with_policy(root_dir, verification_policy);
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -379,46 +548,7 @@ impl Backend {
     async fn refresh_diagnostics(&self, root_file_id: FileId) {
         let (publish, stale, versions, log_error) = {
             let mut state = self.state.lock().await;
-            let mut grouped: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> = HashMap::new();
-            let mut current = HashSet::new();
-            let mut log_error = None;
-
-            match state.workspace.elaborate(root_file_id) {
-                Ok(elaborated) => {
-                    for diagnostic in &elaborated.diagnostics {
-                        let Some((uri, lsp_diagnostic)) =
-                            diagnostic_to_lsp(&state.workspace, root_file_id, diagnostic)
-                        else {
-                            continue;
-                        };
-                        current.insert(uri.clone());
-                        grouped.entry(uri).or_default().push(lsp_diagnostic);
-                    }
-                }
-                Err(error) => {
-                    log_error = Some(format!("failed to refresh diagnostics: {error:?}"));
-                }
-            }
-
-            let previous = state
-                .published_by_root
-                .insert(root_file_id, current.clone())
-                .unwrap_or_default();
-            let stale_uris: Vec<_> = previous
-                .difference(&current)
-                .filter(|uri| !state.uri_published_elsewhere(root_file_id, uri))
-                .cloned()
-                .collect();
-            let versions = state
-                .documents
-                .keys()
-                .cloned()
-                .map(|uri| {
-                    let version = state.document_version(&uri);
-                    (uri, version)
-                })
-                .collect::<HashMap<_, _>>();
-            (grouped, stale_uris, versions, log_error)
+            collect_diagnostics_for_root(&mut state, root_file_id)
         };
 
         if let Some(message) = log_error {
@@ -472,6 +602,83 @@ impl Backend {
         )?;
         Some((symbol, range))
     }
+}
+
+fn collect_diagnostics_for_root(
+    state: &mut LspState,
+    root_file_id: FileId,
+) -> (
+    HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>,
+    Vec<Url>,
+    HashMap<Url, Option<i32>>,
+    Option<String>,
+) {
+    let mut grouped: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> = HashMap::new();
+    let mut current = HashSet::new();
+    let mut log_error = None;
+
+    match state.workspace.lower(root_file_id) {
+        Ok(lowered) => {
+            for diagnostic in &lowered.diagnostics {
+                collect_lsp_diagnostic(state, root_file_id, diagnostic, &mut current, &mut grouped);
+            }
+
+            if state.verification_policy.should_run_automatically() {
+                let mut config = abide::verify::VerifyConfig::default();
+                config.overall_timeout_ms = state.verification_policy.timeout_ms;
+                config.induction_timeout_ms = state.verification_policy.timeout_ms;
+                let results =
+                    abide::verify::verify_function_contracts_only(&lowered.ir_program, &config);
+                for diagnostic in abide::verify::verification_diagnostics(&results) {
+                    collect_lsp_diagnostic(
+                        state,
+                        root_file_id,
+                        &diagnostic,
+                        &mut current,
+                        &mut grouped,
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            log_error = Some(format!("failed to refresh diagnostics: {error:?}"));
+        }
+    }
+
+    let previous = state
+        .published_by_root
+        .insert(root_file_id, current.clone())
+        .unwrap_or_default();
+    let stale_uris: Vec<_> = previous
+        .difference(&current)
+        .filter(|uri| !state.uri_published_elsewhere(root_file_id, uri))
+        .cloned()
+        .collect();
+    let versions = state
+        .documents
+        .keys()
+        .cloned()
+        .map(|uri| {
+            let version = state.document_version(&uri);
+            (uri, version)
+        })
+        .collect::<HashMap<_, _>>();
+    (grouped, stale_uris, versions, log_error)
+}
+
+fn collect_lsp_diagnostic(
+    state: &LspState,
+    root_file_id: FileId,
+    diagnostic: &Diagnostic,
+    current: &mut HashSet<Url>,
+    grouped: &mut HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>,
+) {
+    let Some((uri, lsp_diagnostic)) = diagnostic_to_lsp(&state.workspace, root_file_id, diagnostic)
+    else {
+        return;
+    };
+    current.insert(uri.clone());
+    grouped.entry(uri).or_default().push(lsp_diagnostic);
 }
 
 fn diagnostic_to_lsp(
@@ -776,5 +983,126 @@ mod tests {
         assert!(!state.should_accept_document_version(&uri, 2));
         assert!(!state.should_accept_document_version(&uri, 3));
         assert!(state.should_accept_document_version(&uri, 4));
+    }
+
+    #[test]
+    fn editor_verification_policy_parses_initialization_options() {
+        let options = serde_json::json!({
+            "abide": {
+                "verification": {
+                    "mode": "save",
+                    "debounceMs": 750,
+                    "timeoutMs": 1250
+                }
+            }
+        });
+
+        let policy = EditorVerificationPolicy::from_initialization_options(Some(&options));
+
+        assert_eq!(policy.trigger, EditorVerificationTrigger::OnSave);
+        assert_eq!(policy.debounce_ms, 750);
+        assert_eq!(policy.timeout_ms, 1250);
+        assert!(!policy.should_schedule_on_change());
+        assert!(policy.should_schedule_on_save());
+    }
+
+    #[test]
+    fn editor_verification_policy_supports_disabled_and_manual_modes() {
+        let disabled = EditorVerificationPolicy::from_initialization_options(Some(
+            &serde_json::json!({ "abide": { "verification": { "mode": "disabled" } } }),
+        ));
+        assert_eq!(disabled.trigger, EditorVerificationTrigger::Disabled);
+        assert!(!disabled.should_schedule_on_change());
+        assert!(!disabled.should_schedule_on_save());
+        assert_eq!(
+            EditorVerificationStatus::Disabled.code(),
+            "abide.lsp.verification.disabled"
+        );
+        assert_eq!(
+            EditorVerificationStatus::TimedOut.message(),
+            "Abide verification timed out"
+        );
+
+        let disabled_by_flag = EditorVerificationPolicy::from_initialization_options(Some(
+            &serde_json::json!({ "verification": { "enabled": false } }),
+        ));
+        assert_eq!(
+            disabled_by_flag.trigger,
+            EditorVerificationTrigger::Disabled
+        );
+
+        let manual = EditorVerificationPolicy::from_initialization_options(Some(
+            &serde_json::json!({ "abide": { "verification": { "mode": "manual" } } }),
+        ));
+        assert_eq!(manual.trigger, EditorVerificationTrigger::Manual);
+        assert!(!manual.should_schedule_on_change());
+        assert!(!manual.should_schedule_on_save());
+    }
+
+    #[test]
+    fn verification_request_version_guard_rejects_stale_results() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let uri = Url::parse("file:///tmp/example.ab").expect("uri");
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/example.ab", "fn f(): int { 0 }");
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 3,
+            },
+        );
+
+        let request = state
+            .begin_verification_request(file_id)
+            .expect("verification request");
+        assert!(state.should_publish_verification_result(&request));
+
+        state.documents.insert(
+            uri,
+            OpenDocument {
+                file_id,
+                version: 4,
+            },
+        );
+
+        assert!(!state.should_publish_verification_result(&request));
+    }
+
+    #[test]
+    fn lsp_diagnostics_include_function_contract_failures() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let file_id = state.workspace.set_file_source(
+            "/tmp/fn_lsp.ab",
+            "module FnLsp\n\n\
+             fn bad_ensures(x: int): int\n  ensures result > x\n{\n  x\n}\n\n\
+             fn positive(x: int): int\n  requires x > 0\n{\n  x\n}\n\n\
+             fn caller_bad(x: int): int\n  ensures result == positive(x)\n{\n  positive(x)\n}\n",
+        );
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let mut codes = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .filter_map(|diagnostic| diagnostic.code.as_ref())
+            .filter_map(|code| match code {
+                NumberOrString::String(code) => Some(code.clone()),
+                NumberOrString::Number(_) => None,
+            })
+            .collect::<Vec<_>>();
+        codes.sort();
+
+        assert!(
+            codes.contains(&"abide::verify::fn_ensures_failed".to_owned()),
+            "expected failing ensures diagnostic: {codes:#?}"
+        );
+        assert!(
+            codes.contains(&"abide::verify::fn_precondition_failed".to_owned()),
+            "expected call-site requires diagnostic: {codes:#?}"
+        );
     }
 }

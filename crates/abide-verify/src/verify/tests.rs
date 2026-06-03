@@ -11509,11 +11509,8 @@ fn theorem_step_case_does_not_vacuously_prove_under_no_stutter() {
 
     let ir = make_dead_event_theorem_ir(vec![], vec![trivial]);
 
-    // cover BOTH proof techniques with the
-    // default config. Pre-fix, both `try_ic3_on_theorem` (the CHC
-    // encoding) and the 1-induction action case vacuously discharged
-    // this theorem under no-stutter; the theorem-side fix has to
-    // gate both paths.
+    // Default theorem proof search covers the staged induction path. IC3/PDR
+    // theorem search is an explicit opt-in so editor preflight can stay light.
     let results = verify_all(&ir, &VerifyConfig::default());
     assert_eq!(results.len(), 1);
     assert!(
@@ -11584,7 +11581,8 @@ fn theorem_invariant_preservation_does_not_vacuously_prove_under_no_stutter() {
 
     let ir = make_dead_event_theorem_ir(vec![trivial_inv], vec![trivial_show]);
 
-    // cover both IC3 and induction.
+    // Default theorem proof search covers the staged induction path. IC3/PDR
+    // theorem search is an explicit opt-in so editor preflight can stay light.
     let results = verify_all(&ir, &VerifyConfig::default());
     assert_eq!(results.len(), 1);
     assert!(
@@ -18611,10 +18609,14 @@ fn multi_apply_forall_scene_checks_final_state() {
 
 /// Helper: build an IR program with a single function (no entities/systems).
 fn make_fn_ir(func: IRFunction) -> IRProgram {
+    make_fns_ir(vec![func])
+}
+
+fn make_fns_ir(functions: Vec<IRFunction>) -> IRProgram {
     IRProgram {
         types: vec![],
         constants: vec![],
-        functions: vec![func],
+        functions,
         entities: vec![],
         systems: vec![],
         verifies: vec![],
@@ -18622,6 +18624,649 @@ fn make_fn_ir(func: IRFunction) -> IRProgram {
         axioms: vec![],
         lemmas: vec![],
         scenes: vec![],
+    }
+}
+
+fn make_empty_ir() -> IRProgram {
+    make_fns_ir(vec![])
+}
+
+fn span(start: usize, end: usize) -> crate::span::Span {
+    crate::span::Span { start, end }
+}
+
+fn trivial_verify_block(name: &str) -> IRVerify {
+    IRVerify {
+        name: name.to_owned(),
+        depth: Some(0),
+        systems: vec![],
+        stores: vec![],
+        assumption_set: IRAssumptionSet::default_for_verify(),
+        activations: vec![],
+        initial_constraints: vec![],
+        asserts: vec![IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        }],
+        span: None,
+        file: None,
+    }
+}
+
+fn bad_identity_fn_contract() -> IRFunction {
+    IRFunction {
+        name: "bad".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "result".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        decreases: None,
+        span: None,
+        file: None,
+    }
+}
+
+fn admitted_sorry_fn_contract() -> IRFunction {
+    IRFunction {
+        name: "admitted".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Sorry { span: None }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "result".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        decreases: None,
+        span: None,
+        file: None,
+    }
+}
+
+fn admitted_todo_fn_contract() -> IRFunction {
+    IRFunction {
+        name: "admitted".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Todo { span: None }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "result".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        decreases: None,
+        span: None,
+        file: None,
+    }
+}
+
+#[test]
+fn failing_fn_contract_preflight_stops_verify_dispatch() {
+    let mut ir = make_fn_ir(bad_identity_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        matches!(&results[0], VerificationResult::FnContractFailed { name, .. } if name == "bad"),
+        "function contract should be checked before verify blocks: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "verify block should not run after hard preflight failure: {results:#?}"
+    );
+}
+
+#[test]
+fn failing_fn_contract_preflight_stops_targeted_verify_dispatch() {
+    let mut ir = make_fn_ir(bad_identity_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+    let config = VerifyConfig {
+        target: Some("verify:should_not_run".parse().unwrap()),
+        ..VerifyConfig::default()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(&results[0], VerificationResult::FnContractFailed { name, .. } if name == "bad"),
+        "function contract should gate targeted verify blocks: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "targeted verify block should not run after hard preflight failure: {results:#?}"
+    );
+}
+
+#[test]
+fn admitted_fn_contract_preflight_discloses_then_allows_verify_dispatch() {
+    let mut ir = make_fn_ir(admitted_sorry_fn_contract());
+    ir.verifies.push(trivial_verify_block("still_runs"));
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("sorry")
+        ),
+        "admission should be disclosed before verify block results: {results:#?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result_name(result) == "still_runs"),
+        "verify block should run after admitted preflight: {results:#?}"
+    );
+}
+
+#[test]
+fn admitted_fn_contract_does_not_suppress_other_fn_preflight() {
+    let mut ir = make_fn_ir(admitted_sorry_fn_contract());
+    ir.functions.push(bad_identity_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("sorry")
+        )),
+        "sorry should admit only the function containing it: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::FnContractFailed { name, .. } if name == "bad"
+        )),
+        "other functions must still be checked after a scoped sorry: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "hard failures in other functions should still gate verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn todo_fn_contract_preflight_discloses_then_allows_verify_dispatch() {
+    let mut ir = make_fn_ir(admitted_todo_fn_contract());
+    ir.verifies.push(trivial_verify_block("still_runs"));
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("todo")
+        ),
+        "todo admission should be disclosed before verify block results: {results:#?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result_name(result) == "still_runs"),
+        "verify block should run after admitted todo preflight: {results:#?}"
+    );
+}
+
+#[test]
+fn todo_fn_contract_does_not_suppress_other_fn_preflight() {
+    let mut ir = make_fn_ir(admitted_todo_fn_contract());
+    ir.functions.push(bad_identity_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("todo")
+        )),
+        "todo should admit only the function containing it: {results:#?}"
+    );
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::FnContractFailed { name, .. } if name == "bad"
+        )),
+        "other functions must still be checked after a scoped todo: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "hard failures in other functions should still gate verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn function_contracts_only_does_not_dispatch_verify_blocks() {
+    let mut ir = make_fn_ir(admitted_todo_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+
+    let results = verify_function_contracts_only(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "admitted" && reason.contains("todo")
+        )),
+        "function-only pass should still report function preflight: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "function-only pass must not dispatch verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn proof_obligations_only_reports_theorem_admission_without_verify_blocks() {
+    let mut ir = make_empty_ir();
+    ir.theorems.push(IRTheorem {
+        name: "external_fact".to_owned(),
+        systems: vec![],
+        assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        invariants: vec![],
+        shows: vec![bool_lit(true)],
+        by_file: Some("proofs/external.agda".to_owned()),
+        by_lemmas: vec![],
+        span: Some(span(10, 20)),
+        file: Some("proof.ab".to_owned()),
+    });
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+
+    let results = verify_proof_obligations_only(&ir, &VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::Admitted { name, reason, .. }
+                if name == "external_fact" && reason.contains("external proof artifact reference")
+        )),
+        "proof preflight should disclose theorem admissions: {results:#?}"
+    );
+    assert!(
+        !results
+            .iter()
+            .any(|result| result_name(result) == "should_not_run"),
+        "proof preflight must not dispatch verify blocks: {results:#?}"
+    );
+}
+
+#[test]
+fn admitted_proof_results_surface_as_diagnostics() {
+    let admitted = VerificationResult::Admitted {
+        name: "external_fact".to_owned(),
+        reason: "external proof artifact reference `proofs/external.agda`".to_owned(),
+        time_ms: 0,
+        evidence: None,
+        assumptions: vec![],
+        span: Some(span(30, 40)),
+        file: Some("proof.ab".to_owned()),
+    };
+
+    let diagnostic = admitted
+        .to_diagnostic()
+        .expect("admitted proof result should become a diagnostic");
+
+    assert_eq!(
+        diagnostic.code.as_deref(),
+        Some("abide::verify::proof_admitted")
+    );
+    assert_eq!(
+        diagnostic.severity,
+        abide_core::diagnostic::DiagnosticSeverity::Warning
+    );
+    assert_eq!(diagnostic.span, Some(span(30, 40)));
+    assert_eq!(diagnostic.file.as_deref(), Some("proof.ab"));
+}
+
+#[test]
+fn fn_precondition_failure_uses_call_site_span() {
+    let function_span = span(10, 20);
+    let call_span = span(40, 50);
+    let fn_ty = IRType::Fn {
+        param: Box::new(IRType::Int),
+        result: Box::new(IRType::Int),
+    };
+    let positive = IRFunction {
+        name: "positive".to_owned(),
+        ty: fn_ty.clone(),
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(int_lit(0)),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        ensures: vec![],
+        decreases: None,
+        span: None,
+        file: None,
+    };
+    let call = IRExpr::App {
+        func: Box::new(IRExpr::Var {
+            name: "positive".to_owned(),
+            ty: fn_ty,
+            span: None,
+        }),
+        arg: Box::new(IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        ty: IRType::Int,
+        span: Some(call_span),
+    };
+    let caller = IRFunction {
+        name: "caller_bad".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(call.clone()),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "result".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(call),
+            ty: IRType::Bool,
+            span: None,
+        }],
+        decreases: None,
+        span: Some(function_span),
+        file: None,
+    };
+
+    let results = verify_all(
+        &make_fns_ir(vec![positive, caller]),
+        &VerifyConfig::default(),
+    );
+    let result = results
+        .iter()
+        .find(|result| matches!(result, VerificationResult::Unprovable { name, .. } if name == "fn_caller_bad"))
+        .unwrap_or_else(|| panic!("expected caller precondition failure: {results:#?}"));
+
+    assert!(
+        matches!(
+            result,
+            VerificationResult::Unprovable { span, .. } if *span == Some(call_span)
+        ),
+        "precondition failure should use call-site span, not function span: {result:#?}"
+    );
+}
+
+#[test]
+fn fn_assertion_failure_uses_assert_span() {
+    let function_span = span(100, 160);
+    let assert_span = span(125, 135);
+    let assert_expr = IRExpr::Assert {
+        expr: Box::new(IRExpr::BinOp {
+            op: "OpGt".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(int_lit(0)),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        span: Some(assert_span),
+    };
+    let func = IRFunction {
+        name: "assert_bad".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Block {
+                exprs: vec![
+                    assert_expr,
+                    IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    },
+                ],
+                span: None,
+            }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
+        span: Some(function_span),
+        file: None,
+    };
+
+    let results = verify_all(&make_fn_ir(func), &VerifyConfig::default());
+    let result = results
+        .iter()
+        .find(|result| matches!(result, VerificationResult::Unprovable { name, .. } if name == "fn_assert_bad"))
+        .unwrap_or_else(|| panic!("expected assertion failure: {results:#?}"));
+
+    assert!(
+        matches!(
+            result,
+            VerificationResult::Unprovable { span, .. } if *span == Some(assert_span)
+        ),
+        "assertion failure should use assert span, not function span: {result:#?}"
+    );
+}
+
+#[test]
+fn function_result_diagnostics_classify_contract_outcomes() {
+    let span = crate::span::Span { start: 10, end: 20 };
+    let file = Some("test.ab".to_owned());
+    let failed = VerificationResult::FnContractFailed {
+        name: "bad".to_owned(),
+        counterexample: vec![("x".to_owned(), "0".to_owned())],
+        span: Some(span),
+        file: file.clone(),
+    }
+    .to_diagnostic()
+    .expect("failed fn contract diagnostic");
+    assert_eq!(
+        failed.code.as_deref(),
+        Some("abide::verify::fn_ensures_failed")
+    );
+    assert_eq!(
+        failed.severity,
+        abide_core::diagnostic::DiagnosticSeverity::Error
+    );
+    assert_eq!(failed.span, Some(span));
+    assert_eq!(failed.file, file);
+    assert!(failed.message.contains("bad"), "{failed:#?}");
+    assert!(
+        failed
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("x = 0")),
+        "{failed:#?}"
+    );
+
+    let admitted = VerificationResult::FnContractAdmitted {
+        name: "admitted".to_owned(),
+        reason: "sorry in body".to_owned(),
+        time_ms: 0,
+        span: Some(span),
+        file: Some("test.ab".to_owned()),
+    }
+    .to_diagnostic()
+    .expect("admitted fn contract diagnostic");
+    assert_eq!(
+        admitted.code.as_deref(),
+        Some("abide::verify::fn_admitted_sorry")
+    );
+    assert_eq!(
+        admitted.severity,
+        abide_core::diagnostic::DiagnosticSeverity::Warning
+    );
+    assert!(admitted.message.contains("admitted"), "{admitted:#?}");
+
+    let todo = VerificationResult::FnContractAdmitted {
+        name: "planned".to_owned(),
+        reason: "todo in body".to_owned(),
+        time_ms: 0,
+        span: Some(span),
+        file: Some("test.ab".to_owned()),
+    }
+    .to_diagnostic()
+    .expect("todo fn contract diagnostic");
+    assert_eq!(
+        todo.code.as_deref(),
+        Some("abide::verify::fn_admitted_todo")
+    );
+}
+
+#[test]
+fn function_result_diagnostics_classify_unprovable_obligations() {
+    let span = Some(crate::span::Span { start: 30, end: 40 });
+    let file = Some("test.ab".to_owned());
+    for (hint, expected_code) in [
+        (
+            crate::messages::FN_CALL_PRECONDITION_FAILED,
+            "abide::verify::fn_precondition_failed",
+        ),
+        (
+            crate::messages::FN_TERMINATION_FAILED,
+            "abide::verify::fn_decreases_failed",
+        ),
+        (
+            crate::messages::FN_LOOP_INIT_FAILED,
+            "abide::verify::fn_loop_invariant_failed",
+        ),
+        (
+            crate::messages::FN_ASSERT_FAILED,
+            "abide::verify::fn_assertion_failed",
+        ),
+    ] {
+        let diagnostic = VerificationResult::Unprovable {
+            name: "fn_bad".to_owned(),
+            hint: hint.to_owned(),
+            span,
+            file: file.clone(),
+        }
+        .to_diagnostic()
+        .unwrap_or_else(|| panic!("diagnostic for {hint}"));
+        assert_eq!(diagnostic.code.as_deref(), Some(expected_code));
+        assert_eq!(
+            diagnostic.severity,
+            abide_core::diagnostic::DiagnosticSeverity::Error
+        );
+        assert_eq!(diagnostic.span, span);
+        assert_eq!(diagnostic.file, file);
+        assert!(diagnostic.message.contains("bad"), "{diagnostic:#?}");
     }
 }
 

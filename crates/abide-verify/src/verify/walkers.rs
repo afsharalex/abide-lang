@@ -349,20 +349,41 @@ pub(super) fn body_contains_assume(expr: &IRExpr) -> bool {
 ///
 /// Walks the entire expression tree so nested forms like `x + sorry` are detected.
 pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
+    body_contains_admitted_stub(expr, |expr| matches!(expr, IRExpr::Sorry { .. }))
+}
+
+/// Check if a function body contains `todo`.
+/// Used to short-circuit verification — todo admits the local proof obligation.
+///
+/// Walks the entire expression tree so nested forms like `x + todo` are detected.
+pub(super) fn body_contains_todo(expr: &IRExpr) -> bool {
+    body_contains_admitted_stub(expr, |expr| matches!(expr, IRExpr::Todo { .. }))
+}
+
+fn body_contains_admitted_stub(expr: &IRExpr, predicate: fn(&IRExpr) -> bool) -> bool {
+    if predicate(expr) {
+        return true;
+    }
+
     match expr {
-        IRExpr::Sorry { .. } => true,
-        IRExpr::Block { exprs, .. } => exprs.iter().any(body_contains_sorry),
+        IRExpr::Block { exprs, .. } => exprs
+            .iter()
+            .any(|expr| body_contains_admitted_stub(expr, predicate)),
         IRExpr::Lam { body, .. }
         | IRExpr::Always { body, .. }
         | IRExpr::Eventually { body, .. }
         | IRExpr::Historically { body, .. }
         | IRExpr::Once { body, .. }
-        | IRExpr::Previously { body, .. } => body_contains_sorry(body),
-        IRExpr::Choose { predicate, .. } => predicate
+        | IRExpr::Previously { body, .. } => body_contains_admitted_stub(body, predicate),
+        IRExpr::Choose {
+            predicate: choice_predicate,
+            ..
+        } => choice_predicate
             .as_ref()
-            .is_some_and(|pred| body_contains_sorry(pred)),
+            .is_some_and(|pred| body_contains_admitted_stub(pred, predicate)),
         IRExpr::VarDecl { init, rest, .. } => {
-            body_contains_sorry(init) || body_contains_sorry(rest)
+            body_contains_admitted_stub(init, predicate)
+                || body_contains_admitted_stub(rest, predicate)
         }
         IRExpr::While {
             cond,
@@ -370,9 +391,11 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
             body,
             ..
         } => {
-            body_contains_sorry(cond)
-                || invariants.iter().any(body_contains_sorry)
-                || body_contains_sorry(body)
+            body_contains_admitted_stub(cond, predicate)
+                || invariants
+                    .iter()
+                    .any(|invariant| body_contains_admitted_stub(invariant, predicate))
+                || body_contains_admitted_stub(body, predicate)
         }
         IRExpr::IfElse {
             cond,
@@ -380,42 +403,60 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
             else_body,
             ..
         } => {
-            body_contains_sorry(cond)
-                || body_contains_sorry(then_body)
-                || else_body.as_ref().is_some_and(|e| body_contains_sorry(e))
+            body_contains_admitted_stub(cond, predicate)
+                || body_contains_admitted_stub(then_body, predicate)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|expr| body_contains_admitted_stub(expr, predicate))
         }
         IRExpr::BinOp { left, right, .. }
         | IRExpr::Until { left, right, .. }
         | IRExpr::Since { left, right, .. } => {
-            body_contains_sorry(left) || body_contains_sorry(right)
+            body_contains_admitted_stub(left, predicate)
+                || body_contains_admitted_stub(right, predicate)
         }
-        IRExpr::UnOp { operand, .. } => body_contains_sorry(operand),
-        IRExpr::App { func, arg, .. } => body_contains_sorry(func) || body_contains_sorry(arg),
+        IRExpr::UnOp { operand, .. } => body_contains_admitted_stub(operand, predicate),
+        IRExpr::App { func, arg, .. } => {
+            body_contains_admitted_stub(func, predicate)
+                || body_contains_admitted_stub(arg, predicate)
+        }
         IRExpr::Let { bindings, body, .. } => {
-            bindings.iter().any(|b| body_contains_sorry(&b.expr)) || body_contains_sorry(body)
+            bindings
+                .iter()
+                .any(|binding| body_contains_admitted_stub(&binding.expr, predicate))
+                || body_contains_admitted_stub(body, predicate)
         }
         IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
         | IRExpr::One { body, .. }
-        | IRExpr::Lone { body, .. } => body_contains_sorry(body),
+        | IRExpr::Lone { body, .. } => body_contains_admitted_stub(body, predicate),
         IRExpr::Field { expr, .. }
         | IRExpr::Prime { expr, .. }
         | IRExpr::Card { expr, .. }
         | IRExpr::Assert { expr, .. }
-        | IRExpr::Assume { expr, .. } => body_contains_sorry(expr),
+        | IRExpr::Assume { expr, .. } => body_contains_admitted_stub(expr, predicate),
         IRExpr::Match {
             scrutinee, arms, ..
         } => {
-            body_contains_sorry(scrutinee)
+            body_contains_admitted_stub(scrutinee, predicate)
                 || arms.iter().any(|a| {
-                    a.guard.as_ref().is_some_and(body_contains_sorry)
-                        || body_contains_sorry(&a.body)
+                    a.guard
+                        .as_ref()
+                        .is_some_and(|guard| body_contains_admitted_stub(guard, predicate))
+                        || body_contains_admitted_stub(&a.body, predicate)
                 })
         }
         IRExpr::MapUpdate {
             map, key, value, ..
-        } => body_contains_sorry(map) || body_contains_sorry(key) || body_contains_sorry(value),
-        IRExpr::Index { map, key, .. } => body_contains_sorry(map) || body_contains_sorry(key),
+        } => {
+            body_contains_admitted_stub(map, predicate)
+                || body_contains_admitted_stub(key, predicate)
+                || body_contains_admitted_stub(value, predicate)
+        }
+        IRExpr::Index { map, key, .. } => {
+            body_contains_admitted_stub(map, predicate)
+                || body_contains_admitted_stub(key, predicate)
+        }
         IRExpr::SetComp {
             source,
             filter,
@@ -424,9 +465,11 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
         } => {
             source
                 .as_ref()
-                .is_some_and(|source| body_contains_sorry(source))
-                || body_contains_sorry(filter)
-                || projection.as_ref().is_some_and(|p| body_contains_sorry(p))
+                .is_some_and(|source| body_contains_admitted_stub(source, predicate))
+                || body_contains_admitted_stub(filter, predicate)
+                || projection
+                    .as_ref()
+                    .is_some_and(|projection| body_contains_admitted_stub(projection, predicate))
         }
         IRExpr::RelComp {
             projection,
@@ -434,33 +477,40 @@ pub(super) fn body_contains_sorry(expr: &IRExpr) -> bool {
             filter,
             ..
         } => {
-            body_contains_sorry(projection)
-                || body_contains_sorry(filter)
+            body_contains_admitted_stub(projection, predicate)
+                || body_contains_admitted_stub(filter, predicate)
                 || bindings.iter().any(|binding| {
                     binding
                         .source
                         .as_ref()
-                        .is_some_and(|source| body_contains_sorry(source))
+                        .is_some_and(|source| body_contains_admitted_stub(source, predicate))
                 })
         }
-        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
-            elements.iter().any(body_contains_sorry)
-        }
-        IRExpr::MapLit { entries, .. } => entries
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements
             .iter()
-            .any(|(k, v)| body_contains_sorry(k) || body_contains_sorry(v)),
-        // saw args may contain sorry.
-        IRExpr::Saw { args, .. } => args
-            .iter()
-            .any(|a| a.as_ref().is_some_and(|e| body_contains_sorry(e))),
+            .any(|element| body_contains_admitted_stub(element, predicate)),
+        IRExpr::MapLit { entries, .. } => entries.iter().any(|(key, value)| {
+            body_contains_admitted_stub(key, predicate)
+                || body_contains_admitted_stub(value, predicate)
+        }),
+        // saw args may contain admitted stubs.
+        IRExpr::Saw { args, .. } => args.iter().any(|arg| {
+            arg.as_ref()
+                .is_some_and(|e| body_contains_admitted_stub(e, predicate))
+        }),
         IRExpr::Aggregate {
             body, in_filter, ..
         } => {
-            body_contains_sorry(body) || in_filter.as_ref().is_some_and(|f| body_contains_sorry(f))
+            body_contains_admitted_stub(body, predicate)
+                || in_filter
+                    .as_ref()
+                    .is_some_and(|filter| body_contains_admitted_stub(filter, predicate))
         }
-        IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } | IRExpr::Todo { .. } => {
-            false
-        }
+        IRExpr::Lit { .. }
+        | IRExpr::Var { .. }
+        | IRExpr::Ctor { .. }
+        | IRExpr::Sorry { .. }
+        | IRExpr::Todo { .. } => false,
     }
 }
 
@@ -2558,6 +2608,13 @@ mod tests {
         assert!(body_contains_assert(&nested));
         assert!(body_contains_assume(&nested));
         assert!(body_contains_sorry(&nested));
+        assert!(body_contains_todo(&IRExpr::BinOp {
+            op: "OpAdd".to_owned(),
+            left: Box::new(var("x", IRType::Int)),
+            right: Box::new(IRExpr::Todo { span: None }),
+            ty: IRType::Int,
+            span: None,
+        }));
         assert!(contains_imperative(&bin(
             "OpEq",
             var("x", IRType::Int),
