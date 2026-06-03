@@ -109,10 +109,7 @@ impl EditorVerificationPolicy {
     }
 
     fn should_run_automatically(self) -> bool {
-        matches!(
-            self.trigger,
-            EditorVerificationTrigger::OnChange | EditorVerificationTrigger::OnSave
-        )
+        self.should_schedule_on_change() || self.should_schedule_on_save()
     }
 }
 
@@ -124,55 +121,6 @@ fn verification_options(
         .and_then(|value| value.get("verification"))
         .or_else(|| options.and_then(|value| value.get("verification")))?
         .as_object()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum EditorVerificationStatus {
-    Verifying,
-    Verified,
-    Failed,
-    Admitted,
-    Disabled,
-    TimedOut,
-    Cancelled,
-    Stale,
-}
-
-impl EditorVerificationStatus {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Verifying => "abide.lsp.verification.verifying",
-            Self::Verified => "abide.lsp.verification.verified",
-            Self::Failed => "abide.lsp.verification.failed",
-            Self::Admitted => "abide.lsp.verification.admitted",
-            Self::Disabled => "abide.lsp.verification.disabled",
-            Self::TimedOut => "abide.lsp.verification.timeout",
-            Self::Cancelled => "abide.lsp.verification.cancelled",
-            Self::Stale => "abide.lsp.verification.stale",
-        }
-    }
-
-    fn message(self) -> &'static str {
-        match self {
-            Self::Verifying => "Abide verification is running",
-            Self::Verified => "Abide verification passed",
-            Self::Failed => "Abide verification found failures",
-            Self::Admitted => "Abide verification has admitted obligations",
-            Self::Disabled => "Abide editor verification is disabled",
-            Self::TimedOut => "Abide verification timed out",
-            Self::Cancelled => "Abide verification was cancelled",
-            Self::Stale => "Abide verification result is stale",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EditorVerificationRequest {
-    root_file_id: FileId,
-    root_uri: Url,
-    version: i32,
-    generation: u64,
 }
 
 /// Per-server-instance state shared behind a `tokio::Mutex`.
@@ -190,7 +138,6 @@ struct LspState {
     /// must explicitly republish empty diagnostics for that URI.
     published_by_root: HashMap<FileId, HashSet<Url>>,
     verification_policy: EditorVerificationPolicy,
-    verification_generations: HashMap<FileId, u64>,
 }
 
 impl LspState {
@@ -204,7 +151,6 @@ impl LspState {
             documents: HashMap::new(),
             published_by_root: HashMap::new(),
             verification_policy,
-            verification_generations: HashMap::new(),
         }
     }
 
@@ -230,36 +176,6 @@ impl LspState {
             .iter()
             .any(|(other_root, uris)| *other_root != root_file_id && uris.contains(uri))
     }
-
-    fn begin_verification_request(
-        &mut self,
-        root_file_id: FileId,
-    ) -> Option<EditorVerificationRequest> {
-        let root_uri = Url::from_file_path(self.workspace.path(root_file_id)?).ok()?;
-        let version = self.document_version(&root_uri)?;
-        let generation = self
-            .verification_generations
-            .entry(root_file_id)
-            .and_modify(|generation| *generation += 1)
-            .or_insert(1);
-        Some(EditorVerificationRequest {
-            root_file_id,
-            root_uri,
-            version,
-            generation: *generation,
-        })
-    }
-
-    fn should_publish_verification_result(&self, request: &EditorVerificationRequest) -> bool {
-        self.verification_policy.trigger != EditorVerificationTrigger::Disabled
-            && self
-                .verification_generations
-                .get(&request.root_file_id)
-                .is_some_and(|generation| *generation == request.generation)
-            && self.documents.get(&request.root_uri).is_some_and(|doc| {
-                doc.file_id == request.root_file_id && doc.version == request.version
-            })
-    }
 }
 
 /// LSP request handler. All async methods serialize through the
@@ -268,6 +184,15 @@ struct Backend {
     client: Client,
     state: Arc<Mutex<LspState>>,
 }
+
+type LspDiagnosticMap = HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>;
+type LspDocumentVersions = HashMap<Url, Option<i32>>;
+type DiagnosticsForRoot = (
+    LspDiagnosticMap,
+    Vec<Url>,
+    LspDocumentVersions,
+    Option<String>,
+);
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
@@ -400,7 +325,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let context = completion_context(source.as_ref(), offset);
-        let mut items = keyword_completions(context);
+        let keyword_context = keyword_completion_context(source.as_ref(), offset);
+        let mut items = keyword_completions(context, keyword_context);
         items.extend(
             index
                 .completion_symbols(context)
@@ -604,16 +530,8 @@ impl Backend {
     }
 }
 
-fn collect_diagnostics_for_root(
-    state: &mut LspState,
-    root_file_id: FileId,
-) -> (
-    HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>,
-    Vec<Url>,
-    HashMap<Url, Option<i32>>,
-    Option<String>,
-) {
-    let mut grouped: HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>> = HashMap::new();
+fn collect_diagnostics_for_root(state: &mut LspState, root_file_id: FileId) -> DiagnosticsForRoot {
+    let mut grouped: LspDiagnosticMap = HashMap::new();
     let mut current = HashSet::new();
     let mut log_error = None;
 
@@ -624,9 +542,11 @@ fn collect_diagnostics_for_root(
             }
 
             if state.verification_policy.should_run_automatically() {
-                let mut config = abide::verify::VerifyConfig::default();
-                config.overall_timeout_ms = state.verification_policy.timeout_ms;
-                config.induction_timeout_ms = state.verification_policy.timeout_ms;
+                let config = abide::verify::VerifyConfig {
+                    overall_timeout_ms: state.verification_policy.timeout_ms,
+                    induction_timeout_ms: state.verification_policy.timeout_ms,
+                    ..abide::verify::VerifyConfig::default()
+                };
                 let results =
                     abide::verify::verify_function_contracts_only(&lowered.ir_program, &config);
                 for diagnostic in abide::verify::verification_diagnostics(&results) {
@@ -816,45 +736,134 @@ fn completion_item_for_symbol(symbol: &IdeSymbol) -> CompletionItem {
     }
 }
 
-fn keyword_completions(context: CompletionContext) -> Vec<CompletionItem> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeywordCompletionContext {
+    General,
+    Contract,
+}
+
+fn keyword_completion_context(source: &str, offset: usize) -> KeywordCompletionContext {
+    let prefix = &source[..offset.min(source.len())];
+    let since_last_boundary = prefix
+        .rsplit(['{', '}'])
+        .next()
+        .unwrap_or(prefix)
+        .trim_start();
+    if starts_with_any_keyword(since_last_boundary, &["fn", "action", "command", "proc"]) {
+        KeywordCompletionContext::Contract
+    } else {
+        KeywordCompletionContext::General
+    }
+}
+
+fn starts_with_any_keyword(text: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| {
+        text.strip_prefix(keyword)
+            .is_some_and(|rest| rest.chars().next().is_none_or(is_word_boundary))
+    })
+}
+
+fn is_word_boundary(ch: char) -> bool {
+    !(ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+const GENERAL_KEYWORD_COMPLETIONS: &[&str] = &[
+    "module",
+    "include",
+    "as",
+    "use",
+    "const",
+    "fn",
+    "type",
+    "enum",
+    "struct",
+    "entity",
+    "interface",
+    "extern",
+    "system",
+    "implements",
+    "dep",
+    "action",
+    "command",
+    "query",
+    "store",
+    "activate",
+    "return",
+    "needs",
+    "fair",
+    "strong",
+    "stutter",
+    "when",
+    "may",
+    "else",
+    "where",
+    "choose",
+    "for",
+    "create",
+    "program",
+    "proc",
+    "pred",
+    "prop",
+    "verify",
+    "assert",
+    "invariant",
+    "show",
+    "theorem",
+    "lemma",
+    "axiom",
+    "scene",
+    "given",
+    "match",
+    "if",
+    "let",
+    "one",
+    "assume",
+    "then",
+    "requires",
+    "ensures",
+    "decreases",
+    "var",
+    "while",
+    "all",
+    "exists",
+    "some",
+    "no",
+    "lone",
+    "always",
+    "eventually",
+    "historically",
+    "once",
+    "previously",
+    "since",
+    "until",
+    "true",
+    "false",
+    "not",
+    "and",
+    "or",
+    "implies",
+    "in",
+    "sorry",
+    "todo",
+    "by",
+    "mut",
+    "derived",
+    "fsm",
+    "under",
+    "saw",
+    "sum",
+    "product",
+    "min",
+    "max",
+    "count",
+];
+
+fn keyword_completions(
+    context: CompletionContext,
+    keyword_context: KeywordCompletionContext,
+) -> Vec<CompletionItem> {
     let keywords: &[&str] = match context {
-        CompletionContext::General => &[
-            "module",
-            "include",
-            "use",
-            "const",
-            "fn",
-            "type",
-            "enum",
-            "struct",
-            "entity",
-            "system",
-            "program",
-            "proc",
-            "pred",
-            "prop",
-            "verify",
-            "theorem",
-            "lemma",
-            "axiom",
-            "scene",
-            "match",
-            "if",
-            "let",
-            "var",
-            "while",
-            "all",
-            "exists",
-            "always",
-            "eventually",
-            "historically",
-            "once",
-            "previously",
-            "since",
-            "until",
-            "true",
-            "false",
-        ],
+        CompletionContext::General => GENERAL_KEYWORD_COMPLETIONS,
         CompletionContext::AfterAt | CompletionContext::AfterDot => &[],
     };
     keywords
@@ -862,9 +871,21 @@ fn keyword_completions(context: CompletionContext) -> Vec<CompletionItem> {
         .map(|keyword| CompletionItem {
             label: (*keyword).to_owned(),
             kind: Some(CompletionItemKind::KEYWORD),
+            sort_text: Some(keyword_sort_text(keyword, keyword_context)),
             ..CompletionItem::default()
         })
         .collect()
+}
+
+fn keyword_sort_text(keyword: &str, context: KeywordCompletionContext) -> String {
+    let priority = match (context, keyword) {
+        (KeywordCompletionContext::Contract, "requires") => "00",
+        (KeywordCompletionContext::Contract, "ensures") => "01",
+        (KeywordCompletionContext::Contract, "decreases") => "02",
+        (KeywordCompletionContext::General, "requires" | "ensures" | "decreases") => "40",
+        _ => "20",
+    };
+    format!("{priority}_{keyword}")
 }
 
 /// Translates an LSP (line, character) [`Position`] to a byte offset
@@ -1014,14 +1035,6 @@ mod tests {
         assert_eq!(disabled.trigger, EditorVerificationTrigger::Disabled);
         assert!(!disabled.should_schedule_on_change());
         assert!(!disabled.should_schedule_on_save());
-        assert_eq!(
-            EditorVerificationStatus::Disabled.code(),
-            "abide.lsp.verification.disabled"
-        );
-        assert_eq!(
-            EditorVerificationStatus::TimedOut.message(),
-            "Abide verification timed out"
-        );
 
         let disabled_by_flag = EditorVerificationPolicy::from_initialization_options(Some(
             &serde_json::json!({ "verification": { "enabled": false } }),
@@ -1040,34 +1053,64 @@ mod tests {
     }
 
     #[test]
-    fn verification_request_version_guard_rejects_stale_results() {
-        let mut state = LspState::new(PathBuf::from("."));
-        let uri = Url::parse("file:///tmp/example.ab").expect("uri");
-        let file_id = state
-            .workspace
-            .set_file_source("/tmp/example.ab", "fn f(): int { 0 }");
-        state.documents.insert(
-            uri.clone(),
-            OpenDocument {
-                file_id,
-                version: 3,
-            },
+    fn keyword_completions_include_contract_keywords() {
+        let labels = keyword_completions(
+            CompletionContext::General,
+            KeywordCompletionContext::General,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"requires".to_owned()));
+        assert!(labels.contains(&"ensures".to_owned()));
+        assert!(labels.contains(&"decreases".to_owned()));
+    }
+
+    #[test]
+    fn keyword_completions_rank_requires_first_in_contract_context() {
+        let source = "fn bounded(x: int): int\n  req";
+        let context = keyword_completion_context(source, source.len());
+        let items = keyword_completions(CompletionContext::General, context);
+        let requires = items
+            .iter()
+            .find(|item| item.label == "requires")
+            .expect("requires completion");
+        let module = items
+            .iter()
+            .find(|item| item.label == "module")
+            .expect("module completion");
+
+        assert_eq!(context, KeywordCompletionContext::Contract);
+        assert!(requires.sort_text < module.sort_text);
+    }
+
+    #[test]
+    fn keyword_completions_keep_contract_keywords_lower_in_general_context() {
+        let source = "req";
+        let context = keyword_completion_context(source, source.len());
+        let items = keyword_completions(CompletionContext::General, context);
+        let requires = items
+            .iter()
+            .find(|item| item.label == "requires")
+            .expect("requires completion");
+        let module = items
+            .iter()
+            .find(|item| item.label == "module")
+            .expect("module completion");
+
+        assert_eq!(context, KeywordCompletionContext::General);
+        assert!(requires.sort_text > module.sort_text);
+    }
+
+    #[test]
+    fn keyword_completion_context_does_not_promote_inside_body() {
+        let source = "fn bounded(x: int): int {\n  req";
+
+        assert_eq!(
+            keyword_completion_context(source, source.len()),
+            KeywordCompletionContext::General
         );
-
-        let request = state
-            .begin_verification_request(file_id)
-            .expect("verification request");
-        assert!(state.should_publish_verification_result(&request));
-
-        state.documents.insert(
-            uri,
-            OpenDocument {
-                file_id,
-                version: 4,
-            },
-        );
-
-        assert!(!state.should_publish_verification_result(&request));
     }
 
     #[test]
