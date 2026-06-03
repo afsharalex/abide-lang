@@ -3,6 +3,7 @@
 //! offset-keyed lookup (identifier-at, completion-context) routines.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use crate::ast::{
     EntityItem, InterfaceItem, ProcItem, Program, SystemItem, TopDecl, TypeVariant, VerifyDecl,
@@ -212,7 +213,10 @@ pub fn completion_context(source: &str, offset: usize) -> CompletionContext {
 /// known file's parsed program and token stream.
 pub fn build_workspace_index(workspace: &mut CompilerWorkspace) -> miette::Result<WorkspaceIndex> {
     let mut index = WorkspaceIndex::default();
-    for (file_id, _) in workspace.known_files() {
+    for (file_id, path) in workspace.known_files() {
+        if !is_abide_source_path(&path) {
+            continue;
+        }
         let Some(source) = workspace.source_text(file_id) else {
             continue;
         };
@@ -236,6 +240,12 @@ pub fn build_workspace_index(workspace: &mut CompilerWorkspace) -> miette::Resul
     dedup_symbols(&mut index.symbols);
     dedup_occurrences(&mut index.occurrences);
     Ok(index)
+}
+
+fn is_abide_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| matches!(extension, "ab" | "abi" | "abp"))
 }
 
 /// Returns the [`IdeOccurrence`] under `offset` in `file_id`, or
@@ -587,5 +597,24 @@ mod tests {
         assert!(identifier_at(&mut workspace, root_id, 6)
             .expect("identifier")
             .is_some());
+    }
+
+    #[test]
+    fn workspace_index_skips_qa_sources() {
+        let mut workspace = CompilerWorkspace::with_root_dir("/tmp");
+        workspace.set_file_source(
+            "query.qa",
+            "load \"model.ab\"\nassert terminal Ticket.status\n",
+        );
+
+        let index = build_workspace_index(&mut workspace).expect("index");
+
+        assert!(
+            index
+                .occurrences
+                .iter()
+                .all(|occurrence| occurrence.name != "load"),
+            "QA source should not be lexed as Abide IDE input: {index:#?}"
+        );
     }
 }

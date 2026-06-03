@@ -1990,6 +1990,47 @@ fn cli_verify_renders_miette_snippet_for_failure() {
     );
 }
 
+#[test]
+fn cli_qa_renders_miette_snippet_for_parse_error() {
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let script_path = tmp.path().join("bad.qa");
+    std::fs::write(&script_path, "query entities\n").expect("write qa script");
+
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .args(["qa", script_path.to_str().expect("utf-8 temp path")])
+        .output()
+        .expect("failed to run abide qa");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("bad.qa"),
+        "stderr should reference the QA script: {stderr}"
+    );
+    assert!(
+        stderr.contains("abide::qa::parse::expected"),
+        "stderr should include a stable QA parse diagnostic code: {stderr}"
+    );
+    assert!(
+        stderr.contains("query entities"),
+        "stderr should include the source line: {stderr}"
+    );
+    assert!(
+        stderr.contains("│"),
+        "stderr should contain miette line gutter: {stderr}"
+    );
+    assert!(
+        stderr.contains("try `ask entities`"),
+        "stderr should include a QA-specific help hint: {stderr}"
+    );
+}
+
 /// Verify that success-only output goes to stdout with no miette rendering.
 /// Uses the workflow fixture which has no failures.
 #[test]

@@ -8,12 +8,21 @@ use super::ast::{
     BlockArg, BlockPredicate, QAStatement, Query, SimulationRequest, StateSpaceRequest,
     TemporalBounds, TemporalOp, TemporalTarget,
 };
+use abide_syntax::diagnostic::Diagnostic;
+use abide_syntax::span::Span;
+
+const QA_PARSE_EXPECTED: &str = "abide::qa::parse::expected";
+const QA_PARSE_ERROR: &str = "abide::qa::parse::error";
+const QA_PARSE_UNCLOSED_BLOCK: &str = "abide::qa::parse::unclosed_block";
 
 /// Parse error for QA input.
 #[derive(Debug, Clone)]
 pub struct QAParseError {
     pub message: String,
     pub line: usize,
+    pub span: Span,
+    pub code: String,
+    pub help: Option<String>,
 }
 
 impl std::fmt::Display for QAParseError {
@@ -22,17 +31,219 @@ impl std::fmt::Display for QAParseError {
     }
 }
 
-/// Parse a `.qa` file or multi-line QA input into statements.
-pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
-    let mut statements = Vec::new();
-    let mut abide_block: Option<(usize, String, i32)> = None; // (start_line, content, brace_depth)
+impl QAParseError {
+    #[must_use]
+    pub fn to_diagnostic(&self) -> Diagnostic {
+        let mut diagnostic = Diagnostic::error(self.message.clone())
+            .with_code(self.code.clone())
+            .with_span(self.span);
+        if let Some(help) = &self.help {
+            diagnostic = diagnostic.with_help(help.clone());
+        }
+        diagnostic
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QAToken<'a> {
+    text: &'a str,
+    span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QAEmbeddedAbideBlock {
+    pub body: String,
+    pub body_span: Span,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OpenAbideBlock {
+    start_line: usize,
+    keyword_span: Span,
+    body_start: usize,
+    depth: i32,
+}
+
+fn qa_error(
+    message: impl Into<String>,
+    line: usize,
+    span: Span,
+    code: &'static str,
+    help: Option<&str>,
+) -> QAParseError {
+    QAParseError {
+        message: message.into(),
+        line,
+        span,
+        code: code.to_owned(),
+        help: help.map(str::to_owned),
+    }
+}
+
+fn expected_error(
+    message: impl Into<String>,
+    line: usize,
+    span: Span,
+    help: Option<&str>,
+) -> QAParseError {
+    qa_error(message, line, span, QA_PARSE_EXPECTED, help)
+}
+
+fn general_error(
+    message: impl Into<String>,
+    line: usize,
+    span: Span,
+    help: Option<&str>,
+) -> QAParseError {
+    qa_error(message, line, span, QA_PARSE_ERROR, help)
+}
+
+fn empty_span(offset: usize) -> Span {
+    Span {
+        start: offset,
+        end: offset.saturating_add(1),
+    }
+}
+
+fn scan_qa_tokens(line: &str, line_start: usize) -> Vec<QAToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+
+    for (offset, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                tokens.push(QAToken {
+                    text: &line[start..offset],
+                    span: Span {
+                        start: line_start + start,
+                        end: line_start + offset,
+                    },
+                });
+            }
+        } else if token_start.is_none() {
+            token_start = Some(offset);
+        }
+    }
+
+    if let Some(start) = token_start {
+        tokens.push(QAToken {
+            text: &line[start..],
+            span: Span {
+                start: line_start + start,
+                end: line_start + line.len(),
+            },
+        });
+    }
+
+    tokens
+}
+
+/// Extract embedded `abide { ... }` blocks with byte spans into the original QA source.
+pub fn embedded_abide_blocks(input: &str) -> Result<Vec<QAEmbeddedAbideBlock>, QAParseError> {
+    let mut blocks = Vec::new();
+    let mut open_block: Option<OpenAbideBlock> = None;
+    let mut line_start = 0usize;
 
     for (line_num, line) in input.lines().enumerate() {
         let line_no = line_num + 1;
         let trimmed = line.trim();
+        let trimmed_start = line.find(trimmed).unwrap_or(0);
+        let trimmed_offset = line_start + trimmed_start;
+
+        if let Some(mut block) = open_block.take() {
+            if let Some(body_end) = update_abide_block_depth(line, line_start, &mut block.depth) {
+                blocks.push(QAEmbeddedAbideBlock {
+                    body: input[block.body_start..body_end].to_owned(),
+                    body_span: Span {
+                        start: block.body_start,
+                        end: body_end,
+                    },
+                });
+            } else {
+                open_block = Some(block);
+            }
+            line_start += line.len() + 1;
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            line_start += line.len() + 1;
+            continue;
+        }
+
+        if trimmed.starts_with("abide") && trimmed.contains('{') {
+            let open_brace_in_trimmed = trimmed.find('{').expect("checked contains");
+            let open_brace = trimmed_offset + open_brace_in_trimmed;
+            let body_start = open_brace + 1;
+            let after_brace = &input[body_start..line_start + line.len()];
+            let mut depth = 1;
+            if let Some(body_end) = update_abide_block_depth(after_brace, body_start, &mut depth) {
+                blocks.push(QAEmbeddedAbideBlock {
+                    body: input[body_start..body_end].to_owned(),
+                    body_span: Span {
+                        start: body_start,
+                        end: body_end,
+                    },
+                });
+            } else {
+                open_block = Some(OpenAbideBlock {
+                    start_line: line_no,
+                    keyword_span: Span {
+                        start: trimmed_offset,
+                        end: trimmed_offset + "abide".len(),
+                    },
+                    body_start,
+                    depth,
+                });
+            }
+        }
+
+        line_start += line.len() + 1;
+    }
+
+    if let Some(block) = open_block {
+        return Err(qa_error(
+            "unclosed abide block",
+            block.start_line,
+            block.keyword_span,
+            QA_PARSE_UNCLOSED_BLOCK,
+            Some("close the block with `}`"),
+        ));
+    }
+
+    Ok(blocks)
+}
+
+fn update_abide_block_depth(text: &str, text_start: usize, depth: &mut i32) -> Option<usize> {
+    for (offset, ch) in text.char_indices() {
+        match ch {
+            '{' => *depth += 1,
+            '}' => {
+                *depth -= 1;
+                if *depth <= 0 {
+                    return Some(text_start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse a `.qa` file or multi-line QA input into statements.
+pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
+    let mut statements = Vec::new();
+    let mut abide_block: Option<(usize, Span, String, i32)> = None; // (start_line, start_span, content, brace_depth)
+    let mut line_start = 0usize;
+
+    for (line_num, line) in input.lines().enumerate() {
+        let line_no = line_num + 1;
+        let trimmed = line.trim();
+        let trimmed_start = line.find(trimmed).unwrap_or(0);
+        let trimmed_offset = line_start + trimmed_start;
 
         // Inside an abide block: accumulate until braces balance
-        if let Some((_, ref mut content, ref mut depth)) = abide_block {
+        if let Some((_, _, ref mut content, ref mut depth)) = abide_block {
             for ch in trimmed.chars() {
                 match ch {
                     '{' => *depth += 1,
@@ -49,11 +260,13 @@ pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
                 content.push_str(line);
                 content.push('\n');
             }
+            line_start += line.len() + 1;
             continue;
         }
 
         // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with("//") {
+            line_start += line.len() + 1;
             continue;
         }
 
@@ -81,19 +294,32 @@ pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
                 // Multi-line: start accumulating
                 let mut content = after_brace.to_owned();
                 content.push('\n');
-                abide_block = Some((line_no, content, depth));
+                abide_block = Some((
+                    line_no,
+                    Span {
+                        start: trimmed_offset,
+                        end: trimmed_offset + "abide".len(),
+                    },
+                    content,
+                    depth,
+                ));
             }
+            line_start += line.len() + 1;
             continue;
         }
 
-        statements.push(parse_statement(trimmed, line_no)?);
+        statements.push(parse_statement_at(trimmed, line_no, trimmed_offset)?);
+        line_start += line.len() + 1;
     }
 
-    if let Some((start_line, _, _)) = abide_block {
-        return Err(QAParseError {
-            message: "unclosed abide block".to_owned(),
-            line: start_line,
-        });
+    if let Some((start_line, start_span, _, _)) = abide_block {
+        return Err(qa_error(
+            "unclosed abide block",
+            start_line,
+            start_span,
+            QA_PARSE_UNCLOSED_BLOCK,
+            Some("close the block with `}`"),
+        ));
     }
 
     Ok(statements)
@@ -101,16 +327,26 @@ pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
 
 /// Parse a single QA statement from one line.
 pub fn parse_statement(input: &str, line: usize) -> Result<QAStatement, QAParseError> {
-    let tokens: Vec<&str> = input.split_whitespace().collect();
+    parse_statement_at(input, line, 0)
+}
+
+fn parse_statement_at(
+    input: &str,
+    line: usize,
+    line_start: usize,
+) -> Result<QAStatement, QAParseError> {
+    let tokens = scan_qa_tokens(input, line_start);
     if tokens.is_empty() {
-        return Err(QAParseError {
-            message: "empty statement".to_owned(),
+        return Err(expected_error(
+            "empty statement",
             line,
-        });
+            empty_span(line_start),
+            Some("write a QA command such as `ask entities`"),
+        ));
     }
 
-    match tokens[0] {
-        "load" => parse_load(input, line),
+    match tokens[0].text {
+        "load" => parse_load(input, line, line_start, &tokens),
         "verify" => Ok(QAStatement::Verify),
         "simulate" => parse_simulate(&tokens[1..], line),
         "explore" => parse_explore(&tokens[1..], line),
@@ -121,252 +357,375 @@ pub fn parse_statement(input: &str, line: usize) -> Result<QAStatement, QAParseE
         "diff" => parse_diff_artifact(&tokens[1..], line),
         "export" => parse_export_artifact(&tokens[1..], line),
         "ask" => {
-            if tokens.len() > 1 && tokens[1] == "{" {
-                parse_block_ask(input, line)
+            if tokens.len() > 1 && tokens[1].text == "{" {
+                parse_block_ask(input, line, line_start)
             } else {
                 Ok(QAStatement::Ask(parse_query(&tokens[1..], line)?))
             }
         }
         "explain" => Ok(QAStatement::Explain(parse_query(&tokens[1..], line)?)),
         "assert" => Ok(QAStatement::Assert(parse_query(&tokens[1..], line)?)),
-        _ => Err(QAParseError {
-            message: format!(
+        _ => {
+            let help = if tokens[0].text == "query"
+                && tokens.get(1).is_some_and(|token| token.text == "entities")
+            {
+                Some("try `ask entities`")
+            } else {
+                Some("start QA statements with `ask`, `explain`, `assert`, or `load`")
+            };
+            Err(expected_error(
+                format!(
                 "expected 'ask', 'explain', 'assert', 'load', 'verify', 'simulate', 'explore', 'artifacts', 'show', 'draw', 'state', 'diff', or 'export', got '{}'",
-                tokens[0]
+                tokens[0].text
             ),
-            line,
-        }),
+                line,
+                tokens[0].span,
+                help,
+            ))
+        }
     }
 }
 
-fn parse_simulate(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
+fn parse_simulate(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
     let mut request = SimulationRequest::default();
     let mut index = 0usize;
     while index < tokens.len() {
-        match tokens[index] {
+        match tokens[index].text {
             "--steps" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "simulate --steps requires a value".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "simulate --steps requires a value",
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--steps`"),
+                    )
                 })?;
                 request.steps = parse_usize(value, "step count", line)?;
                 index += 2;
             }
             "--seed" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "simulate --seed requires a value".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "simulate --seed requires a value",
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--seed`"),
+                    )
                 })?;
-                request.seed = value.parse::<u64>().map_err(|_| QAParseError {
-                    message: format!("invalid simulation seed '{value}'"),
-                    line,
+                request.seed = value.text.parse::<u64>().map_err(|_| {
+                    general_error(
+                        format!("invalid simulation seed '{}'", value.text),
+                        line,
+                        value.span,
+                        Some("simulation seeds must be non-negative integers"),
+                    )
                 })?;
                 index += 2;
             }
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "simulate --slots requires a value".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "simulate --slots requires a value",
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--slots`"),
+                    )
                 })?;
                 request.slots = parse_usize(value, "slot count", line)?;
                 index += 2;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "simulate --scope requires Entity=N".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "simulate --scope requires Entity=N",
+                        line,
+                        tokens[index].span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
                 })?;
-                let (entity, slots) = value.split_once('=').ok_or_else(|| QAParseError {
-                    message: format!("invalid simulation scope '{value}', expected Entity=N"),
-                    line,
-                })?;
-                if entity.trim().is_empty() {
-                    return Err(QAParseError {
-                        message: format!(
-                            "invalid simulation scope '{value}'; entity name must not be empty"
+                let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
+                    expected_error(
+                        format!(
+                            "invalid simulation scope '{}', expected Entity=N",
+                            value.text
                         ),
                         line,
-                    });
+                        value.span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
+                })?;
+                if entity.trim().is_empty() {
+                    return Err(expected_error(
+                        format!(
+                            "invalid simulation scope '{}'; entity name must not be empty",
+                            value.text
+                        ),
+                        line,
+                        value.span,
+                        Some("put the entity name before `=`"),
+                    ));
                 }
                 request.scopes.push((
                     entity.trim().to_owned(),
-                    parse_usize(slots, "scope slot count", line)?,
+                    parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
                 index += 2;
             }
             "--system" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "simulate --system requires a system name".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "simulate --system requires a system name",
+                        line,
+                        tokens[index].span,
+                        Some("provide a system name after `--system`"),
+                    )
                 })?;
-                request.system = Some((*value).to_owned());
+                request.system = Some(value.text.to_owned());
                 index += 2;
             }
             other => {
-                return Err(QAParseError {
-                    message: format!("unknown simulate option '{other}'"),
+                return Err(expected_error(
+                    format!("unknown simulate option '{other}'"),
                     line,
-                });
+                    tokens[index].span,
+                    Some(
+                        "expected one of `--steps`, `--seed`, `--slots`, `--scope`, or `--system`",
+                    ),
+                ));
             }
         }
     }
     Ok(QAStatement::Simulate(request))
 }
 
-fn parse_explore(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
+fn parse_explore(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
     let mut request = StateSpaceRequest::default();
     let mut index = 0usize;
     while index < tokens.len() {
-        match tokens[index] {
+        match tokens[index].text {
             "--depth" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "explore --depth requires a value".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "explore --depth requires a value",
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--depth`"),
+                    )
                 })?;
                 request.depth = Some(parse_usize(value, "exploration depth", line)?);
                 index += 2;
             }
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "explore --slots requires a value".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "explore --slots requires a value",
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--slots`"),
+                    )
                 })?;
                 request.slots = parse_usize(value, "slot count", line)?;
                 index += 2;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "explore --scope requires Entity=N".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "explore --scope requires Entity=N",
+                        line,
+                        tokens[index].span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
                 })?;
-                let (entity, slots) = value.split_once('=').ok_or_else(|| QAParseError {
-                    message: format!("invalid explore scope '{value}', expected Entity=N"),
-                    line,
+                let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
+                    expected_error(
+                        format!("invalid explore scope '{}', expected Entity=N", value.text),
+                        line,
+                        value.span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
                 })?;
                 if entity.trim().is_empty() {
-                    return Err(QAParseError {
-                        message: format!(
-                            "invalid explore scope '{value}'; entity name must not be empty"
+                    return Err(expected_error(
+                        format!(
+                            "invalid explore scope '{}'; entity name must not be empty",
+                            value.text
                         ),
                         line,
-                    });
+                        value.span,
+                        Some("put the entity name before `=`"),
+                    ));
                 }
                 request.scopes.push((
                     entity.trim().to_owned(),
-                    parse_usize(slots, "scope slot count", line)?,
+                    parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
                 index += 2;
             }
             "--system" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: "explore --system requires a system name".to_owned(),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        "explore --system requires a system name",
+                        line,
+                        tokens[index].span,
+                        Some("provide a system name after `--system`"),
+                    )
                 })?;
-                request.system = Some((*value).to_owned());
+                request.system = Some(value.text.to_owned());
                 index += 2;
             }
             other => {
-                return Err(QAParseError {
-                    message: format!("unknown explore option '{other}'"),
+                return Err(expected_error(
+                    format!("unknown explore option '{other}'"),
                     line,
-                });
+                    tokens[index].span,
+                    Some("expected one of `--depth`, `--slots`, `--scope`, or `--system`"),
+                ));
             }
         }
     }
     Ok(QAStatement::Explore(request))
 }
 
-fn parse_show_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
-    if tokens.len() != 2 || tokens[0] != "artifact" {
-        return Err(QAParseError {
-            message: "expected: show artifact <selector>".to_owned(),
+fn parse_show_artifact(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
+    if tokens.len() != 2 || tokens[0].text != "artifact" {
+        return Err(expected_error(
+            "expected: show artifact <selector>",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `show artifact <selector>`"),
+        ));
     }
-    Ok(QAStatement::ShowArtifact(tokens[1].to_owned()))
+    Ok(QAStatement::ShowArtifact(tokens[1].text.to_owned()))
 }
 
-fn parse_draw_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
-    if tokens.len() != 2 || tokens[0] != "artifact" {
-        return Err(QAParseError {
-            message: "expected: draw artifact <selector>".to_owned(),
+fn parse_draw_artifact(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
+    if tokens.len() != 2 || tokens[0].text != "artifact" {
+        return Err(expected_error(
+            "expected: draw artifact <selector>",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `draw artifact <selector>`"),
+        ));
     }
-    Ok(QAStatement::DrawArtifact(tokens[1].to_owned()))
+    Ok(QAStatement::DrawArtifact(tokens[1].text.to_owned()))
 }
 
-fn parse_state_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
-    if tokens.len() != 3 || tokens[0] != "artifact" {
-        return Err(QAParseError {
-            message: "expected: state artifact <selector> <index>".to_owned(),
+fn parse_state_artifact(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
+    if tokens.len() != 3 || tokens[0].text != "artifact" {
+        return Err(expected_error(
+            "expected: state artifact <selector> <index>",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `state artifact <selector> <index>`"),
+        ));
     }
     Ok(QAStatement::StateArtifact {
-        selector: tokens[1].to_owned(),
-        index: parse_usize(tokens[2], "state index", line)?,
+        selector: tokens[1].text.to_owned(),
+        index: parse_usize(&tokens[2], "state index", line)?,
     })
 }
 
-fn parse_diff_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
-    if tokens.len() != 4 || tokens[0] != "artifact" {
-        return Err(QAParseError {
-            message: "expected: diff artifact <selector> <from> <to>".to_owned(),
+fn parse_diff_artifact(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
+    if tokens.len() != 4 || tokens[0].text != "artifact" {
+        return Err(expected_error(
+            "expected: diff artifact <selector> <from> <to>",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `diff artifact <selector> <from> <to>`"),
+        ));
     }
     Ok(QAStatement::DiffArtifact {
-        selector: tokens[1].to_owned(),
-        from: parse_usize(tokens[2], "from state index", line)?,
-        to: parse_usize(tokens[3], "to state index", line)?,
+        selector: tokens[1].text.to_owned(),
+        from: parse_usize(&tokens[2], "from state index", line)?,
+        to: parse_usize(&tokens[3], "to state index", line)?,
     })
 }
 
-fn parse_export_artifact(tokens: &[&str], line: usize) -> Result<QAStatement, QAParseError> {
-    if tokens.len() != 3 || tokens[0] != "artifact" {
-        return Err(QAParseError {
-            message: "expected: export artifact <selector> <format>".to_owned(),
+fn parse_export_artifact(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
+    if tokens.len() != 3 || tokens[0].text != "artifact" {
+        return Err(expected_error(
+            "expected: export artifact <selector> <format>",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `export artifact <selector> <format>`"),
+        ));
     }
     Ok(QAStatement::ExportArtifact {
-        selector: tokens[1].to_owned(),
-        format: tokens[2].to_owned(),
+        selector: tokens[1].text.to_owned(),
+        format: tokens[2].text.to_owned(),
     })
 }
 
-fn parse_usize(token: &str, label: &str, line: usize) -> Result<usize, QAParseError> {
-    token.parse::<usize>().map_err(|_| QAParseError {
-        message: format!("invalid {label} '{token}'"),
-        line,
+fn parse_usize(token: &QAToken<'_>, label: &str, line: usize) -> Result<usize, QAParseError> {
+    parse_usize_text(token.text, token.span, label, line)
+}
+
+fn parse_usize_text(
+    token: &str,
+    span: Span,
+    label: &str,
+    line: usize,
+) -> Result<usize, QAParseError> {
+    token.parse::<usize>().map_err(|_| {
+        general_error(
+            format!("invalid {label} '{token}'"),
+            line,
+            span,
+            Some("use a non-negative integer"),
+        )
     })
 }
 
 /// Parse a `load "path"` statement.
-fn parse_load(input: &str, line: usize) -> Result<QAStatement, QAParseError> {
+fn parse_load(
+    input: &str,
+    line: usize,
+    line_start: usize,
+    tokens: &[QAToken<'_>],
+) -> Result<QAStatement, QAParseError> {
     // Extract the path from: load "path/to/specs"
     let rest = input.trim_start_matches("load").trim();
     if let Some(path) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         Ok(QAStatement::Load(path.to_owned()))
     } else {
-        Err(QAParseError {
-            message: "load requires a quoted path: load \"path/to/specs\"".to_owned(),
+        let span = if let Some(path_token) = tokens.get(1) {
+            path_token.span
+        } else {
+            tokens
+                .first()
+                .map_or_else(|| empty_span(line_start), |token| token.span)
+        };
+        Err(expected_error(
+            "load requires a quoted path: load \"path/to/specs\"",
             line,
-        })
+            span,
+            Some("write load paths as `load \"path\"`"),
+        ))
     }
 }
 
 /// Parse a query from tokens (after the verb).
-fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_query(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
     if tokens.is_empty() {
-        return Err(QAParseError {
-            message: "expected a query after ask/explain/assert".to_owned(),
+        return Err(expected_error(
+            "expected a query after ask/explain/assert",
             line,
-        });
+            empty_span(0),
+            Some("try a query such as `entities`, `reachable`, or `terminal`"),
+        ));
     }
 
-    match tokens[0] {
+    match tokens[0].text {
         // Negation
         "not" => {
             let inner = parse_query(&tokens[1..], line)?;
@@ -420,13 +779,15 @@ fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
         }
         "deadlock" => {
             if tokens.len() < 2 {
-                return Err(QAParseError {
-                    message: "deadlock requires a system name".to_owned(),
+                return Err(expected_error(
+                    "deadlock requires a system name",
                     line,
-                });
+                    tokens[0].span,
+                    Some("write `deadlock SystemName`"),
+                ));
             }
             Ok(Query::Deadlock {
-                system: tokens[1].to_owned(),
+                system: tokens[1].text.to_owned(),
             })
         }
 
@@ -434,25 +795,27 @@ fn parse_query(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
         "always" => parse_temporal_query(TemporalOp::Always, &tokens[1..], line),
         "eventually" => parse_temporal_query(TemporalOp::Eventually, &tokens[1..], line),
 
-        other => Err(QAParseError {
-            message: format!(
+        other => Err(expected_error(
+            format!(
                 "unknown query type '{other}'. Expected: reachable, path, terminal, initial, \
                  cycles, transitions, entities, systems, types, invariants, contracts, \
                  events, match-coverage, cross-calls, updates, deadlock, always, eventually, not"
             ),
             line,
-        }),
+            tokens[0].span,
+            Some("use a known QA query after `ask`, `explain`, or `assert`"),
+        )),
     }
 }
 
 fn parse_temporal_query(
     op: TemporalOp,
-    tokens: &[&str],
+    tokens: &[QAToken<'_>],
     line: usize,
 ) -> Result<Query, QAParseError> {
     if tokens.is_empty() {
-        return Err(QAParseError {
-            message: format!(
+        return Err(expected_error(
+            format!(
                 "{} requires an expression",
                 match op {
                     TemporalOp::Always => "always",
@@ -460,53 +823,70 @@ fn parse_temporal_query(
                 }
             ),
             line,
-        });
+            empty_span(0),
+            Some("provide an Abide expression for the temporal query"),
+        ));
     }
 
     let mut bounds = TemporalBounds::default();
     let mut index = 0usize;
     while index < tokens.len() {
-        match tokens[index] {
+        match tokens[index].text {
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: format!(
-                        "{} --slots requires a value",
-                        match op {
-                            TemporalOp::Always => "always",
-                            TemporalOp::Eventually => "eventually",
-                        }
-                    ),
-                    line,
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        format!(
+                            "{} --slots requires a value",
+                            match op {
+                                TemporalOp::Always => "always",
+                                TemporalOp::Eventually => "eventually",
+                            }
+                        ),
+                        line,
+                        tokens[index].span,
+                        Some("provide a non-negative integer after `--slots`"),
+                    )
                 })?;
                 bounds.slots = Some(parse_usize(value, "slot count", line)?);
                 index += 2;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| QAParseError {
-                    message: format!(
-                        "{} --scope requires Entity=N",
-                        match op {
-                            TemporalOp::Always => "always",
-                            TemporalOp::Eventually => "eventually",
-                        }
-                    ),
-                    line,
-                })?;
-                let (entity, slots) = value.split_once('=').ok_or_else(|| QAParseError {
-                    message: format!("invalid temporal scope '{value}', expected Entity=N"),
-                    line,
-                })?;
-                if entity.trim().is_empty() {
-                    return Err(QAParseError {
-                        message: format!(
-                            "invalid temporal scope '{value}'; entity name must not be empty"
+                let value = tokens.get(index + 1).ok_or_else(|| {
+                    expected_error(
+                        format!(
+                            "{} --scope requires Entity=N",
+                            match op {
+                                TemporalOp::Always => "always",
+                                TemporalOp::Eventually => "eventually",
+                            }
                         ),
                         line,
-                    });
+                        tokens[index].span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
+                })?;
+                let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
+                    expected_error(
+                        format!("invalid temporal scope '{}', expected Entity=N", value.text),
+                        line,
+                        value.span,
+                        Some("write scopes as `--scope Entity=N`"),
+                    )
+                })?;
+                if entity.trim().is_empty() {
+                    return Err(expected_error(
+                        format!(
+                            "invalid temporal scope '{}'; entity name must not be empty",
+                            value.text
+                        ),
+                        line,
+                        value.span,
+                        Some("put the entity name before `=`"),
+                    ));
                 }
                 bounds.scopes.push((
                     entity.trim().to_owned(),
-                    parse_usize(slots, "scope slot count", line)?,
+                    parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
                 index += 2;
             }
@@ -514,10 +894,10 @@ fn parse_temporal_query(
         }
     }
 
-    let (target, expr_tokens) = if tokens.get(index).copied() == Some("on") {
+    let (target, expr_tokens) = if tokens.get(index).is_some_and(|token| token.text == "on") {
         if tokens.len() < index + 3 {
-            return Err(QAParseError {
-                message: format!(
+            return Err(expected_error(
+                format!(
                     "expected: {} on Owner[.field] <expr>",
                     match op {
                         TemporalOp::Always => "always",
@@ -525,7 +905,9 @@ fn parse_temporal_query(
                     }
                 ),
                 line,
-            });
+                tokens[index].span,
+                Some("provide a target and expression after `on`"),
+            ));
         }
         (
             Some(parse_temporal_target(tokens[index + 1], line)?),
@@ -535,10 +917,14 @@ fn parse_temporal_query(
         (None, &tokens[index..])
     };
 
-    let expr = expr_tokens.join(" ");
+    let expr = expr_tokens
+        .iter()
+        .map(|token| token.text)
+        .collect::<Vec<_>>()
+        .join(" ");
     if expr.trim().is_empty() {
-        return Err(QAParseError {
-            message: format!(
+        return Err(expected_error(
+            format!(
                 "{} requires an expression",
                 match op {
                     TemporalOp::Always => "always",
@@ -546,7 +932,11 @@ fn parse_temporal_query(
                 }
             ),
             line,
-        });
+            tokens
+                .last()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("provide an Abide expression for the temporal query"),
+        ));
     }
 
     Ok(Query::Temporal {
@@ -557,61 +947,74 @@ fn parse_temporal_query(
     })
 }
 
-fn parse_temporal_target(token: &str, line: usize) -> Result<TemporalTarget, QAParseError> {
-    if let Some((owner, field)) = token.split_once('.') {
+fn parse_temporal_target(token: QAToken<'_>, line: usize) -> Result<TemporalTarget, QAParseError> {
+    if let Some((owner, field)) = token.text.split_once('.') {
         return Ok(TemporalTarget {
             owner: owner.to_owned(),
             field: Some(field.to_owned()),
         });
     }
 
-    if token.is_empty() {
-        return Err(QAParseError {
-            message: "expected Owner or Owner.field after `on`".to_owned(),
+    if token.text.is_empty() {
+        return Err(expected_error(
+            "expected Owner or Owner.field after `on`",
             line,
-        });
+            token.span,
+            Some("write `on Owner` or `on Owner.field`"),
+        ));
     }
 
     Ok(TemporalTarget {
-        owner: token.to_owned(),
+        owner: token.text.to_owned(),
         field: None,
     })
 }
 
 /// Parse `E.field` from tokens. Returns `(entity, field)`.
-fn parse_entity_field(tokens: &[&str], line: usize) -> Result<(String, String), QAParseError> {
+fn parse_entity_field(
+    tokens: &[QAToken<'_>],
+    line: usize,
+) -> Result<(String, String), QAParseError> {
     if tokens.is_empty() {
-        return Err(QAParseError {
-            message: "expected E.field".to_owned(),
+        return Err(expected_error(
+            "expected E.field",
             line,
-        });
+            empty_span(0),
+            Some("provide an entity field such as `Order.status`"),
+        ));
     }
     split_dot(tokens[0], line)
 }
 
 /// Split `E.field` into `(entity, field)`.
-fn split_dot(s: &str, line: usize) -> Result<(String, String), QAParseError> {
-    if let Some((entity, field)) = s.split_once('.') {
+fn split_dot(token: QAToken<'_>, line: usize) -> Result<(String, String), QAParseError> {
+    if let Some((entity, field)) = token.text.split_once('.') {
         Ok((entity.to_owned(), field.to_owned()))
     } else {
-        Err(QAParseError {
-            message: format!("expected E.field (dot-separated), got '{s}'"),
+        Err(expected_error(
+            format!("expected E.field (dot-separated), got '{}'", token.text),
             line,
-        })
+            token.span,
+            Some("write entity fields with `.`, for example `Order.status`"),
+        ))
     }
 }
 
 /// Parse `reachable E.field -> @State`
-fn parse_reachable(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_reachable(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
     // reachable E.field -> @State
-    if tokens.len() < 3 || tokens[1] != "->" {
-        return Err(QAParseError {
-            message: "expected: reachable E.field -> @State".to_owned(),
+    if tokens.len() < 3 || tokens[1].text != "->" {
+        return Err(expected_error(
+            "expected: reachable E.field -> @State",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `reachable Entity.field -> @State`"),
+        ));
     }
     let (entity, field) = split_dot(tokens[0], line)?;
-    let state = strip_at(tokens[2]);
+    let state = strip_at(tokens[2].text);
     Ok(Query::Reachable {
         entity,
         field,
@@ -620,17 +1023,21 @@ fn parse_reachable(tokens: &[&str], line: usize) -> Result<Query, QAParseError> 
 }
 
 /// Parse `path E.field @From -> @To`
-fn parse_path(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_path(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
     // path E.field @From -> @To
-    if tokens.len() < 4 || tokens[2] != "->" {
-        return Err(QAParseError {
-            message: "expected: path E.field @From -> @To".to_owned(),
+    if tokens.len() < 4 || tokens[2].text != "->" {
+        return Err(expected_error(
+            "expected: path E.field @From -> @To",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `path Entity.field @From -> @To`"),
+        ));
     }
     let (entity, field) = split_dot(tokens[0], line)?;
-    let from = strip_at(tokens[1]);
-    let to = strip_at(tokens[3]);
+    let from = strip_at(tokens[1].text);
+    let to = strip_at(tokens[3].text);
     Ok(Query::Path {
         entity,
         field,
@@ -640,16 +1047,20 @@ fn parse_path(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
 }
 
 /// Parse `transitions from E.field == @State`
-fn parse_transitions(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_transitions(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
     // transitions from E.field == @State
-    if tokens.len() < 4 || tokens[0] != "from" || tokens[2] != "==" {
-        return Err(QAParseError {
-            message: "expected: transitions from E.field == @State".to_owned(),
+    if tokens.len() < 4 || tokens[0].text != "from" || tokens[2].text != "==" {
+        return Err(expected_error(
+            "expected: transitions from E.field == @State",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `transitions from Entity.field == @State`"),
+        ));
     }
     let (entity, field) = split_dot(tokens[1], line)?;
-    let state = strip_at(tokens[3]);
+    let state = strip_at(tokens[3].text);
     Ok(Query::Transitions {
         entity,
         field,
@@ -660,39 +1071,49 @@ fn parse_transitions(tokens: &[&str], line: usize) -> Result<Query, QAParseError
 /// dispatch `transitions from...` (the existing
 /// state-graph query) vs `transitions of E::field` (the new fsm
 /// declaration query).
-fn parse_transitions_or_of(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
-    match tokens.first().copied() {
+fn parse_transitions_or_of(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
+    match tokens.first().map(|token| token.text) {
         Some("of") => {
             if tokens.len() < 2 {
-                return Err(QAParseError {
-                    message: "expected: transitions of E::field".to_owned(),
+                return Err(expected_error(
+                    "expected: transitions of E::field",
                     line,
-                });
+                    tokens[0].span,
+                    Some("write `transitions of Entity::field`"),
+                ));
             }
             let (entity, field) = split_double_colon(tokens[1], line)?;
             Ok(Query::FsmTransitions { entity, field })
         }
         Some("from") => parse_transitions(tokens, line),
-        _ => Err(QAParseError {
-            message: "expected: transitions from E.field == @State, or \
-                      transitions of E::field"
-                .to_owned(),
+        _ => Err(expected_error(
+            "expected: transitions from E.field == @State, or transitions of E::field",
             line,
-        }),
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some(
+                "write `transitions from Entity.field == @State` or `transitions of Entity::field`",
+            ),
+        )),
     }
 }
 
 /// dispatch `terminal E.field` (the existing
 /// state-graph query) vs `terminal states of E::field` (the new fsm
 /// declaration query).
-fn parse_terminal_or_states(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
-    if matches!(tokens.first().copied(), Some("states")) {
+fn parse_terminal_or_states(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
+    if matches!(tokens.first().map(|token| token.text), Some("states")) {
         // `terminal states of E::field`
-        if tokens.len() < 3 || tokens[1] != "of" {
-            return Err(QAParseError {
-                message: "expected: terminal states of E::field".to_owned(),
+        if tokens.len() < 3 || tokens[1].text != "of" {
+            return Err(expected_error(
+                "expected: terminal states of E::field",
                 line,
-            });
+                tokens
+                    .first()
+                    .map_or_else(|| empty_span(0), |token| token.span),
+                Some("write `terminal states of Entity::field`"),
+            ));
         }
         let (entity, field) = split_double_colon(tokens[2], line)?;
         Ok(Query::FsmTerminalStates { entity, field })
@@ -708,29 +1129,38 @@ fn parse_terminal_or_states(tokens: &[&str], line: usize) -> Result<Query, QAPar
 /// Split `E::field` into `(entity, field)`. Used for the
 /// / fsm queries which use `::` instead of `.`
 /// to disambiguate fsm-declared structure from state-graph structure.
-fn split_double_colon(s: &str, line: usize) -> Result<(String, String), QAParseError> {
-    if let Some((entity, field)) = s.split_once("::") {
+fn split_double_colon(token: QAToken<'_>, line: usize) -> Result<(String, String), QAParseError> {
+    if let Some((entity, field)) = token.text.split_once("::") {
         Ok((entity.to_owned(), field.to_owned()))
     } else {
-        Err(QAParseError {
-            message: format!("expected E::field (double-colon-separated), got '{s}'"),
+        Err(expected_error(
+            format!(
+                "expected E::field (double-colon-separated), got '{}'",
+                token.text
+            ),
             line,
-        })
+            token.span,
+            Some("write fsm fields with `::`, for example `Order::status`"),
+        ))
     }
 }
 
 /// Parse `updates on E.field @From -> @To`
-fn parse_updates(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
+fn parse_updates(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
     // updates on E.field @From -> @To
-    if tokens.len() < 5 || tokens[0] != "on" || tokens[3] != "->" {
-        return Err(QAParseError {
-            message: "expected: updates on E.field @From -> @To".to_owned(),
+    if tokens.len() < 5 || tokens[0].text != "on" || tokens[3].text != "->" {
+        return Err(expected_error(
+            "expected: updates on E.field @From -> @To",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `updates on Entity.field @From -> @To`"),
+        ));
     }
     let (entity, field) = split_dot(tokens[1], line)?;
-    let from = strip_at(tokens[2]);
-    let to = strip_at(tokens[4]);
+    let from = strip_at(tokens[2].text);
+    let to = strip_at(tokens[4].text);
     Ok(Query::Updates {
         entity,
         field,
@@ -740,53 +1170,73 @@ fn parse_updates(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
 }
 
 /// Parse `events on E.field`
-fn parse_events(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
-    if tokens.len() < 2 || tokens[0] != "on" {
-        return Err(QAParseError {
-            message: "expected: events on E.field".to_owned(),
+fn parse_events(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
+    if tokens.len() < 2 || tokens[0].text != "on" {
+        return Err(expected_error(
+            "expected: events on E.field",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `events on Entity.field`"),
+        ));
     }
     let (entity, field) = split_dot(tokens[1], line)?;
     Ok(Query::Events { entity, field })
 }
 
 /// Parse `invariants on E`
-fn parse_on_entity(tokens: &[&str], line: usize) -> Result<String, QAParseError> {
-    if tokens.len() < 2 || tokens[0] != "on" {
-        return Err(QAParseError {
-            message: "expected: ... on EntityName".to_owned(),
+fn parse_on_entity(tokens: &[QAToken<'_>], line: usize) -> Result<String, QAParseError> {
+    if tokens.len() < 2 || tokens[0].text != "on" {
+        return Err(expected_error(
+            "expected: ... on EntityName",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `on EntityName`"),
+        ));
     }
-    Ok(tokens[1].to_owned())
+    Ok(tokens[1].text.to_owned())
 }
 
 /// Parse `contracts on E.action`
-fn parse_contracts(tokens: &[&str], line: usize) -> Result<Query, QAParseError> {
-    if tokens.len() < 2 || tokens[0] != "on" {
-        return Err(QAParseError {
-            message: "expected: contracts on E.action".to_owned(),
+fn parse_contracts(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseError> {
+    if tokens.len() < 2 || tokens[0].text != "on" {
+        return Err(expected_error(
+            "expected: contracts on E.action",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `contracts on Entity.action`"),
+        ));
     }
     let (entity, action) = split_dot(tokens[1], line)?;
     Ok(Query::Contracts { entity, action })
 }
 
 /// Parse `cross-calls from System`
-fn parse_from_system(tokens: &[&str], line: usize) -> Result<String, QAParseError> {
-    if tokens.len() < 2 || tokens[0] != "from" {
-        return Err(QAParseError {
-            message: "expected: ... from SystemName".to_owned(),
+fn parse_from_system(tokens: &[QAToken<'_>], line: usize) -> Result<String, QAParseError> {
+    if tokens.len() < 2 || tokens[0].text != "from" {
+        return Err(expected_error(
+            "expected: ... from SystemName",
             line,
-        });
+            tokens
+                .first()
+                .map_or_else(|| empty_span(0), |token| token.span),
+            Some("write `from SystemName`"),
+        ));
     }
-    Ok(tokens[1].to_owned())
+    Ok(tokens[1].text.to_owned())
 }
 
 /// Parse block-form: `ask { for e, f, s where pred(e, f, s) select e, f, s }`
-fn parse_block_ask(input: &str, line: usize) -> Result<QAStatement, QAParseError> {
+fn parse_block_ask(
+    input: &str,
+    line: usize,
+    line_start: usize,
+) -> Result<QAStatement, QAParseError> {
     // Strip "ask {" prefix and "}" suffix
     let inner = input
         .trim_start_matches("ask")
@@ -796,10 +1246,15 @@ fn parse_block_ask(input: &str, line: usize) -> Result<QAStatement, QAParseError
         .map(str::trim);
 
     let Some(inner) = inner else {
-        return Err(QAParseError {
-            message: "block query must be: ask { for ... select ... }".to_owned(),
+        return Err(expected_error(
+            "block query must be: ask { for ... select ... }",
             line,
-        });
+            Span {
+                start: line_start,
+                end: line_start + input.len(),
+            },
+            Some("close the block query with `}`"),
+        ));
     };
 
     let mut bindings = Vec::new();
@@ -1366,10 +1821,93 @@ explain path Order.status @Pending -> @Shipped
     }
 
     #[test]
+    fn parse_error_unknown_verb_has_diagnostic_payload() {
+        let err = parse_qa("query entities").unwrap_err();
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(err.span.start, 0);
+        assert_eq!(err.span.end, 5);
+        assert_eq!(err.help.as_deref(), Some("try `ask entities`"));
+
+        let diagnostic = err.to_diagnostic();
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("abide::qa::parse::expected")
+        );
+        assert_eq!(diagnostic.span, Some(err.span));
+        assert_eq!(diagnostic.help.as_deref(), Some("try `ask entities`"));
+    }
+
+    #[test]
     fn parse_error_missing_path() {
         let result = parse_qa("load commerce/");
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("quoted path"));
+    }
+
+    #[test]
+    fn parse_error_missing_load_quotes_points_at_path() {
+        let err = parse_qa("load commerce/").unwrap_err();
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(err.span.start, 5);
+        assert_eq!(err.span.end, 14);
+        assert_eq!(
+            err.help.as_deref(),
+            Some("write load paths as `load \"path\"`")
+        );
+    }
+
+    #[test]
+    fn parse_error_missing_option_value_points_at_option() {
+        let err = parse_qa("simulate --steps").unwrap_err();
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(err.span.start, 9);
+        assert_eq!(err.span.end, 16);
+        assert_eq!(
+            err.help.as_deref(),
+            Some("provide a non-negative integer after `--steps`")
+        );
+    }
+
+    #[test]
+    fn parse_error_unclosed_abide_block_points_at_block_start() {
+        let err = parse_qa("ask entities\nabide {\n  entity Ticket {\n").unwrap_err();
+        assert_eq!(err.code, "abide::qa::parse::unclosed_block");
+        assert_eq!(err.line, 2);
+        assert_eq!(err.span.start, 13);
+        assert_eq!(err.span.end, 18);
+        assert_eq!(err.help.as_deref(), Some("close the block with `}`"));
+    }
+
+    #[test]
+    fn embedded_abide_blocks_record_multiline_body_span() {
+        let source =
+            "ask entities\nabide {\n  entity Ticket {\n    status: int\n  }\n}\nask types\n";
+        let blocks = embedded_abide_blocks(source).expect("embedded blocks");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].body,
+            "\n  entity Ticket {\n    status: int\n  }\n"
+        );
+        assert_eq!(blocks[0].body_span, Span { start: 20, end: 59 });
+        assert_eq!(
+            &source[blocks[0].body_span.start..blocks[0].body_span.end],
+            blocks[0].body
+        );
+    }
+
+    #[test]
+    fn embedded_abide_blocks_record_single_line_body_span() {
+        let source = "abide { entity Ticket { status: int } }\nask entities\n";
+        let blocks = embedded_abide_blocks(source).expect("embedded blocks");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, " entity Ticket { status: int } ");
+        assert_eq!(blocks[0].body_span, Span { start: 7, end: 38 });
+        assert_eq!(
+            &source[blocks[0].body_span.start..blocks[0].body_span.end],
+            blocks[0].body
+        );
     }
 
     #[test]

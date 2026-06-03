@@ -9,6 +9,7 @@ use crate::loader;
 use abide_ir::ir::types::{
     IRAssumptionSet, IRExpr, IRStoreDecl, IRType, IRVerify, IRVerifySystem, LitVal,
 };
+use abide_syntax::diagnostic::Diagnostic;
 use abide_verify::verify::{
     explore_verify_state_space, verify_all, ExplicitStateSpace, VerifyConfig,
 };
@@ -31,6 +32,8 @@ pub struct QARunResult {
     pub executed: usize,
     /// Output lines for display.
     pub output: Vec<String>,
+    /// Structured diagnostics for hosts such as the CLI and LSP.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Pluggable hooks for the runner to defer expensive work to a host.
@@ -75,6 +78,16 @@ pub fn run_qa_script(script_path: &Path, spec_dir: Option<&Path>, json_mode: boo
     run_qa_script_with_hooks(script_path, spec_dir, json_mode, &mut hooks)
 }
 
+pub fn run_qa_source(
+    script_path: &Path,
+    script_content: &str,
+    spec_dir: Option<&Path>,
+    json_mode: bool,
+) -> QARunResult {
+    let mut hooks = NoopRunnerHooks;
+    run_qa_source_with_hooks(script_path, script_content, spec_dir, json_mode, &mut hooks)
+}
+
 pub fn run_qa_script_with_hooks<H: RunnerHooks>(
     script_path: &Path,
     spec_dir: Option<&Path>,
@@ -89,18 +102,31 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
                 failed: 0,
                 executed: 0,
                 output: vec![format!("error: cannot read {}: {e}", script_path.display())],
+                diagnostics: Vec::new(),
             };
         }
     };
 
-    let statements = match parse::parse_qa(&script_content) {
+    run_qa_source_with_hooks(script_path, &script_content, spec_dir, json_mode, hooks)
+}
+
+pub fn run_qa_source_with_hooks<H: RunnerHooks>(
+    script_path: &Path,
+    script_content: &str,
+    spec_dir: Option<&Path>,
+    json_mode: bool,
+    hooks: &mut H,
+) -> QARunResult {
+    let statements = match parse::parse_qa(script_content) {
         Ok(stmts) => stmts,
         Err(e) => {
+            let diagnostic = e.to_diagnostic().in_file(script_path.display().to_string());
             return QARunResult {
                 passed: 0,
                 failed: 0,
                 executed: 0,
                 output: vec![format!("error: {}: {e}", script_path.display())],
+                diagnostics: vec![diagnostic],
             };
         }
     };
@@ -139,6 +165,7 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
                 failed: 0,
                 executed: 0,
                 output: errors,
+                diagnostics: Vec::new(),
             };
         }
     };
@@ -366,6 +393,7 @@ pub fn run_qa_script_with_hooks<H: RunnerHooks>(
         failed,
         executed,
         output,
+        diagnostics: Vec::new(),
     }
 }
 
@@ -612,6 +640,39 @@ explore --system Commerce --scope Missing=1
             .output
             .iter()
             .any(|line| { line.contains("unknown or unused entity `Missing`") }));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_executes_in_memory_script() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-source-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(
+            dir.join("model.ab"),
+            "module QASource\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write model");
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\nassert terminal Ticket.status\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.passed, 1, "{:?}", result.output);
+        assert_eq!(result.failed, 0, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -924,7 +985,7 @@ fn load_and_build_model(
 ///
 /// The overlay must declare `module X` so its entities get the correct
 /// qualified key (e.g., `Commerce::Order`) matching the base env.
-fn merge_env_overlay(dst: &mut crate::elab::env::Env, src: &crate::elab::env::Env) {
+pub(crate) fn merge_env_overlay(dst: &mut crate::elab::env::Env, src: &crate::elab::env::Env) {
     // Module-level metadata: known_modules, use_decls, decls registry.
     // These feed build_working_namespace() and resolve_use_declarations().
     dst.known_modules.extend(src.known_modules.iter().cloned());

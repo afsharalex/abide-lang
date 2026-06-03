@@ -29,12 +29,15 @@ use abide::ide::{
     build_workspace_index, completion_context, identifier_at, CompletionContext, IdeSymbol,
     IdeSymbolKind,
 };
+use abide::qa::complete::{qa_command_candidates, qa_query_subcommand_candidates};
 use abide::workspace::{CompilerWorkspace, FileId};
 use tokio::sync::Mutex;
-use tower_lsp::jsonrpc::Result;
+use tower_lsp::jsonrpc::{Error, Result};
 #[allow(clippy::wildcard_imports)]
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
+const QA_RUN_SCRIPT_COMMAND: &str = "abide.qa.runScript";
 
 /// Tracking record for one open editor buffer.
 ///
@@ -231,6 +234,10 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec![".".to_owned(), "@".to_owned()]),
                     ..CompletionOptions::default()
                 }),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec![QA_RUN_SCRIPT_COMMAND.to_owned()],
+                    ..ExecuteCommandOptions::default()
+                }),
                 ..ServerCapabilities::default()
             },
         })
@@ -310,30 +317,29 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let state = self.state.lock().await;
-        let Some(doc) = state.documents.get(&uri) else {
+        let mut state = self.state.lock().await;
+        Ok(
+            completion_items_for_open_document(&mut state, &uri, position)
+                .map(CompletionResponse::Array),
+        )
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        if params.command != QA_RUN_SCRIPT_COMMAND {
             return Ok(None);
+        }
+        let uri = qa_run_command_uri_arg(&params.arguments).map_err(Error::invalid_params)?;
+        let (path, source) = {
+            let state = self.state.lock().await;
+            qa_run_source_for_uri(&state, &uri).map_err(Error::invalid_params)?
         };
-        let Some(source) = state.workspace.source_text(doc.file_id) else {
-            return Ok(None);
-        };
-        let mut state = state;
-        let Ok(index) = build_workspace_index(&mut state.workspace) else {
-            return Ok(None);
-        };
-        let Some(offset) = position_to_offset(source.as_ref(), position) else {
-            return Ok(None);
-        };
-        let context = completion_context(source.as_ref(), offset);
-        let keyword_context = keyword_completion_context(source.as_ref(), offset);
-        let mut items = keyword_completions(context, keyword_context);
-        items.extend(
-            index
-                .completion_symbols(context)
-                .into_iter()
-                .map(completion_item_for_symbol),
-        );
-        Ok(Some(CompletionResponse::Array(items)))
+        let result = tokio::task::spawn_blocking(move || run_qa_source_to_json(&path, &source))
+            .await
+            .map_err(|error| Error::invalid_params(format!("QA command task failed: {error}")))?;
+        Ok(Some(result))
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -535,33 +541,47 @@ fn collect_diagnostics_for_root(state: &mut LspState, root_file_id: FileId) -> D
     let mut current = HashSet::new();
     let mut log_error = None;
 
-    match state.workspace.lower(root_file_id) {
-        Ok(lowered) => {
-            for diagnostic in &lowered.diagnostics {
-                collect_lsp_diagnostic(state, root_file_id, diagnostic, &mut current, &mut grouped);
-            }
-
-            if state.verification_policy.should_run_automatically() {
-                let config = abide::verify::VerifyConfig {
-                    overall_timeout_ms: state.verification_policy.timeout_ms,
-                    induction_timeout_ms: state.verification_policy.timeout_ms,
-                    ..abide::verify::VerifyConfig::default()
-                };
-                let results =
-                    abide::verify::verify_function_contracts_only(&lowered.ir_program, &config);
-                for diagnostic in abide::verify::verification_diagnostics(&results) {
+    if state
+        .workspace
+        .path(root_file_id)
+        .is_some_and(is_qa_document_path)
+    {
+        collect_qa_diagnostics_for_root(state, root_file_id, &mut current, &mut grouped);
+    } else {
+        match state.workspace.lower(root_file_id) {
+            Ok(lowered) => {
+                for diagnostic in &lowered.diagnostics {
                     collect_lsp_diagnostic(
                         state,
                         root_file_id,
-                        &diagnostic,
+                        diagnostic,
                         &mut current,
                         &mut grouped,
                     );
                 }
+
+                if state.verification_policy.should_run_automatically() {
+                    let config = abide::verify::VerifyConfig {
+                        overall_timeout_ms: state.verification_policy.timeout_ms,
+                        induction_timeout_ms: state.verification_policy.timeout_ms,
+                        ..abide::verify::VerifyConfig::default()
+                    };
+                    let results =
+                        abide::verify::verify_function_contracts_only(&lowered.ir_program, &config);
+                    for diagnostic in abide::verify::verification_diagnostics(&results) {
+                        collect_lsp_diagnostic(
+                            state,
+                            root_file_id,
+                            &diagnostic,
+                            &mut current,
+                            &mut grouped,
+                        );
+                    }
+                }
             }
-        }
-        Err(error) => {
-            log_error = Some(format!("failed to refresh diagnostics: {error:?}"));
+            Err(error) => {
+                log_error = Some(format!("failed to refresh diagnostics: {error:?}"));
+            }
         }
     }
 
@@ -586,6 +606,39 @@ fn collect_diagnostics_for_root(state: &mut LspState, root_file_id: FileId) -> D
     (grouped, stale_uris, versions, log_error)
 }
 
+fn collect_qa_diagnostics_for_root(
+    state: &LspState,
+    root_file_id: FileId,
+    current: &mut HashSet<Url>,
+    grouped: &mut HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>,
+) {
+    let Some(source) = state.workspace.source_text(root_file_id) else {
+        return;
+    };
+    let Some(path) = state.workspace.path(root_file_id) else {
+        return;
+    };
+
+    for diagnostic in abide::qa::validate::validate_qa_source(path, source.as_ref()) {
+        collect_lsp_diagnostic(state, root_file_id, &diagnostic, current, grouped);
+    }
+
+    collect_embedded_abide_diagnostics_for_root(
+        state,
+        root_file_id,
+        source.as_ref(),
+        path,
+        current,
+        grouped,
+    );
+}
+
+fn is_qa_document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("qa"))
+}
+
 fn collect_lsp_diagnostic(
     state: &LspState,
     root_file_id: FileId,
@@ -599,6 +652,62 @@ fn collect_lsp_diagnostic(
     };
     current.insert(uri.clone());
     grouped.entry(uri).or_default().push(lsp_diagnostic);
+}
+
+fn qa_run_command_uri_arg(arguments: &[serde_json::Value]) -> std::result::Result<Url, String> {
+    let Some(first) = arguments.first() else {
+        return Err("expected document URI argument".to_owned());
+    };
+    if let Some(uri) = first.as_str() {
+        return Url::parse(uri).map_err(|error| format!("invalid document URI: {error}"));
+    }
+    if let Some(uri) = first.get("uri").and_then(serde_json::Value::as_str) {
+        return Url::parse(uri).map_err(|error| format!("invalid document URI: {error}"));
+    }
+    Err("expected document URI string or object with `uri`".to_owned())
+}
+
+#[cfg(test)]
+fn run_qa_script_for_uri(
+    state: &LspState,
+    uri: &Url,
+) -> std::result::Result<serde_json::Value, String> {
+    let (path, source) = qa_run_source_for_uri(state, uri)?;
+    Ok(run_qa_source_to_json(&path, &source))
+}
+
+fn qa_run_source_for_uri(
+    state: &LspState,
+    uri: &Url,
+) -> std::result::Result<(PathBuf, String), String> {
+    let path = uri
+        .to_file_path()
+        .map_err(|()| "QA run command requires a file URI".to_owned())?;
+    if !is_qa_document_path(&path) {
+        return Err("QA run command requires a .qa document".to_owned());
+    }
+    let source = if let Some(document) = state.documents.get(uri) {
+        state
+            .workspace
+            .source_text(document.file_id)
+            .map(|source| source.to_string())
+            .ok_or_else(|| "open QA document source is unavailable".to_owned())?
+    } else {
+        std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?
+    };
+    Ok((path, source))
+}
+
+fn run_qa_source_to_json(path: &Path, source: &str) -> serde_json::Value {
+    let result = abide::qa::runner::run_qa_source(path, source, None, false);
+    serde_json::json!({
+        "passed": result.passed,
+        "failed": result.failed,
+        "executed": result.executed,
+        "output": result.output,
+        "diagnostics": result.diagnostics,
+    })
 }
 
 fn diagnostic_to_lsp(
@@ -680,6 +789,19 @@ fn source_for_path(workspace: &CompilerWorkspace, path: &Path) -> Option<String>
     Some(workspace.source_text(file_id)?.to_string())
 }
 
+fn collect_embedded_abide_diagnostics_for_root(
+    state: &LspState,
+    root_file_id: FileId,
+    source: &str,
+    path: &Path,
+    current: &mut HashSet<Url>,
+    grouped: &mut HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>,
+) {
+    for diagnostic in abide::qa::validate::validate_embedded_abide_blocks(path, source) {
+        collect_lsp_diagnostic(state, root_file_id, &diagnostic, current, grouped);
+    }
+}
+
 fn location_for_span(
     workspace: &CompilerWorkspace,
     file_id: FileId,
@@ -734,6 +856,106 @@ fn completion_item_for_symbol(symbol: &IdeSymbol) -> CompletionItem {
         detail: Some(symbol.detail.clone()),
         ..CompletionItem::default()
     }
+}
+
+fn completion_items_for_open_document(
+    state: &mut LspState,
+    uri: &Url,
+    position: Position,
+) -> Option<Vec<CompletionItem>> {
+    let file_id = state.documents.get(uri)?.file_id;
+    let source = state.workspace.source_text(file_id)?;
+    let offset = position_to_offset(source.as_ref(), position)?;
+    let path = state.workspace.path(file_id)?;
+
+    if is_qa_document_path(path) {
+        if let Some(block) = embedded_abide_block_at(source.as_ref(), offset) {
+            return Some(abide_completion_items_for_source(
+                state,
+                &block.body,
+                offset.saturating_sub(block.body_span.start),
+            ));
+        }
+        return Some(qa_completion_items(source.as_ref(), offset));
+    }
+
+    Some(abide_completion_items_for_source(
+        state,
+        source.as_ref(),
+        offset,
+    ))
+}
+
+fn embedded_abide_block_at(
+    source: &str,
+    offset: usize,
+) -> Option<abide::qa::parse::QAEmbeddedAbideBlock> {
+    abide::qa::parse::embedded_abide_blocks(source)
+        .ok()?
+        .into_iter()
+        .find(|block| offset >= block.body_span.start && offset <= block.body_span.end)
+}
+
+fn abide_completion_items_for_source(
+    state: &mut LspState,
+    source: &str,
+    offset: usize,
+) -> Vec<CompletionItem> {
+    let context = completion_context(source, offset);
+    let keyword_context = keyword_completion_context(source, offset);
+    let mut items = keyword_completions(context, keyword_context);
+    if let Ok(index) = build_workspace_index(&mut state.workspace) {
+        items.extend(
+            index
+                .completion_symbols(context)
+                .into_iter()
+                .map(completion_item_for_symbol),
+        );
+    }
+    items
+}
+
+fn qa_completion_items(source: &str, offset: usize) -> Vec<CompletionItem> {
+    let candidates = match qa_completion_context(source, offset) {
+        QACompletionContext::Command => qa_command_candidates(),
+        QACompletionContext::Query => qa_query_subcommand_candidates(),
+        QACompletionContext::None => Vec::new(),
+    };
+    candidates
+        .into_iter()
+        .map(|label| CompletionItem {
+            label,
+            kind: Some(CompletionItemKind::KEYWORD),
+            ..CompletionItem::default()
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QACompletionContext {
+    Command,
+    Query,
+    None,
+}
+
+fn qa_completion_context(source: &str, offset: usize) -> QACompletionContext {
+    let line = current_line_prefix(source, offset);
+    let token_count = line.split_whitespace().count();
+    if token_count <= 1 {
+        return QACompletionContext::Command;
+    }
+
+    let first = line.split_whitespace().next().unwrap_or_default();
+    if matches!(first, "ask" | "explain" | "assert") && token_count == 2 {
+        QACompletionContext::Query
+    } else {
+        QACompletionContext::None
+    }
+}
+
+fn current_line_prefix(source: &str, offset: usize) -> &str {
+    let prefix = &source[..offset.min(source.len())];
+    prefix.rsplit('\n').next().unwrap_or(prefix)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1114,6 +1336,118 @@ mod tests {
     }
 
     #[test]
+    fn lsp_completion_uses_qa_commands_for_qa_documents() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let uri = Url::parse("file:///tmp/commands.qa").expect("uri");
+        let file_id = state.workspace.set_file_source("/tmp/commands.qa", "ver");
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 1,
+            },
+        );
+
+        let items = completion_items_for_open_document(&mut state, &uri, Position::new(0, 3))
+            .expect("completion items");
+        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert!(labels.contains(&"verify".to_owned()), "{labels:#?}");
+        assert!(
+            !labels.contains(&"module".to_owned()),
+            "QA completions should not include Abide keywords: {labels:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_completion_uses_qa_query_subcommands_for_qa_documents() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let uri = Url::parse("file:///tmp/query.qa").expect("uri");
+        let file_id = state.workspace.set_file_source("/tmp/query.qa", "ask fs");
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 1,
+            },
+        );
+
+        let items = completion_items_for_open_document(&mut state, &uri, Position::new(0, 6))
+            .expect("completion items");
+        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert!(labels.contains(&"fsms".to_owned()), "{labels:#?}");
+        assert!(
+            !labels.contains(&"fn".to_owned()),
+            "QA subcommand completions should not include Abide keywords: {labels:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_completion_uses_abide_keywords_inside_embedded_qa_blocks() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let uri = Url::parse("file:///tmp/embedded_completion.qa").expect("uri");
+        let source = "ask entities\nabide {\n  ent\n}\n";
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/embedded_completion.qa", source);
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 1,
+            },
+        );
+
+        let items = completion_items_for_open_document(&mut state, &uri, Position::new(2, 5))
+            .expect("completion items");
+        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert!(
+            labels.contains(&"entity".to_owned()),
+            "embedded Abide completions should include Abide keywords: {labels:#?}"
+        );
+        assert!(
+            !labels.contains(&"ask".to_owned()),
+            "embedded Abide completions should not include QA commands: {labels:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_qa_run_command_uses_open_document_source() {
+        let root = std::env::temp_dir().join(format!("abide-lsp-qa-run-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        std::fs::write(
+            root.join("model.ab"),
+            "module QALspRun\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write model");
+
+        let qa_path = root.join("query.qa");
+        let uri = Url::from_file_path(&qa_path).expect("file uri");
+        let source = "load \"model.ab\"\nassert terminal Ticket.status\n";
+        let mut state = LspState::new(root);
+        let file_id = state.workspace.set_file_source(&qa_path, source);
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 1,
+            },
+        );
+
+        let result = run_qa_script_for_uri(&state, &uri).expect("run QA command");
+
+        assert_eq!(result["passed"], 1);
+        assert_eq!(result["failed"], 0);
+        assert_eq!(result["executed"], 1);
+    }
+
+    #[test]
     fn lsp_diagnostics_include_function_contract_failures() {
         let mut state = LspState::new(PathBuf::from("."));
         let file_id = state.workspace.set_file_source(
@@ -1146,6 +1480,223 @@ mod tests {
         assert!(
             codes.contains(&"abide::verify::fn_precondition_failed".to_owned()),
             "expected call-site requires diagnostic: {codes:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_do_not_lower_valid_qa_as_abide_source() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/valid.qa", "ask entities\n");
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        assert!(
+            diagnostics.values().all(Vec::is_empty),
+            "valid QA should not produce Abide source diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_publish_qa_parse_errors_for_qa_documents() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/bad.qa", "query entities\n");
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(all.len(), 1, "expected one QA parse diagnostic: {all:#?}");
+
+        let diagnostic = all[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                "abide::qa::parse::expected".to_owned()
+            ))
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 0));
+        assert_eq!(diagnostic.range.end, Position::new(0, 5));
+        assert!(
+            diagnostic.message.contains("expected 'ask'"),
+            "unexpected diagnostic message: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_publish_missing_qa_load_targets() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let file_id = state.workspace.set_file_source(
+            "/tmp/missing_load.qa",
+            "load \"missing.ab\"\nask entities\n",
+        );
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all.len(),
+            1,
+            "expected one missing load diagnostic: {all:#?}"
+        );
+
+        let diagnostic = all[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                "abide::qa::semantic::missing_load".to_owned()
+            ))
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 6));
+        assert_eq!(diagnostic.range.end, Position::new(0, 16));
+    }
+
+    #[test]
+    fn lsp_diagnostics_map_embedded_qa_abide_blocks_to_qa_source() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let source = "ask entities\nabide {\n  entity Broken {\n    status: MissingType\n  }\n}\n";
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/embedded_diagnostic.qa", source);
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            !all.is_empty(),
+            "expected embedded Abide diagnostic mapped into QA source"
+        );
+        assert!(
+            all.iter()
+                .any(|diagnostic| diagnostic.range.start == Position::new(1, 7)),
+            "expected spanless embedded diagnostic to anchor inside the Abide block: {all:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_map_embedded_qa_abide_parse_spans_to_qa_source() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let source = "ask entities\nabide {\n  entity Broken {\n    status:\n  }\n}\n";
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/embedded_parse_diagnostic.qa", source);
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            all.iter().any(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("abide::parse::expected".to_owned()))
+                    && diagnostic.range.start == Position::new(4, 2)
+            }),
+            "expected embedded Abide parse diagnostic mapped into QA source: {all:#?}"
+        );
+    }
+
+    #[test]
+    fn lsp_diagnostics_publish_unknown_qa_query_references() {
+        let root =
+            std::env::temp_dir().join(format!("abide-lsp-qa-validation-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let spec_path = root.join("model.ab");
+        std::fs::write(
+            &spec_path,
+            "module QALsp\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write spec");
+
+        let qa_path = root.join("query.qa");
+        let source = "load \"model.ab\"\nask terminal Missing.status\n";
+        let mut state = LspState::new(root);
+        let file_id = state.workspace.set_file_source(&qa_path, source);
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all.len(),
+            1,
+            "expected one unknown query reference diagnostic: {all:#?}"
+        );
+
+        let diagnostic = all[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                "abide::qa::semantic::unknown_reference".to_owned()
+            ))
+        );
+        assert_eq!(diagnostic.range.start, Position::new(1, 13));
+        assert_eq!(diagnostic.range.end, Position::new(1, 27));
+    }
+
+    #[test]
+    fn lsp_diagnostics_treat_hypothetical_fixture_as_qa_source() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let qa_path = root
+            .join("..")
+            .join("abide")
+            .join("tests")
+            .join("fixtures")
+            .join("test_hypothetical.qa");
+        let source = std::fs::read_to_string(&qa_path).expect("fixture source");
+        let mut state = LspState::new(root);
+        let file_id = state.workspace.set_file_source(&qa_path, source);
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert!(
+            all.iter().all(|diagnostic| !diagnostic
+                .message
+                .contains("expected top-level declaration")),
+            "QA fixture should not be parsed as Abide source: {all:#?}"
+        );
+        assert!(
+            all.iter().all(|diagnostic| {
+                !(diagnostic.message.contains("unresolved name")
+                    && diagnostic.message.contains("Closed"))
+            }),
+            "embedded block should see the loaded base spec context: {all:#?}"
         );
     }
 }

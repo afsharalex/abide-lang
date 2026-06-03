@@ -5,6 +5,7 @@
 
 pub mod artifacts;
 pub mod ast;
+pub mod complete;
 pub mod exec;
 pub mod extract;
 pub mod fmt;
@@ -12,3 +13,4 @@ pub mod graph;
 pub mod model;
 pub mod parse;
 pub mod runner;
+pub mod validate;

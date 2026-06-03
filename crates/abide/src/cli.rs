@@ -970,6 +970,12 @@ fn run_qa_command(script: PathBuf, spec_dir: Option<PathBuf>, format: &str) {
     for line in &result.output {
         println!("{line}");
     }
+    if !result.diagnostics.is_empty() {
+        let sources = std::fs::read_to_string(&script)
+            .map(|source| vec![(script.display().to_string(), source)])
+            .unwrap_or_default();
+        report_diagnostics(&result.diagnostics, &sources);
+    }
     if result.failed > 0 || result.executed == 0 {
         print_qa_summary(&result, json_mode);
         std::process::exit(1);

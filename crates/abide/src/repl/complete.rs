@@ -2,6 +2,7 @@
 
 use reedline::{Completer, Span, Suggestion};
 
+use crate::qa::complete::{qa_command_candidates, qa_query_subcommand_candidates};
 use crate::qa::model::FlowModel;
 
 use super::Mode;
@@ -58,33 +59,8 @@ impl AbideCompleter {
 
         Self {
             mode,
-            qa_verbs: vec![
-                "ask".into(),
-                "explain".into(),
-                "assert".into(),
-                "load".into(),
-            ],
-            qa_subcommands: vec![
-                "reachable".into(),
-                "terminal".into(),
-                "initial".into(),
-                "cycles".into(),
-                "transitions".into(),
-                "entities".into(),
-                "systems".into(),
-                "types".into(),
-                "invariants".into(),
-                "contracts".into(),
-                "cross-calls".into(),
-                "deadlock".into(),
-                "always".into(),
-                "eventually".into(),
-                "not".into(),
-                "path".into(),
-                "events".into(),
-                "match-coverage".into(),
-                "updates".into(),
-            ],
+            qa_verbs: qa_command_candidates(),
+            qa_subcommands: qa_query_subcommand_candidates(),
             model_names,
             env_names: env_names.to_vec(),
             entity_fields,
@@ -221,4 +197,56 @@ fn suggest_from(candidates: &[String], prefix: &str, start: usize) -> Vec<Sugges
             append_whitespace: true,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn suggestion_values(suggestions: Vec<Suggestion>) -> Vec<String> {
+        suggestions
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect()
+    }
+
+    #[test]
+    fn qa_mode_completes_current_top_level_commands() {
+        let mut completer = AbideCompleter::new(Mode::QA, None, &[]);
+
+        let values = suggestion_values(completer.complete("ver", 3));
+        assert!(
+            values.contains(&"verify".to_owned()),
+            "expected verify completion, got {values:#?}"
+        );
+
+        let values = suggestion_values(completer.complete("sim", 3));
+        assert!(
+            values.contains(&"simulate".to_owned()),
+            "expected simulate completion, got {values:#?}"
+        );
+
+        let values = suggestion_values(completer.complete("exp", 3));
+        assert!(
+            values.contains(&"explore".to_owned()),
+            "expected explore completion, got {values:#?}"
+        );
+    }
+
+    #[test]
+    fn qa_mode_completes_current_query_subcommands() {
+        let mut completer = AbideCompleter::new(Mode::QA, None, &[]);
+
+        let values = suggestion_values(completer.complete("ask fs", 6));
+        assert!(
+            values.contains(&"fsms".to_owned()),
+            "expected fsms completion, got {values:#?}"
+        );
+
+        let values = suggestion_values(completer.complete("assert al", 9));
+        assert!(
+            values.contains(&"always".to_owned()),
+            "expected always completion, got {values:#?}"
+        );
+    }
 }
