@@ -1,0 +1,80 @@
+module CommerceProject
+
+include "../domain/order.ab"
+include "../domain/payment.ab"
+include "../domain/inventory.ab"
+include "../domain/shipment.ab"
+include "../systems/storefront.ab"
+
+use CommerceOrder::*
+use CommercePayment::PaymentIntent
+use CommercePayment::PaymentStatus as PayStatus
+use CommerceInventory::StockItem
+use CommerceInventory::InventoryStatus as InvStatus
+use CommerceShipment::Shipment
+use CommerceShipment::ShipmentStatus as ShipStatus
+use CommercePlatform::*
+
+prop paid_orders_have_positive_totals for Storefront =
+  always all o: Order | o.status == @Paid implies order_has_positive_total(o)
+
+verify checkout_graph_smoke {
+  assume {
+    store orders: Order[0..4]
+    store customers: Customer[0..2]
+    let storefront = Storefront { orders: orders, customers: customers }
+  }
+
+  assert always all o: Order | o.status == @Closed implies o.total > 0
+}
+
+verify payment_status_smoke {
+  assume {
+    store orders: Order[0..4]
+    store intents: PaymentIntent[0..4]
+    let billing = Billing { orders: orders, intents: intents }
+  }
+
+  assert always all p: PaymentIntent | p.status == @Captured implies p.amount > 0
+}
+
+verify fulfillment_status_smoke {
+  assume {
+    store orders: Order[0..4]
+    store shipments: Shipment[0..4]
+    let fulfillment = Fulfillment { orders: orders, shipments: shipments }
+  }
+
+  assert always all s: Shipment | s.status == @Delivered implies shipment_finished(s)
+}
+
+scene happy_path_order {
+  given {
+    store orders: Order[1]
+    store customers: Customer[1]
+    store intents: PaymentIntent[1]
+    store items: StockItem[1]
+    store shipments: Shipment[1]
+    let storefront = Storefront { orders: orders, customers: customers }
+    let billing = Billing { orders: orders, intents: intents }
+    let warehouse = Warehouse { orders: orders, items: items }
+    let fulfillment = Fulfillment { orders: orders, shipments: shipments }
+    let o = one Order in orders where o.total == 50 and o.status == @Draft
+    let p = one PaymentIntent in intents where p.order_id == o.id and p.amount == 50 and p.status == @Authorized
+    let i = one StockItem in items where i.status == @Available
+    let s = one Shipment in shipments where s.order_id == o.id and s.status == @Pending
+  }
+  when {
+    storefront.submit_order(o.id)
+    billing.capture_payment(p.id)
+    warehouse.reserve_item(o.id, i.id)
+    fulfillment.ship_order(o.id, s.id)
+    fulfillment.deliver_order(o.id, s.id)
+  }
+  then {
+    assert o.status == @Closed
+    assert p.status == @Captured
+    assert i.status == @Allocated
+    assert s.status == @Delivered
+  }
+}

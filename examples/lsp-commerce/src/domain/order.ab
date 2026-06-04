@@ -1,0 +1,92 @@
+module CommerceOrder
+
+enum CustomerSegment = Standard | Preferred | Enterprise
+enum OrderStatus = Draft | Submitted | AwaitingPayment | Paid | Allocating | ReadyToShip | Shipped | Closed | Cancelled
+
+type Money = int
+
+fn bounded_discount(points: int, requested: int): int
+  requires points >= 0
+  requires requested >= 0
+  ensures result >= 0
+  ensures result <= requested
+{
+  match points {
+    _ if points >= 1000 => requested
+    _ => 0
+  }
+}
+
+fn loyalty_floor(points: int): int
+  requires points >= 0
+  ensures result >= 0
+  decreases points
+{
+  match points {
+    _ if points == 0 => 0
+    _ => loyalty_floor(points - 1)
+  }
+}
+
+entity Customer {
+  id: identity
+  segment: CustomerSegment = @Standard
+  loyalty_points: int = 0
+
+  action promote()
+    requires segment == @Standard
+    requires loyalty_points >= 1000 {
+    segment' = @Preferred
+  }
+}
+
+entity Order {
+  id: identity
+  customer_id: identity
+  total: Money = 0
+  status: OrderStatus = @Draft
+
+  action submit()
+    requires status == @Draft
+    requires total > 0 {
+    status' = @Submitted
+  }
+
+  action await_payment()
+    requires status == @Submitted {
+    status' = @AwaitingPayment
+  }
+
+  action mark_paid()
+    requires status == @AwaitingPayment {
+    status' = @Paid
+  }
+
+  action allocate()
+    requires status == @Paid {
+    status' = @Allocating
+  }
+
+  action mark_ready()
+    requires status == @Allocating {
+    status' = @ReadyToShip
+  }
+
+  action ship()
+    requires status == @ReadyToShip {
+    status' = @Shipped
+  }
+
+  action close()
+    requires status == @Shipped {
+    status' = @Closed
+  }
+
+  action cancel()
+    requires status == @Draft {
+    status' = @Cancelled
+  }
+}
+
+pred order_has_positive_total(o: Order) = o.total > 0
+

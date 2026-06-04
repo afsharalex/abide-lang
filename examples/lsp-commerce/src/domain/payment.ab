@@ -1,0 +1,37 @@
+module CommercePayment
+
+enum PaymentStatus = Open | Authorized | Captured | Failed | Refunded
+enum PaymentProvider = Stripe | Adyen | Manual
+
+entity PaymentIntent {
+  id: identity
+  order_id: identity
+  amount: int = 0
+  provider: PaymentProvider = @Stripe
+  status: PaymentStatus = @Open
+
+  action authorize()
+    requires status == @Open
+    requires amount > 0 {
+    status' = @Authorized
+  }
+
+  action capture()
+    requires status == @Authorized
+    requires amount > 0 {
+    status' = @Captured
+  }
+
+  action fail()
+    requires status == @Open {
+    status' = @Failed
+  }
+
+  action refund()
+    requires status == @Captured {
+    status' = @Refunded
+  }
+}
+
+pred captured_payment(p: PaymentIntent) = p.status == @Captured
+

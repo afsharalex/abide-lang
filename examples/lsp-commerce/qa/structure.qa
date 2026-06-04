@@ -1,0 +1,19 @@
+// Structural QA checks for the multi-file commerce example.
+
+load "../src/project.ab"
+
+ask entities
+ask systems
+ask types
+
+ask transitions from Order.status == @Draft
+ask terminal Order.status
+ask path Order.status @Draft -> @Closed
+
+assert reachable Order.status -> @Closed
+assert reachable PaymentIntent.status -> @Captured
+assert reachable StockItem.status -> @Allocated
+assert reachable Shipment.status -> @Delivered
+assert not cycles Order.status
+
+explain path Order.status @Draft -> @Closed

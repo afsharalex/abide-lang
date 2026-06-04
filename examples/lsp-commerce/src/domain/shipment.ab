@@ -1,0 +1,32 @@
+module CommerceShipment
+
+enum ShipmentStatus = Pending | Packed | InTransit | Delivered | Returned
+
+entity Shipment {
+  id: identity
+  order_id: identity
+  status: ShipmentStatus = @Pending
+
+  action pack()
+    requires status == @Pending {
+    status' = @Packed
+  }
+
+  action dispatch()
+    requires status == @Packed {
+    status' = @InTransit
+  }
+
+  action deliver()
+    requires status == @InTransit {
+    status' = @Delivered
+  }
+
+  action return_to_sender()
+    requires status == @Delivered {
+    status' = @Returned
+  }
+}
+
+pred shipment_finished(s: Shipment) = s.status == @Delivered or s.status == @Returned
+

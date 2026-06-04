@@ -1,0 +1,36 @@
+// QA script that adds hypothetical return and refund behavior.
+
+load "../src/project.ab"
+
+abide {
+  module CommercePayment
+
+  entity PaymentIntent {
+    action reopen_after_refund()
+      requires status == @Refunded
+    {
+      status' = @Open
+    }
+  }
+}
+
+abide {
+  module CommerceShipment
+
+  entity Shipment {
+    action mark_returned()
+      requires status == @Delivered
+    {
+      status' = @Returned
+    }
+  }
+}
+
+assert reachable PaymentIntent.status -> @Refunded
+assert cycles PaymentIntent.status
+assert reachable Shipment.status -> @Returned
+assert not cycles Order.status
+
+ask transitions from PaymentIntent.status == @Refunded
+ask transitions from Shipment.status == @Delivered
+

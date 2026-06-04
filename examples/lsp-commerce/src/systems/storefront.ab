@@ -1,0 +1,134 @@
+module CommercePlatform
+
+include "../domain/order.ab"
+include "../domain/payment.ab"
+include "../domain/inventory.ab"
+include "../domain/shipment.ab"
+
+use CommerceOrder::*
+use CommercePayment::*
+use CommercePayment::PaymentStatus as PayStatus
+use CommerceInventory::*
+use CommerceShipment::Shipment
+use CommerceShipment::ShipmentStatus as ShipStatus
+
+system Storefront(orders: Store<Order>, customers: Store<Customer>) {
+  command create_order(customer_id: identity, total: Money)
+    requires total > 0 {
+    create Order {
+      customer_id = customer_id
+      total = total
+      status = @Draft
+    }
+  }
+
+  command submit_order(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Draft {
+    choose o: Order where o.id == order_id {
+      o.submit()
+      o.await_payment()
+    }
+  }
+
+  command cancel_draft(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Draft {
+    choose o: Order where o.id == order_id {
+      o.cancel()
+    }
+  }
+
+  query can_submit(order: Order) =
+    order.status == @Draft and order.total > 0
+}
+
+system Billing(orders: Store<Order>, intents: Store<PaymentIntent>) {
+  command open_intent(order_id: identity, amount: int)
+    requires amount > 0 {
+    create PaymentIntent {
+      order_id = order_id
+      amount = amount
+      status = @Open
+    }
+  }
+
+  command authorize_payment(intent_id: identity)
+    requires exists p: PaymentIntent | p.id == intent_id and p.status == @Open {
+    choose p: PaymentIntent where p.id == intent_id {
+      p.authorize()
+    }
+  }
+
+  command capture_payment(intent_id: identity)
+    requires exists p: PaymentIntent | p.id == intent_id and p.status == @Authorized {
+    choose p: PaymentIntent where p.id == intent_id {
+      p.capture()
+      choose o: Order where o.id == p.order_id {
+        o.mark_paid()
+      }
+    }
+  }
+
+  query captured(intent: PaymentIntent) =
+    intent.status == @Captured
+}
+
+system Warehouse(orders: Store<Order>, items: Store<StockItem>) {
+  command reserve_item(order_id: identity, item_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Paid
+    requires exists i: StockItem | i.id == item_id and i.status == @Available {
+    choose i: StockItem where i.id == item_id {
+      i.reserve_for(order_id)
+      i.allocate()
+    }
+    choose o: Order where o.id == order_id {
+      o.allocate()
+      o.mark_ready()
+    }
+  }
+
+  command backorder_item(order_id: identity, item_id: identity)
+    requires exists i: StockItem | i.id == item_id and i.status == @Available {
+    choose i: StockItem where i.id == item_id {
+      i.backorder(order_id)
+    }
+  }
+}
+
+system Fulfillment(orders: Store<Order>, shipments: Store<Shipment>) {
+  command create_shipment(order_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @ReadyToShip {
+    create Shipment {
+      order_id = order_id
+      status = @Pending
+    }
+  }
+
+  command ship_order(order_id: identity, shipment_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @ReadyToShip
+    requires exists s: Shipment | s.id == shipment_id and s.status == @Pending {
+    choose s: Shipment where s.id == shipment_id {
+      s.pack()
+      s.dispatch()
+    }
+    choose o: Order where o.id == order_id {
+      o.ship()
+    }
+  }
+
+  command deliver_order(order_id: identity, shipment_id: identity)
+    requires exists o: Order | o.id == order_id and o.status == @Shipped
+    requires exists s: Shipment | s.id == shipment_id and s.status == @InTransit {
+    choose s: Shipment where s.id == shipment_id {
+      s.deliver()
+    }
+    choose o: Order where o.id == order_id {
+      o.close()
+    }
+  }
+}
+
+pred payment_has_terminal_status(p: PaymentIntent) =
+  p.status == @Captured or p.status == @Failed or p.status == @Refunded
+
+pred shipment_is_in_flight(s: Shipment) =
+  s.status == @Packed or s.status == @InTransit

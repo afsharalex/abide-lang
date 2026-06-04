@@ -1,0 +1,35 @@
+module CommerceInventory
+
+enum InventoryStatus = Available | Reserved | Allocated | Backordered | Released
+
+entity StockItem {
+  id: identity
+  sku: identity
+  order_id: identity
+  status: InventoryStatus = @Available
+
+  action reserve_for(order_id: identity)
+    requires status == @Available {
+    status' = @Reserved
+    order_id' = order_id
+  }
+
+  action allocate()
+    requires status == @Reserved {
+    status' = @Allocated
+  }
+
+  action backorder(order_id: identity)
+    requires status == @Available {
+    status' = @Backordered
+    order_id' = order_id
+  }
+
+  action release()
+    requires status == @Reserved {
+    status' = @Released
+  }
+}
+
+pred item_committed(i: StockItem) = i.status == @Reserved or i.status == @Allocated
+

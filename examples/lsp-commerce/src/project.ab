@@ -1,0 +1,87 @@
+// Project program for the LSP commerce example.
+//
+// This file is the single project root: it loads the domain/system modules and
+// defines the program that wires all process DAGs across those systems.
+
+module CommerceProject
+
+include "domain/order.ab"
+include "domain/payment.ab"
+include "domain/inventory.ab"
+include "domain/shipment.ab"
+include "systems/storefront.ab"
+include "policies/safety.ab"
+
+use CommerceOrder::*
+use CommercePayment::*
+use CommerceInventory::*
+use CommerceShipment::*
+use CommercePlatform::*
+
+// Reusable process DAG for the normal checkout path. Program-level `use`
+// binds the first four system parameters and leaves the remaining value
+// parameters on the instantiated program proc.
+proc checkout_flow(
+  storefront: Storefront,
+  billing: Billing,
+  warehouse: Warehouse,
+  fulfillment: Fulfillment,
+  customer_id: identity,
+  order_id: identity,
+  item_id: identity,
+  intent_id: identity,
+  shipment_id: identity,
+  total: int
+) requires total > 0 {
+  create_order = storefront.create_order(customer_id, total)
+  submit_order = storefront.submit_order(order_id)
+  open_intent = billing.open_intent(order_id, total)
+  authorize_payment = billing.authorize_payment(intent_id)
+  capture_payment = billing.capture_payment(intent_id)
+  reserve_item = warehouse.reserve_item(order_id, item_id)
+  create_shipment = fulfillment.create_shipment(order_id)
+  ship_order = fulfillment.ship_order(order_id, shipment_id)
+  deliver_order = fulfillment.deliver_order(order_id, shipment_id)
+
+  submit_order needs create_order.done
+  open_intent needs submit_order.done
+  authorize_payment needs open_intent.done
+  capture_payment needs authorize_payment.done
+  reserve_item needs capture_payment.done
+  create_shipment needs reserve_item.done
+  ship_order needs reserve_item.done and create_shipment.done
+  deliver_order needs ship_order.done
+}
+
+program CommerceOperations(
+  orders: Store<Order>[..6],
+  customers: Store<Customer>[..4],
+  intents: Store<PaymentIntent>[..6],
+  items: Store<StockItem>[..6],
+  shipments: Store<Shipment>[..6]
+) {
+  let storefront = Storefront { orders: orders, customers: customers }
+  let billing = Billing { orders: orders, intents: intents }
+  let warehouse = Warehouse { orders: orders, items: items }
+  let fulfillment = Fulfillment { orders: orders, shipments: shipments }
+
+  use checkout_flow(storefront, billing, warehouse, fulfillment)
+
+  proc fulfill_paid_order(order_id: identity, item_id: identity, shipment_id: identity) {
+    reserve = warehouse.reserve_item(order_id, item_id)
+    create_shipment = fulfillment.create_shipment(order_id)
+    ship = fulfillment.ship_order(order_id, shipment_id)
+    deliver = fulfillment.deliver_order(order_id, shipment_id)
+
+    create_shipment needs reserve.done
+    ship needs reserve.done and create_shipment.done
+    deliver needs ship.done
+  }
+
+  proc exception_flow(order_id: identity, item_id: identity) {
+    backorder = warehouse.backorder_item(order_id, item_id)
+    cancel = storefront.cancel_draft(order_id)
+
+    cancel needs backorder.done
+  }
+}
