@@ -46,7 +46,7 @@ pub(super) fn lower_system(
             entities.push(hidden);
         }
     }
-    let let_binding_system_types: HashMap<&str, String> = es
+    let mut let_binding_system_types: HashMap<&str, String> = es
         .let_bindings
         .iter()
         .map(|lb| {
@@ -56,6 +56,9 @@ pub(super) fn lower_system(
             )
         })
         .collect();
+    let_binding_system_types
+        .entry("self")
+        .or_insert_with(|| canonical(aliases, &es.name).to_owned());
 
     let mut ir_system = IRSystem {
         name: es.name.clone(),

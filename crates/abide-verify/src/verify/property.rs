@@ -3272,14 +3272,21 @@ fn encode_prop_set_comp_value(
     match expr {
         IRExpr::SetComp {
             var,
+            domain,
             source: Some(source),
             filter,
             projection,
             ty,
             ..
-        } => {
-            encode_prop_sourced_set_comp_value(enc, var, source, filter, projection.as_deref(), ty)
-        }
+        } => encode_prop_sourced_set_comp_value(
+            enc,
+            var,
+            domain,
+            source,
+            filter,
+            projection.as_deref(),
+            ty,
+        ),
         IRExpr::SetComp {
             var,
             domain: IRType::Entity { name: entity_name },
@@ -3316,11 +3323,27 @@ fn encode_prop_set_comp_value(
 fn encode_prop_sourced_set_comp_value(
     enc: PropertyEncodingCtx<'_>,
     var: &str,
+    domain: &IRType,
     source: &IRExpr,
     filter: &IRExpr,
     projection: Option<&IRExpr>,
     ty: &IRType,
 ) -> Result<SmtValue, String> {
+    if let Some((entity_name, start_slot, slot_count)) =
+        store_source_range(enc.property, domain, source)
+    {
+        return encode_prop_store_sourced_entity_set_comp_value(
+            enc,
+            var,
+            &entity_name,
+            start_slot,
+            slot_count,
+            filter,
+            projection,
+            ty,
+        );
+    }
+
     let elements = match source {
         IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
         _ => {
@@ -3350,6 +3373,67 @@ fn encode_prop_sourced_set_comp_value(
             value.to_dynamic(),
         )?;
         let cond = set_comp_condition(filter_val, constraints);
+        let stored = arr.store(&key, &true_val);
+        arr = smt::array_ite(&cond, &stored, &arr);
+    }
+    Ok(SmtValue::Array(arr))
+}
+
+fn store_source_range(
+    ctx: &PropertyCtx,
+    domain: &IRType,
+    source: &IRExpr,
+) -> Option<(String, usize, usize)> {
+    let IRType::Entity {
+        name: domain_entity,
+    } = domain
+    else {
+        return None;
+    };
+    let IRExpr::Var {
+        name: store_name, ..
+    } = source
+    else {
+        return None;
+    };
+    let store_range = ctx.store_ranges.get(store_name)?;
+    if store_range.entity_type != *domain_entity {
+        return None;
+    }
+    Some((
+        store_range.entity_type.clone(),
+        store_range.start_slot,
+        store_range.slot_count,
+    ))
+}
+
+fn encode_prop_store_sourced_entity_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    var: &str,
+    entity_name: &str,
+    start_slot: usize,
+    slot_count: usize,
+    filter: &IRExpr,
+    projection: Option<&IRExpr>,
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let result_elem_sort = entity_set_comp_sort(enc.vctx, projection, ty)?;
+    let false_val = smt::bool_val(false).to_dynamic();
+    let true_val = smt::bool_val(true).to_dynamic();
+    let mut arr = smt::const_array(&result_elem_sort, &false_val);
+    for slot in start_slot..start_slot.saturating_add(slot_count) {
+        let Some(SmtValue::Bool(active)) = enc.pool.active_at(entity_name, slot, enc.step) else {
+            continue;
+        };
+        let inner_ctx = enc.property.with_binding(var, entity_name, slot);
+        let filter_val =
+            encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        let fallback = smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic();
+        let (key, constraints) =
+            encode_set_comp_key(enc.with_property(&inner_ctx), projection, fallback)?;
+        let mut cond_parts = vec![active.clone(), filter_val];
+        cond_parts.extend(constraints);
+        let cond = bool_and_values(&cond_parts);
         let stored = arr.store(&key, &true_val);
         arr = smt::array_ite(&cond, &stored, &arr);
     }
@@ -6289,6 +6373,97 @@ mod tests {
         let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
             .expect("finite sourced set-comprehension cardinality should encode");
         let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_with_ctx_supports_store_sourced_projected_setcomp_values() {
+        let entity = make_order_entity();
+        let ir = IRProgram {
+            entities: vec![entity.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let mut scopes = HashMap::new();
+        scopes.insert("Order".to_owned(), 2usize);
+        let pool = create_slot_pool(&[entity], &scopes, 0);
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "orders".to_owned(),
+            crate::verify::scope::VerifyStoreRange {
+                entity_type: "Order".to_owned(),
+                start_slot: 0,
+                slot_count: 2,
+            },
+        );
+        let ctx = PropertyCtx::new().with_store_ranges(ranges);
+
+        let order_ty = IRType::Entity {
+            name: "Order".to_owned(),
+        };
+        let set_int_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let status_set = IRExpr::SetComp {
+            var: "o".to_owned(),
+            domain: order_ty.clone(),
+            source: Some(Box::new(IRExpr::Var {
+                name: "orders".to_owned(),
+                ty: IRType::Set {
+                    element: Box::new(order_ty.clone()),
+                },
+                span: None,
+            })),
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: Some(Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "o".to_owned(),
+                    ty: order_ty,
+                    span: None,
+                }),
+                field: "status".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            })),
+            ty: set_int_ty,
+            span: None,
+        };
+        let property = IRExpr::Index {
+            map: Box::new(status_set),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 7 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        let encoded = encode_prop_expr_with_ctx(&pool, &vctx, &defs, &ctx, &property, 0)
+            .expect("store-sourced projection set-comprehension should encode");
+        let solver = AbideSolver::new();
+        solver.assert(pool.active_at("Order", 0, 0).unwrap().to_bool().unwrap());
+        solver.assert(pool.active_at("Order", 1, 0).unwrap().to_bool().unwrap());
+        solver.assert(
+            smt::smt_eq(
+                pool.field_at("Order", 0, "status", 0).unwrap(),
+                &smt::int_val(7),
+            )
+            .unwrap(),
+        );
+        solver.assert(
+            smt::smt_eq(
+                pool.field_at("Order", 1, "status", 0).unwrap(),
+                &smt::int_val(3),
+            )
+            .unwrap(),
+        );
         solver.assert(smt::bool_not(&encoded));
         assert_eq!(solver.check(), SatResult::Unsat);
     }

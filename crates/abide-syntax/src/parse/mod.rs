@@ -171,6 +171,7 @@ fn is_system_item_starter(tok: &Token, next: Option<&Token>) -> bool {
             | Token::Command
             | Token::Query
             | Token::Pred
+            | Token::Proc
             | Token::Derived
             | Token::Invariant
     ) || matches!(tok, Token::Name(_)) && matches!(next, Some(Token::Colon))

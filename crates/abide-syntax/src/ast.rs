@@ -682,6 +682,8 @@ pub enum SystemItem {
     Query(QueryDecl),
     /// System-internal predicate (). Not cross-system callable.
     Pred(PredDecl),
+    /// System-owned process DAG (`proc name(...) { ... }`).
+    Proc(ProcDecl),
     /// an `fsm FIELD { ROWS }` declaration on a
     /// direct system field. This remains a narrow field-lifecycle
     /// contract, not a workflow/process construct.

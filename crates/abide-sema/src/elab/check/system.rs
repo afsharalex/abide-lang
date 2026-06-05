@@ -616,11 +616,14 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
 
     // validate proc declarations.
     // Build let-binding map: instance_name → system_type
-    let let_binding_systems: HashMap<&str, &str> = system
+    let mut let_binding_systems: HashMap<&str, &str> = system
         .let_bindings
         .iter()
         .map(|lb| (lb.name.as_str(), lb.system_type.as_str()))
         .collect();
+    let_binding_systems
+        .entry("self")
+        .or_insert_with(|| system.name.as_str());
     for proc in &system.procs {
         let proc_ctx = format!("proc {}", proc.name);
         let span = proc
@@ -724,7 +727,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                 errors.push(ElabError::with_span(
                     ErrorKind::UndefinedRef,
                     format!(
-                        "proc node `{}` references instance `{}` which is not a let binding in this program",
+                        "proc node `{}` references instance `{}` which is neither `self` nor a let binding in this program",
                         node.name, node.instance
                     ),
                     &proc_ctx,

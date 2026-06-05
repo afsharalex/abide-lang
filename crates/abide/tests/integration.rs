@@ -8818,6 +8818,31 @@ verify finite_projected_setcomp {
 }
 
 #[test]
+fn verifier_supports_store_sourced_projected_setcomp_values() {
+    let src = r"module T
+
+entity Dummy { id: identity }
+
+system Fixture(dummies: Store<Dummy>) {
+  command noop() {}
+}
+
+verify store_sourced_projected_setcomp {
+  assume {
+    store dummies: Dummy[0..2]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert always { d.id | d: Dummy in dummies where true }
+            == { d.id | d: Dummy in dummies where true }
+}
+";
+
+    let results = verify_source(src);
+    assert_verify_result_success(&results, "store_sourced_projected_setcomp");
+}
+
+#[test]
 fn verifier_action_context_supports_finite_domain_setcomp_values_and_projected_cardinality() {
     let src = r"module T
 
@@ -17003,6 +17028,48 @@ verify bound_proc_pool {
 }
 
 #[test]
+fn verify_proc_bounds_accept_system_owned_proc() {
+    let result = elaborate_source(
+        r"module T
+
+entity Order {}
+
+system Shop(orders: Store<Order>) {
+  command charge(order: Order) { }
+
+  proc fulfill(order: Order) {
+    charge = self.charge(order)
+  }
+}
+
+verify bound_system_proc_pool {
+  assume {
+    store orders: Order[0..3]
+    let shop = Shop { orders: orders }
+    proc shop.fulfill[0..2]
+  }
+  assert true
+}
+",
+    );
+    let (prog, _lower_diag) = ir::lower(&result);
+
+    let verify = prog
+        .verifies
+        .iter()
+        .find(|verify| verify.name == "bound_system_proc_pool")
+        .expect("expected verify block");
+    let proc_store = verify
+        .stores
+        .iter()
+        .find(|store| store.name == "__abide_procbound__Shop__fulfill")
+        .expect("expected lowered proc bound store");
+
+    assert_eq!(proc_store.entity_type, "__abide_procinst__Shop__fulfill");
+    assert_eq!((proc_store.lo, proc_store.hi), (0, 2));
+}
+
+#[test]
 fn theorem_proc_bounds_are_rejected() {
     let errors = elaborate_source_errors(
         r"module T
@@ -17885,6 +17952,37 @@ system Billing(orders: Store<Order>) {
     assert!(
         errors.is_empty(),
         "expected invariant with system-local pred to elaborate cleanly, got: {errors:?}"
+    );
+}
+
+#[test]
+fn program_invariant_quantifier_entity_type_resolves_before_lowering() {
+    let result = elaborate_source(
+        r"module T
+
+entity Order { status: int = 0 }
+
+system Billing(orders: Store<Order>) {
+  command charge(order: Order) {
+    order.status' = 1
+  }
+}
+
+program Shop(orders: Store<Order>) {
+  let billing = Billing { orders: orders }
+
+  invariant orders_have_non_negative_status {
+    all o: Order | o.status >= 0
+  }
+}
+",
+    );
+    let (_prog, lower_diag) = ir::lower(&result);
+
+    assert!(
+        !lower_diag.has_errors(),
+        "program invariant entity quantifier should lower without unresolved type errors, got: {:?}",
+        lower_diag.diagnostics
     );
 }
 

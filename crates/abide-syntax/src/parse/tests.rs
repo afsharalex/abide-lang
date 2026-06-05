@@ -338,6 +338,35 @@ system StripeAdapter implements PaymentProcessor {
 }
 
 #[test]
+fn parse_system_proc_item() {
+    let program = parse_program(
+        r#"
+entity Order {}
+
+system Shop {
+  command charge(order: Order) { }
+
+  proc fulfill(order: Order) {
+    charge = self.charge(order)
+  }
+}
+"#,
+    );
+
+    let system = program
+        .decls
+        .iter()
+        .find_map(|decl| match decl {
+            crate::ast::TopDecl::System(system) => Some(system),
+            _ => None,
+        })
+        .expect("expected system");
+
+    assert_eq!(system.items.len(), 2);
+    assert!(matches!(system.items[1], SystemItem::Proc(_)));
+}
+
+#[test]
 fn parse_action_macro_let_call_and_match() {
     let program = parse_program(
         r#"

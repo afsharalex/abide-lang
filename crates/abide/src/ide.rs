@@ -447,6 +447,7 @@ impl SymbolCollector<'_> {
                     self.symbol(query.span, &query.name, IdeSymbolKind::Query);
                 }
                 SystemItem::Pred(pred) => self.symbol(pred.span, &pred.name, IdeSymbolKind::Pred),
+                SystemItem::Proc(proc_decl) => self.collect_proc_decl(proc_decl),
                 SystemItem::Derived(derived) => {
                     self.symbol(derived.span, &derived.name, IdeSymbolKind::Derived);
                 }

@@ -548,13 +548,13 @@ impl Parser {
     pub(super) fn system_item(&mut self) -> Result<SystemItem, ParseError> {
         match self.peek() {
             Some(Token::Use) => Err(ParseError::expected_with_help(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `pred`, `proc`, `fsm`, `derived`, `invariant`, or field)",
                 "`use`",
                 self.cur_span(),
                 crate::messages::USE_ENTITY_REMOVED,
             )),
             Some(tok @ (Token::Fair | Token::Strong)) => Err(ParseError::expected(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `pred`, `proc`, `fsm`, `derived`, `invariant`, or field)",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),
@@ -563,11 +563,12 @@ impl Parser {
             Some(Token::Action) => Ok(SystemItem::Action(self.system_action_decl()?)),
             Some(Token::Query) => Ok(SystemItem::Query(self.query_decl()?)),
             Some(Token::Pred) => Ok(SystemItem::Pred(self.pred_decl()?)),
+            Some(Token::Proc) => Ok(SystemItem::Proc(self.proc_decl()?)),
             Some(Token::Fsm) => Ok(SystemItem::Fsm(self.fsm_decl()?)),
             Some(Token::Derived) => Ok(SystemItem::Derived(self.derived_decl()?)),
             Some(Token::Invariant) => Ok(SystemItem::Invariant(self.invariant_decl()?)),
             Some(Token::Name(ref name)) if name == "uses" => Err(ParseError::expected_with_help(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `pred`, `proc`, `fsm`, `derived`, `invariant`, or field)",
                 "`uses`",
                 self.cur_span(),
                 crate::messages::USE_ENTITY_REMOVED,
@@ -577,7 +578,7 @@ impl Parser {
                 Ok(SystemItem::Field(self.field_decl()?))
             }
             Some(tok) => Err(ParseError::expected(
-                "system item (`command`, `action`, `query`, `fsm`, `derived`, `invariant`, or field)",
+                "system item (`command`, `action`, `query`, `pred`, `proc`, `fsm`, `derived`, `invariant`, or field)",
                 &format!("`{tok}`"),
                 self.cur_span(),
             )),

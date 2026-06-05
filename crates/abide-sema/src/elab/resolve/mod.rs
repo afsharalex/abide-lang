@@ -1661,6 +1661,18 @@ fn resolve_entities(env: &mut Env, ctx: &Ctx) {
                 None => {}
             }
         }
+        let entity_bound: HashMap<String, Ty> = entity
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.ty.clone()))
+            .collect();
+        for derived in &mut entity.derived_fields {
+            derived.body = resolve_expr(ctx, &entity_bound, &derived.body);
+            derived.ty = ctx.resolve_ty(&derived.ty);
+        }
+        for invariant in &mut entity.invariants {
+            invariant.body = resolve_expr(ctx, &entity_bound, &invariant.body);
+        }
         for action in &mut entity.actions {
             action.refs = action
                 .refs
@@ -1713,6 +1725,14 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
                 None => {}
             }
         }
+        let system_bound = system_expr_bound(ctx, system);
+        for derived in &mut system.derived_fields {
+            derived.body = resolve_expr(ctx, &system_bound, &derived.body);
+            derived.ty = ctx.resolve_ty(&derived.ty);
+        }
+        for invariant in &mut system.invariants {
+            invariant.body = resolve_expr(ctx, &system_bound, &invariant.body);
+        }
         for cmd in &mut system.commands {
             let (resolved_params, _) = resolve_params_lr(ctx, &cmd.params, HashMap::new());
             cmd.params = resolved_params;
@@ -1754,6 +1774,23 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
             pred.body = resolve_expr(ctx, &pred_bound, &pred.body);
         }
     }
+}
+
+fn system_expr_bound(ctx: &Ctx, system: &ESystem) -> HashMap<String, Ty> {
+    let mut bound: HashMap<String, Ty> = system
+        .fields
+        .iter()
+        .map(|field| (field.name.clone(), field.ty.clone()))
+        .collect();
+    for store in &system.store_params {
+        let entity = ctx
+            .entity_canonical
+            .get(store.entity_type.as_str())
+            .cloned()
+            .unwrap_or_else(|| store.entity_type.clone());
+        bound.insert(store.name.clone(), Ty::Store(entity));
+    }
+    bound
 }
 
 fn resolve_externs(env: &mut Env, ctx: &Ctx) {
@@ -3031,6 +3068,36 @@ mod tests {
                 );
             }
             other => panic!("expected Quant in axiom body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn program_invariant_quantifier_domain_resolved() {
+        let env = elaborate_src(
+            "module Test\n\
+             entity Order { status: int = 0 }\n\
+             system Billing(orders: Store<Order>) {}\n\
+             program Shop(orders: Store<Order>) {\n\
+               let billing = Billing { orders: orders }\n\
+               invariant orders_have_non_negative_status {\n\
+                 all o: Order | o.status >= 0\n\
+               }\n\
+             }",
+        );
+
+        let shop = env
+            .systems
+            .get("Shop")
+            .expect("program collected as system");
+        let invariant = shop.invariants.first().expect("expected program invariant");
+        match &invariant.body {
+            EExpr::Quant(_, _, _, domain_ty, _, _) => {
+                assert!(
+                    matches!(domain_ty, Ty::Entity(n) if n == "Order"),
+                    "program invariant quantifier domain should be Entity(\"Order\"), got {domain_ty:?}"
+                );
+            }
+            other => panic!("expected Quant in program invariant body, got {other:?}"),
         }
     }
 

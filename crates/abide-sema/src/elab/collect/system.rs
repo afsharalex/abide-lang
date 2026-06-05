@@ -201,6 +201,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     let mut raw_fsms = Vec::new();
     let mut derived_fields = Vec::new();
     let mut invariants = Vec::new();
+    let mut procs = Vec::new();
     let mut explicit_action_names = Vec::new();
 
     for item in &sd.items {
@@ -220,6 +221,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
             }
             ast::SystemItem::Query(q) => queries.push(collect_query(q)),
             ast::SystemItem::Pred(p) => sys_preds.push(collect_system_pred(p)),
+            ast::SystemItem::Proc(p) => procs.push(collect_proc(p)),
             ast::SystemItem::Fsm(fsm) => raw_fsms.push(fsm),
             // derived field declarations on the
             // system. Body type is inferred from the expression.
@@ -261,7 +263,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
     }
 
     // enforce
-    // name uniqueness across commands, queries, derived fields, AND
+    // name uniqueness across commands, queries, procs, derived fields, AND
     // invariants for system-level scope per /.
     // (Pool/use entity names live in their own namespace and are
     // intentionally allowed to reuse names.
@@ -276,7 +278,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
                 format!(
                     "duplicate name `{}` for query in system `{}` \
                      — conflicts with an earlier command, query, derived \
-                     field, or invariant declaration",
+                     field, proc, or invariant declaration",
                     q.name, name
                 ),
                 String::new(),
@@ -291,11 +293,26 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
                 format!(
                     "duplicate name `{}` for derived field in system `{}` \
                      — conflicts with an earlier command, query, derived \
-                     field, or invariant declaration",
+                     field, proc, or invariant declaration",
                     d.name, name
                 ),
                 String::new(),
                 d.span.unwrap_or(sd.span),
+            ));
+        }
+    }
+    for p in &procs {
+        if !seen.insert(p.name.clone()) {
+            env.errors.push(ElabError::with_span(
+                ErrorKind::DuplicateDecl,
+                format!(
+                    "duplicate name `{}` for proc in system `{}` \
+                     — conflicts with an earlier command, query, derived \
+                     field, proc, or invariant declaration",
+                    p.name, name
+                ),
+                String::new(),
+                p.span.unwrap_or(sd.span),
             ));
         }
     }
@@ -306,7 +323,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
                 format!(
                     "duplicate name `{}` for invariant in system `{}` \
                      — conflicts with an earlier command, query, derived \
-                     field, or invariant declaration",
+                     field, proc, or invariant declaration",
                     inv.name, name
                 ),
                 String::new(),
@@ -343,7 +360,7 @@ pub(super) fn collect_system(env: &mut Env, sd: &ast::SystemDecl) {
         invariants,
         preds: sys_preds,
         let_bindings: Vec::new(),
-        procs: Vec::new(),
+        procs,
         proc_uses: Vec::new(),
         span: Some(sd.span),
     };
