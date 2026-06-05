@@ -3023,6 +3023,18 @@ fn docs_cli_verify_documents_stream_not_progress() {
         !docs.contains("--progress"),
         "CLI docs should not document removed --progress flag"
     );
+    assert!(
+        docs.contains("verdict, target, duration, and detail"),
+        "CLI docs should describe polished verify result columns"
+    );
+    assert!(
+        docs.contains("green") && docs.contains("red") && docs.contains("yellow"),
+        "CLI docs should document verify verdict color categories"
+    );
+    assert!(
+        docs.contains("Do not parse human terminal output for automation"),
+        "CLI docs should point automation users at reports or JSON instead of styled output"
+    );
 }
 
 #[test]

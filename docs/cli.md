@@ -96,6 +96,18 @@ was found within the explored transition depth. The depth can include stutter
 steps, and it is not exhaustive reachable-state exploration or all-instance
 coverage.
 
+Human `verify` output is formatted for terminal scanning. Each result row
+shows verdict, target, duration, and detail columns. Long detail text wraps
+under the detail column, and wrapped rows are separated with a blank line.
+When the terminal supports color, successful verdicts such as `PROVED`,
+`CHECKED`, and `PASS` are green; trusted or admitted verdicts are yellow; and
+failing verdicts such as `COUNTEREXAMPLE`, `UNPROVABLE`, `FAILED`, `DEADLOCK`,
+and liveness violations are red. Captured or piped output is kept plain.
+
+Do not parse human terminal output for automation. Use `--report json`,
+`--report markdown`, `--report html`, or `--trace-artifact` when scripts need
+stable machine-readable verification results or evidence.
+
 Ordinary `verify` runs bounded/exploration checking by default with a
 30-second end-to-end timeout. When a bounded `CHECKED` result may need an
 unbounded proof attempt, Abide reports that and suggests an explicit proof-mode
