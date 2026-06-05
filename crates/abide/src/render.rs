@@ -1649,6 +1649,13 @@ const TERMINAL_STATUS_COLUMN_WIDTH: usize = 18;
 const TERMINAL_SUBJECT_COLUMN_WIDTH: usize = 40;
 const TERMINAL_TIME_COLUMN_WIDTH: usize = 8;
 const TERMINAL_ROW_WIDTH: usize = 120;
+const TERMINAL_DETAIL_COLUMN_START: usize = 2
+    + TERMINAL_STATUS_COLUMN_WIDTH
+    + 1
+    + TERMINAL_SUBJECT_COLUMN_WIDTH
+    + 1
+    + TERMINAL_TIME_COLUMN_WIDTH
+    + 2;
 
 struct TerminalResultRow {
     status: &'static str,
@@ -1658,34 +1665,41 @@ struct TerminalResultRow {
 }
 
 fn render_terminal_summary(result: &verify::VerificationResult) -> String {
+    render_terminal_summary_with_color(result, TerminalColorPolicy::Never)
+}
+
+fn render_terminal_summary_with_color(
+    result: &verify::VerificationResult,
+    color_policy: TerminalColorPolicy,
+) -> String {
     let row = TerminalResultRow::from_result(result);
     let time = row
         .time
         .map(|time_ms| format!("{time_ms}ms"))
         .unwrap_or_else(|| "-".to_owned());
+    let status = render_terminal_status_column(row.status, color_policy);
     let prefix = format!(
-        "  {status:<status_width$} {subject:<subject_width$} {time:>time_width$}  ",
-        status = row.status,
+        "  {status} {subject:<subject_width$} {time:>time_width$}  ",
+        status = status,
         subject = row.subject,
         time = time,
-        status_width = TERMINAL_STATUS_COLUMN_WIDTH,
         subject_width = TERMINAL_SUBJECT_COLUMN_WIDTH,
         time_width = TERMINAL_TIME_COLUMN_WIDTH,
     );
-    render_terminal_row_with_wrapped_detail(&prefix, &row.detail)
+    render_terminal_row_with_wrapped_detail(&prefix, TERMINAL_DETAIL_COLUMN_START, &row.detail)
 }
 
 fn report_terminal_summary(result: &verify::VerificationResult, failure_stream: bool) {
-    let summary = render_terminal_summary(result);
+    let summary = render_terminal_summary_with_color(result, TerminalColorPolicy::Always);
     if failure_stream {
-        eprintln!("{summary}");
+        anstream::eprintln!("{summary}");
         if terminal_summary_needs_row_separator(&summary) {
-            eprintln!();
+            anstream::eprintln!();
         }
     } else {
-        println!("{summary}");
+        anstream::println!("{summary}");
         if terminal_summary_needs_row_separator(&summary) {
-            println!();
+            anstream::println!();
         }
     }
 }
@@ -1694,11 +1708,45 @@ fn terminal_summary_needs_row_separator(summary: &str) -> bool {
     summary.contains('\n')
 }
 
-fn render_terminal_row_with_wrapped_detail(prefix: &str, detail: &str) -> String {
-    let detail_width = TERMINAL_ROW_WIDTH.saturating_sub(prefix.len()).max(20);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalColorPolicy {
+    Always,
+    Never,
+}
+
+fn render_terminal_status_column(status: &str, color_policy: TerminalColorPolicy) -> String {
+    let padding = " ".repeat(TERMINAL_STATUS_COLUMN_WIDTH.saturating_sub(status.len()));
+    match color_policy {
+        TerminalColorPolicy::Always => {
+            let style = terminal_status_style(status);
+            format!("{style}{status}{}{padding}", style.render_reset())
+        }
+        TerminalColorPolicy::Never => format!("{status}{padding}"),
+    }
+}
+
+fn terminal_status_style(status: &str) -> anstyle::Style {
+    let color = match status {
+        "PROVED" | "CHECKED" | "PASS" => anstyle::AnsiColor::Green,
+        "ADMITTED" => anstyle::AnsiColor::Yellow,
+        "COUNTEREXAMPLE" | "SCENE FAIL" | "SCENE UNKNOWN" | "UNPROVABLE" | "FAILED"
+        | "LIVENESS VIOLATION" | "DEADLOCK" => anstyle::AnsiColor::Red,
+        _ => anstyle::AnsiColor::White,
+    };
+    anstyle::Style::new().bold().fg_color(Some(color.into()))
+}
+
+fn render_terminal_row_with_wrapped_detail(
+    prefix: &str,
+    visible_prefix_width: usize,
+    detail: &str,
+) -> String {
+    let detail_width = TERMINAL_ROW_WIDTH
+        .saturating_sub(visible_prefix_width)
+        .max(20);
     let wrapped = wrap_terminal_detail(detail, detail_width);
     let mut lines = Vec::with_capacity(wrapped.len().max(1));
-    let continuation_prefix = " ".repeat(prefix.len());
+    let continuation_prefix = " ".repeat(visible_prefix_width);
 
     for (idx, detail_line) in wrapped.iter().enumerate() {
         if idx == 0 {
@@ -3668,6 +3716,75 @@ mod tests {
             terminal_summary_needs_row_separator(&render_terminal_summary(&wrapped)),
             "wrapped rows should get visual separation from the next result"
         );
+    }
+
+    #[test]
+    fn terminal_summary_color_policy_controls_status_styling() {
+        let result = verify::VerificationResult::FnContractProved {
+            name: "zero".to_owned(),
+            time_ms: 7,
+            span: None,
+            file: None,
+        };
+
+        let plain = render_terminal_summary_with_color(&result, TerminalColorPolicy::Never);
+        let styled = render_terminal_summary_with_color(&result, TerminalColorPolicy::Always);
+
+        assert!(
+            !plain.contains("\x1b["),
+            "never-color policy should not emit ANSI escapes: {plain:?}"
+        );
+        assert!(
+            styled.contains("\x1b[") && styled.contains("PROVED"),
+            "always-color policy should style the status token: {styled:?}"
+        );
+        assert!(
+            styled.contains("\x1b[0m"),
+            "styled status should reset before the rest of the row: {styled:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_maps_verdicts_to_semantic_colors() {
+        let green = anstyle::Style::new()
+            .bold()
+            .fg_color(Some(anstyle::AnsiColor::Green.into()));
+        let yellow = anstyle::Style::new()
+            .bold()
+            .fg_color(Some(anstyle::AnsiColor::Yellow.into()));
+        let red = anstyle::Style::new()
+            .bold()
+            .fg_color(Some(anstyle::AnsiColor::Red.into()));
+
+        for status in ["PROVED", "CHECKED", "PASS"] {
+            assert_eq!(
+                terminal_status_style(status),
+                green,
+                "{status} should be rendered as a green verdict"
+            );
+        }
+        for status in ["ADMITTED"] {
+            assert_eq!(
+                terminal_status_style(status),
+                yellow,
+                "{status} should be rendered as a yellow warning verdict"
+            );
+        }
+        for status in [
+            "COUNTEREXAMPLE",
+            "SCENE FAIL",
+            "SCENE UNKNOWN",
+            "UNPROVABLE",
+            "FAILED",
+            "LIVENESS VIOLATION",
+            "DEADLOCK",
+        ] {
+            assert_eq!(
+                terminal_status_style(status),
+                red,
+                "{status} should be rendered as a red failure verdict"
+            );
+        }
     }
 
     #[test]

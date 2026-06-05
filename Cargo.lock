@@ -13,6 +13,8 @@ dependencies = [
  "abide-syntax",
  "abide-verify",
  "abide-witness",
+ "anstream",
+ "anstyle",
  "clap",
  "miette",
  "reedline",

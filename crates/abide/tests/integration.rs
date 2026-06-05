@@ -2766,6 +2766,10 @@ fn zero(): int
         "streaming verdict should use column layout, not colon/prose timing: {result_line}"
     );
     assert!(
+        !stdout.contains("\x1b["),
+        "captured streaming output should stay ANSI-free unless color is forced: {stdout:?}"
+    );
+    assert!(
         stderr.is_empty(),
         "streaming success should not emit progress markers on stderr: {stderr}"
     );
