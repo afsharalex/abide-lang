@@ -40,6 +40,40 @@ fn skip_unbounded_proof_test() {
     eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
 }
 
+fn terminal_verdict_line_matches(line: &str, status: &str, subject: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(status) && trimmed.contains(subject)
+}
+
+fn output_has_verdict_subject(output: &str, status: &str, subject: &str) -> bool {
+    output
+        .lines()
+        .any(|line| terminal_verdict_line_matches(line, status, subject))
+}
+
+fn collapse_output_whitespace(output: &str) -> String {
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_terminal_verdict_line(line: &str) -> bool {
+    const STATUSES: &[&str] = &[
+        "PROVED",
+        "CHECKED",
+        "ADMITTED",
+        "COUNTEREXAMPLE",
+        "SCENE FAIL",
+        "SCENE UNKNOWN",
+        "UNPROVABLE",
+        "FAILED",
+        "LIVENESS VIOLATION",
+        "DEADLOCK",
+        "PASS",
+    ];
+
+    let trimmed = line.trim_start();
+    STATUSES.iter().any(|status| trimmed.starts_with(status))
+}
+
 macro_rules! require_unbounded_proof_tests {
     () => {
         if !should_run_unbounded_proof_tests() {
@@ -1890,21 +1924,17 @@ fn public_example_verify_blocks_run_with_bounded_targets() {
                 String::from_utf8_lossy(&output.stderr)
             );
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let verdict_prefix = format!("{expected_verdict}: {verify_target}");
             let verdict_lines: Vec<_> = stdout
                 .lines()
-                .filter(|line| {
-                    line.starts_with("PROVED:")
-                        || line.starts_with("CHECKED:")
-                        || line.starts_with("COUNTEREXAMPLE:")
-                        || line.starts_with("LIVENESS VIOLATION:")
-                        || line.starts_with("DEADLOCK:")
-                        || line.starts_with("UNPROVABLE:")
-                })
+                .filter(|line| is_terminal_verdict_line(line))
                 .collect();
+            let matching_verdict_count = verdict_lines
+                .iter()
+                .filter(|line| terminal_verdict_line_matches(line, expected_verdict, verify_target))
+                .count();
             assert!(
-                verdict_lines.len() == 1 && verdict_lines[0].starts_with(&verdict_prefix),
-                "{example} {target} should report exactly one {expected_verdict} verdict for {verify_target}\nstdout:\n{stdout}"
+                matching_verdict_count == 1,
+                "{example} {target} should report exactly one matching {expected_verdict} verdict for {verify_target}\nstdout:\n{stdout}"
             );
         }
     }
@@ -2709,9 +2739,31 @@ fn zero(): int
         output.status.success(),
         "expected --stream verify to succeed: stdout={stdout}, stderr={stderr}"
     );
+    let result_line = stdout
+        .lines()
+        .find(|line| line.contains("PROVED") && line.contains("fn zero"))
+        .unwrap_or_else(|| {
+            panic!("streaming output should include completed function verdict: {stdout}")
+        });
+    let columns = result_line.split_whitespace().collect::<Vec<_>>();
     assert!(
-        stdout.contains("PROVED: fn zero"),
-        "streaming output should include completed function verdict: {stdout}"
+        columns.len() >= 5,
+        "streaming verdict should render status, subject, time, and detail columns: {result_line}"
+    );
+    assert_eq!(columns[0], "PROVED", "status column: {result_line}");
+    assert_eq!(columns[1], "fn", "subject kind column: {result_line}");
+    assert_eq!(columns[2], "zero", "subject name column: {result_line}");
+    assert!(
+        columns[3].ends_with("ms"),
+        "time column should be separated from detail prose: {result_line}"
+    );
+    assert!(
+        result_line.contains("function contract proved"),
+        "detail column should describe the result without embedding duration prose: {result_line}"
+    );
+    assert!(
+        !result_line.contains("PROVED:") && !result_line.contains("proved in"),
+        "streaming verdict should use column layout, not colon/prose timing: {result_line}"
     );
     assert!(
         stderr.is_empty(),
@@ -2729,22 +2781,27 @@ fn cli_verify_checked_output_names_trace_prefix_contract() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let normalized_stdout = collapse_output_whitespace(&stdout);
 
     assert!(
         output.status.success(),
         "expected zero exit: stdout={stdout}, stderr={stderr}"
     );
     assert!(
-        stdout.contains("CHECKED: workflow_safety"),
+        output_has_verdict_subject(&stdout, "CHECKED", "workflow_safety"),
         "expected workflow_safety CHECKED result: {stdout}"
     );
     assert!(
-        stdout.contains("bounded trace-prefix"),
+        normalized_stdout.contains("bounded trace-prefix"),
         "expected CHECKED output to name bounded trace-prefix contract: {stdout}"
     );
     assert!(
-        stdout.contains("not exhaustive reachable-state or all-instance coverage"),
+        normalized_stdout.contains("not exhaustive reachable-state or all-instance coverage"),
         "expected CHECKED output to reject exhaustive coverage wording: {stdout}"
+    );
+    assert!(
+        stdout.contains("to attempt an unbounded proof\n\n  CHECKED"),
+        "expected wrapped CHECKED rows to have a blank line before the next result: {stdout}"
     );
 }
 
@@ -2800,7 +2857,7 @@ fn cli_verify_prop_bmc_depth_controls_auto_prop_fallback() {
         "expected shallow prop BMC to pass: stdout={shallow_stdout}, stderr={shallow_stderr}"
     );
     assert!(
-        shallow_stdout.contains("CHECKED: prop_counter_below_three")
+        output_has_verdict_subject(&shallow_stdout, "CHECKED", "prop_counter_below_three")
             && shallow_stdout.contains("bounded trace-prefix depth 3"),
         "expected shallow prop BMC to disclose configured depth 3: {shallow_stdout}"
     );
@@ -2825,7 +2882,7 @@ fn cli_verify_prop_bmc_depth_controls_auto_prop_fallback() {
         "expected deeper prop BMC to find counterexample: stdout={deep_stdout}, stderr={deep_stderr}"
     );
     assert!(
-        deep_stderr.contains("COUNTEREXAMPLE: prop_counter_below_three"),
+        output_has_verdict_subject(&deep_stderr, "COUNTEREXAMPLE", "prop_counter_below_three"),
         "expected deep prop BMC counterexample at configured depth 4: stderr={deep_stderr}"
     );
 }
@@ -2907,7 +2964,7 @@ fn cli_verify_stream_preserves_report_and_trace_artifact_outputs() {
         "expected counterexample: stdout={stdout}, stderr={stderr}"
     );
     assert!(
-        stderr.contains("COUNTEREXAMPLE: shortest_counterexample"),
+        output_has_verdict_subject(&stderr, "COUNTEREXAMPLE", "shortest_counterexample"),
         "streaming failure should render the completed result: stderr={stderr}"
     );
     assert!(
@@ -2984,7 +3041,7 @@ fn cli_verify_accepts_bmc_iterative_deepening_opt_out() {
         "expected counterexample despite opting out of iterative deepening: stdout={stdout}, stderr={stderr}"
     );
     assert!(
-        stderr.contains("COUNTEREXAMPLE: shortest_counterexample"),
+        output_has_verdict_subject(&stderr, "COUNTEREXAMPLE", "shortest_counterexample"),
         "expected ordinary counterexample output when iterative deepening is disabled: stderr={stderr}"
     );
 }
@@ -4339,13 +4396,16 @@ fn verify_contracts_cli_output() {
         "CLI should succeed for valid contracts"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("PROVED: fn abs"), "should show abs proved");
     assert!(
-        stdout.contains("PROVED: fn max_val"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn abs"),
+        "should show abs proved"
+    );
+    assert!(
+        output_has_verdict_subject(&stdout, "PROVED", "fn max_val"),
         "should show max_val proved"
     );
     assert!(
-        stdout.contains("PROVED: fn clamp"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn clamp"),
         "should show clamp proved"
     );
 }
@@ -4361,7 +4421,7 @@ fn verify_contracts_no_fn_verify_flag() {
     // With --no-fn-verify, no fn contract results should appear
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("PROVED: fn"),
+        !output_has_verdict_subject(&stdout, "PROVED", "fn "),
         "no fn contract results should appear with --no-fn-verify"
     );
 }
@@ -5551,7 +5611,7 @@ fn verify_valid_nested_while_proves() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED: fn matrix_sum"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn matrix_sum"),
         "should show matrix_sum proved: {stdout}"
     );
 }
@@ -5590,7 +5650,7 @@ fn verify_imperative_if_else_with_assignments() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED: fn conditional_assign"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn conditional_assign"),
         "should show conditional_assign proved: {stdout}"
     );
 }
@@ -5634,7 +5694,7 @@ fn verify_branch_condition_propagated_to_loop() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED: fn branch_inner"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn branch_inner"),
         "should prove branch_inner: {stdout}"
     );
 }
@@ -5850,15 +5910,15 @@ fn verify_call_site_cli_output() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED: fn caller_good"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn caller_good"),
         "caller_good proved: {stdout}"
     );
     assert!(
-        stdout.contains("PROVED: fn caller_literal"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn caller_literal"),
         "caller_literal proved: {stdout}"
     );
     assert!(
-        stdout.contains("PROVED: fn add_positive"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn add_positive"),
         "add_positive proved: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6133,12 +6193,15 @@ fn verify_termination_cli_output() {
     assert!(!output.status.success(), "should fail due to bad_recurse");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("PROVED: fn factorial"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn factorial"),
         "factorial proved: {stdout}"
     );
-    assert!(stdout.contains("PROVED: fn fib"), "fib proved: {stdout}");
     assert!(
-        stdout.contains("PROVED: fn no_recursion"),
+        output_has_verdict_subject(&stdout, "PROVED", "fn fib"),
+        "fib proved: {stdout}"
+    );
+    assert!(
+        output_has_verdict_subject(&stdout, "PROVED", "fn no_recursion"),
         "no_recursion proved: {stdout}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -502,7 +502,7 @@ pub(crate) fn report_verification_result(
                     if verbose {
                         report_result_verbose_details(result, true);
                     } else {
-                        eprintln!("{}", render_terminal_summary(result));
+                        report_terminal_summary(result, true);
                         if let Some(human_text) =
                             render_result_human_text(result, terminal_text_art())
                         {
@@ -519,7 +519,7 @@ pub(crate) fn report_verification_result(
         if verbose {
             report_result_verbose_details(result, true);
         } else {
-            eprintln!("{}", render_terminal_summary(result));
+            report_terminal_summary(result, true);
         }
         if debug_evidence {
             report_result_debug_evidence(result, true);
@@ -528,7 +528,7 @@ pub(crate) fn report_verification_result(
         if verbose {
             report_result_verbose_details(result, false);
         } else {
-            println!("{}", render_terminal_summary(result));
+            report_terminal_summary(result, false);
         }
         if debug_evidence {
             report_result_debug_evidence(result, false);
@@ -1645,13 +1645,118 @@ fn render_result_html_source_note(result: &verify::VerificationResult) -> Option
     Some(out)
 }
 
+const TERMINAL_STATUS_COLUMN_WIDTH: usize = 18;
+const TERMINAL_SUBJECT_COLUMN_WIDTH: usize = 40;
+const TERMINAL_TIME_COLUMN_WIDTH: usize = 8;
+const TERMINAL_ROW_WIDTH: usize = 120;
+
+struct TerminalResultRow {
+    status: &'static str,
+    subject: String,
+    time: Option<u64>,
+    detail: String,
+}
+
 fn render_terminal_summary(result: &verify::VerificationResult) -> String {
-    format!(
-        "{}: {} - {}",
-        render_result_heading_kind(result),
-        result_primary_name(result),
-        result_secondary_summary(result)
-    )
+    let row = TerminalResultRow::from_result(result);
+    let time = row
+        .time
+        .map(|time_ms| format!("{time_ms}ms"))
+        .unwrap_or_else(|| "-".to_owned());
+    let prefix = format!(
+        "  {status:<status_width$} {subject:<subject_width$} {time:>time_width$}  ",
+        status = row.status,
+        subject = row.subject,
+        time = time,
+        status_width = TERMINAL_STATUS_COLUMN_WIDTH,
+        subject_width = TERMINAL_SUBJECT_COLUMN_WIDTH,
+        time_width = TERMINAL_TIME_COLUMN_WIDTH,
+    );
+    render_terminal_row_with_wrapped_detail(&prefix, &row.detail)
+}
+
+fn report_terminal_summary(result: &verify::VerificationResult, failure_stream: bool) {
+    let summary = render_terminal_summary(result);
+    if failure_stream {
+        eprintln!("{summary}");
+        if terminal_summary_needs_row_separator(&summary) {
+            eprintln!();
+        }
+    } else {
+        println!("{summary}");
+        if terminal_summary_needs_row_separator(&summary) {
+            println!();
+        }
+    }
+}
+
+fn terminal_summary_needs_row_separator(summary: &str) -> bool {
+    summary.contains('\n')
+}
+
+fn render_terminal_row_with_wrapped_detail(prefix: &str, detail: &str) -> String {
+    let detail_width = TERMINAL_ROW_WIDTH.saturating_sub(prefix.len()).max(20);
+    let wrapped = wrap_terminal_detail(detail, detail_width);
+    let mut lines = Vec::with_capacity(wrapped.len().max(1));
+    let continuation_prefix = " ".repeat(prefix.len());
+
+    for (idx, detail_line) in wrapped.iter().enumerate() {
+        if idx == 0 {
+            lines.push(format!("{prefix}{detail_line}"));
+        } else {
+            lines.push(format!("{continuation_prefix}{detail_line}"));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(prefix.to_owned());
+    }
+
+    lines.join("\n")
+}
+
+fn wrap_terminal_detail(detail: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in detail.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_owned();
+        }
+
+        while current.chars().count() > width {
+            let split_at = current
+                .char_indices()
+                .nth(width)
+                .map_or(current.len(), |(idx, _)| idx);
+            let remainder = current.split_off(split_at);
+            lines.push(current);
+            current = remainder;
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
+impl TerminalResultRow {
+    fn from_result(result: &verify::VerificationResult) -> Self {
+        Self {
+            status: render_result_heading_kind(result),
+            subject: result_primary_name(result),
+            time: result_time_ms(result),
+            detail: result_terminal_detail(result),
+        }
+    }
 }
 
 fn render_result_heading(result: &verify::VerificationResult) -> String {
@@ -1677,6 +1782,98 @@ fn render_result_heading_kind(result: &verify::VerificationResult) -> &'static s
         verify::VerificationResult::FnContractFailed { .. } => "FAILED",
         verify::VerificationResult::LivenessViolation { .. } => "LIVENESS VIOLATION",
         verify::VerificationResult::Deadlock { .. } => "DEADLOCK",
+    }
+}
+
+fn result_time_ms(result: &verify::VerificationResult) -> Option<u64> {
+    match result {
+        verify::VerificationResult::Proved { time_ms, .. }
+        | verify::VerificationResult::Admitted { time_ms, .. }
+        | verify::VerificationResult::Checked { time_ms, .. }
+        | verify::VerificationResult::ScenePass { time_ms, .. }
+        | verify::VerificationResult::FnContractProved { time_ms, .. }
+        | verify::VerificationResult::FnContractAdmitted { time_ms, .. } => Some(*time_ms),
+        verify::VerificationResult::Counterexample { .. }
+        | verify::VerificationResult::SceneFail { .. }
+        | verify::VerificationResult::SceneUnknown { .. }
+        | verify::VerificationResult::Unprovable { .. }
+        | verify::VerificationResult::FnContractFailed { .. }
+        | verify::VerificationResult::LivenessViolation { .. }
+        | verify::VerificationResult::Deadlock { .. } => None,
+    }
+}
+
+fn result_terminal_detail(result: &verify::VerificationResult) -> String {
+    match result {
+        verify::VerificationResult::Proved {
+            method,
+            assumptions,
+            ..
+        } => format!("method: {method}{}", render_assumption_suffix(assumptions)),
+        verify::VerificationResult::Admitted {
+            reason,
+            assumptions,
+            ..
+        } => format!(
+            "admitted: {reason}{}",
+            render_assumption_suffix(assumptions)
+        ),
+        verify::VerificationResult::Checked {
+            depth,
+            method,
+            assumptions,
+            backend_diagnostics,
+            ..
+        } => {
+            let method = method
+                .as_deref()
+                .map(|method| format!("; method: {method}"))
+                .unwrap_or_default();
+            let proof_mode_hint = backend_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.phase == "proof_mode")
+                .map(|diagnostic| format!("; {}", diagnostic.message))
+                .unwrap_or_default();
+            format!(
+                "bounded trace-prefix depth {depth}{method}; depth may include stutter steps; not exhaustive reachable-state or all-instance coverage{}{}",
+                render_assumption_suffix(assumptions),
+                proof_mode_hint
+            )
+        }
+        verify::VerificationResult::Counterexample { assumptions, .. } => {
+            format!(
+                "counterexample witness{}",
+                render_assumption_suffix(assumptions)
+            )
+        }
+        verify::VerificationResult::ScenePass { .. } => "scene satisfied".to_owned(),
+        verify::VerificationResult::SceneFail { reason, .. }
+        | verify::VerificationResult::SceneUnknown { reason, .. } => reason.clone(),
+        verify::VerificationResult::Unprovable { hint, .. } => hint.clone(),
+        verify::VerificationResult::FnContractProved { .. } => {
+            "function contract proved".to_owned()
+        }
+        verify::VerificationResult::FnContractAdmitted { reason, .. } => {
+            format!("function contract admitted: {reason}")
+        }
+        verify::VerificationResult::FnContractFailed { .. } => {
+            "function contract violation".to_owned()
+        }
+        verify::VerificationResult::LivenessViolation { assumptions, .. } => {
+            format!(
+                "infinite counterexample{}",
+                render_assumption_suffix(assumptions)
+            )
+        }
+        verify::VerificationResult::Deadlock {
+            step,
+            reason,
+            assumptions,
+            ..
+        } => format!(
+            "deadlock at step {step}: {reason}{}",
+            render_assumption_suffix(assumptions)
+        ),
     }
 }
 
@@ -3352,9 +3549,124 @@ mod tests {
             file: None,
         };
 
-        assert_eq!(
-            render_terminal_summary(&result),
-            "SCENE FAIL: eligible_patient_can_book - scenario is unsatisfiable"
+        let summary = render_terminal_summary(&result);
+
+        assert!(
+            summary.starts_with("  SCENE FAIL"),
+            "summary should start with an aligned status column: {summary}"
+        );
+        assert!(
+            summary.contains("eligible_patient_can_book"),
+            "summary should include the subject column: {summary}"
+        );
+        assert!(
+            summary.contains(" -  scenario is unsatisfiable"),
+            "summary should include an empty time column before detail: {summary}"
+        );
+        assert!(
+            !summary.contains("SCENE FAIL:"),
+            "summary should use columns instead of colon-separated prose: {summary}"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_renders_time_as_own_column() {
+        let result = verify::VerificationResult::FnContractProved {
+            name: "zero".to_owned(),
+            time_ms: 7,
+            span: None,
+            file: None,
+        };
+
+        let summary = render_terminal_summary(&result);
+        let columns = summary.split_whitespace().collect::<Vec<_>>();
+
+        assert_eq!(columns[0], "PROVED", "status column: {summary}");
+        assert_eq!(columns[1], "fn", "subject kind column: {summary}");
+        assert_eq!(columns[2], "zero", "subject name column: {summary}");
+        assert_eq!(columns[3], "7ms", "time column: {summary}");
+        assert!(
+            summary.contains("function contract proved"),
+            "detail column should describe the result: {summary}"
+        );
+        assert!(
+            !summary.contains("proved in"),
+            "time should not be embedded in detail prose: {summary}"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_wraps_long_detail_column() {
+        let result = verify::VerificationResult::Checked {
+            name: "checkout_graph_smoke".to_owned(),
+            depth: 4,
+            method: None,
+            time_ms: 716,
+            assumptions: vec![verify::TrustedAssumption::DefaultStutter],
+            backend_diagnostics: vec![verify::BackendDiagnostic {
+                backend: "verify".to_owned(),
+                phase: "proof_mode".to_owned(),
+                severity: "info".to_owned(),
+                message: "ordinary verify ran bounded/exploration checking; rerun with --ic3 or --unbounded-only to attempt an unbounded proof".to_owned(),
+            }],
+            span: None,
+            file: None,
+        };
+
+        let summary = render_terminal_summary(&result);
+        let lines = summary.lines().collect::<Vec<_>>();
+        let first_detail_start = lines[0]
+            .find("bounded trace-prefix")
+            .expect("first detail starts with checked detail");
+
+        assert!(
+            lines.len() > 1,
+            "long detail should wrap onto continuation lines: {summary}"
+        );
+        assert!(
+            lines.iter().all(|line| line.len() <= TERMINAL_ROW_WIDTH),
+            "wrapped lines should fit the terminal row width: {summary}"
+        );
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .all(|line| line[..first_detail_start].trim().is_empty()),
+            "continuation lines should align to detail column: {summary}"
+        );
+    }
+
+    #[test]
+    fn terminal_summary_separator_only_follows_wrapped_rows() {
+        let short = verify::VerificationResult::FnContractProved {
+            name: "zero".to_owned(),
+            time_ms: 7,
+            span: None,
+            file: None,
+        };
+        let wrapped = verify::VerificationResult::Checked {
+            name: "checkout_graph_smoke".to_owned(),
+            depth: 4,
+            method: None,
+            time_ms: 716,
+            assumptions: vec![verify::TrustedAssumption::DefaultStutter],
+            backend_diagnostics: vec![verify::BackendDiagnostic {
+                backend: "verify".to_owned(),
+                phase: "proof_mode".to_owned(),
+                severity: "info".to_owned(),
+                message: "ordinary verify ran bounded/exploration checking; rerun with --ic3 or --unbounded-only to attempt an unbounded proof".to_owned(),
+            }],
+            span: None,
+            file: None,
+        };
+
+        assert!(
+            !terminal_summary_needs_row_separator(&render_terminal_summary(&short)),
+            "short one-line rows should stay compact"
+        );
+        assert!(
+            terminal_summary_needs_row_separator(&render_terminal_summary(&wrapped)),
+            "wrapped rows should get visual separation from the next result"
         );
     }
 
@@ -3372,17 +3684,18 @@ mod tests {
         };
 
         let summary = render_terminal_summary(&result);
+        let normalized = collapse_inline_whitespace(&summary);
 
         assert!(
-            summary.contains("bounded trace-prefix"),
+            normalized.contains("bounded trace-prefix"),
             "expected CHECKED summary to describe trace-prefix semantics: {summary}"
         );
         assert!(
-            summary.contains("stutter"),
+            normalized.contains("stutter"),
             "expected CHECKED summary to disclose stutter depth semantics: {summary}"
         );
         assert!(
-            summary.contains("not exhaustive"),
+            normalized.contains("not exhaustive"),
             "expected CHECKED summary to disclose coverage limits: {summary}"
         );
     }
@@ -3401,9 +3714,10 @@ mod tests {
         };
 
         let summary = render_terminal_summary(&result);
+        let normalized = collapse_inline_whitespace(&summary);
 
         assert!(
-            summary.contains("under default stutter"),
+            normalized.contains("under default stutter"),
             "expected terminal summary to disclose default stutter provenance: {summary}"
         );
     }
