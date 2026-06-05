@@ -54,8 +54,22 @@ use theorem::*;
 mod scene;
 #[allow(clippy::wildcard_imports)]
 use scene::*;
+mod obligation;
 mod relational;
 pub mod solver;
+
+pub use obligation::{
+    analyze_verification_dependency_graph, classify_verification_parallel_lanes,
+    collect_verification_obligations, execute_verification_lane_plan,
+    execute_verification_lane_plan_with_events, schedule_verification_obligations,
+    VerificationConcurrencyBlocker, VerificationDependencyEdge, VerificationDependencyGraph,
+    VerificationDependencyKind, VerificationExecutionMode, VerificationExecutionOutcome,
+    VerificationExecutionResult, VerificationLaneConcurrency, VerificationObligation,
+    VerificationObligationDependency, VerificationObligationId, VerificationObligationKind,
+    VerificationObligationResultKind, VerificationParallelLane, VerificationParallelLanePlan,
+    VerificationSchedule, VerificationScheduleStep, VerificationSchedulerEvent,
+    VerificationSchedulerPolicy, VerificationSchedulingMode, VerificationTrustPolicy,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -878,6 +892,28 @@ impl VerificationResult {
         self
     }
 
+    /// Replace the displayed elapsed time for result variants that carry one.
+    fn with_time_ms(mut self, elapsed: u64) -> Self {
+        match &mut self {
+            Self::Proved { time_ms, .. }
+            | Self::Admitted { time_ms, .. }
+            | Self::Checked { time_ms, .. }
+            | Self::ScenePass { time_ms, .. }
+            | Self::FnContractProved { time_ms, .. }
+            | Self::FnContractAdmitted { time_ms, .. } => {
+                *time_ms = elapsed;
+            }
+            Self::Counterexample { .. }
+            | Self::SceneFail { .. }
+            | Self::SceneUnknown { .. }
+            | Self::Unprovable { .. }
+            | Self::FnContractFailed { .. }
+            | Self::LivenessViolation { .. }
+            | Self::Deadlock { .. } => {}
+        }
+        self
+    }
+
     /// Is this a failure (counterexample, scene fail, fn contract fail, liveness violation, deadlock, or unprovable)?
     pub fn is_failure(&self) -> bool {
         matches!(
@@ -1340,6 +1376,28 @@ impl VerifyTargetKind {
     }
 }
 
+/// Streaming notification emitted by verifier runs that opt into
+/// observation. `ResultReady` carries the same finalized result value
+/// that is appended to the complete result vector returned by the run.
+#[derive(Debug, Clone)]
+pub enum VerificationStreamEvent {
+    TargetStarted {
+        kind: VerifyTargetKind,
+        name: String,
+    },
+    ResultReady {
+        result: VerificationResult,
+    },
+    TargetSkipped {
+        kind: VerifyTargetKind,
+        name: String,
+        reason: String,
+    },
+    RunCompleted {
+        result_count: usize,
+    },
+}
+
 /// Optional `--target` filter. Parsed from the CLI as `[kind:]name`;
 /// when `kind` is `None` the name must resolve unambiguously across
 /// every declaration kind in scope.
@@ -1439,8 +1497,6 @@ pub struct VerifyConfig {
     pub no_prop_verify: bool,
     /// Skip function contract verification.
     pub no_fn_verify: bool,
-    /// Print progress messages to stderr.
-    pub progress: bool,
     /// Native witness family to prefer when multiple extraction paths exist.
     pub witness_semantics: WitnessSemantics,
     /// Add semantics-preserving symmetry breaking to relational SAT encodings.
@@ -1466,7 +1522,6 @@ impl Default for VerifyConfig {
             no_ic3: true,
             no_prop_verify: false,
             no_fn_verify: false,
-            progress: false,
             witness_semantics: WitnessSemantics::Operational,
             relational_symmetry_breaking: true,
             target: None,
@@ -1583,7 +1638,8 @@ pub fn available_verify_targets(ir: &IRProgram) -> Vec<VerifyTargetEntry> {
             && (!func.ensures.is_empty()
                 || func.decreases.is_some()
                 || body_contains_assert(&func.body)
-                || body_contains_sorry(&func.body))
+                || body_contains_sorry(&func.body)
+                || body_contains_todo(&func.body))
         {
             Some(VerifyTargetEntry {
                 kind: VerifyTargetKind::Fn,
@@ -1908,14 +1964,48 @@ fn check_prop_bmc_fallback(
 /// admitted obligations remain visible but allow later verification to run.
 /// Returns one result per target, each carrying source location for diagnostic rendering.
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
+    let mut event_sink = ignore_verification_stream_event;
+    verify_all_inner(ir, config, &mut event_sink, false)
+}
+
+/// Verify all targets and notify a caller-provided sink as each finalized
+/// result becomes available.
+///
+/// The returned vector is identical to [`verify_all`]. Streaming events are
+/// observational: they do not change target selection, solver semantics,
+/// report generation, or trace artifact inputs.
+pub fn verify_all_with_events<F>(
+    ir: &IRProgram,
+    config: &VerifyConfig,
+    mut event_sink: F,
+) -> Vec<VerificationResult>
+where
+    F: FnMut(&VerificationStreamEvent),
+{
+    let results = verify_all_inner(ir, config, &mut event_sink, true);
+    event_sink(&VerificationStreamEvent::RunCompleted {
+        result_count: results.len(),
+    });
+    results
+}
+
+fn verify_all_inner(
+    ir: &IRProgram,
+    config: &VerifyConfig,
+    event_sink: &mut dyn FnMut(&VerificationStreamEvent),
+    streaming: bool,
+) -> Vec<VerificationResult> {
     if let Some(result) = selected_target_error(ir, config) {
+        emit_stream_result(event_sink, &result);
         return vec![result];
     }
 
     let resolved_chc_family = match chc::resolve_chc_family(config.chc_selection) {
         Ok(family) => family,
         Err(hint) => {
-            return vec![unavailable_solver_result("chc_backend", hint)];
+            let result = unavailable_solver_result("chc_backend", hint);
+            emit_stream_result(event_sink, &result);
+            return vec![result];
         }
     };
 
@@ -1926,13 +2016,16 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
             SolverFamily::Z3,
             SolverFamily::Z3,
             resolved_chc_family,
+            event_sink,
         ),
         SolverSelection::Cvc5 => {
             if !is_solver_family_available(SolverFamily::Cvc5) {
-                return vec![unavailable_solver_result(
+                let result = unavailable_solver_result(
                     "verification",
                     "requested solver `cvc5` is not available in this build".to_owned(),
-                )];
+                );
+                emit_stream_result(event_sink, &result);
+                return vec![result];
             }
             verify_all_single(
                 ir,
@@ -1940,6 +2033,7 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
                 SolverFamily::Cvc5,
                 SolverFamily::Cvc5,
                 resolved_chc_family,
+                event_sink,
             )
         }
         SolverSelection::Auto => {
@@ -1950,15 +2044,46 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
                 SolverFamily::Z3,
                 scene_family,
                 resolved_chc_family,
+                event_sink,
             )
         }
         SolverSelection::Both => {
             if !is_solver_family_available(SolverFamily::Cvc5) {
-                return vec![unavailable_solver_result(
+                let result = unavailable_solver_result(
                     "solver_backend_comparison",
                     "requested solver `both` requires the cvc5 backend to be available in this build"
                         .to_owned(),
-                )];
+                );
+                emit_stream_result(event_sink, &result);
+                return vec![result];
+            }
+            if streaming {
+                let mut z3_config = config.clone();
+                z3_config.solver_selection = SolverSelection::Z3;
+                let mut cvc5_config = config.clone();
+                cvc5_config.solver_selection = SolverSelection::Cvc5;
+                let z3_results = verify_all_single(
+                    ir,
+                    &z3_config,
+                    SolverFamily::Z3,
+                    SolverFamily::Z3,
+                    resolved_chc_family,
+                    event_sink,
+                );
+                let cvc5_results = verify_all_single(
+                    ir,
+                    &cvc5_config,
+                    SolverFamily::Cvc5,
+                    SolverFamily::Cvc5,
+                    resolved_chc_family,
+                    event_sink,
+                );
+                return reconcile_solver_results(
+                    SolverFamily::Z3,
+                    z3_results,
+                    SolverFamily::Cvc5,
+                    cvc5_results,
+                );
             }
             let ir_z3 = ir.clone();
             let ir_cvc5 = ir.clone();
@@ -1968,21 +2093,25 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
             cvc5_config.solver_selection = SolverSelection::Cvc5;
 
             let z3 = thread::spawn(move || {
+                let mut event_sink = ignore_verification_stream_event;
                 verify_all_single(
                     &ir_z3,
                     &z3_config,
                     SolverFamily::Z3,
                     SolverFamily::Z3,
                     resolved_chc_family,
+                    &mut event_sink,
                 )
             });
             let cvc5 = thread::spawn(move || {
+                let mut event_sink = ignore_verification_stream_event;
                 verify_all_single(
                     &ir_cvc5,
                     &cvc5_config,
                     SolverFamily::Cvc5,
                     SolverFamily::Cvc5,
                     resolved_chc_family,
+                    &mut event_sink,
                 )
             });
 
@@ -2024,6 +2153,17 @@ pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResu
     }
 }
 
+fn emit_stream_result(
+    event_sink: &mut dyn FnMut(&VerificationStreamEvent),
+    result: &VerificationResult,
+) {
+    event_sink(&VerificationStreamEvent::ResultReady {
+        result: result.clone(),
+    });
+}
+
+fn ignore_verification_stream_event(_: &VerificationStreamEvent) {}
+
 /// Verify only function contracts in an IR program.
 ///
 /// This is intended for latency-sensitive editor feedback. It runs the same
@@ -2047,7 +2187,8 @@ pub fn verify_function_contracts_only(
     };
 
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family);
+        let mut event_sink = ignore_verification_stream_event;
+        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family, &mut event_sink);
         run.verify_function_contracts();
         run.finish()
     })) {
@@ -2091,7 +2232,8 @@ pub fn verify_proof_obligations_only(
     };
 
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family);
+        let mut event_sink = ignore_verification_stream_event;
+        let mut run = VerifyAllRun::new(ir, config, solver_family, solver_family, &mut event_sink);
         run.verify_lemmas();
         run.verify_theorems();
         run.finish()
@@ -2118,20 +2260,32 @@ fn verify_all_single(
     solver_family: SolverFamily,
     scene_solver_family: SolverFamily,
     chc_family: SolverFamily,
+    event_sink: &mut dyn FnMut(&VerificationStreamEvent),
 ) -> Vec<VerificationResult> {
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        verify_all_single_impl(ir, config, solver_family, scene_solver_family, chc_family)
+        verify_all_single_impl(
+            ir,
+            config,
+            solver_family,
+            scene_solver_family,
+            chc_family,
+            event_sink,
+        )
     })) {
         Ok(results) => results,
-        Err(payload) => vec![VerificationResult::Unprovable {
-            name: "verification".to_owned(),
-            hint: internal_verifier_hint(
-                &format!("running {} backend", solver_label(solver_family)),
-                &panic_message(payload),
-            ),
-            span: None,
-            file: None,
-        }],
+        Err(payload) => {
+            let result = VerificationResult::Unprovable {
+                name: "verification".to_owned(),
+                hint: internal_verifier_hint(
+                    &format!("running {} backend", solver_label(solver_family)),
+                    &panic_message(payload),
+                ),
+                span: None,
+                file: None,
+            };
+            emit_stream_result(event_sink, &result);
+            vec![result]
+        }
     }
 }
 
@@ -2141,17 +2295,22 @@ fn verify_all_single_impl(
     solver_family: SolverFamily,
     scene_solver_family: SolverFamily,
     chc_family: SolverFamily,
+    event_sink: &mut dyn FnMut(&VerificationStreamEvent),
 ) -> Vec<VerificationResult> {
     if let Err(hint) = set_active_solver_family(solver_family) {
-        return vec![unavailable_solver_result("verification", hint)];
+        let result = unavailable_solver_result("verification", hint);
+        emit_stream_result(event_sink, &result);
+        return vec![result];
     }
     if let Err(hint) = chc::set_active_chc_family(chc_family) {
-        return vec![unavailable_solver_result("chc_backend", hint)];
+        let result = unavailable_solver_result("chc_backend", hint);
+        emit_stream_result(event_sink, &result);
+        return vec![result];
     }
-    VerifyAllRun::new(ir, config, solver_family, scene_solver_family).run()
+    VerifyAllRun::new(ir, config, solver_family, scene_solver_family, event_sink).run()
 }
 
-struct VerifyAllRun<'a> {
+struct VerifyAllRun<'a, 'e> {
     ir: &'a IRProgram,
     config: &'a VerifyConfig,
     solver_family: SolverFamily,
@@ -2161,14 +2320,16 @@ struct VerifyAllRun<'a> {
     deadline: Option<Instant>,
     results: Vec<VerificationResult>,
     axiom_assumptions: Vec<TrustedAssumption>,
+    event_sink: &'e mut dyn FnMut(&VerificationStreamEvent),
 }
 
-impl<'a> VerifyAllRun<'a> {
+impl<'a, 'e> VerifyAllRun<'a, 'e> {
     fn new(
         ir: &'a IRProgram,
         config: &'a VerifyConfig,
         solver_family: SolverFamily,
         scene_solver_family: SolverFamily,
+        event_sink: &'e mut dyn FnMut(&VerificationStreamEvent),
     ) -> Self {
         Self {
             ir,
@@ -2180,6 +2341,7 @@ impl<'a> VerifyAllRun<'a> {
             deadline: verification_deadline(config),
             results: Vec::new(),
             axiom_assumptions: build_axiom_assumptions(&ir.axioms),
+            event_sink,
         }
     }
 
@@ -2197,14 +2359,13 @@ impl<'a> VerifyAllRun<'a> {
     }
 
     fn finish(self) -> Vec<VerificationResult> {
-        if self.axiom_assumptions.is_empty() {
-            self.results
-        } else {
-            self.results
-                .into_iter()
-                .map(|result| result.with_axioms(&self.axiom_assumptions))
-                .collect()
-        }
+        self.results
+    }
+
+    fn push_result(&mut self, result: VerificationResult) {
+        let result = result.with_axioms(&self.axiom_assumptions);
+        emit_stream_result(self.event_sink, &result);
+        self.results.push(result);
     }
 
     fn effective_config_for_target(
@@ -2214,7 +2375,7 @@ impl<'a> VerifyAllRun<'a> {
         file: Option<String>,
     ) -> Option<VerifyConfig> {
         let Some(effective_config) = clamp_config_to_deadline(self.config, self.deadline) else {
-            self.results.push(VerificationResult::Unprovable {
+            self.push_result(VerificationResult::Unprovable {
                 name: name.to_owned(),
                 hint: verification_timeout_hint(self.config),
                 span,
@@ -2242,14 +2403,14 @@ impl<'a> VerifyAllRun<'a> {
             };
             if let Err(hint) = set_active_solver_family(self.solver_family) {
                 if selected {
-                    self.results.push(
+                    self.push_result(
                         unavailable_solver_result(&lemma_block.name, hint)
                             .with_source(lemma_block.span, lemma_block.file.clone()),
                     );
                 }
                 continue;
             }
-            self.progress_start(selected, &format!("Proving lemma {}", lemma_block.name));
+            let start = Instant::now();
             let result = catch_verification_panic(
                 &lemma_block.name,
                 lemma_block.span,
@@ -2260,13 +2421,13 @@ impl<'a> VerifyAllRun<'a> {
                         .with_source(lemma_block.span, lemma_block.file.clone())
                 },
             );
-            self.progress_done(selected);
+            let result = result.with_time_ms(elapsed_ms(&start));
             if matches!(&result, VerificationResult::Proved { .. }) {
                 self.defs
                     .add_lemma_fact(&lemma_block.name, &lemma_block.body);
             }
             if selected {
-                self.results.push(result);
+                self.push_result(result);
             }
         }
     }
@@ -2280,7 +2441,7 @@ impl<'a> VerifyAllRun<'a> {
     ) -> Option<VerifyConfig> {
         let Some(effective_config) = clamp_config_to_deadline(self.config, self.deadline) else {
             if selected {
-                self.results.push(VerificationResult::Unprovable {
+                self.push_result(VerificationResult::Unprovable {
                     name: name.to_owned(),
                     hint: verification_timeout_hint(self.config),
                     span,
@@ -2305,15 +2466,15 @@ impl<'a> VerifyAllRun<'a> {
                 continue;
             };
             if let Err(hint) = set_active_solver_family(self.solver_family) {
-                self.results.push(
+                self.push_result(
                     unavailable_solver_result(&verify_block.name, hint)
                         .with_source(verify_block.span, verify_block.file.clone()),
                 );
                 continue;
             }
-            self.progress_start(true, &format!("Checking {}", verify_block.name));
             clear_prop_precondition_obligations();
             clear_path_guard_stack();
+            let start = Instant::now();
             let result = catch_verification_panic(
                 &verify_block.name,
                 verify_block.span,
@@ -2331,7 +2492,7 @@ impl<'a> VerifyAllRun<'a> {
                     .with_source(verify_block.span, verify_block.file.clone())
                 },
             );
-            self.progress_done(true);
+            let result = result.with_time_ms(elapsed_ms(&start));
             self.push_result_or_precondition_violation(
                 &verify_block.name,
                 verify_block.span,
@@ -2353,7 +2514,7 @@ impl<'a> VerifyAllRun<'a> {
             ) else {
                 continue;
             };
-            self.progress_start(true, &format!("Checking scene {}", scene_block.name));
+            let start = Instant::now();
             let result = catch_verification_panic(
                 &scene_block.name,
                 scene_block.span,
@@ -2361,8 +2522,8 @@ impl<'a> VerifyAllRun<'a> {
                 "checking scene block",
                 || self.check_scene(scene_block, &effective_config),
             );
-            self.progress_done(true);
-            self.results.push(result);
+            let result = result.with_time_ms(elapsed_ms(&start));
+            self.push_result(result);
         }
     }
 
@@ -2402,15 +2563,15 @@ impl<'a> VerifyAllRun<'a> {
                 continue;
             };
             if let Err(hint) = set_active_solver_family(self.solver_family) {
-                self.results.push(
+                self.push_result(
                     unavailable_solver_result(&theorem_block.name, hint)
                         .with_source(theorem_block.span, theorem_block.file.clone()),
                 );
                 continue;
             }
-            self.progress_start(true, &format!("Proving {}", theorem_block.name));
             clear_prop_precondition_obligations();
             clear_path_guard_stack();
+            let start = Instant::now();
             let result = catch_verification_panic(
                 &theorem_block.name,
                 theorem_block.span,
@@ -2428,7 +2589,7 @@ impl<'a> VerifyAllRun<'a> {
                     .with_source(theorem_block.span, theorem_block.file.clone())
                 },
             );
-            self.progress_done(true);
+            let result = result.with_time_ms(elapsed_ms(&start));
             self.push_result_or_precondition_violation(
                 &theorem_block.name,
                 theorem_block.span,
@@ -2443,9 +2604,9 @@ impl<'a> VerifyAllRun<'a> {
             return;
         }
         if let Err(hint) = set_active_solver_family(self.solver_family) {
-            self.results
-                .push(unavailable_solver_result("fn_verification", hint));
+            self.push_result(unavailable_solver_result("fn_verification", hint));
         } else {
+            let first_new_result = self.results.len();
             verify_fn_contracts(
                 self.ir,
                 &self.vctx,
@@ -2454,6 +2615,10 @@ impl<'a> VerifyAllRun<'a> {
                 self.deadline,
                 &mut self.results,
             );
+            let new_results = self.results.split_off(first_new_result);
+            for result in new_results {
+                self.push_result(result);
+            }
         }
     }
 
@@ -2538,10 +2703,10 @@ impl<'a> VerifyAllRun<'a> {
             return;
         };
         if let Some(result) = self.prop_preflight_result(func, &result_name) {
-            self.results.push(result);
+            self.push_result(result);
             return;
         }
-        self.progress_start(true, &format!("Verifying prop {}", func.name));
+        let start = Instant::now();
         let result = catch_verification_panic(
             &result_name,
             func.span,
@@ -2549,8 +2714,8 @@ impl<'a> VerifyAllRun<'a> {
             "verifying prop",
             || self.check_prop_function(func, target_system, &effective_config),
         );
-        self.progress_done(true);
-        self.results.push(result);
+        let result = result.with_time_ms(elapsed_ms(&start));
+        self.push_result(result);
     }
 
     fn prop_preflight_result(
@@ -2620,24 +2785,6 @@ impl<'a> VerifyAllRun<'a> {
                 config,
                 self.deadline,
             )
-        } else if matches!(
-            &theorem_result,
-            VerificationResult::Proved { method, .. } if method == "1-induction"
-        ) {
-            let bounded_result = check_prop_bmc_fallback(
-                self.ir,
-                &self.vctx,
-                &self.defs,
-                func,
-                target_system,
-                config,
-                self.deadline,
-            );
-            if bounded_result.is_failure() {
-                bounded_result
-            } else {
-                theorem_result
-            }
         } else {
             theorem_result
         }
@@ -2651,26 +2798,14 @@ impl<'a> VerifyAllRun<'a> {
         result: VerificationResult,
     ) {
         if let Some(violation) = check_prop_precondition_obligations() {
-            self.results.push(VerificationResult::Unprovable {
+            self.push_result(VerificationResult::Unprovable {
                 name: name.to_owned(),
                 hint: violation,
                 span,
                 file,
             });
         } else {
-            self.results.push(result);
-        }
-    }
-
-    fn progress_start(&self, selected: bool, message: &str) {
-        if self.config.progress && selected {
-            eprint!("{message}...");
-        }
-    }
-
-    fn progress_done(&self, selected: bool) {
-        if self.config.progress && selected {
-            eprintln!(" done");
+            self.push_result(result);
         }
     }
 }
@@ -4400,10 +4535,6 @@ fn try_ic3_on_verify_with_diagnostics(
             )],
         };
     };
-    if config.progress {
-        eprint!(" (trying IC3/PDR)");
-    }
-
     let mut diagnostics = Vec::new();
 
     // Try IC3 on each assert — all must pass for PROVED
@@ -4842,19 +4973,20 @@ fn bmc_solver_result(
     pool: &SlotPool,
     fire_tracking: &harness::FireTracking,
 ) -> VerificationResult {
-    let elapsed = elapsed_ms(&ctx.started_at);
-
     match solver.check() {
-        SatResult::Unsat => VerificationResult::Checked {
-            name: ctx.verify_block.name.clone(),
-            depth: ctx.bound,
-            method: None,
-            time_ms: elapsed,
-            assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
-            backend_diagnostics: vec![],
-            span: None,
-            file: None,
-        },
+        SatResult::Unsat => {
+            let elapsed = elapsed_ms(&ctx.started_at);
+            VerificationResult::Checked {
+                name: ctx.verify_block.name.clone(),
+                depth: ctx.bound,
+                method: None,
+                time_ms: elapsed,
+                assumptions: verify_assumptions(ctx.ir, ctx.verify_block),
+                backend_diagnostics: vec![],
+                span: None,
+                file: None,
+            }
+        }
         SatResult::Sat => bmc_counterexample(ctx, solver, pool, fire_tracking),
         SatResult::Unknown(reason) => bmc_unknown_result(ctx.verify_block, ctx.config, &reason),
     }

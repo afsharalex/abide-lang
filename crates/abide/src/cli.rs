@@ -179,9 +179,9 @@ enum Command {
         #[arg(long)]
         no_fn_verify: bool,
 
-        /// Show progress messages during verification
+        /// Stream verification results as targets finish
         #[arg(long)]
-        progress: bool,
+        stream: bool,
 
         /// Native witness family for failing verification results
         #[arg(long = "witness-semantics", value_enum, default_value_t = VerifyWitnessSemantics::Operational)]
@@ -379,7 +379,7 @@ fn run_command(command: Command) -> miette::Result<()> {
             cvc5_sygus,
             no_prop_verify,
             no_fn_verify,
-            progress,
+            stream,
             witness_semantics,
             no_relational_symmetry_breaking,
             target,
@@ -414,7 +414,7 @@ fn run_command(command: Command) -> miette::Result<()> {
                     no_fn_verify,
                 },
                 output: VerifyOutputOptions {
-                    progress,
+                    stream,
                     verbose,
                     debug_evidence,
                     report,
@@ -554,7 +554,7 @@ struct VerifyDisabledChecks {
 }
 
 struct VerifyOutputOptions {
-    progress: bool,
+    stream: bool,
     verbose: bool,
     debug_evidence: bool,
     report: Option<Vec<String>>,
@@ -572,7 +572,7 @@ fn run_verify_command(args: VerifyCommand) -> miette::Result<()> {
     let names = verify_names(&args);
     let report_request = render::parse_verify_report_request(args.output.report.clone())?;
     let config = build_verify_config(&args)?;
-    let verified = match driver::verify_files(&args.files, &config) {
+    let verified = match verify_files_for_cli(&args, &config) {
         Ok(verified) => verified,
         Err(diagnostics) => {
             write_failed_verify_report(&args, &names, report_request.as_ref(), &diagnostics)?;
@@ -594,13 +594,42 @@ fn run_verify_command(args: VerifyCommand) -> miette::Result<()> {
         &results,
     )?;
     write_verify_trace_artifact(&args, &names, &results)?;
-    report_verify_results(
-        &results,
-        &verified.lowered.sources,
-        args.output.verbose,
-        args.output.debug_evidence,
-    );
+    if args.output.stream {
+        finish_streamed_verify_results(&results);
+    } else {
+        report_verify_results(
+            &results,
+            &verified.lowered.sources,
+            args.output.verbose,
+            args.output.debug_evidence,
+        );
+    }
     Ok(())
+}
+
+fn verify_files_for_cli(
+    args: &VerifyCommand,
+    config: &crate::verify::VerifyConfig,
+) -> Result<driver::VerifiedFiles, Vec<Diagnostic>> {
+    if !args.output.stream {
+        return driver::verify_files(&args.files, config);
+    }
+    let lowered = driver::lower_files(&args.files)?;
+    if has_error_diagnostics(&lowered.diagnostics) {
+        return Err(lowered.diagnostics);
+    }
+    let results = {
+        let sources = &lowered.sources;
+        crate::verify::verify_all_with_events(&lowered.ir_program, config, |event| {
+            report_verification_stream_event(
+                event,
+                sources,
+                args.output.verbose,
+                args.output.debug_evidence,
+            );
+        })
+    };
+    Ok(driver::VerifiedFiles { lowered, results })
 }
 
 fn validate_verify_solver_options(args: &VerifyCommand) -> miette::Result<()> {
@@ -663,7 +692,6 @@ fn build_verify_config(args: &VerifyCommand) -> miette::Result<crate::verify::Ve
         no_ic3: args.disabled_checks.no_ic3,
         no_prop_verify: args.disabled_checks.no_prop_verify,
         no_fn_verify: args.disabled_checks.no_fn_verify,
-        progress: args.output.progress,
         witness_semantics: witness_semantics(args.witness_semantics),
         relational_symmetry_breaking: args.solver_flags.relational_symmetry_breaking,
         target,
@@ -719,7 +747,6 @@ fn verify_report_config<'a>(
             no_prop_verify: args.disabled_checks.no_prop_verify,
             no_fn_verify: args.disabled_checks.no_fn_verify,
         },
-        progress: args.output.progress,
         witness_semantics: &names.witness_semantics,
         target: args.target.as_deref(),
     }
@@ -831,6 +858,29 @@ fn report_verify_results(
         }
     }
     if !all_passed {
+        std::process::exit(1);
+    }
+}
+
+fn report_verification_stream_event(
+    event: &crate::verify::VerificationStreamEvent,
+    sources: &[(String, String)],
+    verbose: bool,
+    debug_evidence: bool,
+) {
+    if let crate::verify::VerificationStreamEvent::ResultReady { result } = event {
+        render::report_verification_result(result, sources, verbose, debug_evidence);
+    }
+}
+
+fn finish_streamed_verify_results(results: &[crate::verify::VerificationResult]) {
+    if results.is_empty() {
+        println!("No verification targets found.");
+    }
+    if results
+        .iter()
+        .any(crate::verify::VerificationResult::is_failure)
+    {
         std::process::exit(1);
     }
 }
@@ -1092,5 +1142,59 @@ fn report_diagnostics(diagnostics: &[Diagnostic], sources: &[(String, String)]) 
                 _ => eprintln!("  note: {}", related.message),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verify_command_for_config_tests() -> VerifyCommand {
+        VerifyCommand {
+            files: vec![PathBuf::from("spec.ab")],
+            solver: VerifySolver::Z3,
+            chc_solver: VerifyChcSolver::Z3,
+            timeouts: VerifyTimeouts {
+                overall: 30,
+                induction: 30,
+                bmc: 30,
+                ic3: 30,
+                prop_bmc_depth: 10,
+            },
+            mode: VerifyModeOptions {
+                bounded_only: false,
+                unbounded_only: false,
+                bmc_iterative_deepening: true,
+            },
+            solver_flags: VerifySolverFlags {
+                cvc5_sygus: false,
+                relational_symmetry_breaking: true,
+            },
+            disabled_checks: VerifyDisabledChecks {
+                no_ic3: true,
+                no_prop_verify: false,
+                no_fn_verify: false,
+            },
+            output: VerifyOutputOptions {
+                stream: true,
+                verbose: false,
+                debug_evidence: false,
+                report: None,
+                trace_artifact: None,
+            },
+            witness_semantics: VerifyWitnessSemantics::Operational,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn verify_stream_flag_does_not_change_solver_config() {
+        let args = verify_command_for_config_tests();
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.solver_selection, crate::verify::SolverSelection::Z3);
+        assert_eq!(config.chc_selection, crate::verify::ChcSelection::Z3);
+        assert_eq!(config.target, None);
     }
 }

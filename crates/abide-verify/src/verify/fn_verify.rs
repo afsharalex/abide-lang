@@ -221,9 +221,6 @@ pub(super) fn verify_fn_contracts(
         let mut termination_failed = false;
         if let Some(ref dec) = func.decreases {
             if !dec.star {
-                if config.progress {
-                    eprint!("Checking termination of fn {}...", func.name);
-                }
                 let start = Instant::now();
                 let term_result = panic::catch_unwind(AssertUnwindSafe(|| {
                     verify_fn_termination(func, vctx, defs)
@@ -237,9 +234,6 @@ pub(super) fn verify_fn_contracts(
                     ))
                 });
                 let _time_ms = elapsed_ms(&start);
-                if config.progress {
-                    eprintln!(" done");
-                }
                 if let Err(err) = term_result {
                     let (hint, obligation_span) = err.into_message_and_span();
                     results.push(VerificationResult::Unprovable {
@@ -258,10 +252,6 @@ pub(super) fn verify_fn_contracts(
         // termination + callee preconditions at recursive call sites.
         if termination_failed {
             continue;
-        }
-
-        if config.progress {
-            eprint!("Verifying fn {}...", func.name);
         }
 
         let start = Instant::now();
@@ -310,9 +300,6 @@ pub(super) fn verify_fn_contracts(
             }
         };
 
-        if config.progress {
-            eprintln!(" done");
-        }
         results.push(vr);
     }
 }

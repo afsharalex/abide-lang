@@ -18786,6 +18786,63 @@ fn failing_fn_contract_preflight_stops_verify_dispatch() {
 }
 
 #[test]
+fn verify_all_with_events_streams_completed_results_in_final_order() {
+    let ir = make_fn_ir(admitted_sorry_fn_contract());
+    let mut events = Vec::new();
+
+    let results = verify_all_with_events(&ir, &VerifyConfig::default(), |event| {
+        events.push(event.clone());
+    });
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        &results[0],
+        VerificationResult::FnContractAdmitted { name, .. } if name == "admitted"
+    ));
+    let streamed_names: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            VerificationStreamEvent::ResultReady { result } => Some(result_name(result)),
+            _ => None,
+        })
+        .collect();
+    let result_names: Vec<_> = results.iter().map(result_name).collect();
+    assert_eq!(streamed_names, result_names);
+    assert!(matches!(
+        events.last(),
+        Some(VerificationStreamEvent::RunCompleted { result_count: 1 })
+    ));
+}
+
+#[test]
+fn verify_all_with_events_streams_blocking_preflight_failure_before_stopping() {
+    let mut ir = make_fn_ir(bad_identity_fn_contract());
+    ir.verifies.push(trivial_verify_block("should_not_run"));
+    let mut events = Vec::new();
+
+    let results = verify_all_with_events(&ir, &VerifyConfig::default(), |event| {
+        events.push(event.clone());
+    });
+
+    assert!(matches!(
+        &results[0],
+        VerificationResult::FnContractFailed { name, .. } if name == "bad"
+    ));
+    assert!(!results.iter().any(|result| {
+        matches!(result, VerificationResult::Checked { name, .. } if name == "should_not_run")
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        VerificationStreamEvent::ResultReady { result }
+            if matches!(result, VerificationResult::FnContractFailed { name, .. } if name == "bad")
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(VerificationStreamEvent::RunCompleted { result_count }) if *result_count == results.len()
+    ));
+}
+
+#[test]
 fn failing_fn_contract_preflight_stops_targeted_verify_dispatch() {
     let mut ir = make_fn_ir(bad_identity_fn_contract());
     ir.verifies.push(trivial_verify_block("should_not_run"));

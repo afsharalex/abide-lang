@@ -189,11 +189,22 @@ pub fn verify_files(
     paths: &[PathBuf],
     config: &VerifyConfig,
 ) -> Result<VerifiedFiles, Vec<Diagnostic>> {
+    verify_files_with_events(paths, config, |_| {})
+}
+
+pub fn verify_files_with_events<F>(
+    paths: &[PathBuf],
+    config: &VerifyConfig,
+    event_sink: F,
+) -> Result<VerifiedFiles, Vec<Diagnostic>>
+where
+    F: FnMut(&verify::VerificationStreamEvent),
+{
     let lowered = lower_files(paths)?;
     if has_error_diagnostics(&lowered.diagnostics) {
         return Err(lowered.diagnostics);
     }
-    let results = verify::verify_all(&lowered.ir_program, config);
+    let results = verify::verify_all_with_events(&lowered.ir_program, config, event_sink);
     Ok(VerifiedFiles { lowered, results })
 }
 

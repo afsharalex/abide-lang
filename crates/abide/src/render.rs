@@ -549,7 +549,6 @@ pub(crate) struct VerificationReportConfig<'a> {
     pub mode: VerificationModeConfig,
     pub timeouts: VerificationTimeoutConfig,
     pub disabled_checks: VerificationDisabledChecks,
-    pub progress: bool,
     pub witness_semantics: &'a str,
     pub target: Option<&'a str>,
 }
@@ -657,7 +656,6 @@ fn build_verification_report_json(input: &VerificationReportInput<'_>) -> serde_
             "no_ic3": config.disabled_checks.no_ic3,
             "no_prop_verify": config.disabled_checks.no_prop_verify,
             "no_fn_verify": config.disabled_checks.no_fn_verify,
-            "progress": config.progress,
             "witness_semantics": config.witness_semantics,
             "target": config.target,
         },

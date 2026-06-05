@@ -60,7 +60,7 @@ Run verification across verify blocks, scenes, theorems, props, and function con
 
 ```sh
 abide verify spec.ab
-abide verify spec.ab --solver auto --progress
+abide verify spec.ab --solver auto --stream
 abide verify spec.ab --bounded-only
 abide verify spec.ab --report json reports/
 abide verify examples/relations.ab --witness-semantics relational
@@ -83,7 +83,7 @@ Selected flags:
 - `--no-prop-verify`
 - `--no-fn-verify`
 - `--no-relational-symmetry-breaking`
-- `--progress`
+- `--stream` — print completed verification results as targets finish
 - `--witness-semantics {operational,relational}`
 - `--verbose`
 - `--debug-evidence`

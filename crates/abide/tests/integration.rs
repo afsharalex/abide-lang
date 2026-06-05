@@ -82,6 +82,592 @@ fn elaborate_file(path: &str) -> elab::types::ElabResult {
     result
 }
 
+fn lower_source(src: &str) -> ir::types::IRProgram {
+    use std::io::Write;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("test.ab");
+    let mut f = std::fs::File::create(&file).expect("create");
+    f.write_all(src.as_bytes()).expect("write");
+    drop(f);
+    let path_str = file.to_str().unwrap().to_owned();
+    lower_files(&[path_str.as_str()])
+}
+
+#[test]
+fn verification_obligation_model_represents_scheduler_inputs() {
+    use abide::verify::{
+        SolverSelection, VerificationObligation, VerificationObligationId,
+        VerificationObligationKind, VerificationObligationResultKind, VerificationSchedulerPolicy,
+        VerificationTrustPolicy, VerifyTargetKind,
+    };
+
+    let source = "/tmp/obligations.ab".to_owned();
+    let span = abide::span::Span { start: 12, end: 34 };
+    let obligation = VerificationObligation::new(
+        VerificationObligationId::new(VerifyTargetKind::Fn, "requires_positive"),
+        VerificationObligationKind::FunctionPostcondition {
+            function: "requires_positive".to_owned(),
+        },
+        VerifyTargetKind::Fn,
+        "requires_positive",
+        VerificationObligationResultKind::FnContract,
+    )
+    .with_source(Some(span), Some(source.clone()))
+    .with_trust_policy(VerificationTrustPolicy::AdmitOnSorryOrTodo)
+    .with_solver_policy(VerificationSchedulerPolicy::new(SolverSelection::Z3));
+
+    assert_eq!(obligation.id.as_str(), "fn:requires_positive");
+    assert_eq!(obligation.target_kind, VerifyTargetKind::Fn);
+    assert_eq!(obligation.target_name, "requires_positive");
+    assert_eq!(obligation.span, Some(span));
+    assert_eq!(obligation.file.as_deref(), Some(source.as_str()));
+    assert_eq!(
+        obligation.kind,
+        VerificationObligationKind::FunctionPostcondition {
+            function: "requires_positive".to_owned()
+        }
+    );
+    assert_eq!(
+        obligation.result_kind,
+        VerificationObligationResultKind::FnContract
+    );
+    assert_eq!(
+        obligation.trust_policy,
+        VerificationTrustPolicy::AdmitOnSorryOrTodo
+    );
+    assert_eq!(
+        obligation.scheduler_policy.solver_selection,
+        SolverSelection::Z3
+    );
+}
+
+#[test]
+fn collect_verification_obligations_preserves_dispatch_inputs() {
+    use abide::verify::{
+        collect_verification_obligations, VerificationObligationKind,
+        VerificationObligationResultKind, VerifyConfig, VerifyTargetKind,
+    };
+
+    let ir = lower_source(
+        r"module T
+
+fn bounded(n: int): int
+  ensures result >= 0
+  decreases n
+{
+  if n <= 0 { 0 } else { bounded(n - 1) }
+}
+
+entity Counter {
+  value: int = 0
+  action tick() { value' = value + 1 }
+}
+
+system Sys(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.tick() }
+  }
+}
+
+lemma helper { true }
+
+verify safety {
+  assume {
+    store counters: Counter[0..1]
+    let sys = Sys { counters: counters }
+  }
+  assert always true
+}
+
+scene witness {
+  given {
+    store counters: Counter[1..1]
+    let sys = Sys { counters: counters }
+  }
+  then { assert true }
+}
+
+theorem stable for Sys { show always true }
+
+prop visible for Sys = always true
+",
+    );
+    let config = VerifyConfig::default();
+    let obligations = collect_verification_obligations(&ir, &config);
+    let ids: Vec<_> = obligations
+        .iter()
+        .map(|obligation| obligation.id.as_str())
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![
+            "fn:bounded/postcondition",
+            "fn:bounded/termination",
+            "lemma:helper",
+            "verify:safety",
+            "scene:witness",
+            "theorem:stable",
+            "prop:visible",
+        ]
+    );
+    assert!(obligations
+        .iter()
+        .all(|obligation| obligation.span.is_some()));
+    let fileless: Vec<_> = obligations
+        .iter()
+        .filter(|obligation| {
+            !obligation
+                .file
+                .as_deref()
+                .is_some_and(|file| file.ends_with("test.ab"))
+        })
+        .map(|obligation| obligation.id.as_str())
+        .collect();
+    assert!(fileless.is_empty(), "fileless obligations: {fileless:?}");
+    assert_eq!(obligations[0].target_kind, VerifyTargetKind::Fn);
+    assert_eq!(
+        obligations[0].result_kind,
+        VerificationObligationResultKind::FnContract
+    );
+    assert_eq!(
+        obligations[0].kind,
+        VerificationObligationKind::FunctionPostcondition {
+            function: "bounded".to_owned()
+        }
+    );
+    assert_eq!(
+        obligations[1].kind,
+        VerificationObligationKind::FunctionTermination {
+            function: "bounded".to_owned()
+        }
+    );
+    assert_eq!(obligations[2].target_kind, VerifyTargetKind::Lemma);
+    assert_eq!(obligations[3].target_kind, VerifyTargetKind::Verify);
+    assert_eq!(obligations[4].target_kind, VerifyTargetKind::Scene);
+    assert_eq!(obligations[5].target_kind, VerifyTargetKind::Theorem);
+    assert_eq!(obligations[6].target_kind, VerifyTargetKind::Prop);
+}
+
+#[test]
+fn analyze_verification_dependency_graph_classifies_scheduler_edges() {
+    use abide::verify::{
+        analyze_verification_dependency_graph, collect_verification_obligations,
+        VerificationDependencyKind, VerifyConfig,
+    };
+
+    let ir = lower_source(
+        r"module T
+
+fn bounded(n: int): int
+  ensures result >= 0
+  decreases n
+{
+  if n <= 0 { 0 } else { bounded(n - 1) }
+}
+
+entity Counter {
+  value: int = 0
+  action tick() { value' = value + 1 }
+}
+
+system Sys(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.tick() }
+  }
+}
+
+lemma helper { always true }
+
+verify safety {
+  assume {
+    store counters: Counter[0..1]
+    let sys = Sys { counters: counters }
+  }
+  assert always true
+}
+
+theorem stable for Sys {
+  by helper
+  show always true
+}
+",
+    );
+    let obligations = collect_verification_obligations(&ir, &VerifyConfig::default());
+    let graph = analyze_verification_dependency_graph(&obligations);
+    let independent_ids: Vec<_> = graph
+        .independent_obligations()
+        .iter()
+        .map(|obligation| obligation.id.as_str())
+        .collect();
+
+    assert_eq!(
+        independent_ids,
+        vec!["fn:bounded/postcondition", "fn:bounded/termination"]
+    );
+    assert!(graph.has_edge(
+        "lemma:helper",
+        "theorem:stable",
+        VerificationDependencyKind::Semantic
+    ));
+    assert!(graph.has_edge(
+        "fn:bounded/postcondition",
+        "verify:safety",
+        VerificationDependencyKind::FailureGate
+    ));
+    assert!(graph.has_edge(
+        "fn:bounded/termination",
+        "theorem:stable",
+        VerificationDependencyKind::FailureGate
+    ));
+    assert!(!graph.has_edge(
+        "verify:safety",
+        "theorem:stable",
+        VerificationDependencyKind::Semantic
+    ));
+}
+
+#[test]
+fn schedule_verification_obligations_respects_dependency_graph_order() {
+    use abide::verify::{
+        analyze_verification_dependency_graph, collect_verification_obligations,
+        schedule_verification_obligations, VerificationSchedulingMode, VerifyConfig,
+    };
+
+    let ir = lower_source(
+        r"module T
+
+fn bounded(n: int): int
+  ensures result >= 0
+  decreases n
+{
+  if n <= 0 { 0 } else { bounded(n - 1) }
+}
+
+entity Counter {
+  value: int = 0
+  action tick() { value' = value + 1 }
+}
+
+system Sys(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.tick() }
+  }
+}
+
+lemma helper { always true }
+
+verify safety {
+  assume {
+    store counters: Counter[0..1]
+    let sys = Sys { counters: counters }
+  }
+  assert always true
+}
+
+theorem stable for Sys {
+  by helper
+  show always true
+}
+",
+    );
+    let obligations = collect_verification_obligations(&ir, &VerifyConfig::default());
+    let graph = analyze_verification_dependency_graph(&obligations);
+    let schedule = schedule_verification_obligations(
+        &graph,
+        VerificationSchedulingMode::DeterministicSequential,
+    );
+    let step_ids: Vec<Vec<_>> = schedule
+        .steps
+        .iter()
+        .map(|step| {
+            step.obligations
+                .iter()
+                .map(|obligation| obligation.id.as_str())
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(
+        step_ids,
+        vec![
+            vec!["fn:bounded/postcondition"],
+            vec!["fn:bounded/termination"],
+            vec!["lemma:helper"],
+            vec!["verify:safety"],
+            vec!["theorem:stable"],
+        ]
+    );
+    assert!(schedule.unscheduled_obligations.is_empty());
+}
+
+#[test]
+fn classify_verification_parallel_lanes_records_safe_serial_policy() {
+    use abide::verify::{
+        analyze_verification_dependency_graph, classify_verification_parallel_lanes,
+        collect_verification_obligations, schedule_verification_obligations,
+        VerificationConcurrencyBlocker, VerificationLaneConcurrency, VerificationSchedulingMode,
+        VerifyConfig,
+    };
+
+    let ir = lower_source(
+        r"module T
+
+fn bounded(n: int): int
+  ensures result >= 0
+  decreases n
+{
+  if n <= 0 { 0 } else { bounded(n - 1) }
+}
+
+fn other(n: int): int
+  ensures result >= 0
+{
+  if n <= 0 { 0 } else { n }
+}
+
+entity Counter {
+  value: int = 0
+  action tick() { value' = value + 1 }
+}
+
+system Sys(counters: Store<Counter>) {
+  command tick() {
+    choose c: Counter where true { c.tick() }
+  }
+}
+
+verify safety {
+  assume {
+    store counters: Counter[0..1]
+    let sys = Sys { counters: counters }
+  }
+  assert always true
+}
+",
+    );
+    let obligations = collect_verification_obligations(&ir, &VerifyConfig::default());
+    let graph = analyze_verification_dependency_graph(&obligations);
+    let schedule =
+        schedule_verification_obligations(&graph, VerificationSchedulingMode::DependencyBatches);
+    let plan = classify_verification_parallel_lanes(&schedule);
+    let lane_ids: Vec<Vec<_>> = plan
+        .lanes
+        .iter()
+        .map(|lane| {
+            lane.obligations
+                .iter()
+                .map(|obligation| obligation.id.as_str())
+                .collect()
+        })
+        .collect();
+
+    let flattened_lane_ids: Vec<_> = lane_ids.iter().flatten().copied().collect();
+    assert_eq!(flattened_lane_ids.len(), 4);
+    assert!(flattened_lane_ids.contains(&"fn:other/postcondition"));
+    assert!(flattened_lane_ids.contains(&"fn:bounded/postcondition"));
+    assert!(flattened_lane_ids.contains(&"fn:bounded/termination"));
+    assert_eq!(flattened_lane_ids.last(), Some(&"verify:safety"));
+    assert!(plan
+        .lanes
+        .iter()
+        .all(|lane| lane.concurrency == VerificationLaneConcurrency::Serial));
+    assert!(plan.lanes.iter().any(|lane| lane
+        .blockers
+        .contains(&VerificationConcurrencyBlocker::ExclusiveSolver)));
+    assert_eq!(
+        plan.deterministic_result_order
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        flattened_lane_ids
+    );
+}
+
+#[test]
+fn execute_verification_parallel_lanes_preserves_deterministic_results() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use abide::verify::{
+        analyze_verification_dependency_graph, classify_verification_parallel_lanes,
+        execute_verification_lane_plan, schedule_verification_obligations,
+        VerificationExecutionMode, VerificationObligation, VerificationObligationId,
+        VerificationObligationKind, VerificationObligationResultKind, VerificationSchedulerPolicy,
+        VerificationSchedulingMode, VerifyTargetKind,
+    };
+
+    let safe_a = VerificationObligation::new(
+        VerificationObligationId::new(VerifyTargetKind::Scene, "slow"),
+        VerificationObligationKind::SceneBlock {
+            scene: "slow".to_owned(),
+        },
+        VerifyTargetKind::Scene,
+        "slow",
+        VerificationObligationResultKind::Scene,
+    )
+    .with_solver_policy(
+        VerificationSchedulerPolicy::new(abide::verify::SolverSelection::Z3)
+            .allow_parallel()
+            .outside_global_deadline(),
+    );
+    let safe_b = VerificationObligation::new(
+        VerificationObligationId::new(VerifyTargetKind::Scene, "fast"),
+        VerificationObligationKind::SceneBlock {
+            scene: "fast".to_owned(),
+        },
+        VerifyTargetKind::Scene,
+        "fast",
+        VerificationObligationResultKind::Scene,
+    )
+    .with_solver_policy(
+        VerificationSchedulerPolicy::new(abide::verify::SolverSelection::Z3)
+            .allow_parallel()
+            .outside_global_deadline(),
+    );
+    let graph = analyze_verification_dependency_graph(&[safe_a, safe_b]);
+    let schedule =
+        schedule_verification_obligations(&graph, VerificationSchedulingMode::DependencyBatches);
+    let plan = classify_verification_parallel_lanes(&schedule);
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+
+    let results = execute_verification_lane_plan(
+        &plan,
+        VerificationExecutionMode::Parallel { max_workers: 2 },
+        {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            move |obligation| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(now, Ordering::SeqCst);
+                if obligation.id.as_str() == "scene:slow" {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                obligation.id.as_str().to_owned()
+            }
+        },
+    );
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.output.as_str())
+            .collect::<Vec<_>>(),
+        vec!["scene:slow", "scene:fast"]
+    );
+    assert!(
+        max_active.load(Ordering::SeqCst) > 1,
+        "parallel-safe lane should execute with overlapping workers"
+    );
+}
+
+#[test]
+fn execute_verification_lanes_emits_scheduler_lifecycle_events() {
+    use abide::verify::{
+        analyze_verification_dependency_graph, classify_verification_parallel_lanes,
+        execute_verification_lane_plan_with_events, schedule_verification_obligations,
+        VerificationExecutionMode, VerificationObligation, VerificationObligationId,
+        VerificationObligationKind, VerificationObligationResultKind, VerificationSchedulerEvent,
+        VerificationSchedulerPolicy, VerificationSchedulingMode, VerifyTargetKind,
+    };
+
+    let safe = VerificationObligation::new(
+        VerificationObligationId::new(VerifyTargetKind::Scene, "evented"),
+        VerificationObligationKind::SceneBlock {
+            scene: "evented".to_owned(),
+        },
+        VerifyTargetKind::Scene,
+        "evented",
+        VerificationObligationResultKind::Scene,
+    )
+    .with_solver_policy(
+        VerificationSchedulerPolicy::new(abide::verify::SolverSelection::Z3)
+            .allow_parallel()
+            .outside_global_deadline(),
+    );
+    let graph = analyze_verification_dependency_graph(&[safe]);
+    let schedule =
+        schedule_verification_obligations(&graph, VerificationSchedulingMode::DependencyBatches);
+    let plan = classify_verification_parallel_lanes(&schedule);
+    let mut events = Vec::new();
+
+    let results = execute_verification_lane_plan_with_events(
+        &plan,
+        VerificationExecutionMode::Parallel { max_workers: 2 },
+        |event| events.push(event.clone()),
+        |obligation| obligation.id.as_str().to_owned(),
+    );
+
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        &events[0],
+        VerificationSchedulerEvent::LaneStarted { step_index: 0, .. }
+    ));
+    assert!(matches!(
+        &events[1],
+        VerificationSchedulerEvent::ObligationStarted { obligation_id, .. }
+            if obligation_id.as_str() == "scene:evented"
+    ));
+    assert!(matches!(
+        &events[2],
+        VerificationSchedulerEvent::ObligationCompleted { obligation_id, .. }
+            if obligation_id.as_str() == "scene:evented"
+    ));
+    assert!(matches!(
+        &events[3],
+        VerificationSchedulerEvent::LaneCompleted { step_index: 0, .. }
+    ));
+}
+
+#[test]
+fn verify_files_with_events_streams_results_before_returning_final_vector() {
+    use std::io::Write;
+
+    use abide::verify::{VerificationResult, VerificationStreamEvent, VerifyConfig};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("streaming.ab");
+    let mut f = std::fs::File::create(&file).expect("create");
+    f.write_all(
+        br"module Streaming
+
+fn zero(): int
+  ensures result == 0
+{
+  0
+}
+",
+    )
+    .expect("write");
+    drop(f);
+
+    let mut events = Vec::new();
+    let verified = abide::driver::verify_files_with_events(
+        std::slice::from_ref(&file),
+        &VerifyConfig::default(),
+        |event| events.push(event.clone()),
+    )
+    .expect("verify");
+
+    assert_eq!(verified.results.len(), 1);
+    assert!(matches!(
+        &verified.results[0],
+        VerificationResult::FnContractProved { name, .. } if name == "zero"
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        VerificationStreamEvent::ResultReady { result }
+            if matches!(result, VerificationResult::FnContractProved { name, .. } if name == "zero")
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(VerificationStreamEvent::RunCompleted { result_count: 1 })
+    ));
+}
+
 /// Load and elaborate via the multi-file loader (handles include/use).
 fn load_and_elaborate_files(paths: &[&str]) -> elab::types::ElabResult {
     let path_bufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
@@ -2068,6 +2654,72 @@ fn cli_verify_success_only_renders_plain_text() {
 }
 
 #[test]
+fn cli_verify_rejects_removed_progress_flag() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .args(["verify", "--progress", "tests/fixtures/workflow.ab"])
+        .output()
+        .expect("failed to run abide verify --progress");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected --progress to be rejected: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("unexpected argument '--progress'")
+            || stderr.contains("unrecognized option '--progress'"),
+        "stderr should reject --progress as a removed flag: {stderr}"
+    );
+}
+
+#[test]
+fn cli_verify_stream_prints_completed_result() {
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let spec_path = tmp.path().join("stream.ab");
+    std::fs::write(
+        &spec_path,
+        r"module StreamingCli
+
+fn zero(): int
+  ensures result == 0
+{
+  0
+}
+",
+    )
+    .expect("write spec");
+
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "--stream",
+            spec_path.to_str().expect("utf-8 temp path"),
+        ])
+        .output()
+        .expect("failed to run abide verify --stream");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected --stream verify to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("PROVED: fn zero"),
+        "streaming output should include completed function verdict: {stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "streaming success should not emit progress markers on stderr: {stderr}"
+    );
+}
+
+#[test]
 fn cli_verify_checked_output_names_trace_prefix_contract() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let output = std::process::Command::new(binary)
@@ -2224,6 +2876,91 @@ fn cli_verify_trace_artifact_uses_shortest_bounded_counterexample() {
             .pointer("/artifacts/0/normalized_trace/frames/0/transition_to_next/label")
             .and_then(serde_json::Value::as_str),
         Some("Flags::fail_one")
+    );
+}
+
+#[test]
+fn cli_verify_stream_preserves_report_and_trace_artifact_outputs() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifact_path = dir.path().join("stream.trace.json");
+    let report_path = dir.path().join("shortest_counterexample.report.json");
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "tests/fixtures/shortest_counterexample.ab",
+            "--bounded-only",
+            "--stream",
+            "--trace-artifact",
+            artifact_path.to_str().expect("utf8 artifact path"),
+            "--report",
+            "json",
+            dir.path().to_str().expect("utf8 report dir"),
+        ])
+        .output()
+        .expect("failed to run streaming verification with artifacts");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected counterexample: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("COUNTEREXAMPLE: shortest_counterexample"),
+        "streaming failure should render the completed result: stderr={stderr}"
+    );
+    assert!(
+        report_path.exists(),
+        "streaming verify should still write report: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        artifact_path.exists(),
+        "streaming verify should still write trace artifact: stdout={stdout}, stderr={stderr}"
+    );
+
+    let report_json =
+        std::fs::read_to_string(&report_path).expect("should read streaming report JSON");
+    let report_value: serde_json::Value =
+        serde_json::from_str(&report_json).expect("streaming report should be valid JSON");
+    assert_eq!(
+        report_value
+            .pointer("/summary/result_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        report_value
+            .pointer("/summary/failure_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+
+    let artifact_json =
+        std::fs::read_to_string(&artifact_path).expect("should read streaming trace artifact JSON");
+    let artifact_value: serde_json::Value = serde_json::from_str(&artifact_json)
+        .expect("streaming trace artifact should be valid JSON");
+    assert!(
+        artifact_value
+            .pointer("/artifacts/0/normalized_trace/frames")
+            .and_then(serde_json::Value::as_array)
+            .is_some(),
+        "streaming trace artifact should include normalized frames: {artifact_json}"
+    );
+}
+
+#[test]
+fn docs_cli_verify_documents_stream_not_progress() {
+    let docs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli.md");
+    let docs = std::fs::read_to_string(&docs_path).expect("read CLI docs");
+
+    assert!(
+        docs.contains("--stream"),
+        "CLI docs should document verify --stream"
+    );
+    assert!(
+        !docs.contains("--progress"),
+        "CLI docs should not document removed --progress flag"
     );
 }
 

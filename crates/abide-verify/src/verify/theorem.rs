@@ -1106,10 +1106,6 @@ fn try_ic3_on_theorem(
         }
     }
 
-    if config.progress {
-        eprint!(" (trying IC3/PDR)");
-    }
-
     // Try IC3 on each show expression
     for (property_index, _) in safety.step_properties().iter().enumerate() {
         let timeout_ms = match clamp_timeout_to_deadline(config.ic3_timeout_ms, deadline) {

@@ -875,8 +875,6 @@ pub(super) fn check_scene_block(
         Err(result) => return *result,
     };
 
-    let elapsed = elapsed_ms(&start);
-
     match solver.check() {
         result @ SatResult::Sat => {
             let evidence = scene_pass_evidence(&SceneEvidenceCtx {
@@ -893,9 +891,11 @@ pub(super) fn check_scene_block(
                 bound: scope.bound,
             })
             .ok();
+            let elapsed = elapsed_ms(&start);
             scene_solver_result(scene, result, elapsed, evidence)
         }
         result @ (SatResult::Unsat | SatResult::Unknown(_)) => {
+            let elapsed = elapsed_ms(&start);
             scene_solver_result(scene, result, elapsed, None)
         }
     }
