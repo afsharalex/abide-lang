@@ -11639,6 +11639,33 @@ extern StripeGateway implements PaymentProcessor {
 }
 
 #[test]
+fn interface_extern_enum_command_return_conformance_succeeds() {
+    let src = r#"module T
+
+enum PaymentDecision = Approved | Declined
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> PaymentDecision
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> PaymentDecision
+
+  may authorize {
+    return @Approved
+    return @Declined
+  }
+}
+"#;
+    let result = elaborate_source(src);
+    assert_eq!(result.externs.len(), 1);
+    assert_eq!(
+        result.externs[0].implements.as_deref(),
+        Some("PaymentProcessor")
+    );
+}
+
+#[test]
 fn interface_extern_missing_required_command_is_rejected() {
     let src = r#"module T
 

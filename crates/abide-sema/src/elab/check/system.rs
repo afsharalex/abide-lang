@@ -647,6 +647,75 @@ fn implemented_queries_from_system(queries: &[EQuery]) -> Vec<ImplementedQuery> 
         .collect()
 }
 
+fn resolve_type_for_compatibility(env: &Env, ty: &Ty) -> Ty {
+    fn resolve(env: &Env, ty: &Ty, seen: &mut HashSet<String>) -> Ty {
+        match ty {
+            Ty::Named(name) => {
+                let canonical_name = env.aliases.get(name).unwrap_or(name);
+                if !seen.insert(canonical_name.clone()) {
+                    return ty.clone();
+                }
+                if let Some(resolved) = env.lookup_type(canonical_name) {
+                    resolve(env, resolved, seen)
+                } else if let Some(entity) = env.lookup_entity(canonical_name) {
+                    Ty::Entity(entity.name.clone())
+                } else {
+                    Ty::Named(canonical_name.clone())
+                }
+            }
+            Ty::Record(name, fields) => Ty::Record(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(field, field_ty)| (field.clone(), resolve(env, field_ty, seen)))
+                    .collect(),
+            ),
+            Ty::Alias(name, inner) => Ty::Alias(name.clone(), Box::new(resolve(env, inner, seen))),
+            Ty::Newtype(name, inner) => {
+                Ty::Newtype(name.clone(), Box::new(resolve(env, inner, seen)))
+            }
+            Ty::Param(name, args) => Ty::Param(
+                name.clone(),
+                args.iter().map(|arg| resolve(env, arg, seen)).collect(),
+            ),
+            Ty::Fn(arg, ret) => Ty::Fn(
+                Box::new(resolve(env, arg, seen)),
+                Box::new(resolve(env, ret, seen)),
+            ),
+            Ty::Set(inner) => Ty::Set(Box::new(resolve(env, inner, seen))),
+            Ty::Seq(inner) => Ty::Seq(Box::new(resolve(env, inner, seen))),
+            Ty::Map(key, value) => Ty::Map(
+                Box::new(resolve(env, key, seen)),
+                Box::new(resolve(env, value, seen)),
+            ),
+            Ty::Relation(columns) => Ty::Relation(
+                columns
+                    .iter()
+                    .map(|column| resolve(env, column, seen))
+                    .collect(),
+            ),
+            Ty::Tuple(elements) => Ty::Tuple(
+                elements
+                    .iter()
+                    .map(|element| resolve(env, element, seen))
+                    .collect(),
+            ),
+            Ty::Refinement(base, pred) => {
+                Ty::Refinement(Box::new(resolve(env, base, seen)), pred.clone())
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    resolve(env, ty, &mut HashSet::new())
+}
+
+fn types_compatible_in_env(env: &Env, implemented: &Ty, expected: &Ty) -> bool {
+    let implemented = resolve_type_for_compatibility(env, implemented);
+    let expected = resolve_type_for_compatibility(env, expected);
+    super::types_compatible(&implemented, &expected)
+}
+
 fn check_interface_conformance(
     env: &Env,
     target: InterfaceConformanceTarget<'_>,
@@ -701,7 +770,7 @@ fn check_interface_conformance(
                         .zip(iface_cmd.params.iter())
                         .enumerate()
                     {
-                        if format!("{:?}", implemented_param.1) != format!("{:?}", iface_param.1) {
+                        if !types_compatible_in_env(env, &implemented_param.1, &iface_param.1) {
                             errors.push(ElabError::with_span(
                                 ErrorKind::TypeMismatch,
                                 format!(
@@ -728,7 +797,7 @@ fn check_interface_conformance(
                     (Some(implemented_ret), Some(iface_ret))
                         if !matches!(implemented_ret, Ty::Error)
                             && !matches!(iface_ret, Ty::Error)
-                            && !super::types_compatible(implemented_ret, iface_ret) =>
+                            && !types_compatible_in_env(env, implemented_ret, iface_ret) =>
                     {
                         errors.push(ElabError::with_span(
                             ErrorKind::TypeMismatch,
@@ -835,7 +904,7 @@ fn check_interface_conformance(
                         .zip(iface_query.params.iter())
                         .enumerate()
                     {
-                        if format!("{:?}", implemented_param.1) != format!("{:?}", iface_param.1) {
+                        if !types_compatible_in_env(env, &implemented_param.1, &iface_param.1) {
                             errors.push(ElabError::with_span(
                                 ErrorKind::TypeMismatch,
                                 format!(
@@ -862,7 +931,7 @@ fn check_interface_conformance(
                 let iface_ret = &iface_query.return_type;
                 if !matches!(implemented_ret, Ty::Error)
                     && !matches!(iface_ret, Ty::Error)
-                    && !super::types_compatible(implemented_ret, iface_ret)
+                    && !types_compatible_in_env(env, implemented_ret, iface_ret)
                 {
                     errors.push(ElabError::with_span(
                         ErrorKind::TypeMismatch,
@@ -959,7 +1028,8 @@ pub(super) fn check_extern(env: &Env, ext: &EExtern) -> Vec<ElabError> {
             Some(return_ty) => {
                 for ret in &may.returns {
                     let ret_ty = ret.ty();
-                    if !matches!(ret_ty, Ty::Error) && !super::types_compatible(&ret_ty, return_ty)
+                    if !matches!(ret_ty, Ty::Error)
+                        && !types_compatible_in_env(env, &ret_ty, return_ty)
                     {
                         errors.push(ElabError::with_span(
                             ErrorKind::TypeMismatch,
@@ -1147,6 +1217,13 @@ mod tests {
         Ty::Builtin(BuiltinTy::Int)
     }
 
+    fn payment_decision_ty() -> Ty {
+        Ty::Enum(
+            "PaymentDecision".to_owned(),
+            vec!["Approved".to_owned(), "Declined".to_owned()],
+        )
+    }
+
     fn command(name: &str, return_type: Option<Ty>) -> ECommand {
         ECommand {
             name: name.to_owned(),
@@ -1170,6 +1247,10 @@ mod tests {
 
     fn lit_int(value: i64) -> EExpr {
         EExpr::Lit(ty_int(), Literal::Int(value), None)
+    }
+
+    fn enum_variant(ty: Ty, variant: &str) -> EExpr {
+        EExpr::Var(ty, variant.to_owned(), None)
     }
 
     fn env_with_interface(interface: EInterface) -> Env {
@@ -1228,6 +1309,38 @@ mod tests {
                 "extern `StripeGateway` command `authorize` returns `int` but interface `PaymentProcessor` requires `string`"
             )),
             "expected extern command return mismatch diagnostic, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_extern_accepts_named_enum_interface_command_return() {
+        let enum_ty = payment_decision_ty();
+        let interface = EInterface {
+            name: "PaymentProcessor".to_owned(),
+            commands: vec![command(
+                "authorize",
+                Some(Ty::Named("PaymentDecision".to_owned())),
+            )],
+            queries: vec![],
+            span: None,
+        };
+        let mut env = env_with_interface(interface);
+        env.types
+            .insert("PaymentDecision".to_owned(), enum_ty.clone());
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: Some("PaymentProcessor".to_owned()),
+            commands: vec![command("authorize", Some(enum_ty.clone()))],
+            mays: vec![may("authorize", enum_variant(enum_ty, "Approved"))],
+            assumes: vec![],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+
+        assert!(
+            errors.is_empty(),
+            "expected compatible enum return conformance, got: {errors:?}"
         );
     }
 
