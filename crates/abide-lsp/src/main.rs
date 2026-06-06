@@ -1414,6 +1414,47 @@ mod tests {
     }
 
     #[test]
+    fn lsp_completion_offers_interface_names_from_workspace_index() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let uri = Url::parse("file:///tmp/interface_completion.ab").expect("uri");
+        let source = "module InterfaceCompletion\n\n\
+             interface PaymentProcessor {\n\
+               command authorize(amount: int) -> string\n\
+             }\n\n\
+             system LocalGateway implements PaymentProcessor {\n\
+             }\n\n";
+        let file_id = state
+            .workspace
+            .set_file_source("/tmp/interface_completion.ab", source);
+        state.documents.insert(
+            uri.clone(),
+            OpenDocument {
+                file_id,
+                version: 1,
+            },
+        );
+
+        let completion_line = 8;
+        let completion_column = source
+            .lines()
+            .nth(completion_line)
+            .expect("completion line")
+            .len() as u32;
+        let items = completion_items_for_open_document(
+            &mut state,
+            &uri,
+            Position::new(completion_line as u32, completion_column),
+        )
+        .expect("completion items");
+        let labels = items.into_iter().map(|item| item.label).collect::<Vec<_>>();
+
+        assert!(
+            labels.contains(&"PaymentProcessor".to_owned()),
+            "interface completions should come from indexed declarations: {labels:#?}"
+        );
+    }
+
+    #[test]
     fn lsp_qa_run_command_uses_open_document_source() {
         let root = std::env::temp_dir().join(format!("abide-lsp-qa-run-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create temp root");

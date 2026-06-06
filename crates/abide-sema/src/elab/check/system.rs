@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use super::super::env::Env;
 use super::super::error::{ElabError, ErrorKind};
 use super::super::types::{
-    EEventAction, EExpr, EExtern, EExternAssume, EMatchScrutinee, EProcDepCond, ESystem, Ty,
+    ECommand, EEventAction, EExpr, EExtern, EExternAssume, EMatchScrutinee, EProcDepCond, EQuery,
+    ESystem, Ty,
 };
 use super::matches::{check_pattern_shape, resolve_to_enum_info};
 
@@ -98,224 +99,21 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
         }
     }
 
-    if let Some(interface_name) = &system.implements {
-        let Some(interface) = env.interfaces.get(interface_name) else {
-            let err = if let Some(span) = system.span {
-                ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    format!(
-                        "system {} implements unknown interface `{interface_name}`",
-                        system.name
-                    ),
-                    &sys_ctx,
-                    span,
-                )
-            } else {
-                ElabError::new(
-                    ErrorKind::UndefinedRef,
-                    format!(
-                        "system {} implements unknown interface `{interface_name}`",
-                        system.name
-                    ),
-                    &sys_ctx,
-                )
-            };
-            errors.push(err);
-            return errors;
-        };
-
-        for iface_cmd in &interface.commands {
-            match system
-                .commands
-                .iter()
-                .find(|cmd| cmd.name == iface_cmd.name)
-            {
-                Some(sys_cmd) => {
-                    if sys_cmd.params.len() != iface_cmd.params.len() {
-                        errors.push(ElabError::with_span(
-                            ErrorKind::ParamMismatch,
-                            format!(
-                                "system `{}` command `{}` has {} parameter(s), but interface `{}` requires {}",
-                                system.name,
-                                iface_cmd.name,
-                                sys_cmd.params.len(),
-                                interface.name,
-                                iface_cmd.params.len()
-                            ),
-                            &sys_ctx,
-                            sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                        ));
-                    } else {
-                        for (idx, (sys_param, iface_param)) in sys_cmd
-                            .params
-                            .iter()
-                            .zip(iface_cmd.params.iter())
-                            .enumerate()
-                        {
-                            if format!("{:?}", sys_param.1) != format!("{:?}", iface_param.1) {
-                                errors.push(ElabError::with_span(
-                                    ErrorKind::TypeMismatch,
-                                    format!(
-                                        "system `{}` command `{}` parameter {} has type `{}` but interface `{}` requires `{}`",
-                                        system.name,
-                                        iface_cmd.name,
-                                        idx + 1,
-                                        sys_param.1.name(),
-                                        interface.name,
-                                        iface_param.1.name()
-                                    ),
-                                    &sys_ctx,
-                                    sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                                ));
-                            }
-                        }
-                    }
-                    match (&sys_cmd.return_type, &iface_cmd.return_type) {
-                        (Some(sys_ret), Some(iface_ret))
-                            if !matches!(sys_ret, Ty::Error)
-                                && !matches!(iface_ret, Ty::Error)
-                                && !super::types_compatible(sys_ret, iface_ret) =>
-                        {
-                            errors.push(ElabError::with_span(
-                                ErrorKind::TypeMismatch,
-                                format!(
-                                    "system `{}` command `{}` returns `{}` but interface `{}` requires `{}`",
-                                    system.name,
-                                    iface_cmd.name,
-                                    sys_ret.name(),
-                                    interface.name,
-                                    iface_ret.name()
-                                ),
-                                &sys_ctx,
-                                sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                            ));
-                        }
-                        (None, Some(iface_ret)) => {
-                            errors.push(ElabError::with_span(
-                                ErrorKind::TypeMismatch,
-                                format!(
-                                    "system `{}` command `{}` has no return type but interface `{}` requires `{}`",
-                                    system.name,
-                                    iface_cmd.name,
-                                    interface.name,
-                                    iface_ret.name()
-                                ),
-                                &sys_ctx,
-                                sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                            ));
-                        }
-                        (Some(sys_ret), None) if !matches!(sys_ret, Ty::Error) => {
-                            errors.push(ElabError::with_span(
-                                ErrorKind::TypeMismatch,
-                                format!(
-                                    "system `{}` command `{}` returns `{}` but interface `{}` declares no return value",
-                                    system.name,
-                                    iface_cmd.name,
-                                    sys_ret.name(),
-                                    interface.name
-                                ),
-                                &sys_ctx,
-                                sys_cmd.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                None => {
-                    errors.push(ElabError::with_span(
-                        ErrorKind::UndefinedRef,
-                        format!(
-                            "system `{}` is missing command `{}` required by interface `{}`",
-                            system.name, iface_cmd.name, interface.name
-                        ),
-                        &sys_ctx,
-                        system
-                            .span
-                            .unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                    ));
-                }
-            }
-        }
-
-        for iface_query in &interface.queries {
-            match system.queries.iter().find(|q| q.name == iface_query.name) {
-                Some(sys_query) => {
-                    if sys_query.params.len() != iface_query.params.len() {
-                        errors.push(ElabError::with_span(
-                            ErrorKind::ParamMismatch,
-                            format!(
-                                "system `{}` query `{}` has {} parameter(s), but interface `{}` requires {}",
-                                system.name,
-                                iface_query.name,
-                                sys_query.params.len(),
-                                interface.name,
-                                iface_query.params.len()
-                            ),
-                            &sys_ctx,
-                            sys_query.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                        ));
-                    } else {
-                        for (idx, (sys_param, iface_param)) in sys_query
-                            .params
-                            .iter()
-                            .zip(iface_query.params.iter())
-                            .enumerate()
-                        {
-                            if format!("{:?}", sys_param.1) != format!("{:?}", iface_param.1) {
-                                errors.push(ElabError::with_span(
-                                    ErrorKind::TypeMismatch,
-                                    format!(
-                                        "system `{}` query `{}` parameter {} has type `{}` but interface `{}` requires `{}`",
-                                        system.name,
-                                        iface_query.name,
-                                        idx + 1,
-                                        sys_param.1.name(),
-                                        interface.name,
-                                        iface_param.1.name()
-                                    ),
-                                    &sys_ctx,
-                                    sys_query.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                                ));
-                            }
-                        }
-                    }
-
-                    let sys_ret = sys_query.body.ty();
-                    let iface_ret = &iface_query.return_type;
-                    if !matches!(&sys_ret, Ty::Error)
-                        && !matches!(iface_ret, Ty::Error)
-                        && !super::types_compatible(&sys_ret, iface_ret)
-                    {
-                        errors.push(ElabError::with_span(
-                            ErrorKind::TypeMismatch,
-                            format!(
-                                "system `{}` query `{}` returns `{}` but interface `{}` requires `{}`",
-                                system.name,
-                                iface_query.name,
-                                sys_ret.name(),
-                                interface.name,
-                                iface_ret.name()
-                            ),
-                            &sys_ctx,
-                            sys_query.span.or(system.span).unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                        ));
-                    }
-                }
-                None => {
-                    errors.push(ElabError::with_span(
-                        ErrorKind::UndefinedRef,
-                        format!(
-                            "system `{}` is missing query `{}` required by interface `{}`",
-                            system.name, iface_query.name, interface.name
-                        ),
-                        &sys_ctx,
-                        system
-                            .span
-                            .unwrap_or(crate::span::Span { start: 0, end: 0 }),
-                    ));
-                }
-            }
-        }
+    let system_queries = implemented_queries_from_system(&system.queries);
+    if !check_interface_conformance(
+        env,
+        InterfaceConformanceTarget {
+            decl_kind: "system",
+            decl_name: &system.name,
+            implements: system.implements.as_deref(),
+            commands: &system.commands,
+            queries: &system_queries,
+            ctx: &sys_ctx,
+            fallback_span: system.span,
+        },
+        &mut errors,
+    ) {
+        return errors;
     }
 
     for step in &system.actions {
@@ -820,9 +618,309 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     errors
 }
 
-pub(super) fn check_extern(_env: &Env, ext: &EExtern) -> Vec<ElabError> {
+struct ImplementedQuery {
+    name: String,
+    params: Vec<(String, Ty)>,
+    return_type: Ty,
+    span: Option<crate::span::Span>,
+}
+
+struct InterfaceConformanceTarget<'a> {
+    decl_kind: &'a str,
+    decl_name: &'a str,
+    implements: Option<&'a str>,
+    commands: &'a [ECommand],
+    queries: &'a [ImplementedQuery],
+    ctx: &'a str,
+    fallback_span: Option<crate::span::Span>,
+}
+
+fn implemented_queries_from_system(queries: &[EQuery]) -> Vec<ImplementedQuery> {
+    queries
+        .iter()
+        .map(|query| ImplementedQuery {
+            name: query.name.clone(),
+            params: query.params.clone(),
+            return_type: query.body.ty(),
+            span: query.span,
+        })
+        .collect()
+}
+
+fn check_interface_conformance(
+    env: &Env,
+    target: InterfaceConformanceTarget<'_>,
+    errors: &mut Vec<ElabError>,
+) -> bool {
+    let Some(interface_name) = target.implements else {
+        return true;
+    };
+    let Some(interface) = env.interfaces.get(interface_name) else {
+        let message = format!(
+            "{} {} implements unknown interface `{interface_name}`",
+            target.decl_kind, target.decl_name
+        );
+        let err = if let Some(span) = target.fallback_span {
+            ElabError::with_span(ErrorKind::UndefinedRef, message, target.ctx, span)
+        } else {
+            ElabError::new(ErrorKind::UndefinedRef, message, target.ctx)
+        };
+        errors.push(err);
+        return false;
+    };
+
+    for iface_cmd in &interface.commands {
+        match target
+            .commands
+            .iter()
+            .find(|cmd| cmd.name == iface_cmd.name)
+        {
+            Some(implemented_cmd) => {
+                if implemented_cmd.params.len() != iface_cmd.params.len() {
+                    errors.push(ElabError::with_span(
+                        ErrorKind::ParamMismatch,
+                        format!(
+                            "{} `{}` command `{}` has {} parameter(s), but interface `{}` requires {}",
+                            target.decl_kind,
+                            target.decl_name,
+                            iface_cmd.name,
+                            implemented_cmd.params.len(),
+                            interface.name,
+                            iface_cmd.params.len()
+                        ),
+                        target.ctx,
+                        implemented_cmd
+                            .span
+                            .or(target.fallback_span)
+                            .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                    ));
+                } else {
+                    for (idx, (implemented_param, iface_param)) in implemented_cmd
+                        .params
+                        .iter()
+                        .zip(iface_cmd.params.iter())
+                        .enumerate()
+                    {
+                        if format!("{:?}", implemented_param.1) != format!("{:?}", iface_param.1) {
+                            errors.push(ElabError::with_span(
+                                ErrorKind::TypeMismatch,
+                                format!(
+                                    "{} `{}` command `{}` parameter {} has type `{}` but interface `{}` requires `{}`",
+                                    target.decl_kind,
+                                    target.decl_name,
+                                    iface_cmd.name,
+                                    idx + 1,
+                                    implemented_param.1.name(),
+                                    interface.name,
+                                    iface_param.1.name()
+                                ),
+                                target.ctx,
+                                implemented_cmd
+                                    .span
+                                    .or(target.fallback_span)
+                                    .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                            ));
+                        }
+                    }
+                }
+
+                match (&implemented_cmd.return_type, &iface_cmd.return_type) {
+                    (Some(implemented_ret), Some(iface_ret))
+                        if !matches!(implemented_ret, Ty::Error)
+                            && !matches!(iface_ret, Ty::Error)
+                            && !super::types_compatible(implemented_ret, iface_ret) =>
+                    {
+                        errors.push(ElabError::with_span(
+                            ErrorKind::TypeMismatch,
+                            format!(
+                                "{} `{}` command `{}` returns `{}` but interface `{}` requires `{}`",
+                                target.decl_kind,
+                                target.decl_name,
+                                iface_cmd.name,
+                                implemented_ret.name(),
+                                interface.name,
+                                iface_ret.name()
+                            ),
+                            target.ctx,
+                            implemented_cmd
+                                .span
+                                .or(target.fallback_span)
+                                .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                        ));
+                    }
+                    (None, Some(iface_ret)) => {
+                        errors.push(ElabError::with_span(
+                            ErrorKind::TypeMismatch,
+                            format!(
+                                "{} `{}` command `{}` has no return type but interface `{}` requires `{}`",
+                                target.decl_kind,
+                                target.decl_name,
+                                iface_cmd.name,
+                                interface.name,
+                                iface_ret.name()
+                            ),
+                            target.ctx,
+                            implemented_cmd
+                                .span
+                                .or(target.fallback_span)
+                                .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                        ));
+                    }
+                    (Some(implemented_ret), None) if !matches!(implemented_ret, Ty::Error) => {
+                        errors.push(ElabError::with_span(
+                            ErrorKind::TypeMismatch,
+                            format!(
+                                "{} `{}` command `{}` returns `{}` but interface `{}` declares no return value",
+                                target.decl_kind,
+                                target.decl_name,
+                                iface_cmd.name,
+                                implemented_ret.name(),
+                                interface.name
+                            ),
+                            target.ctx,
+                            implemented_cmd
+                                .span
+                                .or(target.fallback_span)
+                                .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                errors.push(ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!(
+                        "{} `{}` is missing command `{}` required by interface `{}`",
+                        target.decl_kind, target.decl_name, iface_cmd.name, interface.name
+                    ),
+                    target.ctx,
+                    target
+                        .fallback_span
+                        .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                ));
+            }
+        }
+    }
+
+    for iface_query in &interface.queries {
+        match target
+            .queries
+            .iter()
+            .find(|query| query.name == iface_query.name)
+        {
+            Some(implemented_query) => {
+                if implemented_query.params.len() != iface_query.params.len() {
+                    errors.push(ElabError::with_span(
+                        ErrorKind::ParamMismatch,
+                        format!(
+                            "{} `{}` query `{}` has {} parameter(s), but interface `{}` requires {}",
+                            target.decl_kind,
+                            target.decl_name,
+                            iface_query.name,
+                            implemented_query.params.len(),
+                            interface.name,
+                            iface_query.params.len()
+                        ),
+                        target.ctx,
+                        implemented_query
+                            .span
+                            .or(target.fallback_span)
+                            .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                    ));
+                } else {
+                    for (idx, (implemented_param, iface_param)) in implemented_query
+                        .params
+                        .iter()
+                        .zip(iface_query.params.iter())
+                        .enumerate()
+                    {
+                        if format!("{:?}", implemented_param.1) != format!("{:?}", iface_param.1) {
+                            errors.push(ElabError::with_span(
+                                ErrorKind::TypeMismatch,
+                                format!(
+                                    "{} `{}` query `{}` parameter {} has type `{}` but interface `{}` requires `{}`",
+                                    target.decl_kind,
+                                    target.decl_name,
+                                    iface_query.name,
+                                    idx + 1,
+                                    implemented_param.1.name(),
+                                    interface.name,
+                                    iface_param.1.name()
+                                ),
+                                target.ctx,
+                                implemented_query
+                                    .span
+                                    .or(target.fallback_span)
+                                    .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                            ));
+                        }
+                    }
+                }
+
+                let implemented_ret = &implemented_query.return_type;
+                let iface_ret = &iface_query.return_type;
+                if !matches!(implemented_ret, Ty::Error)
+                    && !matches!(iface_ret, Ty::Error)
+                    && !super::types_compatible(implemented_ret, iface_ret)
+                {
+                    errors.push(ElabError::with_span(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "{} `{}` query `{}` returns `{}` but interface `{}` requires `{}`",
+                            target.decl_kind,
+                            target.decl_name,
+                            iface_query.name,
+                            implemented_ret.name(),
+                            interface.name,
+                            iface_ret.name()
+                        ),
+                        target.ctx,
+                        implemented_query
+                            .span
+                            .or(target.fallback_span)
+                            .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                    ));
+                }
+            }
+            None => {
+                errors.push(ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!(
+                        "{} `{}` is missing query `{}` required by interface `{}`",
+                        target.decl_kind, target.decl_name, iface_query.name, interface.name
+                    ),
+                    target.ctx,
+                    target
+                        .fallback_span
+                        .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                ));
+            }
+        }
+    }
+
+    true
+}
+
+pub(super) fn check_extern(env: &Env, ext: &EExtern) -> Vec<ElabError> {
     let mut errors = Vec::new();
     let ext_ctx = format!("extern {}", ext.name);
+
+    if !check_interface_conformance(
+        env,
+        InterfaceConformanceTarget {
+            decl_kind: "extern",
+            decl_name: &ext.name,
+            implements: ext.implements.as_deref(),
+            commands: &ext.commands,
+            queries: &[],
+            ctx: &ext_ctx,
+            fallback_span: ext.span,
+        },
+        &mut errors,
+    ) {
+        return errors;
+    }
 
     let command_map: HashMap<&str, _> = ext.commands.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut seen_may: HashSet<&str> = HashSet::new();
@@ -1033,6 +1131,133 @@ fn validate_crosscalls_in_actions(
             | EEventAction::Apply(_, _, _, _)
             | EEventAction::Expr(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::types::{BuiltinTy, ECommand, EInterface, EMay, EQuerySig, Literal};
+    use super::*;
+
+    fn ty_string() -> Ty {
+        Ty::Builtin(BuiltinTy::String)
+    }
+
+    fn ty_int() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn command(name: &str, return_type: Option<Ty>) -> ECommand {
+        ECommand {
+            name: name.to_owned(),
+            params: vec![("amount".to_owned(), ty_int())],
+            return_type,
+            span: None,
+        }
+    }
+
+    fn may(name: &str, literal: EExpr) -> EMay {
+        EMay {
+            command: name.to_owned(),
+            returns: vec![literal],
+            span: None,
+        }
+    }
+
+    fn lit_string(value: &str) -> EExpr {
+        EExpr::Lit(ty_string(), Literal::Str(value.to_owned()), None)
+    }
+
+    fn lit_int(value: i64) -> EExpr {
+        EExpr::Lit(ty_int(), Literal::Int(value), None)
+    }
+
+    fn env_with_interface(interface: EInterface) -> Env {
+        let mut env = Env::new();
+        env.interfaces.insert(interface.name.clone(), interface);
+        env
+    }
+
+    fn payment_interface() -> EInterface {
+        EInterface {
+            name: "PaymentProcessor".to_owned(),
+            commands: vec![command("authorize", Some(ty_string()))],
+            queries: vec![],
+            span: None,
+        }
+    }
+
+    #[test]
+    fn check_extern_rejects_missing_interface_command() {
+        let env = env_with_interface(payment_interface());
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: Some("PaymentProcessor".to_owned()),
+            commands: vec![command("capture", Some(ty_string()))],
+            mays: vec![may("capture", lit_string("ok"))],
+            assumes: vec![],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+
+        assert!(
+            errors.iter().any(|error| error.message.contains(
+                "extern `StripeGateway` is missing command `authorize` required by interface `PaymentProcessor`"
+            )),
+            "expected missing extern command diagnostic, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_extern_rejects_interface_command_return_mismatch() {
+        let env = env_with_interface(payment_interface());
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: Some("PaymentProcessor".to_owned()),
+            commands: vec![command("authorize", Some(ty_int()))],
+            mays: vec![may("authorize", lit_int(1))],
+            assumes: vec![],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+
+        assert!(
+            errors.iter().any(|error| error.message.contains(
+                "extern `StripeGateway` command `authorize` returns `int` but interface `PaymentProcessor` requires `string`"
+            )),
+            "expected extern command return mismatch diagnostic, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn check_extern_rejects_missing_interface_query() {
+        let mut interface = payment_interface();
+        interface.queries.push(EQuerySig {
+            name: "settlement_count".to_owned(),
+            params: vec![],
+            return_type: ty_int(),
+            span: None,
+        });
+        let env = env_with_interface(interface);
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: Some("PaymentProcessor".to_owned()),
+            commands: vec![command("authorize", Some(ty_string()))],
+            mays: vec![may("authorize", lit_string("ok"))],
+            assumes: vec![],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+
+        assert!(
+            errors.iter().any(|error| error.message.contains(
+                "extern `StripeGateway` is missing query `settlement_count` required by interface `PaymentProcessor`"
+            )),
+            "expected missing extern query diagnostic, got: {errors:?}"
+        );
     }
 }
 

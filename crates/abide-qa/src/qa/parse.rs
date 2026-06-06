@@ -736,6 +736,7 @@ fn parse_query(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseErro
         "entities" => Ok(Query::Entities),
         "systems" => Ok(Query::Systems),
         "types" => Ok(Query::Types),
+        "interfaces" => Ok(Query::Interfaces),
 
         // Entity field queries: subcommand E.field [args...]
         "reachable" => parse_reachable(&tokens[1..], line),
@@ -798,8 +799,9 @@ fn parse_query(tokens: &[QAToken<'_>], line: usize) -> Result<Query, QAParseErro
         other => Err(expected_error(
             format!(
                 "unknown query type '{other}'. Expected: reachable, path, terminal, initial, \
-                 cycles, transitions, entities, systems, types, invariants, contracts, \
-                 events, match-coverage, cross-calls, updates, deadlock, always, eventually, not"
+                 cycles, transitions, entities, systems, types, interfaces, invariants, \
+                 contracts, events, match-coverage, cross-calls, updates, deadlock, always, \
+                 eventually, not"
             ),
             line,
             tokens[0].span,
@@ -1419,6 +1421,12 @@ mod tests {
     fn parse_ask_types() {
         let stmts = parse_qa("ask types").unwrap();
         assert_eq!(stmts[0], QAStatement::Ask(Query::Types));
+    }
+
+    #[test]
+    fn parse_ask_interfaces() {
+        let stmts = parse_qa("ask interfaces").unwrap();
+        assert_eq!(stmts[0], QAStatement::Ask(Query::Interfaces));
     }
 
     #[test]

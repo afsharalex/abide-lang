@@ -4381,6 +4381,7 @@ mod tests {
 
     fn empty_ir() -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -4672,6 +4673,7 @@ mod tests {
             ],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![IRTypeEntry {
                 name: "Decision".to_owned(),
                 ty: decision_ty.clone(),
@@ -4739,6 +4741,7 @@ mod tests {
             ],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![IRTypeEntry {
                 name: "Decision".to_owned(),
                 ty: decision_ty.clone(),
@@ -5049,6 +5052,7 @@ mod tests {
     fn encode_prop_expr_covers_entity_quantifier_branches() {
         let entity = make_order_entity();
         let ir = IRProgram {
+            interfaces: vec![],
             entities: vec![entity.clone()],
             ..empty_ir()
         };
@@ -5276,6 +5280,7 @@ mod tests {
             },
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![outcome_ty.clone()],
             ..empty_ir()
         };
@@ -6238,6 +6243,7 @@ mod tests {
     fn encode_card_counts_distinct_entity_projection_values() {
         let entity = make_order_entity();
         let ir = IRProgram {
+            interfaces: vec![],
             entities: vec![entity.clone()],
             ..empty_ir()
         };
@@ -6381,6 +6387,7 @@ mod tests {
     fn encode_prop_expr_with_ctx_supports_store_sourced_projected_setcomp_values() {
         let entity = make_order_entity();
         let ir = IRProgram {
+            interfaces: vec![],
             entities: vec![entity.clone()],
             ..empty_ir()
         };
@@ -6513,6 +6520,7 @@ mod tests {
     fn encode_prop_expr_respects_store_scoped_entity_quantifiers() {
         let entity = make_order_entity();
         let ir = IRProgram {
+            interfaces: vec![],
             entities: vec![entity.clone()],
             ..empty_ir()
         };
@@ -6768,6 +6776,7 @@ mod tests {
     #[test]
     fn encode_prop_expr_covers_non_entity_quantifier_branches() {
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![crate::ir::types::IRTypeEntry {
                 name: "Status".to_owned(),
                 ty: IRType::Enum {

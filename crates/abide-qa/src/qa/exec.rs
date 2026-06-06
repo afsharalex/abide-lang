@@ -22,7 +22,7 @@ use super::ast::{
     BlockArg, BlockPredicate, QAStatement, Query, TemporalBounds, TemporalOp, TemporalTarget,
 };
 use super::graph;
-use super::model::{FlowModel, OwnerKind, StateGraph, TransitionEdge};
+use super::model::{FlowModel, InterfaceImplementorKind, OwnerKind, StateGraph, TransitionEdge};
 
 /// Result of executing a QA query.
 ///
@@ -216,6 +216,7 @@ fn execute_query_core_with_env(model: &FlowModel, env: Option<&Env>, query: &Que
         Query::Entities => QueryResult::NameList(model.entity_names.clone()),
         Query::Systems => QueryResult::NameList(model.systems.keys().cloned().collect()),
         Query::Types => QueryResult::NameList(model.type_names.clone()),
+        Query::Interfaces => execute_interfaces_query(model),
         Query::Invariants { entity } => execute_invariants_query(model, entity),
         Query::Contracts { entity, action } => execute_contracts_query(model, entity, action),
         Query::Events { entity, field } => execute_events_query(model, entity, field),
@@ -245,6 +246,50 @@ fn execute_query_core_with_env(model: &FlowModel, env: Option<&Env>, query: &Que
             predicates,
             select,
         } => execute_block(model, bindings, predicates, select),
+    }
+}
+
+fn execute_interfaces_query(model: &FlowModel) -> QueryResult {
+    let mut rows = Vec::new();
+    let mut interfaces: Vec<_> = model.interfaces.values().collect();
+    interfaces.sort_by(|left, right| left.name.cmp(&right.name));
+
+    for interface in interfaces {
+        if interface.implementors.is_empty() {
+            rows.push(vec![interface.name.clone(), String::new(), String::new()]);
+            continue;
+        }
+
+        let mut implementors = interface.implementors.iter().collect::<Vec<_>>();
+        implementors.sort_by(|left, right| {
+            left.name.cmp(&right.name).then_with(|| {
+                interface_implementor_kind_label(left.kind)
+                    .cmp(interface_implementor_kind_label(right.kind))
+            })
+        });
+        for implementor in implementors {
+            rows.push(vec![
+                interface.name.clone(),
+                implementor.name.clone(),
+                interface_implementor_kind_label(implementor.kind).to_owned(),
+            ]);
+        }
+    }
+
+    QueryResult::Table {
+        columns: vec![
+            "interface".to_owned(),
+            "implementor".to_owned(),
+            "kind".to_owned(),
+        ],
+        rows,
+    }
+}
+
+fn interface_implementor_kind_label(kind: InterfaceImplementorKind) -> &'static str {
+    match kind {
+        InterfaceImplementorKind::System => "system",
+        InterfaceImplementorKind::Extern => "extern",
     }
 }
 
@@ -3161,6 +3206,25 @@ mod tests {
                 ],
             },
         );
+        let mut interfaces = HashMap::new();
+        interfaces.insert(
+            "PaymentProcessor".to_owned(),
+            InterfaceInfo {
+                name: "PaymentProcessor".to_owned(),
+                commands: vec!["authorize".to_owned()],
+                queries: vec![],
+                implementors: vec![
+                    InterfaceImplementorInfo {
+                        name: "LocalGateway".to_owned(),
+                        kind: InterfaceImplementorKind::System,
+                    },
+                    InterfaceImplementorInfo {
+                        name: "StripeGateway".to_owned(),
+                        kind: InterfaceImplementorKind::Extern,
+                    },
+                ],
+            },
+        );
         FlowModel {
             state_graphs,
             field_graph_meta,
@@ -3168,6 +3232,7 @@ mod tests {
             entity_names: vec!["Order".to_owned()],
             system_names: vec!["Commerce".to_owned()],
             type_names: vec!["OrderStatus".to_owned()],
+            interfaces,
             action_contracts: std::collections::HashMap::new(),
             fsm_decls: std::collections::HashMap::new(),
         }
@@ -3230,6 +3295,7 @@ mod tests {
             entity_names: vec!["Order".to_owned()],
             system_names: Vec::new(),
             type_names: vec!["OrderStatus".to_owned()],
+            interfaces: HashMap::new(),
             action_contracts: HashMap::new(),
             fsm_decls: HashMap::new(),
         }
@@ -3274,6 +3340,7 @@ mod tests {
             entity_names: vec!["Workflow".to_owned()],
             system_names: Vec::new(),
             type_names: vec!["WorkflowMode".to_owned()],
+            interfaces: HashMap::new(),
             action_contracts: HashMap::new(),
             fsm_decls: HashMap::new(),
         }
@@ -3445,6 +3512,29 @@ mod tests {
         let m = commerce_model();
         match execute_query(&m, &Query::Systems) {
             QueryResult::NameList(n) => assert!(n.contains(&"Commerce".to_owned())),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_interfaces_lists_implementors() {
+        let m = commerce_model();
+        match execute_query(&m, &Query::Interfaces) {
+            QueryResult::Table { columns, rows } => {
+                assert_eq!(columns, vec!["interface", "implementor", "kind"]);
+                assert!(rows.iter().any(|row| row
+                    == &vec![
+                        "PaymentProcessor".to_owned(),
+                        "LocalGateway".to_owned(),
+                        "system".to_owned(),
+                    ]));
+                assert!(rows.iter().any(|row| row
+                    == &vec![
+                        "PaymentProcessor".to_owned(),
+                        "StripeGateway".to_owned(),
+                        "extern".to_owned(),
+                    ]));
+            }
             other => panic!("got {other:?}"),
         }
     }

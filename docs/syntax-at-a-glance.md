@@ -133,6 +133,47 @@ system to a declared `extern`, but they do not import names, instantiate runtime
 objects, or add verifier assumptions by themselves. Extern behavior comes from
 the extern block's `may` clauses and from actual calls that appear in commands.
 
+## Interfaces and Extern Boundaries
+
+```abide
+interface PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+
+  may authorize {
+    return "approved"
+    return "declined"
+  }
+}
+
+system Checkout(orders: Store<Order>) {
+  dep StripeGateway
+
+  command checkout(order_id: identity) {
+    choose o: Order where o.id == order_id {
+      StripeGateway::authorize(o.id, o.total)
+    }
+  }
+}
+```
+
+Interfaces are contract metadata over concrete systems and externs. They do not
+create runtime stores, schedule events, or introduce a verifier target by
+themselves. A `system ... implements Interface` or
+`extern ... implements Interface` declaration must provide the command and query
+surface declared by the interface; a missing command or query is a conformance
+error, and command return types must match.
+
+Use the concrete system or extern name when behavior matters. System commands
+call extern commands through an explicit `dep`, and temporal observations use
+the concrete boundary event, for example `saw StripeGateway::authorize(_, _)`.
+Tooling also exposes interface metadata: `ask interfaces` in QA lists interface
+declarations and their system or extern implementors, and editor completions can
+offer declared interface names.
+
 ## Scenes
 
 ```abide

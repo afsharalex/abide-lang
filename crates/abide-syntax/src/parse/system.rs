@@ -93,6 +93,13 @@ impl Parser {
     pub(super) fn extern_decl(&mut self) -> Result<ExternDecl, ParseError> {
         let start = self.expect(&Token::Extern)?;
         let (name, _) = self.expect_name()?;
+        let implements = if self.eat(&Token::Implements).is_some() {
+            let (iface, _) = self.expect_name()?;
+            Some(iface)
+        } else {
+            None
+        };
+
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
         while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
@@ -110,6 +117,7 @@ impl Parser {
         let end = self.expect(&Token::RBrace)?;
         Ok(ExternDecl {
             name,
+            implements,
             items,
             span: start.merge(end),
         })

@@ -334,6 +334,8 @@ pub struct EInterface {
 #[derive(Debug, Clone)]
 pub struct EExtern {
     pub name: String,
+    /// Optional interface contract this boundary claims to satisfy.
+    pub implements: Option<String>,
     pub commands: Vec<ECommand>,
     pub mays: Vec<EMay>,
     pub assumes: Vec<EExternAssume>,

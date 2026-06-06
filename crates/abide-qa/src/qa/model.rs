@@ -20,6 +20,8 @@ pub struct FlowModel {
     pub system_names: Vec<String>,
     /// Type names.
     pub type_names: Vec<String>,
+    /// Interface declarations and their concrete implementors.
+    pub interfaces: HashMap<String, InterfaceInfo>,
     /// Action contracts per entity.
     /// Key: `(entity_name, action_name)`
     pub action_contracts: HashMap<(String, String), ActionContract>,
@@ -29,6 +31,32 @@ pub struct FlowModel {
     /// graph) so QA queries can distinguish "what the user declared"
     /// from "what actions actually drive."
     pub fsm_decls: HashMap<(String, String), FsmInfo>,
+}
+
+/// Structural information about an interface declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceInfo {
+    pub name: String,
+    /// Command signatures declared by the interface.
+    pub commands: Vec<String>,
+    /// Query signatures declared by the interface.
+    pub queries: Vec<String>,
+    /// Concrete systems and externs that implement the interface.
+    pub implementors: Vec<InterfaceImplementorInfo>,
+}
+
+/// Concrete declaration that implements an interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceImplementorInfo {
+    pub name: String,
+    pub kind: InterfaceImplementorKind,
+}
+
+/// Kind of concrete declaration that implements an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceImplementorKind {
+    System,
+    Extern,
 }
 
 /// What kind of declaration owns a graph-addressable field.

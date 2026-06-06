@@ -2441,6 +2441,7 @@ mod tests {
 
     fn empty_ir() -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

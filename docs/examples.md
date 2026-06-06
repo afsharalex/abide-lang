@@ -183,6 +183,39 @@ Highlights:
 - liveness/fairness in bounded verification
 - extern `dep` declarations and disclosed extern assumptions
 
+## Interface and extern contract boundaries
+
+See: [`examples/external_payment_provider.ab`](../examples/external_payment_provider.ab)
+
+Highlights:
+- `interface` declarations as contract metadata over concrete systems and externs
+- `extern StripeGateway implements PaymentProcessor`
+- extern `may` blocks describing allowed command results
+- concrete extern calls authorized by `dep`
+- `saw StripeGateway::authorize(...)` in a scene to observe the boundary call
+- `ask interfaces` in QA to list interface declarations and implementors
+
+```abide
+interface PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+
+  may authorize {
+    return "approved"
+    return "declined"
+  }
+}
+```
+
+An interface does not run by itself. It records the command/query contract that
+concrete systems or externs claim to implement. If an implementor omits a
+required command/query, the missing command or query is a conformance error
+during checking; a command with a different return type is also rejected.
+Verification and scenes still name the concrete system or extern boundary.
+
 ## Advanced temporal operators
 
 See: [`examples/advanced_temporal.ab`](../examples/advanced_temporal.ab)

@@ -514,7 +514,11 @@ fn query_reference_validation(query: &Query, model: &FlowModel) -> Option<(Strin
         Query::Temporal { target, .. } => target
             .as_ref()
             .map(|target| temporal_target_reference_validation(target, model)),
-        Query::Entities | Query::Systems | Query::Types | Query::Block { .. } => None,
+        Query::Entities
+        | Query::Systems
+        | Query::Types
+        | Query::Interfaces
+        | Query::Block { .. } => None,
     }
 }
 

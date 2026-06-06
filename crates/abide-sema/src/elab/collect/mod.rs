@@ -1193,6 +1193,27 @@ mod tests {
         EExpr::Lit(int_ty(), super::super::types::Literal::Int(value), None)
     }
 
+    #[test]
+    fn collect_extern_preserves_implements_clause() {
+        let env = collect_src(
+            r#"
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+"#,
+        );
+
+        let ext = env
+            .externs
+            .get("StripeGateway")
+            .expect("extern should be collected");
+        assert_eq!(ext.implements.as_deref(), Some("PaymentProcessor"));
+    }
+
     fn expr_contains_var(expr: &EExpr, target: &str) -> bool {
         match expr {
             EExpr::Lit(_, _, _) | EExpr::Qual(_, _, _, _) | EExpr::Sorry(_) | EExpr::Todo(_) => {

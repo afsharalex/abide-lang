@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 
 use crate::ir::types::{
-    IRAction, IREntity, IRExpr, IRField, IRProgram, IRSystem, IRType, IRVariant,
+    IRAction, IREntity, IRExpr, IRField, IRInterface, IRInterfaceImplementorKind, IRProgram,
+    IRSystem, IRType, IRVariant,
 };
 
 use super::model::{
-    ActionContract, ApplyInfo, CrossCall, EventInfo, FieldGraphMeta, FlowModel, FsmInfo, OwnerKind,
-    StateGraph, SystemInfo, TransitionEdge,
+    ActionContract, ApplyInfo, CrossCall, EventInfo, FieldGraphMeta, FlowModel, FsmInfo,
+    InterfaceImplementorInfo, InterfaceImplementorKind, InterfaceInfo, OwnerKind, StateGraph,
+    SystemInfo, TransitionEdge,
 };
 
 /// Extract a `FlowModel` from an `IRProgram`.
@@ -41,6 +43,7 @@ pub fn extract(ir: &IRProgram) -> FlowModel {
     let entity_names = ir.entities.iter().map(|e| e.name.clone()).collect();
     let system_names = ir.systems.iter().map(|s| s.name.clone()).collect();
     let type_names = ir.types.iter().map(|t| t.name.clone()).collect();
+    let interfaces = extract_interfaces(&ir.interfaces);
 
     let mut action_contracts = HashMap::new();
     for entity in &ir.entities {
@@ -153,9 +156,43 @@ pub fn extract(ir: &IRProgram) -> FlowModel {
         entity_names,
         system_names,
         type_names,
+        interfaces,
         action_contracts,
         fsm_decls,
     }
+}
+
+fn extract_interfaces(interfaces: &[IRInterface]) -> HashMap<String, InterfaceInfo> {
+    interfaces
+        .iter()
+        .map(|interface| {
+            let info = InterfaceInfo {
+                name: interface.name.clone(),
+                commands: interface
+                    .commands
+                    .iter()
+                    .map(|cmd| cmd.name.clone())
+                    .collect(),
+                queries: interface
+                    .queries
+                    .iter()
+                    .map(|query| query.name.clone())
+                    .collect(),
+                implementors: interface
+                    .implementors
+                    .iter()
+                    .map(|implementor| InterfaceImplementorInfo {
+                        name: implementor.name.clone(),
+                        kind: match &implementor.kind {
+                            IRInterfaceImplementorKind::System => InterfaceImplementorKind::System,
+                            IRInterfaceImplementorKind::Extern => InterfaceImplementorKind::Extern,
+                        },
+                    })
+                    .collect(),
+            };
+            (info.name.clone(), info)
+        })
+        .collect()
 }
 
 fn record_entity_field_meta(
@@ -941,6 +978,7 @@ mod tests {
             fsm_decls: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -989,6 +1027,7 @@ mod tests {
             fsm_decls: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -1067,6 +1106,67 @@ mod tests {
         assert_eq!(info.events[0].name, "submit_order");
         assert_eq!(info.events[0].applies.len(), 1);
         assert_eq!(info.events[0].applies[0].action, "submit");
+    }
+
+    #[test]
+    fn extract_interface_metadata_and_implementors() {
+        let ir = IRProgram {
+            interfaces: vec![crate::ir::types::IRInterface {
+                name: "PaymentProcessor".to_owned(),
+                commands: vec![crate::ir::types::IRInterfaceCommand {
+                    name: "authorize".to_owned(),
+                    params: vec![],
+                    return_type: Some(IRType::String),
+                }],
+                queries: vec![crate::ir::types::IRInterfaceQuery {
+                    name: "status".to_owned(),
+                    params: vec![],
+                    return_type: IRType::String,
+                }],
+                implementors: vec![
+                    crate::ir::types::IRInterfaceImplementor {
+                        name: "LocalGateway".to_owned(),
+                        kind: IRInterfaceImplementorKind::System,
+                    },
+                    crate::ir::types::IRInterfaceImplementor {
+                        name: "StripeGateway".to_owned(),
+                        kind: IRInterfaceImplementorKind::Extern,
+                    },
+                ],
+            }],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+
+        let model = extract(&ir);
+        let interface = model
+            .interfaces
+            .get("PaymentProcessor")
+            .expect("interface metadata");
+
+        assert_eq!(interface.commands, vec!["authorize"]);
+        assert_eq!(interface.queries, vec!["status"]);
+        assert_eq!(
+            interface.implementors,
+            vec![
+                InterfaceImplementorInfo {
+                    name: "LocalGateway".to_owned(),
+                    kind: InterfaceImplementorKind::System,
+                },
+                InterfaceImplementorInfo {
+                    name: "StripeGateway".to_owned(),
+                    kind: InterfaceImplementorKind::Extern,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1166,6 +1266,7 @@ mod tests {
             procs: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -1269,6 +1370,7 @@ mod tests {
             fsm_decls: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

@@ -1610,6 +1610,7 @@ mod tests {
             fsm_decls: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -1764,6 +1765,7 @@ mod tests {
             file: None,
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![order_status],
             constants: vec![],
             functions: vec![],
@@ -1873,6 +1875,7 @@ mod tests {
             file: None,
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -1929,6 +1932,7 @@ mod tests {
             file: None,
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -2031,6 +2035,7 @@ mod tests {
             file: None,
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -2119,6 +2124,7 @@ mod tests {
             procs: vec![],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

@@ -86,6 +86,7 @@ fn make_vctx() -> VerifyContext {
         command_params: HashMap::new(),
         system_queries: HashMap::new(),
         defs: super::defenv::DefEnv::from_ir(&crate::ir::types::IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -289,6 +290,7 @@ fn make_billing_query_program() -> (IRProgram, IRSystem) {
         procs: vec![],
     };
     let program = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -894,6 +896,7 @@ fn make_account_vctx() -> VerifyContext {
         command_params: HashMap::new(),
         system_queries: HashMap::new(),
         defs: super::defenv::DefEnv::from_ir(&crate::ir::types::IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

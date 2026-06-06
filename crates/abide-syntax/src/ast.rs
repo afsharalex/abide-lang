@@ -518,12 +518,15 @@ pub struct InterfaceDecl {
     pub span: Span,
 }
 
-/// `extern Name { items }` — boundary surface for capabilities owned
-/// by something outside the spec. May declarations describe possible
-/// returns; assume items pin down fairness/behavior at the boundary.
+/// `extern Name [implements I] { items }` — boundary surface for
+/// capabilities owned by something outside the spec. May declarations
+/// describe possible returns; assume items pin down fairness/behavior
+/// at the boundary. The optional `implements` names an interface the
+/// boundary claims to satisfy.
 #[derive(Debug, Clone)]
 pub struct ExternDecl {
     pub name: String,
+    pub implements: Option<String>,
     pub items: Vec<ExternItem>,
     pub span: Span,
 }

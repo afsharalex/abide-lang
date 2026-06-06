@@ -16,9 +16,11 @@ use crate::elab::types as E;
 use abide_core::diagnostic::{Diagnostic, DiagnosticSink};
 
 use super::types::{
-    IRAxiom, IRConst, IRDecreases, IREntity, IRExpr, IRField, IRFunction, IRLemma, IRProgram,
-    IRRecordField, IRScene, IRSceneEvent, IRSceneGiven, IRTheorem, IRTransParam, IRTransRef,
-    IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify, IRVerifySystem, LitVal,
+    IRAxiom, IRConst, IRDecreases, IREntity, IRExpr, IRField, IRFunction, IRInterface,
+    IRInterfaceCommand, IRInterfaceImplementor, IRInterfaceImplementorKind, IRInterfaceQuery,
+    IRLemma, IRProgram, IRRecordField, IRScene, IRSceneEvent, IRSceneGiven, IRTheorem,
+    IRTransParam, IRTransRef, IRTransition, IRType, IRTypeEntry, IRUpdate, IRVerify,
+    IRVerifySystem, LitVal,
 };
 
 /// Unwrap `Ty::Alias` wrappers to get to the underlying type.
@@ -97,6 +99,11 @@ pub fn lower(er: &E::ElabResult) -> (IRProgram, LowerDiagnostics) {
         constants: er.consts.iter().map(|c| lower_const(c, &ctx)).collect(),
         functions,
         entities,
+        interfaces: er
+            .interfaces
+            .iter()
+            .map(|interface| lower_interface(interface, er, a, &ctx))
+            .collect(),
         systems: er
             .systems
             .iter()
@@ -119,6 +126,76 @@ pub fn lower(er: &E::ElabResult) -> (IRProgram, LowerDiagnostics) {
     };
 
     (program, ctx.take_diagnostics())
+}
+
+fn lower_interface(
+    interface: &E::EInterface,
+    er: &E::ElabResult,
+    aliases: &std::collections::HashMap<String, String>,
+    ctx: &LowerCtx<'_>,
+) -> IRInterface {
+    let mut implementors: Vec<IRInterfaceImplementor> = er
+        .systems
+        .iter()
+        .filter_map(|system| {
+            let implemented = system.implements.as_deref()?;
+            (canonical(aliases, implemented) == interface.name).then(|| IRInterfaceImplementor {
+                name: system.name.clone(),
+                kind: IRInterfaceImplementorKind::System,
+            })
+        })
+        .collect();
+    implementors.extend(er.externs.iter().filter_map(|external| {
+        let implemented = external.implements.as_deref()?;
+        (canonical(aliases, implemented) == interface.name).then(|| IRInterfaceImplementor {
+            name: external.name.clone(),
+            kind: IRInterfaceImplementorKind::Extern,
+        })
+    }));
+    implementors.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+
+    IRInterface {
+        name: interface.name.clone(),
+        commands: interface
+            .commands
+            .iter()
+            .map(|command| IRInterfaceCommand {
+                name: command.name.clone(),
+                params: lower_params(&command.params, ctx),
+                return_type: command.return_type.as_ref().map(|ty| lower_ty(ty, ctx)),
+            })
+            .collect(),
+        queries: interface
+            .queries
+            .iter()
+            .map(|query| IRInterfaceQuery {
+                name: query.name.clone(),
+                params: lower_params(&query.params, ctx),
+                return_type: lower_ty(&query.return_type, ctx),
+            })
+            .collect(),
+        implementors,
+    }
+}
+
+fn lower_params(params: &[(String, E::Ty)], ctx: &LowerCtx<'_>) -> Vec<IRTransParam> {
+    params
+        .iter()
+        .map(|(name, ty)| {
+            let base_ty = match unwrap_alias(ty) {
+                E::Ty::Refinement(base, _) => base.as_ref(),
+                _ => ty,
+            };
+            IRTransParam {
+                name: name.clone(),
+                ty: lower_ty(base_ty, ctx),
+            }
+        })
+        .collect()
 }
 
 // ── Lowering context ────────────────────────────────────────────────

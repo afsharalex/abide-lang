@@ -338,6 +338,33 @@ system StripeAdapter implements PaymentProcessor {
 }
 
 #[test]
+fn parse_extern_with_implements() {
+    let program = parse_program(
+        r#"
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+"#,
+    );
+
+    let ext = program
+        .decls
+        .iter()
+        .find_map(|decl| match decl {
+            crate::ast::TopDecl::Extern(ext) => Some(ext),
+            _ => None,
+        })
+        .expect("expected extern");
+
+    assert_eq!(ext.implements.as_deref(), Some("PaymentProcessor"));
+    assert!(matches!(ext.items[0], crate::ast::ExternItem::Command(_)));
+}
+
+#[test]
 fn parse_system_proc_item() {
     let program = parse_program(
         r#"

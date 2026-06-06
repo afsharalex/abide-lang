@@ -5293,6 +5293,7 @@ fn cvc5_sygus_single_entity_matches_current_z3_ic3_on_simple_counter() {
     let entity = make_counter_entity();
     let property = non_negative_property();
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5319,6 +5320,7 @@ fn active_cvc5_transition_backend_uses_sygus_for_single_entity_safety() {
     let entity = make_counter_entity();
     let property = non_negative_property();
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],

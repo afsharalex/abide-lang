@@ -2768,6 +2768,7 @@ mod tests {
             },
         };
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![IRFunction {
@@ -2875,6 +2876,7 @@ mod tests {
     #[test]
     fn expand_nullary_prop() {
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![IRFunction {
@@ -2916,6 +2918,7 @@ mod tests {
     fn expand_pred_app() {
         // pred positive(x: Int) = x > 0
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![IRFunction {
@@ -2992,6 +2995,7 @@ mod tests {
     #[test]
     fn expand_var_returns_none_for_parameterized() {
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![IRFunction {
@@ -3060,6 +3064,7 @@ mod tests {
             span: None,
         };
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![IRFunction {
@@ -3121,6 +3126,7 @@ mod tests {
     #[test]
     fn add_lemma_fact_conjoins_multiple_expressions() {
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3505,6 +3511,7 @@ mod tests {
         };
 
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3586,6 +3593,7 @@ mod tests {
         };
 
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3656,6 +3664,7 @@ mod tests {
         };
 
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3742,6 +3751,7 @@ mod tests {
         };
 
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3817,6 +3827,7 @@ mod tests {
         };
 
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -3845,6 +3856,7 @@ mod tests {
     #[test]
     fn rewrite_entity_invariant_body_rewrites_field_refs() {
         let program = IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

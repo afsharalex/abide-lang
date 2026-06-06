@@ -158,6 +158,7 @@ mod tests {
 
     fn make_step_test_vctx() -> VerifyContext {
         VerifyContext::from_ir(&IRProgram {
+            interfaces: vec![],
             types: vec![
                 IRTypeEntry {
                     name: "Status".to_owned(),

@@ -171,6 +171,7 @@ pub(super) fn collect_extern(env: &mut Env, ed: &ast::ExternDecl) {
 
     let ext = EExtern {
         name: name.clone(),
+        implements: ed.implements.clone(),
         commands,
         mays,
         assumes,

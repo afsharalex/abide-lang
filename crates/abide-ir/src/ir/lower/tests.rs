@@ -162,12 +162,87 @@ fn lower_proc_and_query_preserve_parameter_refinement_predicates() {
 }
 
 #[test]
+fn lower_program_preserves_interface_metadata_and_implementors() {
+    let mut er = empty_elab_result();
+    er.interfaces.push(E::EInterface {
+        name: "PaymentProcessor".to_owned(),
+        commands: vec![E::ECommand {
+            name: "authorize".to_owned(),
+            params: vec![("amount".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
+            return_type: Some(E::Ty::Builtin(E::BuiltinTy::String)),
+            span: None,
+        }],
+        queries: vec![],
+        span: None,
+    });
+    er.systems.push(E::ESystem {
+        name: "LocalGateway".to_owned(),
+        implements: Some("PaymentProcessor".to_owned()),
+        deps: vec![],
+        fields: vec![],
+        store_params: vec![],
+        scopes: vec![],
+        commands: vec![],
+        actions: vec![],
+        queries: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+        proc_uses: vec![],
+        span: None,
+    });
+    er.externs.push(E::EExtern {
+        name: "StripeGateway".to_owned(),
+        implements: Some("PaymentProcessor".to_owned()),
+        commands: vec![E::ECommand {
+            name: "authorize".to_owned(),
+            params: vec![("amount".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
+            return_type: Some(E::Ty::Builtin(E::BuiltinTy::String)),
+            span: None,
+        }],
+        mays: vec![],
+        assumes: vec![],
+        span: None,
+    });
+
+    let (program, diagnostics) = lower(&er);
+
+    assert!(
+        !diagnostics.has_errors(),
+        "interface metadata lowering should not report diagnostics: {:?}",
+        diagnostics.diagnostics
+    );
+    let interface = program.interfaces.first().expect("interface metadata");
+    assert_eq!(interface.name, "PaymentProcessor");
+    assert_eq!(interface.commands.len(), 1);
+    assert_eq!(interface.commands[0].name, "authorize");
+    assert_eq!(interface.commands[0].params.len(), 1);
+    assert_eq!(interface.commands[0].return_type, Some(IRType::String));
+    assert!(interface.queries.is_empty());
+    assert_eq!(interface.implementors.len(), 2);
+    assert_eq!(interface.implementors[0].name, "LocalGateway");
+    assert_eq!(
+        interface.implementors[0].kind,
+        IRInterfaceImplementorKind::System
+    );
+    assert_eq!(interface.implementors[1].name, "StripeGateway");
+    assert_eq!(
+        interface.implementors[1].kind,
+        IRInterfaceImplementorKind::Extern
+    );
+}
+
+#[test]
 fn lower_extern_reports_multi_segment_fairness_instead_of_dropping_it() {
     let vi = VariantInfo::new();
     let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
     let span = Span { start: 10, end: 25 };
     let ext = E::EExtern {
         name: "Gateway".to_owned(),
+        implements: None,
         commands: vec![
             E::ECommand {
                 name: "authorize".to_owned(),
@@ -218,6 +293,30 @@ fn lower_extern_reports_multi_segment_fairness_instead_of_dropping_it() {
         "multi-segment fairness should not synthesize misleading hidden preds: {:?}",
         lowered.preds
     );
+}
+
+fn empty_elab_result() -> E::ElabResult {
+    E::ElabResult {
+        module_name: None,
+        includes: vec![],
+        use_decls: vec![],
+        aliases: std::collections::HashMap::new(),
+        types: vec![],
+        entities: vec![],
+        interfaces: vec![],
+        externs: vec![],
+        systems: vec![],
+        preds: vec![],
+        props: vec![],
+        verifies: vec![],
+        scenes: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        consts: vec![],
+        fns: vec![],
+        under_blocks: vec![],
+    }
 }
 
 #[test]

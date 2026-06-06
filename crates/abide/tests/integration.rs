@@ -1947,6 +1947,7 @@ fn public_examples_without_verify_blocks_still_load_under_bounded_command() {
     let examples = [
         "examples/algorithms.ab",
         "examples/contracts.ab",
+        "examples/external_payment_provider.ab",
         "examples/imperative.ab",
         "examples/matching.ab",
     ];
@@ -2037,6 +2038,7 @@ fn public_examples_cover_remaining_audit_constructs() {
     };
 
     let temporal = read_example("examples/advanced_temporal.ab");
+    let boundary = read_example("examples/external_payment_provider.ab");
     let state = read_example("examples/state_modeling.ab");
     let failures = read_example("examples/intentional_failures.ab");
     let timeout = read_example("examples/intentional_timeout.ab");
@@ -2047,6 +2049,16 @@ fn public_examples_cover_remaining_audit_constructs() {
         ("historically", temporal.as_str(), "historically"),
         ("since", temporal.as_str(), "since"),
         ("saw", temporal.as_str(), "saw AuditLog::record"),
+        (
+            "extern interface",
+            boundary.as_str(),
+            "extern StripeGateway implements PaymentProcessor",
+        ),
+        (
+            "extern boundary observation",
+            boundary.as_str(),
+            "saw StripeGateway::authorize",
+        ),
         ("fsm", state.as_str(), "fsm status"),
         ("derived", state.as_str(), "derived ready_to_ship"),
         (
@@ -3035,6 +3047,49 @@ fn docs_cli_verify_documents_stream_not_progress() {
         docs.contains("Do not parse human terminal output for automation"),
         "CLI docs should point automation users at reports or JSON instead of styled output"
     );
+}
+
+#[test]
+fn docs_explain_interface_and_extern_boundary_semantics() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let syntax = std::fs::read_to_string(workspace_root.join("docs/syntax-at-a-glance.md"))
+        .expect("read syntax docs");
+    let examples = std::fs::read_to_string(workspace_root.join("docs/examples.md"))
+        .expect("read examples docs");
+
+    for (label, haystack, needle) in [
+        (
+            "interface example",
+            syntax.as_str(),
+            "interface PaymentProcessor",
+        ),
+        (
+            "extern implements example",
+            syntax.as_str(),
+            "extern StripeGateway implements PaymentProcessor",
+        ),
+        (
+            "metadata semantics",
+            syntax.as_str(),
+            "contract metadata over concrete systems and externs",
+        ),
+        ("QA visibility", syntax.as_str(), "ask interfaces"),
+        (
+            "curated example link",
+            examples.as_str(),
+            "examples/external_payment_provider.ab",
+        ),
+        (
+            "conformance diagnostics",
+            examples.as_str(),
+            "missing command or query is a conformance error",
+        ),
+    ] {
+        assert!(
+            haystack.contains(needle),
+            "missing public docs coverage for {label}: expected `{needle}`"
+        );
+    }
 }
 
 #[test]
@@ -4209,6 +4264,58 @@ fn qa_script_load_from_directory() {
     assert!(
         !result.output.iter().any(|l| l.starts_with("error:")),
         "should not have errors: {:?}",
+        result.output
+    );
+}
+
+#[test]
+fn qa_script_lists_interface_implementors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let spec_path = tmp.path().join("interfaces.ab");
+    std::fs::write(
+        &spec_path,
+        r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+system LocalGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string {
+    return "ok"
+  }
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+
+  may authorize {
+    return "ok"
+  }
+}
+"#,
+    )
+    .unwrap();
+    let script_path = tmp.path().join("interfaces.qa");
+    std::fs::write(&script_path, "load \"interfaces.ab\"\nask interfaces\n").unwrap();
+
+    let result = abide::qa::runner::run_qa_script(&script_path, None, false);
+
+    assert_eq!(result.failed, 0, "{:?}", result.output);
+    assert!(
+        result
+            .output
+            .iter()
+            .any(|line| line.contains("PaymentProcessor") && line.contains("LocalGateway")),
+        "expected system implementor in QA interface output: {:?}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .iter()
+            .any(|line| line.contains("PaymentProcessor") && line.contains("StripeGateway")),
+        "expected extern implementor in QA interface output: {:?}",
         result.output
     );
 }
@@ -11479,6 +11586,219 @@ system SlackAdapter implements NotificationBackend {
     assert_eq!(
         result.systems[0].implements.as_deref(),
         Some("NotificationBackend")
+    );
+}
+
+#[test]
+fn interface_elaborates_and_extern_records_implements() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+
+  may authorize {
+    return "ok"
+  }
+}
+"#;
+    let result = elaborate_source(src);
+    assert_eq!(result.interfaces.len(), 1);
+    assert_eq!(result.externs.len(), 1);
+    assert_eq!(
+        result.externs[0].implements.as_deref(),
+        Some("PaymentProcessor")
+    );
+}
+
+#[test]
+fn interface_extern_command_conformance_succeeds() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+
+  may authorize {
+    return "ok"
+  }
+}
+"#;
+    let result = elaborate_source(src);
+    assert_eq!(result.externs.len(), 1);
+    assert_eq!(
+        result.externs[0].implements.as_deref(),
+        Some("PaymentProcessor")
+    );
+}
+
+#[test]
+fn interface_extern_missing_required_command_is_rejected() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command capture(amount: int) -> string
+
+  may capture {
+    return "ok"
+  }
+}
+"#;
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains(
+            "extern `StripeGateway` is missing command `authorize` required by interface `PaymentProcessor`"
+        )),
+        "expected missing extern command diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn interface_extern_command_return_mismatch_is_rejected() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> int
+
+  may authorize {
+    return 1
+  }
+}
+"#;
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains(
+            "extern `StripeGateway` command `authorize` returns `int` but interface `PaymentProcessor` requires `string`"
+        )),
+        "expected extern command return mismatch diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn interface_extern_missing_required_query_is_rejected() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+  query settlement_count() -> int
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+
+  may authorize {
+    return "ok"
+  }
+}
+"#;
+    let (_, errors) = elab_with_errors(src);
+    assert!(
+        errors.iter().any(|e| e.message.contains(
+            "extern `StripeGateway` is missing query `settlement_count` required by interface `PaymentProcessor`"
+        )),
+        "expected missing extern query diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
+fn interface_lowers_to_ir_metadata_with_system_implementor() {
+    let src = r"module T
+
+interface NotificationBackend {
+  command send(recipient: string, body: string) -> string
+  query delivery_count() -> int
+}
+
+system SlackAdapter implements NotificationBackend {
+  command send(recipient: string, body: string) -> string {
+  }
+  query delivery_count() = 0
+}
+";
+    let program = lower_source(src);
+
+    assert_eq!(program.interfaces.len(), 1);
+    let interface = &program.interfaces[0];
+    assert_eq!(interface.name, "NotificationBackend");
+    assert_eq!(interface.commands.len(), 1);
+    assert_eq!(interface.commands[0].name, "send");
+    assert_eq!(interface.commands[0].params.len(), 2);
+    assert_eq!(
+        interface.commands[0].return_type,
+        Some(abide::ir::types::IRType::String)
+    );
+    assert_eq!(interface.queries.len(), 1);
+    assert_eq!(interface.queries[0].name, "delivery_count");
+    assert_eq!(
+        interface.queries[0].return_type,
+        abide::ir::types::IRType::Int
+    );
+    assert_eq!(interface.implementors.len(), 1);
+    assert_eq!(interface.implementors[0].name, "SlackAdapter");
+    assert_eq!(
+        interface.implementors[0].kind,
+        abide::ir::types::IRInterfaceImplementorKind::System
+    );
+}
+
+#[test]
+fn interface_lowers_to_ir_metadata_with_system_and_extern_implementors() {
+    let src = r#"module T
+
+interface PaymentProcessor {
+  command authorize(amount: int) -> string
+}
+
+system LocalGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string {
+    return "ok"
+  }
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(amount: int) -> string
+
+  may authorize {
+    return "ok"
+  }
+}
+"#;
+    let program = lower_source(src);
+
+    assert_eq!(program.interfaces.len(), 1);
+    let interface = &program.interfaces[0];
+    assert_eq!(interface.name, "PaymentProcessor");
+    assert_eq!(interface.implementors.len(), 2);
+    assert_eq!(interface.implementors[0].name, "LocalGateway");
+    assert_eq!(
+        interface.implementors[0].kind,
+        abide::ir::types::IRInterfaceImplementorKind::System
+    );
+    assert_eq!(interface.implementors[1].name, "StripeGateway");
+    assert_eq!(
+        interface.implementors[1].kind,
+        abide::ir::types::IRInterfaceImplementorKind::Extern
+    );
+    assert!(
+        program
+            .systems
+            .iter()
+            .any(|system| system.name == "StripeGateway"),
+        "extern boundary should still lower as a concrete IR system"
     );
 }
 

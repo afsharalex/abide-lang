@@ -703,6 +703,56 @@ pub struct IRQuery {
     pub body: IRExpr,
 }
 
+// ── Interfaces ──────────────────────────────────────────────────────
+
+/// Lowered interface declaration metadata.
+///
+/// Interfaces are contract metadata over concrete systems and externs.
+/// They are not executable verifier systems; downstream tools can use
+/// them to discover capability surfaces and implementation boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRInterface {
+    pub name: std::string::String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<IRInterfaceCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<IRInterfaceQuery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub implementors: Vec<IRInterfaceImplementor>,
+}
+
+/// Command signature declared by an interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRInterfaceCommand {
+    pub name: std::string::String,
+    pub params: Vec<IRTransParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<IRType>,
+}
+
+/// Query signature declared by an interface.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IRInterfaceQuery {
+    pub name: std::string::String,
+    pub params: Vec<IRTransParam>,
+    pub return_type: IRType,
+}
+
+/// Kind of concrete declaration that implements an interface.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IRInterfaceImplementorKind {
+    System,
+    Extern,
+}
+
+/// Concrete declaration that claims conformance to an interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IRInterfaceImplementor {
+    pub name: std::string::String,
+    pub kind: IRInterfaceImplementorKind,
+}
+
 /// R4: a let binding in a program system. Each let binding instantiates a
 /// composed system with store bindings that wire the program's stores to
 /// the composed system's store parameters.
@@ -1360,6 +1410,9 @@ pub struct IRProgram {
     pub functions: Vec<IRFunction>,
     /// `entity` declarations.
     pub entities: Vec<IREntity>,
+    /// Interface declarations and their concrete implementors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<IRInterface>,
     /// `system` and `program` declarations.
     pub systems: Vec<IRSystem>,
     /// `verify` blocks.

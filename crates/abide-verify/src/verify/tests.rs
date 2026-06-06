@@ -267,6 +267,7 @@ fn make_order_ir(assert_expr: IRExpr, bound: usize) -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![order_status],
         constants: vec![],
         functions: vec![],
@@ -320,6 +321,7 @@ fn verification_panic_boundary_preserves_success_result() {
 
 fn target_selector_test_ir() -> IRProgram {
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -540,6 +542,7 @@ fn make_system_field_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -688,6 +691,7 @@ fn make_system_field_enum_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -918,6 +922,7 @@ fn make_system_field_eventual_liveness_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -1051,6 +1056,7 @@ fn make_system_field_bool_param_weak_fair_eventual_liveness_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -1317,6 +1323,7 @@ fn make_system_field_enum_param_per_tuple_weak_fair_liveness_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -1561,6 +1568,7 @@ fn make_system_field_strong_fair_eventual_liveness_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -1804,6 +1812,7 @@ fn make_multi_system_field_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -2034,6 +2043,7 @@ fn make_explicit_entity_store_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -2427,6 +2437,7 @@ fn make_explicit_entity_store_transition_arg_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -2666,6 +2677,7 @@ fn make_explicit_entity_store_ref_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -3071,6 +3083,7 @@ fn make_explicit_entity_store_ref_param_per_tuple_weak_fair_liveness_ir() -> IRP
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -4474,6 +4487,7 @@ fn make_explicit_multi_entity_store_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -4616,6 +4630,7 @@ fn make_explicit_bare_entity_apply_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![IRTypeEntry {
             name: "TaskStatus".to_owned(),
             ty: status_ty,
@@ -4794,6 +4809,7 @@ fn make_explicit_system_cross_call_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5043,6 +5059,7 @@ fn make_explicit_system_let_crosscall_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5313,6 +5330,7 @@ fn make_explicit_system_match_crosscall_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![IRTypeEntry {
             name: "Decision".to_owned(),
             ty: decision_ty,
@@ -5708,6 +5726,7 @@ fn make_explicit_entity_store_param_per_tuple_weak_fair_liveness_ir() -> IRProgr
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5837,6 +5856,7 @@ fn make_system_field_bool_param_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5976,6 +5996,7 @@ fn make_system_field_enum_param_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6102,6 +6123,7 @@ fn make_system_field_counter_with_invariant_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6271,6 +6293,7 @@ fn make_system_field_match_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6439,6 +6462,7 @@ fn make_pooled_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6640,6 +6664,7 @@ fn make_pooled_ticket_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6831,6 +6856,7 @@ fn make_pooled_ref_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -7031,6 +7057,7 @@ fn make_pooled_nested_ref_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -7226,6 +7253,7 @@ fn make_pooled_forall_nested_ref_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -7416,6 +7444,7 @@ fn make_pooled_arg_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -7783,6 +7812,7 @@ fn make_pooled_match_crosscall_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -8010,6 +8040,7 @@ fn make_pooled_let_crosscall_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -8292,6 +8323,7 @@ fn make_pooled_match_var_crosscall_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![IRTypeEntry {
             name: "Decision".to_owned(),
             ty: decision_ty,
@@ -8558,6 +8590,7 @@ fn make_pooled_let_crosscall_into_crosscall_arg_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -8794,6 +8827,7 @@ fn make_pooled_callee_field_crosscall_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -9062,6 +9096,7 @@ fn make_pooled_callee_store_crosscall_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -9347,6 +9382,7 @@ fn make_pooled_apply_chain_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -9517,6 +9553,7 @@ fn make_pooled_create_then_inc_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -9659,6 +9696,7 @@ fn make_pooled_store_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10076,6 +10114,7 @@ fn make_multi_pooled_counter_marker_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10378,6 +10417,7 @@ fn bmc_counterexample_on_violation() {
 #[test]
 fn bmc_empty_program_no_results() {
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10412,6 +10452,7 @@ fn make_dummy_entity() -> IREntity {
 #[test]
 fn scene_accepts_let_in_given_constraint() {
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10472,6 +10513,7 @@ fn scene_accepts_let_in_given_constraint() {
 #[test]
 fn scene_still_rejects_lambda_in_given_constraint() {
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10601,6 +10643,7 @@ fn scene_reports_crosscall_arity_mismatch() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -10781,6 +10824,7 @@ fn make_scene_test_ir(scene: IRScene) -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![status_enum],
         constants: vec![],
         functions: vec![],
@@ -11314,6 +11358,7 @@ fn axiom_by_file_is_disclosed_in_result_assumptions() {
 #[test]
 fn lemma_sat_failure_carries_countermodel_evidence() {
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -11419,6 +11464,7 @@ fn make_dead_event_theorem_ir(invariants: Vec<IRExpr>, shows: Vec<IRExpr>) -> IR
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12038,6 +12084,7 @@ fn ic3_proves_property_induction_cannot() {
 
     // Verify block with this property
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12383,6 +12430,7 @@ fn make_two_counter_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12486,6 +12534,7 @@ fn make_single_entity_ir(hi: i64) -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12563,6 +12612,7 @@ fn compute_verify_scope_uses_default_bound_when_hi_is_smaller() {
 #[test]
 fn select_verify_relevant_filters_entities_and_systems() {
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12731,6 +12781,7 @@ fn compute_theorem_scope_follows_let_bindings_and_crosscalls() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -12834,6 +12885,7 @@ fn collect_in_scope_invariants_wraps_entity_and_target_system_only() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -13258,6 +13310,7 @@ fn map_field_verify_index_after_update() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -13436,6 +13489,7 @@ fn map_literal_in_property_encoding() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -13681,6 +13735,7 @@ fn primed_map_update_sugar_encoding() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -13905,6 +13960,7 @@ fn set_membership_via_index() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -14065,6 +14121,7 @@ fn set_literal_in_property() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -14214,6 +14271,7 @@ fn set_literal_cardinality() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -14360,6 +14418,7 @@ fn set_literal_cardinality_deduplicates() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -14591,6 +14650,7 @@ fn set_comprehension_simple_form() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -14761,6 +14821,7 @@ fn set_comprehension_membership_check() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -14934,6 +14995,7 @@ fn set_comprehension_projection_form() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -15364,6 +15426,7 @@ fn seq_literal_index_and_cardinality() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -15641,6 +15704,7 @@ fn seq_field_frame_across_transition() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -15899,6 +15963,7 @@ fn card_set_comp_bounded_sum() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -16058,6 +16123,7 @@ fn prop_auto_verified_when_true() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![IRFunction {
@@ -16152,6 +16218,7 @@ fn prop_skipped_when_covered_by_theorem() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![IRFunction {
@@ -16216,6 +16283,7 @@ fn prop_skipped_when_covered_by_theorem() {
 fn no_prop_verify_flag_skips_props() {
     // --no-prop-verify should skip all prop auto-verification.
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![IRFunction {
@@ -16402,6 +16470,7 @@ fn prop_auto_verified_when_false() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![IRFunction {
@@ -16555,6 +16624,7 @@ fn make_delayed_prop_failure_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![IRFunction {
@@ -16829,6 +16899,7 @@ fn multi_apply_sequential_chaining() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -17089,6 +17160,7 @@ fn multi_apply_scene_checks_final_state() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -17314,6 +17386,7 @@ fn multi_apply_ic3_proves_property() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -17625,6 +17698,7 @@ fn multi_apply_step_scoping_no_intermediate_collision() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -17905,6 +17979,7 @@ fn multi_apply_active_flag_preserved_in_chain() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -18324,6 +18399,7 @@ fn multi_apply_second_apply_args_depend_on_first_update() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -18584,6 +18660,7 @@ fn multi_apply_forall_scene_checks_final_state() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -18614,6 +18691,7 @@ fn make_fn_ir(func: IRFunction) -> IRProgram {
 
 fn make_fns_ir(functions: Vec<IRFunction>) -> IRProgram {
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions,
@@ -20845,6 +20923,7 @@ fn make_multi_system_duplicate_field_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -21048,6 +21127,7 @@ fn make_explicit_pooled_let_crosscall_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -21287,6 +21367,7 @@ fn make_explicit_pooled_match_crosscall_counterexample_ir() -> IRProgram {
     };
 
     IRProgram {
+        interfaces: vec![],
         types: vec![IRTypeEntry {
             name: "Decision".to_owned(),
             ty: decision_ty,

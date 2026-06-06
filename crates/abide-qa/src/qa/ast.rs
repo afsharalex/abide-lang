@@ -142,6 +142,8 @@ pub enum Query {
     Systems,
     /// `types`
     Types,
+    /// `interfaces`
+    Interfaces,
     /// `invariants on E`
     Invariants { entity: String },
     /// `contracts on E.action`
@@ -321,6 +323,7 @@ impl std::fmt::Display for Query {
             Self::Entities => write!(f, "entities"),
             Self::Systems => write!(f, "systems"),
             Self::Types => write!(f, "types"),
+            Self::Interfaces => write!(f, "interfaces"),
             Self::Invariants { entity } => write!(f, "invariants on {entity}"),
             Self::Contracts { entity, action } => write!(f, "contracts on {entity}.{action}"),
             Self::Fsms { entity } => write!(f, "fsms on {entity}"),

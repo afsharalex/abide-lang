@@ -1963,6 +1963,7 @@ mod tests {
 
     fn empty_ir() -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],
@@ -1978,6 +1979,7 @@ mod tests {
 
     fn enum_ir() -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: vec![IRTypeEntry {
                 name: "Status".to_owned(),
                 ty: IRType::Enum {
@@ -2153,6 +2155,7 @@ mod tests {
     #[test]
     fn build_domain_predicate_reports_empty_enum_domain_without_panicking() {
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![IRTypeEntry {
                 name: "Empty".to_owned(),
                 ty: IRType::Enum {
@@ -2426,6 +2429,7 @@ mod tests {
             file: None,
         };
         let ir = IRProgram {
+            interfaces: vec![],
             functions: vec![function],
             ..empty_ir()
         };

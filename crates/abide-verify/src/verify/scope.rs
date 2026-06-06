@@ -1056,6 +1056,7 @@ mod tests {
 
     fn program(entities: Vec<IREntity>, systems: Vec<IRSystem>) -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

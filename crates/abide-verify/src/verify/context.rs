@@ -440,6 +440,7 @@ mod default_tests {
             variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
         };
         let ir = IRProgram {
+            interfaces: vec![],
             types: vec![IRTypeEntry {
                 name: "Status".to_owned(),
                 ty: status_ty.clone(),

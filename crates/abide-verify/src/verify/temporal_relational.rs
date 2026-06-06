@@ -1464,6 +1464,7 @@ mod tests {
 
     fn program(entity: IREntity) -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: Vec::new(),
             constants: Vec::new(),
             functions: Vec::new(),
@@ -1483,6 +1484,7 @@ mod tests {
 
     fn program_with_entities_system(entities: Vec<IREntity>, system: IRSystem) -> IRProgram {
         IRProgram {
+            interfaces: vec![],
             types: Vec::new(),
             constants: Vec::new(),
             functions: Vec::new(),

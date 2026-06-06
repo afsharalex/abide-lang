@@ -1,0 +1,54 @@
+module ExternalPaymentProvider
+
+// Interface + extern boundary example.
+// This file is intended to load under:
+//   abide verify examples/external_payment_provider.ab --bounded-only --no-fn-verify --no-prop-verify
+
+interface PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+}
+
+extern StripeGateway implements PaymentProcessor {
+  command authorize(order_id: identity, amount: int) -> string
+
+  may authorize {
+    return "approved"
+    return "declined"
+  }
+}
+
+entity Order {
+  id: identity
+  total: int = 10
+  paid: bool = false
+
+  action mark_paid()
+    requires total > 0 {
+    paid' = true
+  }
+}
+
+system Checkout(orders: Store<Order>) {
+  dep StripeGateway
+
+  command checkout(order_id: identity) {
+    choose o: Order where o.id == order_id and o.total > 0 {
+      StripeGateway::authorize(o.id, o.total)
+      o.mark_paid()
+    }
+  }
+}
+
+scene checkout_observes_payment_boundary {
+  given {
+    store orders: Order[1]
+    let checkout = Checkout { orders: orders }
+    let order = one Order in orders where order.total > 0
+  }
+  when {
+    let run = checkout.checkout(order.id)
+  }
+  then {
+    assert saw StripeGateway::authorize(order.id, order.total)
+  }
+}

@@ -174,6 +174,7 @@ impl WorkspaceIndex {
                         | IdeSymbolKind::Alias
                         | IdeSymbolKind::Newtype
                         | IdeSymbolKind::Entity
+                        | IdeSymbolKind::Interface
                         | IdeSymbolKind::System
                         | IdeSymbolKind::Program
                         | IdeSymbolKind::Proc

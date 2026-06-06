@@ -1518,6 +1518,7 @@ mod tests {
             file: None,
         };
         let defs = defenv::DefEnv::from_ir(&IRProgram {
+            interfaces: vec![],
             types: vec![],
             constants: vec![],
             functions: vec![],

@@ -335,6 +335,7 @@ fn all_orders_have_status(ctor: &str) -> IRExpr {
 
 fn make_ir_for_entity(entity: &IREntity, types: Vec<IRTypeEntry>) -> IRProgram {
     IRProgram {
+        interfaces: vec![],
         types,
         constants: vec![],
         functions: vec![],
@@ -2303,6 +2304,7 @@ fn build_system_chc_supports_top_level_pure_finite_payload_enum_cardinality() {
         ty: decision_ty.clone(),
     });
     let ir = IRProgram {
+        interfaces: vec![],
         types: all_types,
         constants: vec![],
         functions: vec![],
@@ -3554,6 +3556,7 @@ fn ic3_system_proves_multi_entity_safety() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![order_status],
         constants: vec![],
         functions: vec![],
@@ -3928,6 +3931,7 @@ fn ic3_system_supports_match_destructuring_for_constructor_fields() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![result_ty],
         constants: vec![],
         functions: vec![],
@@ -4081,6 +4085,7 @@ fn build_system_chc_supports_payload_field_projection_in_properties() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![result_ty],
         constants: vec![],
         functions: vec![],
@@ -4165,6 +4170,7 @@ fn build_system_chc_supports_unary_negation_in_properties() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -4397,6 +4403,7 @@ fn build_system_chc_supports_payload_field_projection_in_transition_updates() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![result_ty],
         constants: vec![],
         functions: vec![],
@@ -4514,6 +4521,7 @@ fn build_system_chc_supports_div_mod_in_transition_updates() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -4760,6 +4768,7 @@ fn build_system_chc_supports_direct_choose_in_event_guards() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -4899,6 +4908,7 @@ fn ic3_system_supports_cross_entity_let_property() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![order_status],
         constants: vec![],
         functions: vec![],
@@ -5400,6 +5410,7 @@ fn make_system_program() -> (IRProgram, IRExpr) {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -5560,6 +5571,7 @@ fn ic3_system_missing_transition_returns_unknown() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![status_type],
         constants: vec![],
         functions: vec![],
@@ -5646,6 +5658,7 @@ fn ic3_system_missing_crosscall_target_returns_unknown() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5773,6 +5786,7 @@ fn ic3_system_crosscall_create_via_recursion() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -5890,6 +5904,7 @@ fn ic3_system_forall_with_apply() {
     };
 
     let ir2 = IRProgram {
+        interfaces: vec![],
         systems: vec![forall_sys],
         ..ir
     };
@@ -5999,6 +6014,7 @@ fn ic3_system_forall_with_create() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6115,6 +6131,7 @@ fn ic3_system_event_guard_propagation() {
     };
 
     let ir2 = IRProgram {
+        interfaces: vec![],
         systems: vec![guarded_sys],
         ..ir
     };
@@ -6360,6 +6377,7 @@ fn ic3_system_cyclic_crosscall_returns_unknown() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6440,6 +6458,7 @@ fn ic3_system_apply_target_mismatch_returns_unknown() {
     };
 
     let ir2 = IRProgram {
+        interfaces: vec![],
         systems: vec![bad_sys],
         ..ir
     };
@@ -6500,6 +6519,7 @@ fn collect_crosscall_targets_walks_nested_actions_without_duplication() {
 fn build_liveness_chc_emits_monitor_columns_and_accepting_rule() {
     let (entity, tys) = make_simple_entity();
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -6595,6 +6615,7 @@ fn try_ic3_liveness_reports_missing_quantified_entity() {
     require_unbounded_proof_tests!();
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: vec![],
         constants: vec![],
         functions: vec![],
@@ -6646,6 +6667,7 @@ fn try_ic3_liveness_reports_missing_quantified_entity() {
 fn build_multi_slot_chc_and_system_chc_emit_expected_rules() {
     let (entity, tys) = make_simple_entity();
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys.clone(),
         constants: vec![],
         functions: vec![],
@@ -6697,6 +6719,7 @@ fn build_system_chc_keeps_entity_rules_when_system_scope_is_nonempty() {
     let (entity, tys) = make_simple_entity();
     let system = make_empty_system("Inventory", &["Order"]);
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -6733,6 +6756,7 @@ fn ic3_system_with_irrelevant_system_sees_entity_transition_violation() {
     let (entity, tys) = make_simple_entity();
     let system = make_empty_system("Inventory", &["Order"]);
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -6767,6 +6791,7 @@ fn ic3_system_with_irrelevant_system_sees_entity_transition_violation() {
 fn no_stutter_chc_encodings_remove_self_loop_and_report_deadlock_error() {
     let (entity, tys) = make_simple_entity();
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys.clone(),
         constants: vec![],
         functions: vec![],
@@ -6831,6 +6856,7 @@ fn no_stutter_chc_encodings_remove_self_loop_and_report_deadlock_error() {
 fn build_multi_slot_chc_supports_choose_let_and_match_rich_properties() {
     let (entity, tys) = make_simple_entity();
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys.clone(),
         constants: vec![],
         functions: vec![],
@@ -6961,6 +6987,7 @@ fn build_system_chc_supports_entity_choose_scoped_properties() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys.clone(),
         constants: vec![],
         functions: vec![],
@@ -7136,6 +7163,7 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys.clone(),
         constants: vec![],
         functions: vec![],
@@ -7332,6 +7360,7 @@ fn build_system_chc_supports_macro_step_let_match_routing() {
     };
 
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -7409,6 +7438,7 @@ fn system_action_encoder_supports_nested_macro_step_let_match_routing() {
         procs: vec![],
     };
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
@@ -9093,6 +9123,7 @@ fn multi_slot_constraint_and_guard_translators_cover_scoped_forms() {
 fn system_property_scoped_choose_over_entities_expands_active_slot_disjunctions() {
     let (entity, tys) = make_simple_entity();
     let ir = IRProgram {
+        interfaces: vec![],
         types: tys,
         constants: vec![],
         functions: vec![],
