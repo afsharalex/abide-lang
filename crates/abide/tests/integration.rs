@@ -104,6 +104,325 @@ fn eexpr_contains_qualified_variant(
     }
 }
 
+#[test]
+fn source_target_discovery_recurses_sorts_and_dedups_abide_sources() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested).expect("create nested dir");
+    let a = root.join("a.ab");
+    let b = nested.join("b.abi");
+    let c = nested.join("c.abp");
+    let ignored_qa = nested.join("ignored.qa");
+    let ignored_txt = root.join("ignored.txt");
+    std::fs::write(&c, "module C\n").expect("write c");
+    std::fs::write(&ignored_txt, "not abide").expect("write txt");
+    std::fs::write(&b, "module B\n").expect("write b");
+    std::fs::write(&ignored_qa, "ask entities\n").expect("write qa");
+    std::fs::write(&a, "module A\n").expect("write a");
+
+    let targets = abide::targets::resolve_source_targets(&[root.to_path_buf(), b.clone()])
+        .expect("directory source discovery should succeed");
+
+    assert_eq!(
+        targets,
+        vec![
+            std::fs::canonicalize(a).expect("canonicalize a"),
+            std::fs::canonicalize(b).expect("canonicalize b"),
+            std::fs::canonicalize(c).expect("canonicalize c"),
+        ]
+    );
+}
+
+#[test]
+fn source_target_discovery_reports_missing_and_empty_directories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).expect("create empty dir");
+    let missing = dir.path().join("missing.ab");
+
+    let empty_error = abide::targets::resolve_source_targets(std::slice::from_ref(&empty))
+        .expect_err("empty source directory should error");
+    assert!(
+        empty_error
+            .to_string()
+            .contains("no Abide source files found"),
+        "expected empty directory diagnostic, got: {empty_error}"
+    );
+
+    let missing_error = abide::targets::resolve_source_targets(std::slice::from_ref(&missing))
+        .expect_err("missing source target should error");
+    assert!(
+        missing_error
+            .to_string()
+            .contains("source target not found"),
+        "expected missing target diagnostic, got: {missing_error}"
+    );
+}
+
+fn write_cli_directory_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested dir");
+    let a = dir.path().join("a.ab");
+    let b = nested.join("b.ab");
+    std::fs::write(&a, "module Alpha\n\nenum Status = Open | Closed\n").expect("write a");
+    std::fs::write(&b, "module Beta\n\nentity Ticket { id: identity }\n").expect("write b");
+    std::fs::write(nested.join("ignored.qa"), "ask entities\n").expect("write qa");
+    (dir, a, b)
+}
+
+#[test]
+fn cli_lex_accepts_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let (dir, a, b) = write_cli_directory_fixture();
+    let a = std::fs::canonicalize(a).expect("canonicalize a");
+    let b = std::fs::canonicalize(b).expect("canonicalize b");
+    let output = std::process::Command::new(binary)
+        .arg("lex")
+        .arg(dir.path())
+        .output()
+        .expect("failed to run abide lex on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected lex DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", a.display())),
+        "lex output should group the first source file: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", b.display())),
+        "lex output should group the nested source file: {stdout}"
+    );
+    assert!(stdout.contains("module"));
+    assert!(stdout.contains("Ticket"));
+    assert!(
+        !stdout.contains("ignored.qa") && !stdout.contains("ask entities"),
+        "lex DIR should ignore QA scripts: {stdout}"
+    );
+}
+
+#[test]
+fn cli_parse_accepts_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let (dir, a, b) = write_cli_directory_fixture();
+    let a = std::fs::canonicalize(a).expect("canonicalize a");
+    let b = std::fs::canonicalize(b).expect("canonicalize b");
+    let output = std::process::Command::new(binary)
+        .arg("parse")
+        .arg(dir.path())
+        .output()
+        .expect("failed to run abide parse on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected parse DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", a.display())),
+        "parse output should group the first source file: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", b.display())),
+        "parse output should group the nested source file: {stdout}"
+    );
+    assert!(stdout.contains("Alpha"));
+    assert!(stdout.contains("Ticket"));
+    assert!(
+        !stdout.contains("ignored.qa") && !stdout.contains("ask entities"),
+        "parse DIR should ignore QA scripts: {stdout}"
+    );
+}
+
+#[test]
+fn cli_lex_directory_diagnostics_include_file_paths() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bad = dir.path().join("bad.ab");
+    std::fs::write(&bad, "module Bad\n!\n").expect("write bad source");
+    let bad = std::fs::canonicalize(bad).expect("canonicalize bad");
+
+    let output = std::process::Command::new(binary)
+        .arg("lex")
+        .arg(dir.path())
+        .output()
+        .expect("failed to run abide lex on bad source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected lex DIR to fail: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&bad.display().to_string()),
+        "lex diagnostic should include the bad file path: {stderr}"
+    );
+    assert!(
+        stderr.contains("unexpected character"),
+        "lex diagnostic should describe the lexer error: {stderr}"
+    );
+}
+
+#[test]
+fn cli_parse_directory_diagnostics_include_file_paths() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bad = dir.path().join("bad.ab");
+    std::fs::write(&bad, "module Bad\nentity Broken { id: }\n").expect("write bad source");
+    let bad = std::fs::canonicalize(bad).expect("canonicalize bad");
+
+    let output = std::process::Command::new(binary)
+        .arg("parse")
+        .arg(dir.path())
+        .output()
+        .expect("failed to run abide parse on bad source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected parse DIR to fail: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&bad.display().to_string()),
+        "parse diagnostic should include the bad file path: {stderr}"
+    );
+    assert!(
+        stderr.contains("expected") || stderr.contains("unexpected"),
+        "parse diagnostic should describe the parser error: {stderr}"
+    );
+}
+
+fn lsp_commerce_src_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/lsp-commerce/src")
+        .canonicalize()
+        .expect("canonicalize lsp-commerce example src")
+}
+
+#[test]
+fn cli_emit_ir_accepts_multi_file_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let src_dir = lsp_commerce_src_dir();
+    let output = std::process::Command::new(binary)
+        .arg("emit-ir")
+        .arg(&src_dir)
+        .output()
+        .expect("failed to run abide emit-ir on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected emit-ir DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("CommerceOperations"),
+        "IR JSON should include the program loaded from the directory: {stdout}"
+    );
+    assert!(
+        stdout.contains("Storefront"),
+        "IR JSON should include systems loaded from nested files: {stdout}"
+    );
+}
+
+#[test]
+fn cli_elaborate_accepts_multi_file_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let src_dir = lsp_commerce_src_dir();
+    let output = std::process::Command::new(binary)
+        .arg("elaborate")
+        .arg(&src_dir)
+        .output()
+        .expect("failed to run abide elaborate on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected elaborate DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("CommerceOperations"),
+        "elaboration output should include the program loaded from the directory: {stdout}"
+    );
+    assert!(
+        stdout.contains("checkout_graph_smoke"),
+        "elaboration output should include verify blocks loaded from nested files: {stdout}"
+    );
+}
+
+#[test]
+fn cli_export_temporal_accepts_multi_file_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let src_dir = lsp_commerce_src_dir();
+    let output = std::process::Command::new(binary)
+        .arg("export-temporal")
+        .arg(&src_dir)
+        .output()
+        .expect("failed to run abide export-temporal on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected export-temporal DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("checkout_graph_smoke"),
+        "temporal export should include verify blocks loaded from nested files: {stdout}"
+    );
+    assert!(
+        stdout.contains("payment_status_smoke"),
+        "temporal export should include multiple nested verify blocks: {stdout}"
+    );
+}
+
+#[test]
+fn cli_verify_accepts_multi_file_source_directory() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let src_dir = lsp_commerce_src_dir();
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            "--target",
+            "verify:checkout_graph_smoke",
+            "--bounded-only",
+            "--no-fn-verify",
+            "--no-prop-verify",
+        ])
+        .arg(&src_dir)
+        .output()
+        .expect("failed to run abide verify on source directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected verify DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        output_has_verdict_subject(&stdout, "CHECKED", "checkout_graph_smoke")
+            || output_has_verdict_subject(&stdout, "PROVED", "checkout_graph_smoke"),
+        "stdout should include the selected verification result: {stdout}"
+    );
+}
+
 macro_rules! require_unbounded_proof_tests {
     () => {
         if !should_run_unbounded_proof_tests() {
@@ -2763,6 +3082,97 @@ fn cli_qa_renders_miette_snippet_for_parse_error() {
     assert!(
         stderr.contains("try `ask entities`"),
         "stderr should include a QA-specific help hint: {stderr}"
+    );
+}
+
+#[test]
+fn cli_qa_accepts_directory_of_scripts() {
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let scripts = tmp.path().join("qa");
+    let nested = scripts.join("nested");
+    std::fs::create_dir_all(&nested).expect("create qa dirs");
+    let first = scripts.join("a.qa");
+    let second = nested.join("b.qa");
+    std::fs::write(&first, "assert reachable Order.status -> @Shipped\n")
+        .expect("write first qa script");
+    std::fs::write(&second, "assert not cycles Order.status\n").expect("write second qa script");
+    std::fs::write(nested.join("ignored.txt"), "assert false\n").expect("write ignored file");
+    let first = std::fs::canonicalize(first).expect("canonicalize first qa");
+    let second = std::fs::canonicalize(second).expect("canonicalize second qa");
+
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .arg("qa")
+        .arg(&scripts)
+        .args(["-f", "tests/fixtures/commerce.ab"])
+        .output()
+        .expect("failed to run abide qa on script directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "expected qa DIR to succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", first.display())),
+        "QA suite output should group the first script: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("== {} ==", second.display())),
+        "QA suite output should group the nested script: {stdout}"
+    );
+    assert!(
+        stdout.contains("PASS: assert reachable Order.status -> @Shipped")
+            && stdout.contains("PASS: assert not cycles Order.status"),
+        "QA suite should execute both scripts: {stdout}"
+    );
+    assert!(
+        stdout.contains("=== QA: 2 passed, 0 failed (2 executed) ==="),
+        "QA suite should print one aggregate summary: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ignored.txt") && !stdout.contains("assert false"),
+        "QA suite should ignore non-QA files: {stdout}"
+    );
+}
+
+#[test]
+fn cli_qa_directory_parse_errors_keep_script_paths() {
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let scripts = tmp.path().join("qa");
+    std::fs::create_dir_all(&scripts).expect("create qa dir");
+    let bad = scripts.join("bad.qa");
+    std::fs::write(&bad, "query entities\n").expect("write bad qa script");
+    let bad = std::fs::canonicalize(bad).expect("canonicalize bad qa");
+
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let output = std::process::Command::new(binary)
+        .arg("qa")
+        .arg(&scripts)
+        .args(["-f", "tests/fixtures/commerce.ab"])
+        .output()
+        .expect("failed to run abide qa on bad script directory");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected qa DIR to fail: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(&bad.display().to_string()),
+        "QA directory diagnostic should reference the bad script: {stderr}"
+    );
+    assert!(
+        stderr.contains("abide::qa::parse::expected"),
+        "QA directory diagnostic should include parse code: {stderr}"
+    );
+    assert!(
+        stdout.contains("=== QA: 0 passed, 0 failed (0 executed) ==="),
+        "QA directory should still print aggregate summary: {stdout}"
     );
 }
 
@@ -8883,6 +9293,37 @@ fn cli_verify_help_discloses_short_default_timeout() {
         stdout.contains("--ic3"),
         "verify help should expose the explicit proof-search opt-in: {stdout}"
     );
+}
+
+#[test]
+fn cli_help_documents_directory_targets_for_supported_commands() {
+    let cases = [
+        ("lex", "<FILE_OR_DIR>"),
+        ("parse", "<FILE_OR_DIR>"),
+        ("elaborate", "<FILES_OR_DIRS>..."),
+        ("emit-ir", "<FILES_OR_DIRS>..."),
+        ("export-temporal", "<FILES_OR_DIRS>..."),
+        ("verify", "<FILES_OR_DIRS>..."),
+        ("qa", "<SCRIPT_OR_DIR>"),
+    ];
+
+    for (command, expected_arg) in cases {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+            .args([command, "--help"])
+            .output()
+            .unwrap_or_else(|error| panic!("run abide {command} --help: {error}"));
+
+        assert!(
+            output.status.success(),
+            "help should exit successfully for {command}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(expected_arg),
+            "help for {command} should document directory-capable argument {expected_arg}: {stdout}"
+        );
+    }
 }
 
 #[test]

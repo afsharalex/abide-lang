@@ -16,26 +16,29 @@ The `abide` binary exposes these subcommands:
 
 ## `abide lex`
 
-Lex a source file and print tokens.
+Lex a source file or every `.ab` source under a directory and print tokens.
 
 ```sh
 abide lex spec.ab
+abide lex specs/
 ```
 
 ## `abide parse`
 
-Parse a source file and print the AST.
+Parse a source file or every `.ab` source under a directory and print the AST.
 
 ```sh
 abide parse spec.ab
+abide parse specs/
 ```
 
 ## `abide elaborate`
 
-Load one or more files, resolve names, and print elaborated output.
+Load one or more source files or directories, resolve names, and print elaborated output.
 
 ```sh
 abide elaborate types.ab system.ab checks.ab
+abide elaborate specs/
 ```
 
 ## `abide emit-ir`
@@ -44,6 +47,7 @@ Emit the lowered IR as JSON.
 
 ```sh
 abide emit-ir spec.ab
+abide emit-ir specs/
 ```
 
 ## `abide export-temporal`
@@ -52,6 +56,7 @@ Export compiled temporal formulas for verify blocks as JSON.
 
 ```sh
 abide export-temporal spec.ab
+abide export-temporal specs/
 ```
 
 ## `abide verify`
@@ -60,6 +65,7 @@ Run verification across verify blocks, scenes, theorems, props, and function con
 
 ```sh
 abide verify spec.ab
+abide verify specs/
 abide verify spec.ab --solver auto --stream
 abide verify spec.ab --bounded-only
 abide verify spec.ab --report json reports/
@@ -169,6 +175,11 @@ Selected flags:
 - `--system <name>`
 - `--trace-artifact <path>`
 
+`run` currently resolves runnable candidates from the source files passed on
+the command line. If more than one system exists, choose one with `--system`.
+Directory target support and a future `--target` selector are tracked
+separately.
+
 ## `abide simulate`
 
 `simulate` has the same behavior and flags as `run`.
@@ -201,11 +212,12 @@ Flags:
 
 ## `abide qa`
 
-Run QA scripts.
+Run one QA script or every `.qa` script under a directory.
 
 ```sh
 abide qa checks.qa -f .
 abide qa checks.qa -f specs --format json
+abide qa qa/ -f specs
 ```
 
 Flags:
@@ -234,4 +246,17 @@ Common conventions:
 | `.ab` | Abide source files |
 | `.qa` | QA scripts |
 
-Multiple `.ab` files can be passed together to `elaborate`, `emit-ir`, or `verify`.
+`lex` and `parse` accept one source file or one source directory. When given a
+directory, they recursively discover `.ab` files, ignore QA scripts, process
+files in deterministic path order, and group output by file.
+
+`elaborate`, `emit-ir`, `export-temporal`, and `verify` accept any mix of `.ab`
+files and directories. Directories are recursively expanded to `.ab` files,
+deduplicated, and loaded in deterministic path order. This lets you run commands
+against a project directory while still supporting C-compiler-style explicit
+file lists.
+
+`qa` accepts either one `.qa` script or a directory of QA scripts. Directory
+targets recursively discover `.qa` files in deterministic path order and print
+one aggregate QA summary. Use `-f, --from` to load the Abide source file or
+directory that the QA scripts should inspect.

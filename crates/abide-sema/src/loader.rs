@@ -88,6 +88,12 @@ pub fn load_files_with_provider<P: SourceProvider>(
         }
     }
 
+    if paths.len() > 1 {
+        env.module_name = None;
+        env.module_inherited = false;
+        env.current_file = None;
+    }
+
     let all_paths: Vec<PathBuf> = visited.into_iter().collect();
     (env, errors, all_paths)
 }
@@ -687,6 +693,34 @@ mod tests {
         assert!(
             has_good_type,
             "good include's type should be loaded despite bad sibling"
+        );
+    }
+
+    #[test]
+    fn multiple_top_level_files_leave_no_single_root_module() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let a_path = dir.path().join("a.ab");
+        let mut a = std::fs::File::create(&a_path).unwrap();
+        writeln!(a, "module Alpha").unwrap();
+        writeln!(a, "enum A = One").unwrap();
+
+        let b_path = dir.path().join("b.ab");
+        let mut b = std::fs::File::create(&b_path).unwrap();
+        writeln!(b, "module Beta").unwrap();
+        writeln!(b, "enum B = Two").unwrap();
+
+        let (env, load_errors, _) = load_files(&[a_path, b_path]);
+
+        assert!(load_errors.is_empty(), "top-level files should load");
+        assert_eq!(
+            env.module_name, None,
+            "multi-root loads should not select one file's module as the compilation root"
+        );
+        assert!(
+            env.known_modules.contains("Alpha") && env.known_modules.contains("Beta"),
+            "both module names should still be known: {:?}",
+            env.known_modules
         );
     }
 

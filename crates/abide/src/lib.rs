@@ -75,4 +75,5 @@ pub mod ide;
 pub mod render;
 pub mod repl;
 pub mod simulate;
+pub mod targets;
 pub mod workspace;

@@ -92,35 +92,41 @@ enum VerifyWitnessSemantics {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Lex a source file and print tokens
-    Lex { file: PathBuf },
+    /// Lex a source file or directory and print tokens
+    Lex {
+        #[arg(value_name = "FILE_OR_DIR")]
+        file: PathBuf,
+    },
 
-    /// Parse a source file and print AST
-    Parse { file: PathBuf },
+    /// Parse a source file or directory and print AST
+    Parse {
+        #[arg(value_name = "FILE_OR_DIR")]
+        file: PathBuf,
+    },
 
-    /// Elaborate source file(s) and print result
+    /// Elaborate source file(s) or directories and print result
     Elaborate {
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "FILES_OR_DIRS")]
         files: Vec<PathBuf>,
     },
 
     /// Emit IR as JSON
     #[command(name = "emit-ir")]
     EmitIr {
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "FILES_OR_DIRS")]
         files: Vec<PathBuf>,
     },
 
     /// Export compiled temporal formulas for verify blocks as JSON
     #[command(name = "export-temporal")]
     ExportTemporal {
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "FILES_OR_DIRS")]
         files: Vec<PathBuf>,
     },
 
     /// Verify a specification: bounded model checking, scene checking, theorem proving
     Verify {
-        #[arg(required = true)]
+        #[arg(required = true, value_name = "FILES_OR_DIRS")]
         files: Vec<PathBuf>,
 
         /// SMT backend for SAT/BMC/property/theorem/scene paths
@@ -232,7 +238,8 @@ enum Command {
     /// Run QA structural analysis scripts
     #[command(name = "qa")]
     Qa {
-        /// QA script file (.qa)
+        /// QA script file or directory of .qa scripts
+        #[arg(value_name = "SCRIPT_OR_DIR")]
         script: PathBuf,
 
         /// Load specs from this directory before running the script
@@ -359,7 +366,7 @@ fn run_command(command: Command) -> miette::Result<()> {
             run_parse_command(file)?;
         }
         Command::Elaborate { files } => {
-            run_elaborate_command(files);
+            run_elaborate_command(files)?;
         }
         Command::EmitIr { files } => {
             run_emit_ir_command(files)?;
@@ -454,27 +461,93 @@ fn run_command(command: Command) -> miette::Result<()> {
 }
 
 fn run_lex_command(file: PathBuf) -> miette::Result<()> {
-    let src = driver::read_file(&file)?;
-    let tokens = driver::lex_source(&src).map_err(|errors| errors.into_iter().next().unwrap())?;
-    for (token, span) in &tokens {
-        println!("{span:?}  {token}");
+    let group_by_file = file.is_dir();
+    let files = resolve_file_by_file_source_targets(file)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
+    let group_by_file = group_by_file || files.len() > 1;
+    let mut sources = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut lexed_files = Vec::new();
+
+    for file in &files {
+        let src = driver::read_file(file)?;
+        sources.push((file.display().to_string(), src.clone()));
+        match driver::lex_source(&src) {
+            Ok(tokens) => lexed_files.push((file.clone(), tokens)),
+            Err(errors) => {
+                diagnostics.extend(
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_diagnostic().in_file(file.display().to_string())),
+                );
+            }
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        report_diagnostics(&diagnostics, &sources);
+        std::process::exit(1);
+    }
+
+    for (file, tokens) in &lexed_files {
+        if group_by_file {
+            println!("== {} ==", file.display());
+        }
+        for (token, span) in tokens {
+            println!("{span:?}  {token}");
+        }
     }
     Ok(())
 }
 
 fn run_parse_command(file: PathBuf) -> miette::Result<()> {
-    let parsed = driver::parse_file(&file)?;
-    let program = parsed.program;
-    let diagnostics = parsed.diagnostics;
+    let group_by_file = file.is_dir();
+    let files = resolve_file_by_file_source_targets(file)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
+    let group_by_file = group_by_file || files.len() > 1;
+    let mut sources = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut parsed_files = Vec::new();
+
+    for file in &files {
+        let parsed = driver::parse_file(file)?;
+        sources.push((file.display().to_string(), parsed.source));
+        diagnostics.extend(parsed.diagnostics);
+        parsed_files.push((file.clone(), parsed.program));
+    }
+
     if !diagnostics.is_empty() {
-        report_diagnostics(&diagnostics, &[(file.display().to_string(), parsed.source)]);
+        report_diagnostics(&diagnostics, &sources);
         std::process::exit(1);
     }
-    println!("{program:#?}");
+
+    for (file, program) in &parsed_files {
+        if group_by_file {
+            println!("== {} ==", file.display());
+        }
+        println!("{program:#?}");
+    }
     Ok(())
 }
 
-fn run_elaborate_command(files: Vec<PathBuf>) {
+fn resolve_file_by_file_source_targets(
+    file: PathBuf,
+) -> Result<Vec<PathBuf>, crate::targets::TargetDiscoveryError> {
+    crate::targets::resolve_source_targets(&[file])
+}
+
+fn resolve_whole_spec_source_targets(
+    files: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, crate::targets::TargetDiscoveryError> {
+    crate::targets::resolve_source_targets(&files)
+}
+
+fn run_elaborate_command(files: Vec<PathBuf>) -> miette::Result<()> {
+    let files = resolve_whole_spec_source_targets(files)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
     let elaborated = match driver::load_and_elaborate(&files) {
         Ok(elaborated) => elaborated,
         Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
@@ -484,9 +557,13 @@ fn run_elaborate_command(files: Vec<PathBuf>) {
         std::process::exit(1);
     }
     println!("{:#?}", elaborated.result);
+    Ok(())
 }
 
 fn run_emit_ir_command(files: Vec<PathBuf>) -> miette::Result<()> {
+    let files = resolve_whole_spec_source_targets(files)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
     let lowered = match driver::lower_files(&files) {
         Ok(lowered) => lowered,
         Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
@@ -503,6 +580,9 @@ fn run_emit_ir_command(files: Vec<PathBuf>) -> miette::Result<()> {
 }
 
 fn run_export_temporal_command(files: Vec<PathBuf>) -> miette::Result<()> {
+    let files = resolve_whole_spec_source_targets(files)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
     let exported = match driver::export_temporal_files(&files) {
         Ok(exported) => exported,
         Err(diagnostics) => exit_with_diagnostics(&diagnostics, &files),
@@ -626,7 +706,10 @@ struct VerifyNames {
     witness_semantics: String,
 }
 
-fn run_verify_command(args: VerifyCommand) -> miette::Result<()> {
+fn run_verify_command(mut args: VerifyCommand) -> miette::Result<()> {
+    args.files = resolve_whole_spec_source_targets(args.files)
+        .into_diagnostic()
+        .wrap_err("failed to resolve source targets")?;
     validate_verify_solver_options(&args)?;
     let names = verify_names(&args);
     let report_request = render::parse_verify_report_request(args.output.report.clone())?;
@@ -1079,26 +1162,105 @@ fn print_selected_trace_artifact(
 fn run_qa_command(script: PathBuf, spec_dir: Option<PathBuf>, format: &str) {
     let json_mode = format == "json";
     let mut hooks = QaRunnerHooks;
-    let result = crate::qa::runner::run_qa_script_with_hooks(
-        &script,
-        spec_dir.as_deref(),
-        json_mode,
-        &mut hooks,
-    );
-    for line in &result.output {
-        println!("{line}");
+    let scripts = match resolve_qa_script_targets(script) {
+        Ok(scripts) => scripts,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    let group_by_script = scripts.len() > 1 && !json_mode;
+    let mut aggregate = crate::qa::runner::QARunResult {
+        passed: 0,
+        failed: 0,
+        executed: 0,
+        output: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut any_script_failed = false;
+
+    for script in &scripts {
+        if group_by_script {
+            println!("== {} ==", script.display());
+        }
+        let result = crate::qa::runner::run_qa_script_with_hooks(
+            script,
+            spec_dir.as_deref(),
+            json_mode,
+            &mut hooks,
+        );
+        for line in &result.output {
+            println!("{line}");
+        }
+        if !result.diagnostics.is_empty() {
+            let sources = std::fs::read_to_string(script)
+                .map(|source| vec![(script.display().to_string(), source)])
+                .unwrap_or_default();
+            report_diagnostics(&result.diagnostics, &sources);
+        }
+        if result.failed > 0 || result.executed == 0 {
+            any_script_failed = true;
+        }
+        aggregate.passed += result.passed;
+        aggregate.failed += result.failed;
+        aggregate.executed += result.executed;
+        aggregate.output.extend(result.output);
+        aggregate.diagnostics.extend(result.diagnostics);
     }
-    if !result.diagnostics.is_empty() {
-        let sources = std::fs::read_to_string(&script)
-            .map(|source| vec![(script.display().to_string(), source)])
-            .unwrap_or_default();
-        report_diagnostics(&result.diagnostics, &sources);
-    }
-    if result.failed > 0 || result.executed == 0 {
-        print_qa_summary(&result, json_mode);
+
+    if any_script_failed {
+        print_qa_summary(&aggregate, json_mode);
         std::process::exit(1);
     }
-    print_qa_summary(&result, json_mode);
+    print_qa_summary(&aggregate, json_mode);
+}
+
+fn resolve_qa_script_targets(script: PathBuf) -> miette::Result<Vec<PathBuf>> {
+    if script.is_dir() {
+        let mut scripts = Vec::new();
+        collect_qa_scripts_in_directory(&script, &mut scripts)?;
+        if scripts.is_empty() {
+            return Err(miette::miette!(
+                "no QA scripts found in {}",
+                script.display()
+            ));
+        }
+        scripts.sort();
+        scripts.dedup();
+        Ok(scripts)
+    } else {
+        Ok(vec![script])
+    }
+}
+
+fn collect_qa_scripts_in_directory(
+    dir: &PathBuf,
+    scripts: &mut Vec<PathBuf>,
+) -> miette::Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read QA directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    entries.sort();
+
+    for path in entries {
+        if path.is_dir() {
+            collect_qa_scripts_in_directory(&path, scripts)?;
+        } else if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("qa")
+        ) {
+            scripts.push(
+                std::fs::canonicalize(&path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("failed to canonicalize QA script {}", path.display())
+                    })?,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_qa_summary(result: &crate::qa::runner::QARunResult, json_mode: bool) {
@@ -1216,6 +1378,7 @@ fn report_diagnostics(diagnostics: &[Diagnostic], sources: &[(String, String)]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn verify_command_for_config_tests() -> VerifyCommand {
         VerifyCommand {
@@ -1255,6 +1418,112 @@ mod tests {
             witness_semantics: VerifyWitnessSemantics::Operational,
             target: None,
         }
+    }
+
+    #[test]
+    fn help_documents_directory_capable_targets() {
+        let mut command = Cli::command();
+        for (subcommand, expected_arg) in [
+            ("lex", "<FILE_OR_DIR>"),
+            ("parse", "<FILE_OR_DIR>"),
+            ("elaborate", "<FILES_OR_DIRS>..."),
+            ("emit-ir", "<FILES_OR_DIRS>..."),
+            ("export-temporal", "<FILES_OR_DIRS>..."),
+            ("verify", "<FILES_OR_DIRS>..."),
+            ("qa", "<SCRIPT_OR_DIR>"),
+        ] {
+            let subcommand = command
+                .find_subcommand_mut(subcommand)
+                .unwrap_or_else(|| panic!("subcommand {subcommand}"));
+            let help = subcommand.render_long_help().to_string();
+            assert!(
+                help.contains(expected_arg),
+                "help should document {expected_arg}: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_spec_source_targets_expand_directories_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested dir");
+        let root = dir.path().join("a_root.ab");
+        let nested_source = nested.join("z_nested.ab");
+        std::fs::write(&nested_source, "module Nested\n").expect("write nested source");
+        std::fs::write(&root, "module Root\n").expect("write root source");
+        std::fs::write(dir.path().join("ignored.qa"), "ask entities\n").expect("write qa");
+
+        let resolved = resolve_whole_spec_source_targets(vec![dir.path().to_path_buf()])
+            .expect("resolve source directory");
+
+        assert_eq!(
+            resolved,
+            vec![
+                std::fs::canonicalize(&root).expect("canonicalize root"),
+                std::fs::canonicalize(&nested_source).expect("canonicalize nested source"),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_by_file_source_targets_expand_directories_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested dir");
+        let root = dir.path().join("a_root.ab");
+        let nested_source = nested.join("z_nested.ab");
+        std::fs::write(&nested_source, "module Nested\n").expect("write nested source");
+        std::fs::write(&root, "module Root\n").expect("write root source");
+        std::fs::write(dir.path().join("ignored.qa"), "ask entities\n").expect("write qa");
+
+        let resolved = resolve_file_by_file_source_targets(dir.path().to_path_buf())
+            .expect("resolve source directory");
+
+        assert_eq!(
+            resolved,
+            vec![
+                std::fs::canonicalize(&root).expect("canonicalize root"),
+                std::fs::canonicalize(&nested_source).expect("canonicalize nested source"),
+            ]
+        );
+    }
+
+    #[test]
+    fn qa_script_targets_expand_directories_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested dir");
+        let first = dir.path().join("a.qa");
+        let second = nested.join("b.qa");
+        std::fs::write(&second, "ask systems\n").expect("write nested qa");
+        std::fs::write(&first, "ask entities\n").expect("write first qa");
+        std::fs::write(nested.join("ignored.txt"), "ask types\n").expect("write ignored");
+
+        let resolved =
+            resolve_qa_script_targets(dir.path().to_path_buf()).expect("resolve qa directory");
+
+        assert_eq!(
+            resolved,
+            vec![
+                std::fs::canonicalize(&first).expect("canonicalize first"),
+                std::fs::canonicalize(&second).expect("canonicalize second"),
+            ]
+        );
+    }
+
+    #[test]
+    fn qa_script_targets_reject_empty_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ignored.txt"), "ask entities\n").expect("write ignored");
+
+        let error =
+            resolve_qa_script_targets(dir.path().to_path_buf()).expect_err("empty qa dir errors");
+
+        assert!(
+            error.to_string().contains("no QA scripts found"),
+            "expected empty QA directory error, got: {error}"
+        );
     }
 
     #[test]

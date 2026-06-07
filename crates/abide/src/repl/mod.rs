@@ -140,11 +140,11 @@ impl ReplState {
     }
 
     fn current_loaded_files(&self) -> Vec<PathBuf> {
-        collect_files_for_targets(&self.loaded_targets)
+        crate::targets::resolve_source_targets(&self.loaded_targets).unwrap_or_default()
     }
 
     fn add_loaded_target(&mut self, target: PathBuf) -> Result<LoadTargetOutcome, Vec<String>> {
-        let candidate_files = collect_files_for_target(&target)?;
+        let candidate_files = resolve_single_source_target(&target)?;
         let current_files = self.current_loaded_files();
         let already_loaded = !candidate_files.is_empty()
             && candidate_files
@@ -178,7 +178,7 @@ impl ReplState {
 
         if let Some(target) = target {
             let normalized = normalize_target(target).map_err(|err| vec![err])?;
-            let candidate_files = collect_files_for_target(&normalized)?;
+            let candidate_files = resolve_single_source_target(&normalized)?;
             let current_files = self.current_loaded_files();
             let covered = !candidate_files.is_empty()
                 && candidate_files
@@ -1177,12 +1177,8 @@ fn parse_explore_command(cmd: &str) -> Result<StateSpaceRequest, String> {
 }
 
 fn load_base_envs(targets: &[PathBuf]) -> Result<Env, Vec<String>> {
-    let mut paths = collect_files_for_targets(targets);
-    paths.sort();
-    paths.dedup();
-    if paths.is_empty() {
-        return Err(vec!["no .ab files found".to_owned()]);
-    }
+    let paths =
+        crate::targets::resolve_source_targets(targets).map_err(|error| vec![error.to_string()])?;
 
     let (mut env, load_errors, _) = loader::load_files(&paths);
     if !load_errors.is_empty() {
@@ -1209,44 +1205,9 @@ fn load_base_envs(targets: &[PathBuf]) -> Result<Env, Vec<String>> {
     Ok(env)
 }
 
-fn collect_files_for_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for target in targets {
-        if let Ok(mut target_paths) = collect_files_for_target(target) {
-            paths.append(&mut target_paths);
-        }
-    }
-    paths
-}
-
-fn collect_files_for_target(path: &Path) -> Result<Vec<PathBuf>, Vec<String>> {
-    let mut paths = Vec::new();
-    if path.is_file() {
-        paths.push(path.to_owned());
-    } else if path.is_dir() {
-        collect_abide_files(path, &mut paths);
-    } else {
-        return Err(vec![format!("path not found: {}", path.display())]);
-    }
-    Ok(paths)
-}
-
-fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
-    let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
-        Err(_) => return,
-    };
-    entries.sort();
-    for path in entries {
-        if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("ab" | "abi" | "abp")
-        ) {
-            paths.push(path);
-        } else if path.is_dir() {
-            collect_abide_files(&path, paths);
-        }
-    }
+fn resolve_single_source_target(path: &Path) -> Result<Vec<PathBuf>, Vec<String>> {
+    crate::targets::resolve_source_targets(&[path.to_path_buf()])
+        .map_err(|error| vec![error.to_string()])
 }
 
 fn normalize_target(path: &Path) -> Result<PathBuf, String> {
@@ -1266,12 +1227,10 @@ fn determine_startup_targets(load_path: Option<&Path>, scratch: bool) -> Option<
 }
 
 fn determine_startup_targets_in_dir(dir: &Path) -> Option<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    collect_abide_files(dir, &mut paths);
-    if paths.is_empty() {
-        None
-    } else {
+    if crate::targets::directory_contains_source_files(dir) {
         Some(vec![dir.to_path_buf()])
+    } else {
+        None
     }
 }
 
