@@ -93,7 +93,7 @@ use crate::ir::types::{
 pub use self::chc::ChcSelection;
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints,
+    create_slot_pool_with_systems, domain_constraints, initial_state_constraints_with_store_ranges,
     store_active_cardinality_constraints, SlotPool,
 };
 use self::smt::SmtValue;
@@ -2785,6 +2785,24 @@ impl<'a, 'e> VerifyAllRun<'a, 'e> {
                 config,
                 self.deadline,
             )
+        } else if matches!(theorem_result, VerificationResult::Proved { .. }) {
+            let bounded_result = check_prop_bmc_fallback(
+                self.ir,
+                &self.vctx,
+                &self.defs,
+                func,
+                target_system,
+                config,
+                self.deadline,
+            );
+            if matches!(
+                bounded_result,
+                VerificationResult::Counterexample { .. } | VerificationResult::Deadlock { .. }
+            ) {
+                bounded_result
+            } else {
+                theorem_result
+            }
         } else {
             theorem_result
         }
@@ -3261,12 +3279,12 @@ fn check_verify_block_tiered(
         merged_asserts.extend(invariant_asserts);
         verify_block_with_invariants = IRVerify {
             name: verify_block.name.clone(),
-            depth: None,
+            depth: verify_block.depth,
             systems: verify_block.systems.clone(),
             stores: verify_block.stores.clone(),
             assumption_set: verify_block.assumption_set.clone(),
-            activations: vec![],
-            initial_constraints: vec![],
+            activations: verify_block.activations.clone(),
+            initial_constraints: verify_block.initial_constraints.clone(),
             asserts: merged_asserts,
             span: verify_block.span,
             file: verify_block.file.clone(),
@@ -3852,7 +3870,11 @@ fn prove_induction_base(
     let solver = induction_solver(config);
     let initial_bindings =
         allocate_initial_activations(system.store_ranges(), system.activations()).ok()?;
-    for c in initial_state_constraints(&pool, &initial_bindings.active_slots) {
+    for c in initial_state_constraints_with_store_ranges(
+        &pool,
+        &initial_bindings.active_slots,
+        system.store_ranges(),
+    ) {
         solver.assert(&c);
     }
     for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {

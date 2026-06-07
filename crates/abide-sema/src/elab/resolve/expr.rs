@@ -18,7 +18,7 @@ fn infer_field_type(ctx: &Ctx, base: &EExpr, field_name: &str) -> Ty {
     if let Some(entity_name) = entity_name {
         if let Some(entity) = ctx.entities.get(entity_name.as_str()) {
             if let Some(field) = entity.fields.iter().find(|f| f.name == field_name) {
-                return field.ty.clone();
+                return ctx.resolve_ty(&field.ty);
             }
         }
     }
@@ -317,8 +317,14 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
             EExpr::Prime(resolved_expr.ty(), Box::new(resolved_expr), *sp)
         }
         EExpr::BinOp(ty, op, a, b, sp) => {
-            let resolved_left = resolve_expr(ctx, bound, a);
-            let resolved_right = resolve_expr(ctx, bound, b);
+            let mut resolved_left = resolve_expr(ctx, bound, a);
+            let mut resolved_right = resolve_expr(ctx, bound, b);
+            if matches!(op, BinOp::Eq | BinOp::NEq) {
+                resolved_left =
+                    resolve_comparison_ctor_from_context(ctx, resolved_left, &resolved_right.ty());
+                resolved_right =
+                    resolve_comparison_ctor_from_context(ctx, resolved_right, &resolved_left.ty());
+            }
             let resolved_ty = infer_relation_set_op_type(*op, &resolved_left, &resolved_right)
                 .or_else(|| {
                     infer_numeric_binop_type(*op, &resolved_left.ty(), &resolved_right.ty())
@@ -903,6 +909,36 @@ fn collect_epattern_vars_for_scrutinee(
     }
 }
 
+fn resolve_comparison_ctor_from_context(ctx: &Ctx, expr: EExpr, expected_ty: &Ty) -> EExpr {
+    let expected_ty = ctx.resolve_ty(expected_ty);
+    let Ty::Enum(enum_name, ctors) = &expected_ty else {
+        return expr;
+    };
+    match expr {
+        EExpr::Qual(_, scope, ctor, sp)
+            if enum_scope_matches(enum_name, &scope) && ctors.iter().any(|c| c == &ctor) =>
+        {
+            EExpr::Qual(expected_ty, scope, ctor, sp)
+        }
+        EExpr::Var(ty, ctor, sp) if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == &ctor) => {
+            EExpr::Var(expected_ty, ctor, sp)
+        }
+        other => other,
+    }
+}
+
+fn enum_scope_matches(concrete_enum: &str, written_scope: &str) -> bool {
+    let concrete_base = enum_name_without_args(concrete_enum);
+    concrete_base == written_scope
+        || concrete_base
+            .rsplit_once("::")
+            .is_some_and(|(_, bare)| bare == written_scope)
+}
+
+fn enum_name_without_args(name: &str) -> &str {
+    name.split_once('<').map_or(name, |(base, _)| base)
+}
+
 fn enum_constructors_for_ty(ctx: &Ctx, ty: &Ty) -> Option<Vec<String>> {
     match ctx.resolve_ty(ty) {
         Ty::Enum(_, ctors) => Some(ctors),
@@ -920,7 +956,7 @@ pub(super) fn resolve_var_type(ctx: &Ctx, name: &str) -> Ty {
     Ty::Error
 }
 
-/// When a constructor expression has `Ty::Unresolved` (e.g. `@None` ambiguous across
+/// When a constructor expression has `Ty::Error` (e.g. `@None` ambiguous across
 /// multiple monomorphized generics), use the declared field type to resolve it.
 /// If the field type is an enum and the constructor name is one of its variants,
 /// patch the expression's type to the field's enum type.

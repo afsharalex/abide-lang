@@ -23,6 +23,7 @@ use super::temporal::LivenessPattern;
 pub struct VerifyStoreRange {
     pub entity_type: String,
     pub start_slot: usize,
+    pub min_active: usize,
     pub slot_count: usize,
 }
 
@@ -130,6 +131,8 @@ pub(super) fn compute_verify_scope(
     for store in &verify_block.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let slot_count = store.hi.max(0) as usize;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let min_active = (store.lo.max(0) as usize).min(slot_count);
         bound = bound.max(slot_count);
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         // Track this store's slot range before accumulating.
@@ -138,6 +141,7 @@ pub(super) fn compute_verify_scope(
             VerifyStoreRange {
                 entity_type: store.entity_type.clone(),
                 start_slot: existing,
+                min_active,
                 slot_count,
             },
         );
@@ -1134,8 +1138,10 @@ mod tests {
         assert!(systems.contains(&"Orders".to_owned()));
         assert!(systems.contains(&"Audit".to_owned()));
         assert_eq!(ranges["pending"].start_slot, 0);
+        assert_eq!(ranges["pending"].min_active, 1);
         assert_eq!(ranges["pending"].slot_count, 2);
         assert_eq!(ranges["archived"].start_slot, 2);
+        assert_eq!(ranges["archived"].min_active, 0);
         assert_eq!(ranges["archived"].slot_count, 3);
     }
 

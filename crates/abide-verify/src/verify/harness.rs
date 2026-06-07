@@ -316,6 +316,27 @@ pub fn initial_state_constraints(
     pool: &SlotPool,
     active_slots: &HashSet<(String, usize)>,
 ) -> Vec<Bool> {
+    initial_state_constraints_for_required_slots(pool, active_slots)
+}
+
+pub fn initial_state_constraints_with_store_ranges(
+    pool: &SlotPool,
+    active_slots: &HashSet<(String, usize)>,
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> Vec<Bool> {
+    let mut required_slots = active_slots.clone();
+    for range in store_ranges.values() {
+        for slot in range.start_slot..range.start_slot + range.min_active {
+            required_slots.insert((range.entity_type.clone(), slot));
+        }
+    }
+    initial_state_constraints_for_required_slots(pool, &required_slots)
+}
+
+fn initial_state_constraints_for_required_slots(
+    pool: &SlotPool,
+    active_slots: &HashSet<(String, usize)>,
+) -> Vec<Bool> {
     let mut constraints = Vec::new();
 
     for ((entity, slot), actives) in &pool.active_vars {
@@ -354,9 +375,6 @@ pub fn try_entity_field_initial_constraints(
 
     for entity in entities {
         for slot in 0..pool.slots_for(&entity.name) {
-            if !active_slots.contains(&(entity.name.clone(), slot)) {
-                continue;
-            }
             for field in &entity.fields {
                 let Some(default_expr) = field.default.as_ref() else {
                     continue;
@@ -375,13 +393,51 @@ pub fn try_entity_field_initial_constraints(
                     entity_param_types: &empty_entity_param_types,
                     store_param_types: &empty_store_param_types,
                 };
-                let value = try_encode_slot_expr(&ctx, default_expr, 0)?;
-                constraints.push(smt::smt_eq(field_at_0, &value)?);
+                let value = try_encode_field_default_expr(&ctx, default_expr, &field.ty, 0)?;
+                let default_holds = smt::smt_eq(field_at_0, &value)?;
+                if active_slots.contains(&(entity.name.clone(), slot)) {
+                    constraints.push(default_holds);
+                } else if let Some(SmtValue::Bool(active)) = pool.active_at(&entity.name, slot, 0) {
+                    constraints.push(smt::bool_implies(active, &default_holds));
+                }
             }
         }
     }
 
     Ok(constraints)
+}
+
+fn try_encode_field_default_expr(
+    ctx: &SlotEncodeCtx<'_>,
+    default_expr: &IRExpr,
+    field_ty: &IRType,
+    step: usize,
+) -> Result<SmtValue, String> {
+    if let (
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            span,
+        },
+        IRType::Enum { name, .. },
+    ) = (default_expr, field_ty)
+    {
+        if args.is_empty() {
+            return ctx.vctx.variants.try_id_of(name, ctor).map(smt::int_val);
+        }
+        if enum_name != name {
+            let concrete_ctor = IRExpr::Ctor {
+                enum_name: name.clone(),
+                ctor: ctor.clone(),
+                args: args.clone(),
+                span: *span,
+            };
+            return try_encode_slot_expr(ctx, &concrete_ctor, step);
+        }
+    }
+
+    try_encode_slot_expr(ctx, default_expr, step)
 }
 
 /// Constrain each explicit store's active population at every encoded step.
@@ -413,7 +469,9 @@ pub fn store_active_cardinality_constraints(
             } else {
                 smt::int_add(&refs)
             };
+            let minimum = i64::try_from(range.min_active).unwrap_or(i64::MAX);
             let capacity = i64::try_from(range.slot_count).unwrap_or(i64::MAX);
+            constraints.push(smt::int_ge(&active_count, &smt::int_lit(minimum)));
             constraints.push(smt::int_le(&active_count, &smt::int_lit(capacity)));
         }
     }

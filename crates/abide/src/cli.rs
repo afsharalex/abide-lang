@@ -143,11 +143,11 @@ enum Command {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Bounded workflow timeout in seconds (verify/scene/BMC fallback; 0 = no timeout)
+        /// Bounded workflow timeout in seconds (verify/scene/BMC fallback; 0 = no timeout; default: 30)
         #[arg(long = "bounded-timeout")]
         bounded_timeout: Option<u64>,
 
-        /// Proof workflow timeout in seconds (theorem/lemma/contracts/IC3; 0 = no timeout)
+        /// Proof workflow timeout in seconds (theorem/lemma/contracts/IC3; 0 = no timeout; default: 120)
         #[arg(long = "proof-timeout")]
         proof_timeout: Option<u64>,
 

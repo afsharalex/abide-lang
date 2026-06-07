@@ -1069,14 +1069,28 @@ fn assert_scene_domain_constraints(
 
 fn scene_store_ranges(scene: &IRScene) -> SceneStores {
     let raw = raw_scene_store_ranges(scene);
+    let store_lowers: HashMap<_, _> = scene
+        .stores
+        .iter()
+        .map(|store| {
+            let min_active = usize::try_from(store.lo.max(0)).unwrap_or(0);
+            (store.name.as_str(), min_active)
+        })
+        .collect();
     let property = raw
         .iter()
         .map(|(store_name, (entity_type, start_slot, slot_count))| {
+            let min_active = store_lowers
+                .get(store_name.as_str())
+                .copied()
+                .unwrap_or(0)
+                .min(*slot_count);
             (
                 store_name.clone(),
                 VerifyStoreRange {
                     entity_type: entity_type.clone(),
                     start_slot: *start_slot,
+                    min_active,
                     slot_count: *slot_count,
                 },
             )
@@ -1456,9 +1470,20 @@ fn constrain_scene_initial_activity(
         .values()
         .map(|(entity, slot)| (entity.clone(), *slot))
         .collect();
+    let store_slots: HashSet<(String, usize)> = ctx
+        .stores
+        .raw
+        .values()
+        .flat_map(|(entity, start, count)| {
+            (*start..*start + *count).map(|slot| (entity.clone(), slot))
+        })
+        .collect();
     for entity in ctx.relevant_entities {
         for slot in 0..ctx.pool.slots_for(&entity.name) {
             if activated_slots.contains(&(entity.name.clone(), slot)) {
+                continue;
+            }
+            if store_slots.contains(&(entity.name.clone(), slot)) {
                 continue;
             }
             if let Some(SmtValue::Bool(active)) = ctx.pool.active_at(&entity.name, slot, 0) {

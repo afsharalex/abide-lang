@@ -17,9 +17,9 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::encode::encode_pure_expr;
 use super::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints, lasso_loopback,
-    store_active_cardinality_constraints, symmetry_breaking_constraints, try_encode_guard_expr,
-    try_entity_field_initial_constraints, try_fairness_constraints,
+    create_slot_pool_with_systems, domain_constraints, initial_state_constraints_with_store_ranges,
+    lasso_loopback, store_active_cardinality_constraints, symmetry_breaking_constraints,
+    try_encode_guard_expr, try_entity_field_initial_constraints, try_fairness_constraints,
     try_system_field_initial_constraints, try_transition_constraints_with_fire, FireTracking,
     LassoLoop, SlotPool,
 };
@@ -1055,8 +1055,11 @@ impl<'a> TransitionSmtEncoding<'a> {
         );
         let initial_bindings =
             allocate_initial_activations(system.store_ranges(), system.activations())?;
-        let mut initial_constraints =
-            initial_state_constraints(&pool, &initial_bindings.active_slots);
+        let mut initial_constraints = initial_state_constraints_with_store_ranges(
+            &pool,
+            &initial_bindings.active_slots,
+            system.store_ranges(),
+        );
         initial_constraints.extend(try_entity_field_initial_constraints(
             &pool,
             system.vctx,
@@ -1574,8 +1577,8 @@ pub fn solve_transition_obligation(obligation: TransitionObligation<'_>) -> Tran
 mod tests {
     use super::*;
     use crate::ir::types::{
-        IRAssumptionSet, IRCommandRef, IRField, IRProgram, IRSystem, IRTransition, IRType,
-        IRVariant, IRVerify, IRVerifySystem, LitVal,
+        IRAssumptionSet, IRCommandRef, IRField, IRProgram, IRStoreDecl, IRSystem, IRTransition,
+        IRType, IRVariant, IRVerify, IRVerifySystem, LitVal,
     };
     use crate::verify::smt::{self, AbideSolver, SatResult};
 
@@ -1684,6 +1687,107 @@ mod tests {
         assert_eq!(roundtrip.weak_fair.len(), 2);
         assert_eq!(roundtrip.strong_fair.len(), 1);
         assert_eq!(roundtrip.per_tuple.len(), 1);
+    }
+
+    #[test]
+    fn transition_encoding_seeds_declared_store_lower_bound_at_initial_state() {
+        let account = IREntity {
+            name: "Account".to_owned(),
+            fields: vec![IRField {
+                name: "balance".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }),
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let bank = IRSystem {
+            name: "Bank".to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec!["Account".to_owned()],
+            commands: vec![],
+            actions: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            let_bindings: vec![],
+            preds: vec![],
+            procs: vec![],
+        };
+        let verify = IRVerify {
+            name: "store_initial".to_owned(),
+            depth: Some(1),
+            systems: vec![IRVerifySystem {
+                name: "Bank".to_owned(),
+                lo: 0,
+                hi: 1,
+            }],
+            stores: vec![IRStoreDecl {
+                name: "accounts".to_owned(),
+                entity_type: "Account".to_owned(),
+                lo: 1,
+                hi: 1,
+            }],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
+            initial_constraints: vec![],
+            asserts: vec![IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }],
+            span: None,
+            file: None,
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![account],
+            systems: vec![bank],
+            verifies: vec![verify.clone()],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let obligation = TransitionVerifyObligation::for_verify(&ir, &vctx, &verify, &defs)
+            .expect("transition obligation");
+        let encoding = TransitionSmtEncoding::from_plan(obligation.bmc_plan()).expect("encoding");
+        let solver = AbideSolver::new();
+        for constraint in encoding.initial_constraints() {
+            solver.assert(constraint);
+        }
+
+        assert_eq!(solver.check(), SatResult::Sat);
+        let active = encoding
+            .pool()
+            .active_at("Account", 0, 0)
+            .expect("account active flag")
+            .as_bool()
+            .expect("active flag should be bool");
+        solver.assert(smt::bool_not(active));
+        assert_eq!(solver.check(), SatResult::Unsat);
+        let balance = encoding
+            .pool()
+            .field_at("Account", 0, "balance", 0)
+            .expect("account balance field")
+            .as_int()
+            .expect("balance should be int");
+        solver.assert(smt::bool_not(&smt::int_eq(balance, &smt::int_lit(0))));
+        assert_eq!(solver.check(), SatResult::Unsat);
     }
 
     #[test]

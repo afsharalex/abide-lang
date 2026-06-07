@@ -83,10 +83,13 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
         IRExpr::App { func, arg, .. } => {
             needs_property_encoder(func) || needs_property_encoder(arg)
         }
-        IRExpr::Forall { body, .. }
-        | IRExpr::Exists { body, .. }
-        | IRExpr::One { body, .. }
-        | IRExpr::Lone { body, .. } => needs_property_encoder(body),
+        IRExpr::Forall { domain, body, .. }
+        | IRExpr::Exists { domain, body, .. }
+        | IRExpr::One { domain, body, .. }
+        | IRExpr::Lone { domain, body, .. } => {
+            matches!(domain, crate::ir::types::IRType::Entity { .. })
+                || needs_property_encoder(body)
+        }
         IRExpr::Aggregate {
             body, in_filter, ..
         } => {
@@ -1456,6 +1459,14 @@ mod tests {
             domain: IRType::Int,
             predicate: Some(Box::new(bool_lit(true))),
             ty: IRType::Int,
+            span: None,
+        });
+        assert_needs(IRExpr::Forall {
+            var: "entity".to_owned(),
+            domain: IRType::Entity {
+                name: "Thing".to_owned(),
+            },
+            body: Box::new(bool_lit(true)),
             span: None,
         });
         assert_needs(IRExpr::Assert {

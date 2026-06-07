@@ -2120,11 +2120,15 @@ fn relational_verify_spec(
             return Ok(None);
         };
         let slot_count = usize::try_from(store.hi).unwrap_or(0);
+        let min_active = usize::try_from(store.lo.max(0))
+            .unwrap_or(0)
+            .min(slot_count);
         store_ranges.insert(
             store.name.clone(),
             VerifyStoreRange {
                 entity_type: store.entity_type.clone(),
                 start_slot: 0,
+                min_active,
                 slot_count,
             },
         );

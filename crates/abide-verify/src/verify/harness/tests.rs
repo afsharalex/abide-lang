@@ -634,7 +634,7 @@ fn entity_field_initial_constraints_apply_defaults_to_explicit_active_slots() {
 
     let constraints = try_entity_field_initial_constraints(&pool, &vctx, &[entity], &active_slots)
         .expect("entity initial defaults should encode");
-    assert_eq!(constraints.len(), 3);
+    assert_eq!(constraints.len(), 6);
 
     let solver = AbideSolver::new();
     for constraint in &constraints {
@@ -678,6 +678,7 @@ fn store_active_cardinality_constraints_allow_empty_capacity() {
         crate::verify::scope::VerifyStoreRange {
             entity_type: "Order".to_owned(),
             start_slot: 0,
+            min_active: 0,
             slot_count: 2,
         },
     );

@@ -467,7 +467,7 @@ pub fn try_encode_create(
                     }
                 } else if let Some(ref default_expr) = field.default {
                     // Deterministic: field_next == default
-                    let val = try_encode_slot_expr(&ctx, default_expr, step)?;
+                    let val = try_encode_field_default_expr(&ctx, default_expr, &field.ty, step)?;
                     if let Some(field_next) =
                         pool.field_at(entity_name, slot, &field.name, step + 1)
                     {

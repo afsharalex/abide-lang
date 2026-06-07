@@ -74,6 +74,36 @@ fn is_terminal_verdict_line(line: &str) -> bool {
     STATUSES.iter().any(|status| trimmed.starts_with(status))
 }
 
+fn eexpr_contains_qualified_variant(
+    expr: &abide::elab::types::EExpr,
+    enum_name: &str,
+    variant: &str,
+) -> bool {
+    use abide::elab::types::EExpr;
+
+    match expr {
+        EExpr::Qual(_, owner, name, _) => owner == enum_name && name == variant,
+        EExpr::BinOp(_, _, left, right, _) => {
+            eexpr_contains_qualified_variant(left, enum_name, variant)
+                || eexpr_contains_qualified_variant(right, enum_name, variant)
+        }
+        EExpr::UnOp(_, _, operand, _)
+        | EExpr::Field(_, operand, _, _)
+        | EExpr::Prime(_, operand, _)
+        | EExpr::Always(_, operand, _)
+        | EExpr::Eventually(_, operand, _)
+        | EExpr::Historically(_, operand, _)
+        | EExpr::Once(_, operand, _)
+        | EExpr::Previously(_, operand, _)
+        | EExpr::Assert(_, operand, _)
+        | EExpr::Assume(_, operand, _)
+        | EExpr::Card(_, operand, _) => {
+            eexpr_contains_qualified_variant(operand, enum_name, variant)
+        }
+        _ => false,
+    }
+}
+
 macro_rules! require_unbounded_proof_tests {
     () => {
         if !should_run_unbounded_proof_tests() {
@@ -2495,6 +2525,83 @@ fn verify_enforces_entity_field_refinements_as_implicit_invariants() {
                 if name == "field_refinement_preserved"
         )),
         "invalid refined field update should violate the implicit field invariant: {results:?}"
+    );
+}
+
+#[test]
+fn verify_store_lower_bound_seeds_required_slots_with_defaults() {
+    let src = r"module StoreLowerBoundDefaults
+
+enum TicketStatus = Open | Closed
+
+entity Ticket {
+  status: TicketStatus = @Open
+  priority: int { $ >= 0 } = 1
+}
+
+system Helpdesk(tickets: Store<Ticket>) {}
+
+verify lower_bound_defaults {
+  assume {
+    store tickets: Ticket[2]
+    let helpdesk = Helpdesk { tickets: tickets }
+    stutter
+  }
+
+  assert always (some t: Ticket in tickets | true)
+  assert always (not (lone t: Ticket in tickets | true))
+  assert always (all t: Ticket in tickets | t.status == @Open and t.priority == 1)
+}
+";
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+            if name == "lower_bound_defaults"
+        )),
+        "store lower-bound slots should start active with field defaults: {results:?}"
+    );
+}
+
+#[test]
+fn auto_prop_bounded_guard_rejects_vacuous_unbounded_proof() {
+    let src = r"module AutoPropGuard
+
+enum SwitchStatus = Off | On
+
+entity Switch {
+  status: SwitchStatus = @Off
+
+  action turn_on() requires status == @Off {
+    status' = @On
+  }
+}
+
+system Panel(switches: Store<Switch>) {
+  command create_switch() {
+    create Switch {}
+  }
+
+  command turn_on_switch() {
+    choose s: Switch where s.status == @Off {
+      s.turn_on()
+    }
+  }
+}
+
+prop all_switches_stay_off for Panel =
+  all s: Switch | s.status == @Off
+";
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Counterexample { name, .. }
+                if name == "prop_all_switches_stay_off"
+        )),
+        "auto-prop verification must prefer a bounded operational counterexample over a vacuous proof: {results:?}"
     );
 }
 
@@ -7025,8 +7132,8 @@ fn verify_liveness_per_tuple_fairness() {
          command tick(j: Job) { j.toggle() }\n}\n\n\
          verify per_tuple_liveness {
   assume {
-    store es: E[0..8]
-    let s = S { es: es }
+    store jobs: Job[0..8]
+    let s = S { jobs: jobs }
     fair S::create_job\n    fair S::tick\n  }\n  \
          assert all j: Job | eventually j.active\n}\n",
     )
@@ -12856,14 +12963,17 @@ entity Order {
         .iter()
         .find(|d| d.name == "is_terminal")
         .expect("synthesized is_terminal derived field");
-    let body = format!("{:?}", synth.body);
     assert!(
-        body.contains("delivered") && body.contains("cancelled"),
-        "synthesized is_terminal body should reference @delivered and @cancelled, got: {body}"
+        eexpr_contains_qualified_variant(&synth.body, "OrderStatus", "delivered")
+            && eexpr_contains_qualified_variant(&synth.body, "OrderStatus", "cancelled"),
+        "synthesized is_terminal body should reference @delivered and @cancelled, got: {:?}",
+        synth.body
     );
     assert!(
-        !body.contains(" \"cart\"") && !body.contains(" \"placed\""),
-        "synthesized is_terminal body should NOT reference non-terminal states, got: {body}"
+        !eexpr_contains_qualified_variant(&synth.body, "OrderStatus", "cart")
+            && !eexpr_contains_qualified_variant(&synth.body, "OrderStatus", "placed"),
+        "synthesized is_terminal body should NOT reference non-terminal states, got: {:?}",
+        synth.body
     );
 }
 
@@ -17932,7 +18042,7 @@ program Shop(orders: Store<Order>) {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("unknown") && e.contains("not a let binding")),
+            .any(|e| e.contains("unknown") && e.contains("self") && e.contains("let binding")),
         "expected unknown instance error, got: {errors:?}"
     );
 }
@@ -19176,6 +19286,84 @@ verify v {
             if name == "v"
         )),
         "expected verify with multi-instantiation defaults to pass, got: {results:?}"
+    );
+}
+
+#[test]
+fn generic_enum_defaults_apply_to_lower_bound_store_members() {
+    let src = r"module T
+
+enum Option<T> = Some(T) | None
+
+entity Order {
+  maybe_id: Option<int> = @None
+  maybe_flag: Option<bool> = @None
+}
+
+system Registry(orders: Store<Order>) {}
+
+verify seeded_generic_defaults {
+  assume {
+    store orders: Order[1]
+    let registry = Registry { orders: orders }
+    stutter
+  }
+
+  assert always (
+    all o: Order in orders |
+      o.maybe_id == @Option::None
+        and o.maybe_flag == @Option::None
+  )
+}
+";
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+            if name == "seeded_generic_defaults"
+        )),
+        "generic enum defaults should apply to lower-bound active store members, got: {results:?}"
+    );
+}
+
+#[test]
+fn generic_enum_defaults_infer_unqualified_none_in_property_comparisons() {
+    let src = r"module T
+
+enum Option<T> = Some(T) | None
+
+entity Order {
+  maybe_id: Option<int> = @None
+  maybe_flag: Option<bool> = @None
+}
+
+system Registry(orders: Store<Order>) {}
+
+verify seeded_generic_defaults_unqualified {
+  assume {
+    store orders: Order[1]
+    let registry = Registry { orders: orders }
+    stutter
+  }
+
+  assert always (
+    all o: Order in orders |
+      o.maybe_id == @None
+        and o.maybe_flag == @None
+  )
+}
+";
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+            if name == "seeded_generic_defaults_unqualified"
+        )),
+        "generic enum defaults should infer unqualified @None from property field types, got: {results:?}"
     );
 }
 

@@ -228,7 +228,7 @@ pub(super) struct PropertyCtx {
     /// Used for enum/Int/Bool/Real domain quantifiers in verify/theorem properties.
     pub(super) locals: HashMap<String, SmtValue>,
     /// Store ranges from `compute_verify_scope`. Maps `store_name` →
-    /// `VerifyStoreRange { entity_type, start_slot, slot_count }`.
+    /// `VerifyStoreRange { entity_type, start_slot, min_active, slot_count }`.
     /// Available for future store-scoped quantifier iteration: when a
     /// quantifier has an `in store_name` filter, the encoding can
     /// restrict iteration to `start_slot..start_slot+slot_count` instead
@@ -1135,8 +1135,15 @@ pub(super) fn encode_prop_expr(
             )? {
                 return Ok(encoded);
             }
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
+            let enc = PropertyEncodingCtx {
+                pool,
+                vctx,
+                defs,
+                property: ctx,
+                step,
+            };
+            let l = encode_prop_value_for_comparison(&enc, left, right)?;
+            let r = encode_prop_value_for_comparison(&enc, right, left)?;
             Ok(smt::binop(op, &l, &r)?.to_bool()?)
         }
         IRExpr::BinOp {
@@ -1153,8 +1160,15 @@ pub(super) fn encode_prop_expr(
         IRExpr::BinOp {
             op, left, right, ..
         } => {
-            let l = encode_prop_value(pool, vctx, defs, ctx, left, step)?;
-            let r = encode_prop_value(pool, vctx, defs, ctx, right, step)?;
+            let enc = PropertyEncodingCtx {
+                pool,
+                vctx,
+                defs,
+                property: ctx,
+                step,
+            };
+            let l = encode_prop_value_for_comparison(&enc, left, right)?;
+            let r = encode_prop_value_for_comparison(&enc, right, left)?;
             Ok(smt::binop(op, &l, &r)?.to_bool()?)
         }
         // Literals
@@ -2926,11 +2940,49 @@ fn encode_prop_binop_value(
         "OpMapHas" => encode_prop_map_has_value(enc, left, right),
         "OpMapMerge" => encode_prop_map_merge_value(enc, left, right),
         _ => {
-            let l = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, left, enc.step)?;
-            let r = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, right, enc.step)?;
+            let l = encode_prop_value_for_comparison(&enc, left, right)?;
+            let r = encode_prop_value_for_comparison(&enc, right, left)?;
             Ok(smt::binop(op, &l, &r)?)
         }
     }
+}
+
+fn encode_prop_value_for_comparison(
+    enc: &PropertyEncodingCtx<'_>,
+    expr: &IRExpr,
+    other: &IRExpr,
+) -> Result<SmtValue, String> {
+    if let (
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            ..
+        },
+        Some(IRType::Enum { name, variants }),
+    ) = (expr, slot_field_expr_type(enc.property, other))
+    {
+        if args.is_empty()
+            && enum_name == name
+            && variants
+                .iter()
+                .any(|variant| variant.name == *ctor && variant.fields.is_empty())
+        {
+            return enc.vctx.variants.try_id_of(name, ctor).map(smt::int_val);
+        }
+    }
+
+    encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, expr, enc.step)
+}
+
+fn slot_field_expr_type<'a>(ctx: &PropertyCtx, expr: &'a IRExpr) -> Option<&'a IRType> {
+    let IRExpr::Field { expr: base, ty, .. } = expr else {
+        return None;
+    };
+    let IRExpr::Var { name, .. } = base.as_ref() else {
+        return None;
+    };
+    ctx.bindings.contains_key(name).then_some(ty)
 }
 
 fn encode_prop_seq_concat_value(
@@ -3180,6 +3232,9 @@ fn encode_prop_index_value(
     key: &IRExpr,
     ty: &IRType,
 ) -> Result<SmtValue, String> {
+    if let Some(membership) = encode_prop_store_membership_index(enc, map, key)? {
+        return Ok(SmtValue::Bool(membership));
+    }
     let arr = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, map, enc.step)?;
     let k = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, key, enc.step)?;
     if let Some(IRType::Map { value, .. }) = expr_type(map) {
@@ -3192,6 +3247,46 @@ fn encode_prop_index_value(
         arr.as_array()?.select(&k.to_dynamic()),
         ty,
     ))
+}
+
+fn encode_prop_store_membership_index(
+    enc: PropertyEncodingCtx<'_>,
+    map: &IRExpr,
+    key: &IRExpr,
+) -> Result<Option<Bool>, String> {
+    let IRExpr::Var {
+        name: store_name, ..
+    } = map
+    else {
+        return Ok(None);
+    };
+    let Some(range) = enc.property.store_ranges.get(store_name) else {
+        return Ok(None);
+    };
+    let IRExpr::Var { name: key_var, .. } = key else {
+        return Ok(None);
+    };
+    let Some((entity_name, slot)) = enc.property.bindings.get(key_var) else {
+        return Ok(None);
+    };
+    if entity_name != &range.entity_type {
+        return Err(format!(
+            "store `{store_name}` contains `{}`, but membership key `{key_var}` is `{entity_name}`",
+            range.entity_type
+        ));
+    }
+    let in_range =
+        *slot >= range.start_slot && *slot < range.start_slot.saturating_add(range.slot_count);
+    if !in_range {
+        return Ok(Some(smt::bool_const(false)));
+    }
+    match enc.pool.active_at(entity_name, *slot, enc.step) {
+        Some(SmtValue::Bool(active)) => Ok(Some(active.clone())),
+        Some(other) => Err(format!(
+            "store membership expected bool active flag for `{entity_name}` slot {slot}, got {other:?}"
+        )),
+        None => Ok(Some(smt::bool_const(false))),
+    }
 }
 
 fn encode_prop_map_lit_value(
@@ -4437,6 +4532,7 @@ mod tests {
             crate::verify::scope::VerifyStoreRange {
                 entity_type: "Order".to_owned(),
                 start_slot: 2,
+                min_active: 0,
                 slot_count: 3,
             },
         );
@@ -6402,6 +6498,7 @@ mod tests {
             crate::verify::scope::VerifyStoreRange {
                 entity_type: "Order".to_owned(),
                 start_slot: 0,
+                min_active: 0,
                 slot_count: 2,
             },
         );
@@ -6535,6 +6632,7 @@ mod tests {
             crate::verify::scope::VerifyStoreRange {
                 entity_type: "Order".to_owned(),
                 start_slot: 0,
+                min_active: 0,
                 slot_count: 1,
             },
         );
@@ -6543,6 +6641,7 @@ mod tests {
             crate::verify::scope::VerifyStoreRange {
                 entity_type: "Order".to_owned(),
                 start_slot: 1,
+                min_active: 0,
                 slot_count: 1,
             },
         );
@@ -6650,6 +6749,25 @@ mod tests {
             encode_prop_expr(&pool, &vctx, &defs, &ctx, &one_pending, 0).expect("store-scoped one");
         let lone = encode_prop_expr(&pool, &vctx, &defs, &ctx, &lone_pending, 0)
             .expect("store-scoped lone");
+        let slot_0_ctx = ctx.with_binding("o", "Order", 0);
+        let pending_membership = encode_prop_expr(
+            &pool,
+            &vctx,
+            &defs,
+            &slot_0_ctx,
+            &membership("pending", "o"),
+            0,
+        )
+        .expect("direct pending membership");
+        let archived_membership = encode_prop_expr(
+            &pool,
+            &vctx,
+            &defs,
+            &slot_0_ctx,
+            &membership("archived", "o"),
+            0,
+        )
+        .expect("direct archived membership");
 
         let solver = AbideSolver::new();
         solver.assert(
@@ -6770,6 +6888,26 @@ mod tests {
             &smt::int_lit(1),
         ));
         solver.assert(&smt::bool_not(&lone));
+        assert_eq!(solver.check(), SatResult::Unsat);
+
+        let solver = AbideSolver::new();
+        solver.assert(
+            pool.active_at("Order", 0, 0)
+                .expect("active0")
+                .to_bool()
+                .expect("bool"),
+        );
+        solver.assert(&smt::bool_not(&pending_membership));
+        assert_eq!(solver.check(), SatResult::Unsat);
+
+        let solver = AbideSolver::new();
+        solver.assert(
+            pool.active_at("Order", 0, 0)
+                .expect("active0")
+                .to_bool()
+                .expect("bool"),
+        );
+        solver.assert(&archived_membership);
         assert_eq!(solver.check(), SatResult::Unsat);
     }
 

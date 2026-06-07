@@ -24294,14 +24294,14 @@ fn verify_routes_store_relation_reachability_to_rustsat() {
 }
 
 #[test]
-fn scene_store_bound_is_capacity_not_initial_population() {
+fn scene_store_lower_bound_seeds_initial_population() {
     let ir = lower_source_file(
-        "scene_store_bound_capacity.ab",
+        "scene_store_lower_bound_population.ab",
         "module StoreCardinality\n\n\
          enum Status = Pending\n\n\
          entity Order {\n  status: Status = @Pending\n}\n\n\
          system Commerce(orders: Store<Order>[1]) {}\n\n\
-         scene capacity_starts_empty {\n\
+         scene lower_bound_starts_nonempty {\n\
            given {\n\
              store orders: Order[1]\n\
              let commerce = Commerce { orders: orders }\n\
@@ -24317,8 +24317,8 @@ fn scene_store_bound_is_capacity_not_initial_population() {
     assert!(
         results
             .iter()
-            .any(|r| matches!(r, VerificationResult::ScenePass { name, .. } if name == "capacity_starts_empty")),
-        "store bounds should describe capacity, not initial population: {results:?}"
+            .any(|r| matches!(r, VerificationResult::SceneFail { name, .. } if name == "lower_bound_starts_nonempty")),
+        "store lower bounds should seed initial population: {results:?}"
     );
 }
 
@@ -26121,14 +26121,14 @@ fn relational_verify_fragment_detects_create_only_bounded_verify() {
 }
 
 #[test]
-fn verify_store_bound_is_capacity_not_initial_population() {
+fn verify_store_lower_bound_seeds_initial_population() {
     let ir = lower_source_file(
-        "verify_store_bound_capacity.ab",
+        "verify_store_lower_bound_population.ab",
         "module StoreCardinality\n\n\
          enum Status = Pending\n\n\
          entity Order {\n  status: Status = @Pending\n}\n\n\
          system Commerce(orders: Store<Order>[1]) {}\n\n\
-         verify capacity_starts_empty_verify {\n\
+         verify lower_bound_starts_nonempty_verify {\n\
            assume {\n\
              stutter\n\
              store orders: Order[1]\n\
@@ -26143,10 +26143,10 @@ fn verify_store_bound_is_capacity_not_initial_population() {
     assert!(
         results.iter().any(|r| matches!(
             r,
-            VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }
-                if name == "capacity_starts_empty_verify"
+            VerificationResult::Counterexample { name, .. }
+                if name == "lower_bound_starts_nonempty_verify"
         )),
-        "store bounds should describe capacity, not initial population for verify blocks: {results:?}"
+        "store lower bounds should seed initial population for verify blocks: {results:?}"
     );
 }
 

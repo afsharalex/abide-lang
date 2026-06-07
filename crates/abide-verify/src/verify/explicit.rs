@@ -674,8 +674,6 @@ impl<'a> ExplicitModel<'a> {
             }
         }
 
-        let active_slot_options = vec![initial_active_slots];
-
         let model = Self {
             roots: system.selected_system_names().to_vec(),
             system_fields,
@@ -694,6 +692,11 @@ impl<'a> ExplicitModel<'a> {
             strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
             per_tuple_fair: system.assumptions().per_tuple_fair_event_keys().to_vec(),
         };
+        let active_slot_options = enumerate_initial_active_slot_options(
+            system.store_ranges(),
+            &model.entity_indices,
+            &initial_active_slots,
+        )?;
         let initial_int_candidates = collect_initial_int_candidates(&model.initial_constraints);
         let mut initial_states = Vec::new();
         for active_slots in active_slot_options {
@@ -2153,6 +2156,36 @@ fn strongly_connected_components(
     }
 
     tarjan.components
+}
+
+fn enumerate_initial_active_slot_options(
+    store_ranges: &HashMap<String, super::scope::VerifyStoreRange>,
+    entity_indices: &HashMap<String, usize>,
+    required_active_slots: &HashSet<(usize, usize)>,
+) -> Result<Vec<HashSet<(usize, usize)>>, String> {
+    let mut active_slots = required_active_slots.clone();
+    let mut ranges = store_ranges.iter().collect::<Vec<_>>();
+    ranges.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (store_name, range) in ranges {
+        let Some(&entity_index) = entity_indices.get(&range.entity_type) else {
+            return Err(format!(
+                "store `{store_name}` references unknown explicit-state entity `{}`",
+                range.entity_type
+            ));
+        };
+        if range.min_active > range.slot_count {
+            return Err(format!(
+                "store `{store_name}` cannot satisfy minimum active bound {}",
+                range.min_active
+            ));
+        }
+        for slot in range.start_slot..range.start_slot + range.min_active {
+            active_slots.insert((entity_index, slot));
+        }
+    }
+
+    Ok(vec![active_slots])
 }
 
 fn enumerate_initial_states(
