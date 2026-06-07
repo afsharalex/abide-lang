@@ -258,6 +258,9 @@ pub struct VerifyArtifactConfig<'a> {
     pub chc_solver: &'a str,
     pub bounded_only: bool,
     pub unbounded_only: bool,
+    pub overall_timeout_ms: u64,
+    pub bounded_timeout_ms: u64,
+    pub proof_timeout_ms: u64,
     pub induction_timeout_ms: u64,
     pub bmc_timeout_ms: u64,
     pub bmc_iterative_deepening: bool,
@@ -336,6 +339,9 @@ fn verification_artifact(
             .option("chc_solver", config.chc_solver)
             .option("bounded_only", config.bounded_only)
             .option("unbounded_only", config.unbounded_only)
+            .option("overall_timeout_ms", config.overall_timeout_ms)
+            .option("bounded_timeout_ms", config.bounded_timeout_ms)
+            .option("proof_timeout_ms", config.proof_timeout_ms)
             .option("induction_timeout_ms", config.induction_timeout_ms)
             .option("bmc_timeout_ms", config.bmc_timeout_ms)
             .option("bmc_iterative_deepening", config.bmc_iterative_deepening)
@@ -1188,6 +1194,9 @@ mod tests {
             chc_solver: "z3",
             bounded_only: true,
             unbounded_only: false,
+            overall_timeout_ms: 3_000,
+            bounded_timeout_ms: 2_000,
+            proof_timeout_ms: 1_000,
             induction_timeout_ms: 1_000,
             bmc_timeout_ms: 2_000,
             bmc_iterative_deepening: true,

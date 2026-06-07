@@ -73,6 +73,8 @@ Selected flags:
 - `--bounded-only`
 - `--unbounded-only`
 - `--timeout <secs>`
+- `--bounded-timeout <secs>`
+- `--proof-timeout <secs>`
 - `--induction-timeout <secs>`
 - `--bmc-timeout <secs>`
 - `--prop-bmc-depth <depth>`
@@ -109,12 +111,25 @@ Do not parse human terminal output for automation. Use `--report json`,
 stable machine-readable verification results or evidence.
 
 Ordinary `verify` runs bounded/exploration checking by default with a
-30-second end-to-end timeout. When a bounded `CHECKED` result may need an
-unbounded proof attempt, Abide reports that and suggests an explicit proof-mode
-rerun. Use `--ic3` to opt verify blocks into IC3/PDR proof search, or
-`--unbounded-only` when you want proof search without the bounded fallback.
-Scenes and `run`/`simulate` remain bounded/execution workflows and do not use
-proof engines.
+30-second bounded timeout. Theorem, lemma, function-contract, and IC3/PDR proof
+workflows use a separate 120-second proof timeout by default. `--timeout`
+sets a generic timeout for every class that does not have a more granular
+override. `--bounded-timeout` applies to bounded workflows and BMC fallbacks;
+`--proof-timeout` applies to proof workflows, theorem/lemma induction, function
+contracts, and IC3/PDR. Backend-specific flags are most specific:
+`--bmc-timeout` overrides `--bounded-timeout`, while `--induction-timeout` and
+`--ic3-timeout` override `--proof-timeout`. A timeout value of `0` disables that
+timeout class.
+
+JSON reports and trace artifacts include the resolved timeout policy:
+`overall_timeout_ms`, `bounded_timeout_ms`, `proof_timeout_ms`, and the concrete
+backend timeouts. This makes it clear whether a result used bounded or proof
+timeout policy. When a bounded `CHECKED` result may need an unbounded proof
+attempt, Abide reports that and suggests an explicit proof-mode rerun. Use
+`--ic3` to opt verify blocks into IC3/PDR proof search, or `--unbounded-only`
+when you want proof search without the bounded fallback. Scenes and
+`run`/`simulate` remain bounded/execution workflows and do not use proof
+engines.
 
 Safety BMC searches depths incrementally by default so counterexamples stop at
 the first failing bound. Use `--no-bmc-iterative-deepening` to run the selected

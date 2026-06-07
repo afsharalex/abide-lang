@@ -139,17 +139,25 @@ enum Command {
         #[arg(long, conflicts_with = "bounded_only")]
         unbounded_only: bool,
 
-        /// End-to-end verify timeout in seconds (default: 30, 0 = no timeout)
-        #[arg(long, default_value_t = DEFAULT_VERIFY_TIMEOUT_SECS)]
-        timeout: u64,
+        /// Generic verify timeout in seconds (0 = no timeout)
+        #[arg(long)]
+        timeout: Option<u64>,
 
-        /// Induction timeout in seconds (default: 30, 0 = no timeout)
-        #[arg(long, default_value_t = DEFAULT_INDUCTION_TIMEOUT_SECS)]
-        induction_timeout: u64,
+        /// Bounded workflow timeout in seconds (verify/scene/BMC fallback; 0 = no timeout)
+        #[arg(long = "bounded-timeout")]
+        bounded_timeout: Option<u64>,
 
-        /// BMC timeout in seconds (default: 30, 0 = no timeout)
-        #[arg(long, default_value_t = DEFAULT_BMC_TIMEOUT_SECS)]
-        bmc_timeout: u64,
+        /// Proof workflow timeout in seconds (theorem/lemma/contracts/IC3; 0 = no timeout)
+        #[arg(long = "proof-timeout")]
+        proof_timeout: Option<u64>,
+
+        /// Induction timeout in seconds (overrides --proof-timeout; 0 = no timeout)
+        #[arg(long)]
+        induction_timeout: Option<u64>,
+
+        /// BMC timeout in seconds (overrides --bounded-timeout; 0 = no timeout)
+        #[arg(long)]
+        bmc_timeout: Option<u64>,
 
         /// BMC fallback depth for auto-verified props
         #[arg(long = "prop-bmc-depth", default_value_t = DEFAULT_PROP_BMC_DEPTH)]
@@ -159,9 +167,9 @@ enum Command {
         #[arg(long = "no-bmc-iterative-deepening")]
         no_bmc_iterative_deepening: bool,
 
-        /// IC3/PDR timeout in seconds (default: 30, 0 = no timeout)
-        #[arg(long, default_value_t = DEFAULT_IC3_TIMEOUT_SECS)]
-        ic3_timeout: u64,
+        /// IC3/PDR timeout in seconds (overrides --proof-timeout; 0 = no timeout)
+        #[arg(long)]
+        ic3_timeout: Option<u64>,
 
         /// Opt ordinary verify blocks into IC3/PDR proof search
         #[arg(long)]
@@ -312,27 +320,23 @@ enum TraceCommand {
     Json,
 }
 
-/// Default timeout for verifier passes, in seconds.
+/// Default generic timeout for verifier passes, in seconds.
 ///
-/// The default user-facing verify path should terminate on its own even when
-/// backends hit hard cases. Individual passes remain overrideable with the
-/// existing per-flag controls.
+/// When users pass `--timeout`, it applies to every timeout class that does
+/// not have a more granular override.
 const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 30;
 
-/// Default timeout for Tier 1 induction attempts, in seconds.
-const DEFAULT_INDUCTION_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
+/// Default timeout for bounded workflows, in seconds.
+const DEFAULT_BOUNDED_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
+
+/// Default timeout for proof workflows, in seconds.
+const DEFAULT_PROOF_TIMEOUT_SECS: u64 = 120;
 
 /// Default bounded model checking depth for auto-verified props.
 ///
 /// Props don't have an explicit `[0..N]` scope like verify blocks.
 /// When induction fails for a prop, the BMC fallback uses this depth.
 const DEFAULT_PROP_BMC_DEPTH: usize = 10;
-
-/// Default timeout for IC3/PDR attempts, in seconds.
-const DEFAULT_BMC_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
-
-/// Default timeout for IC3/PDR attempts, in seconds.
-const DEFAULT_IC3_TIMEOUT_SECS: u64 = DEFAULT_VERIFY_TIMEOUT_SECS;
 
 /// Parses CLI arguments from the process environment and dispatches
 /// the chosen subcommand. The `main` binary calls this directly.
@@ -370,6 +374,8 @@ fn run_command(command: Command) -> miette::Result<()> {
             bounded_only,
             unbounded_only,
             timeout,
+            bounded_timeout,
+            proof_timeout,
             induction_timeout,
             bmc_timeout,
             prop_bmc_depth,
@@ -393,7 +399,9 @@ fn run_command(command: Command) -> miette::Result<()> {
                 solver,
                 chc_solver,
                 timeouts: VerifyTimeouts {
-                    overall: timeout,
+                    generic: timeout,
+                    bounded: bounded_timeout,
+                    proof: proof_timeout,
                     induction: induction_timeout,
                     bmc: bmc_timeout,
                     ic3: ic3_timeout,
@@ -529,11 +537,62 @@ struct VerifyCommand {
 }
 
 struct VerifyTimeouts {
+    generic: Option<u64>,
+    bounded: Option<u64>,
+    proof: Option<u64>,
+    induction: Option<u64>,
+    bmc: Option<u64>,
+    ic3: Option<u64>,
+    prop_bmc_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectiveVerifyTimeouts {
     overall: u64,
+    bounded: u64,
+    proof: u64,
     induction: u64,
     bmc: u64,
     ic3: u64,
     prop_bmc_depth: usize,
+}
+
+impl VerifyTimeouts {
+    fn effective(&self) -> EffectiveVerifyTimeouts {
+        let bounded = self
+            .bounded
+            .or(self.generic)
+            .unwrap_or(DEFAULT_BOUNDED_TIMEOUT_SECS);
+        let proof = self
+            .proof
+            .or(self.generic)
+            .unwrap_or(DEFAULT_PROOF_TIMEOUT_SECS);
+        let induction = self.induction.unwrap_or(proof);
+        let bmc = self.bmc.unwrap_or(bounded);
+        let ic3 = self.ic3.unwrap_or(proof);
+        let overall = effective_overall_timeout([induction, bmc, ic3]);
+
+        EffectiveVerifyTimeouts {
+            overall,
+            bounded,
+            proof,
+            induction,
+            bmc,
+            ic3,
+            prop_bmc_depth: self.prop_bmc_depth,
+        }
+    }
+}
+
+fn effective_overall_timeout(timeouts: [u64; 3]) -> u64 {
+    if timeouts.contains(&0) {
+        0
+    } else {
+        timeouts
+            .into_iter()
+            .max()
+            .unwrap_or(DEFAULT_PROOF_TIMEOUT_SECS)
+    }
 }
 
 struct VerifyModeOptions {
@@ -677,18 +736,19 @@ fn build_verify_config(args: &VerifyCommand) -> miette::Result<crate::verify::Ve
         .map(str::parse)
         .transpose()
         .map_err(|err| miette::miette!("{err}"))?;
+    let timeouts = args.timeouts.effective();
     Ok(crate::verify::VerifyConfig {
         solver_selection: solver_selection(args.solver),
         chc_selection: chc_selection(args.chc_solver),
         bounded_only: args.mode.bounded_only,
         unbounded_only: args.mode.unbounded_only,
-        overall_timeout_ms: args.timeouts.overall.saturating_mul(1000),
-        induction_timeout_ms: args.timeouts.induction.saturating_mul(1000),
-        bmc_timeout_ms: args.timeouts.bmc.saturating_mul(1000),
+        overall_timeout_ms: timeouts.overall.saturating_mul(1000),
+        induction_timeout_ms: timeouts.induction.saturating_mul(1000),
+        bmc_timeout_ms: timeouts.bmc.saturating_mul(1000),
         bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
-        prop_bmc_depth: args.timeouts.prop_bmc_depth,
+        prop_bmc_depth: timeouts.prop_bmc_depth,
         cvc5_sygus: args.solver_flags.cvc5_sygus,
-        ic3_timeout_ms: args.timeouts.ic3.saturating_mul(1000),
+        ic3_timeout_ms: timeouts.ic3.saturating_mul(1000),
         no_ic3: args.disabled_checks.no_ic3,
         no_prop_verify: args.disabled_checks.no_prop_verify,
         no_fn_verify: args.disabled_checks.no_fn_verify,
@@ -726,6 +786,7 @@ fn verify_report_config<'a>(
     args: &'a VerifyCommand,
     names: &'a VerifyNames,
 ) -> render::VerificationReportConfig<'a> {
+    let timeouts = args.timeouts.effective();
     render::VerificationReportConfig {
         solver: render::VerificationSolverConfig {
             solver_name: &names.solver,
@@ -737,10 +798,13 @@ fn verify_report_config<'a>(
             bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
         },
         timeouts: render::VerificationTimeoutConfig {
-            induction_secs: args.timeouts.induction,
-            bmc_secs: args.timeouts.bmc,
-            prop_bmc_depth: args.timeouts.prop_bmc_depth,
-            ic3_secs: args.timeouts.ic3,
+            overall_secs: timeouts.overall,
+            bounded_secs: timeouts.bounded,
+            proof_secs: timeouts.proof,
+            induction_secs: timeouts.induction,
+            bmc_secs: timeouts.bmc,
+            prop_bmc_depth: timeouts.prop_bmc_depth,
+            ic3_secs: timeouts.ic3,
         },
         disabled_checks: render::VerificationDisabledChecks {
             no_ic3: args.disabled_checks.no_ic3,
@@ -805,15 +869,19 @@ fn write_verify_trace_artifact(
     let Some(path) = args.output.trace_artifact.as_ref() else {
         return Ok(());
     };
+    let timeouts = args.timeouts.effective();
     let artifact_config = crate::artifact::VerifyArtifactConfig {
         solver: &names.solver,
         chc_solver: &names.chc_solver,
         bounded_only: args.mode.bounded_only,
         unbounded_only: args.mode.unbounded_only,
-        induction_timeout_ms: args.timeouts.induction.saturating_mul(1000),
-        bmc_timeout_ms: args.timeouts.bmc.saturating_mul(1000),
+        overall_timeout_ms: timeouts.overall.saturating_mul(1000),
+        bounded_timeout_ms: timeouts.bounded.saturating_mul(1000),
+        proof_timeout_ms: timeouts.proof.saturating_mul(1000),
+        induction_timeout_ms: timeouts.induction.saturating_mul(1000),
+        bmc_timeout_ms: timeouts.bmc.saturating_mul(1000),
         bmc_iterative_deepening: args.mode.bmc_iterative_deepening,
-        ic3_timeout_ms: args.timeouts.ic3.saturating_mul(1000),
+        ic3_timeout_ms: timeouts.ic3.saturating_mul(1000),
         no_ic3: args.disabled_checks.no_ic3,
         no_prop_verify: args.disabled_checks.no_prop_verify,
         no_fn_verify: args.disabled_checks.no_fn_verify,
@@ -1155,10 +1223,12 @@ mod tests {
             solver: VerifySolver::Z3,
             chc_solver: VerifyChcSolver::Z3,
             timeouts: VerifyTimeouts {
-                overall: 30,
-                induction: 30,
-                bmc: 30,
-                ic3: 30,
+                generic: None,
+                bounded: None,
+                proof: None,
+                induction: None,
+                bmc: None,
+                ic3: None,
                 prop_bmc_depth: 10,
             },
             mode: VerifyModeOptions {
@@ -1196,5 +1266,63 @@ mod tests {
         assert_eq!(config.solver_selection, crate::verify::SolverSelection::Z3);
         assert_eq!(config.chc_selection, crate::verify::ChcSelection::Z3);
         assert_eq!(config.target, None);
+    }
+
+    #[test]
+    fn verify_timeout_policy_uses_generic_timeout_without_granular_overrides() {
+        let mut args = verify_command_for_config_tests();
+        args.timeouts.generic = Some(7);
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.overall_timeout_ms, 7_000);
+        assert_eq!(config.induction_timeout_ms, 7_000);
+        assert_eq!(config.bmc_timeout_ms, 7_000);
+        assert_eq!(config.ic3_timeout_ms, 7_000);
+    }
+
+    #[test]
+    fn verify_timeout_policy_prefers_class_timeout_over_generic_timeout() {
+        let mut args = verify_command_for_config_tests();
+        args.timeouts.generic = Some(7);
+        args.timeouts.bounded = Some(3);
+        args.timeouts.proof = Some(11);
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.overall_timeout_ms, 11_000);
+        assert_eq!(config.induction_timeout_ms, 11_000);
+        assert_eq!(config.bmc_timeout_ms, 3_000);
+        assert_eq!(config.ic3_timeout_ms, 11_000);
+    }
+
+    #[test]
+    fn verify_timeout_policy_prefers_backend_specific_timeout_over_class_timeout() {
+        let mut args = verify_command_for_config_tests();
+        args.timeouts.generic = Some(7);
+        args.timeouts.bounded = Some(3);
+        args.timeouts.proof = Some(11);
+        args.timeouts.induction = Some(13);
+        args.timeouts.bmc = Some(5);
+        args.timeouts.ic3 = Some(17);
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.overall_timeout_ms, 17_000);
+        assert_eq!(config.induction_timeout_ms, 13_000);
+        assert_eq!(config.bmc_timeout_ms, 5_000);
+        assert_eq!(config.ic3_timeout_ms, 17_000);
+    }
+
+    #[test]
+    fn verify_timeout_policy_defaults_to_short_bounded_and_longer_proof_timeouts() {
+        let args = verify_command_for_config_tests();
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.overall_timeout_ms, 120_000);
+        assert_eq!(config.induction_timeout_ms, 120_000);
+        assert_eq!(config.bmc_timeout_ms, 30_000);
+        assert_eq!(config.ic3_timeout_ms, 120_000);
     }
 }

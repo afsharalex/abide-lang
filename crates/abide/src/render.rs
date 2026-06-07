@@ -565,6 +565,9 @@ pub(crate) struct VerificationModeConfig {
 }
 
 pub(crate) struct VerificationTimeoutConfig {
+    pub overall_secs: u64,
+    pub bounded_secs: u64,
+    pub proof_secs: u64,
     pub induction_secs: u64,
     pub bmc_secs: u64,
     pub prop_bmc_depth: usize,
@@ -648,6 +651,9 @@ fn build_verification_report_json(input: &VerificationReportInput<'_>) -> serde_
             "chc_solver": config.solver.chc_solver_name,
             "bounded_only": config.mode.bounded_only,
             "unbounded_only": config.mode.unbounded_only,
+            "overall_timeout_ms": config.timeouts.overall_secs.saturating_mul(1000),
+            "bounded_timeout_ms": config.timeouts.bounded_secs.saturating_mul(1000),
+            "proof_timeout_ms": config.timeouts.proof_secs.saturating_mul(1000),
             "induction_timeout_ms": config.timeouts.induction_secs.saturating_mul(1000),
             "bmc_timeout_ms": config.timeouts.bmc_secs.saturating_mul(1000),
             "prop_bmc_depth": config.timeouts.prop_bmc_depth,

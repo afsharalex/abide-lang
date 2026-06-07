@@ -3023,6 +3023,96 @@ fn cli_verify_stream_preserves_report_and_trace_artifact_outputs() {
 }
 
 #[test]
+fn cli_verify_report_records_granular_timeout_policy() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let spec_path = dir.path().join("timeouts.ab");
+    let report_path = dir.path().join("timeouts.report.json");
+    std::fs::write(&spec_path, "module T\n\nlemma helper { true }\n").expect("write spec");
+
+    let output = std::process::Command::new(binary)
+        .args([
+            "verify",
+            spec_path.to_str().expect("utf8 spec path"),
+            "--target",
+            "lemma:helper",
+            "--timeout",
+            "7",
+            "--bounded-timeout",
+            "3",
+            "--proof-timeout",
+            "11",
+            "--report",
+            "json",
+            dir.path().to_str().expect("utf8 report dir"),
+        ])
+        .output()
+        .expect("failed to run verify with granular timeout policy");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected timeout policy verify to pass: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        report_path.exists(),
+        "expected report to be written: stdout={stdout}, stderr={stderr}"
+    );
+
+    let report_json = std::fs::read_to_string(&report_path).expect("read report");
+    let value: serde_json::Value =
+        serde_json::from_str(&report_json).expect("report should be valid JSON");
+    let config = value
+        .pointer("/config")
+        .and_then(serde_json::Value::as_object)
+        .expect("report should include config object");
+
+    assert_eq!(
+        config
+            .get("overall_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(11_000),
+        "overall deadline should allow the most specific configured timeout: {report_json}"
+    );
+    assert_eq!(
+        config
+            .get("bounded_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(3_000),
+        "bounded class should use --bounded-timeout: {report_json}"
+    );
+    assert_eq!(
+        config
+            .get("proof_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(11_000),
+        "proof class should use --proof-timeout: {report_json}"
+    );
+    assert_eq!(
+        config
+            .get("induction_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(11_000),
+        "lemma/theorem induction should use proof timeout: {report_json}"
+    );
+    assert_eq!(
+        config
+            .get("bmc_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(3_000),
+        "bounded BMC should use bounded timeout: {report_json}"
+    );
+    assert_eq!(
+        config
+            .get("ic3_timeout_ms")
+            .and_then(serde_json::Value::as_u64),
+        Some(11_000),
+        "IC3/PDR proof attempts should use proof timeout: {report_json}"
+    );
+}
+
+#[test]
 fn docs_cli_verify_documents_stream_not_progress() {
     let docs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/cli.md");
     let docs = std::fs::read_to_string(&docs_path).expect("read CLI docs");
