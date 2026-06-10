@@ -1,6 +1,7 @@
 use super::relation_expr::lower_relation_expr;
 use super::*;
 use crate::ir::relation::{IRRelationExpr, IRRelationSource, IRRelationType};
+use crate::ir::types::{IRAction, IRPattern};
 use crate::span::Span;
 
 #[test]
@@ -58,6 +59,83 @@ fn lower_expr_binop_propagates_span() {
 }
 
 #[test]
+fn lower_expr_distinguishes_enum_constructors_from_enum_typed_variables() {
+    let status_ty = E::Ty::Enum(
+        "Status".to_owned(),
+        vec!["Open".to_owned(), "Closed".to_owned()],
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let ctor = lower_expr(
+        &E::EExpr::Var(status_ty.clone(), "Open".to_owned(), None),
+        &ctx,
+    );
+    assert!(matches!(
+        ctor,
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            ..
+        } if enum_name == "Status" && ctor == "Open"
+    ));
+
+    let var = lower_expr(
+        &E::EExpr::Var(status_ty.clone(), "current".to_owned(), None),
+        &ctx,
+    );
+    assert!(matches!(
+        var,
+        IRExpr::Var { name, ty, .. }
+            if name == "current"
+                && matches!(ty, IRType::Enum { ref name, .. } if name == "Status")
+    ));
+
+    let qualified_ctor = lower_expr(
+        &E::EExpr::Qual(
+            status_ty.clone(),
+            "Status".to_owned(),
+            "Closed".to_owned(),
+            None,
+        ),
+        &ctx,
+    );
+    assert!(matches!(
+        qualified_ctor,
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            ..
+        } if enum_name == "Status" && ctor == "Closed"
+    ));
+
+    let qualified_enum_var = lower_expr(
+        &E::EExpr::Qual(status_ty, "Status".to_owned(), "current".to_owned(), None),
+        &ctx,
+    );
+    assert!(matches!(
+        qualified_enum_var,
+        IRExpr::Var { name, ty, .. }
+            if name == "Status::current"
+                && matches!(ty, IRType::Enum { ref name, .. } if name == "Status")
+    ));
+
+    let qualified_field = lower_expr(
+        &E::EExpr::Qual(
+            E::Ty::Builtin(E::BuiltinTy::Int),
+            "Order".to_owned(),
+            "total".to_owned(),
+            None,
+        ),
+        &ctx,
+    );
+    assert!(matches!(
+        qualified_field,
+        IRExpr::Var { name, ty, .. } if name == "Order::total" && ty == IRType::Int
+    ));
+}
+
+#[test]
 fn lower_ty_treats_resolved_named_enum_as_enum_reference() {
     let expr_variants = vec![
         E::EVariant::Record(
@@ -92,24 +170,7 @@ fn lower_ty_treats_resolved_named_enum_as_enum_reference() {
 
 #[test]
 fn lower_proc_and_query_preserve_parameter_refinement_predicates() {
-    let refinement_ty = E::Ty::Refinement(
-        Box::new(E::Ty::Builtin(E::BuiltinTy::Int)),
-        Box::new(E::EExpr::BinOp(
-            E::Ty::Builtin(E::BuiltinTy::Bool),
-            E::BinOp::Gt,
-            Box::new(E::EExpr::Var(
-                E::Ty::Builtin(E::BuiltinTy::Int),
-                "$".to_owned(),
-                None,
-            )),
-            Box::new(E::EExpr::Lit(
-                E::Ty::Builtin(E::BuiltinTy::Int),
-                E::Literal::Int(0),
-                None,
-            )),
-            None,
-        )),
-    );
+    let refinement_ty = positive_int_refinement_ty();
     let vi = VariantInfo::new();
     let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
 
@@ -158,6 +219,617 @@ fn lower_proc_and_query_preserve_parameter_refinement_predicates() {
         ),
         "query parameter refinement should lower into query preconditions: {:?}",
         lowered_query.requires
+    );
+}
+
+#[test]
+fn lower_interface_strips_refinement_types_from_signature_params() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let interface = E::EInterface {
+        name: "Gateway".to_owned(),
+        commands: vec![E::ECommand {
+            name: "authorize".to_owned(),
+            params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+            return_type: Some(E::Ty::Builtin(E::BuiltinTy::Bool)),
+            span: None,
+        }],
+        queries: vec![E::EQuerySig {
+            name: "remaining".to_owned(),
+            params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+            return_type: E::Ty::Builtin(E::BuiltinTy::Int),
+            span: None,
+        }],
+        span: None,
+    };
+
+    let aliases = std::collections::HashMap::new();
+    let er = empty_elab_result();
+    let lowered = lower_interface(&interface, &er, &aliases, &ctx);
+
+    assert_eq!(lowered.commands[0].params[0].ty, IRType::Int);
+    assert_eq!(lowered.queries[0].params[0].ty, IRType::Int);
+    assert!(
+        !ctx.diagnostics.borrow().has_errors(),
+        "interface refinement parameter stripping should not emit lower diagnostics"
+    );
+}
+
+#[test]
+fn lower_fn_preserves_contracts_decreases_and_refinement_requires() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let ef = E::EFn {
+        name: "discount".to_owned(),
+        params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+        ret_ty: E::Ty::Builtin(E::BuiltinTy::Int),
+        contracts: vec![
+            E::EContract::Requires(gt_int_var("amount", 1)),
+            E::EContract::Ensures(ge_int_var("result", 0)),
+            E::EContract::Decreases {
+                measures: vec![int_var("amount")],
+                star: false,
+            },
+        ],
+        body: int_var("amount"),
+        span: None,
+        file: None,
+    };
+
+    let lowered = lower_fn(&ef, &ctx);
+
+    assert!(
+        matches!(
+            lowered.ty,
+            IRType::Fn { ref param, ref result }
+                if param.as_ref() == &IRType::Int && result.as_ref() == &IRType::Int
+        ),
+        "refined fn parameter should be stripped in fn type: {:?}",
+        lowered.ty
+    );
+    assert!(
+        matches!(
+            lowered.body,
+            IRExpr::Lam { ref param_type, .. } if param_type == &IRType::Int
+        ),
+        "refined fn parameter should be stripped in lambda body: {:?}",
+        lowered.body
+    );
+    assert_eq!(lowered.requires.len(), 2);
+    assert!(
+        matches!(
+            &lowered.requires[0],
+            IRExpr::BinOp { op, left, .. }
+                if op == "OpGt"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "refinement-derived requires should be prepended: {:?}",
+        lowered.requires
+    );
+    assert!(
+        matches!(
+            &lowered.requires[1],
+            IRExpr::BinOp { op, left, .. }
+                if op == "OpGt"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "explicit requires should be preserved after refinement requires: {:?}",
+        lowered.requires
+    );
+    assert!(
+        matches!(
+            lowered.ensures.as_slice(),
+            [IRExpr::BinOp { op, left, .. }]
+                if op == "OpGe"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "result")
+        ),
+        "ensures should be lowered: {:?}",
+        lowered.ensures
+    );
+    let decreases = lowered.decreases.expect("decreases should lower");
+    assert!(!decreases.star);
+    assert_eq!(decreases.measures.len(), 1);
+    assert!(matches!(
+        &decreases.measures[0],
+        IRExpr::Var { name, .. } if name == "amount"
+    ));
+}
+
+#[test]
+fn lower_while_preserves_invariants_and_decreases() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let while_expr = E::EExpr::While(
+        Box::new(gt_int_var("amount", 0)),
+        vec![
+            E::EContract::Invariant(ge_int_var("amount", 0)),
+            E::EContract::Decreases {
+                measures: vec![int_var("amount")],
+                star: true,
+            },
+        ],
+        Box::new(E::EExpr::Block(vec![int_var("amount")], None)),
+        None,
+    );
+
+    let lowered = lower_expr(&while_expr, &ctx);
+
+    let IRExpr::While {
+        invariants,
+        decreases,
+        ..
+    } = lowered
+    else {
+        panic!("expected while expression to lower to IR while");
+    };
+    assert!(
+        matches!(
+            invariants.as_slice(),
+            [IRExpr::BinOp { op, left, .. }]
+                if op == "OpGe"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "while invariant should be lowered: {invariants:?}"
+    );
+    let decreases = decreases.expect("while decreases should lower");
+    assert!(decreases.star);
+    assert_eq!(decreases.measures.len(), 1);
+    assert!(matches!(
+        &decreases.measures[0],
+        IRExpr::Var { name, .. } if name == "amount"
+    ));
+}
+
+#[test]
+fn lower_action_strips_refinement_params_and_adds_guard() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let action = E::EAction {
+        name: "charge".to_owned(),
+        refs: vec![],
+        params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+        requires: vec![],
+        ensures: vec![],
+        body: vec![],
+        span: None,
+    };
+
+    let lowered = lower_action(&action, &ctx);
+
+    assert_eq!(lowered.params[0].ty, IRType::Int);
+    assert!(
+        matches!(
+            lowered.guard,
+            IRExpr::BinOp { ref op, ref left, .. }
+                if op == "OpGt"
+                    && matches!(left.as_ref(), IRExpr::Var { name, .. } if name == "amount")
+        ),
+        "action refinement predicate should lower into guard: {:?}",
+        lowered.guard
+    );
+}
+
+fn positive_int_refinement_ty() -> E::Ty {
+    E::Ty::Refinement(
+        Box::new(E::Ty::Builtin(E::BuiltinTy::Int)),
+        Box::new(E::EExpr::BinOp(
+            E::Ty::Builtin(E::BuiltinTy::Bool),
+            E::BinOp::Gt,
+            Box::new(E::EExpr::Var(
+                E::Ty::Builtin(E::BuiltinTy::Int),
+                "$".to_owned(),
+                None,
+            )),
+            Box::new(E::EExpr::Lit(
+                E::Ty::Builtin(E::BuiltinTy::Int),
+                E::Literal::Int(0),
+                None,
+            )),
+            None,
+        )),
+    )
+}
+
+fn int_var(name: &str) -> E::EExpr {
+    E::EExpr::Var(E::Ty::Builtin(E::BuiltinTy::Int), name.to_owned(), None)
+}
+
+fn int_lit(value: i64) -> E::EExpr {
+    E::EExpr::Lit(
+        E::Ty::Builtin(E::BuiltinTy::Int),
+        E::Literal::Int(value),
+        None,
+    )
+}
+
+fn gt_int_var(name: &str, value: i64) -> E::EExpr {
+    E::EExpr::BinOp(
+        E::Ty::Builtin(E::BuiltinTy::Bool),
+        E::BinOp::Gt,
+        Box::new(int_var(name)),
+        Box::new(int_lit(value)),
+        None,
+    )
+}
+
+fn ge_int_var(name: &str, value: i64) -> E::EExpr {
+    E::EExpr::BinOp(
+        E::Ty::Builtin(E::BuiltinTy::Bool),
+        E::BinOp::Ge,
+        Box::new(int_var(name)),
+        Box::new(int_lit(value)),
+        None,
+    )
+}
+
+fn bool_var(name: &str) -> E::EExpr {
+    E::EExpr::Var(E::Ty::Builtin(E::BuiltinTy::Bool), name.to_owned(), None)
+}
+
+fn bool_lit(value: bool) -> E::EExpr {
+    E::EExpr::Lit(
+        E::Ty::Builtin(E::BuiltinTy::Bool),
+        E::Literal::Bool(value),
+        None,
+    )
+}
+
+fn empty_system(name: &str) -> E::ESystem {
+    E::ESystem {
+        name: name.to_owned(),
+        implements: None,
+        deps: vec![],
+        fields: vec![],
+        store_params: vec![],
+        scopes: vec![],
+        commands: vec![],
+        actions: vec![],
+        queries: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+        proc_uses: vec![],
+        span: None,
+    }
+}
+
+#[test]
+fn lower_system_preserves_composed_entities_and_scoped_names() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let aliases = std::collections::HashMap::new();
+    let mut inventory = empty_system("Inventory");
+    inventory.store_params = vec![E::EStoreParam {
+        name: "products".to_owned(),
+        entity_type: "Product".to_owned(),
+        lo: Some(0),
+        hi: Some(10),
+    }];
+    let mut billing = empty_system("Billing");
+    billing.store_params = vec![E::EStoreParam {
+        name: "orders".to_owned(),
+        entity_type: "Order".to_owned(),
+        lo: Some(0),
+        hi: Some(10),
+    }];
+    let mut storefront = empty_system("Storefront");
+    storefront.store_params = vec![E::EStoreParam {
+        name: "carts".to_owned(),
+        entity_type: "Cart".to_owned(),
+        lo: Some(0),
+        hi: Some(10),
+    }];
+    storefront.let_bindings = vec![
+        E::ELetBinding {
+            name: "inventory".to_owned(),
+            system_type: "Inventory".to_owned(),
+            store_bindings: vec![("products".to_owned(), "products".to_owned())],
+        },
+        E::ELetBinding {
+            name: "inventory_read_model".to_owned(),
+            system_type: "Inventory".to_owned(),
+            store_bindings: vec![("products".to_owned(), "products".to_owned())],
+        },
+        E::ELetBinding {
+            name: "billing".to_owned(),
+            system_type: "Billing".to_owned(),
+            store_bindings: vec![("orders".to_owned(), "orders".to_owned())],
+        },
+    ];
+    storefront.commands = vec![E::ECommand {
+        name: "checkout".to_owned(),
+        params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+        return_type: Some(E::Ty::Builtin(E::BuiltinTy::Bool)),
+        span: None,
+    }];
+    storefront.actions = vec![E::ESystemAction {
+        name: "checkout".to_owned(),
+        params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+        requires: vec![bool_var("can_ship")],
+        body: vec![E::EEventAction::Expr(bool_var("internal_ok"))],
+        return_expr: Some(bool_var("can_ship")),
+        span: None,
+    }];
+    storefront.queries = vec![E::EQuery {
+        name: "can_ship".to_owned(),
+        params: vec![],
+        body: bool_var("internal_ok"),
+        span: None,
+    }];
+    storefront.preds = vec![E::EPred {
+        name: "internal_ok".to_owned(),
+        params: vec![],
+        body: bool_var("can_ship"),
+        span: None,
+        file: None,
+    }];
+    storefront.derived_fields = vec![E::EDerived {
+        name: "eligible".to_owned(),
+        body: bool_var("can_ship"),
+        ty: E::Ty::Builtin(E::BuiltinTy::Bool),
+        span: None,
+    }];
+    storefront.invariants = vec![E::EInvariant {
+        name: "safe".to_owned(),
+        body: bool_var("can_ship"),
+        span: None,
+    }];
+    let all_systems = vec![inventory, billing, storefront.clone()];
+
+    let lowered = super::system::lower_system(&storefront, &all_systems, &aliases, &ctx);
+
+    assert_eq!(lowered.store_params.len(), 1);
+    assert_eq!(
+        lowered.entities,
+        vec!["Cart".to_owned(), "Product".to_owned(), "Order".to_owned()],
+        "composed system entity types should be included without duplicate entries"
+    );
+    assert_eq!(lowered.commands[0].params[0].ty, IRType::Int);
+    assert_eq!(lowered.actions[0].params[0].ty, IRType::Int);
+    assert!(
+        matches!(
+            &lowered.actions[0].guard,
+            IRExpr::BinOp { op, left, right, .. }
+                if op == "OpAnd"
+                    && matches!(left.as_ref(), IRExpr::BinOp { op, .. } if op == "OpGt")
+                    && matches!(right.as_ref(), IRExpr::Var { name, .. } if name == "Storefront::can_ship")
+        ),
+        "action guard should combine refinement requires with qualified local query names: {:?}",
+        lowered.actions[0].guard
+    );
+    assert!(
+        matches!(
+            lowered.actions[0].body.as_slice(),
+            [IRAction::ExprStmt { expr: IRExpr::Var { name, .. } }]
+                if name == "Storefront::internal_ok"
+        ),
+        "action bodies should qualify local pred/query references: {:?}",
+        lowered.actions[0].body
+    );
+    assert!(
+        matches!(
+            lowered.actions[0].return_expr.as_ref(),
+            Some(IRExpr::Var { name, .. }) if name == "Storefront::can_ship"
+        ),
+        "return expressions should qualify local pred/query references: {:?}",
+        lowered.actions[0].return_expr
+    );
+    assert!(matches!(
+        &lowered.derived_fields[0].body,
+        IRExpr::Var { name, .. } if name == "Storefront::can_ship"
+    ));
+    assert!(matches!(
+        &lowered.invariants[0].body,
+        IRExpr::Var { name, .. } if name == "Storefront::can_ship"
+    ));
+    assert!(matches!(
+        &lowered.preds[0].body,
+        IRExpr::Var { name, .. } if name == "Storefront::can_ship"
+    ));
+    assert!(matches!(
+        &lowered.queries[0].body,
+        IRExpr::Var { name, .. } if name == "Storefront::internal_ok"
+    ));
+}
+
+#[test]
+fn lower_extern_preserves_may_params_and_local_fairness_assumptions() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let ext = E::EExtern {
+        name: "Gateway".to_owned(),
+        implements: None,
+        commands: vec![
+            E::ECommand {
+                name: "authorize".to_owned(),
+                params: vec![("amount".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
+                return_type: Some(E::Ty::Builtin(E::BuiltinTy::Bool)),
+                span: None,
+            },
+            E::ECommand {
+                name: "settle".to_owned(),
+                params: vec![],
+                return_type: None,
+                span: None,
+            },
+        ],
+        mays: vec![E::EMay {
+            command: "authorize".to_owned(),
+            returns: vec![bool_lit(true)],
+            span: None,
+        }],
+        assumes: vec![
+            E::EExternAssume::Fair(vec!["authorize".to_owned()], None),
+            E::EExternAssume::StrongFair(vec!["settle".to_owned()], None),
+            E::EExternAssume::Expr(bool_var("provider_ready"), None),
+        ],
+        span: None,
+    };
+
+    let lowered = super::system::lower_extern(&ext, &ctx);
+
+    assert_eq!(lowered.commands.len(), 2);
+    assert_eq!(lowered.actions.len(), 1);
+    assert_eq!(lowered.actions[0].params.len(), 1);
+    assert_eq!(lowered.actions[0].params[0].name, "amount");
+    assert_eq!(lowered.actions[0].params[0].ty, IRType::Int);
+    let pred_names: Vec<_> = lowered
+        .preds
+        .iter()
+        .map(|pred| pred.name.as_str())
+        .collect();
+    assert!(
+        pred_names.contains(&"__abide_extern_assume_wf__authorize"),
+        "weak fairness assumption should lower to hidden local predicate: {pred_names:?}"
+    );
+    assert!(
+        pred_names.contains(&"__abide_extern_assume_sf__settle"),
+        "strong fairness assumption should lower to hidden local predicate: {pred_names:?}"
+    );
+    assert!(
+        pred_names.contains(&"__abide_extern_assume_expr__3"),
+        "expression assumption should lower to hidden local predicate: {pred_names:?}"
+    );
+}
+
+#[test]
+fn lower_program_proc_synthesizes_refined_params_and_outcome_actions() {
+    let mut variants = VariantInfo::new();
+    let payment_variants = vec![
+        E::EVariant::Simple("ok".to_owned()),
+        E::EVariant::Simple("fail".to_owned()),
+    ];
+    variants.insert("PaymentResult".to_owned(), payment_variants.as_slice());
+    let ctx = LowerCtx::new(&variants, std::collections::HashSet::new());
+    let aliases = std::collections::HashMap::new();
+    let mut gateway = empty_system("Gateway");
+    gateway.commands = vec![E::ECommand {
+        name: "authorize".to_owned(),
+        params: vec![("amount".to_owned(), E::Ty::Builtin(E::BuiltinTy::Int))],
+        return_type: Some(E::Ty::Enum(
+            "PaymentResult".to_owned(),
+            vec!["ok".to_owned(), "fail".to_owned()],
+        )),
+        span: None,
+    }];
+    let mut program = empty_system("CheckoutProgram");
+    program.let_bindings = vec![E::ELetBinding {
+        name: "gateway".to_owned(),
+        system_type: "Gateway".to_owned(),
+        store_bindings: vec![],
+    }];
+    program.procs = vec![E::EProc {
+        name: "checkout".to_owned(),
+        params: vec![("amount".to_owned(), positive_int_refinement_ty())],
+        requires: Some(gt_int_var("amount", 1)),
+        nodes: vec![
+            E::EProcNode {
+                name: "charge".to_owned(),
+                instance: "gateway".to_owned(),
+                command: "authorize".to_owned(),
+                args: vec![int_var("amount")],
+            },
+            E::EProcNode {
+                name: "ship".to_owned(),
+                instance: "self".to_owned(),
+                command: "ship".to_owned(),
+                args: vec![],
+            },
+        ],
+        edges: vec![E::EProcEdge {
+            target: "ship".to_owned(),
+            condition: E::EProcDepCond::Fact {
+                node: "charge".to_owned(),
+                qualifier: Some("ok".to_owned()),
+            },
+        }],
+        proc_uses: vec![],
+        span: None,
+    }];
+    let all_systems = vec![gateway, program.clone()];
+
+    let lowered = super::system::lower_system(&program, &all_systems, &aliases, &ctx);
+
+    assert!(
+        lowered
+            .entities
+            .iter()
+            .any(|entity| entity.contains("checkout")),
+        "program procs should add their hidden workflow entity to system entities: {:?}",
+        lowered.entities
+    );
+    assert_eq!(lowered.procs[0].params.len(), 1);
+    assert_eq!(lowered.procs[0].params[0].ty, IRType::Int);
+    assert!(
+        matches!(
+            lowered.procs[0].requires.as_ref(),
+            Some(IRExpr::BinOp { op, left, right, .. })
+                if op == "OpAnd"
+                    && matches!(left.as_ref(), IRExpr::BinOp { op, .. } if op == "OpGt")
+                    && matches!(right.as_ref(), IRExpr::BinOp { op, .. } if op == "OpGt")
+        ),
+        "proc requires should include refinement and explicit guards: {:?}",
+        lowered.procs[0].requires
+    );
+    assert!(
+        lowered
+            .commands
+            .iter()
+            .any(|command| command.name == "checkout" && command.params[0].ty == IRType::Int),
+        "synthetic proc start command should use stripped refined params: {:?}",
+        lowered.commands
+    );
+    let charge_action = lowered
+        .actions
+        .iter()
+        .find(|action| {
+            action.body.iter().any(|step| {
+                matches!(
+                    step,
+                    IRAction::LetCrossCall { system, command, args, .. }
+                        if system == "Gateway" && command == "authorize" && args.len() == 1
+                )
+            })
+        })
+        .expect("charge proc node should synthesize a cross-call action");
+    assert!(
+        charge_action
+            .body
+            .iter()
+            .any(|step| matches!(step, IRAction::Match { arms, .. }
+                if arms.iter().any(|arm| matches!(&arm.pattern, IRPattern::PCtor { name, .. } if name == "ok"))
+                    && arms.iter().any(|arm| matches!(&arm.pattern, IRPattern::PWild)))),
+        "outcome-bearing proc node should synthesize match arms for return variants and fallback: {:?}",
+        charge_action.body
+    );
+    let ok_arm_transition = charge_action.body.iter().find_map(|step| {
+        let IRAction::Match { arms, .. } = step else {
+            return None;
+        };
+        arms.iter().find_map(|arm| {
+            if !matches!(&arm.pattern, IRPattern::PCtor { name, .. } if name == "ok") {
+                return None;
+            }
+            arm.body.iter().find_map(|body_step| {
+                let IRAction::Choose { ops, .. } = body_step else {
+                    return None;
+                };
+                ops.iter().find_map(|op| {
+                    let IRAction::Apply { transition, .. } = op else {
+                        return None;
+                    };
+                    Some(transition.as_str())
+                })
+            })
+        })
+    });
+    assert!(
+        ok_arm_transition.is_some_and(|transition| transition.contains("ok")),
+        "ok outcome arm should apply an ok-specific workflow transition, got {:?}",
+        charge_action.body
     );
 }
 
@@ -627,6 +1299,162 @@ fn lower_relation_field_uses_store_scoped_relation_symbol() {
         }
     );
     assert_eq!(symbol.relation_type.arity(), 2);
+}
+
+#[test]
+fn lower_expr_dispatches_only_supported_relation_qualified_calls() {
+    let result_ty = E::Ty::Relation(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Builtin(E::BuiltinTy::String),
+    ]);
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let field_call = lower_expr(
+        &E::EExpr::QualCall(
+            result_ty.clone(),
+            "Rel".to_owned(),
+            "field".to_owned(),
+            vec![
+                E::EExpr::Var(E::Ty::Store("Order".to_owned()), "orders".to_owned(), None),
+                E::EExpr::Qual(
+                    E::Ty::Named("Order".to_owned()),
+                    "Order".to_owned(),
+                    "status".to_owned(),
+                    None,
+                ),
+            ],
+            None,
+        ),
+        &ctx,
+    );
+    assert!(
+        matches!(
+            field_call,
+            IRExpr::BinOp { ref op, ref right, .. }
+                if op == "OpRelationField"
+                    && matches!(right.as_ref(), IRExpr::Var { name, .. } if name == "Order::status")
+        ),
+        "Rel::field should lower to the relation-field IR operator: {field_call:?}"
+    );
+
+    let tuple_set_ty = E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+        E::Ty::Entity("Order".to_owned()),
+        E::Ty::Entity("Customer".to_owned()),
+        E::Ty::Builtin(E::BuiltinTy::String),
+    ])));
+    let project_call = lower_expr(
+        &E::EExpr::QualCall(
+            result_ty.clone(),
+            "Rel".to_owned(),
+            "project".to_owned(),
+            vec![
+                E::EExpr::Var(tuple_set_ty, "order_customer_segment".to_owned(), None),
+                int_lit(0),
+                int_lit(2),
+            ],
+            None,
+        ),
+        &ctx,
+    );
+    assert!(
+        matches!(
+            project_call,
+            IRExpr::BinOp { ref op, .. } if op == "OpRelProject"
+        ),
+        "Rel::project with at least two args should lower to the relation-project IR operator: {project_call:?}"
+    );
+
+    let rel_project_without_columns = lower_expr(
+        &E::EExpr::QualCall(
+            result_ty.clone(),
+            "Rel".to_owned(),
+            "project".to_owned(),
+            vec![E::EExpr::Var(
+                E::Ty::Set(Box::new(E::Ty::Tuple(vec![
+                    E::Ty::Entity("Order".to_owned()),
+                    E::Ty::Builtin(E::BuiltinTy::String),
+                ]))),
+                "order_status".to_owned(),
+                None,
+            )],
+            None,
+        ),
+        &ctx,
+    );
+    assert!(
+        !matches!(rel_project_without_columns, IRExpr::BinOp { ref op, .. } if op == "OpRelProject"),
+        "Rel::project without projection columns should stay off the relation-project path: {rel_project_without_columns:?}"
+    );
+
+    let set_project = lower_expr(
+        &E::EExpr::QualCall(
+            result_ty,
+            "Set".to_owned(),
+            "project".to_owned(),
+            vec![E::EExpr::Var(
+                E::Ty::Set(Box::new(E::Ty::Builtin(E::BuiltinTy::Int))),
+                "xs".to_owned(),
+                None,
+            )],
+            None,
+        ),
+        &ctx,
+    );
+    assert!(
+        !matches!(set_project, IRExpr::BinOp { ref op, .. } if op == "OpRelProject"),
+        "non-Rel project calls should stay off the Rel::project path: {set_project:?}"
+    );
+}
+
+#[test]
+fn lower_match_patterns_resolve_enum_constructor_binders_through_or_patterns() {
+    let status_ty = E::Ty::Enum(
+        "Status".to_owned(),
+        vec!["Open".to_owned(), "Closed".to_owned(), "Paused".to_owned()],
+    );
+    let match_expr = E::EExpr::Match(
+        Box::new(E::EExpr::Var(status_ty.clone(), "status".to_owned(), None)),
+        vec![
+            (E::EPattern::Var("Open".to_owned()), None, bool_lit(true)),
+            (
+                E::EPattern::Or(
+                    Box::new(E::EPattern::Var("Closed".to_owned())),
+                    Box::new(E::EPattern::Var("Paused".to_owned())),
+                ),
+                None,
+                bool_lit(false),
+            ),
+            (
+                E::EPattern::Var("other_status".to_owned()),
+                None,
+                bool_lit(false),
+            ),
+        ],
+        None,
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+
+    let lowered = lower_expr(&match_expr, &ctx);
+
+    let IRExpr::Match { arms, .. } = lowered else {
+        panic!("expected match expression");
+    };
+    assert!(matches!(
+        &arms[0].pattern,
+        IRPattern::PCtor { name, fields } if name == "Open" && fields.is_empty()
+    ));
+    assert!(matches!(
+        &arms[1].pattern,
+        IRPattern::POr { left, right }
+            if matches!(left.as_ref(), IRPattern::PCtor { name, .. } if name == "Closed")
+                && matches!(right.as_ref(), IRPattern::PCtor { name, .. } if name == "Paused")
+    ));
+    assert!(matches!(
+        &arms[2].pattern,
+        IRPattern::PVar { name } if name == "other_status"
+    ));
 }
 
 #[test]

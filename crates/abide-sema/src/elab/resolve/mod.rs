@@ -2285,6 +2285,563 @@ mod tests {
         columns
     }
 
+    fn assert_builtin_int(ty: &Ty, context: &str) {
+        assert!(
+            matches!(ty, Ty::Builtin(BuiltinTy::Int)),
+            "{context} should resolve to int, got {ty:?}"
+        );
+    }
+
+    fn error_var(name: &str) -> EExpr {
+        EExpr::Var(Ty::Error, name.to_owned(), None)
+    }
+
+    #[test]
+    fn resolve_all_types_resolves_type_alias_bodies_from_snapshot() {
+        let mut env = Env::new();
+        env.types
+            .insert("Leaf".to_owned(), Ty::Builtin(BuiltinTy::Int));
+        env.types.insert(
+            "Numbers".to_owned(),
+            Ty::Set(Box::new(Ty::Named("Leaf".to_owned()))),
+        );
+
+        resolve_all_types(&mut env);
+
+        let numbers = env.types.get("Numbers").expect("alias collected");
+        let Ty::Set(inner) = numbers else {
+            panic!("expected Set alias body, got {numbers:?}");
+        };
+        assert_builtin_int(inner, "set element");
+    }
+
+    #[test]
+    fn resolve_type_refinement_predicates_binds_placeholder_to_base_type() {
+        let mut env = Env::new();
+        env.types.insert(
+            "Positive".to_owned(),
+            Ty::Refinement(
+                Box::new(Ty::Builtin(BuiltinTy::Int)),
+                Box::new(EExpr::BinOp(
+                    Ty::Error,
+                    BinOp::Gt,
+                    Box::new(error_var("$")),
+                    Box::new(EExpr::Lit(
+                        Ty::Builtin(BuiltinTy::Int),
+                        Literal::Int(0),
+                        None,
+                    )),
+                    None,
+                )),
+            ),
+        );
+
+        resolve_type_refinement_predicates(&mut env);
+
+        let Some(Ty::Refinement(_, pred)) = env.types.get("Positive") else {
+            panic!(
+                "expected Positive refinement, got {:?}",
+                env.types.get("Positive")
+            );
+        };
+        let EExpr::BinOp(_, BinOp::Gt, lhs, _, _) = pred.as_ref() else {
+            panic!("expected greater-than predicate, got {pred:?}");
+        };
+        assert!(
+            matches!(lhs.as_ref(), EExpr::Var(Ty::Builtin(BuiltinTy::Int), name, _) if name == "$"),
+            "refinement placeholder should resolve to int var, got {lhs:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_ty_walks_composite_types_and_preserves_generic_arity() {
+        let types = HashMap::from([
+            ("Leaf".to_owned(), Ty::Builtin(BuiltinTy::Int)),
+            (
+                "Option<int>".to_owned(),
+                Ty::Enum(
+                    "Option<int>".to_owned(),
+                    vec!["Some".to_owned(), "None".to_owned()],
+                ),
+            ),
+        ]);
+        let entities = HashMap::from([("UserAlias".to_owned(), "User".to_owned())]);
+        let generic_types = HashMap::from([(
+            "Option".to_owned(),
+            GenericTypeDef {
+                name: "Option".to_owned(),
+                type_params: vec!["T".to_owned()],
+                variant_names: vec!["Some".to_owned(), "None".to_owned()],
+                variant_fields: vec![(
+                    "Some".to_owned(),
+                    vec![("value".to_owned(), Ty::Named("T".to_owned()))],
+                )],
+                visibility: Visibility::Private,
+                span: crate::span::Span { start: 0, end: 0 },
+            },
+        )]);
+        let unresolved = Ty::Tuple(vec![
+            Ty::Record(
+                "Boxed".to_owned(),
+                vec![("value".to_owned(), Ty::Named("Leaf".to_owned()))],
+            ),
+            Ty::Param("Option".to_owned(), vec![Ty::Named("Leaf".to_owned())]),
+            Ty::Alias(
+                "AliasBox".to_owned(),
+                Box::new(Ty::Named("Leaf".to_owned())),
+            ),
+            Ty::Newtype("NewBox".to_owned(), Box::new(Ty::Named("Leaf".to_owned()))),
+            Ty::Fn(
+                Box::new(Ty::Named("Leaf".to_owned())),
+                Box::new(Ty::Named("UserAlias".to_owned())),
+            ),
+            Ty::Set(Box::new(Ty::Named("Leaf".to_owned()))),
+            Ty::Seq(Box::new(Ty::Named("Leaf".to_owned()))),
+            Ty::Map(
+                Box::new(Ty::Named("Leaf".to_owned())),
+                Box::new(Ty::Named("UserAlias".to_owned())),
+            ),
+            Ty::Store("UserAlias".to_owned()),
+            Ty::Relation(vec![
+                Ty::Named("Leaf".to_owned()),
+                Ty::Named("UserAlias".to_owned()),
+            ]),
+            Ty::Tuple(vec![Ty::Named("Leaf".to_owned())]),
+            Ty::Refinement(
+                Box::new(Ty::Named("Leaf".to_owned())),
+                Box::new(error_var("$")),
+            ),
+        ]);
+
+        let resolved = resolve_ty(&types, &entities, &generic_types, &unresolved);
+
+        let Ty::Tuple(items) = resolved else {
+            panic!("expected tuple result, got {resolved:?}");
+        };
+        let Ty::Record(_, fields) = &items[0] else {
+            panic!(
+                "record arm should be preserved and walked, got {:?}",
+                items[0]
+            );
+        };
+        assert_builtin_int(&fields[0].1, "record field");
+        assert!(
+            matches!(&items[1], Ty::Enum(name, variants) if name == "Option<int>" && variants == &vec!["Some".to_owned(), "None".to_owned()]),
+            "generic application should resolve with exact arity, got {:?}",
+            items[1]
+        );
+        let Ty::Alias(_, alias_inner) = &items[2] else {
+            panic!(
+                "alias arm should be preserved and walked, got {:?}",
+                items[2]
+            );
+        };
+        assert_builtin_int(alias_inner, "alias inner");
+        let Ty::Newtype(_, newtype_inner) = &items[3] else {
+            panic!(
+                "newtype arm should be preserved and walked, got {:?}",
+                items[3]
+            );
+        };
+        assert_builtin_int(newtype_inner, "newtype inner");
+        let Ty::Fn(arg, ret) = &items[4] else {
+            panic!("fn arm should be preserved and walked, got {:?}", items[4]);
+        };
+        assert_builtin_int(arg, "function argument");
+        assert!(matches!(ret.as_ref(), Ty::Entity(name) if name == "User"));
+        let Ty::Set(set_inner) = &items[5] else {
+            panic!("set arm should be preserved and walked, got {:?}", items[5]);
+        };
+        assert_builtin_int(set_inner, "set inner");
+        let Ty::Seq(seq_inner) = &items[6] else {
+            panic!("seq arm should be preserved and walked, got {:?}", items[6]);
+        };
+        assert_builtin_int(seq_inner, "seq inner");
+        let Ty::Map(map_key, map_value) = &items[7] else {
+            panic!("map arm should be preserved and walked, got {:?}", items[7]);
+        };
+        assert_builtin_int(map_key, "map key");
+        assert!(matches!(map_value.as_ref(), Ty::Entity(name) if name == "User"));
+        assert!(matches!(&items[8], Ty::Store(entity) if entity == "User"));
+        let Ty::Relation(columns) = &items[9] else {
+            panic!(
+                "relation arm should be preserved and walked, got {:?}",
+                items[9]
+            );
+        };
+        assert_builtin_int(&columns[0], "relation first column");
+        assert!(matches!(&columns[1], Ty::Entity(name) if name == "User"));
+        let Ty::Tuple(nested) = &items[10] else {
+            panic!(
+                "tuple arm should be preserved and walked, got {:?}",
+                items[10]
+            );
+        };
+        assert_builtin_int(&nested[0], "nested tuple item");
+        let Ty::Refinement(base, _) = &items[11] else {
+            panic!(
+                "refinement arm should be preserved and walked, got {:?}",
+                items[11]
+            );
+        };
+        assert_builtin_int(base, "refinement base");
+    }
+
+    #[test]
+    fn resolve_params_lr_resolves_refinement_predicates_with_prior_params() {
+        let env = Env::new();
+        let ctx = Ctx::from_env(&env);
+        let params = vec![
+            ("limit".to_owned(), Ty::Builtin(BuiltinTy::Int)),
+            (
+                "x".to_owned(),
+                Ty::Refinement(
+                    Box::new(Ty::Builtin(BuiltinTy::Int)),
+                    Box::new(EExpr::BinOp(
+                        Ty::Error,
+                        BinOp::Gt,
+                        Box::new(error_var("limit")),
+                        Box::new(error_var("$")),
+                        None,
+                    )),
+                ),
+            ),
+        ];
+
+        let (resolved_params, bound) = resolve_params_lr(&ctx, &params, HashMap::new());
+
+        assert_builtin_int(bound.get("x").expect("x should enter bound"), "x bound");
+        let Ty::Refinement(_, pred) = &resolved_params[1].1 else {
+            panic!(
+                "refined param should remain a refinement, got {:?}",
+                resolved_params[1]
+            );
+        };
+        let EExpr::BinOp(_, BinOp::Gt, lhs, rhs, _) = pred.as_ref() else {
+            panic!("expected resolved refinement predicate, got {pred:?}");
+        };
+        assert!(
+            matches!(lhs.as_ref(), EExpr::Var(Ty::Builtin(BuiltinTy::Int), name, _) if name == "limit"),
+            "left-to-right param binding should resolve prior param, got {lhs:?}"
+        );
+        assert!(
+            matches!(rhs.as_ref(), EExpr::Var(Ty::Builtin(BuiltinTy::Int), name, _) if name == "$"),
+            "placeholder binding should resolve to the refinement base, got {rhs:?}"
+        );
+    }
+
+    #[test]
+    fn event_path_resolution_accepts_system_and_instance_qualified_paths() {
+        let system_events = HashMap::from([(
+            "S".to_owned(),
+            HashMap::from([("tick".to_owned(), false), ("param_tick".to_owned(), true)]),
+        )]);
+        let scope = vec!["S".to_owned()];
+        let let_bindings = HashMap::from([("s".to_owned(), "S".to_owned())]);
+        let mut errors = Vec::new();
+        let span = crate::span::Span { start: 1, end: 2 };
+
+        let system_path = crate::ast::EventPath {
+            segments: vec!["S".to_owned(), "tick".to_owned()],
+            span,
+        };
+        let resolved = resolve_event_path(
+            &system_path,
+            &scope,
+            &system_events,
+            &let_bindings,
+            &mut errors,
+            span,
+        )
+        .expect("system-qualified event should resolve");
+        assert_eq!(resolved.0, crate::elab::types::EventRef::new("S", "tick"));
+        assert!(!resolved.1);
+
+        let instance_path = crate::ast::EventPath {
+            segments: vec!["s".to_owned(), "param_tick".to_owned()],
+            span,
+        };
+        let resolved = resolve_event_path(
+            &instance_path,
+            &scope,
+            &system_events,
+            &let_bindings,
+            &mut errors,
+            span,
+        )
+        .expect("instance-qualified event should resolve through let binding");
+        assert_eq!(
+            resolved.0,
+            crate::elab::types::EventRef::new("S", "param_tick")
+        );
+        assert!(resolved.1);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn event_path_resolution_handles_unqualified_unknown_single_and_ambiguous_events() {
+        let system_events = HashMap::from([
+            (
+                "A".to_owned(),
+                HashMap::from([("tick".to_owned(), false), ("shared".to_owned(), false)]),
+            ),
+            ("B".to_owned(), HashMap::from([("shared".to_owned(), true)])),
+        ]);
+        let scope = vec!["A".to_owned(), "B".to_owned()];
+        let let_bindings = HashMap::new();
+        let span = crate::span::Span { start: 3, end: 4 };
+        let mut errors = Vec::new();
+
+        let single = crate::ast::EventPath {
+            segments: vec!["tick".to_owned()],
+            span,
+        };
+        let resolved = resolve_event_path(
+            &single,
+            &scope,
+            &system_events,
+            &let_bindings,
+            &mut errors,
+            span,
+        )
+        .expect("single unqualified match should resolve");
+        assert_eq!(resolved.0, crate::elab::types::EventRef::new("A", "tick"));
+        assert!(!resolved.1);
+
+        let unknown = crate::ast::EventPath {
+            segments: vec!["missing".to_owned()],
+            span,
+        };
+        assert!(
+            resolve_event_path(
+                &unknown,
+                &scope,
+                &system_events,
+                &let_bindings,
+                &mut errors,
+                span,
+            )
+            .is_none(),
+            "unknown unqualified event should fail"
+        );
+
+        let ambiguous = crate::ast::EventPath {
+            segments: vec!["shared".to_owned()],
+            span,
+        };
+        assert!(
+            resolve_event_path(
+                &ambiguous,
+                &scope,
+                &system_events,
+                &let_bindings,
+                &mut errors,
+                span,
+            )
+            .is_none(),
+            "ambiguous unqualified event should fail"
+        );
+
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("not declared in any system")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("matches: A, B")));
+    }
+
+    #[test]
+    fn bindings_without_removes_only_shadowed_names() {
+        let bindings = HashMap::from([
+            ("shadowed".to_owned(), "CanonicalShadowed".to_owned()),
+            ("kept".to_owned(), "CanonicalKept".to_owned()),
+        ]);
+
+        let filtered = bindings_without(&bindings, &["shadowed"]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            filtered.get("kept").map(String::as_str),
+            Some("CanonicalKept")
+        );
+        assert!(!filtered.contains_key("shadowed"));
+        assert_eq!(
+            bindings.get("shadowed").map(String::as_str),
+            Some("CanonicalShadowed"),
+            "original bindings should not be mutated"
+        );
+    }
+
+    #[test]
+    fn use_all_unknown_module_reports_warning_when_modules_are_known() {
+        let env = elaborate_src("module App\nuse Missing::*\nenum Local = Here");
+
+        assert!(
+            env.errors.iter().any(|error| {
+                error.severity == super::super::error::Severity::Warning
+                    && error
+                        .message
+                        .contains("unknown module 'Missing' in use declaration")
+            }),
+            "expected unknown module warning, got {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn use_cycle_reachable_from_root_reports_warning() {
+        use crate::elab;
+        use crate::elab::env::Env;
+
+        let mut env = Env::new();
+
+        let tokens_a = lex::lex("module A\nuse B::Thing\nenum Other = O").unwrap();
+        let mut parser_a = Parser::new(tokens_a);
+        let prog_a = parser_a.parse_program().unwrap();
+        collect::collect_into(&mut env, &prog_a);
+        env.module_name = None;
+
+        let tokens_b = lex::lex("module B\nuse A::Other\nenum Thing = T").unwrap();
+        let mut parser_b = Parser::new(tokens_b);
+        let prog_b = parser_b.parse_program().unwrap();
+        collect::collect_into(&mut env, &prog_b);
+        env.module_name = Some("A".to_owned());
+
+        let (_result, errors) = elab::elaborate_env(env);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.severity == super::super::error::Severity::Warning
+                    && error.message.contains("circular use dependency")
+                    && error.message.contains("A")
+                    && error.message.contains("B")
+            }),
+            "expected reachable cycle warning, got {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn dfs_use_cycle_reports_cycle_from_repeated_stack_node() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let deps = BTreeMap::from([
+            ("A".to_owned(), BTreeSet::from(["B".to_owned()])),
+            ("B".to_owned(), BTreeSet::from(["A".to_owned()])),
+        ]);
+
+        let cycle = dfs_use_cycle(
+            "A",
+            &deps,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .expect("expected cycle");
+
+        assert_eq!(cycle, vec!["A", "B", "A"]);
+    }
+
+    #[test]
+    fn check_use_cycles_uses_first_cycle_edge_location() {
+        use crate::ast::UseDecl;
+        use crate::elab::env::{Env, UseDeclEntry};
+        use crate::span::Span;
+
+        let mut env = Env::new();
+        env.known_modules.insert("A".to_owned());
+        env.known_modules.insert("B".to_owned());
+        env.use_decls = vec![
+            UseDeclEntry {
+                decl: UseDecl::Single {
+                    module: "B".to_owned(),
+                    name: "Thing".to_owned(),
+                    span: Span { start: 10, end: 20 },
+                },
+                source_module: Some("A".to_owned()),
+                source_file: Some("a.ab".to_owned()),
+            },
+            UseDeclEntry {
+                decl: UseDecl::Single {
+                    module: "A".to_owned(),
+                    name: "Other".to_owned(),
+                    span: Span { start: 30, end: 40 },
+                },
+                source_module: Some("B".to_owned()),
+                source_file: Some("b.ab".to_owned()),
+            },
+        ];
+
+        check_use_cycles(&mut env, Some("A"));
+
+        let warning = env
+            .errors
+            .iter()
+            .find(|error| error.message.contains("circular use dependency"))
+            .expect("expected cycle warning");
+        assert_eq!(warning.message, "circular use dependency: A → B → A");
+        assert_eq!(warning.file.as_deref(), Some("a.ab"));
+        assert_eq!(warning.span, Some(Span { start: 10, end: 20 }));
+    }
+
+    #[test]
+    fn check_import_target_warns_for_unknown_module_only_when_modules_are_known() {
+        use crate::elab::env::Env;
+        use crate::span::Span;
+        use std::collections::HashSet;
+
+        let env = Env::new();
+        let span = Span { start: 1, end: 5 };
+
+        assert!(
+            check_import_target(&env, &HashSet::new(), "Missing", "Thing", Some("App"), span)
+                .is_none(),
+            "single-file/no-module mode should ignore unresolved use targets"
+        );
+
+        let known_modules = HashSet::from(["App".to_owned()]);
+        let warning =
+            check_import_target(&env, &known_modules, "Missing", "Thing", Some("App"), span)
+                .expect("known module graph should warn on unknown target module");
+
+        assert_eq!(warning.severity, super::super::error::Severity::Warning);
+        assert!(warning
+            .message
+            .contains("unknown module 'Missing' in use declaration"));
+        assert_eq!(warning.span, Some(span));
+    }
+
+    #[test]
+    fn check_import_target_reports_missing_export_in_known_module() {
+        use crate::elab::env::Env;
+        use crate::span::Span;
+        use std::collections::HashSet;
+
+        let env = Env::new();
+        let span = Span { start: 8, end: 13 };
+        let known_modules = HashSet::from(["Lib".to_owned()]);
+
+        let error = check_import_target(&env, &known_modules, "Lib", "Thing", Some("App"), span)
+            .expect("known module without target declaration should error");
+
+        assert_eq!(error.severity, super::super::error::Severity::Error);
+        assert_eq!(error.message, "module 'Lib' does not export 'Thing'");
+        assert_eq!(error.span, Some(span));
+    }
+
+    #[test]
+    fn same_module_use_is_not_reported_as_cycle() {
+        let env = elaborate_src("module A\nuse A::*\nenum Local = Here");
+
+        assert!(
+            env.errors
+                .iter()
+                .all(|error| !error.message.contains("circular use dependency")),
+            "same-module imports should not create use-cycle diagnostics: {:?}",
+            env.errors
+        );
+    }
+
     #[test]
     fn store_param_bounds_validate_bound_store_scopes() {
         let (_result, errors) = elaborate_all(

@@ -3430,9 +3430,8 @@ pub(crate) fn z3_check_chc(chc_text: &str, error_relation: &str, timeout_ms: u64
     let mut params = Z3Params::new();
     params.set_symbol("engine", "spacer");
     params.set_bool("xform.slice", false);
-    if timeout_ms > 0 {
-        #[allow(clippy::cast_possible_truncation)]
-        params.set_u32("timeout", timeout_ms.min(u64::from(u32::MAX)) as u32);
+    if let Some(timeout) = z3_timeout_param_ms(timeout_ms) {
+        params.set_u32("timeout", timeout);
     }
     fp.set_params(&params);
 
@@ -3454,6 +3453,13 @@ pub(crate) fn z3_check_chc(chc_text: &str, error_relation: &str, timeout_ms: u64
     }
 }
 
+fn z3_timeout_param_ms(timeout_ms: u64) -> Option<u32> {
+    if timeout_ms == 0 {
+        return None;
+    }
+    Some(timeout_ms.min(u64::from(u32::MAX)) as u32)
+}
+
 pub(crate) fn cvc5_check_chc(chc_text: &str, _error_relation: &str, _timeout_ms: u64) -> ChcResult {
     ChcResult::Unknown(format!(
         "CVC5 does not support Abide's current Z3-style fixedpoint CHC text (`declare-var`, `rule`, `query`) yet; use `--chc-solver z3` for IC3/PDR (input size: {} bytes)",
@@ -3467,6 +3473,7 @@ pub(crate) fn cvc5_check_chc(chc_text: &str, _error_relation: &str, _timeout_ms:
 pub struct AbideSolver<B: SolverBackend = Z3Backend> {
     _ctx: B::Context,
     backend: B,
+    timeout_ms: Cell<Option<u64>>,
 }
 
 impl<B: SolverBackend> AbideSolver<B> {
@@ -3475,6 +3482,7 @@ impl<B: SolverBackend> AbideSolver<B> {
         Self {
             backend: B::solver_new(&ctx),
             _ctx: ctx,
+            timeout_ms: Cell::new(None),
         }
     }
 
@@ -3499,7 +3507,13 @@ impl<B: SolverBackend> AbideSolver<B> {
     }
 
     pub fn set_timeout(&self, ms: u64) {
+        self.timeout_ms.set(Some(ms));
         self.backend.solver_set_timeout(ms);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configured_timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms.get()
     }
 
     pub fn get_model(&self) -> Option<B::Model> {
@@ -3770,6 +3784,22 @@ mod tests {
     }
 
     #[test]
+    fn z3_timeout_param_skips_zero_and_clamps_to_u32() {
+        assert_eq!(z3_timeout_param_ms(0), None);
+        assert_eq!(z3_timeout_param_ms(1), Some(1));
+        assert_eq!(z3_timeout_param_ms(u64::from(u32::MAX) + 1), Some(u32::MAX));
+    }
+
+    #[test]
+    fn abide_solver_records_configured_timeout() {
+        let solver = AbideSolver::<Z3Backend>::new();
+        assert_eq!(solver.timeout_ms.get(), None);
+
+        solver.set_timeout(123);
+        assert_eq!(solver.timeout_ms.get(), Some(123));
+    }
+
+    #[test]
     fn z3_backend_bool_const() {
         let ctx = Z3Backend::context_new();
         let t = Z3Backend::bool_const(&ctx, true);
@@ -3794,6 +3824,157 @@ mod tests {
         assert!(caps.chc);
         assert!(!caps.native_sequences);
         assert!(!caps.native_bags);
+    }
+
+    #[test]
+    fn solver_capabilities_require_all_core_smt_features_for_standard_tasks() {
+        let supported = SolverCapabilities {
+            arrays: true,
+            datatypes: true,
+            quantifiers: true,
+            models: true,
+            incremental: true,
+            chc: true,
+            native_sequences: false,
+            native_bags: false,
+            unsat_cores: false,
+        };
+
+        assert!(supported.supports(VerificationTask::Property));
+        assert!(supported.supports(VerificationTask::FunctionVc));
+        assert!(supported.supports(VerificationTask::Chc));
+
+        assert!(!SolverCapabilities {
+            arrays: false,
+            ..supported
+        }
+        .supports(VerificationTask::Property));
+        assert!(!SolverCapabilities {
+            quantifiers: false,
+            ..supported
+        }
+        .supports(VerificationTask::Property));
+        assert!(!SolverCapabilities {
+            models: false,
+            ..supported
+        }
+        .supports(VerificationTask::Property));
+        assert!(!SolverCapabilities {
+            incremental: false,
+            ..supported
+        }
+        .supports(VerificationTask::Property));
+        assert!(!SolverCapabilities {
+            chc: false,
+            ..supported
+        }
+        .supports(VerificationTask::Chc));
+    }
+
+    #[test]
+    fn backend_score_returns_exact_routing_penalties_and_preferences() {
+        let supported = SolverCapabilities {
+            arrays: true,
+            datatypes: true,
+            quantifiers: true,
+            models: true,
+            incremental: true,
+            chc: true,
+            native_sequences: false,
+            native_bags: false,
+            unsat_cores: false,
+        };
+
+        assert_eq!(
+            backend_score(
+                SolverFamily::Z3,
+                SolverCapabilities {
+                    arrays: false,
+                    ..supported
+                },
+                VerificationTask::Property,
+                BackendRequirements::default()
+            ),
+            -1
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Cvc5,
+                SolverCapabilities {
+                    chc: false,
+                    ..supported
+                },
+                VerificationTask::Property,
+                BackendRequirements {
+                    chc: true,
+                    ..BackendRequirements::default()
+                }
+            ),
+            -1
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Z3,
+                supported,
+                VerificationTask::Property,
+                BackendRequirements {
+                    unsat_cores: true,
+                    ..BackendRequirements::default()
+                }
+            ),
+            -1
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Z3,
+                supported,
+                VerificationTask::Property,
+                BackendRequirements {
+                    bags: true,
+                    ..BackendRequirements::default()
+                }
+            ),
+            -20
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Z3,
+                supported,
+                VerificationTask::Property,
+                BackendRequirements {
+                    sequences: true,
+                    ..BackendRequirements::default()
+                }
+            ),
+            -10
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Z3,
+                supported,
+                VerificationTask::Chc,
+                BackendRequirements::for_task(VerificationTask::Chc)
+            ),
+            50
+        );
+        assert_eq!(
+            backend_score(
+                SolverFamily::Cvc5,
+                SolverCapabilities {
+                    native_sequences: true,
+                    native_bags: true,
+                    unsat_cores: true,
+                    ..supported
+                },
+                VerificationTask::Property,
+                BackendRequirements {
+                    sequences: true,
+                    bags: true,
+                    ..BackendRequirements::default()
+                }
+            ),
+            140
+        );
     }
 
     #[test]
@@ -3907,6 +4088,406 @@ mod tests {
         solver.assert(&gt);
         assert_eq!(solver.check(), SatResult::Sat);
         set_active_solver_family(SolverFamily::Z3).unwrap();
+    }
+
+    fn with_runtime_family<T>(family: SolverFamily, f: impl FnOnce(&RuntimeContext) -> T) -> T {
+        set_active_solver_family(family).unwrap();
+        let ctx = RuntimeBackend::context_new();
+        let result = f(&ctx);
+        set_active_solver_family(SolverFamily::Z3).unwrap();
+        result
+    }
+
+    #[test]
+    fn runtime_wrappers_project_scalar_dynamic_values_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let bool_dyn =
+                    RuntimeBackend::dynamic_from_bool(ctx, &RuntimeBackend::bool_const(ctx, true));
+                let projected_bool = bool_dyn.as_bool().expect("dynamic bool should project");
+                assert_eq!(projected_bool.as_bool(), Some(true));
+                assert!(!projected_bool.to_string().is_empty());
+                let false_bool =
+                    RuntimeBackend::dynamic_from_bool(ctx, &RuntimeBackend::bool_const(ctx, false));
+                let projected_false_bool = false_bool
+                    .as_bool()
+                    .expect("dynamic false bool should project");
+                assert_eq!(projected_false_bool.as_bool(), Some(false));
+
+                let int_dyn =
+                    RuntimeBackend::dynamic_from_int(ctx, &RuntimeBackend::int_lit(ctx, 42));
+                let projected_int = int_dyn.as_int().expect("dynamic int should project");
+                assert_eq!(projected_int.as_i64(), Some(42));
+                assert!(projected_int.to_string().contains("42"));
+
+                let real_dyn =
+                    RuntimeBackend::dynamic_from_real(ctx, &RuntimeBackend::real_val(ctx, 3, 2));
+                let projected_real = real_dyn.as_real().expect("dynamic real should project");
+                assert!(!projected_real.to_string().is_empty());
+                assert!(!real_dyn.to_string().is_empty());
+
+                let array = RuntimeBackend::array_const_array(
+                    ctx,
+                    &RuntimeBackend::int_sort(ctx),
+                    &RuntimeBackend::dynamic_from_bool(
+                        ctx,
+                        &RuntimeBackend::bool_const(ctx, false),
+                    ),
+                );
+                assert!(!array.to_string().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_model_eval_covers_scalar_dynamic_and_array_values_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let solver = AbideSolver::<RuntimeBackend>::new();
+                let b = RuntimeBackend::bool_var(ctx, "runtime_model_b");
+                let i = RuntimeBackend::int_var(ctx, "runtime_model_i");
+                let r = RuntimeBackend::real_var(ctx, "runtime_model_r");
+                let array = RuntimeBackend::array_const_array(
+                    ctx,
+                    &RuntimeBackend::int_sort(ctx),
+                    &RuntimeBackend::dynamic_from_bool(
+                        ctx,
+                        &RuntimeBackend::bool_const(ctx, false),
+                    ),
+                );
+                let stored = RuntimeBackend::array_store(
+                    ctx,
+                    &array,
+                    &RuntimeBackend::dynamic_from_int(ctx, &RuntimeBackend::int_lit(ctx, 1)),
+                    &RuntimeBackend::dynamic_from_bool(ctx, &RuntimeBackend::bool_const(ctx, true)),
+                );
+                let dynamic_i = RuntimeBackend::dynamic_from_int(ctx, &i);
+
+                solver.assert(RuntimeBackend::bool_eq(
+                    ctx,
+                    &b,
+                    &RuntimeBackend::bool_const(ctx, true),
+                ));
+                solver.assert(RuntimeBackend::int_eq(
+                    ctx,
+                    &i,
+                    &RuntimeBackend::int_lit(ctx, 42),
+                ));
+                solver.assert(RuntimeBackend::real_eq(
+                    ctx,
+                    &r,
+                    &RuntimeBackend::real_val(ctx, 3, 2),
+                ));
+                assert_eq!(solver.check(), SatResult::Sat);
+
+                let model = solver.get_model().expect("runtime model");
+                let evaluated_bool = model.eval(&b, true).expect("bool eval");
+                assert_eq!(evaluated_bool.as_bool(), Some(true));
+                let evaluated_int = model.eval(&i, true).expect("int eval");
+                assert_eq!(evaluated_int.as_i64(), Some(42));
+                let evaluated_real = model.eval(&r, true).expect("real eval");
+                assert!(!evaluated_real.to_string().is_empty());
+                let evaluated_dynamic = model.eval(&dynamic_i, true).expect("dynamic eval");
+                let evaluated_dynamic_int =
+                    evaluated_dynamic.as_int().expect("dynamic int projection");
+                assert_eq!(evaluated_dynamic_int.as_i64(), Some(42));
+                let evaluated_array = model.eval(&stored, true).expect("array eval");
+                assert!(!evaluated_array.to_string().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_backend_model_eval_facade_returns_concrete_values_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let solver = RuntimeBackend::solver_new(ctx);
+                let b = RuntimeBackend::bool_var(ctx, "runtime_facade_b");
+                let b_true = RuntimeBackend::bool_var(ctx, "runtime_facade_b_true");
+                let i = RuntimeBackend::int_var(ctx, "runtime_facade_i");
+                let d = RuntimeBackend::dynamic_from_int(ctx, &i);
+
+                solver.solver_assert(&RuntimeBackend::bool_eq(
+                    ctx,
+                    &b,
+                    &RuntimeBackend::bool_const(ctx, false),
+                ));
+                solver.solver_assert(&RuntimeBackend::bool_eq(
+                    ctx,
+                    &b_true,
+                    &RuntimeBackend::bool_const(ctx, true),
+                ));
+                solver.solver_assert(&RuntimeBackend::int_eq(
+                    ctx,
+                    &i,
+                    &RuntimeBackend::int_lit(ctx, 42),
+                ));
+                assert_eq!(solver.solver_check(), SatResult::Sat);
+
+                let model = solver.solver_get_model().expect("runtime model");
+                assert_eq!(RuntimeBackend::model_eval_bool(&model, &b), Some(false));
+                assert_eq!(RuntimeBackend::model_eval_bool(&model, &b_true), Some(true));
+                assert_eq!(RuntimeBackend::model_eval_int(&model, &i), Some(42));
+                let dynamic_value =
+                    RuntimeBackend::model_eval_dynamic(&model, &d).expect("dynamic value");
+                assert!(dynamic_value.contains("42"));
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_solver_lifecycle_forwards_push_pop_and_timeout_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let solver = RuntimeBackend::solver_new(ctx);
+                solver.solver_set_timeout(321);
+                match &solver {
+                    RuntimeBackend::Z3(backend) => assert_eq!(backend.timeout_ms.get(), 321),
+                    RuntimeBackend::Cvc5(backend) => assert_eq!(backend.timeout_ms.get(), 321),
+                }
+
+                let flag = RuntimeBackend::bool_var(ctx, "runtime_lifecycle_flag");
+                solver.solver_assert(&flag);
+                assert_eq!(solver.solver_check(), SatResult::Sat);
+
+                solver.solver_push();
+                solver.solver_assert(&RuntimeBackend::bool_not(ctx, &flag));
+                assert_eq!(solver.solver_check(), SatResult::Unsat);
+
+                solver.solver_pop();
+                assert_eq!(solver.solver_check(), SatResult::Sat);
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_backend_forwards_bool_int_and_real_variadic_ops_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let bool_and = RuntimeBackend::bool_and(
+                    ctx,
+                    &[
+                        &RuntimeBackend::bool_const(ctx, true),
+                        &RuntimeBackend::bool_const(ctx, true),
+                    ],
+                );
+                let bool_or = RuntimeBackend::bool_or(
+                    ctx,
+                    &[
+                        &RuntimeBackend::bool_const(ctx, false),
+                        &RuntimeBackend::bool_const(ctx, true),
+                    ],
+                );
+
+                let int_add = RuntimeBackend::int_add(
+                    ctx,
+                    &[
+                        &RuntimeBackend::int_lit(ctx, 2),
+                        &RuntimeBackend::int_lit(ctx, 3),
+                    ],
+                );
+                let int_sub = RuntimeBackend::int_sub(
+                    ctx,
+                    &[
+                        &RuntimeBackend::int_lit(ctx, 9),
+                        &RuntimeBackend::int_lit(ctx, 4),
+                    ],
+                );
+                let int_mul = RuntimeBackend::int_mul(
+                    ctx,
+                    &[
+                        &RuntimeBackend::int_lit(ctx, 3),
+                        &RuntimeBackend::int_lit(ctx, 4),
+                    ],
+                );
+
+                let real_add = RuntimeBackend::real_add(
+                    ctx,
+                    &[
+                        &RuntimeBackend::real_val(ctx, 1, 2),
+                        &RuntimeBackend::real_val(ctx, 3, 2),
+                    ],
+                );
+                let real_sub = RuntimeBackend::real_sub(
+                    ctx,
+                    &[
+                        &RuntimeBackend::real_val(ctx, 5, 2),
+                        &RuntimeBackend::real_val(ctx, 1, 2),
+                    ],
+                );
+                let real_mul = RuntimeBackend::real_mul(
+                    ctx,
+                    &[
+                        &RuntimeBackend::real_val(ctx, 2, 1),
+                        &RuntimeBackend::real_val(ctx, 3, 2),
+                    ],
+                );
+                let solver = RuntimeBackend::solver_new(ctx);
+                solver.solver_assert(&RuntimeBackend::bool_eq(
+                    ctx,
+                    &bool_and,
+                    &RuntimeBackend::bool_const(ctx, true),
+                ));
+                solver.solver_assert(&RuntimeBackend::bool_eq(
+                    ctx,
+                    &bool_or,
+                    &RuntimeBackend::bool_const(ctx, true),
+                ));
+                solver.solver_assert(&RuntimeBackend::int_eq(
+                    ctx,
+                    &int_add,
+                    &RuntimeBackend::int_lit(ctx, 5),
+                ));
+                solver.solver_assert(&RuntimeBackend::int_eq(
+                    ctx,
+                    &int_sub,
+                    &RuntimeBackend::int_lit(ctx, 5),
+                ));
+                solver.solver_assert(&RuntimeBackend::int_eq(
+                    ctx,
+                    &int_mul,
+                    &RuntimeBackend::int_lit(ctx, 12),
+                ));
+                solver.solver_assert(&RuntimeBackend::real_eq(
+                    ctx,
+                    &real_add,
+                    &RuntimeBackend::real_val(ctx, 2, 1),
+                ));
+                solver.solver_assert(&RuntimeBackend::real_eq(
+                    ctx,
+                    &real_sub,
+                    &RuntimeBackend::real_val(ctx, 2, 1),
+                ));
+                solver.solver_assert(&RuntimeBackend::real_eq(
+                    ctx,
+                    &real_mul,
+                    &RuntimeBackend::real_val(ctx, 3, 1),
+                ));
+                assert_eq!(solver.solver_check(), SatResult::Sat);
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_backend_forwards_sort_names_and_array_dynamic_projection_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let int_sort = RuntimeBackend::int_sort(ctx);
+                let bool_sort = RuntimeBackend::bool_sort(ctx);
+                let array_sort = RuntimeBackend::array_sort(ctx, &int_sort, &bool_sort);
+
+                let domain = RuntimeBackend::sort_array_domain(ctx, &array_sort)
+                    .expect("array domain should be present");
+                let range = RuntimeBackend::sort_array_range(ctx, &array_sort)
+                    .expect("array range should be present");
+                assert_eq!(RuntimeBackend::sort_to_string(ctx, &int_sort), "Int");
+                assert_eq!(RuntimeBackend::sort_to_string(ctx, &bool_sort), "Bool");
+                assert_eq!(
+                    RuntimeBackend::sort_to_string(ctx, &domain),
+                    RuntimeBackend::sort_to_string(ctx, &int_sort)
+                );
+                assert_eq!(
+                    RuntimeBackend::sort_to_string(ctx, &range),
+                    RuntimeBackend::sort_to_string(ctx, &bool_sort)
+                );
+                assert!(!RuntimeBackend::sort_to_string(ctx, &array_sort).is_empty());
+
+                let array = RuntimeBackend::array_const_array(
+                    ctx,
+                    &int_sort,
+                    &RuntimeBackend::dynamic_from_bool(
+                        ctx,
+                        &RuntimeBackend::bool_const(ctx, false),
+                    ),
+                );
+                let array_dynamic = RuntimeBackend::dynamic_from_array(ctx, &array);
+                let projected_array =
+                    RuntimeBackend::dynamic_as_array(ctx, &array_dynamic).expect("array dynamic");
+                assert!(!projected_array.to_string().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_backend_forwards_quantifiers_functions_datatypes_and_params_for_each_backend() {
+        for family in [SolverFamily::Z3, SolverFamily::Cvc5] {
+            with_runtime_family(family, |ctx| {
+                let int_sort = RuntimeBackend::int_sort(ctx);
+                let bool_sort = RuntimeBackend::bool_sort(ctx);
+                let bound = RuntimeBackend::dynamic_bound_var(ctx, "runtime_adv_x", &int_sort);
+                let bound_int = RuntimeBackend::dynamic_as_int(ctx, &bound).expect("bound int");
+                let body = RuntimeBackend::int_eq(ctx, &bound_int, &bound_int);
+                let forall = RuntimeBackend::forall(ctx, &[&bound], &body);
+                let exists = RuntimeBackend::exists(ctx, &[&bound], &body);
+                let lambda = RuntimeBackend::lambda(
+                    ctx,
+                    &[&bound],
+                    &RuntimeBackend::dynamic_from_int(ctx, &bound_int),
+                );
+                let lambda_sort = RuntimeBackend::array_get_sort(ctx, &lambda);
+                assert!(!RuntimeBackend::sort_to_string(ctx, &lambda_sort).is_empty());
+
+                let solver = RuntimeBackend::solver_new(ctx);
+                solver.solver_assert(&forall);
+                solver.solver_assert(&exists);
+                assert_eq!(solver.solver_check(), SatResult::Sat);
+
+                let func = RuntimeBackend::func_decl_new(
+                    ctx,
+                    "runtime_advanced_func",
+                    &[&int_sort],
+                    &bool_sort,
+                );
+                assert_eq!(
+                    RuntimeBackend::func_decl_name(ctx, &func),
+                    "runtime_advanced_func"
+                );
+                let applied = RuntimeBackend::func_decl_apply(
+                    ctx,
+                    &func,
+                    &[&RuntimeBackend::dynamic_from_int(
+                        ctx,
+                        &RuntimeBackend::int_lit(ctx, 1),
+                    )],
+                );
+                assert!(RuntimeBackend::dynamic_as_bool(ctx, &applied).is_some());
+
+                let datatype = RuntimeBackend::datatype_builder_finish(
+                    ctx,
+                    RuntimeBackend::datatype_builder_variant(
+                        ctx,
+                        RuntimeBackend::datatype_builder_new(ctx, "RuntimeAdvancedOption"),
+                        "Some",
+                        vec![(
+                            "value",
+                            RuntimeBackend::datatype_accessor_sort(ctx, int_sort.clone()),
+                        )],
+                    ),
+                );
+                assert_eq!(datatype.variants.len(), 1);
+                assert_eq!(datatype.variants[0].name, "Some");
+                assert_eq!(
+                    RuntimeBackend::func_decl_name(ctx, &datatype.variants[0].constructor),
+                    "Some"
+                );
+
+                let mut params = RuntimeBackend::params_new();
+                RuntimeBackend::params_set_bool(&mut params, "runtime-bool", true);
+                RuntimeBackend::params_set_u32(&mut params, "runtime-timeout", 17);
+                RuntimeBackend::params_set_symbol(&mut params, "runtime-engine", "default");
+                match &params {
+                    RuntimeParams::Z3(_) => assert!(!format!("{params:?}").is_empty()),
+                    RuntimeParams::Cvc5(params) => {
+                        assert_eq!(params.values.get("runtime-bool"), Some(&"true".to_owned()));
+                        assert_eq!(params.values.get("runtime-timeout"), Some(&"17".to_owned()));
+                        assert_eq!(
+                            params.values.get("runtime-engine"),
+                            Some(&"default".to_owned())
+                        );
+                    }
+                }
+            });
+        }
     }
 
     #[test]

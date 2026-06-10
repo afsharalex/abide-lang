@@ -1113,6 +1113,165 @@ fn validation_gates_expose_unbounded_proof_tests() {
     }
 }
 
+#[test]
+fn validation_gates_split_cargo_mutants_verify_lanes() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    let required_lanes = [
+        (
+            "check-lang-mutants-fn-vc",
+            "crates/abide-verify/src/verify/fn_verify.rs",
+            "mutants.out.fn-vc",
+        ),
+        (
+            "check-lang-mutants-smt-facade",
+            "crates/abide-verify/src/verify/smt.rs",
+            "mutants.out.smt-facade",
+        ),
+        (
+            "check-lang-mutants-solver-routing",
+            "crates/abide-verify/src/verify/solver.rs",
+            "mutants.out.solver-routing",
+        ),
+        (
+            "check-lang-mutants-runtime-backend",
+            "crates/abide-verify/src/verify/solver.rs",
+            "mutants.out.runtime-backend",
+        ),
+        (
+            "check-lang-mutants-syntax-core",
+            "crates/abide-syntax/src/parse/mod.rs",
+            "mutants.out.syntax-core",
+        ),
+        (
+            "check-lang-mutants-syntax-expr",
+            "crates/abide-syntax/src/parse/expr.rs",
+            "mutants.out.syntax-expr",
+        ),
+        (
+            "check-lang-mutants-syntax-system",
+            "crates/abide-syntax/src/parse/system.rs",
+            "mutants.out.syntax-system",
+        ),
+        (
+            "check-lang-mutants-syntax-types",
+            "crates/abide-syntax/src/parse/types.rs",
+            "mutants.out.syntax-types",
+        ),
+    ];
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            contents.contains("cargo mutants"),
+            "{file_name} must expose cargo-mutants validation gates"
+        );
+        assert!(
+            contents.contains("900"),
+            "{file_name} must default mutation lanes to a 15-minute timeout"
+        );
+        assert!(
+            contents.contains("mutants"),
+            "{file_name} must use the cargo mutants profile"
+        );
+        assert!(
+            contents.contains("--jobs") && contents.contains("1"),
+            "{file_name} must default cargo-mutants to one concurrent mutation job"
+        );
+        assert!(
+            contents.contains("--timeout") && contents.contains("60"),
+            "{file_name} must set an explicit one-minute per-mutant test timeout"
+        );
+        assert!(
+            contents.contains("--build-timeout") && contents.contains("180"),
+            "{file_name} must set an explicit mutant build timeout"
+        );
+        assert!(
+            contents.contains("CARGO_BUILD_JOBS") && contents.contains("--test-threads"),
+            "{file_name} must constrain cargo build jobs and libtest threads"
+        );
+        assert!(
+            contents.contains("--shard")
+                && ((contents.contains("1-of-") && contents.contains("4-of-"))
+                    || contents.contains("{{shard}}-of-")),
+            "{file_name} must split heavy mutation lanes into isolated sequential shards"
+        );
+        if file_name == "Makefile" {
+            assert!(
+                contents.contains("--shard 0/$(MUTANTS_SHARD_TOTAL)")
+                    && contents.contains("--shard 3/$(MUTANTS_SHARD_TOTAL)")
+                    && !contents.contains("--shard 4/$(MUTANTS_SHARD_TOTAL)"),
+                "{file_name} must pass zero-based shard indexes to cargo-mutants"
+            );
+        } else {
+            assert!(
+                contents.contains("$(({{shard}} - 1))/{{mutants_shard_total}}"),
+                "{file_name} must map human-facing shard numbers to zero-based cargo-mutants shard indexes"
+            );
+        }
+        assert!(
+            contents.contains("check-lang-mutants-syntax-parser"),
+            "{file_name} must expose an aggregate syntax parser cargo-mutants lane"
+        );
+        if file_name == "Makefile" {
+            assert!(
+                contents.contains("check-lang-mutants-syntax-expr-shard-1")
+                    && contents.contains("check-lang-mutants-syntax-expr-shard-4")
+                    && contents.contains("mutants.out.syntax-expr.1-of-")
+                    && contents.contains("mutants.out.syntax-expr.4-of-"),
+                "{file_name} must split the expression parser mutation lane into isolated shards"
+            );
+        } else {
+            assert!(
+                contents.contains("check-lang-mutants-syntax-expr-shard")
+                    && contents.contains("mutants.out.syntax-expr.{{shard}}-of-"),
+                "{file_name} must split the expression parser mutation lane into isolated shards"
+            );
+        }
+        for (target, file_filter, output_dir) in required_lanes {
+            assert!(
+                contents.contains(target),
+                "{file_name} must expose the {target} cargo-mutants lane"
+            );
+            assert!(
+                contents.contains(file_filter),
+                "{file_name} {target} must restrict mutants to {file_filter}"
+            );
+            assert!(
+                contents.contains(output_dir),
+                "{file_name} {target} must write an isolated report directory"
+            );
+        }
+        assert!(
+            contents.contains("SolverCapabilities|backend_score")
+                && contents.contains("RuntimeBackend|RuntimeModel"),
+            "{file_name} must separate solver routing mutants from runtime backend mutants"
+        );
+    }
+
+    let cargo_toml = std::fs::read_to_string(workspace_dir.join("Cargo.toml"))
+        .expect("workspace Cargo.toml should be readable");
+    assert!(
+        cargo_toml.contains("[profile.mutants]") && cargo_toml.contains("debug = \"none\""),
+        "workspace Cargo.toml must define a lightweight cargo-mutants profile"
+    );
+
+    let mutants_toml = std::fs::read_to_string(workspace_dir.join(".cargo/mutants.toml"))
+        .expect(".cargo/mutants.toml should be readable");
+    assert!(
+        mutants_toml.contains("profile = \"mutants\"")
+            && mutants_toml.contains("gitignore = true")
+            && mutants_toml.contains("copy_vcs = false"),
+        ".cargo/mutants.toml must configure lightweight defaults"
+    );
+}
+
 /// Commerce fixture: multi-file via include (commerce.ab includes billing.ab).
 const COMMERCE_FIXTURE: &[&str] = &["tests/fixtures/commerce.ab"];
 
@@ -4580,8 +4739,9 @@ fn cli_verify_missing_input_does_not_write_report() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to read"),
-        "expected missing-file load error in stderr: {stderr}"
+        stderr.contains("failed to resolve source targets")
+            && stderr.contains("source target not found"),
+        "expected missing source target error in stderr: {stderr}"
     );
 }
 
@@ -5783,6 +5943,29 @@ fn verify_assert_false_without_ensures_fails() {
 }
 
 #[test]
+fn verify_assume_without_ensures_is_admitted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("assume_no_ensures.ab");
+    std::fs::write(
+        &file,
+        "module TestAssume\n\nfn trusted(x: int): int {\n  assume x >= 0\n  x\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "trusted" && reason.contains("assume")
+        )),
+        "assume without ensures should still disclose an admitted fn contract, got: {results:?}"
+    );
+}
+
+#[test]
 fn verify_nested_assert_in_pure_context_caught() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let file = dir.path().join("nested_assert.ab");
@@ -6426,6 +6609,81 @@ fn verify_branch_condition_propagated_to_loop() {
     assert!(
         output_has_verdict_subject(&stdout, "PROVED", "fn branch_inner"),
         "should prove branch_inner: {stdout}"
+    );
+}
+
+#[test]
+fn verify_branch_assert_uses_outer_requires() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("branch_requires.ab");
+    std::fs::write(
+        &file,
+        "module BranchRequires\n\n\
+         fn branch_assert(x: int, flag: bool): int\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 if flag {\n\
+         \x20   assert x > 0\n\
+         \x20 } else {\n\
+         \x20   assert x > 0\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "branch assertions should see outer requires; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output_has_verdict_subject(&stdout, "PROVED", "fn branch_assert"),
+        "should prove branch_assert: {stdout}"
+    );
+}
+
+#[test]
+fn verify_branch_assert_uses_branch_condition() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("branch_condition_assert.ab");
+    std::fs::write(
+        &file,
+        "module BranchConditionAssert\n\n\
+         fn branch_condition(flag: bool): bool\n\
+         {\n\
+         \x20 if flag {\n\
+         \x20   assert flag\n\
+         \x20 } else {\n\
+         \x20   assert not flag\n\
+         \x20 }\n\
+         \x20 flag\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
+        .arg("verify")
+        .arg(&file)
+        .output()
+        .expect("run CLI");
+    assert!(
+        output.status.success(),
+        "branch assertions should see branch path conditions; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output_has_verdict_subject(&stdout, "PROVED", "fn branch_condition"),
+        "should prove branch_condition: {stdout}"
     );
 }
 
@@ -14423,7 +14681,8 @@ theorem t for S {
 ///
 /// Scenario: file `a.ab` declares module A with an under block over
 /// system A::S; file `b.ab` declares module B with its own under
-/// block over system B::S. Loading `[a, b]` makes A the root module.
+/// block over system B::S. A multi-root load has no implicit current
+/// module, so the test explicitly selects module A before elaboration.
 /// After `elaborate_env`, `result.under_blocks` must contain only A's
 /// under block; B's must be filtered out. Member theorem indices for
 /// A's surviving theorem must remain valid (point at the still-present
@@ -14466,11 +14725,12 @@ under {
         .write_all(b_src.as_bytes())
         .expect("write b.ab");
 
-    let (env, load_errors, _) = loader::load_files(&[a_path.clone(), b_path.clone()]);
+    let (mut env, load_errors, _) = loader::load_files(&[a_path.clone(), b_path.clone()]);
     assert!(
         load_errors.is_empty(),
         "load_errors should be empty: {load_errors:?}"
     );
+    env.module_name = Some("A".to_owned());
     let (result, errors) = elab::elaborate_env(env);
     let real_errors: Vec<_> = errors
         .iter()

@@ -1197,6 +1197,14 @@ mod tests {
     }
 
     #[test]
+    fn entity_state_getters_preserve_inactive_slots() {
+        let entity = EntityState::builder(false).build();
+
+        assert!(!entity.active());
+        assert!(entity.fields().is_empty());
+    }
+
+    #[test]
     fn binding_and_atomic_step_getters_work() {
         let binding = Binding::new("amount", WitnessValue::Int(7))
             .expect("valid binding")
@@ -1209,16 +1217,20 @@ mod tests {
         let step = AtomicStep::builder(step_id.clone(), "Billing", "charge")
             .step_name("charge_card")
             .param(binding)
+            .choice(Choice::Create {
+                created: EntitySlotRef::new("Payment", 0),
+            })
             .result(WitnessValue::Bool(true))
             .build()
             .expect("valid step");
 
         assert_eq!(step.id(), &step_id);
+        assert_eq!(step.id().as_str(), "charge");
         assert_eq!(step.system(), "Billing");
         assert_eq!(step.command(), "charge");
         assert_eq!(step.step_name(), Some("charge_card"));
         assert_eq!(step.params().len(), 1);
-        assert_eq!(step.choices().len(), 0);
+        assert_eq!(step.choices().len(), 1);
         assert_eq!(step.result(), Some(&WitnessValue::Bool(true)));
     }
 
@@ -1248,6 +1260,24 @@ mod tests {
     }
 
     #[test]
+    fn deadlock_and_liveness_accessors_return_actual_indices() {
+        let behavior = Behavior::builder()
+            .state(State::builder().build())
+            .state(State::builder().build())
+            .state(State::builder().build())
+            .transition(Transition::builder().build().expect("valid transition"))
+            .transition(Transition::builder().build().expect("valid transition"))
+            .build()
+            .expect("valid behavior");
+
+        let deadlock = DeadlockWitness::new(behavior.clone()).expect("deadlock witness");
+        let liveness = LassoWitness::new(behavior, 2).expect("valid liveness witness");
+
+        assert_eq!(deadlock.deadlocked_at(), 2);
+        assert_eq!(liveness.loop_start(), 2);
+    }
+
+    #[test]
     fn transition_and_behavior_accessors_work() {
         let behavior = sample_behavior();
         let transition = behavior.transition(0).expect("transition");
@@ -1270,5 +1300,53 @@ mod tests {
 
         assert!(matches!(ordered, StepRelation::Ordered { .. }));
         assert!(matches!(concurrent, StepRelation::Concurrent { .. }));
+    }
+
+    #[test]
+    fn behavior_accessors_and_topology_report_absent_or_invalid_shapes() {
+        let behavior = Behavior {
+            states: vec![State::builder().build(), State::builder().build()],
+            transitions: vec![],
+        };
+
+        assert!(behavior.state(2).is_none());
+        assert!(!behavior.is_linear_topology());
+    }
+
+    #[test]
+    fn operational_witness_validate_rejects_invalid_liveness_payload() {
+        let witness = OperationalWitness::Liveness {
+            witness: LassoWitness {
+                behavior: Behavior {
+                    states: vec![State::builder().build()],
+                    transitions: vec![],
+                },
+                loop_start: 1,
+            },
+        };
+
+        assert_eq!(
+            witness.validate(),
+            Err(ValidationError::LoopStart {
+                loop_start: 1,
+                states: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validation_error_display_includes_context() {
+        assert_eq!(
+            ValidationError::TransitionCount {
+                states: 3,
+                transitions: 1,
+            }
+            .to_string(),
+            "operational witness topology mismatch: 3 states require 2 transitions, found 1"
+        );
+        assert_eq!(
+            ValidationError::UnknownAtomicStepRef("missing".to_owned()).to_string(),
+            "transition relation references unknown atomic step `missing`"
+        );
     }
 }

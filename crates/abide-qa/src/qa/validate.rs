@@ -219,7 +219,7 @@ fn build_base_env_from_paths(paths: &[PathBuf]) -> Result<elab::env::Env, ()> {
     if !load_errors.is_empty() || !env.include_load_errors.is_empty() {
         return Err(());
     }
-    if paths.len() > 1 {
+    if should_clear_root_module(paths.len()) {
         env.module_name = None;
     }
 
@@ -411,7 +411,7 @@ fn build_flow_model_from_paths(paths: &[PathBuf]) -> Result<FlowModel, Vec<Strin
             .map(|error| format!("error: {error}"))
             .collect());
     }
-    if paths.len() > 1 {
+    if should_clear_root_module(paths.len()) {
         env.module_name = None;
     }
 
@@ -436,6 +436,10 @@ fn build_flow_model_from_paths(paths: &[PathBuf]) -> Result<FlowModel, Vec<Strin
     }
 
     Ok(extract::extract(&ir_program))
+}
+
+fn should_clear_root_module(path_count: usize) -> bool {
+    path_count.saturating_sub(1) > 0
 }
 
 fn statement_query(statement: &QAStatement) -> Option<&Query> {
@@ -554,6 +558,30 @@ fn reference_span(statement: &LocatedStatement, reference: &str) -> Option<Span>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qa::ast::{Query, TemporalTarget};
+    use crate::qa::model::{FieldGraphMeta, OwnerKind, SystemInfo};
+    use std::collections::HashMap;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("abide-qa-validate-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        root
+    }
+
+    fn empty_model() -> FlowModel {
+        FlowModel {
+            state_graphs: HashMap::new(),
+            field_graph_meta: HashMap::new(),
+            systems: HashMap::new(),
+            entity_names: Vec::new(),
+            system_names: Vec::new(),
+            type_names: Vec::new(),
+            interfaces: HashMap::new(),
+            action_contracts: HashMap::new(),
+            fsm_decls: HashMap::new(),
+        }
+    }
 
     #[test]
     fn validate_qa_source_reports_missing_load_target() {
@@ -566,6 +594,32 @@ mod tests {
             Some(QA_SEMANTIC_MISSING_LOAD)
         );
         assert_eq!(diagnostics[0].span, Some(Span { start: 6, end: 16 }));
+    }
+
+    #[test]
+    fn validate_qa_source_stops_after_any_missing_load_target() {
+        let root = temp_root("mixed-loads");
+        std::fs::write(
+            root.join("model.ab"),
+            "module QAValidateMixed\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write model");
+
+        let script_path = root.join("query.qa");
+        let diagnostics = validate_qa_source(
+            &script_path,
+            "load \"missing.ab\"\nload \"model.ab\"\nask terminal Missing.status\n",
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].code.as_deref(),
+            Some(QA_SEMANTIC_MISSING_LOAD)
+        );
     }
 
     #[test]
@@ -597,6 +651,68 @@ mod tests {
     }
 
     #[test]
+    fn base_env_for_qa_source_marks_missing_loads_invalid() {
+        let root = temp_root("missing-base-env");
+        let script_path = root.join("query.qa");
+
+        assert!(matches!(
+            base_env_for_qa_source(&script_path, "load \"missing.ab\"\n"),
+            BaseEnv::Invalid
+        ));
+    }
+
+    #[test]
+    fn base_env_for_qa_source_loads_existing_specs() {
+        let root = temp_root("loaded-base-env");
+        std::fs::write(
+            root.join("model.ab"),
+            "module QAValidateLoaded\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write model");
+        let script_path = root.join("query.qa");
+
+        assert!(matches!(
+            base_env_for_qa_source(&script_path, "load \"model.ab\"\n"),
+            BaseEnv::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn validate_embedded_abide_blocks_reports_embedded_parse_errors() {
+        let script_path = Path::new("/tmp/qa_validate_embedded_parse.qa");
+        let diagnostics = validate_embedded_abide_blocks(
+            script_path,
+            "abide {\nentity Ticket {\n  status:\n}\n}\n",
+        );
+
+        assert!(!diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(diagnostics.iter().all(|diagnostic| {
+            diagnostic.file.as_deref() == Some("/tmp/qa_validate_embedded_parse.qa")
+        }));
+    }
+
+    #[test]
+    fn validate_embedded_abide_blocks_reports_embedded_semantic_errors() {
+        let script_path = Path::new("/tmp/qa_validate_embedded_semantic.qa");
+        let diagnostics = validate_embedded_abide_blocks(
+            script_path,
+            "abide {\nentity Ticket {\n  status: MissingStatus = @Open\n}\n}\n",
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown type")
+                    || diagnostic.message.contains("unresolved")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn validate_embedded_abide_blocks_uses_loaded_qa_context() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -614,6 +730,203 @@ mod tests {
                     && diagnostic.message.contains("Closed"))
             }),
             "embedded block should see variants from loaded base spec: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn build_flow_model_from_paths_reports_invalid_loaded_specs() {
+        let root = temp_root("invalid-loaded-spec");
+        let model = root.join("model.ab");
+        std::fs::write(
+            &model,
+            "module QAValidateInvalid\n\
+             entity Ticket {\n\
+               status: MissingStatus = @Open\n\
+             }\n",
+        )
+        .expect("write invalid model");
+
+        let errors = build_flow_model_from_paths(&[model]).expect_err("invalid model should fail");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn build_flow_model_from_paths_merges_multiple_loaded_files() {
+        let root = temp_root("multi-file-model");
+        let types = root.join("types.ab");
+        let entities = root.join("entities.ab");
+        std::fs::write(
+            &types,
+            "module QAValidateMulti\n\
+             enum TicketStatus = Open | Closed\n",
+        )
+        .expect("write types");
+        std::fs::write(
+            &entities,
+            "module QAValidateMulti\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write entities");
+
+        let model =
+            build_flow_model_from_paths(&[types, entities]).expect("multi-file model should load");
+        assert!(
+            model
+                .field_graph_meta
+                .contains_key(&("Ticket".to_owned(), "status".to_owned())),
+            "{model:#?}"
+        );
+    }
+
+    #[test]
+    fn build_flow_model_from_paths_exposes_all_loaded_modules_as_project_root() {
+        let root = temp_root("multi-module-model");
+        let catalog = root.join("catalog.ab");
+        let support = root.join("support.ab");
+        std::fs::write(
+            &catalog,
+            "module Catalog\n\
+             enum ProductStatus = Draft | Active\n\
+             entity Product {\n\
+               status: ProductStatus = @Draft\n\
+             }\n",
+        )
+        .expect("write catalog");
+        std::fs::write(
+            &support,
+            "module Support\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               status: TicketStatus = @Open\n\
+             }\n",
+        )
+        .expect("write support");
+
+        let model =
+            build_flow_model_from_paths(&[catalog, support]).expect("multi-module model loads");
+        assert!(
+            model
+                .field_graph_meta
+                .contains_key(&("Product".to_owned(), "status".to_owned())),
+            "{model:#?}"
+        );
+        assert!(
+            model
+                .field_graph_meta
+                .contains_key(&("Ticket".to_owned(), "status".to_owned())),
+            "{model:#?}"
+        );
+    }
+
+    #[test]
+    fn should_clear_root_module_only_for_multiple_input_paths() {
+        assert!(!should_clear_root_module(0));
+        assert!(!should_clear_root_module(1));
+        assert!(should_clear_root_module(2));
+    }
+
+    #[test]
+    fn temporal_target_reference_validation_checks_owner_and_field_targets() {
+        let mut model = empty_model();
+        model.entity_names.push("Ticket".to_owned());
+        model.systems.insert(
+            "Support".to_owned(),
+            SystemInfo {
+                name: "Support".to_owned(),
+                entities: vec!["Ticket".to_owned()],
+                events: Vec::new(),
+            },
+        );
+        model.field_graph_meta.insert(
+            ("Ticket".to_owned(), "status".to_owned()),
+            FieldGraphMeta {
+                owner: "Ticket".to_owned(),
+                field: "status".to_owned(),
+                owner_kind: OwnerKind::Entity,
+                graphable: true,
+                type_name: "TicketStatus".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            temporal_target_reference_validation(
+                &TemporalTarget {
+                    owner: "Ticket".to_owned(),
+                    field: Some("status".to_owned()),
+                },
+                &model,
+            ),
+            ("Ticket.status".to_owned(), true)
+        );
+        assert_eq!(
+            temporal_target_reference_validation(
+                &TemporalTarget {
+                    owner: "Ticket".to_owned(),
+                    field: Some("missing".to_owned()),
+                },
+                &model,
+            ),
+            ("Ticket.missing".to_owned(), false)
+        );
+        assert_eq!(
+            temporal_target_reference_validation(
+                &TemporalTarget {
+                    owner: "Support".to_owned(),
+                    field: None,
+                },
+                &model,
+            ),
+            ("Support".to_owned(), true)
+        );
+        assert_eq!(
+            temporal_target_reference_validation(
+                &TemporalTarget {
+                    owner: "Unknown".to_owned(),
+                    field: None,
+                },
+                &model,
+            ),
+            ("Unknown".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn model_has_owner_accepts_entities_and_systems_only_by_exact_name() {
+        let mut model = empty_model();
+        model.entity_names.push("Ticket".to_owned());
+        model.systems.insert(
+            "Support".to_owned(),
+            SystemInfo {
+                name: "Support".to_owned(),
+                entities: Vec::new(),
+                events: Vec::new(),
+            },
+        );
+
+        assert!(model_has_owner(&model, "Ticket"));
+        assert!(model_has_owner(&model, "Support"));
+        assert!(!model_has_owner(&model, "Tick"));
+        assert!(!model_has_owner(&model, "Unknown"));
+
+        assert_eq!(
+            query_reference_validation(
+                &Query::Invariants {
+                    entity: "Ticket".to_owned(),
+                },
+                &model,
+            ),
+            Some(("Ticket".to_owned(), true))
+        );
+        assert_eq!(
+            query_reference_validation(
+                &Query::Deadlock {
+                    system: "Unknown".to_owned(),
+                },
+                &model,
+            ),
+            Some(("Unknown".to_owned(), false))
         );
     }
 }

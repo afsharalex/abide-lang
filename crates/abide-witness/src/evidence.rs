@@ -495,6 +495,71 @@ mod tests {
     }
 
     #[test]
+    fn proof_artifact_payload_accessors_preserve_reference() {
+        let artifact = ProofArtifactRef::new("proofs/order.agda")
+            .expect("valid proof ref")
+            .backend("agda")
+            .label("order_no_overdraft")
+            .checked(true);
+        let payload = EvidencePayload::proof_artifact_ref(artifact.clone());
+        let envelope =
+            EvidenceEnvelope::proof_artifact_ref(artifact.clone()).expect("valid evidence");
+
+        assert_eq!(payload.as_proof_artifact_ref(), Some(&artifact));
+        assert_eq!(payload.as_countermodel(), None);
+        assert_eq!(envelope.as_proof_artifact_ref(), Some(&artifact));
+        assert_eq!(envelope.payload(), &payload);
+        assert_eq!(artifact.locator(), "proofs/order.agda");
+        assert_eq!(artifact.backend_name(), Some("agda"));
+        assert_eq!(artifact.label_text(), Some("order_no_overdraft"));
+        assert!(artifact.is_checked());
+        assert!(!ProofArtifactRef::new("proofs/unchecked.agda")
+            .expect("valid proof ref")
+            .is_checked());
+    }
+
+    #[test]
+    fn countermodel_builder_and_accessors_preserve_payload() {
+        let binding = CountermodelBinding::new("n", WitnessValue::Int(42)).expect("valid binding");
+        let countermodel = Countermodel::new()
+            .backend("cvc5")
+            .summary("model satisfies negated goal")
+            .binding(binding.clone());
+
+        assert_eq!(countermodel.backend_name(), Some("cvc5"));
+        assert_eq!(
+            countermodel.summary_text(),
+            Some("model satisfies negated goal")
+        );
+        assert_eq!(countermodel.bindings(), &[binding.clone()]);
+        assert_eq!(countermodel.validate(), Ok(()));
+        assert_eq!(binding.name(), "n");
+        assert_eq!(binding.value(), &WitnessValue::Int(42));
+    }
+
+    #[test]
+    fn countermodel_validation_rejects_tampered_binding_names() {
+        let binding = CountermodelBinding {
+            name: " ".to_owned(),
+            value: WitnessValue::Bool(true),
+        };
+        assert_eq!(
+            binding.validate(),
+            Err(CountermodelValidationError::EmptyBindingName)
+        );
+
+        let countermodel = Countermodel {
+            backend: Some("z3".to_owned()),
+            summary: None,
+            bindings: vec![binding],
+        };
+        assert_eq!(
+            countermodel.validate(),
+            Err(CountermodelValidationError::EmptyBindingName)
+        );
+    }
+
+    #[test]
     fn evidence_envelope_from_json_validated_accepts_valid_payload() {
         let evidence = EvidenceEnvelope::proof_artifact_ref(
             ProofArtifactRef::new("proofs/order.agda").expect("valid proof ref"),
@@ -526,5 +591,27 @@ mod tests {
                 ProofArtifactRefValidationError::EmptyLocator
             ))
         ));
+    }
+
+    #[test]
+    fn evidence_validation_errors_display_inner_context() {
+        assert_eq!(
+            ValidationError::ProofArtifactRef(ProofArtifactRefValidationError::EmptyLocator)
+                .to_string(),
+            "proof artifact locator may not be empty"
+        );
+        assert_eq!(
+            ValidationError::Countermodel(CountermodelValidationError::EmptyBindingName)
+                .to_string(),
+            "countermodel binding name may not be empty"
+        );
+        assert_eq!(
+            CountermodelValidationError::EmptyBindingName.to_string(),
+            "countermodel binding name may not be empty"
+        );
+        assert_eq!(
+            ProofArtifactRefValidationError::EmptyLocator.to_string(),
+            "proof artifact locator may not be empty"
+        );
     }
 }

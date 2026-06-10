@@ -1056,6 +1056,15 @@ mod tests {
             .expect("title field metadata");
         assert!(!title_meta.graphable);
         assert_eq!(title_meta.type_name, "string");
+        let status_meta = model
+            .field_graph_meta
+            .get(&("Ticket".to_owned(), "status".to_owned()))
+            .expect("status field metadata");
+        assert_eq!(status_meta.owner, "Ticket");
+        assert_eq!(status_meta.field, "status");
+        assert_eq!(status_meta.owner_kind, OwnerKind::Entity);
+        assert!(status_meta.graphable);
+        assert_eq!(status_meta.type_name, "statusStatus");
     }
 
     #[test]
@@ -1290,6 +1299,13 @@ mod tests {
         );
         assert_eq!(entity_graph.initial, Some("false".to_owned()));
         assert_eq!(entity_graph.transitions[0].to, "true");
+        let entity_meta = model
+            .field_graph_meta
+            .get(&("Ticket".to_owned(), "ready".to_owned()))
+            .expect("entity bool metadata");
+        assert_eq!(entity_meta.owner_kind, OwnerKind::Entity);
+        assert!(entity_meta.graphable);
+        assert_eq!(entity_meta.type_name, "bool");
 
         let system_graph = model
             .state_graphs
@@ -1300,6 +1316,544 @@ mod tests {
         assert_eq!(system_graph.transitions[0].action, "start");
         assert_eq!(system_graph.transitions[0].from, Some("false".to_owned()));
         assert_eq!(system_graph.transitions[0].to, "true");
+        let system_meta = model
+            .field_graph_meta
+            .get(&("Workflow".to_owned(), "running".to_owned()))
+            .expect("system bool metadata");
+        assert_eq!(system_meta.owner, "Workflow");
+        assert_eq!(system_meta.field, "running");
+        assert_eq!(system_meta.owner_kind, OwnerKind::System);
+        assert!(system_meta.graphable);
+        assert_eq!(system_meta.type_name, "bool");
+    }
+
+    #[test]
+    fn extract_system_field_update_requires_equality_to_the_target_field() {
+        let assignment = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Prime {
+                expr: Box::new(IRExpr::Var {
+                    name: "running".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        assert_eq!(
+            extract_system_field_update(&assignment, "running", &IRType::Bool),
+            Some("true".to_owned())
+        );
+        assert_eq!(
+            extract_system_field_update(&assignment, "paused", &IRType::Bool),
+            None
+        );
+
+        let wrong_op = match assignment.clone() {
+            IRExpr::BinOp {
+                left,
+                right,
+                ty,
+                span,
+                ..
+            } => IRExpr::BinOp {
+                op: "OpNe".to_owned(),
+                left,
+                right,
+                ty,
+                span,
+            },
+            _ => unreachable!("assignment fixture is a binary expression"),
+        };
+        assert_eq!(
+            extract_system_field_update(&wrong_op, "running", &IRType::Bool),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_guard_state_requires_equality_and_recurses_through_conjunctions() {
+        let ready_var = IRExpr::Var {
+            name: "ready".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let true_lit = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        };
+        let false_lit = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: false },
+            span: None,
+        };
+        let eq_ready_true = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(ready_var.clone()),
+            right: Box::new(true_lit.clone()),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let reversed_eq = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(false_lit.clone()),
+            right: Box::new(ready_var.clone()),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let conjunct = IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            right: Box::new(eq_ready_true.clone()),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let disjunct = IRExpr::BinOp {
+            op: "OpOr".to_owned(),
+            left: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            right: Box::new(eq_ready_true.clone()),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let not_equal = IRExpr::BinOp {
+            op: "OpNe".to_owned(),
+            left: Box::new(ready_var),
+            right: Box::new(true_lit),
+            ty: IRType::Bool,
+            span: None,
+        };
+
+        assert_eq!(
+            extract_guard_state(&eq_ready_true, "ready", &IRType::Bool),
+            Some("true".to_owned())
+        );
+        assert_eq!(
+            extract_guard_state(&reversed_eq, "ready", &IRType::Bool),
+            Some("false".to_owned())
+        );
+        assert_eq!(
+            extract_guard_state(&conjunct, "ready", &IRType::Bool),
+            Some("true".to_owned())
+        );
+        assert_eq!(extract_guard_state(&disjunct, "ready", &IRType::Bool), None);
+        assert_eq!(
+            extract_guard_state(&not_equal, "ready", &IRType::Bool),
+            None
+        );
+    }
+
+    #[test]
+    fn finite_field_states_rejects_recursive_enum_payloads() {
+        let recursive = IRType::Enum {
+            name: "Node".to_owned(),
+            variants: vec![IRVariant {
+                name: "Wrap".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "next".to_owned(),
+                    ty: IRType::Enum {
+                        name: "Node".to_owned(),
+                        variants: vec![IRVariant::simple("Leaf")],
+                    },
+                }],
+            }],
+        };
+
+        assert_eq!(finite_field_states(&recursive), None);
+    }
+
+    #[test]
+    fn display_ir_expr_renders_literals_and_variables() {
+        assert_eq!(
+            display_ir_expr(&IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 7 },
+                span: None,
+            }),
+            "7"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            "true"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Lit {
+                ty: IRType::String,
+                value: LitVal::Str {
+                    value: "ticket".to_owned(),
+                },
+                span: None,
+            }),
+            "\"ticket\""
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Var {
+                name: "status".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "status"
+        );
+    }
+
+    #[test]
+    fn display_ir_expr_renders_structural_and_temporal_forms() {
+        let var = |name: &str| IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let bool_lit = |value| IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        };
+
+        assert_eq!(
+            display_ir_expr(&IRExpr::Ctor {
+                enum_name: "Status".to_owned(),
+                ctor: "Ready".to_owned(),
+                args: vec![("armed".to_owned(), bool_lit(true))],
+                span: None,
+            }),
+            "@Ready { armed: true }"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Field {
+                expr: Box::new(var("order")),
+                field: "status".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "order.status"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Prime {
+                expr: Box::new(var("status")),
+                span: None,
+            }),
+            "status'"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(var("ready")),
+                right: Box::new(bool_lit(true)),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "ready == true"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::UnOp {
+                op: "OpNot".to_owned(),
+                operand: Box::new(var("ready")),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "not ready"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Always {
+                body: Box::new(var("safe")),
+                span: None,
+            }),
+            "always safe"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Eventually {
+                body: Box::new(var("done")),
+                span: None,
+            }),
+            "eventually done"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Until {
+                left: Box::new(var("pending")),
+                right: Box::new(var("done")),
+                span: None,
+            }),
+            "pending until done"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Historically {
+                body: Box::new(var("safe")),
+                span: None,
+            }),
+            "historically safe"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Once {
+                body: Box::new(var("ready")),
+                span: None,
+            }),
+            "once ready"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Previously {
+                body: Box::new(var("ready")),
+                span: None,
+            }),
+            "previously ready"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Since {
+                left: Box::new(var("open")),
+                right: Box::new(var("created")),
+                span: None,
+            }),
+            "open since created"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Match {
+                scrutinee: Box::new(var("status")),
+                arms: vec![IRMatchArm {
+                    pattern: IRPattern::PVar {
+                        name: "s".to_owned(),
+                    },
+                    guard: Some(bool_lit(true)),
+                    body: var("s"),
+                }],
+                span: None,
+            }),
+            "match status { s if true => s }"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Forall {
+                var: "x".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "all x: bool | x"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Exists {
+                var: "x".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "exists x: bool | x"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::One {
+                var: "x".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "one x: bool | x"
+        );
+    }
+
+    #[test]
+    fn display_ir_expr_renders_call_collection_control_and_stub_forms() {
+        let var = |name: &str| IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let bool_lit = |value| IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        };
+
+        assert_eq!(
+            display_ir_expr(&IRExpr::Lone {
+                var: "x".to_owned(),
+                domain: IRType::Bool,
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "lone x: bool | x"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::App {
+                func: Box::new(var("valid")),
+                arg: Box::new(var("x")),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "valid(x)"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Lam {
+                param: "x".to_owned(),
+                param_type: IRType::Bool,
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "fn(x) => x"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: "x".to_owned(),
+                    ty: IRType::Bool,
+                    expr: bool_lit(true),
+                }],
+                body: Box::new(var("x")),
+                span: None,
+            }),
+            "let x = true in x"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::IfElse {
+                cond: Box::new(var("ready")),
+                then_body: Box::new(var("go")),
+                else_body: Some(Box::new(var("stop"))),
+                span: None,
+            }),
+            "if ready then go else stop"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Card {
+                expr: Box::new(var("items")),
+                span: None,
+            }),
+            "#items"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::SetLit {
+                elements: vec![bool_lit(true), bool_lit(false)],
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            "Set(true, false)"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::SeqLit {
+                elements: vec![bool_lit(true)],
+                ty: IRType::Seq {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            "Seq(true)"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::MapLit {
+                entries: vec![(var("k"), bool_lit(true))],
+                ty: IRType::Map {
+                    key: Box::new(IRType::Bool),
+                    value: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            "Map((k, true))"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Index {
+                map: Box::new(var("m")),
+                key: Box::new(var("k")),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            "m[k]"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::MapUpdate {
+                map: Box::new(var("m")),
+                key: Box::new(var("k")),
+                value: Box::new(bool_lit(true)),
+                ty: IRType::Map {
+                    key: Box::new(IRType::Bool),
+                    value: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            "m[k := true]"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Assert {
+                expr: Box::new(var("ok")),
+                span: None,
+            }),
+            "assert ok"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Assume {
+                expr: Box::new(var("ok")),
+                span: None,
+            }),
+            "assume ok"
+        );
+        assert_eq!(display_ir_expr(&IRExpr::Sorry { span: None }), "sorry");
+        assert_eq!(display_ir_expr(&IRExpr::Todo { span: None }), "todo");
+        assert_eq!(
+            display_ir_expr(&IRExpr::Block {
+                exprs: vec![var("a"), var("b")],
+                span: None,
+            }),
+            "{ a; b }"
+        );
+        assert_eq!(
+            display_ir_expr(&IRExpr::Saw {
+                system_name: "Commerce".to_owned(),
+                event_name: "ship".to_owned(),
+                args: vec![Some(Box::new(var("order"))), None],
+                span: None,
+            }),
+            "saw Commerce::ship(order, _)"
+        );
+    }
+
+    #[test]
+    fn display_ir_type_renders_common_type_forms() {
+        assert_eq!(display_ir_type(&IRType::Int), "int");
+        assert_eq!(display_ir_type(&IRType::Real), "real");
+        assert_eq!(display_ir_type(&IRType::Float), "float");
+        assert_eq!(display_ir_type(&IRType::Identity), "identity");
+        assert_eq!(
+            display_ir_type(&IRType::Entity {
+                name: "Order".to_owned()
+            }),
+            "Order"
+        );
+        assert_eq!(
+            display_ir_type(&IRType::Set {
+                element: Box::new(IRType::Int)
+            }),
+            "Set<int>"
+        );
+        assert_eq!(
+            display_ir_type(&IRType::Seq {
+                element: Box::new(IRType::Bool)
+            }),
+            "Seq<bool>"
+        );
+        assert_eq!(
+            display_ir_type(&IRType::Map {
+                key: Box::new(IRType::Identity),
+                value: Box::new(IRType::Entity {
+                    name: "Order".to_owned()
+                }),
+            }),
+            "Map<identity, Order>"
+        );
     }
 
     #[test]
@@ -1403,5 +1957,79 @@ mod tests {
             Some("Ready{armed=false}".to_owned())
         );
         assert_eq!(graph.transitions[0].to, "Ready{armed=true}");
+    }
+
+    #[test]
+    fn extract_fsm_terminal_states_from_entity_and_system_field_variants() {
+        let fsm = IRFsm {
+            field: "status".to_owned(),
+            enum_name: "Lifecycle".to_owned(),
+            transitions: vec![IRFsmTransition {
+                from: "Open".to_owned(),
+                to: "Closed".to_owned(),
+            }],
+        };
+        let entity = IREntity {
+            name: "Ticket".to_owned(),
+            fields: vec![make_enum_field(
+                "status",
+                &["Open", "Closed", "Archived"],
+                Some("Open"),
+            )],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![fsm.clone()],
+        };
+        let system = IRSystem {
+            name: "Workflow".to_owned(),
+            fields: vec![make_enum_field(
+                "status",
+                &["Open", "Closed", "Archived"],
+                Some("Open"),
+            )],
+            store_params: vec![],
+            entities: vec![],
+            commands: vec![],
+            actions: vec![],
+            fsm_decls: vec![fsm],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity],
+            systems: vec![system],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+
+        let model = extract(&ir);
+        let entity_fsm = model
+            .fsm_decls
+            .get(&("Ticket".to_owned(), "status".to_owned()))
+            .expect("entity fsm");
+        assert_eq!(
+            entity_fsm.terminal_states,
+            vec!["Closed".to_owned(), "Archived".to_owned()]
+        );
+        let system_fsm = model
+            .fsm_decls
+            .get(&("Workflow".to_owned(), "status".to_owned()))
+            .expect("system fsm");
+        assert_eq!(
+            system_fsm.terminal_states,
+            vec!["Closed".to_owned(), "Archived".to_owned()]
+        );
     }
 }

@@ -554,6 +554,60 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_sink_sorts_same_location_by_severity_then_code_then_message() {
+        let span = Span { start: 1, end: 2 };
+        let mut sink = DiagnosticSink::new();
+        sink.extend([
+            Diagnostic::warning("z")
+                .with_code("B")
+                .with_span(span)
+                .in_file("a.ab"),
+            Diagnostic::error("b")
+                .with_code("B")
+                .with_span(span)
+                .in_file("a.ab"),
+            Diagnostic::error("a")
+                .with_code("A")
+                .with_span(span)
+                .in_file("a.ab"),
+            Diagnostic {
+                severity: DiagnosticSeverity::Hint,
+                code: Some("C".to_owned()),
+                message: "hint".to_owned(),
+                span: Some(span),
+                file: Some("a.ab".to_owned()),
+                help: None,
+                related: Vec::new(),
+            },
+            Diagnostic {
+                severity: DiagnosticSeverity::Info,
+                code: Some("C".to_owned()),
+                message: "info".to_owned(),
+                span: Some(span),
+                file: Some("a.ab".to_owned()),
+                help: None,
+                related: Vec::new(),
+            },
+        ]);
+
+        let diagnostics = sink.into_sorted_deduped();
+        let severities: Vec<_> = diagnostics.iter().map(|d| d.severity).collect();
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+
+        assert_eq!(
+            severities,
+            vec![
+                DiagnosticSeverity::Error,
+                DiagnosticSeverity::Error,
+                DiagnosticSeverity::Warning,
+                DiagnosticSeverity::Info,
+                DiagnosticSeverity::Hint,
+            ]
+        );
+        assert_eq!(messages, vec!["a", "b", "z", "info", "hint"]);
+    }
+
+    #[test]
     fn parse_error_converts_to_shared_diagnostic() {
         let diagnostic = ParseError::expected_with_help(
             "type name",
@@ -568,12 +622,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_variants_preserve_codes_messages_spans_and_help() {
+        let eof = ParseError::eof(Span { start: 9, end: 9 }).to_diagnostic();
+        assert_eq!(eof.code.as_deref(), Some("abide::parse::eof"));
+        assert_eq!(eof.message, "unexpected end of input");
+        assert_eq!(eof.span, Some(Span { start: 9, end: 9 }));
+        assert_eq!(eof.help, None);
+
+        let general = ParseError::general_with_help(
+            "expected declaration",
+            Span { start: 2, end: 6 },
+            "try `entity`",
+        )
+        .to_diagnostic();
+        assert_eq!(general.code.as_deref(), Some("abide::parse::error"));
+        assert_eq!(general.message, "expected declaration");
+        assert_eq!(general.span, Some(Span { start: 2, end: 6 }));
+        assert_eq!(general.help.as_deref(), Some("try `entity`"));
+
+        let expected =
+            ParseError::expected("identifier", "number", Span { start: 1, end: 3 }).to_diagnostic();
+        assert_eq!(expected.code.as_deref(), Some("abide::parse::expected"));
+        assert_eq!(expected.message, "expected identifier, found number");
+        assert_eq!(expected.help, None);
+    }
+
+    #[test]
     fn lex_error_converts_to_shared_diagnostic() {
         let diagnostic = LexError::new("!", Span { start: 0, end: 1 }).to_diagnostic();
         assert_eq!(diagnostic.code.as_deref(), Some("abide::lex::unexpected"));
         assert_eq!(diagnostic.message, "unexpected character");
         assert_eq!(diagnostic.span, Some(Span { start: 0, end: 1 }));
         assert!(diagnostic.is_error());
+    }
+
+    #[test]
+    fn diagnostic_builder_display_and_miette_fields_are_stable() {
+        let diagnostic = Diagnostic::warning("careful")
+            .with_code("abide::warn::careful")
+            .with_span(Span { start: 3, end: 8 })
+            .in_file("main.ab")
+            .with_help("try a safer expression");
+
+        assert_eq!(
+            diagnostic.to_string(),
+            "warning[abide::warn::careful]: careful"
+        );
+        assert!(!diagnostic.is_error());
+        assert_eq!(diagnostic.severity(), Some(miette::Severity::Warning));
+        assert_eq!(
+            diagnostic.code().map(|code| code.to_string()),
+            Some("abide::warn::careful".to_owned())
+        );
+        assert_eq!(
+            diagnostic.help().map(|help| help.to_string()),
+            Some("try a safer expression".to_owned())
+        );
+    }
+
+    #[test]
+    fn diagnostic_display_without_code_uses_plain_prefix() {
+        assert_eq!(Diagnostic::error("boom").to_string(), "error: boom");
+    }
+
+    #[test]
+    fn non_error_severities_map_to_expected_miette_severities() {
+        assert_eq!(
+            miette::Severity::from(DiagnosticSeverity::Info),
+            miette::Severity::Advice
+        );
+        assert_eq!(
+            miette::Severity::from(DiagnosticSeverity::Hint),
+            miette::Severity::Advice
+        );
+        assert!(!DiagnosticSeverity::Warning.is_error());
     }
 
     #[test]
@@ -598,6 +720,10 @@ mod tests {
             2,
             "cross-file related span should not render as a label"
         );
+        assert_eq!(labels[0].label(), Some("primary"));
+        assert_eq!(labels[1].label(), Some("same file"));
+        assert_eq!(labels[0].inner().offset(), 10);
+        assert_eq!(labels[1].inner().offset(), 20);
     }
 
     #[test]

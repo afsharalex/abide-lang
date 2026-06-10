@@ -490,9 +490,13 @@ fn check_type(ty: &Ty, decl_span: Option<crate::span::Span>) -> Vec<ElabError> {
 /// Called recursively on all expressions.
 fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabError>) {
     match expr {
-        EExpr::SetLit(_, elems, _) if elems.len() > 1 => {
-            let first_ty = elems[0].ty();
-            for (i, e) in elems.iter().enumerate().skip(1) {
+        EExpr::SetLit(_, elems, _) => {
+            let [first, rest @ ..] = elems.as_slice() else {
+                return;
+            };
+            for (offset, e) in rest.iter().enumerate() {
+                let i = offset + 1;
+                let first_ty = first.ty();
                 let e_ty = e.ty();
                 if !types_compatible(&first_ty, &e_ty) {
                     errors.push(ElabError::new(
@@ -506,9 +510,13 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
                 }
             }
         }
-        EExpr::SeqLit(_, elems, _) if elems.len() > 1 => {
-            let first_ty = elems[0].ty();
-            for (i, e) in elems.iter().enumerate().skip(1) {
+        EExpr::SeqLit(_, elems, _) => {
+            let [first, rest @ ..] = elems.as_slice() else {
+                return;
+            };
+            for (offset, e) in rest.iter().enumerate() {
+                let i = offset + 1;
+                let first_ty = first.ty();
                 let e_ty = e.ty();
                 if !types_compatible(&first_ty, &e_ty) {
                     errors.push(ElabError::new(
@@ -522,10 +530,14 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
                 }
             }
         }
-        EExpr::MapLit(_, entries, _) if entries.len() > 1 => {
-            let first_k_ty = entries[0].0.ty();
-            let first_v_ty = entries[0].1.ty();
-            for (i, (k, v)) in entries.iter().enumerate().skip(1) {
+        EExpr::MapLit(_, entries, _) => {
+            let [first, rest @ ..] = entries.as_slice() else {
+                return;
+            };
+            for (offset, (k, v)) in rest.iter().enumerate() {
+                let i = offset + 1;
+                let first_k_ty = first.0.ty();
+                let first_v_ty = first.1.ty();
                 let k_ty = k.ty();
                 let v_ty = v.ty();
                 if !types_compatible(&first_k_ty, &k_ty) {
@@ -1697,10 +1709,7 @@ fn check_pred_prop_cycles(env: &Env) -> Vec<ElabError> {
                 let is_self_recursive = cycle.len() == 2 && cycle.first() == cycle.last();
                 // Check if all names in the cycle are fns (decreases is applicable)
                 let cycle_names: Vec<&str> = cycle.iter().map(String::as_str).collect();
-                let all_fns = cycle_names
-                    .iter()
-                    .filter(|n| **n != cycle_names[0] || !is_self_recursive)
-                    .all(|n| env.fns.contains_key(*n));
+                let all_fns = cycle_names.iter().all(|n| env.fns.contains_key(*n));
                 let mut err = ElabError::new(
                     ErrorKind::CyclicDefinition,
                     format!("circular definition detected: {}", cycle.join(" → ")),
@@ -1970,7 +1979,7 @@ fn collect_epattern_vars(pat: &EPattern, vars: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elab::types::{EExpr, Literal, Ty};
+    use crate::elab::types::{EExpr, EPred, EProp, Literal, Ty};
 
     /// Helper: make an unknown uppercase Var that should trigger the hint.
     fn unresolved_var(name: &str) -> EExpr {
@@ -1982,10 +1991,52 @@ mod tests {
         EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(n), None)
     }
 
+    fn bool_lit(value: bool) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(value), None)
+    }
+
     fn collect_hints(expr: &EExpr) -> Vec<ElabError> {
         let mut errors = Vec::new();
         check_unresolved_constructors(expr, "test context", None, &[], &mut errors);
         errors
+    }
+
+    fn collect_homogeneity_errors(expr: &EExpr) -> Vec<ElabError> {
+        let mut errors = Vec::new();
+        check_collection_homogeneity(expr, "test collection", &mut errors);
+        errors
+    }
+
+    fn fn_decl(contracts: Vec<EContract>, params: Vec<(String, Ty)>) -> EFn {
+        EFn {
+            name: "f".to_string(),
+            params,
+            ret_ty: Ty::Builtin(BuiltinTy::Int),
+            contracts,
+            body: int_lit(1),
+            span: Some(crate::span::Span { start: 1, end: 2 }),
+            file: Some("test.ab".to_string()),
+        }
+    }
+
+    fn pred_decl(name: &str, body: EExpr) -> EPred {
+        EPred {
+            name: name.to_string(),
+            params: vec![],
+            body,
+            span: None,
+            file: None,
+        }
+    }
+
+    fn prop_decl(name: &str, body: EExpr) -> EProp {
+        EProp {
+            name: name.to_string(),
+            target: None,
+            body,
+            span: None,
+            file: None,
+        }
     }
 
     #[test]
@@ -2125,6 +2176,612 @@ mod tests {
             hints.len(),
             8,
             "walker should find constructor hints inside every covered variant: {hints:?}"
+        );
+    }
+
+    #[test]
+    fn check_type_reports_duplicate_enum_constructors_and_record_fields() {
+        let enum_errors = check_type(
+            &Ty::Enum(
+                "Status".to_string(),
+                vec![
+                    "Open".to_string(),
+                    "Closed".to_string(),
+                    "Open".to_string(),
+                    "Closed".to_string(),
+                ],
+            ),
+            Some(crate::span::Span { start: 10, end: 16 }),
+        );
+        assert_eq!(enum_errors.len(), 2);
+        assert!(enum_errors
+            .iter()
+            .any(|error| error.message.contains("duplicate constructor Open")));
+        assert!(enum_errors
+            .iter()
+            .any(|error| error.message.contains("duplicate constructor Closed")));
+        assert!(enum_errors.iter().all(|error| error.span.is_some()));
+
+        let record_errors = check_type(
+            &Ty::Record(
+                "Point".to_string(),
+                vec![
+                    ("x".to_string(), Ty::Builtin(BuiltinTy::Int)),
+                    ("y".to_string(), Ty::Builtin(BuiltinTy::Int)),
+                    ("x".to_string(), Ty::Builtin(BuiltinTy::Real)),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(record_errors.len(), 1);
+        assert!(record_errors[0].message.contains("duplicate field x"));
+        assert!(record_errors[0].span.is_none());
+    }
+
+    #[test]
+    fn collection_homogeneity_checks_sets_sequences_maps_and_recurses() {
+        let set_mismatch = EExpr::SetLit(Ty::Error, vec![int_lit(1), bool_lit(true)], None);
+        let seq_mismatch = EExpr::SeqLit(Ty::Error, vec![int_lit(1), bool_lit(false)], None);
+        let map_key_and_value_mismatch = EExpr::MapLit(
+            Ty::Error,
+            vec![(int_lit(1), bool_lit(true)), (bool_lit(false), int_lit(2))],
+            None,
+        );
+        let set_errors = collect_homogeneity_errors(&set_mismatch);
+        let seq_errors = collect_homogeneity_errors(&seq_mismatch);
+        let map_errors = collect_homogeneity_errors(&map_key_and_value_mismatch);
+        assert_eq!(set_errors.len(), 1);
+        assert!(set_errors[0].message.contains("element 1"));
+        assert_eq!(seq_errors.len(), 1);
+        assert!(seq_errors[0].message.contains("element 1"));
+        assert_eq!(map_errors.len(), 2);
+        assert!(map_errors
+            .iter()
+            .any(|error| error.message.contains("key 1")));
+        assert!(map_errors
+            .iter()
+            .any(|error| error.message.contains("value 1")));
+
+        let singleton_set = EExpr::SetLit(Ty::Error, vec![int_lit(1)], None);
+        let singleton_seq = EExpr::SeqLit(Ty::Error, vec![int_lit(1)], None);
+        let singleton_map = EExpr::MapLit(Ty::Error, vec![(int_lit(1), bool_lit(true))], None);
+        assert!(collect_homogeneity_errors(&singleton_set).is_empty());
+        assert!(collect_homogeneity_errors(&singleton_seq).is_empty());
+        assert!(collect_homogeneity_errors(&singleton_map).is_empty());
+        assert!(collect_homogeneity_errors(&EExpr::SetLit(Ty::Error, vec![], None)).is_empty());
+        assert!(collect_homogeneity_errors(&EExpr::SeqLit(Ty::Error, vec![], None)).is_empty());
+        assert!(collect_homogeneity_errors(&EExpr::MapLit(Ty::Error, vec![], None)).is_empty());
+
+        let nested = EExpr::Pipe(
+            Ty::Error,
+            Box::new(EExpr::Field(
+                Ty::Error,
+                Box::new(EExpr::UnOp(
+                    Ty::Error,
+                    crate::elab::types::UnOp::Not,
+                    Box::new(set_mismatch),
+                    None,
+                )),
+                "items".to_string(),
+                None,
+            )),
+            Box::new(EExpr::BinOp(
+                Ty::Error,
+                crate::elab::types::BinOp::Add,
+                Box::new(seq_mismatch),
+                Box::new(map_key_and_value_mismatch),
+                None,
+            )),
+            None,
+        );
+        assert_eq!(collect_homogeneity_errors(&nested).len(), 4);
+    }
+
+    #[test]
+    fn collection_homogeneity_recurses_through_calls_and_nested_collections() {
+        let nested_set = EExpr::SetLit(
+            Ty::Error,
+            vec![EExpr::SetLit(
+                Ty::Error,
+                vec![int_lit(1), bool_lit(false)],
+                None,
+            )],
+            None,
+        );
+        assert_eq!(collect_homogeneity_errors(&nested_set).len(), 1);
+
+        let nested_map = EExpr::MapLit(
+            Ty::Error,
+            vec![(
+                int_lit(0),
+                EExpr::MapLit(
+                    Ty::Error,
+                    vec![(int_lit(1), bool_lit(true)), (bool_lit(false), int_lit(2))],
+                    None,
+                ),
+            )],
+            None,
+        );
+        assert_eq!(collect_homogeneity_errors(&nested_map).len(), 2);
+
+        let bare_relation_call = EExpr::Call(
+            Ty::Error,
+            Box::new(EExpr::Var(
+                Ty::Error,
+                "join".to_string(),
+                Some(crate::span::Span { start: 1, end: 5 }),
+            )),
+            vec![EExpr::SeqLit(
+                Ty::Error,
+                vec![int_lit(1), bool_lit(true)],
+                None,
+            )],
+            Some(crate::span::Span { start: 1, end: 10 }),
+        );
+        let call_errors = collect_homogeneity_errors(&bare_relation_call);
+        assert_eq!(call_errors.len(), 2);
+        assert!(call_errors
+            .iter()
+            .any(|error| error.message.contains("must be called as `Rel::join`")));
+        assert!(call_errors
+            .iter()
+            .any(|error| error.message.contains("Seq literal element 1")));
+
+        let qualified_relation_call = EExpr::QualCall(
+            Ty::Error,
+            "Rel".to_string(),
+            "project".to_string(),
+            vec![EExpr::MapLit(
+                Ty::Error,
+                vec![(int_lit(1), bool_lit(true)), (bool_lit(false), int_lit(2))],
+                None,
+            )],
+            Some(crate::span::Span { start: 11, end: 20 }),
+        );
+        let qual_errors = collect_homogeneity_errors(&qualified_relation_call);
+        assert_eq!(qual_errors.len(), 3);
+        assert!(qual_errors
+            .iter()
+            .any(|error| error.message.contains("Rel::project requires")));
+        assert!(qual_errors
+            .iter()
+            .any(|error| error.message.contains("Map literal key 1")));
+        assert!(qual_errors
+            .iter()
+            .any(|error| error.message.contains("Map literal value 1")));
+    }
+
+    #[test]
+    fn types_compatible_covers_error_wrappers_entities_and_collections() {
+        let int = Ty::Builtin(BuiltinTy::Int);
+        let bool_ty = Ty::Builtin(BuiltinTy::Bool);
+        let real = Ty::Builtin(BuiltinTy::Real);
+        let int_set = Ty::Set(Box::new(int.clone()));
+        let bool_set = Ty::Set(Box::new(bool_ty.clone()));
+        let int_seq = Ty::Seq(Box::new(int.clone()));
+        let bool_seq = Ty::Seq(Box::new(bool_ty.clone()));
+
+        assert!(types_compatible(&Ty::Error, &int));
+        assert!(types_compatible(&int_set, &Ty::Set(Box::new(int.clone()))));
+        assert!(!types_compatible(&int_set, &bool_set));
+        assert!(types_compatible(&int_seq, &Ty::Seq(Box::new(int.clone()))));
+        assert!(!types_compatible(&int_seq, &bool_seq));
+
+        assert!(types_compatible(
+            &Ty::Map(Box::new(int.clone()), Box::new(bool_ty.clone())),
+            &Ty::Map(Box::new(int.clone()), Box::new(bool_ty.clone()))
+        ));
+        assert!(!types_compatible(
+            &Ty::Map(Box::new(int.clone()), Box::new(bool_ty.clone())),
+            &Ty::Map(Box::new(bool_ty.clone()), Box::new(bool_ty.clone()))
+        ));
+        assert!(!types_compatible(
+            &Ty::Map(Box::new(int.clone()), Box::new(bool_ty.clone())),
+            &Ty::Map(Box::new(int.clone()), Box::new(int.clone()))
+        ));
+
+        assert!(types_compatible(
+            &Ty::Store("Account".to_string()),
+            &Ty::Store("Account".to_string())
+        ));
+        assert!(!types_compatible(
+            &Ty::Store("Account".to_string()),
+            &Ty::Store("Order".to_string())
+        ));
+        assert!(types_compatible(
+            &Ty::Entity("Account".to_string()),
+            &Ty::Entity("Account".to_string())
+        ));
+        assert!(!types_compatible(
+            &Ty::Entity("Account".to_string()),
+            &Ty::Entity("Order".to_string())
+        ));
+        assert!(types_compatible(
+            &Ty::Entity("Account".to_string()),
+            &Ty::Named("Account".to_string())
+        ));
+        assert!(!types_compatible(
+            &Ty::Entity("Account".to_string()),
+            &Ty::Named("Order".to_string())
+        ));
+
+        let relation = Ty::Relation(vec![int.clone(), bool_ty.clone()]);
+        assert!(types_compatible(
+            &relation,
+            &Ty::Relation(vec![int.clone(), bool_ty.clone()])
+        ));
+        assert!(!types_compatible(
+            &relation,
+            &Ty::Relation(vec![int.clone(), real.clone()])
+        ));
+        assert!(!types_compatible(
+            &relation,
+            &Ty::Relation(vec![int.clone()])
+        ));
+        assert!(types_compatible(
+            &Ty::Relation(vec![int.clone()]),
+            &Ty::Set(Box::new(int.clone()))
+        ));
+        assert!(types_compatible(
+            &Ty::Set(Box::new(Ty::Tuple(vec![int.clone(), bool_ty.clone()]))),
+            &relation
+        ));
+        assert!(!types_compatible(
+            &Ty::Set(Box::new(Ty::Tuple(vec![int.clone(), real.clone()]))),
+            &relation
+        ));
+        assert!(!types_compatible(
+            &Ty::Relation(vec![int.clone(), bool_ty.clone()]),
+            &Ty::Set(Box::new(int.clone()))
+        ));
+
+        assert!(types_compatible(
+            &Ty::Tuple(vec![int.clone(), bool_ty.clone()]),
+            &Ty::Tuple(vec![int.clone(), bool_ty.clone()])
+        ));
+        assert!(!types_compatible(
+            &Ty::Tuple(vec![int.clone(), bool_ty.clone()]),
+            &Ty::Tuple(vec![int.clone()])
+        ));
+        assert!(types_compatible(
+            &Ty::Alias("Count".to_string(), Box::new(int.clone())),
+            &Ty::Alias("Count".to_string(), Box::new(real.clone()))
+        ));
+        assert!(!types_compatible(
+            &Ty::Alias("Count".to_string(), Box::new(int.clone())),
+            &Ty::Alias("Other".to_string(), Box::new(int.clone()))
+        ));
+        assert!(types_compatible(
+            &Ty::Alias("Count".to_string(), Box::new(int.clone())),
+            &int
+        ));
+        assert!(types_compatible(
+            &Ty::Refinement(Box::new(int.clone()), Box::new(bool_lit(true))),
+            &int
+        ));
+        assert!(!types_compatible(
+            &Ty::Refinement(Box::new(int), Box::new(bool_lit(true))),
+            &bool_ty
+        ));
+    }
+
+    #[test]
+    fn expr_compatible_with_ty_allows_int_literals_for_real_targets_only() {
+        assert!(expr_compatible_with_ty(
+            &int_lit(1),
+            &Ty::Builtin(BuiltinTy::Real)
+        ));
+        assert!(expr_compatible_with_ty(
+            &bool_lit(true),
+            &Ty::Builtin(BuiltinTy::Bool)
+        ));
+        assert!(!expr_compatible_with_ty(
+            &bool_lit(true),
+            &Ty::Builtin(BuiltinTy::Real)
+        ));
+        assert!(!expr_compatible_with_ty(
+            &EExpr::Var(Ty::Builtin(BuiltinTy::Int), "x".to_string(), None),
+            &Ty::Builtin(BuiltinTy::Real)
+        ));
+    }
+
+    #[test]
+    fn fn_contract_checker_accepts_valid_contracts_and_reports_invalid_ones() {
+        let valid = fn_decl(
+            vec![
+                EContract::Requires(bool_lit(true)),
+                EContract::Ensures(bool_lit(true)),
+                EContract::Decreases {
+                    measures: vec![int_lit(1)],
+                    star: false,
+                },
+                EContract::Invariant(bool_lit(true)),
+            ],
+            vec![],
+        );
+        assert!(check_fn_contracts(&valid).is_empty());
+
+        let invalid = fn_decl(
+            vec![
+                EContract::Requires(int_lit(1)),
+                EContract::Ensures(int_lit(2)),
+                EContract::Decreases {
+                    measures: vec![bool_lit(false)],
+                    star: true,
+                },
+                EContract::Invariant(int_lit(3)),
+            ],
+            vec![],
+        );
+        let errors = check_fn_contracts(&invalid);
+        assert_eq!(errors.len(), 5);
+        assert!(errors
+            .iter()
+            .any(|error| error.message == messages::REQUIRES_NOT_BOOL));
+        assert!(errors
+            .iter()
+            .any(|error| error.message == messages::ENSURES_NOT_BOOL));
+        assert!(errors
+            .iter()
+            .any(|error| error.message == messages::DECREASES_MEASURE_NOT_INT));
+        assert!(errors
+            .iter()
+            .any(|error| error.message == messages::DECREASES_STAR_WARNING));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("invariant clause")));
+    }
+
+    #[test]
+    fn refinement_predicate_checker_accepts_bool_or_error_and_rejects_other_types() {
+        let valid = fn_decl(
+            vec![],
+            vec![
+                (
+                    "ok".to_string(),
+                    Ty::Refinement(
+                        Box::new(Ty::Builtin(BuiltinTy::Int)),
+                        Box::new(bool_lit(true)),
+                    ),
+                ),
+                (
+                    "poison".to_string(),
+                    Ty::Refinement(
+                        Box::new(Ty::Builtin(BuiltinTy::Int)),
+                        Box::new(EExpr::Var(Ty::Error, "Bad".to_string(), None)),
+                    ),
+                ),
+            ],
+        );
+        assert!(check_refinement_predicates(&valid).is_empty());
+
+        let invalid = fn_decl(
+            vec![],
+            vec![(
+                "n".to_string(),
+                Ty::Refinement(Box::new(Ty::Builtin(BuiltinTy::Int)), Box::new(int_lit(1))),
+            )],
+        );
+        let errors = check_refinement_predicates(&invalid);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]
+            .message
+            .contains(messages::REFINEMENT_PREDICATE_NOT_BOOL));
+    }
+
+    #[test]
+    fn verifier_surface_checks_sequence_composition_and_unsupported_forms() {
+        let seq = EExpr::Seq(
+            Ty::Builtin(BuiltinTy::Bool),
+            Box::new(bool_lit(true)),
+            Box::new(bool_lit(false)),
+            Some(crate::span::Span { start: 20, end: 22 }),
+        );
+        let mut errors = Vec::new();
+        check_verifier_surface_expr(&seq, "prop p", &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("sequence composition"));
+
+        let mut allowing_sequence_errors = Vec::new();
+        check_verifier_surface_expr_allowing_sequence(
+            &EExpr::Block(
+                vec![bool_lit(true)],
+                Some(crate::span::Span { start: 30, end: 35 }),
+            ),
+            "scene s when assumption",
+            &mut allowing_sequence_errors,
+        );
+        assert_eq!(allowing_sequence_errors.len(), 1);
+        assert!(allowing_sequence_errors[0].message.contains("block"));
+
+        let while_with_sequence_contract = EExpr::While(
+            Box::new(bool_lit(true)),
+            vec![EContract::Invariant(seq)],
+            Box::new(bool_lit(true)),
+            Some(crate::span::Span { start: 40, end: 55 }),
+        );
+        let mut nested_errors = Vec::new();
+        check_verifier_surface_expr(
+            &while_with_sequence_contract,
+            "theorem t show expression",
+            &mut nested_errors,
+        );
+        assert_eq!(nested_errors.len(), 2);
+        assert!(nested_errors
+            .iter()
+            .any(|error| error.message.contains("sequence composition")));
+        assert!(nested_errors
+            .iter()
+            .any(|error| error.message.contains("while loop")));
+    }
+
+    #[test]
+    fn pred_prop_cycle_checker_reports_cycles_and_respects_fn_decreases() {
+        let mut pred_env = Env::new();
+        pred_env.preds.insert(
+            "p".to_string(),
+            pred_decl(
+                "p",
+                EExpr::Var(Ty::Builtin(BuiltinTy::Bool), "p".to_string(), None),
+            ),
+        );
+        let pred_errors = check_pred_prop_cycles(&pred_env);
+        assert_eq!(pred_errors.len(), 1);
+        assert!(pred_errors[0]
+            .message
+            .contains("circular definition detected"));
+        assert_eq!(
+            pred_errors[0].help.as_deref(),
+            Some(messages::HELP_CIRCULAR_DEFINITION)
+        );
+
+        let mut self_recursive_fn = fn_decl(vec![], vec![]);
+        self_recursive_fn.body = EExpr::Var(
+            Ty::Builtin(BuiltinTy::Int),
+            self_recursive_fn.name.clone(),
+            None,
+        );
+        let mut fn_env = Env::new();
+        fn_env
+            .fns
+            .insert(self_recursive_fn.name.clone(), self_recursive_fn.clone());
+        let fn_errors = check_pred_prop_cycles(&fn_env);
+        assert_eq!(fn_errors.len(), 1);
+        assert_eq!(
+            fn_errors[0].help.as_deref(),
+            Some(messages::HELP_SELF_RECURSION_DECREASES)
+        );
+
+        self_recursive_fn.contracts = vec![EContract::Decreases {
+            measures: vec![int_lit(1)],
+            star: false,
+        }];
+        let mut decreasing_fn_env = Env::new();
+        decreasing_fn_env
+            .fns
+            .insert(self_recursive_fn.name.clone(), self_recursive_fn);
+        assert!(check_pred_prop_cycles(&decreasing_fn_env).is_empty());
+
+        let mut f = fn_decl(vec![], vec![]);
+        f.name = "f".to_string();
+        f.body = EExpr::Var(Ty::Builtin(BuiltinTy::Int), "g".to_string(), None);
+        let mut g = fn_decl(vec![], vec![]);
+        g.name = "g".to_string();
+        g.body = EExpr::Var(Ty::Builtin(BuiltinTy::Int), "f".to_string(), None);
+        let mut mutual_env = Env::new();
+        mutual_env.fns.insert("f".to_string(), f);
+        mutual_env.fns.insert("g".to_string(), g);
+        let mutual_errors = check_pred_prop_cycles(&mutual_env);
+        assert_eq!(mutual_errors.len(), 1);
+        assert_eq!(
+            mutual_errors[0].help.as_deref(),
+            Some(messages::HELP_MUTUAL_FN_DECREASES)
+        );
+    }
+
+    #[test]
+    fn collect_name_refs_respects_bindings_and_pattern_variables() {
+        let known = HashSet::from(["p".to_string(), "q".to_string(), "x".to_string()]);
+        let mut refs = HashSet::new();
+        collect_name_refs(
+            &EExpr::Var(Ty::Builtin(BuiltinTy::Bool), "p".to_string(), None),
+            &known,
+            &HashSet::new(),
+            &mut refs,
+        );
+        assert_eq!(refs, HashSet::from(["p".to_string()]));
+
+        let match_expr = EExpr::Match(
+            Box::new(EExpr::Var(
+                Ty::Builtin(BuiltinTy::Bool),
+                "q".to_string(),
+                None,
+            )),
+            vec![(
+                EPattern::Ctor(
+                    "Some".to_string(),
+                    vec![("value".to_string(), EPattern::Var("p".to_string()))],
+                ),
+                Some(EExpr::Var(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    "p".to_string(),
+                    None,
+                )),
+                EExpr::Var(Ty::Builtin(BuiltinTy::Bool), "p".to_string(), None),
+            )],
+            None,
+        );
+        let mut match_refs = HashSet::new();
+        collect_name_refs(&match_expr, &known, &HashSet::new(), &mut match_refs);
+        assert_eq!(
+            match_refs,
+            HashSet::from(["q".to_string()]),
+            "pattern-bound p should not be collected from guard/body"
+        );
+
+        let let_expr = EExpr::Let(
+            vec![(
+                "x".to_string(),
+                Some(Ty::Builtin(BuiltinTy::Bool)),
+                bool_lit(true),
+            )],
+            Box::new(EExpr::Var(
+                Ty::Builtin(BuiltinTy::Bool),
+                "x".to_string(),
+                None,
+            )),
+            None,
+        );
+        let mut let_refs = HashSet::new();
+        collect_name_refs(&let_expr, &known, &HashSet::new(), &mut let_refs);
+        assert!(let_refs.is_empty());
+    }
+
+    #[test]
+    fn dfs_find_cycle_distinguishes_cycles_from_acyclic_graphs() {
+        let cyclic = HashMap::from([
+            ("a".to_string(), HashSet::from(["b".to_string()])),
+            ("b".to_string(), HashSet::from(["c".to_string()])),
+            ("c".to_string(), HashSet::from(["a".to_string()])),
+        ]);
+        let mut visited = HashSet::new();
+        let mut in_stack = HashSet::new();
+        let cycle = dfs_find_cycle("a", &cyclic, &mut visited, &mut in_stack)
+            .expect("expected back-edge cycle");
+        assert_eq!(cycle.first(), cycle.last());
+        assert_eq!(cycle, vec!["a", "b", "c", "a"]);
+
+        let acyclic = HashMap::from([
+            ("a".to_string(), HashSet::from(["b".to_string()])),
+            ("b".to_string(), HashSet::new()),
+        ]);
+        let mut visited = HashSet::new();
+        let mut in_stack = HashSet::new();
+        assert!(dfs_find_cycle("a", &acyclic, &mut visited, &mut in_stack).is_none());
+    }
+
+    #[test]
+    fn prop_pred_cycle_checker_uses_prop_dependencies() {
+        let mut env = Env::new();
+        env.props.insert(
+            "p".to_string(),
+            prop_decl(
+                "p",
+                EExpr::Var(Ty::Builtin(BuiltinTy::Bool), "q".to_string(), None),
+            ),
+        );
+        env.preds.insert(
+            "q".to_string(),
+            pred_decl(
+                "q",
+                EExpr::Var(Ty::Builtin(BuiltinTy::Bool), "p".to_string(), None),
+            ),
+        );
+        let errors = check_pred_prop_cycles(&env);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].help.as_deref(),
+            Some(messages::HELP_CIRCULAR_DEFINITION)
         );
     }
 }

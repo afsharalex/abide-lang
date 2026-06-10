@@ -669,13 +669,19 @@ fn evaluate_temporal_query_with_fallback(
             };
             match evaluate_temporal_query_semantic(model, env, op, bounds, explicit, expr) {
                 Ok(outcome) => Ok(outcome),
-                Err(semantic_err) => Err(if semantic_err == graph_err {
-                    semantic_err
-                } else {
-                    format!("{semantic_err}\n\ngraph evaluator note: {graph_err}")
-                }),
+                Err(semantic_err) => {
+                    Err(combine_temporal_fallback_errors(&graph_err, semantic_err))
+                }
             }
         }
+    }
+}
+
+fn combine_temporal_fallback_errors(graph_err: &str, semantic_err: String) -> String {
+    if semantic_err == graph_err {
+        semantic_err
+    } else {
+        format!("{semantic_err}\n\ngraph evaluator note: {graph_err}")
     }
 }
 
@@ -719,15 +725,6 @@ fn infer_temporal_target(model: &FlowModel, expr: &Expr) -> Result<ResolvedTempo
     let mut collector = TemporalTargetCollector::default();
     collector.collect_expr(model, expr);
 
-    if collector.field_candidates.len() == 1 {
-        let field = collector.field_candidates.iter().next().expect("one field");
-        return Ok(ResolvedTemporalTarget {
-            owner: field.owner.clone(),
-            field: Some(field.field.clone()),
-            inferred: true,
-        });
-    }
-
     let mut owners: BTreeSet<String> = collector.owner_candidates;
     owners.extend(
         collector
@@ -736,16 +733,7 @@ fn infer_temporal_target(model: &FlowModel, expr: &Expr) -> Result<ResolvedTempo
             .map(|field| field.owner.clone()),
     );
 
-    if owners.len() == 1 {
-        let owner = owners.into_iter().next().expect("one owner");
-        return Ok(ResolvedTemporalTarget {
-            owner,
-            field: None,
-            inferred: true,
-        });
-    }
-
-    if collector.field_candidates.len() > 1 || owners.len() > 1 {
+    if owners.len() > 1 {
         let mut candidates: Vec<String> = collector
             .field_candidates
             .iter()
@@ -762,6 +750,24 @@ fn infer_temporal_target(model: &FlowModel, expr: &Expr) -> Result<ResolvedTempo
             "ambiguous temporal QA target; expression references multiple candidates: {}. Use `on Owner` or `on Owner.field` to qualify the query",
             candidates.join(", ")
         ));
+    }
+
+    if collector.field_candidates.len() == 1 {
+        let field = collector.field_candidates.iter().next().expect("one field");
+        return Ok(ResolvedTemporalTarget {
+            owner: field.owner.clone(),
+            field: Some(field.field.clone()),
+            inferred: true,
+        });
+    }
+
+    if owners.len() == 1 {
+        let owner = owners.into_iter().next().expect("one owner");
+        return Ok(ResolvedTemporalTarget {
+            owner,
+            field: None,
+            inferred: true,
+        });
     }
 
     Err(
@@ -1057,7 +1063,7 @@ fn evaluate_temporal_query_semantic(
     let (result, elab_errors) = abide_sema::elab::elaborate_env(synthetic_env);
     let semantic_errors: Vec<String> = elab_errors
         .iter()
-        .filter(|e| !matches!(e.severity, abide_sema::elab::error::Severity::Warning))
+        .filter(|e| is_hard_elab_severity(&e.severity))
         .map(|e| e.to_string())
         .collect();
     if !semantic_errors.is_empty() {
@@ -1092,6 +1098,10 @@ fn evaluate_temporal_query_semantic(
 }
 
 const QA_SEMANTIC_DEFAULT_STORE_SLOTS: i64 = 4;
+
+fn is_hard_elab_severity(severity: &abide_sema::elab::error::Severity) -> bool {
+    !matches!(severity, abide_sema::elab::error::Severity::Warning)
+}
 
 fn semantic_slots_for_entity(bounds: &TemporalBounds, entity_type: &str) -> i64 {
     bounds
@@ -2459,7 +2469,7 @@ fn eval_always(graph: &StateGraph, inner: &TemporalFormula) -> BTreeSet<String> 
     let inner_states = eval_temporal_formula(graph, inner);
     let adjacency = build_state_adjacency(graph);
     let mut current: BTreeSet<String> = graph.states.iter().cloned().collect();
-    loop {
+    for _ in 0..=graph.states.len() {
         let next: BTreeSet<String> = graph
             .states
             .iter()
@@ -2471,17 +2481,18 @@ fn eval_always(graph: &StateGraph, inner: &TemporalFormula) -> BTreeSet<String> 
             })
             .cloned()
             .collect();
-        if next == current {
+        if temporal_fixpoint_reached(&next, &current) {
             return next;
         }
         current = next;
     }
+    current
 }
 
 fn eval_eventually(graph: &StateGraph, inner: &TemporalFormula) -> BTreeSet<String> {
     let adjacency = build_state_adjacency(graph);
     let mut current = eval_temporal_formula(graph, inner);
-    loop {
+    for _ in 0..=graph.states.len() {
         let next: BTreeSet<String> = graph
             .states
             .iter()
@@ -2493,11 +2504,16 @@ fn eval_eventually(graph: &StateGraph, inner: &TemporalFormula) -> BTreeSet<Stri
             })
             .cloned()
             .collect();
-        if next == current {
+        if temporal_fixpoint_reached(&next, &current) {
             return next;
         }
         current = next;
     }
+    current
+}
+
+fn temporal_fixpoint_reached(next: &BTreeSet<String>, current: &BTreeSet<String>) -> bool {
+    next == current
 }
 
 fn build_state_adjacency(graph: &StateGraph) -> HashMap<String, BTreeSet<String>> {
@@ -3396,6 +3412,86 @@ mod tests {
     }
 
     #[test]
+    fn exec_invariants_filters_to_entity_and_nontrivial_guards() {
+        let mut m = commerce_model();
+        m.action_contracts.insert(
+            ("Order".to_owned(), "submit".to_owned()),
+            ActionContract {
+                entity: "Order".to_owned(),
+                action: "submit".to_owned(),
+                guard: "status == @Pending".to_owned(),
+                postcondition: None,
+                updates: vec![],
+            },
+        );
+        m.action_contracts.insert(
+            ("Order".to_owned(), "touch".to_owned()),
+            ActionContract {
+                entity: "Order".to_owned(),
+                action: "touch".to_owned(),
+                guard: "true".to_owned(),
+                postcondition: None,
+                updates: vec![],
+            },
+        );
+        m.action_contracts.insert(
+            ("Payment".to_owned(), "submit".to_owned()),
+            ActionContract {
+                entity: "Payment".to_owned(),
+                action: "submit".to_owned(),
+                guard: "status == @Open".to_owned(),
+                postcondition: None,
+                updates: vec![],
+            },
+        );
+
+        let q = Query::Invariants {
+            entity: "Order".into(),
+        };
+        match execute_query(&m, &q) {
+            QueryResult::NameList(items) => {
+                assert_eq!(items, vec!["submit: requires status == @Pending"]);
+            }
+            other => panic!("expected NameList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_fsms_filters_fields_by_entity_owner() {
+        let mut m = commerce_model();
+        m.fsm_decls.insert(
+            ("Order".to_owned(), "status".to_owned()),
+            FsmInfo {
+                owner: "Order".to_owned(),
+                field: "status".to_owned(),
+                enum_name: "OrderStatus".to_owned(),
+                transitions: vec![("Pending".to_owned(), "Confirmed".to_owned())],
+                terminal_states: vec!["Confirmed".to_owned()],
+            },
+        );
+        m.fsm_decls.insert(
+            ("Payment".to_owned(), "phase".to_owned()),
+            FsmInfo {
+                owner: "Payment".to_owned(),
+                field: "phase".to_owned(),
+                enum_name: "PaymentStatus".to_owned(),
+                transitions: vec![("Open".to_owned(), "Closed".to_owned())],
+                terminal_states: vec!["Closed".to_owned()],
+            },
+        );
+
+        match execute_query(
+            &m,
+            &Query::Fsms {
+                entity: "Order".into(),
+            },
+        ) {
+            QueryResult::NameList(items) => assert_eq!(items, vec!["status"]),
+            other => panic!("expected NameList, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn exec_path_found() {
         let m = commerce_model();
         let q = Query::Path {
@@ -3575,7 +3671,19 @@ mod tests {
 
     #[test]
     fn exec_events_on_field() {
-        let m = commerce_model();
+        let mut m = commerce_model();
+        m.systems
+            .get_mut("Commerce")
+            .expect("commerce system")
+            .events
+            .push(EventInfo {
+                name: "audit_order".to_owned(),
+                cross_calls: vec![],
+                applies: vec![ApplyInfo {
+                    entity: "o".to_owned(),
+                    action: "audit".to_owned(),
+                }],
+            });
         match execute_query(
             &m,
             &Query::Events {
@@ -3585,6 +3693,7 @@ mod tests {
         ) {
             QueryResult::NameList(n) => {
                 assert!(n.iter().any(|s| s.contains("submit_order")));
+                assert!(!n.iter().any(|s| s.contains("audit_order")));
             }
             other => panic!("got {other:?}"),
         }
@@ -3636,6 +3745,68 @@ mod tests {
     }
 
     #[test]
+    fn exec_deadlock_ignores_unrelated_terminal_graphs() {
+        let mut m = commerce_model();
+        m.systems.clear();
+        m.state_graphs.clear();
+        m.systems.insert(
+            "Live".to_owned(),
+            SystemInfo {
+                name: "Live".to_owned(),
+                entities: vec!["Order".to_owned()],
+                events: vec![],
+            },
+        );
+        m.state_graphs.insert(
+            ("Order".to_owned(), "healthy".to_owned()),
+            StateGraph {
+                owner: "Order".to_owned(),
+                owner_kind: OwnerKind::Entity,
+                field: "healthy".to_owned(),
+                states: vec!["false".to_owned(), "true".to_owned()],
+                initial: Some("false".to_owned()),
+                transitions: vec![
+                    TransitionEdge {
+                        action: "start".to_owned(),
+                        from: Some("false".to_owned()),
+                        to: "true".to_owned(),
+                    },
+                    TransitionEdge {
+                        action: "stop".to_owned(),
+                        from: Some("true".to_owned()),
+                        to: "false".to_owned(),
+                    },
+                ],
+            },
+        );
+        m.state_graphs.insert(
+            ("Other".to_owned(), "status".to_owned()),
+            StateGraph {
+                owner: "Other".to_owned(),
+                owner_kind: OwnerKind::Entity,
+                field: "status".to_owned(),
+                states: vec!["Open".to_owned(), "Closed".to_owned()],
+                initial: Some("Open".to_owned()),
+                transitions: vec![TransitionEdge {
+                    action: "close".to_owned(),
+                    from: Some("Open".to_owned()),
+                    to: "Closed".to_owned(),
+                }],
+            },
+        );
+
+        match execute_query(
+            &m,
+            &Query::Deadlock {
+                system: "Live".into(),
+            },
+        ) {
+            QueryResult::Bool(value) => assert!(!value),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
     fn exec_block_terminal_states() {
         let m = commerce_model();
         let q = Query::Block {
@@ -3674,6 +3845,88 @@ mod tests {
     }
 
     #[test]
+    fn exec_block_initial_and_terminal_predicates_filter_rows() {
+        let m = commerce_model();
+        let initial = BlockPredicate {
+            negated: false,
+            name: "initial".into(),
+            args: vec![
+                BlockArg::Positional("e".into()),
+                BlockArg::Positional("f".into()),
+                BlockArg::Positional("s".into()),
+            ],
+        };
+        let terminal = BlockPredicate {
+            negated: false,
+            name: "terminal".into(),
+            args: vec![
+                BlockArg::Positional("e".into()),
+                BlockArg::Positional("f".into()),
+                BlockArg::Positional("s".into()),
+            ],
+        };
+        let mut env = HashMap::from([
+            ("e", "Order".to_owned()),
+            ("f", "status".to_owned()),
+            ("s", "Pending".to_owned()),
+        ]);
+
+        assert!(eval_block_predicate(&m, &initial, &env));
+        assert!(!eval_block_predicate(&m, &terminal, &env));
+
+        env.insert("s", "Shipped".to_owned());
+        assert!(!eval_block_predicate(&m, &initial, &env));
+        assert!(eval_block_predicate(&m, &terminal, &env));
+    }
+
+    #[test]
+    fn exec_block_predicates_enforce_arity_and_transition_filters() {
+        let m = commerce_model();
+        let env = HashMap::new();
+        let short_transition = BlockPredicate {
+            negated: false,
+            name: "transition".into(),
+            args: vec![BlockArg::Positional("Order".into())],
+        };
+        assert!(!eval_block_predicate(&m, &short_transition, &env));
+
+        let missing_field_state = BlockPredicate {
+            negated: false,
+            name: "state".into(),
+            args: vec![
+                BlockArg::Positional("Order".into()),
+                BlockArg::Positional("missing".into()),
+                BlockArg::Positional("Pending".into()),
+            ],
+        };
+        assert!(!eval_block_predicate(&m, &missing_field_state, &env));
+
+        let matching_transition = BlockPredicate {
+            negated: false,
+            name: "transition".into(),
+            args: vec![
+                BlockArg::Positional("Order".into()),
+                BlockArg::Positional("status".into()),
+                BlockArg::Named("from".into(), "Pending".into()),
+                BlockArg::Named("to".into(), "Confirmed".into()),
+            ],
+        };
+        assert!(eval_block_predicate(&m, &matching_transition, &env));
+
+        let mismatched_to = BlockPredicate {
+            negated: false,
+            name: "transition".into(),
+            args: vec![
+                BlockArg::Positional("Order".into()),
+                BlockArg::Positional("status".into()),
+                BlockArg::Named("from".into(), "Pending".into()),
+                BlockArg::Named("to".into(), "Shipped".into()),
+            ],
+        };
+        assert!(!eval_block_predicate(&m, &mismatched_to, &env));
+    }
+
+    #[test]
     fn exec_error_missing_graph() {
         let m = commerce_model();
         assert!(matches!(
@@ -3687,6 +3940,24 @@ mod tests {
             ),
             QueryResult::Error(_)
         ));
+    }
+
+    #[test]
+    fn exec_graph_lookup_error_distinguishes_owner_and_field_failures() {
+        let m = commerce_model();
+
+        assert_eq!(
+            graph_lookup_error(&m, "Order", "missing"),
+            "no field `missing` on `Order`"
+        );
+        assert_eq!(
+            graph_lookup_error(&m, "Commerce", "missing"),
+            "no field `missing` on `Commerce`"
+        );
+        assert_eq!(
+            graph_lookup_error(&m, "Missing", "status"),
+            "no entity or system named `Missing`"
+        );
     }
 
     #[test]
@@ -3755,6 +4026,30 @@ mod tests {
     }
 
     #[test]
+    fn exec_temporal_inference_reports_ambiguous_field_candidates_without_duplicate_owners() {
+        let m = commerce_model();
+        let err = resolve_temporal_target(&m, None, "status == @Pending and running == true")
+            .unwrap_err();
+
+        assert!(err.contains("ambiguous temporal QA target"));
+        assert!(err.contains("Order.status"));
+        assert!(err.contains("Commerce.running"));
+        assert!(!err.contains("Order,"));
+        assert!(!err.contains("Commerce,"));
+    }
+
+    #[test]
+    fn exec_temporal_inference_keeps_owner_only_candidates_next_to_field_candidates() {
+        let m = commerce_model();
+        let err =
+            resolve_temporal_target(&m, None, "status == @Pending and (all c: Commerce | true)")
+                .unwrap_err();
+
+        assert!(err.contains("Order.status"));
+        assert!(err.contains("Commerce"));
+    }
+
+    #[test]
     fn exec_temporal_explicit_target_preserved() {
         let m = commerce_model();
         let resolved = resolve_temporal_target(
@@ -3768,6 +4063,403 @@ mod tests {
         .expect("resolve");
         assert_eq!(resolved.display(), "Order.status");
         assert!(!resolved.inferred);
+    }
+
+    #[test]
+    fn exec_temporal_explicit_target_distinguishes_missing_field_from_missing_owner() {
+        let m = commerce_model();
+
+        let missing_field = resolve_temporal_target(
+            &m,
+            Some(&TemporalTarget {
+                owner: "Order".to_owned(),
+                field: Some("missing".to_owned()),
+            }),
+            "o.missing == @Closed",
+        )
+        .unwrap_err();
+        assert_eq!(missing_field, "no field `missing` on `Order`");
+
+        let missing_owner = resolve_temporal_target(
+            &m,
+            Some(&TemporalTarget {
+                owner: "Missing".to_owned(),
+                field: Some("status".to_owned()),
+            }),
+            "m.status == @Closed",
+        )
+        .unwrap_err();
+        assert_eq!(missing_owner, "no entity or system named `Missing`");
+    }
+
+    #[test]
+    fn exec_temporal_diagnostic_names_unsupported_expression_kinds() {
+        let m = commerce_model();
+        let target = ResolvedTemporalTarget {
+            owner: "Order".to_owned(),
+            field: Some("status".to_owned()),
+            inferred: false,
+        };
+        let parsed = syntax_parse::parse_expr_string("status until status").expect("parse expr");
+        let err =
+            compile_temporal_formula(&m, &target, &parsed, &mut TemporalEvalContext::default())
+                .unwrap_err();
+
+        assert!(err.contains("`until`"));
+        assert!(err.contains("supported field-temporal fragment"));
+    }
+
+    #[test]
+    fn exec_temporal_target_inference_collects_owner_domains_from_comprehensions() {
+        let m = commerce_model();
+        for (expr, owner) in [
+            ("choose o: Order where true", "Order"),
+            ("choose c: Commerce where true", "Commerce"),
+            ("{ o: Order where true }", "Order"),
+            ("{ c: Commerce where true }", "Commerce"),
+            ("Rel((o) | o: Order in orders where true)", "Order"),
+        ] {
+            let parsed = syntax_parse::parse_expr_string(expr).expect("parse expr");
+            let target = infer_temporal_target(&m, &parsed).expect("infer target");
+            assert_eq!(target.owner, owner, "{expr}");
+            assert_eq!(target.field, None, "{expr}");
+        }
+
+        for expr in [
+            "choose m: Missing where true",
+            "{ m: Missing where true }",
+            "Rel((m) | m: Missing in missing where true)",
+        ] {
+            let parsed = syntax_parse::parse_expr_string(expr).expect("parse expr");
+            let err = infer_temporal_target(&m, &parsed).unwrap_err();
+            assert!(
+                err.contains("could not infer temporal QA target"),
+                "{expr}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_temporal_compile_rejects_quantifier_domain_mismatches() {
+        let m = commerce_model();
+        let target = ResolvedTemporalTarget {
+            owner: "Order".to_owned(),
+            field: Some("status".to_owned()),
+            inferred: false,
+        };
+        for expr in [
+            "(all c: Commerce | c.running == true)",
+            "(no c: Commerce | c.running == true)",
+        ] {
+            let parsed = syntax_parse::parse_expr_string(expr).expect("parse expr");
+            let err =
+                compile_temporal_formula(&m, &target, &parsed, &mut TemporalEvalContext::default())
+                    .unwrap_err();
+            assert!(err.contains("does not match target owner `Order`"));
+        }
+    }
+
+    #[test]
+    fn exec_temporal_compile_rejects_bare_non_bool_and_non_target_comparisons() {
+        let m = commerce_model();
+        let target = ResolvedTemporalTarget {
+            owner: "Order".to_owned(),
+            field: Some("status".to_owned()),
+            inferred: false,
+        };
+
+        let bare = syntax_parse::parse_expr_string("status").expect("parse expr");
+        let err = compile_temporal_formula(&m, &target, &bare, &mut TemporalEvalContext::default())
+            .unwrap_err();
+        assert!(err.contains("requires a bool-valued target field"));
+
+        let unrelated = syntax_parse::parse_expr_string("total == 0").expect("parse expr");
+        let err =
+            compile_temporal_formula(&m, &target, &unrelated, &mut TemporalEvalContext::default())
+                .unwrap_err();
+        assert!(err.contains("comparisons must mention the resolved target field Order.status"));
+    }
+
+    #[test]
+    fn exec_temporal_compile_handles_false_bool_values_and_target_refs() {
+        let m = commerce_model();
+        let target = ResolvedTemporalTarget {
+            owner: "Commerce".to_owned(),
+            field: Some("running".to_owned()),
+            inferred: false,
+        };
+        let parsed = syntax_parse::parse_expr_string("running == false").expect("parse expr");
+        let formula =
+            compile_temporal_formula(&m, &target, &parsed, &mut TemporalEvalContext::default())
+                .expect("compile");
+        assert!(matches!(
+            formula,
+            TemporalFormula::Predicate(StatePredicate::BoolValue(false))
+        ));
+
+        let bare_bool = syntax_parse::parse_expr_string("running").expect("parse expr");
+        let formula =
+            compile_temporal_formula(&m, &target, &bare_bool, &mut TemporalEvalContext::default())
+                .expect("compile bare bool");
+        assert!(matches!(
+            formula,
+            TemporalFormula::Predicate(StatePredicate::BoolValue(true))
+        ));
+
+        let entity_target = ResolvedTemporalTarget {
+            owner: "Order".to_owned(),
+            field: Some("status".to_owned()),
+            inferred: false,
+        };
+        let field_ref = syntax_parse::parse_expr_string("o.status").expect("parse expr");
+        let other_ref = syntax_parse::parse_expr_string("o.total").expect("parse expr");
+        let owner_ref = syntax_parse::parse_expr_string("Order.status").expect("parse expr");
+        let other_owner_ref =
+            syntax_parse::parse_expr_string("Payment.status").expect("parse expr");
+        let mut ctx = TemporalEvalContext::default();
+        assert!(is_target_expr(&entity_target, &owner_ref, &ctx));
+        assert!(!is_target_expr(&entity_target, &other_owner_ref, &ctx));
+        ctx.with_binding("o", "Order", |ctx| {
+            assert!(is_target_expr(&entity_target, &field_ref, ctx));
+            assert!(!is_target_expr(&entity_target, &other_ref, ctx));
+        });
+    }
+
+    #[test]
+    fn exec_temporal_formula_truth_tables_cover_negation_implication_and_predicates() {
+        let graph = StateGraph {
+            owner: "Order".to_owned(),
+            owner_kind: OwnerKind::Entity,
+            field: "status".to_owned(),
+            states: vec![
+                "Open".to_owned(),
+                "Closed".to_owned(),
+                "Archived".to_owned(),
+            ],
+            initial: Some("Open".to_owned()),
+            transitions: vec![],
+        };
+
+        let not_open = eval_temporal_formula(
+            &graph,
+            &TemporalFormula::Not(Box::new(TemporalFormula::Predicate(
+                StatePredicate::Equals("Open".to_owned()),
+            ))),
+        );
+        assert_eq!(
+            not_open,
+            BTreeSet::from(["Archived".to_owned(), "Closed".to_owned()])
+        );
+
+        let open_implies_closed = eval_temporal_formula(
+            &graph,
+            &TemporalFormula::Implies(
+                Box::new(TemporalFormula::Predicate(StatePredicate::Equals(
+                    "Open".to_owned(),
+                ))),
+                Box::new(TemporalFormula::Predicate(StatePredicate::Equals(
+                    "Closed".to_owned(),
+                ))),
+            ),
+        );
+        assert_eq!(
+            open_implies_closed,
+            BTreeSet::from(["Archived".to_owned(), "Closed".to_owned()])
+        );
+
+        assert!(state_predicate_holds(
+            &StatePredicate::BoolValue(true),
+            "true"
+        ));
+        assert!(!state_predicate_holds(
+            &StatePredicate::BoolValue(true),
+            "false"
+        ));
+        assert!(state_predicate_holds(
+            &StatePredicate::BoolValue(false),
+            "false"
+        ));
+        assert!(!state_predicate_holds(
+            &StatePredicate::BoolValue(false),
+            "true"
+        ));
+        assert!(state_predicate_holds(
+            &StatePredicate::NotEquals("Open".to_owned()),
+            "Closed"
+        ));
+        assert!(!state_predicate_holds(
+            &StatePredicate::NotEquals("Open".to_owned()),
+            "Open"
+        ));
+    }
+
+    #[test]
+    fn exec_temporal_fixpoint_detection_distinguishes_stable_from_changed_sets() {
+        let current = BTreeSet::from(["Open".to_owned(), "Closed".to_owned()]);
+        let same = BTreeSet::from(["Closed".to_owned(), "Open".to_owned()]);
+        let changed = BTreeSet::from(["Open".to_owned()]);
+
+        assert!(temporal_fixpoint_reached(&same, &current));
+        assert!(!temporal_fixpoint_reached(&changed, &current));
+    }
+
+    #[test]
+    fn exec_temporal_semantic_error_filter_ignores_warnings() {
+        assert!(!is_hard_elab_severity(
+            &abide_sema::elab::error::Severity::Warning
+        ));
+        assert!(is_hard_elab_severity(
+            &abide_sema::elab::error::Severity::Error
+        ));
+    }
+
+    #[test]
+    fn exec_temporal_owner_scoped_rewrite_handles_owner_fields_and_bindings() {
+        let owner_fields = BTreeSet::from(["status".to_owned()]);
+        let mut bound_vars = Vec::new();
+
+        let rewritten = rewrite_owner_scoped_expr(
+            &EExpr::Var(Ty::Error, "Order".to_owned(), None),
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite owner");
+        assert!(matches!(rewritten, EExpr::Var(Ty::Error, var, _) if var == "__qa_owner"));
+
+        let rewritten = rewrite_owner_scoped_expr(
+            &EExpr::Var(Ty::Error, "status".to_owned(), None),
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite field");
+        assert!(matches!(
+            rewritten,
+            EExpr::Field(_, base, field, _)
+                if field == "status"
+                    && matches!(&*base, EExpr::Var(Ty::Error, var, _) if var == "__qa_owner")
+        ));
+
+        bound_vars.push("status".to_owned());
+        let rewritten = rewrite_owner_scoped_expr(
+            &EExpr::Var(Ty::Error, "status".to_owned(), None),
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite bound field");
+        assert!(matches!(rewritten, EExpr::Var(_, name, _) if name == "status"));
+    }
+
+    #[test]
+    fn exec_temporal_owner_scoped_rewrite_handles_qualified_owner_fields_and_lists() {
+        let owner_fields = BTreeSet::from(["status".to_owned(), "total".to_owned()]);
+        let mut bound_vars = Vec::new();
+        let exprs = vec![
+            EExpr::Field(
+                Ty::Error,
+                Box::new(EExpr::Var(Ty::Error, "Order".to_owned(), None)),
+                "status".to_owned(),
+                None,
+            ),
+            EExpr::Field(
+                Ty::Error,
+                Box::new(EExpr::Var(Ty::Error, "Payment".to_owned(), None)),
+                "status".to_owned(),
+                None,
+            ),
+        ];
+
+        let rewritten = rewrite_expr_list(
+            &exprs,
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite list");
+        assert_eq!(rewritten.len(), 2);
+        assert!(matches!(
+            &rewritten[0],
+            EExpr::Field(_, base, field, _)
+                if field == "status"
+                    && matches!(&**base, EExpr::Var(Ty::Error, var, _) if var == "__qa_owner")
+        ));
+        assert!(matches!(
+            &rewritten[1],
+            EExpr::Field(_, base, field, _)
+                if field == "status"
+                    && matches!(&**base, EExpr::Var(_, name, _) if name == "Payment")
+        ));
+
+        bound_vars.push("Order".to_owned());
+        let rewritten = rewrite_owner_scoped_expr(
+            &EExpr::Var(Ty::Error, "Order".to_owned(), None),
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite shadowed owner");
+        assert!(matches!(rewritten, EExpr::Var(_, name, _) if name == "Order"));
+
+        let rewritten = rewrite_owner_scoped_expr(
+            &EExpr::Field(
+                Ty::Error,
+                Box::new(EExpr::Var(Ty::Error, "Order".to_owned(), None)),
+                "status".to_owned(),
+                None,
+            ),
+            "Order",
+            OwnerKind::Entity,
+            "__qa_owner",
+            &owner_fields,
+            &mut bound_vars,
+        )
+        .expect("rewrite shadowed owner field");
+        assert!(matches!(
+            rewritten,
+            EExpr::Field(_, base, field, _)
+                if field == "status"
+                    && matches!(&*base, EExpr::Var(_, name, _) if name == "Order")
+        ));
+    }
+
+    #[test]
+    fn exec_temporal_collect_pattern_bindings_recurses_through_ctor_and_or_patterns() {
+        let pattern = EPattern::Or(
+            Box::new(EPattern::Ctor(
+                "Ready".to_owned(),
+                vec![("value".to_owned(), EPattern::Var("x".to_owned()))],
+            )),
+            Box::new(EPattern::Var("y".to_owned())),
+        );
+        let mut bindings = Vec::new();
+
+        collect_pattern_bindings(&pattern, &mut bindings);
+
+        assert_eq!(bindings, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn exec_temporal_fallback_error_combination_deduplicates_matching_errors() {
+        assert_eq!(
+            combine_temporal_fallback_errors("same failure", "same failure".to_owned()),
+            "same failure"
+        );
+        assert_eq!(
+            combine_temporal_fallback_errors("graph failure", "semantic failure".to_owned()),
+            "semantic failure\n\ngraph evaluator note: graph failure"
+        );
     }
 
     #[test]

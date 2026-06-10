@@ -225,4 +225,87 @@ mod tests {
         write_file(&dir.path().join("spec.ab"), "module Spec\n");
         assert!(directory_contains_source_files(dir.path()));
     }
+
+    #[test]
+    fn source_file_extensions_are_exactly_abide_definition_extensions() {
+        for accepted in ["spec.ab", "impl.abi", "proof.abp"] {
+            assert!(
+                is_abide_source_file(Path::new(accepted)),
+                "{accepted} should be accepted"
+            );
+        }
+        for rejected in ["script.qa", "notes.txt", "archive.ab.bak", "README"] {
+            assert!(
+                !is_abide_source_file(Path::new(rejected)),
+                "{rejected} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn target_discovery_errors_render_actionable_messages() {
+        let missing = PathBuf::from("missing.ab");
+        let unsupported = PathBuf::from("script.qa");
+        let empty = PathBuf::from("empty");
+
+        assert_eq!(
+            TargetDiscoveryError::NoTargets.to_string(),
+            "no source targets provided"
+        );
+        assert!(TargetDiscoveryError::MissingTarget(missing.clone())
+            .to_string()
+            .contains("source target not found: missing.ab"));
+        assert!(TargetDiscoveryError::UnsupportedFile(unsupported)
+            .to_string()
+            .contains("expected .ab, .abi, or .abp"));
+        assert!(TargetDiscoveryError::EmptyDirectory(empty)
+            .to_string()
+            .contains("no Abide source files found in empty"));
+    }
+
+    #[test]
+    fn resolve_source_targets_reports_missing_and_unsupported_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing = dir.path().join("missing.ab");
+        let unsupported = dir.path().join("script.qa");
+        write_file(&unsupported, "ask entities\n");
+
+        let missing_error =
+            resolve_source_targets(&[missing]).expect_err("missing target should fail");
+        assert!(matches!(
+            missing_error,
+            TargetDiscoveryError::MissingTarget(_)
+        ));
+
+        let unsupported_error =
+            resolve_source_targets(&[unsupported]).expect_err("unsupported file should fail");
+        assert!(matches!(
+            unsupported_error,
+            TargetDiscoveryError::UnsupportedFile(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_source_targets_preserves_non_not_found_metadata_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("tempdir");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&private).expect("create private dir");
+        let private_file = private.join("hidden.ab");
+        write_file(&private_file, "module Hidden\n");
+
+        let original_permissions = std::fs::metadata(&private)
+            .expect("private metadata")
+            .permissions();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000))
+            .expect("make private dir unreadable");
+        let error = resolve_source_targets(&[private_file])
+            .expect_err("permission-denied metadata should fail distinctly");
+        std::fs::set_permissions(&private, original_permissions)
+            .expect("restore private dir permissions");
+
+        assert!(matches!(error, TargetDiscoveryError::TargetMetadata { .. }));
+    }
 }

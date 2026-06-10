@@ -181,6 +181,44 @@ impl LspState {
     }
 }
 
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                will_save: None,
+                will_save_wait_until: None,
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+            },
+        )),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: Some(false),
+            trigger_characters: Some(vec![".".to_owned(), "@".to_owned()]),
+            ..CompletionOptions::default()
+        }),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![QA_RUN_SCRIPT_COMMAND.to_owned()],
+            ..ExecuteCommandOptions::default()
+        }),
+        ..ServerCapabilities::default()
+    }
+}
+
+fn verify_config_for_editor_policy(
+    verification_policy: EditorVerificationPolicy,
+) -> abide::verify::VerifyConfig {
+    abide::verify::VerifyConfig {
+        overall_timeout_ms: verification_policy.timeout_ms,
+        induction_timeout_ms: verification_policy.timeout_ms,
+        ..abide::verify::VerifyConfig::default()
+    }
+}
+
 /// LSP request handler. All async methods serialize through the
 /// `state` mutex.
 struct Backend {
@@ -215,31 +253,7 @@ impl LanguageServer for Backend {
                 name: "abide-lsp".to_owned(),
                 version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             }),
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        will_save: None,
-                        will_save_wait_until: None,
-                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-                    },
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                references_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
-                completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
-                    trigger_characters: Some(vec![".".to_owned(), "@".to_owned()]),
-                    ..CompletionOptions::default()
-                }),
-                execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec![QA_RUN_SCRIPT_COMMAND.to_owned()],
-                    ..ExecuteCommandOptions::default()
-                }),
-                ..ServerCapabilities::default()
-            },
+            capabilities: server_capabilities(),
         })
     }
 
@@ -561,11 +575,7 @@ fn collect_diagnostics_for_root(state: &mut LspState, root_file_id: FileId) -> D
                 }
 
                 if state.verification_policy.should_run_automatically() {
-                    let config = abide::verify::VerifyConfig {
-                        overall_timeout_ms: state.verification_policy.timeout_ms,
-                        induction_timeout_ms: state.verification_policy.timeout_ms,
-                        ..abide::verify::VerifyConfig::default()
-                    };
+                    let config = verify_config_for_editor_policy(state.verification_policy);
                     let results =
                         abide::verify::verify_function_contracts_only(&lowered.ir_program, &config);
                     for diagnostic in abide::verify::verification_diagnostics(&results) {
@@ -724,7 +734,7 @@ fn diagnostic_to_lsp(
     let range = diagnostic
         .span
         .and_then(|span| range_from_span(&source, span))
-        .unwrap_or_else(default_range);
+        .unwrap_or_else(|| Range::new(Position::new(0, 0), Position::new(0, 0)));
 
     Some((
         Url::from_file_path(&file_path).ok()?,
@@ -1136,12 +1146,7 @@ fn position_to_offset(source: &str, position: Position) -> Option<usize> {
         line += 1;
     }
     if line == position.line {
-        Some(
-            offset
-                + usize::try_from(position.character)
-                    .ok()?
-                    .min(source[offset..].len()),
-        )
+        Some(offset)
     } else {
         None
     }
@@ -1177,10 +1182,6 @@ fn offset_to_position(source: &str, offset: usize) -> Option<Position> {
     Some(Position::new(line, u32::try_from(character).ok()?))
 }
 
-fn default_range() -> Range {
-    Range::new(Position::new(0, 0), Position::new(0, 0))
-}
-
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
@@ -1206,6 +1207,20 @@ mod tests {
             offset_to_position(source, offset),
             Some(Position::new(1, 3))
         );
+        assert_eq!(
+            position_to_offset(source, Position::new(2, 0)),
+            Some(source.len())
+        );
+        assert_eq!(position_to_offset(source, Position::new(3, 0)), None);
+        assert_eq!(
+            offset_to_position(source, source.len()),
+            Some(Position::new(2, 0))
+        );
+        assert_eq!(offset_to_position(source, source.len() + 1), None);
+
+        let final_line = "a\nbc";
+        assert_eq!(position_to_offset(final_line, Position::new(1, 2)), Some(4));
+        assert_eq!(offset_to_position(final_line, 4), Some(Position::new(1, 2)));
     }
 
     #[test]
@@ -1226,6 +1241,195 @@ mod tests {
         assert!(!state.should_accept_document_version(&uri, 2));
         assert!(!state.should_accept_document_version(&uri, 3));
         assert!(state.should_accept_document_version(&uri, 4));
+        assert_eq!(state.document_version(&uri), Some(3));
+        assert_eq!(
+            state.document_version(&Url::parse("file:///tmp/missing.ab").expect("uri")),
+            None
+        );
+    }
+
+    #[test]
+    fn published_diagnostics_track_other_roots_only() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let root_a = state.workspace.set_file_source("/tmp/a.ab", "system A { }");
+        let root_b = state.workspace.set_file_source("/tmp/b.ab", "system B { }");
+        let shared_uri = Url::parse("file:///tmp/shared.ab").expect("uri");
+        let other_uri = Url::parse("file:///tmp/other.ab").expect("uri");
+
+        state
+            .published_by_root
+            .insert(root_a, HashSet::from([shared_uri.clone()]));
+        state.published_by_root.insert(
+            root_b,
+            HashSet::from([shared_uri.clone(), other_uri.clone()]),
+        );
+
+        assert!(state.uri_published_elsewhere(root_a, &shared_uri));
+        assert!(state.uri_published_elsewhere(root_b, &shared_uri));
+        assert!(!state.uri_published_elsewhere(root_b, &other_uri));
+        assert!(!state.uri_published_elsewhere(root_a, &Url::parse("file:///tmp/new.ab").unwrap()));
+    }
+
+    #[test]
+    fn stale_diagnostics_clear_only_when_no_other_root_publishes_uri() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let root_a = state.workspace.set_file_source("/tmp/a.ab", "system A { }");
+        let root_b = state.workspace.set_file_source("/tmp/b.ab", "system B { }");
+        let stale_uri = Url::parse("file:///tmp/stale.ab").expect("uri");
+        let shared_uri = Url::parse("file:///tmp/shared.ab").expect("uri");
+
+        state.published_by_root.insert(
+            root_a,
+            HashSet::from([stale_uri.clone(), shared_uri.clone()]),
+        );
+        state
+            .published_by_root
+            .insert(root_b, HashSet::from([shared_uri.clone()]));
+
+        let (_, stale_uris, _, log_error) = collect_diagnostics_for_root(&mut state, root_a);
+
+        assert_eq!(log_error, None);
+        assert_eq!(stale_uris, vec![stale_uri]);
+        assert!(!stale_uris.contains(&shared_uri));
+    }
+
+    #[test]
+    fn lsp_diagnostics_include_related_information() {
+        let mut workspace = CompilerWorkspace::with_root_dir(PathBuf::from("/tmp"));
+        let path = "/tmp/related.ab";
+        let file_id = workspace.set_file_source(path, "entity Account { }");
+        let diagnostic = Diagnostic::error("duplicate name")
+            .in_file(path)
+            .with_span((0..6).into())
+            .with_related(
+                "previous definition",
+                Some((7..14).into()),
+                Some(path.to_owned()),
+            );
+
+        let (_, lsp_diagnostic) =
+            diagnostic_to_lsp(&workspace, file_id, &diagnostic).expect("lsp diagnostic");
+        let related = lsp_diagnostic
+            .related_information
+            .expect("related information");
+
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "previous definition");
+        assert_eq!(related[0].location.uri, Url::from_file_path(path).unwrap());
+        assert_eq!(related[0].location.range.start, Position::new(0, 7));
+        assert_eq!(related[0].location.range.end, Position::new(0, 14));
+    }
+
+    #[test]
+    fn lsp_diagnostics_without_spans_use_zero_width_start_range() {
+        let mut workspace = CompilerWorkspace::with_root_dir(PathBuf::from("/tmp"));
+        let path = "/tmp/no_span.ab";
+        let file_id = workspace.set_file_source(path, "system S { }");
+        let diagnostic = Diagnostic::warning("workspace note").in_file(path);
+
+        let (_, lsp_diagnostic) =
+            diagnostic_to_lsp(&workspace, file_id, &diagnostic).expect("lsp diagnostic");
+
+        assert_eq!(
+            lsp_diagnostic.range,
+            Range::new(Position::new(0, 0), Position::new(0, 0))
+        );
+    }
+
+    #[test]
+    fn definition_locations_map_symbols_to_file_uris_and_ranges() {
+        let mut workspace = CompilerWorkspace::with_root_dir(PathBuf::from("/tmp"));
+        let path = "/tmp/definitions.ab";
+        let file_id = workspace.set_file_source(path, "entity Account { }\n");
+        let index = build_workspace_index(&mut workspace).expect("workspace index");
+
+        let locations = definition_locations(&workspace, &index, "Account");
+
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].uri, Url::from_file_path(path).unwrap());
+        assert_eq!(locations[0].range.start, Position::new(0, 7));
+        assert_eq!(locations[0].range.end, Position::new(0, 14));
+
+        let location =
+            location_for_span(&workspace, file_id, (7..14).into()).expect("span location");
+        assert_eq!(location, locations[0]);
+        let (uri, range) =
+            uri_and_range_for_span(&workspace, file_id, (7..14).into()).expect("uri and range");
+        assert_eq!(uri, locations[0].uri);
+        assert_eq!(range, locations[0].range);
+    }
+
+    #[test]
+    fn completion_items_preserve_symbol_kind_and_detail() {
+        let mut workspace = CompilerWorkspace::with_root_dir(PathBuf::from("/tmp"));
+        let file_id = workspace.set_file_source("/tmp/completions.ab", "fn total(): int { 0 }");
+        let symbol = IdeSymbol {
+            name: "total".to_owned(),
+            kind: IdeSymbolKind::Function,
+            file_id,
+            span: (3..8).into(),
+            detail: "fn total(): int".to_owned(),
+        };
+
+        let item = completion_item_for_symbol(&symbol);
+
+        assert_eq!(item.label, "total");
+        assert_eq!(item.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(item.detail, Some("fn total(): int".to_owned()));
+    }
+
+    #[test]
+    fn server_capabilities_advertise_document_features_and_qa_command() {
+        let capabilities = server_capabilities();
+
+        let sync = capabilities
+            .text_document_sync
+            .expect("text document sync capability");
+        let TextDocumentSyncCapability::Options(sync) = sync else {
+            panic!("expected sync options");
+        };
+        assert_eq!(sync.open_close, Some(true));
+        assert_eq!(sync.change, Some(TextDocumentSyncKind::FULL));
+        assert_eq!(
+            sync.save,
+            Some(TextDocumentSyncSaveOptions::Supported(true))
+        );
+        assert!(matches!(
+            capabilities.hover_provider,
+            Some(HoverProviderCapability::Simple(true))
+        ));
+        assert_eq!(capabilities.definition_provider, Some(OneOf::Left(true)));
+        assert_eq!(capabilities.references_provider, Some(OneOf::Left(true)));
+        assert_eq!(capabilities.rename_provider, Some(OneOf::Left(true)));
+
+        let completion = capabilities
+            .completion_provider
+            .expect("completion capability");
+        assert_eq!(completion.resolve_provider, Some(false));
+        assert_eq!(
+            completion.trigger_characters,
+            Some(vec![".".to_owned(), "@".to_owned()])
+        );
+
+        let commands = capabilities
+            .execute_command_provider
+            .expect("execute command capability")
+            .commands;
+        assert_eq!(commands, vec![QA_RUN_SCRIPT_COMMAND.to_owned()]);
+    }
+
+    #[test]
+    fn editor_verification_config_uses_policy_timeout_for_lsp_checks() {
+        let policy = EditorVerificationPolicy {
+            trigger: EditorVerificationTrigger::OnChange,
+            debounce_ms: 123,
+            timeout_ms: 4567,
+        };
+
+        let config = verify_config_for_editor_policy(policy);
+
+        assert_eq!(config.overall_timeout_ms, 4567);
+        assert_eq!(config.induction_timeout_ms, 4567);
     }
 
     #[test]
@@ -1247,6 +1451,7 @@ mod tests {
         assert_eq!(policy.timeout_ms, 1250);
         assert!(!policy.should_schedule_on_change());
         assert!(policy.should_schedule_on_save());
+        assert!(policy.should_run_automatically());
     }
 
     #[test]
@@ -1265,6 +1470,7 @@ mod tests {
             disabled_by_flag.trigger,
             EditorVerificationTrigger::Disabled
         );
+        assert!(!disabled_by_flag.should_run_automatically());
 
         let manual = EditorVerificationPolicy::from_initialization_options(Some(
             &serde_json::json!({ "abide": { "verification": { "mode": "manual" } } }),
@@ -1272,21 +1478,39 @@ mod tests {
         assert_eq!(manual.trigger, EditorVerificationTrigger::Manual);
         assert!(!manual.should_schedule_on_change());
         assert!(!manual.should_schedule_on_save());
+        assert!(!manual.should_run_automatically());
     }
 
     #[test]
     fn keyword_completions_include_contract_keywords() {
-        let labels = keyword_completions(
+        let items = keyword_completions(
             CompletionContext::General,
             KeywordCompletionContext::General,
-        )
-        .into_iter()
-        .map(|item| item.label)
-        .collect::<Vec<_>>();
+        );
+        let labels = items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect::<Vec<_>>();
 
         assert!(labels.contains(&"requires".to_owned()));
         assert!(labels.contains(&"ensures".to_owned()));
         assert!(labels.contains(&"decreases".to_owned()));
+        assert!(items
+            .iter()
+            .all(|item| item.kind == Some(CompletionItemKind::KEYWORD)));
+    }
+
+    #[test]
+    fn keyword_context_uses_real_word_boundaries() {
+        assert!(is_word_boundary(' '));
+        assert!(is_word_boundary('('));
+        assert!(!is_word_boundary('_'));
+        assert!(!is_word_boundary('a'));
+        assert!(!is_word_boundary('7'));
+
+        assert!(starts_with_any_keyword("fn bounded", &["fn"]));
+        assert!(!starts_with_any_keyword("fn_helper", &["fn"]));
+        assert!(!starts_with_any_keyword("fn2", &["fn"]));
     }
 
     #[test]
@@ -1305,6 +1529,18 @@ mod tests {
 
         assert_eq!(context, KeywordCompletionContext::Contract);
         assert!(requires.sort_text < module.sort_text);
+        assert_eq!(
+            keyword_sort_text("requires", KeywordCompletionContext::Contract),
+            "00_requires"
+        );
+        assert_eq!(
+            keyword_sort_text("ensures", KeywordCompletionContext::Contract),
+            "01_ensures"
+        );
+        assert_eq!(
+            keyword_sort_text("decreases", KeywordCompletionContext::Contract),
+            "02_decreases"
+        );
     }
 
     #[test]
@@ -1323,6 +1559,10 @@ mod tests {
 
         assert_eq!(context, KeywordCompletionContext::General);
         assert!(requires.sort_text > module.sort_text);
+        assert_eq!(
+            keyword_sort_text("requires", KeywordCompletionContext::General),
+            "40_requires"
+        );
     }
 
     #[test]
@@ -1381,6 +1621,25 @@ mod tests {
             !labels.contains(&"fn".to_owned()),
             "QA subcommand completions should not include Abide keywords: {labels:#?}"
         );
+        assert_eq!(
+            qa_completion_context("load fs", "load fs".len()),
+            QACompletionContext::None
+        );
+        assert_eq!(
+            qa_completion_context("ask fs extra", "ask fs extra".len()),
+            QACompletionContext::None
+        );
+    }
+
+    #[test]
+    fn qa_completion_items_are_keyword_items() {
+        let items = qa_completion_items("ver", 3);
+        let verify = items
+            .iter()
+            .find(|item| item.label == "verify")
+            .expect("verify completion");
+
+        assert_eq!(verify.kind, Some(CompletionItemKind::KEYWORD));
     }
 
     #[test]
@@ -1411,6 +1670,18 @@ mod tests {
             !labels.contains(&"ask".to_owned()),
             "embedded Abide completions should not include QA commands: {labels:#?}"
         );
+    }
+
+    #[test]
+    fn embedded_abide_block_lookup_respects_body_boundaries() {
+        let source = "ask entities\nabide {\n  entity Account { }\n}\nask systems\n";
+        let inside_offset = source.find("entity").expect("entity offset");
+        let block = embedded_abide_block_at(source, inside_offset).expect("embedded block");
+
+        assert!(inside_offset >= block.body_span.start);
+        assert!(inside_offset <= block.body_span.end);
+        assert!(embedded_abide_block_at(source, block.body_span.start - 1).is_none());
+        assert!(embedded_abide_block_at(source, block.body_span.end + 1).is_none());
     }
 
     #[test]

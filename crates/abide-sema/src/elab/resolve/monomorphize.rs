@@ -465,14 +465,66 @@ pub(super) fn collect_all_param_uses(ty: &Ty, out: &mut Vec<(String, Vec<Ty>)>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elab::types::BuiltinTy;
+    use crate::ast::Visibility;
+    use crate::elab::types::{BuiltinTy, EExpr, Literal};
+    use crate::span::Span;
 
     fn int_ty() -> Ty {
         Ty::Builtin(BuiltinTy::Int)
     }
 
+    fn string_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::String)
+    }
+
     fn param(name: &str, args: Vec<Ty>) -> Ty {
         Ty::Param(name.to_owned(), args)
+    }
+
+    fn generic_def(name: &str, type_params: &[&str], fields: EnumVariantFields) -> GenericTypeDef {
+        GenericTypeDef {
+            name: name.to_owned(),
+            type_params: type_params
+                .iter()
+                .map(|param| (*param).to_owned())
+                .collect(),
+            variant_names: fields.iter().map(|(variant, _)| variant.clone()).collect(),
+            variant_fields: fields,
+            visibility: Visibility::Private,
+            span: Span { start: 0, end: 0 },
+        }
+    }
+
+    fn option_generic() -> GenericTypeDef {
+        generic_def(
+            "Option",
+            &["T"],
+            vec![
+                (
+                    "Some".to_owned(),
+                    vec![("value".to_owned(), Ty::Named("T".to_owned()))],
+                ),
+                ("None".to_owned(), vec![]),
+            ],
+        )
+    }
+
+    fn box_generic() -> GenericTypeDef {
+        generic_def(
+            "Box",
+            &["T"],
+            vec![(
+                "Boxed".to_owned(),
+                vec![("value".to_owned(), Ty::Named("T".to_owned()))],
+            )],
+        )
+    }
+
+    fn assert_int(ty: &Ty, context: &str) {
+        assert!(
+            matches!(ty, Ty::Builtin(BuiltinTy::Int)),
+            "{context} should be int, got {ty:?}"
+        );
     }
 
     fn collected_names(ty: &Ty) -> Vec<String> {
@@ -532,6 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn collect_all_param_uses_walks_set_seq_record_and_tuple_shapes() {
+        let ty = Ty::Tuple(vec![
+            Ty::Set(Box::new(param("SetItem", vec![int_ty()]))),
+            Ty::Seq(Box::new(param("SeqItem", vec![int_ty()]))),
+            Ty::Record(
+                "Pair".to_owned(),
+                vec![("left".to_owned(), param("RecordItem", vec![int_ty()]))],
+            ),
+        ]);
+
+        assert_eq!(
+            collected_names(&ty),
+            vec!["SetItem", "SeqItem", "RecordItem"]
+        );
+    }
+
+    #[test]
     fn mono_ty_name_preserves_nominal_newtype_identity() {
         let user_id = Ty::Newtype(
             "UserId".to_owned(),
@@ -546,5 +615,311 @@ mod tests {
         assert_eq!(mono_ty_name(&order_id), "OrderId");
         assert_eq!(format_mono_name("Box", &[user_id]), "Box<UserId>");
         assert_eq!(format_mono_name("Box", &[order_id]), "Box<OrderId>");
+    }
+
+    #[test]
+    fn substitute_ty_walks_every_composite_type_shape() {
+        let subst = HashMap::from([("T".to_owned(), int_ty()), ("U".to_owned(), string_ty())]);
+        let unresolved = Ty::Tuple(vec![
+            Ty::Named("T".to_owned()),
+            param("Box", vec![Ty::Named("T".to_owned())]),
+            Ty::Record(
+                "Pair".to_owned(),
+                vec![("left".to_owned(), Ty::Named("T".to_owned()))],
+            ),
+            Ty::Set(Box::new(Ty::Named("T".to_owned()))),
+            Ty::Seq(Box::new(Ty::Named("T".to_owned()))),
+            Ty::Map(
+                Box::new(Ty::Named("T".to_owned())),
+                Box::new(Ty::Named("U".to_owned())),
+            ),
+            Ty::Fn(
+                Box::new(Ty::Named("T".to_owned())),
+                Box::new(Ty::Named("U".to_owned())),
+            ),
+            Ty::Alias("Alias".to_owned(), Box::new(Ty::Named("T".to_owned()))),
+            Ty::Newtype("New".to_owned(), Box::new(Ty::Named("T".to_owned()))),
+            Ty::Relation(vec![Ty::Named("T".to_owned()), Ty::Named("U".to_owned())]),
+            Ty::Refinement(
+                Box::new(Ty::Named("T".to_owned())),
+                Box::new(EExpr::Lit(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    Literal::Bool(true),
+                    None,
+                )),
+            ),
+        ]);
+
+        let Ty::Tuple(items) = substitute_ty(&unresolved, &subst) else {
+            panic!("expected tuple after substitution");
+        };
+
+        assert_int(&items[0], "named replacement");
+        assert!(
+            matches!(&items[1], Ty::Param(_, args) if matches!(args.as_slice(), [Ty::Builtin(BuiltinTy::Int)]))
+        );
+        let Ty::Record(_, fields) = &items[2] else {
+            panic!("expected record, got {:?}", items[2]);
+        };
+        assert_int(&fields[0].1, "record field");
+        let Ty::Set(set_inner) = &items[3] else {
+            panic!("expected set, got {:?}", items[3]);
+        };
+        assert_int(set_inner, "set inner");
+        let Ty::Seq(seq_inner) = &items[4] else {
+            panic!("expected seq, got {:?}", items[4]);
+        };
+        assert_int(seq_inner, "seq inner");
+        let Ty::Map(map_key, map_value) = &items[5] else {
+            panic!("expected map, got {:?}", items[5]);
+        };
+        assert_int(map_key, "map key");
+        assert!(matches!(map_value.as_ref(), Ty::Builtin(BuiltinTy::String)));
+        let Ty::Fn(arg, ret) = &items[6] else {
+            panic!("expected fn, got {:?}", items[6]);
+        };
+        assert_int(arg, "fn arg");
+        assert!(matches!(ret.as_ref(), Ty::Builtin(BuiltinTy::String)));
+        let Ty::Alias(_, alias_inner) = &items[7] else {
+            panic!("expected alias, got {:?}", items[7]);
+        };
+        assert_int(alias_inner, "alias inner");
+        let Ty::Newtype(_, newtype_inner) = &items[8] else {
+            panic!("expected newtype, got {:?}", items[8]);
+        };
+        assert_int(newtype_inner, "newtype inner");
+        let Ty::Relation(columns) = &items[9] else {
+            panic!("expected relation, got {:?}", items[9]);
+        };
+        assert_int(&columns[0], "relation first column");
+        assert!(matches!(&columns[1], Ty::Builtin(BuiltinTy::String)));
+        let Ty::Refinement(base, _) = &items[10] else {
+            panic!("expected refinement, got {:?}", items[10]);
+        };
+        assert_int(base, "refinement base");
+    }
+
+    #[test]
+    fn monomorphize_variant_fields_substitutes_payloads_and_registers_nested_generics() {
+        let option = option_generic();
+        let wrapper = generic_def(
+            "Wrapper",
+            &["T"],
+            vec![(
+                "Wrap".to_owned(),
+                vec![(
+                    "inner".to_owned(),
+                    param("Option", vec![Ty::Named("T".to_owned())]),
+                )],
+            )],
+        );
+        let generic_types = HashMap::from([
+            ("Option".to_owned(), option),
+            ("Wrapper".to_owned(), wrapper.clone()),
+        ]);
+        let mut types = HashMap::new();
+        let mut variant_fields = HashMap::new();
+        let mut registered = HashSet::new();
+
+        let fields = monomorphize_variant_fields(
+            &wrapper,
+            &[int_ty()],
+            &generic_types,
+            &mut types,
+            &mut variant_fields,
+            &mut registered,
+        );
+
+        assert_eq!(fields.len(), 1);
+        assert!(
+            matches!(&fields[0].1[0].1, Ty::Enum(name, _) if name == "Option<int>"),
+            "nested Option<T> payload should become Option<int>, got {:?}",
+            fields
+        );
+        assert!(
+            types.contains_key("Option<int>"),
+            "nested generic should be registered in types"
+        );
+        assert!(
+            variant_fields.contains_key("Option<int>"),
+            "non-empty nested variant fields should be registered"
+        );
+    }
+
+    #[test]
+    fn resolve_nested_generics_walks_wrappers_and_does_not_overwrite_registered_types() {
+        let option = option_generic();
+        let generic_types = HashMap::from([("Option".to_owned(), option)]);
+        let mut types = HashMap::from([(
+            "Option<int>".to_owned(),
+            Ty::Enum("Option<int>".to_owned(), vec!["Existing".to_owned()]),
+        )]);
+        let mut variant_fields = HashMap::new();
+        let mut registered = HashSet::new();
+        let ty = Ty::Tuple(vec![
+            Ty::Set(Box::new(param("Option", vec![int_ty()]))),
+            Ty::Seq(Box::new(param("Option", vec![int_ty()]))),
+            Ty::Map(
+                Box::new(param("Option", vec![int_ty()])),
+                Box::new(param("Option", vec![int_ty()])),
+            ),
+            Ty::Record(
+                "Record".to_owned(),
+                vec![("field".to_owned(), param("Option", vec![int_ty()]))],
+            ),
+            Ty::Fn(
+                Box::new(param("Option", vec![int_ty()])),
+                Box::new(param("Option", vec![int_ty()])),
+            ),
+            Ty::Alias(
+                "Alias".to_owned(),
+                Box::new(param("Option", vec![int_ty()])),
+            ),
+            Ty::Newtype("New".to_owned(), Box::new(param("Option", vec![int_ty()]))),
+            Ty::Relation(vec![param("Option", vec![int_ty()])]),
+            Ty::Refinement(
+                Box::new(param("Option", vec![int_ty()])),
+                Box::new(EExpr::Lit(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    Literal::Bool(true),
+                    None,
+                )),
+            ),
+        ]);
+
+        let resolved = resolve_nested_generics(
+            &ty,
+            &generic_types,
+            &mut types,
+            &mut variant_fields,
+            &mut registered,
+        );
+
+        let Ty::Tuple(items) = resolved else {
+            panic!("expected tuple after nested generic resolution");
+        };
+        assert!(
+            matches!(&items[0], Ty::Set(inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[1], Ty::Seq(inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[2], Ty::Map(key, value) if matches!(key.as_ref(), Ty::Enum(name, _) if name == "Option<int>") && matches!(value.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[3], Ty::Record(_, fields) if matches!(&fields[0].1, Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[4], Ty::Fn(arg, ret) if matches!(arg.as_ref(), Ty::Enum(name, _) if name == "Option<int>") && matches!(ret.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[5], Ty::Alias(_, inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[6], Ty::Newtype(_, inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[7], Ty::Relation(columns) if matches!(&columns[0], Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(&items[8], Ty::Refinement(base, _) if matches!(base.as_ref(), Ty::Enum(name, _) if name == "Option<int>"))
+        );
+        assert!(
+            matches!(types.get("Option<int>"), Some(Ty::Enum(_, variants)) if variants == &vec!["Existing".to_owned()]),
+            "pre-existing monomorphized type should not be overwritten"
+        );
+        assert!(
+            variant_fields.is_empty(),
+            "pre-existing monomorphized type should not be re-registered"
+        );
+    }
+
+    #[test]
+    fn resolve_nested_generics_registers_variant_fields_when_all_variants_have_payloads() {
+        let boxed = box_generic();
+        let generic_types = HashMap::from([("Box".to_owned(), boxed)]);
+        let mut types = HashMap::new();
+        let mut variant_fields = HashMap::new();
+        let mut registered = HashSet::new();
+
+        let resolved = resolve_nested_generics(
+            &param("Box", vec![int_ty()]),
+            &generic_types,
+            &mut types,
+            &mut variant_fields,
+            &mut registered,
+        );
+
+        assert!(matches!(resolved, Ty::Enum(name, _) if name == "Box<int>"));
+        assert!(
+            variant_fields.contains_key("Box<int>"),
+            "all-non-empty variant payloads must still be registered"
+        );
+    }
+
+    #[test]
+    fn monomorphize_generics_registers_valid_uses_and_reports_wrong_arity() {
+        let mut env = Env::new();
+        env.generic_types
+            .insert("Option".to_owned(), option_generic());
+        env.generic_types.insert("Box".to_owned(), box_generic());
+        env.types
+            .insert("UsesOption".to_owned(), param("Option", vec![int_ty()]));
+        env.types
+            .insert("UsesBox".to_owned(), param("Box", vec![int_ty()]));
+        env.types.insert(
+            "BadOption".to_owned(),
+            param("Option", vec![int_ty(), string_ty()]),
+        );
+
+        monomorphize_generics(&mut env);
+
+        assert!(
+            matches!(env.types.get("Option<int>"), Some(Ty::Enum(name, _)) if name == "Option<int>"),
+            "valid generic use should register Option<int>, got {:?}",
+            env.types.get("Option<int>")
+        );
+        assert!(
+            env.variant_fields.contains_key("Option<int>"),
+            "non-empty Option<int> variant fields should be retained"
+        );
+        assert!(
+            env.variant_fields.contains_key("Box<int>"),
+            "all-non-empty Box<int> variant fields should be retained"
+        );
+        assert!(
+            env.errors
+                .iter()
+                .any(|error| error.message.contains("expects 1 type argument(s)")
+                    && error.message.contains("2 were provided")),
+            "wrong arity should be reported exactly once, got {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn monomorphize_generics_does_not_overwrite_preexisting_monomorphized_type() {
+        let mut env = Env::new();
+        env.generic_types
+            .insert("Option".to_owned(), option_generic());
+        env.types.insert(
+            "Option<int>".to_owned(),
+            Ty::Enum("Option<int>".to_owned(), vec!["Existing".to_owned()]),
+        );
+        env.types
+            .insert("UsesOption".to_owned(), param("Option", vec![int_ty()]));
+
+        monomorphize_generics(&mut env);
+
+        assert!(
+            matches!(env.types.get("Option<int>"), Some(Ty::Enum(_, variants)) if variants == &vec!["Existing".to_owned()]),
+            "pre-existing monomorphized type should not be overwritten, got {:?}",
+            env.types.get("Option<int>")
+        );
+        assert!(
+            !env.variant_fields.contains_key("Option<int>"),
+            "pre-existing monomorphized type should not have fields re-registered"
+        );
     }
 }

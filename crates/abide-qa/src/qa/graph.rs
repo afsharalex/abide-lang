@@ -194,7 +194,10 @@ fn dfs_cycle(
             if in_stack.contains(next.as_str()) {
                 return true;
             }
-            if !visited.contains(next.as_str()) && dfs_cycle(adj, next, visited, in_stack) {
+            if visited.contains(next.as_str()) {
+                continue;
+            }
+            if dfs_cycle(adj, next, visited, in_stack) {
                 return true;
             }
         }
@@ -225,10 +228,11 @@ fn dfs_find_cycle(
                     return Some(cycle);
                 }
             }
-            if !visited.contains(next.as_str()) {
-                if let Some(cycle) = dfs_find_cycle(adj, next, visited, in_stack, path) {
-                    return Some(cycle);
-                }
+            if visited.contains(next.as_str()) {
+                continue;
+            }
+            if let Some(cycle) = dfs_find_cycle(adj, next, visited, in_stack, path) {
+                return Some(cycle);
             }
         }
     }
@@ -339,14 +343,62 @@ mod tests {
     fn initial() {
         let g = order_graph();
         let inits = initial_states(&g);
-        assert!(inits.contains(&"Pending".to_owned()));
-        assert!(!inits.contains(&"Confirmed".to_owned()));
+        assert_eq!(inits, vec!["Pending".to_owned()]);
+    }
+
+    #[test]
+    fn initial_includes_declared_initial_even_with_incoming_edge_once() {
+        let mut g = order_graph();
+        g.transitions.push(TransitionEdge {
+            action: "reset".to_owned(),
+            from: Some("Cancelled".to_owned()),
+            to: "Pending".to_owned(),
+        });
+
+        assert_eq!(initial_states(&g), vec!["Pending".to_owned()]);
     }
 
     #[test]
     fn no_cycles_linear() {
         let g = order_graph();
         assert!(!has_cycles(&g));
+    }
+
+    #[test]
+    fn no_cycles_in_diamond_graph_with_shared_sink() {
+        let mut g = order_graph();
+        g.states = vec![
+            "A".to_owned(),
+            "B".to_owned(),
+            "C".to_owned(),
+            "D".to_owned(),
+        ];
+        g.initial = Some("A".to_owned());
+        g.transitions = vec![
+            TransitionEdge {
+                action: "ab".to_owned(),
+                from: Some("A".to_owned()),
+                to: "B".to_owned(),
+            },
+            TransitionEdge {
+                action: "ac".to_owned(),
+                from: Some("A".to_owned()),
+                to: "C".to_owned(),
+            },
+            TransitionEdge {
+                action: "bd".to_owned(),
+                from: Some("B".to_owned()),
+                to: "D".to_owned(),
+            },
+            TransitionEdge {
+                action: "cd".to_owned(),
+                from: Some("C".to_owned()),
+                to: "D".to_owned(),
+            },
+        ];
+
+        assert!(!has_cycles(&g));
+        assert_eq!(find_cycle(&g), None);
     }
 
     #[test]
@@ -361,6 +413,23 @@ mod tests {
         assert!(has_cycles(&g));
         let cycle = find_cycle(&g).unwrap();
         assert!(cycle.len() >= 2);
+    }
+
+    #[test]
+    fn find_cycle_returns_exact_self_loop_path() {
+        let mut g = order_graph();
+        g.states = vec!["Open".to_owned()];
+        g.initial = Some("Open".to_owned());
+        g.transitions = vec![TransitionEdge {
+            action: "retry".to_owned(),
+            from: Some("Open".to_owned()),
+            to: "Open".to_owned(),
+        }];
+
+        assert_eq!(
+            find_cycle(&g),
+            Some(vec!["Open".to_owned(), "Open".to_owned()])
+        );
     }
 
     #[test]

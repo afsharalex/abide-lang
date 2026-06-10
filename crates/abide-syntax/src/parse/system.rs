@@ -26,7 +26,7 @@ impl Parser {
         let (name, _) = self.expect_name()?;
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.interface_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -68,7 +68,7 @@ impl Parser {
 
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.system_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -102,7 +102,7 @@ impl Parser {
 
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.extern_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -140,7 +140,7 @@ impl Parser {
 
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.peek() {
                 Some(Token::Let) => match self.let_binding_decl() {
                     Ok(item) => items.push(ProgramItem::Let(item)),
@@ -228,11 +228,12 @@ impl Parser {
         };
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
             }
+            let pos_before_item = self.pos;
             let parsed = if matches!(self.peek(), Some(Token::Use)) {
                 self.proc_use_item()
             } else if matches!(self.peek(), Some(Token::Match)) {
@@ -241,7 +242,10 @@ impl Parser {
                 self.proc_item()
             };
             match parsed {
-                Ok(mut parsed) => items.append(&mut parsed),
+                Ok(mut parsed) => {
+                    self.ensure_progress(pos_before_item, "proc item")?;
+                    items.append(&mut parsed);
+                }
                 Err(err) if self.recovering => {
                     self.push_recovery_error(err);
                     items.push(ProcItem::Error(
@@ -425,7 +429,7 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut edges = Vec::new();
 
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             self.expect(&Token::At)?;
             let (port, _) = self.expect_name()?;
             self.expect(&Token::FatArrow)?;
@@ -716,7 +720,7 @@ impl Parser {
 
         let mut items = Vec::new();
         let mut return_expr = None;
-        while !matches!(self.peek(), Some(Token::RBrace)) {
+        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -820,7 +824,7 @@ impl Parser {
         let (command, _) = self.expect_name()?;
         self.expect(&Token::LBrace)?;
         let mut returns = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -841,7 +845,7 @@ impl Parser {
         let start = self.expect(&Token::Assume)?;
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -974,7 +978,7 @@ impl Parser {
         self.expect(&Token::FatArrow)?;
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -1007,7 +1011,7 @@ impl Parser {
         let condition = self.expr()?;
         self.expect(&Token::LBrace)?;
         let mut body = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -1038,7 +1042,7 @@ impl Parser {
         let (ty, _) = self.expect_name()?;
         self.expect(&Token::LBrace)?;
         let mut body = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             while self.eat(&Token::Semi).is_some() {}
             if matches!(self.peek(), Some(Token::RBrace)) {
                 break;
@@ -1072,7 +1076,7 @@ impl Parser {
         };
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) {
+        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
             fields.push(self.create_field()?);
         }
         let end = self.expect(&Token::RBrace)?;

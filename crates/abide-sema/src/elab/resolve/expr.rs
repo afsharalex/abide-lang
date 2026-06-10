@@ -6,20 +6,14 @@ use std::collections::HashMap;
 use super::Ctx;
 
 fn infer_field_type(ctx: &Ctx, base: &EExpr, field_name: &str) -> Ty {
-    let entity_name: Option<String> = match base.ty() {
-        Ty::Entity(name) => Some(name.clone()),
-        Ty::Named(name) if ctx.entities.contains_key(name.as_str()) => Some(name.clone()),
-        other => {
-            let name = other.name();
-            ctx.entities.contains_key(name).then(|| name.to_owned())
-        }
+    let entity_name = match base.ty() {
+        Ty::Entity(name) | Ty::Named(name) => name.clone(),
+        other => other.name().to_owned(),
     };
 
-    if let Some(entity_name) = entity_name {
-        if let Some(entity) = ctx.entities.get(entity_name.as_str()) {
-            if let Some(field) = entity.fields.iter().find(|f| f.name == field_name) {
-                return ctx.resolve_ty(&field.ty);
-            }
+    if let Some(entity) = ctx.entities.get(entity_name.as_str()) {
+        if let Some(field) = entity.fields.iter().find(|f| f.name == field_name) {
+            return ctx.resolve_ty(&field.ty);
         }
     }
 
@@ -1028,4 +1022,681 @@ pub(super) fn find_constructor_type(ctx: &Ctx, name: &str) -> Option<Ty> {
 
 pub(super) fn last_segment(s: &str) -> &str {
     s.rsplit("::").next().unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::env::Env;
+    use crate::elab::types::{BuiltinTy, EEntity, EField};
+
+    fn int_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn bool_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Bool)
+    }
+
+    fn string_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::String)
+    }
+
+    fn var(name: &str, ty: Ty) -> EExpr {
+        EExpr::Var(ty, name.to_owned(), None)
+    }
+
+    fn lit_int(value: i64) -> EExpr {
+        EExpr::Lit(int_ty(), Literal::Int(value), None)
+    }
+
+    fn ctx_with_order_entity() -> Ctx {
+        let mut env = Env::new();
+        env.entities.insert(
+            "Order".to_owned(),
+            EEntity {
+                name: "Order".to_owned(),
+                fields: vec![EField {
+                    name: "status".to_owned(),
+                    ty: Ty::Named("Status".to_owned()),
+                    default: None,
+                    span: None,
+                }],
+                actions: vec![],
+                derived_fields: vec![],
+                invariants: vec![],
+                fsm_decls: vec![],
+                span: None,
+            },
+        );
+        env.types.insert(
+            "Status".to_owned(),
+            Ty::Enum(
+                "Status".to_owned(),
+                vec!["Open".to_owned(), "Closed".to_owned()],
+            ),
+        );
+        Ctx::from_env(&env)
+    }
+
+    fn ctx_with_status_types() -> Ctx {
+        let mut env = Env::new();
+        env.types.insert(
+            "Status".to_owned(),
+            Ty::Enum(
+                "Status".to_owned(),
+                vec!["Open".to_owned(), "Closed".to_owned()],
+            ),
+        );
+        env.types.insert(
+            "Outcome".to_owned(),
+            Ty::Enum(
+                "Outcome".to_owned(),
+                vec!["Open".to_owned(), "Failed".to_owned()],
+            ),
+        );
+        Ctx::from_env(&env)
+    }
+
+    #[test]
+    fn infer_field_type_resolves_named_and_entity_base_types() {
+        let ctx = ctx_with_order_entity();
+
+        for base_ty in [
+            Ty::Entity("Order".to_owned()),
+            Ty::Named("Order".to_owned()),
+        ] {
+            let field_ty = infer_field_type(&ctx, &var("order", base_ty), "status");
+            assert!(
+                matches!(&field_ty, Ty::Enum(name, variants) if name == "Status" && variants == &vec!["Open".to_owned(), "Closed".to_owned()]),
+                "status field should resolve through ctx types, got {field_ty:?}"
+            );
+        }
+
+        assert!(
+            matches!(
+                infer_field_type(
+                    &ctx,
+                    &var("order", Ty::Entity("Order".to_owned())),
+                    "missing"
+                ),
+                Ty::Error
+            ),
+            "unknown fields should remain poison"
+        );
+    }
+
+    #[test]
+    fn infer_qualcall_type_covers_common_collection_helpers() {
+        let ctx = ctx_with_order_entity();
+        let int_set = Ty::Set(Box::new(int_ty()));
+        let int_seq = Ty::Seq(Box::new(int_ty()));
+        let int_string_map = Ty::Map(Box::new(int_ty()), Box::new(string_ty()));
+        let relation = Ty::Relation(vec![int_ty(), int_ty()]);
+
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Rel", "closure", &[var("r", relation)]),
+                Ty::Relation(columns) if matches!(columns.as_slice(), [Ty::Builtin(BuiltinTy::Int), Ty::Builtin(BuiltinTy::Int)])
+            ),
+            "Rel::closure should keep homogeneous binary relation type"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Set", "union", &[var("s", int_set.clone())]),
+                Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(BuiltinTy::Int))
+            ),
+            "Set::union should keep set type"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Set", "member", &[lit_int(1), var("s", int_set)]),
+                Ty::Builtin(BuiltinTy::Bool)
+            ),
+            "Set::member should return bool"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Seq", "head", &[var("xs", int_seq.clone())]),
+                Ty::Builtin(BuiltinTy::Int)
+            ),
+            "Seq::head should return element type"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Seq", "tail", &[var("xs", int_seq)]),
+                Ty::Seq(inner) if matches!(inner.as_ref(), Ty::Builtin(BuiltinTy::Int))
+            ),
+            "Seq::tail should keep sequence type"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(
+                    &ctx,
+                    "Seq",
+                    "length",
+                    &[var("xs", Ty::Seq(Box::new(string_ty())))]
+                ),
+                Ty::Builtin(BuiltinTy::Int)
+            ),
+            "Seq::length should return int"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(
+                    &ctx,
+                    "Seq",
+                    "empty",
+                    &[var("xs", Ty::Seq(Box::new(string_ty())))]
+                ),
+                Ty::Builtin(BuiltinTy::Bool)
+            ),
+            "Seq::empty should return bool"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(
+                    &ctx,
+                    "Map",
+                    "has",
+                    &[var("m", int_string_map.clone()), lit_int(1)]
+                ),
+                Ty::Builtin(BuiltinTy::Bool)
+            ),
+            "Map::has should return bool"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Map", "domain", &[var("m", int_string_map.clone())]),
+                Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(BuiltinTy::Int))
+            ),
+            "Map::domain should return key set"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(&ctx, "Map", "range", &[var("m", int_string_map)]),
+                Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(BuiltinTy::String))
+            ),
+            "Map::range should return value set"
+        );
+        assert!(
+            matches!(
+                infer_qualcall_type(
+                    &ctx,
+                    "Map",
+                    "merge",
+                    &[var("m", Ty::Map(Box::new(int_ty()), Box::new(string_ty())))]
+                ),
+                Ty::Map(key, value)
+                    if matches!(key.as_ref(), Ty::Builtin(BuiltinTy::Int))
+                        && matches!(value.as_ref(), Ty::Builtin(BuiltinTy::String))
+            ),
+            "Map::merge should keep map type"
+        );
+    }
+
+    #[test]
+    fn set_source_element_type_covers_maps_and_stores() {
+        assert!(
+            matches!(
+                set_source_element_type(&Ty::Map(Box::new(int_ty()), Box::new(string_ty()))),
+                Ty::Tuple(columns)
+                    if matches!(columns.as_slice(), [
+                        Ty::Builtin(BuiltinTy::Int),
+                        Ty::Builtin(BuiltinTy::String)
+                    ])
+            ),
+            "map sources should bind key/value tuples"
+        );
+        assert!(
+            matches!(
+                set_source_element_type(&Ty::Store("Order".to_owned())),
+                Ty::Entity(name) if name == "Order"
+            ),
+            "store sources should bind entity instances"
+        );
+    }
+
+    #[test]
+    fn relation_helpers_preserve_columns_and_reject_empty_relations() {
+        assert!(
+            matches!(
+                relation_columns(&Ty::Relation(vec![int_ty(), string_ty()])),
+                Some(columns)
+                    if matches!(columns.as_slice(), [
+                        Ty::Builtin(BuiltinTy::Int),
+                        Ty::Builtin(BuiltinTy::String)
+                    ])
+            ),
+            "relation columns should be returned directly"
+        );
+        assert!(
+            matches!(relation_type_from_columns(vec![]), Ty::Error),
+            "empty relation column list should be poison"
+        );
+    }
+
+    #[test]
+    fn relation_set_op_type_accepts_only_matching_relation_shapes() {
+        let left = var("left", Ty::Relation(vec![int_ty(), string_ty()]));
+        let right = var("right", Ty::Relation(vec![int_ty(), string_ty()]));
+        let wrong_len = var("wrong_len", Ty::Relation(vec![int_ty()]));
+        let wrong_type = var("wrong_type", Ty::Relation(vec![string_ty(), string_ty()]));
+
+        assert!(
+            matches!(
+                infer_relation_set_op_type(BinOp::Add, &left, &right),
+                Some(Ty::Relation(columns))
+                    if matches!(columns.as_slice(), [
+                        Ty::Builtin(BuiltinTy::Int),
+                        Ty::Builtin(BuiltinTy::String)
+                    ])
+            ),
+            "relation union-style ops should preserve matching relation shape"
+        );
+        assert!(
+            matches!(infer_relation_set_op_type(BinOp::Eq, &left, &right), None),
+            "non relation-set operators should not infer a relation set op type"
+        );
+        assert!(
+            matches!(
+                infer_relation_set_op_type(BinOp::Add, &left, &wrong_len),
+                Some(Ty::Error)
+            ),
+            "different relation arity should be poison"
+        );
+        assert!(
+            matches!(
+                infer_relation_set_op_type(BinOp::Add, &left, &wrong_type),
+                Some(Ty::Error)
+            ),
+            "different relation column types should be poison"
+        );
+    }
+
+    #[test]
+    fn relation_project_indices_reject_negative_indices() {
+        assert_eq!(
+            relation_project_indices(&[lit_int(0), lit_int(2)]),
+            Some(vec![0, 2])
+        );
+        assert_eq!(
+            relation_project_indices(&[lit_int(-1)]),
+            None,
+            "negative projection indices should be rejected"
+        );
+    }
+
+    #[test]
+    fn relation_ty_same_compares_nominal_and_container_types_structurally() {
+        assert!(ty_same(
+            &Ty::Enum("Status".to_owned(), vec![]),
+            &Ty::Named("Status".to_owned())
+        ));
+        assert!(!ty_same(
+            &Ty::Enum("Status".to_owned(), vec![]),
+            &Ty::Named("Outcome".to_owned())
+        ));
+        assert!(ty_same(
+            &Ty::Entity("Order".to_owned()),
+            &Ty::Named("Order".to_owned())
+        ));
+        assert!(!ty_same(
+            &Ty::Entity("Order".to_owned()),
+            &Ty::Named("Customer".to_owned())
+        ));
+        assert!(ty_same(
+            &Ty::Set(Box::new(int_ty())),
+            &Ty::Set(Box::new(int_ty()))
+        ));
+        assert!(!ty_same(
+            &Ty::Set(Box::new(int_ty())),
+            &Ty::Set(Box::new(string_ty()))
+        ));
+        assert!(ty_same(
+            &Ty::Seq(Box::new(int_ty())),
+            &Ty::Seq(Box::new(int_ty()))
+        ));
+        assert!(!ty_same(
+            &Ty::Seq(Box::new(int_ty())),
+            &Ty::Seq(Box::new(string_ty()))
+        ));
+        assert!(ty_same(
+            &Ty::Map(Box::new(int_ty()), Box::new(string_ty())),
+            &Ty::Map(Box::new(int_ty()), Box::new(string_ty()))
+        ));
+        assert!(!ty_same(
+            &Ty::Map(Box::new(int_ty()), Box::new(string_ty())),
+            &Ty::Map(Box::new(string_ty()), Box::new(string_ty()))
+        ));
+        assert!(!ty_same(
+            &Ty::Map(Box::new(int_ty()), Box::new(string_ty())),
+            &Ty::Map(Box::new(int_ty()), Box::new(int_ty()))
+        ));
+        assert!(ty_same(
+            &Ty::Store("Order".to_owned()),
+            &Ty::Store("Order".to_owned())
+        ));
+        assert!(!ty_same(
+            &Ty::Store("Order".to_owned()),
+            &Ty::Store("Customer".to_owned())
+        ));
+        assert!(ty_same(
+            &Ty::Relation(vec![int_ty(), string_ty()]),
+            &Ty::Relation(vec![int_ty(), string_ty()])
+        ));
+        assert!(!ty_same(
+            &Ty::Relation(vec![int_ty(), string_ty()]),
+            &Ty::Relation(vec![int_ty(), int_ty()])
+        ));
+        assert!(!ty_same(
+            &Ty::Relation(vec![int_ty(), string_ty()]),
+            &Ty::Relation(vec![int_ty()])
+        ));
+        assert!(ty_same(
+            &Ty::Tuple(vec![int_ty(), string_ty()]),
+            &Ty::Tuple(vec![int_ty(), string_ty()])
+        ));
+        assert!(!ty_same(
+            &Ty::Tuple(vec![int_ty(), string_ty()]),
+            &Ty::Tuple(vec![int_ty()])
+        ));
+        assert!(ty_same(
+            &Ty::Alias("Alias".to_owned(), Box::new(int_ty())),
+            &int_ty()
+        ));
+        assert!(ty_same(
+            &Ty::Refinement(Box::new(int_ty()), Box::new(lit_int(1))),
+            &int_ty()
+        ));
+        assert!(ty_same(&Ty::Error, &Ty::Store("Order".to_owned())));
+    }
+
+    #[test]
+    fn infer_numeric_binop_type_promotes_real_and_float_operands() {
+        assert!(
+            matches!(
+                infer_numeric_binop_type(BinOp::Add, &Ty::Builtin(BuiltinTy::Float), &int_ty()),
+                Some(Ty::Builtin(BuiltinTy::Float))
+            ),
+            "float arithmetic should promote to float"
+        );
+        assert!(
+            matches!(
+                infer_numeric_binop_type(BinOp::Sub, &int_ty(), &Ty::Builtin(BuiltinTy::Real)),
+                Some(Ty::Builtin(BuiltinTy::Real))
+            ),
+            "real arithmetic should promote int/real to real"
+        );
+    }
+
+    #[test]
+    fn infer_index_type_returns_map_value_type() {
+        assert!(
+            matches!(
+                infer_index_type(&var(
+                    "m",
+                    Ty::Map(Box::new(int_ty()), Box::new(string_ty()))
+                )),
+                Ty::Builtin(BuiltinTy::String)
+            ),
+            "map indexing should return the value type"
+        );
+        assert!(
+            matches!(
+                infer_index_type(&var("xs", Ty::Seq(Box::new(int_ty())))),
+                Ty::Builtin(BuiltinTy::Int)
+            ),
+            "sequence indexing should return the element type"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_infers_real_and_float_aggregate_result_types() {
+        let ctx = ctx_with_status_types();
+        let bound = HashMap::new();
+
+        for (body_ty, expected) in [
+            (Ty::Builtin(BuiltinTy::Real), Ty::Builtin(BuiltinTy::Real)),
+            (Ty::Builtin(BuiltinTy::Float), Ty::Builtin(BuiltinTy::Float)),
+        ] {
+            let resolved = resolve_expr(
+                &ctx,
+                &bound,
+                &EExpr::Aggregate(
+                    Ty::Error,
+                    crate::ast::AggKind::Sum,
+                    "x".to_owned(),
+                    body_ty.clone(),
+                    Box::new(var("x", body_ty)),
+                    None,
+                    None,
+                ),
+            );
+            assert!(
+                matches!(
+                    (resolved.ty(), expected),
+                    (Ty::Builtin(actual), Ty::Builtin(expected)) if actual == expected
+                ),
+                "aggregate result type should follow numeric body type, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_expr_disambiguates_ctor_records_by_variant_field_names() {
+        let mut env = Env::new();
+        env.types.insert(
+            "PaymentResult".to_owned(),
+            Ty::Enum("PaymentResult".to_owned(), vec!["Done".to_owned()]),
+        );
+        env.types.insert(
+            "ShippingResult".to_owned(),
+            Ty::Enum("ShippingResult".to_owned(), vec!["Done".to_owned()]),
+        );
+        env.variant_fields.insert(
+            "PaymentResult".to_owned(),
+            vec![(
+                "Done".to_owned(),
+                vec![("receipt".to_owned(), Ty::Builtin(BuiltinTy::String))],
+            )],
+        );
+        env.variant_fields.insert(
+            "ShippingResult".to_owned(),
+            vec![(
+                "Done".to_owned(),
+                vec![("tracking".to_owned(), Ty::Builtin(BuiltinTy::String))],
+            )],
+        );
+        let ctx = Ctx::from_env(&env);
+
+        let resolved = resolve_expr(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::CtorRecord(
+                Ty::Named("Done".to_owned()),
+                None,
+                "Done".to_owned(),
+                vec![(
+                    "receipt".to_owned(),
+                    EExpr::Lit(
+                        Ty::Builtin(BuiltinTy::String),
+                        Literal::Str("r-1".to_owned()),
+                        None,
+                    ),
+                )],
+                None,
+            ),
+        );
+
+        assert!(
+            matches!(resolved.ty(), Ty::Enum(name, _) if name == "PaymentResult"),
+            "constructor record should resolve by matching field names, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_preserves_noncanonical_saw_paths_with_scope_segments() {
+        let mut env = Env::new();
+        env.aliases.insert(
+            "Gateway::authorize".to_owned(),
+            "Canonical::authorize".to_owned(),
+        );
+        let ctx = Ctx::from_env(&env);
+
+        let resolved = resolve_expr(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::Saw(
+                bool_ty(),
+                "Gateway::authorize".to_owned(),
+                "called".to_owned(),
+                vec![],
+                None,
+            ),
+        );
+
+        assert!(
+            matches!(&resolved, EExpr::Saw(_, sys, _, _, _) if sys == "Gateway::authorize"),
+            "multi-segment saw paths should be preserved for validation, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_comparison_ctor_from_context_respects_scope_and_constructor_membership() {
+        let ctx = ctx_with_status_types();
+        let expected = Ty::Enum(
+            "Status".to_owned(),
+            vec!["Open".to_owned(), "Closed".to_owned()],
+        );
+
+        let resolved =
+            resolve_comparison_ctor_from_context(&ctx, var("Open", Ty::Error), &expected);
+        assert!(
+            matches!(resolved, EExpr::Var(Ty::Enum(name, _), ctor, _) if name == "Status" && ctor == "Open"),
+            "unqualified constructor should resolve when it belongs to expected enum"
+        );
+
+        let resolved = resolve_comparison_ctor_from_context(
+            &ctx,
+            EExpr::Qual(Ty::Error, "Status".to_owned(), "Open".to_owned(), None),
+            &expected,
+        );
+        assert!(
+            matches!(resolved, EExpr::Qual(Ty::Enum(name, _), scope, ctor, _) if name == "Status" && scope == "Status" && ctor == "Open"),
+            "qualified constructor should resolve when scope and constructor match"
+        );
+
+        let wrong_scope = resolve_comparison_ctor_from_context(
+            &ctx,
+            EExpr::Qual(Ty::Error, "Outcome".to_owned(), "Open".to_owned(), None),
+            &expected,
+        );
+        assert!(
+            matches!(wrong_scope, EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Outcome" && ctor == "Open"),
+            "wrong enum scope must not be coerced to expected enum"
+        );
+
+        let wrong_qualified_ctor = resolve_comparison_ctor_from_context(
+            &ctx,
+            EExpr::Qual(Ty::Error, "Status".to_owned(), "Missing".to_owned(), None),
+            &expected,
+        );
+        assert!(
+            matches!(wrong_qualified_ctor, EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Status" && ctor == "Missing"),
+            "qualified constructors outside the expected enum must not be coerced"
+        );
+
+        let wrong_ctor =
+            resolve_comparison_ctor_from_context(&ctx, var("Missing", Ty::Error), &expected);
+        assert!(
+            matches!(wrong_ctor, EExpr::Var(Ty::Error, ctor, _) if ctor == "Missing"),
+            "unknown constructor must not be coerced to expected enum"
+        );
+    }
+
+    #[test]
+    fn resolve_ctor_type_from_context_patches_only_matching_error_typed_constructors() {
+        let status_ty = Ty::Enum(
+            "Status".to_owned(),
+            vec!["Open".to_owned(), "Closed".to_owned()],
+        );
+
+        let mut ctor_var = var("Open", Ty::Error);
+        resolve_ctor_type_from_context(&mut ctor_var, &status_ty);
+        assert!(
+            matches!(ctor_var, EExpr::Var(Ty::Enum(name, _), ctor, _) if name == "Status" && ctor == "Open"),
+            "matching error-typed constructor var should be patched"
+        );
+
+        let mut wrong_var = var("Missing", Ty::Error);
+        resolve_ctor_type_from_context(&mut wrong_var, &status_ty);
+        assert!(
+            matches!(wrong_var, EExpr::Var(Ty::Error, ctor, _) if ctor == "Missing"),
+            "non-member constructor var should not be patched"
+        );
+
+        let mut already_typed = var("Open", Ty::Builtin(BuiltinTy::String));
+        resolve_ctor_type_from_context(&mut already_typed, &status_ty);
+        assert!(
+            matches!(already_typed, EExpr::Var(Ty::Builtin(BuiltinTy::String), ctor, _) if ctor == "Open"),
+            "already typed constructor vars should not be overwritten"
+        );
+
+        let mut ctor_call =
+            EExpr::Call(Ty::Error, Box::new(var("Closed", Ty::Error)), vec![], None);
+        resolve_ctor_type_from_context(&mut ctor_call, &status_ty);
+        assert!(
+            matches!(
+                ctor_call,
+                EExpr::Call(Ty::Enum(ref call_ty, _), ref callee, _, _)
+                    if call_ty == "Status"
+                        && matches!(callee.as_ref(), EExpr::Var(Ty::Enum(name, _), ctor, _) if name == "Status" && ctor == "Closed")
+            ),
+            "matching constructor calls should patch both call and callee types"
+        );
+
+        let mut wrong_call =
+            EExpr::Call(Ty::Error, Box::new(var("Missing", Ty::Error)), vec![], None);
+        resolve_ctor_type_from_context(&mut wrong_call, &status_ty);
+        assert!(
+            matches!(
+                wrong_call,
+                EExpr::Call(Ty::Error, ref callee, _, _)
+                    if matches!(callee.as_ref(), EExpr::Var(Ty::Error, ctor, _) if ctor == "Missing")
+            ),
+            "non-member constructor calls should remain unresolved"
+        );
+
+        let mut already_typed_call = EExpr::Call(
+            Ty::Builtin(BuiltinTy::String),
+            Box::new(var("Closed", Ty::Error)),
+            vec![],
+            None,
+        );
+        resolve_ctor_type_from_context(&mut already_typed_call, &status_ty);
+        assert!(
+            matches!(
+                already_typed_call,
+                EExpr::Call(Ty::Builtin(BuiltinTy::String), ref callee, _, _)
+                    if matches!(callee.as_ref(), EExpr::Var(Ty::Error, ctor, _) if ctor == "Closed")
+            ),
+            "already typed constructor calls should not be overwritten"
+        );
+
+        let mut ctor_record = EExpr::CtorRecord(Ty::Error, None, "Open".to_owned(), vec![], None);
+        resolve_ctor_type_from_context(&mut ctor_record, &status_ty);
+        assert!(
+            matches!(ctor_record, EExpr::CtorRecord(Ty::Enum(name, _), _, ctor, _, _) if name == "Status" && ctor == "Open"),
+            "matching record constructors should be patched"
+        );
+
+        let mut wrong_record =
+            EExpr::CtorRecord(Ty::Error, None, "Missing".to_owned(), vec![], None);
+        resolve_ctor_type_from_context(&mut wrong_record, &status_ty);
+        assert!(
+            matches!(wrong_record, EExpr::CtorRecord(Ty::Error, _, ctor, _, _) if ctor == "Missing"),
+            "non-member record constructors should remain unresolved"
+        );
+    }
 }

@@ -1,0 +1,3 @@
+profile = "mutants"
+gitignore = true
+copy_vcs = false

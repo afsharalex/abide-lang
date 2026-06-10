@@ -446,3 +446,294 @@ fn check_assignment(entity: &EEntity, action: &EAction, ctx: &str, expr: &EExpr)
     }
     Vec::new()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{EFieldDefault, EInvariant, Literal};
+
+    fn int_lit(value: i64) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(value), None)
+    }
+
+    fn bool_lit(value: bool) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(value), None)
+    }
+
+    fn var(ty: Ty, name: &str) -> EExpr {
+        EExpr::Var(ty, name.to_string(), None)
+    }
+
+    fn field(name: &str, ty: Ty, default: Option<EFieldDefault>) -> EField {
+        EField {
+            name: name.to_string(),
+            ty,
+            default,
+            span: Some(crate::span::Span { start: 1, end: 2 }),
+        }
+    }
+
+    fn action(requires: Vec<EExpr>, body: Vec<EExpr>) -> EAction {
+        EAction {
+            name: "advance".to_string(),
+            refs: vec![],
+            params: vec![],
+            requires,
+            ensures: vec![],
+            body,
+            span: Some(crate::span::Span { start: 3, end: 4 }),
+        }
+    }
+
+    fn entity(fields: Vec<EField>, actions: Vec<EAction>, invariants: Vec<EInvariant>) -> EEntity {
+        EEntity {
+            name: "Ticket".to_string(),
+            fields,
+            actions,
+            derived_fields: vec![],
+            invariants,
+            fsm_decls: vec![],
+            span: None,
+        }
+    }
+
+    fn enum_ty() -> Ty {
+        Ty::Enum(
+            "Status".to_string(),
+            vec!["Open".to_string(), "Closed".to_string()],
+        )
+    }
+
+    fn invalid_assignment(field_name: &str) -> EExpr {
+        EExpr::Assign(
+            Ty::Error,
+            Box::new(EExpr::Prime(
+                Ty::Error,
+                Box::new(var(Ty::Error, field_name)),
+                None,
+            )),
+            Box::new(var(Ty::Error, "Closed")),
+            None,
+        )
+    }
+
+    #[test]
+    fn invariant_checker_rejects_liveness_and_recurses_into_liveness_operands() {
+        let expr = EExpr::Eventually(
+            Ty::Builtin(BuiltinTy::Bool),
+            Box::new(EExpr::Until(
+                Ty::Builtin(BuiltinTy::Bool),
+                Box::new(EExpr::Previously(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    Box::new(bool_lit(true)),
+                    None,
+                )),
+                Box::new(EExpr::Since(
+                    Ty::Builtin(BuiltinTy::Bool),
+                    Box::new(bool_lit(true)),
+                    Box::new(bool_lit(false)),
+                    None,
+                )),
+                None,
+            )),
+            None,
+        );
+        let mut errors = Vec::new();
+        check_invariant_body_no_liveness(&expr, &mut errors);
+        assert_eq!(errors.len(), 4);
+        for kind in ["eventually", "until", "previously", "since"] {
+            assert!(
+                errors.iter().any(|error| error.message.contains(kind)),
+                "expected invariant liveness error for {kind}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_checker_validates_value_in_and_where_defaults() {
+        assert!(check_field(
+            "Ticket",
+            &field(
+                "status",
+                enum_ty(),
+                Some(EFieldDefault::Value(var(Ty::Error, "Open")))
+            )
+        )
+        .is_empty());
+        assert!(check_field(
+            "Ticket",
+            &field(
+                "amount",
+                Ty::Builtin(BuiltinTy::Real),
+                Some(EFieldDefault::Value(int_lit(1)))
+            )
+        )
+        .is_empty());
+        assert!(check_field(
+            "Ticket",
+            &field(
+                "status",
+                enum_ty(),
+                Some(EFieldDefault::In(vec![var(Ty::Error, "Open")]))
+            )
+        )
+        .is_empty());
+        assert!(check_field(
+            "Ticket",
+            &field(
+                "amount",
+                Ty::Builtin(BuiltinTy::Int),
+                Some(EFieldDefault::In(vec![int_lit(1), int_lit(2)]))
+            )
+        )
+        .is_empty());
+        assert!(check_field(
+            "Ticket",
+            &field(
+                "amount",
+                Ty::Builtin(BuiltinTy::Int),
+                Some(EFieldDefault::Where(bool_lit(true)))
+            )
+        )
+        .is_empty());
+
+        let bad_enum = check_field(
+            "Ticket",
+            &field(
+                "status",
+                enum_ty(),
+                Some(EFieldDefault::Value(var(Ty::Error, "Missing"))),
+            ),
+        );
+        assert_eq!(bad_enum.len(), 1);
+        assert!(bad_enum[0].message.contains("not a constructor"));
+
+        let bad_enum_literal = check_field(
+            "Ticket",
+            &field("status", enum_ty(), Some(EFieldDefault::Value(int_lit(1)))),
+        );
+        assert_eq!(bad_enum_literal.len(), 1);
+        assert!(bad_enum_literal[0]
+            .message
+            .contains("must be a constructor"));
+
+        let bad_in_enum = check_field(
+            "Ticket",
+            &field(
+                "status",
+                enum_ty(),
+                Some(EFieldDefault::In(vec![
+                    var(Ty::Error, "Missing"),
+                    int_lit(1),
+                ])),
+            ),
+        );
+        assert_eq!(bad_in_enum.len(), 2);
+
+        let bad_builtin = check_field(
+            "Ticket",
+            &field(
+                "flag",
+                Ty::Builtin(BuiltinTy::Bool),
+                Some(EFieldDefault::Value(int_lit(1))),
+            ),
+        );
+        assert_eq!(bad_builtin.len(), 1);
+        assert!(bad_builtin[0]
+            .message
+            .contains("default value has type int"));
+
+        let bad_in_builtin = check_field(
+            "Ticket",
+            &field(
+                "count",
+                Ty::Builtin(BuiltinTy::Int),
+                Some(EFieldDefault::In(vec![int_lit(1), bool_lit(false)])),
+            ),
+        );
+        assert_eq!(bad_in_builtin.len(), 1);
+        assert!(bad_in_builtin[0]
+            .message
+            .contains("`in` value has type bool"));
+
+        let bad_where = check_field(
+            "Ticket",
+            &field(
+                "count",
+                Ty::Builtin(BuiltinTy::Int),
+                Some(EFieldDefault::Where(int_lit(1))),
+            ),
+        );
+        assert_eq!(bad_where.len(), 1);
+        assert!(bad_where[0].message.contains("where"));
+    }
+
+    #[test]
+    fn action_checker_validates_boolean_requires_and_primed_field_targets() {
+        let ticket = entity(
+            vec![
+                field("status", enum_ty(), None),
+                field("count", Ty::Builtin(BuiltinTy::Int), None),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(check_action(&ticket, &action(vec![bool_lit(true)], vec![]), &[]).is_empty());
+
+        let errors = check_action(
+            &ticket,
+            &action(vec![int_lit(1)], vec![invalid_assignment("statsu")]),
+            &["Status".to_string(), "Closed".to_string()],
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .any(|error| error.message == crate::messages::MSG_REQUIRES_SHOULD_BE_BOOL));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("is not a field")));
+
+        assert!(check_action(
+            &ticket,
+            &action(vec![bool_lit(true)], vec![invalid_assignment("status")]),
+            &[],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn entity_checker_aggregates_field_action_and_invariant_errors() {
+        let invariant = EInvariant {
+            name: "eventual_close".to_string(),
+            body: EExpr::Eventually(Ty::Builtin(BuiltinTy::Bool), Box::new(bool_lit(true)), None),
+            span: None,
+        };
+        let ticket = entity(
+            vec![field(
+                "status",
+                enum_ty(),
+                Some(EFieldDefault::Value(var(Ty::Error, "Missing"))),
+            )],
+            vec![action(
+                vec![int_lit(1)],
+                vec![invalid_assignment("missing")],
+            )],
+            vec![invariant],
+        );
+
+        let errors = check_entity(&ticket, &["Closed".to_string()]);
+        assert_eq!(errors.len(), 4);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("not a constructor")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message == crate::messages::MSG_REQUIRES_SHOULD_BE_BOOL));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("not a field")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("eventually")));
+    }
+}

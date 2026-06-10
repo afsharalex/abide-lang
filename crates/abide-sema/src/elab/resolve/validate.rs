@@ -1493,7 +1493,9 @@ fn rewrite_named_types_to_error(env: &mut Env) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::elab::types::{BinOp, Literal};
+    use crate::ast::Visibility;
+    use crate::elab::types::{BinOp, ESystem, ESystemAction, GenericTypeDef, Literal};
+    use crate::span::Span;
 
     fn int_ty() -> Ty {
         Ty::Builtin(BuiltinTy::Int)
@@ -1513,6 +1515,52 @@ mod tests {
 
     fn lit_bool(value: bool) -> EExpr {
         EExpr::Lit(bool_ty(), Literal::Bool(value), None)
+    }
+
+    fn generic_def(name: &str, type_params: &[&str]) -> GenericTypeDef {
+        GenericTypeDef {
+            name: name.to_owned(),
+            type_params: type_params
+                .iter()
+                .map(|param| (*param).to_owned())
+                .collect(),
+            variant_names: vec!["Some".to_owned()],
+            variant_fields: vec![(
+                "Some".to_owned(),
+                vec![("value".to_owned(), Ty::Named("T".to_owned()))],
+            )],
+            visibility: Visibility::Private,
+            span: Span { start: 0, end: 0 },
+        }
+    }
+
+    fn empty_system_with_action(body: Vec<EEventAction>) -> ESystem {
+        ESystem {
+            name: "App".to_owned(),
+            implements: None,
+            deps: vec![],
+            fields: vec![],
+            store_params: vec![],
+            scopes: vec![],
+            commands: vec![],
+            actions: vec![ESystemAction {
+                name: "step".to_owned(),
+                params: vec![],
+                requires: vec![],
+                body,
+                return_expr: None,
+                span: None,
+            }],
+            queries: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+            proc_uses: vec![],
+            span: None,
+        }
     }
 
     fn collected_param_names(expr: &EExpr) -> Vec<String> {
@@ -1565,6 +1613,67 @@ mod tests {
                 "expected to collect {expected}, got {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_remaining_type_params_reports_wrong_arity_from_event_actions() {
+        let mut env = Env::new();
+        env.generic_types
+            .insert("Option".to_owned(), generic_def("Option", &["T"]));
+        env.systems.insert(
+            "App".to_owned(),
+            empty_system_with_action(vec![EEventAction::Choose(
+                "item".to_owned(),
+                Ty::Param("Option".to_owned(), vec![int_ty(), bool_ty()]),
+                lit_bool(true),
+                vec![EEventAction::Expr(var_with_ty(
+                    "x",
+                    Ty::Param("Option".to_owned(), vec![int_ty(), bool_ty()]),
+                ))],
+            )]),
+        );
+
+        validate_remaining_type_params(&mut env);
+
+        assert_eq!(
+            env.errors
+                .iter()
+                .filter(|error| error.message.contains("expects 1 type argument(s)")
+                    && error.message.contains("2 were provided"))
+                .count(),
+            1,
+            "wrong arity should be reported and deduplicated, got {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn validate_unresolved_types_reports_and_rewrites_surviving_named_types() {
+        let mut env = Env::new();
+        env.types.insert(
+            "Alias".to_owned(),
+            Ty::Set(Box::new(Ty::Named("Missing".to_owned()))),
+        );
+
+        validate_unresolved_types(&mut env);
+
+        assert!(
+            env.errors
+                .iter()
+                .any(|error| error.message == "unknown type `Missing`"),
+            "expected unknown type diagnostic, got {:?}",
+            env.errors
+        );
+        let Some(Ty::Set(inner)) = env.types.get("Alias") else {
+            panic!(
+                "expected Alias to remain a set, got {:?}",
+                env.types.get("Alias")
+            );
+        };
+        assert!(
+            matches!(inner.as_ref(), Ty::Error),
+            "unresolved named type should be rewritten to poison, got {inner:?}"
+        );
     }
 
     #[test]

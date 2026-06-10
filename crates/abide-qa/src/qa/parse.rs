@@ -166,7 +166,12 @@ pub fn embedded_abide_blocks(input: &str) -> Result<Vec<QAEmbeddedAbideBlock>, Q
             continue;
         }
 
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if trimmed.is_empty() {
+            line_start += line.len() + 1;
+            continue;
+        }
+
+        if trimmed.starts_with("//") {
             line_start += line.len() + 1;
             continue;
         }
@@ -265,7 +270,12 @@ pub fn parse_qa(input: &str) -> Result<Vec<QAStatement>, QAParseError> {
         }
 
         // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if trimmed.is_empty() {
+            line_start += line.len() + 1;
+            continue;
+        }
+
+        if trimmed.starts_with("//") {
             line_start += line.len() + 1;
             continue;
         }
@@ -388,30 +398,16 @@ fn parse_statement_at(
 
 fn parse_simulate(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
     let mut request = SimulationRequest::default();
-    let mut index = 0usize;
-    while index < tokens.len() {
-        match tokens[index].text {
+    let mut pairs = tokens.chunks_exact(2);
+
+    for pair in &mut pairs {
+        let option = pair[0];
+        let value = pair[1];
+        match option.text {
             "--steps" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "simulate --steps requires a value",
-                        line,
-                        tokens[index].span,
-                        Some("provide a non-negative integer after `--steps`"),
-                    )
-                })?;
-                request.steps = parse_usize(value, "step count", line)?;
-                index += 2;
+                request.steps = parse_usize(&value, "step count", line)?;
             }
             "--seed" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "simulate --seed requires a value",
-                        line,
-                        tokens[index].span,
-                        Some("provide a non-negative integer after `--seed`"),
-                    )
-                })?;
                 request.seed = value.text.parse::<u64>().map_err(|_| {
                     general_error(
                         format!("invalid simulation seed '{}'", value.text),
@@ -420,29 +416,11 @@ fn parse_simulate(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QA
                         Some("simulation seeds must be non-negative integers"),
                     )
                 })?;
-                index += 2;
             }
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "simulate --slots requires a value",
-                        line,
-                        tokens[index].span,
-                        Some("provide a non-negative integer after `--slots`"),
-                    )
-                })?;
-                request.slots = parse_usize(value, "slot count", line)?;
-                index += 2;
+                request.slots = parse_usize(&value, "slot count", line)?;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "simulate --scope requires Entity=N",
-                        line,
-                        tokens[index].span,
-                        Some("write scopes as `--scope Entity=N`"),
-                    )
-                })?;
                 let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
                     expected_error(
                         format!(
@@ -469,25 +447,15 @@ fn parse_simulate(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QA
                     entity.trim().to_owned(),
                     parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
-                index += 2;
             }
             "--system" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "simulate --system requires a system name",
-                        line,
-                        tokens[index].span,
-                        Some("provide a system name after `--system`"),
-                    )
-                })?;
                 request.system = Some(value.text.to_owned());
-                index += 2;
             }
             other => {
                 return Err(expected_error(
                     format!("unknown simulate option '{other}'"),
                     line,
-                    tokens[index].span,
+                    option.span,
                     Some(
                         "expected one of `--steps`, `--seed`, `--slots`, `--scope`, or `--system`",
                     ),
@@ -495,47 +463,66 @@ fn parse_simulate(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QA
             }
         }
     }
+
+    if let Some(option) = pairs.remainder().first() {
+        return Err(match option.text {
+            "--steps" => expected_error(
+                "simulate --steps requires a value",
+                line,
+                option.span,
+                Some("provide a non-negative integer after `--steps`"),
+            ),
+            "--seed" => expected_error(
+                "simulate --seed requires a value",
+                line,
+                option.span,
+                Some("provide a non-negative integer after `--seed`"),
+            ),
+            "--slots" => expected_error(
+                "simulate --slots requires a value",
+                line,
+                option.span,
+                Some("provide a non-negative integer after `--slots`"),
+            ),
+            "--scope" => expected_error(
+                "simulate --scope requires Entity=N",
+                line,
+                option.span,
+                Some("write scopes as `--scope Entity=N`"),
+            ),
+            "--system" => expected_error(
+                "simulate --system requires a system name",
+                line,
+                option.span,
+                Some("provide a system name after `--system`"),
+            ),
+            other => expected_error(
+                format!("unknown simulate option '{other}'"),
+                line,
+                option.span,
+                Some("expected one of `--steps`, `--seed`, `--slots`, `--scope`, or `--system`"),
+            ),
+        });
+    }
+
     Ok(QAStatement::Simulate(request))
 }
 
 fn parse_explore(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAParseError> {
     let mut request = StateSpaceRequest::default();
-    let mut index = 0usize;
-    while index < tokens.len() {
-        match tokens[index].text {
+    let mut pairs = tokens.chunks_exact(2);
+
+    for pair in &mut pairs {
+        let option = pair[0];
+        let value = pair[1];
+        match option.text {
             "--depth" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "explore --depth requires a value",
-                        line,
-                        tokens[index].span,
-                        Some("provide a non-negative integer after `--depth`"),
-                    )
-                })?;
-                request.depth = Some(parse_usize(value, "exploration depth", line)?);
-                index += 2;
+                request.depth = Some(parse_usize(&value, "exploration depth", line)?);
             }
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "explore --slots requires a value",
-                        line,
-                        tokens[index].span,
-                        Some("provide a non-negative integer after `--slots`"),
-                    )
-                })?;
-                request.slots = parse_usize(value, "slot count", line)?;
-                index += 2;
+                request.slots = parse_usize(&value, "slot count", line)?;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "explore --scope requires Entity=N",
-                        line,
-                        tokens[index].span,
-                        Some("write scopes as `--scope Entity=N`"),
-                    )
-                })?;
                 let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
                     expected_error(
                         format!("invalid explore scope '{}', expected Entity=N", value.text),
@@ -559,30 +546,56 @@ fn parse_explore(tokens: &[QAToken<'_>], line: usize) -> Result<QAStatement, QAP
                     entity.trim().to_owned(),
                     parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
-                index += 2;
             }
             "--system" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
-                        "explore --system requires a system name",
-                        line,
-                        tokens[index].span,
-                        Some("provide a system name after `--system`"),
-                    )
-                })?;
                 request.system = Some(value.text.to_owned());
-                index += 2;
             }
             other => {
                 return Err(expected_error(
                     format!("unknown explore option '{other}'"),
                     line,
-                    tokens[index].span,
+                    option.span,
                     Some("expected one of `--depth`, `--slots`, `--scope`, or `--system`"),
                 ));
             }
         }
     }
+
+    if let Some(option) = pairs.remainder().first() {
+        return Err(match option.text {
+            "--depth" => expected_error(
+                "explore --depth requires a value",
+                line,
+                option.span,
+                Some("provide a non-negative integer after `--depth`"),
+            ),
+            "--slots" => expected_error(
+                "explore --slots requires a value",
+                line,
+                option.span,
+                Some("provide a non-negative integer after `--slots`"),
+            ),
+            "--scope" => expected_error(
+                "explore --scope requires Entity=N",
+                line,
+                option.span,
+                Some("write scopes as `--scope Entity=N`"),
+            ),
+            "--system" => expected_error(
+                "explore --system requires a system name",
+                line,
+                option.span,
+                Some("provide a system name after `--system`"),
+            ),
+            other => expected_error(
+                format!("unknown explore option '{other}'"),
+                line,
+                option.span,
+                Some("expected one of `--depth`, `--slots`, `--scope`, or `--system`"),
+            ),
+        });
+    }
+
     Ok(QAStatement::Explore(request))
 }
 
@@ -831,12 +844,12 @@ fn parse_temporal_query(
     }
 
     let mut bounds = TemporalBounds::default();
-    let mut index = 0usize;
-    while index < tokens.len() {
-        match tokens[index].text {
+    let mut rest = tokens;
+    while let Some((option, tail)) = rest.split_first() {
+        match option.text {
             "--slots" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
+                let Some((value, after_value)) = tail.split_first() else {
+                    return Err(expected_error(
                         format!(
                             "{} --slots requires a value",
                             match op {
@@ -845,16 +858,16 @@ fn parse_temporal_query(
                             }
                         ),
                         line,
-                        tokens[index].span,
+                        option.span,
                         Some("provide a non-negative integer after `--slots`"),
-                    )
-                })?;
+                    ));
+                };
                 bounds.slots = Some(parse_usize(value, "slot count", line)?);
-                index += 2;
+                rest = after_value;
             }
             "--scope" => {
-                let value = tokens.get(index + 1).ok_or_else(|| {
-                    expected_error(
+                let Some((value, after_value)) = tail.split_first() else {
+                    return Err(expected_error(
                         format!(
                             "{} --scope requires Entity=N",
                             match op {
@@ -863,10 +876,10 @@ fn parse_temporal_query(
                             }
                         ),
                         line,
-                        tokens[index].span,
+                        option.span,
                         Some("write scopes as `--scope Entity=N`"),
-                    )
-                })?;
+                    ));
+                };
                 let (entity, slots) = value.text.split_once('=').ok_or_else(|| {
                     expected_error(
                         format!("invalid temporal scope '{}', expected Entity=N", value.text),
@@ -890,14 +903,17 @@ fn parse_temporal_query(
                     entity.trim().to_owned(),
                     parse_usize_text(slots, value.span, "scope slot count", line)?,
                 ));
-                index += 2;
+                rest = after_value;
             }
             _ => break,
         }
     }
 
-    let (target, expr_tokens) = if tokens.get(index).is_some_and(|token| token.text == "on") {
-        if tokens.len() < index + 3 {
+    let (target, expr_tokens) = if rest.first().is_some_and(|token| token.text == "on") {
+        let Some((on_token, target_and_expr)) = rest.split_first() else {
+            unreachable!("checked first token")
+        };
+        let Some((target_token, expr_tokens)) = target_and_expr.split_first() else {
             return Err(expected_error(
                 format!(
                     "expected: {} on Owner[.field] <expr>",
@@ -907,16 +923,30 @@ fn parse_temporal_query(
                     }
                 ),
                 line,
-                tokens[index].span,
+                on_token.span,
+                Some("provide a target and expression after `on`"),
+            ));
+        };
+        if expr_tokens.is_empty() {
+            return Err(expected_error(
+                format!(
+                    "expected: {} on Owner[.field] <expr>",
+                    match op {
+                        TemporalOp::Always => "always",
+                        TemporalOp::Eventually => "eventually",
+                    }
+                ),
+                line,
+                on_token.span,
                 Some("provide a target and expression after `on`"),
             ));
         }
         (
-            Some(parse_temporal_target(tokens[index + 1], line)?),
-            &tokens[index + 2..],
+            Some(parse_temporal_target(*target_token, line)?),
+            expr_tokens,
         )
     } else {
-        (None, &tokens[index..])
+        (None, rest)
     };
 
     let expr = expr_tokens
@@ -1268,31 +1298,36 @@ fn parse_block_ask(
     let mut i = 0;
 
     // Parse "for e, f, s"
-    if i < parts.len() && parts[i] == "for" {
-        i += 1;
-        while i < parts.len() && parts[i] != "where" && parts[i] != "not" && parts[i] != "select" {
-            let var = parts[i].trim_end_matches(',');
-            bindings.push(var.to_owned());
-            i += 1;
+    if parts.first().is_some_and(|part| *part == "for") {
+        let binding_parts = &parts[1..];
+        let binding_count = binding_parts
+            .iter()
+            .position(|part| matches!(*part, "where" | "not" | "select"))
+            .unwrap_or(binding_parts.len());
+        for part in &binding_parts[..binding_count] {
+            bindings.push(part.trim_end_matches(',').to_owned());
         }
+        i = 1 + binding_count;
     }
 
     // Parse "where pred(args)" and "not pred(args)"
     // Predicates may span multiple whitespace-separated tokens due to
     // args containing spaces: state(e, f, s) → ["state(e,", "f,", "s)"]
-    while i < parts.len() && (parts[i] == "where" || parts[i] == "not") {
-        let negated = parts[i] == "not";
-        i += 1; // skip "where" or "not"
-        if i >= parts.len() {
+    let mut remaining = &parts[i..];
+    while let Some((keyword, after_keyword)) = remaining
+        .split_first()
+        .filter(|(part, _)| matches!(**part, "where" | "not"))
+    {
+        let negated = *keyword == "not";
+        if after_keyword.is_empty() {
             break;
         }
         // Collect tokens until we have balanced parens
-        let mut pred_parts = vec![parts[i].to_owned()];
-        i += 1;
-        while i < parts.len() && !pred_parts.last().is_some_and(|s| s.ends_with(')')) {
-            pred_parts.push(parts[i].to_owned());
-            i += 1;
-        }
+        let predicate_len = after_keyword
+            .iter()
+            .position(|part| part.ends_with(')'))
+            .map_or(after_keyword.len(), |position| position + 1);
+        let pred_parts = &after_keyword[..predicate_len];
         let pred_str = pred_parts.join(" ");
         if let Some((name, args_str)) = pred_str.split_once('(') {
             let args_str = args_str.trim_end_matches(')');
@@ -1303,16 +1338,16 @@ fn parse_block_ask(
                 args,
             });
         }
+        remaining = &after_keyword[predicate_len..];
     }
 
     // Parse "select e, f, s"
-    if i < parts.len() && parts[i] == "select" {
-        i += 1;
-        while i < parts.len() {
-            let var = parts[i].trim_end_matches(',');
-            select.push(var.to_owned());
-            i += 1;
-        }
+    if remaining.first().is_some_and(|part| *part == "select") {
+        select.extend(
+            remaining[1..]
+                .iter()
+                .map(|part| part.trim_end_matches(',').to_owned()),
+        );
     }
 
     Ok(QAStatement::Ask(Query::Block {
@@ -1346,6 +1381,26 @@ fn strip_at(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qa_parse_error_display_includes_line_and_message() {
+        let err = parse_qa("query entities").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "qa parse error (line 1): expected 'ask', 'explain', 'assert', 'load', 'verify', 'simulate', 'explore', 'artifacts', 'show', 'draw', 'state', 'diff', or 'export', got 'query'"
+        );
+    }
+
+    #[test]
+    fn scan_qa_tokens_records_absolute_spans_for_trailing_token() {
+        let tokens = scan_qa_tokens("  ask entities", 40);
+
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].text, "ask");
+        assert_eq!(tokens[0].span, Span { start: 42, end: 45 });
+        assert_eq!(tokens[1].text, "entities");
+        assert_eq!(tokens[1].span, Span { start: 46, end: 54 });
+    }
 
     #[test]
     fn parse_load_statement() {
@@ -1406,6 +1461,21 @@ mod tests {
     }
 
     #[test]
+    fn artifact_commands_require_artifact_keyword() {
+        for source in [
+            "show thing 3",
+            "draw thing 3",
+            "state thing 3 0",
+            "diff thing 3 0 1",
+            "export thing 3 json",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert!(err.message.contains("artifact"));
+        }
+    }
+
+    #[test]
     fn parse_ask_entities() {
         let stmts = parse_qa("ask entities").unwrap();
         assert_eq!(stmts[0], QAStatement::Ask(Query::Entities));
@@ -1454,6 +1524,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_reachable_requires_arrow_and_state() {
+        for source in [
+            "ask reachable Order.status",
+            "ask reachable Order.status ->",
+            "ask reachable Order.status => Shipped",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: reachable E.field -> @State");
+        }
+    }
+
+    #[test]
     fn parse_ask_path() {
         let stmts = parse_qa("ask path Order.status @Pending -> @Shipped").unwrap();
         assert_eq!(
@@ -1465,6 +1548,19 @@ mod tests {
                 to: "Shipped".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn parse_error_path_requires_arrow_and_destination() {
+        for source in [
+            "ask path Order.status @Pending",
+            "ask path Order.status @Pending ->",
+            "ask path Order.status @Pending => @Shipped",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: path E.field @From -> @To");
+        }
     }
 
     #[test]
@@ -1580,6 +1676,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_contracts_requires_on_action() {
+        for source in ["ask contracts", "ask contracts for Order.submit"] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: contracts on E.action");
+        }
+    }
+
+    #[test]
+    fn parse_error_on_entity_queries_require_on_keyword_and_name() {
+        for source in [
+            "ask invariants",
+            "ask invariants for Order",
+            "ask fsms",
+            "ask fsms for Order",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: ... on EntityName");
+        }
+    }
+
+    #[test]
     fn parse_ask_events() {
         let stmts = parse_qa("ask events on Order.status").unwrap();
         assert_eq!(
@@ -1589,6 +1708,31 @@ mod tests {
                 field: "status".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn parse_error_events_requires_on_field() {
+        for source in ["ask events", "ask events for Order.status"] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: events on E.field");
+        }
+    }
+
+    #[test]
+    fn parse_error_transitions_requires_from_field_and_state() {
+        for source in [
+            "ask transitions",
+            "ask transitions Order.status == @Pending",
+            "ask transitions from Order.status",
+            "ask transitions from Order.status => @Pending",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert!(err
+                .message
+                .contains("expected: transitions from E.field == @State"));
+        }
     }
 
     #[test]
@@ -1603,6 +1747,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_deadlock_requires_system_name() {
+        let err = parse_qa("ask deadlock").unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(err.message, "deadlock requires a system name");
+        assert_eq!(err.help.as_deref(), Some("write `deadlock SystemName`"));
+    }
+
+    #[test]
+    fn parse_error_cross_calls_requires_from_system() {
+        for source in ["ask cross-calls", "ask cross-calls of Commerce"] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: ... from SystemName");
+        }
+    }
+
+    #[test]
     fn parse_ask_updates() {
         let stmts = parse_qa("ask updates on Order.status @Pending -> @Confirmed").unwrap();
         assert_eq!(
@@ -1614,6 +1776,20 @@ mod tests {
                 to: "Confirmed".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn parse_error_updates_requires_on_field_arrow_and_destination() {
+        for source in [
+            "ask updates",
+            "ask updates for Order.status @Pending -> @Confirmed",
+            "ask updates on Order.status @Pending",
+            "ask updates on Order.status @Pending => @Confirmed",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+            assert_eq!(err.message, "expected: updates on E.field @From -> @To");
+        }
     }
 
     // fsm-specific QA queries.
@@ -1651,6 +1827,18 @@ mod tests {
                 field: "status".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn parse_error_legacy_fsm_queries_require_expected_keywords() {
+        for source in [
+            "ask transitions of",
+            "ask terminal states",
+            "ask terminal states from Order::status",
+        ] {
+            let err = parse_qa(source).unwrap_err();
+            assert_eq!(err.code, "abide::qa::parse::expected");
+        }
     }
 
     /// The legacy `transitions from E.field == @State` and `terminal
@@ -1786,6 +1974,92 @@ explain path Order.status @Pending -> @Shipped
     }
 
     #[test]
+    fn parse_qa_single_line_abide_block_preserves_nested_body() {
+        let stmts = parse_qa("abide { entity One { status: int } }\nask entities").unwrap();
+
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(
+            stmts[0],
+            QAStatement::AbideBlock("entity One { status: int }".to_owned())
+        );
+        assert_eq!(stmts[1], QAStatement::Ask(Query::Entities));
+    }
+
+    #[test]
+    fn parse_qa_multiline_abide_block_tracks_nested_braces_and_resumes() {
+        let input = "\
+load \"commerce.ab\"
+abide {
+  entity Ticket {
+    status: int
+  }
+}
+ask entities
+";
+        let stmts = parse_qa(input).unwrap();
+
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0], QAStatement::Load("commerce.ab".to_owned()));
+        assert_eq!(
+            stmts[1],
+            QAStatement::AbideBlock("entity Ticket {\n    status: int\n  }".to_owned())
+        );
+        assert_eq!(stmts[2], QAStatement::Ask(Query::Entities));
+    }
+
+    #[test]
+    fn parse_qa_multiline_abide_block_preserves_following_statement_spans() {
+        let input = "\
+abide {
+  entity Ticket {
+    status: int
+  }
+}
+load commerce/
+";
+        let err = parse_qa(input).unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(err.span.start, input.find("commerce/").unwrap());
+        assert_eq!(
+            err.span.end,
+            input.find("commerce/").unwrap() + "commerce/".len()
+        );
+    }
+
+    #[test]
+    fn parse_qa_unclosed_single_line_abide_with_inner_block_requires_outer_close() {
+        let input = "abide { entity Ticket { status: int }\n";
+        let err = parse_qa(input).unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::unclosed_block");
+        assert_eq!(err.line, 1);
+        assert_eq!(err.span, Span { start: 0, end: 5 });
+    }
+
+    #[test]
+    fn parse_qa_unclosed_abide_block_after_skipped_lines_reports_absolute_span() {
+        let input = "\
+ask entities
+
+// ignored
+  abide {
+    entity Ticket {
+";
+        let err = parse_qa(input).unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::unclosed_block");
+        assert_eq!(err.line, 4);
+        assert_eq!(
+            err.span,
+            Span {
+                start: input.find("abide").unwrap(),
+                end: input.find("abide").unwrap() + "abide".len(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_block_query() {
         let stmts = parse_qa(
             "ask { for e, f, s where state(e, f, s) not transition(e, f, from: s) select e, f, s }",
@@ -1812,6 +2086,40 @@ explain path Order.status @Pending -> @Shipped
             }
             other => panic!("expected Block query, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_block_query_allows_bindings_without_predicates_or_select() {
+        let stmts = parse_qa("ask { for e }").unwrap();
+
+        match &stmts[0] {
+            QAStatement::Ask(Query::Block {
+                bindings,
+                predicates,
+                select,
+            }) => {
+                assert_eq!(bindings, &["e"]);
+                assert!(predicates.is_empty());
+                assert!(select.is_empty());
+            }
+            other => panic!("expected Block query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_error_block_query_without_closing_brace_spans_whole_statement() {
+        let source = "ask { for e select e";
+        let err = parse_qa(source).unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(
+            err.span,
+            Span {
+                start: 0,
+                end: source.len()
+            }
+        );
+        assert_eq!(err.help.as_deref(), Some("close the block query with `}`"));
     }
 
     #[test]
@@ -1843,6 +2151,25 @@ explain path Order.status @Pending -> @Shipped
         );
         assert_eq!(diagnostic.span, Some(err.span));
         assert_eq!(diagnostic.help.as_deref(), Some("try `ask entities`"));
+    }
+
+    #[test]
+    fn parse_error_unknown_query_suggestion_only_applies_to_query_entities() {
+        let err = parse_qa("query systems").unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert_eq!(
+            err.help.as_deref(),
+            Some("start QA statements with `ask`, `explain`, `assert`, or `load`")
+        );
+    }
+
+    #[test]
+    fn parse_error_missing_query_after_ask_is_not_block_query() {
+        let err = parse_qa("ask").unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::expected");
+        assert!(err.message.contains("query"));
     }
 
     #[test]
@@ -1915,6 +2242,108 @@ explain path Order.status @Pending -> @Shipped
         assert_eq!(
             &source[blocks[0].body_span.start..blocks[0].body_span.end],
             blocks[0].body
+        );
+    }
+
+    #[test]
+    fn embedded_abide_blocks_record_multiple_indented_nested_source_slices() {
+        let source = "\
+ask entities
+  abide { entity One { status: int } }
+ask systems
+  abide {
+    entity Two {
+      value: int
+    }
+  }
+ask types
+";
+        let blocks = embedded_abide_blocks(source).expect("embedded blocks");
+
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].body, " entity One { status: int } ");
+        assert_eq!(
+            &source[blocks[0].body_span.start..blocks[0].body_span.end],
+            blocks[0].body
+        );
+        assert_eq!(
+            blocks[0].body_span,
+            Span {
+                start: source.find(" entity One").unwrap(),
+                end: source.find(" }\nask systems").unwrap() + 1,
+            }
+        );
+
+        assert_eq!(
+            blocks[1].body,
+            "\n    entity Two {\n      value: int\n    }\n  "
+        );
+        assert_eq!(
+            &source[blocks[1].body_span.start..blocks[1].body_span.end],
+            blocks[1].body
+        );
+        assert_eq!(
+            blocks[1].body_span,
+            Span {
+                start: source.find("\n    entity Two").unwrap(),
+                end: source.find("\nask types").unwrap() - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn embedded_abide_blocks_account_for_skipped_lines_before_block() {
+        let source = "
+// ignored
+
+  abide { entity Later { status: int } }
+";
+        let blocks = embedded_abide_blocks(source).expect("embedded blocks");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, " entity Later { status: int } ");
+        assert_eq!(
+            blocks[0].body_span,
+            Span {
+                start: source.find(" entity Later").unwrap(),
+                end: source.find(" }\n").unwrap() + 1,
+            }
+        );
+        assert_eq!(
+            &source[blocks[0].body_span.start..blocks[0].body_span.end],
+            blocks[0].body
+        );
+    }
+
+    #[test]
+    fn embedded_abide_blocks_ignore_non_block_lines_with_partial_markers() {
+        let source = "\
+abide
+ask { entities }
+";
+        let blocks = embedded_abide_blocks(source).expect("embedded blocks");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn embedded_abide_blocks_unclosed_error_uses_absolute_keyword_span_and_line() {
+        let source = "ask entities
+// ignored
+
+  abide {
+    entity Later {
+";
+        let err = embedded_abide_blocks(source).unwrap_err();
+
+        assert_eq!(err.code, "abide::qa::parse::unclosed_block");
+        assert_eq!(err.line, 4);
+        assert_eq!(
+            err.span,
+            Span {
+                start: source.find("abide").unwrap(),
+                end: source.find("abide").unwrap() + "abide".len(),
+            }
         );
     }
 

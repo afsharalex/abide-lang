@@ -357,25 +357,9 @@ pub(super) fn resolve_field_type(
 ) -> Option<Ty> {
     if let EExpr::Field(_, base, field_name, _) = expr {
         let base_ty = base.ty();
-        // Resolve entity name from the base expression's type
-        let entity_name = match &base_ty {
-            Ty::Entity(name) => Some(name.as_str()),
-            Ty::Named(name) if entities.contains_key(name.as_str()) => Some(name.as_str()),
-            // Follow aliases/type names that resolve to entities
-            _ => {
-                let name = base_ty.name();
-                if entities.contains_key(name) {
-                    Some(name)
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(ent_name) = entity_name {
-            if let Some(entity) = entities.get(ent_name) {
-                if let Some(field) = entity.fields.iter().find(|f| f.name == *field_name) {
-                    return Some(field.ty.clone());
-                }
+        if let Some(entity) = entities.get(base_ty.name()) {
+            if let Some(field) = entity.fields.iter().find(|f| f.name == *field_name) {
+                return Some(field.ty.clone());
             }
         }
         // Recursive: resolve nested field access (o.inner.status)
@@ -392,4 +376,264 @@ pub(super) fn resolve_field_type(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{BuiltinTy, EAction, EField, EInvariant, Literal};
+
+    fn bool_lit(value: bool) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(value), None)
+    }
+
+    fn status_ty() -> Ty {
+        Ty::Enum(
+            "Status".to_string(),
+            vec!["Open".to_string(), "Closed".to_string()],
+        )
+    }
+
+    fn constructors() -> Vec<String> {
+        vec!["Open".to_string(), "Closed".to_string()]
+    }
+
+    fn entity(name: &str, fields: Vec<EField>) -> EEntity {
+        EEntity {
+            name: name.to_string(),
+            fields,
+            actions: Vec::<EAction>::new(),
+            derived_fields: vec![],
+            invariants: Vec::<EInvariant>::new(),
+            fsm_decls: vec![],
+            span: None,
+        }
+    }
+
+    fn field(name: &str, ty: Ty) -> EField {
+        EField {
+            name: name.to_string(),
+            ty,
+            default: None,
+            span: None,
+        }
+    }
+
+    #[test]
+    fn pattern_helpers_distinguish_catchalls_and_covered_constructors() {
+        let ctors = constructors();
+        assert!(pattern_is_catchall(&EPattern::Wild, &ctors));
+        assert!(pattern_is_catchall(
+            &EPattern::Var("binding".to_string()),
+            &ctors
+        ));
+        assert!(!pattern_is_catchall(
+            &EPattern::Var("Open".to_string()),
+            &ctors
+        ));
+        assert!(pattern_is_catchall(
+            &EPattern::Or(
+                Box::new(EPattern::Ctor("Open".to_string(), vec![])),
+                Box::new(EPattern::Wild),
+            ),
+            &ctors
+        ));
+        assert!(!pattern_is_catchall(
+            &EPattern::Ctor("Open".to_string(), vec![]),
+            &ctors
+        ));
+
+        let or_pattern = EPattern::Or(
+            Box::new(EPattern::Var("Open".to_string())),
+            Box::new(EPattern::Ctor("Closed".to_string(), vec![])),
+        );
+        let mut covered = HashSet::new();
+        collect_covered_ctors(&or_pattern, &ctors, &mut covered);
+        assert_eq!(covered, HashSet::from(["Open", "Closed"]));
+    }
+
+    #[test]
+    fn check_pattern_shape_rejects_braces_for_unit_constructor_patterns() {
+        let mut variant_fields = VariantFieldsMap::new();
+        variant_fields.insert(
+            "Status".to_string(),
+            vec![
+                ("Open".to_string(), vec![]),
+                (
+                    "Closed".to_string(),
+                    vec![("reason".to_string(), Ty::Builtin(BuiltinTy::String))],
+                ),
+            ],
+        );
+        let mut errors = Vec::new();
+        check_pattern_shape(
+            &EPattern::Or(
+                Box::new(EPattern::Ctor("Open".to_string(), vec![])),
+                Box::new(EPattern::Ctor(
+                    "Closed".to_string(),
+                    vec![("reason".to_string(), EPattern::Var("r".to_string()))],
+                )),
+            ),
+            "Status",
+            &constructors(),
+            &variant_fields,
+            crate::span::Span { start: 1, end: 2 },
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("unit constructor pattern"));
+
+        check_pattern_shape(
+            &EPattern::Ctor("Missing".to_string(), vec![]),
+            "Status",
+            &constructors(),
+            &variant_fields,
+            crate::span::Span { start: 3, end: 4 },
+            &mut errors,
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "unknown constructors should be ignored by shape checks"
+        );
+
+        check_pattern_shape(
+            &EPattern::Ctor("Closed".to_string(), vec![]),
+            "Status",
+            &constructors(),
+            &variant_fields,
+            crate::span::Span { start: 5, end: 6 },
+            &mut errors,
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "record constructors with declared fields should not be treated as unit constructors"
+        );
+    }
+
+    #[test]
+    fn resolve_to_enum_info_follows_inline_alias_named_and_entity_types() {
+        let mut types = HashMap::new();
+        types.insert("Status".to_string(), status_ty());
+        types.insert(
+            "TicketStatus".to_string(),
+            Ty::Alias(
+                "TicketStatus".to_string(),
+                Box::new(Ty::Named("Status".to_string())),
+            ),
+        );
+
+        let direct_status = status_ty();
+        let (name, ctors) = resolve_to_enum_info(&direct_status, &types).unwrap();
+        assert_eq!(name, "Status");
+        assert_eq!(ctors, &constructors());
+
+        let inline_alias = Ty::Alias(
+            "Inline".to_string(),
+            Box::new(Ty::Named("TicketStatus".to_string())),
+        );
+        let (name, ctors) = resolve_to_enum_info(&inline_alias, &types).unwrap();
+        assert_eq!(name, "Status");
+        assert_eq!(ctors, &constructors());
+
+        let entity_status = Ty::Entity("Status".to_string());
+        let (name, _) = resolve_to_enum_info(&entity_status, &types).unwrap();
+        assert_eq!(name, "Status");
+        assert!(resolve_to_enum_info(&Ty::Named("Missing".to_string()), &types).is_none());
+    }
+
+    #[test]
+    fn resolve_field_type_handles_entity_named_and_nested_field_access() {
+        let mut entities = HashMap::new();
+        entities.insert(
+            "Ticket".to_string(),
+            entity(
+                "Ticket",
+                vec![
+                    field("status", status_ty()),
+                    field("owner", Ty::Entity("User".to_string())),
+                ],
+            ),
+        );
+        entities.insert(
+            "User".to_string(),
+            entity("User", vec![field("status", status_ty())]),
+        );
+
+        let status = EExpr::Field(
+            Ty::Error,
+            Box::new(EExpr::Var(
+                Ty::Entity("Ticket".to_string()),
+                "ticket".to_string(),
+                None,
+            )),
+            "status".to_string(),
+            None,
+        );
+        let resolved = resolve_field_type(&status, &HashMap::new(), &entities).unwrap();
+        assert_eq!(resolved.name(), "Status");
+
+        let named_status = EExpr::Field(
+            Ty::Error,
+            Box::new(EExpr::Var(
+                Ty::Named("Ticket".to_string()),
+                "ticket".to_string(),
+                None,
+            )),
+            "status".to_string(),
+            None,
+        );
+        let resolved = resolve_field_type(&named_status, &HashMap::new(), &entities).unwrap();
+        assert_eq!(resolved.name(), "Status");
+
+        let nested_status = EExpr::Field(
+            Ty::Error,
+            Box::new(EExpr::Field(
+                Ty::Error,
+                Box::new(EExpr::Var(
+                    Ty::Entity("Ticket".to_string()),
+                    "ticket".to_string(),
+                    None,
+                )),
+                "owner".to_string(),
+                None,
+            )),
+            "status".to_string(),
+            None,
+        );
+        let resolved = resolve_field_type(&nested_status, &HashMap::new(), &entities).unwrap();
+        assert_eq!(resolved.name(), "Status");
+        assert!(resolve_field_type(&bool_lit(true), &HashMap::new(), &entities).is_none());
+    }
+
+    #[test]
+    fn check_match_exhaustiveness_reports_missing_constructors_and_recurses() {
+        let types = HashMap::from([("Status".to_string(), status_ty())]);
+        let scrutinee = EExpr::Var(status_ty(), "status".to_string(), None);
+        let nested_non_exhaustive = EExpr::Match(
+            Box::new(scrutinee.clone()),
+            vec![(EPattern::Var("Open".to_string()), None, bool_lit(true))],
+            Some(crate::span::Span { start: 10, end: 20 }),
+        );
+        let expr = EExpr::Match(
+            Box::new(scrutinee),
+            vec![(
+                EPattern::Var("Open".to_string()),
+                Some(bool_lit(true)),
+                nested_non_exhaustive,
+            )],
+            Some(crate::span::Span { start: 1, end: 9 }),
+        );
+        let mut errors = Vec::new();
+        check_match_exhaustiveness(
+            &expr,
+            &types,
+            &HashMap::new(),
+            &VariantFieldsMap::new(),
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().all(|error| error.message.contains("Closed")));
+    }
 }

@@ -718,3 +718,218 @@ pub fn ambiguous_generic_constructor(ctor_name: &str, candidates: &[String]) -> 
         candidates.join(", ")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_contains_all(message: &str, parts: &[&str]) {
+        for part in parts {
+            assert!(
+                message.contains(part),
+                "expected {message:?} to contain {part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_guidance_messages_name_current_constructs() {
+        assert!(HINT_IMPORT_KEYWORD.contains("'module'"));
+        assert!(HINT_IMPORT_KEYWORD.contains("'include'"));
+        assert!(HINT_PROOF_KEYWORD.contains("theorem name for System"));
+        assert!(HINT_FIELD_KEYWORD_ENTITY.contains("name: Type"));
+        assert!(FOR_SYSTEM_REMOVED.contains("store"));
+        assert!(FOR_SYSTEM_REMOVED.contains("let s = S"));
+    }
+
+    #[test]
+    fn assumption_and_theorem_messages_keep_user_actionable_hints() {
+        assert!(ASSUME_STUTTER_CONFLICT.contains("stutter"));
+        assert!(HINT_ASSUME_STUTTER_CONFLICT.contains("remove one"));
+        assert!(UNDER_VERIFY_NOT_ALLOWED.contains("not `verify`"));
+        assert!(HINT_UNDER_VERIFY_NOT_ALLOWED.contains("move the verify block out"));
+        assert!(THEOREM_PAST_TIME_UNSUPPORTED.contains("past-time temporal operators"));
+        assert!(HINT_THEOREM_PAST_TIME_UNSUPPORTED.contains("bounded model checking"));
+    }
+
+    #[test]
+    fn contract_and_verifier_messages_preserve_keywords_and_expected_types() {
+        assert_eq!(
+            DECREASES_MEASURE_NOT_INT,
+            "decreases measure must have type int"
+        );
+        assert_eq!(ENSURES_NOT_BOOL, "ensures clause must have type bool");
+        assert_eq!(REQUIRES_NOT_BOOL, "requires clause must have type bool");
+        assert!(HELP_REQUIRES_BOOL.contains("bool"));
+        assert!(HELP_DECREASES_INT.contains("int"));
+        assert!(VERIFIER_EXPR_NOT_ALLOWED.contains("verify/theorem/scene"));
+        assert!(HINT_VERIFIER_EXPR_NOT_ALLOWED.contains("pure and first-order"));
+    }
+
+    #[test]
+    fn verification_and_scene_helpers_include_identifiers_and_counts() {
+        assert_eq!(
+            label_liveness_violation("eventually_done"),
+            "liveness violation found for 'eventually_done' (infinite counterexample)"
+        );
+        assert_eq!(
+            label_deadlock("no_deadlock", 3),
+            "deadlock for 'no_deadlock' at step 3 (no commands/actions enabled, stutter is opted out)"
+        );
+        assert_eq!(
+            scene_ordering_unknown_var("happy_path", "ship", "create, pay"),
+            "scene 'happy_path': ordering references unknown command variable 'ship'; \
+         declared command variables: create, pay"
+        );
+        assert_eq!(
+            collection_op_unsupported_arity("Seq", "slice", 3),
+            "Seq::slice takes 3 arguments, which is not supported"
+        );
+    }
+
+    #[test]
+    fn derived_invariant_and_fsm_helpers_include_relevant_names() {
+        assert_eq!(
+            derived_cycle(&["a".to_owned(), "b".to_owned(), "a".to_owned()]),
+            "derived field cycle: a -> b -> a"
+        );
+        assert_eq!(
+            invariant_violated("positive_balance"),
+            "invariant `positive_balance` is not preserved by every command/action"
+        );
+
+        assert_contains_all(
+            &fsm_unknown_field("Order", "status"),
+            &["`fsm`", "unknown field", "`status`", "`Order`"],
+        );
+        assert_contains_all(
+            &fsm_field_not_enum("Order", "status"),
+            &["Order::status", "enum type"],
+        );
+        assert_contains_all(
+            &fsm_unknown_variant("Order", "status", "Packed", "OrderStatus"),
+            &["Order::status", "@Packed", "OrderStatus"],
+        );
+        assert_contains_all(
+            &fsm_duplicate("Order", "status"),
+            &["duplicate", "Order::status", "only one"],
+        );
+        assert_contains_all(
+            &fsm_unreachable_state("Order", "status", "Packed"),
+            &["@Packed", "Order::status", "unreachable"],
+        );
+        assert_contains_all(
+            &fsm_trap_state("Order", "status", "Packed"),
+            &["@Packed", "Order::status", "no path"],
+        );
+        assert_contains_all(
+            &fsm_invalid_transition("Order", "status", "Pending", "Shipped"),
+            &["Order::status", "@Pending", "@Shipped", "does not allow"],
+        );
+        assert_contains_all(
+            &fsm_action_violation(
+                "Order",
+                "status",
+                "ship",
+                "Pending",
+                "Cancelled",
+                &["Paid".to_owned(), "Packed".to_owned()],
+            ),
+            &[
+                "Order::ship",
+                "Order::status",
+                "@Pending",
+                "@Cancelled",
+                "@Paid",
+                "@Packed",
+            ],
+        );
+        assert_contains_all(
+            &fsm_action_violation("Order", "status", "ship", "Done", "Packed", &[]),
+            &["Order::ship", "@Done", "@Packed", "terminal"],
+        );
+    }
+
+    #[test]
+    fn cli_match_scene_and_default_helpers_include_relevant_names() {
+        assert_eq!(
+            label_counterexample("no_overdraft"),
+            "counterexample found for 'no_overdraft'"
+        );
+        assert_eq!(
+            label_scene_fail("happy_path", "unsat"),
+            "scene 'happy_path' failed: unsat"
+        );
+        assert_eq!(
+            label_unprovable("safety", "timeout"),
+            "could not prove 'safety': timeout"
+        );
+        assert_eq!(
+            label_fn_contract_failed("bounded_discount"),
+            "fn contract violated for 'bounded_discount'"
+        );
+        assert_eq!(
+            non_exhaustive_match(&["@Some"]),
+            "non-exhaustive match: missing constructor @Some"
+        );
+        assert_eq!(
+            non_exhaustive_match(&["@Some", "@None"]),
+            "non-exhaustive match: missing constructors @Some, @None"
+        );
+
+        assert_contains_all(
+            &scene_xor_multi_instance("checkout", "pay", 2),
+            &["checkout", "pay", "^|", "2", "single-instance"],
+        );
+        assert_contains_all(
+            &scene_xor_no_fire_tracking("checkout", "pay"),
+            &["checkout", "pay", "^|", "{lone}"],
+        );
+        assert_contains_all(
+            &scene_same_step_multi_instance("checkout", "pay", 2, "ship", 3),
+            &["checkout", "pay", "2", "ship", "3", "same-step"],
+        );
+        assert_contains_all(
+            &scene_same_step_entity_conflict("checkout", "Order"),
+            &["checkout", "Order", "same entity type"],
+        );
+        assert_eq!(
+            where_predicate_not_bool("Money"),
+            "`where` predicate must be a boolean expression, got type Money"
+        );
+        assert_eq!(
+            in_value_not_constructor("Status"),
+            "`in` values for Status field must be constructors (@Name), not expressions"
+        );
+        assert_contains_all(
+            &enum_default_not_constructor("Status", "@Open, @Closed"),
+            &["Status", "constructor", "@Open, @Closed"],
+        );
+    }
+
+    #[test]
+    fn saw_and_generic_helpers_preserve_paths_and_counts() {
+        assert!(SAW_RETURN_VALUE_FORBIDDEN.contains("return value"));
+        assert!(HINT_SAW_RETURN_VALUE_FORBIDDEN.contains("call site"));
+        assert!(SAW_EXTERN_QUALIFIED_ONLY.contains("Extern::command"));
+        assert_eq!(
+            saw_arity_mismatch("Payment", "capture", 2, 1),
+            "`saw Payment::capture` expects 2 arguments but got 1"
+        );
+        assert_eq!(
+            generic_arity_mismatch("Option", 1, 2),
+            "`Option` expects 1 type argument(s), but 2 were provided"
+        );
+        assert_eq!(
+            not_a_generic_type("Money"),
+            "`Money` is not a generic type and cannot take type arguments"
+        );
+        assert_eq!(
+            ambiguous_generic_constructor(
+                "Some",
+                &["Option<int>".to_owned(), "Option<bool>".to_owned()],
+            ),
+            "constructor `Some` is ambiguous — found in Option<int>, Option<bool>; qualify with the enum type"
+        );
+    }
+}

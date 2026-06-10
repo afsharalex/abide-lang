@@ -1,11 +1,25 @@
 use super::*;
-use crate::ast::{EventItem, Pattern, SceneItem, SystemItem, TypeRefKind, TypeVariant, WhenItem};
-use crate::lex;
+use crate::ast::{
+    AggKind, EventItem, Pattern, SawArg, SceneItem, SystemItem, TypeRefKind, TypeVariant, WhenItem,
+};
+use crate::lex::{self, Token};
 
 fn parse_expr(src: &str) -> Expr {
     let tokens = lex::lex(src).expect("lex error");
     let mut parser = Parser::new(tokens);
     parser.expr().expect("parse error")
+}
+
+fn parse_expr_full(src: &str) -> Expr {
+    let tokens = lex::lex(src).expect("lex error");
+    let mut parser = Parser::new(tokens);
+    let expr = parser.expr().expect("parse error");
+    assert!(
+        parser.at_end(),
+        "expression parser left trailing token {:?}",
+        parser.peek()
+    );
+    expr
 }
 
 fn parse_program(src: &str) -> Program {
@@ -45,6 +59,14 @@ fn parse_program_err(src: &str) -> ParseError {
         .expect_err("expected parse error, got successful parse")
 }
 
+fn parse_top_decl_err_without_recovery(src: &str) -> ParseError {
+    let tokens = lex::lex(src).expect("lex error");
+    let mut parser = Parser::new(tokens);
+    parser
+        .top_decl()
+        .expect_err("expected non-recovering parse error, got successful parse")
+}
+
 fn parse_expr_err(src: &str) -> ParseError {
     let tokens = lex::lex(src).expect("lex error");
     let mut parser = Parser::new(tokens);
@@ -74,6 +96,17 @@ fn atom_true_false() {
 }
 
 #[test]
+fn atom_stub_and_numeric_literals() {
+    assert!(matches!(parse_expr_full("sorry").kind, ExprKind::Sorry));
+    assert!(matches!(parse_expr_full("todo").kind, ExprKind::Todo));
+    assert!(matches!(parse_expr_full("3.14").kind, ExprKind::Real(_)));
+    assert!(matches!(
+        parse_expr_full("3.14f").kind,
+        ExprKind::Float(ref value) if value == "3.14f"
+    ));
+}
+
+#[test]
 fn atom_state() {
     let e = parse_expr("@Pending");
     assert!(matches!(e.kind, ExprKind::State1(ref s) if s == "Pending"));
@@ -94,9 +127,117 @@ fn atom_qual2() {
 }
 
 #[test]
+fn qualified_name_segments_accept_aggregate_soft_keywords() {
+    for segment in ["sum", "product", "min", "max", "count"] {
+        let expr = parse_expr_full(&format!("Rel::{segment}"));
+        assert!(
+            matches!(expr.kind, ExprKind::Qual2(ref owner, ref name) if owner == "Rel" && name == segment),
+            "expected Rel::{segment} to parse as a qualified name, got {expr:?}"
+        );
+    }
+}
+
+#[test]
 fn binary_add() {
     let e = parse_expr("a + b");
     assert!(matches!(e.kind, ExprKind::Add(_, _)));
+}
+
+#[test]
+fn binary_multiplicative_and_relation_operators() {
+    assert!(matches!(parse_expr_full("a / b").kind, ExprKind::Div(_, _)));
+    assert!(matches!(parse_expr_full("a % b").kind, ExprKind::Mod(_, _)));
+    assert!(matches!(
+        parse_expr_full("a <> b").kind,
+        ExprKind::Diamond(_, _)
+    ));
+    assert!(matches!(
+        parse_expr_full("a !* b").kind,
+        ExprKind::Disjoint(_, _)
+    ));
+}
+
+#[test]
+fn infix_operator_token_guard_is_context_specific() {
+    assert!(super::expr::is_infix_operator_token(&Token::Plus));
+    assert!(super::expr::is_infix_operator_token(&Token::BangStar));
+    assert!(!super::expr::is_infix_operator_token(&Token::RParen));
+    assert!(!super::expr::is_infix_operator_token(&Token::Name(
+        "not_an_operator".to_owned()
+    )));
+}
+
+#[test]
+fn postfix_binding_power_respects_minimum_threshold() {
+    let postfix_bp = postfix_bp(&Token::Dot).expect("dot should be a postfix operator");
+
+    let tokens = lex::lex("a.b").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let expr = parser
+        .expr_bp(postfix_bp)
+        .expect("postfix should bind at its own binding power");
+    assert!(
+        matches!(expr.kind, ExprKind::Field(_, ref name) if name == "b"),
+        "postfix operator at threshold should be consumed: {expr:?}"
+    );
+    assert!(parser.at_end(), "postfix parse should consume all tokens");
+
+    let tokens = lex::lex("a.b").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let expr = parser
+        .expr_bp(postfix_bp + 1)
+        .expect("expression head should parse above postfix binding power");
+    assert!(
+        matches!(expr.kind, ExprKind::Var(ref name) if name == "a"),
+        "postfix operator below threshold should not be consumed: {expr:?}"
+    );
+    assert!(
+        matches!(parser.peek(), Some(Token::Dot)),
+        "postfix token should remain for the caller"
+    );
+}
+
+fn assert_prefix_respects_minimum_threshold(src: &str, min_bp: u8) {
+    let tokens = lex::lex(src).expect("lex");
+    let mut parser = Parser::new(tokens);
+    parser
+        .expr_bp(min_bp)
+        .unwrap_or_else(|err| panic!("prefix should parse at threshold {min_bp}: {src}: {err:?}"));
+
+    let tokens = lex::lex(src).expect("lex");
+    let mut parser = Parser::new(tokens);
+    assert!(
+        parser.expr_bp(min_bp + 1).is_err(),
+        "prefix should not parse above threshold {min_bp}: {src}"
+    );
+}
+
+#[test]
+fn prefix_binding_power_respects_minimum_thresholds() {
+    for src in ["-x", "#items"] {
+        assert_prefix_respects_minimum_threshold(src, BP_UNARY);
+    }
+    assert_prefix_respects_minimum_threshold("not ready", BP_NOT);
+
+    for src in [
+        "always ready",
+        "eventually ready",
+        "historically ready",
+        "once ready",
+        "previously ready",
+        "saw Store::reserve(order_id)",
+        "assert ready",
+        "assume ready",
+        "all o: Order | o.total >= 0",
+        "sum o: Order | o.total",
+        "let x = 1 in x",
+        "if ready { 1 } else { 0 }",
+        "fn(x: int) => x",
+        "match status { Pending => 1 }",
+        "choose id: ChargeId where valid(id)",
+    ] {
+        assert_prefix_respects_minimum_threshold(src, BP_PREFIX_EXPR);
+    }
 }
 
 #[test]
@@ -246,6 +387,55 @@ fn exists_quantifier() {
 }
 
 #[test]
+fn quantifier_variants_parse_to_distinct_ast_kinds() {
+    assert!(matches!(
+        parse_expr_full("some o: Order | o.total > 0").kind,
+        ExprKind::SomeQ(_, _, _, _)
+    ));
+    assert!(matches!(
+        parse_expr_full("no o: Order | o.total < 0").kind,
+        ExprKind::NoQ(_, _, _, _)
+    ));
+    assert!(matches!(
+        parse_expr_full("one o: Order | o.id == target").kind,
+        ExprKind::OneQ(_, _, _, _)
+    ));
+    assert!(matches!(
+        parse_expr_full("lone o: Order | o.id == target").kind,
+        ExprKind::LoneQ(_, _, _, _)
+    ));
+}
+
+#[test]
+fn aggregate_variants_parse_to_distinct_ast_kinds() {
+    for (src, expected) in [
+        ("sum o: Order | o.total", AggKind::Sum),
+        ("product o: Order | o.total", AggKind::Product),
+        ("min o: Order | o.total", AggKind::Min),
+        ("max o: Order | o.total", AggKind::Max),
+        ("count o: Order | o.total > 0", AggKind::Count),
+    ] {
+        match parse_expr_full(src).kind {
+            ExprKind::Aggregate(kind, ..) => assert_eq!(kind, expected),
+            other => panic!("expected aggregate for {src}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn saw_expr_accepts_wildcard_arguments() {
+    match parse_expr_full("saw Store::reserve(_, order_id)").kind {
+        ExprKind::Saw(path, args) => {
+            assert_eq!(path, vec!["Store".to_owned(), "reserve".to_owned()]);
+            assert_eq!(args.len(), 2);
+            assert!(matches!(args[0], SawArg::Wild(_)));
+            assert!(matches!(args[1], SawArg::Expr(_)));
+        }
+        other => panic!("expected Saw expression, got {other:?}"),
+    }
+}
+
+#[test]
 fn choose_expr_with_binding_and_where() {
     let e = parse_expr("choose id: ChargeId where valid(id) and starts_with($, \"ch_\")");
     match &e.kind {
@@ -306,6 +496,41 @@ extern Stripe {
         }
         other => panic!("expected assume block, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_extern_assume_accepts_fair_and_strong_fair_items() {
+    let program = parse_program(
+        r#"
+extern Stripe {
+  assume {
+    strong fair Stripe::charge
+    fair Stripe::refund
+  }
+}
+"#,
+    );
+
+    let ext = program
+        .decls
+        .iter()
+        .find_map(|decl| match decl {
+            crate::ast::TopDecl::Extern(ext) => Some(ext),
+            _ => None,
+        })
+        .expect("expected extern");
+    let crate::ast::ExternItem::Assume(block) = &ext.items[0] else {
+        panic!("expected assume block");
+    };
+    assert_eq!(block.items.len(), 2);
+    assert!(matches!(
+        block.items[0],
+        crate::ast::ExternAssumeItem::StrongFair { .. }
+    ));
+    assert!(matches!(
+        block.items[1],
+        crate::ast::ExternAssumeItem::Fair { .. }
+    ));
 }
 
 #[test]
@@ -687,6 +912,18 @@ fn eventually() {
     assert!(matches!(
         parse_expr("eventually p").kind,
         ExprKind::Eventually(_)
+    ));
+}
+
+#[test]
+fn until_and_since_parse_as_temporal_infix_operators() {
+    assert!(matches!(
+        parse_expr_full("p until q").kind,
+        ExprKind::Until(_, _)
+    ));
+    assert!(matches!(
+        parse_expr_full("p since q").kind,
+        ExprKind::Since(_, _)
     ));
 }
 
@@ -1147,6 +1384,16 @@ fn use_entity_rejected_in_system() {
     assert!(
         msg.contains("Store<T>") || msg.contains("replaced"),
         "expected migration diagnostic for `use Entity`, got: {err:?}"
+    );
+}
+
+#[test]
+fn system_store_params_reject_non_store_type_constructor() {
+    let err = parse_program_err("system S(orders: Bag<Order>) {}");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("Store") || msg.contains("Bag"),
+        "expected store parameter diagnostic, got: {err:?}"
     );
 }
 
@@ -1728,6 +1975,38 @@ assert o.status == @Paid
 }
 
 #[test]
+fn scene_given_block_accepts_activation_declarations() {
+    let src = r"scene activation_test {
+  given {
+    store orders: Order[1]
+    activate {o1, o2} in orders
+  }
+  when {
+    assume true
+  }
+  then {
+    assert true
+  }
+}";
+    let prog = parse_program(src);
+    let TopDecl::Scene(scene) = &prog.decls[0] else {
+        panic!("expected Scene");
+    };
+    let SceneItem::GivenBlock { items, .. } = &scene.items[0] else {
+        panic!("expected given block: {:?}", scene.items);
+    };
+    assert_eq!(items.len(), 2);
+    assert!(matches!(items[0], GivenItem::Store(_)));
+    match &items[1] {
+        GivenItem::Activate(activation) => {
+            assert_eq!(activation.instances, vec!["o1".to_owned(), "o2".to_owned()]);
+            assert_eq!(activation.store_name, "orders");
+        }
+        other => panic!("expected Activate, got {other:?}"),
+    }
+}
+
+#[test]
 fn contract_parsing() {
     let src = r"entity Order {
   action submit()
@@ -2228,8 +2507,12 @@ fn try_parse(src: &str) -> Result<Program, ParseError> {
 #[test]
 fn removed_field_keyword_in_entity() {
     let err = try_parse("entity Order { field status: int }").unwrap_err();
-    let msg = format!("{err}");
+    let msg = format!("{err:?}");
     assert!(msg.contains("field"), "should mention 'field': {msg}");
+    assert!(
+        msg.contains(crate::messages::HINT_FIELD_KEYWORD_ENTITY),
+        "should include entity field migration help: {msg}"
+    );
 }
 
 #[test]
@@ -2242,8 +2525,37 @@ fn removed_import_keyword() {
 #[test]
 fn removed_proof_keyword() {
     let err = try_parse("proof safety for S { show always true }").unwrap_err();
-    let msg = format!("{err}");
+    let msg = format!("{err:?}");
     assert!(msg.contains("proof"), "should mention 'proof': {msg}");
+    assert!(
+        msg.contains(crate::messages::HINT_PROOF_KEYWORD),
+        "should include theorem migration help: {msg}"
+    );
+}
+
+#[test]
+fn removed_field_keyword_at_top_level() {
+    let err = try_parse("field status: int").unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(msg.contains("field"), "should mention 'field': {msg}");
+    assert!(
+        msg.contains(crate::messages::HINT_FIELD_KEYWORD_TOP),
+        "should include top-level field migration help: {msg}"
+    );
+}
+
+#[test]
+fn unknown_top_level_identifier_uses_generic_declaration_diagnostic() {
+    let err = try_parse("ordinary_identifier").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("top-level declaration"),
+        "unknown top-level identifiers should use the generic declaration diagnostic: {msg}"
+    );
+    assert!(
+        !msg.contains("proof") && !msg.contains("field"),
+        "generic top-level identifier diagnostic should not use removed-keyword hints: {msg}"
+    );
 }
 
 #[test]
@@ -2251,6 +2563,473 @@ fn removed_uses_keyword() {
     let err = try_parse("system S { uses Order }").unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("uses"), "should mention 'uses': {msg}");
+}
+
+#[test]
+fn system_body_rejects_lowercase_uses_identifier() {
+    let err = parse_top_decl_err_without_recovery("system S { uses Order }");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("uses") && (msg.contains("Store<T>") || msg.contains("replaced")),
+        "should mention removed `uses` migration help: {msg}"
+    );
+}
+
+#[test]
+fn system_name_items_without_colon_are_not_fields() {
+    let err = parse_top_decl_err_without_recovery("system S { ready }");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ready") || msg.contains("system item"),
+        "expected bare name to be rejected as a system item, got: {msg}"
+    );
+}
+
+#[test]
+fn command_body_rejects_given_and_then_keywords() {
+    for keyword in ["given", "then"] {
+        let src = format!(
+            r#"
+system S {{
+  command run() {{
+    {keyword} ready
+  }}
+}}
+"#
+        );
+        let err = parse_top_decl_err_without_recovery(&src);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("command/action body"),
+            "expected {keyword} to be rejected in command body, got: {msg}"
+        );
+    }
+}
+
+#[test]
+fn recovery_item_starter_predicates_are_context_specific() {
+    use crate::lex::Token;
+
+    assert!(is_entity_item_starter(&Token::Action, None));
+    assert!(is_entity_item_starter(
+        &Token::Name("status".to_owned()),
+        None
+    ));
+    assert!(!is_entity_item_starter(&Token::Command, None));
+
+    assert!(is_system_item_starter(&Token::Command, None));
+    assert!(is_system_item_starter(
+        &Token::Name("screen".to_owned()),
+        Some(&Token::Colon)
+    ));
+    assert!(!is_system_item_starter(
+        &Token::Name("screen".to_owned()),
+        Some(&Token::Name("next".to_owned()))
+    ));
+    assert!(!is_system_item_starter(&Token::Store, None));
+
+    assert!(is_interface_item_starter(&Token::Command, None));
+    assert!(!is_interface_item_starter(&Token::May, None));
+
+    assert!(is_extern_item_starter(&Token::May, None));
+    assert!(!is_extern_item_starter(&Token::Query, None));
+
+    assert!(is_program_item_starter(&Token::Let, None));
+    assert!(!is_program_item_starter(&Token::Command, None));
+
+    assert!(is_proc_item_starter(&Token::Use, None));
+    assert!(!is_proc_item_starter(&Token::Let, None));
+
+    assert!(is_scene_item_starter(&Token::When, None));
+    assert!(!is_scene_item_starter(&Token::Store, None));
+
+    assert!(is_given_item_starter(&Token::Activate, None));
+    assert!(!is_given_item_starter(&Token::Assume, None));
+
+    assert!(is_when_item_starter(&Token::Assume, None));
+    assert!(!is_when_item_starter(&Token::Store, None));
+
+    assert!(is_event_item_starter(&Token::Let));
+    assert!(!is_event_item_starter(&Token::Semi));
+    assert!(!is_event_item_starter(&Token::RBrace));
+    assert!(!is_event_item_starter(&Token::Return));
+}
+
+#[test]
+fn parser_recovery_helpers_stop_at_expected_boundaries() {
+    let tokens = lex::lex("bad module M").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let error = parser.recover_to_top_level();
+    assert_eq!(error.skipped_tokens, vec!["bad"]);
+    assert!(matches!(parser.peek(), Some(crate::lex::Token::Module)));
+}
+
+#[test]
+fn parser_advance_consumes_one_token() {
+    let tokens = lex::lex("name").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let (token, _) = parser.advance();
+    assert!(matches!(token, crate::lex::Token::Name(ref name) if name == "name"));
+    assert!(parser.at_end(), "advance must move the parser forward");
+}
+
+#[test]
+fn parser_ensure_progress_rejects_unchanged_position() {
+    let tokens = lex::lex("name").expect("lex");
+    let parser = Parser::new(tokens);
+    let err = parser
+        .ensure_progress(0, "unit test")
+        .expect_err("unchanged parser position should be an error");
+    assert!(
+        err.to_string().contains("unit test"),
+        "diagnostic should include progress context, got {err}"
+    );
+}
+
+#[test]
+fn parser_expect_rejects_wrong_token_without_consuming() {
+    let tokens = lex::lex("name").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let err = parser
+        .expect(&crate::lex::Token::LBrace)
+        .expect_err("wrong token should be rejected");
+    assert!(
+        err.to_string().contains("{"),
+        "diagnostic should mention expected token, got {err}"
+    );
+    assert!(
+        matches!(parser.peek(), Some(crate::lex::Token::Name(name)) if name == "name"),
+        "expect must not consume an unexpected token"
+    );
+}
+
+#[test]
+fn parser_cur_span_returns_current_token_span() {
+    let tokens = lex::lex("name").expect("lex");
+    let parser = Parser::new(tokens.clone());
+    assert_eq!(parser.cur_span(), tokens[0].1);
+}
+
+#[test]
+fn parser_cur_span_returns_eof_position_after_last_token() {
+    let tokens = lex::lex("name").expect("lex");
+    let mut parser = Parser::new(tokens.clone());
+    parser.advance();
+    assert_eq!(
+        parser.cur_span(),
+        Span {
+            start: tokens[0].1.end,
+            end: tokens[0].1.end
+        }
+    );
+}
+
+#[test]
+fn parser_prev_span_is_empty_before_first_token() {
+    let tokens = lex::lex("name").expect("lex");
+    let parser = Parser::new(tokens);
+    assert_eq!(parser.prev_span(), Span { start: 0, end: 0 });
+}
+
+#[test]
+fn parser_prev_span_returns_last_consumed_token_span() {
+    let tokens = lex::lex("name").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let (_, span) = parser.advance();
+    assert_eq!(parser.prev_span(), span);
+}
+
+#[test]
+fn nonrecovering_entity_body_rejects_malformed_item() {
+    let err = parse_top_decl_err_without_recovery("entity Order { field ; action ping() {} }");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains(crate::messages::HINT_FIELD_KEYWORD_ENTITY),
+        "nonrecovering entity parser should return the body item error directly: {msg}"
+    );
+}
+
+#[test]
+fn recovering_entity_body_keeps_error_item_and_next_valid_item() {
+    let src = "entity Order { field ; action ping() {} }";
+    let tokens = lex::lex(src).expect("lex");
+    let mut parser = Parser::new(tokens);
+    let (program, errors) = parser.parse_program_recovering();
+
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected one recovered entity error: {errors:?}"
+    );
+    let TopDecl::Entity(entity) = &program.decls[0] else {
+        panic!(
+            "recovering parse should keep the entity declaration: {:?}",
+            program.decls
+        );
+    };
+    assert_eq!(entity.items.len(), 2);
+    assert!(
+        matches!(entity.items[0], EntityItem::Error(_)),
+        "malformed entity item should be retained as an error node: {:?}",
+        entity.items
+    );
+    assert!(
+        matches!(entity.items[1], EntityItem::Action(_)),
+        "valid action after malformed item should be recovered: {:?}",
+        entity.items
+    );
+}
+
+#[test]
+fn nonrecovering_block_rejects_malformed_item() {
+    let tokens = lex::lex("{ var y = ; y }").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let err = parser
+        .parse_block()
+        .expect_err("nonrecovering block parser should reject malformed items");
+    assert!(
+        err.to_string().contains("expression"),
+        "block parser should return the malformed item error directly: {err:?}"
+    );
+}
+
+#[test]
+fn recovering_block_keeps_error_item_and_next_valid_item() {
+    let tokens = lex::lex("{ var y = ; y }").expect("lex");
+    let mut parser = Parser::new(tokens);
+    parser.recovering = true;
+    let block = parser
+        .parse_block()
+        .expect("recovering block parser should continue after malformed items");
+
+    assert_eq!(parser.errors.len(), 1, "expected one recovered block error");
+    let ExprKind::Block(items) = block.kind else {
+        panic!("recovering malformed block should stay wrapped as a block: {block:?}");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(
+        matches!(items[0].kind, ExprKind::Error(_)),
+        "malformed block item should be retained as an error expression: {items:?}"
+    );
+    assert!(
+        matches!(items[1].kind, ExprKind::Var(ref name) if name == "y"),
+        "valid item after malformed block item should be recovered: {items:?}"
+    );
+}
+
+#[test]
+fn nonrecovering_scene_rejects_malformed_top_level_item() {
+    parse_top_decl_err_without_recovery("scene broken { ready given { store orders: Order[1] } }");
+}
+
+#[test]
+fn recovering_scene_keeps_error_item_and_next_valid_item() {
+    let src = "scene broken { ready given { store orders: Order[1] } }";
+    let (program, errors) = try_parse_recovering(src);
+
+    assert!(
+        !errors.is_empty(),
+        "malformed scene item should report an error"
+    );
+    let TopDecl::Scene(scene) = &program.decls[0] else {
+        panic!(
+            "recovering parse should keep the scene declaration: {:?}",
+            program.decls
+        );
+    };
+    assert!(
+        scene
+            .items
+            .iter()
+            .any(|item| matches!(item, SceneItem::Error(_))),
+        "malformed scene item should be retained as an error node: {:?}",
+        scene.items
+    );
+    assert!(
+        scene
+            .items
+            .iter()
+            .any(|item| matches!(item, SceneItem::GivenBlock { .. })),
+        "valid given block after malformed scene item should be recovered: {:?}",
+        scene.items
+    );
+}
+
+#[test]
+fn nonrecovering_scene_given_block_rejects_malformed_item() {
+    parse_top_decl_err_without_recovery(
+        "scene broken { given { when true store orders: Order[1] } }",
+    );
+}
+
+#[test]
+fn recovering_scene_given_block_keeps_error_item_and_next_valid_item() {
+    let src = "scene broken { given { when true store orders: Order[1] } }";
+    let (program, errors) = try_parse_recovering(src);
+
+    assert!(
+        !errors.is_empty(),
+        "malformed given item should report an error"
+    );
+    let TopDecl::Scene(scene) = &program.decls[0] else {
+        panic!("expected scene declaration: {:?}", program.decls);
+    };
+    let SceneItem::GivenBlock { items, .. } = &scene.items[0] else {
+        panic!("expected given block: {:?}", scene.items);
+    };
+    assert!(
+        items.iter().any(|item| matches!(item, GivenItem::Error(_))),
+        "malformed given item should be retained as an error node: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| matches!(item, GivenItem::Store(_))),
+        "valid store after malformed given item should be recovered: {items:?}"
+    );
+}
+
+#[test]
+fn nonrecovering_scene_when_block_rejects_malformed_item() {
+    parse_top_decl_err_without_recovery(
+        "scene broken { when { store orders: Order[1] assume true } }",
+    );
+}
+
+#[test]
+fn recovering_scene_when_block_keeps_error_item_and_next_valid_item() {
+    let src = "scene broken { when { store orders: Order[1] assume true } }";
+    let (program, errors) = try_parse_recovering(src);
+
+    assert!(
+        !errors.is_empty(),
+        "malformed when item should report an error"
+    );
+    let TopDecl::Scene(scene) = &program.decls[0] else {
+        panic!("expected scene declaration: {:?}", program.decls);
+    };
+    let SceneItem::WhenBlock { items, .. } = &scene.items[0] else {
+        panic!("expected when block: {:?}", scene.items);
+    };
+    assert!(
+        items.iter().any(|item| matches!(item, WhenItem::Error(_))),
+        "malformed when item should be retained as an error node: {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, WhenItem::Assume { .. })),
+        "valid assume after malformed when item should be recovered: {items:?}"
+    );
+}
+
+#[test]
+fn nonrecovering_scene_then_block_rejects_malformed_item() {
+    parse_top_decl_err_without_recovery("scene broken { then { ; assert true } }");
+}
+
+#[test]
+fn recovering_scene_then_block_keeps_error_item_and_next_valid_item() {
+    let src = "scene broken { then { ; assert true } }";
+    let (program, errors) = try_parse_recovering(src);
+
+    assert!(
+        !errors.is_empty(),
+        "malformed then item should report an error"
+    );
+    let TopDecl::Scene(scene) = &program.decls[0] else {
+        panic!("expected scene declaration: {:?}", program.decls);
+    };
+    let SceneItem::ThenBlock { items, .. } = &scene.items[0] else {
+        panic!("expected then block: {:?}", scene.items);
+    };
+    assert_eq!(
+        items.len(),
+        2,
+        "expected error plus recovered assert: {items:?}"
+    );
+    assert!(
+        matches!(items[0].expr.kind, ExprKind::Error(_)),
+        "malformed then item should be retained as an error expression: {items:?}"
+    );
+    assert!(
+        matches!(items[1].expr.kind, ExprKind::True),
+        "valid assert after malformed then item should be recovered: {items:?}"
+    );
+}
+
+#[test]
+fn brace_recovery_tracks_nested_delimiters_before_starter_tokens() {
+    for src in [
+        "bad ( command ) command ping()",
+        "bad [ command ] command ping()",
+    ] {
+        let tokens = lex::lex(src).expect("lex");
+        let mut parser = Parser::new(tokens);
+        let error = parser.recover_to_brace_item(is_interface_item_starter);
+        assert!(
+            error.skipped_tokens.iter().any(|token| token == ")")
+                || error.skipped_tokens.iter().any(|token| token == "]"),
+            "recovery should skip through nested delimiter contents before stopping: {error:?}"
+        );
+        assert!(
+            matches!(parser.peek(), Some(crate::lex::Token::Command)),
+            "recovery should stop at the outer command starter, got {:?}",
+            parser.peek()
+        );
+    }
+}
+
+#[test]
+fn event_recovery_tracks_nested_delimiters_before_stop_tokens() {
+    for src in ["( ; ) ; let kept = Other::ping()", "[ return ] return"] {
+        let tokens = lex::lex(src).expect("lex");
+        let mut parser = Parser::new(tokens);
+        let error = parser.recover_to_event_item();
+        assert!(
+            error.skipped_tokens.iter().any(|token| token == ")")
+                || error.skipped_tokens.iter().any(|token| token == "]"),
+            "event recovery should not stop on nested semicolon/return tokens: {error:?}"
+        );
+        assert!(
+            matches!(
+                parser.peek(),
+                Some(crate::lex::Token::Semi | crate::lex::Token::Return)
+            ),
+            "event recovery should stop at the outer event boundary, got {:?}",
+            parser.peek()
+        );
+    }
+}
+
+#[test]
+fn block_recovery_tracks_nested_delimiters_before_semicolon() {
+    for src in ["bad ( ; ) ;", "bad [ ; ] ;"] {
+        let tokens = lex::lex(src).expect("lex");
+        let mut parser = Parser::new(tokens);
+        let error = parser.recover_to_block_item();
+        assert!(
+            error.skipped_tokens.iter().any(|token| token == ")")
+                || error.skipped_tokens.iter().any(|token| token == "]"),
+            "block recovery should not stop on nested semicolons: {error:?}"
+        );
+        assert!(
+            matches!(parser.peek(), Some(crate::lex::Token::Semi)),
+            "block recovery should stop at the outer semicolon, got {:?}",
+            parser.peek()
+        );
+    }
+}
+
+#[test]
+fn recovering_program_keeps_error_decl_when_declaration_consumes_to_eof() {
+    let tokens = lex::lex("module").expect("lex");
+    let mut parser = Parser::new(tokens);
+    let (program, errors) = parser.parse_program_recovering();
+    assert_eq!(errors.len(), 1);
+    assert!(
+        matches!(program.decls.as_slice(), [TopDecl::Error(_)]),
+        "recovering parse should retain an error declaration at EOF, got {:?}",
+        program.decls
+    );
 }
 
 // ── Recovery and multi-error tests ──────────────────────────
@@ -2328,6 +3107,481 @@ system S {
             .iter()
             .any(|item| matches!(item, SystemItem::Query(_))),
         "parser should recover and keep later valid system items"
+    );
+}
+
+#[test]
+fn recovery_retains_error_node_inside_interface_body() {
+    let src = r#"
+interface I {
+  uses Order
+  command ping()
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "broken interface body should report an error"
+    );
+    let TopDecl::Interface(interface) = &prog.decls[0] else {
+        panic!("expected interface decl");
+    };
+    assert!(
+        interface
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::InterfaceItem::Error(_))),
+        "interface body should retain an explicit error item"
+    );
+    assert!(
+        interface
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::InterfaceItem::Command(_))),
+        "parser should recover and keep later valid interface items"
+    );
+}
+
+#[test]
+fn recovery_retains_error_node_inside_extern_body() {
+    let src = r#"
+extern Gateway {
+  uses Order
+  command authorize()
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "broken extern body should report an error"
+    );
+    let TopDecl::Extern(ext) = &prog.decls[0] else {
+        panic!("expected extern decl");
+    };
+    assert!(
+        ext.items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ExternItem::Error(_))),
+        "extern body should retain an explicit error item"
+    );
+    assert!(
+        ext.items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ExternItem::Command(_))),
+        "parser should recover and keep later valid extern items"
+    );
+}
+
+#[test]
+fn nonrecovering_parser_rejects_recoverable_body_errors() {
+    for src in [
+        r#"
+interface I {
+  uses Order
+  command ping()
+}
+"#,
+        r#"
+system S {
+  command ping()
+  uses Order
+  query ready() = true
+}
+"#,
+        r#"
+extern Gateway {
+  uses Order
+  command authorize()
+}
+"#,
+        r#"
+program Checkout {
+  let checkout =
+  proc Flow() {
+    step = checkout.reserve()
+  }
+}
+"#,
+        r#"
+program Checkout {
+  use Flow(
+  proc Flow() {
+    step = checkout.reserve()
+  }
+}
+"#,
+        r#"
+program Checkout {
+  invariant safe
+  proc Flow() {
+    step = checkout.reserve()
+  }
+}
+"#,
+        r#"
+program Checkout {
+  proc Flow(
+  invariant safe { true }
+}
+"#,
+        r#"
+proc Flow() {
+  then;
+  step = Store.reserve()
+}
+"#,
+        r#"
+system S {
+  command run() {
+    given ready
+    let ok = Other::ping()
+  }
+}
+"#,
+        r#"
+system S {
+  command run() {
+    match result {
+      ok => {
+        given;
+        let kept = Other::ping()
+      }
+    }
+  }
+}
+"#,
+        r#"
+system S {
+  command run() {
+    choose item: Item where true {
+      given;
+      let kept = Other::ping()
+    }
+  }
+}
+"#,
+        r#"
+system S {
+  command run() {
+    for item: Item {
+      given;
+      let kept = Other::ping()
+    }
+  }
+}
+"#,
+    ] {
+        parse_top_decl_err_without_recovery(src);
+    }
+}
+
+#[test]
+fn recovery_retains_program_after_each_malformed_program_item_kind() {
+    for (case, src) in [
+        (
+            "let",
+            r#"
+program Checkout {
+  let checkout =
+  proc Flow() {
+    step = checkout.reserve()
+  }
+  invariant kept { true }
+}
+"#,
+        ),
+        (
+            "use",
+            r#"
+program Checkout {
+  use Flow(
+  proc Flow() {
+    step = checkout.reserve()
+  }
+  invariant kept { true }
+}
+"#,
+        ),
+        (
+            "invariant",
+            r#"
+program Checkout {
+  invariant safe
+  proc Flow() {
+    step = checkout.reserve()
+  }
+  use Flow()
+}
+"#,
+        ),
+        (
+            "proc",
+            r#"
+program Checkout {
+  proc Flow(
+  invariant safe { true }
+  use Flow()
+}
+"#,
+        ),
+    ] {
+        let (prog, errors) = try_parse_recovering(src);
+        assert!(!errors.is_empty(), "program body error should be reported");
+        let TopDecl::Program(program) = &prog.decls[0] else {
+            panic!("expected program decl");
+        };
+        assert!(
+            program
+                .items
+                .iter()
+                .any(|item| matches!(item, crate::ast::ProgramItem::Error(_))),
+            "program body should retain an explicit error item"
+        );
+        assert!(
+            program.items.iter().any(|item| matches!(
+                item,
+                crate::ast::ProgramItem::Let(_)
+                    | crate::ast::ProgramItem::UseProc(_)
+                    | crate::ast::ProgramItem::Invariant(_)
+                    | crate::ast::ProgramItem::Proc(_)
+            )),
+            "parser should recover and keep later valid program items after malformed {case} item"
+        );
+    }
+}
+
+#[test]
+fn recovery_retains_error_nodes_inside_program_body() {
+    let src = r#"
+program Checkout {
+  command bad
+  let checkout = CheckoutSystem { orders: orders }
+  use Flow(checkout)
+  invariant safe { true }
+  proc Flow(checkout: CheckoutSystem) {
+    step = checkout.reserve()
+  }
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "broken program body should report an error"
+    );
+    let TopDecl::Program(program) = &prog.decls[0] else {
+        panic!("expected program decl");
+    };
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProgramItem::Error(_))),
+        "program body should retain an explicit error item"
+    );
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProgramItem::Let(_))),
+        "parser should recover and keep later let items"
+    );
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProgramItem::UseProc(_))),
+        "parser should recover and keep later use items"
+    );
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProgramItem::Invariant(_))),
+        "parser should recover and keep later invariant items"
+    );
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProgramItem::Proc(_))),
+        "parser should recover and keep later proc items"
+    );
+}
+
+#[test]
+fn recovery_retains_error_node_inside_proc_body() {
+    let src = r#"
+proc Flow() {
+  then;
+  step = Store.reserve()
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "broken proc body should report an error"
+    );
+    let TopDecl::Proc(proc_decl) = &prog.decls[0] else {
+        panic!("expected proc decl");
+    };
+    assert!(
+        proc_decl
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProcItem::Error(_))),
+        "proc body should retain an explicit error item"
+    );
+    assert!(
+        proc_decl
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::ast::ProcItem::Node { .. })),
+        "parser should recover and keep later valid proc items"
+    );
+}
+
+#[test]
+fn recovery_retains_error_node_inside_command_body() {
+    let src = r#"
+system S {
+  command run() {
+    given ready
+    let ok = Other::ping()
+  }
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "broken command body should report an error"
+    );
+    let TopDecl::System(system) = &prog.decls[0] else {
+        panic!("expected system decl");
+    };
+    let body_items = system
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemItem::Command(command) => command.body.as_ref().map(|body| &body.items),
+            _ => None,
+        })
+        .expect("expected command body");
+    assert!(
+        body_items
+            .iter()
+            .any(|item| matches!(item, EventItem::Error(_))),
+        "command body should retain an explicit error item"
+    );
+    assert!(
+        body_items
+            .iter()
+            .any(|item| matches!(item, EventItem::LetCall(_))),
+        "parser should recover and keep later command body items"
+    );
+}
+
+#[test]
+fn recovery_retains_error_node_inside_nested_event_blocks() {
+    let src = r#"
+system S {
+  command run() {
+    match result {
+      ok => {
+        given;
+        let kept = Other::ping()
+      }
+    }
+    choose item: Item where true {
+      given;
+      let kept_choice = Other::ping()
+    }
+    for item: Item {
+      given;
+      let kept_for = Other::ping()
+    }
+  }
+}
+"#;
+    let (prog, errors) = try_parse_recovering(src);
+    assert!(
+        !errors.is_empty(),
+        "nested event body errors should be reported"
+    );
+    let TopDecl::System(system) = &prog.decls[0] else {
+        panic!("expected system decl");
+    };
+    let body_items = system
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemItem::Command(command) => command.body.as_ref().map(|body| &body.items),
+            _ => None,
+        })
+        .expect("expected command body");
+
+    let match_block = body_items
+        .iter()
+        .find_map(|item| match item {
+            EventItem::Match(block) => Some(block),
+            _ => None,
+        })
+        .expect("expected match block");
+    let arm_items = &match_block.arms[0].items;
+    assert!(
+        arm_items
+            .iter()
+            .any(|item| matches!(item, EventItem::Error(_))),
+        "match arm should retain an explicit error item"
+    );
+    assert!(
+        arm_items
+            .iter()
+            .any(|item| matches!(item, EventItem::LetCall(_))),
+        "match arm should recover and keep later valid items"
+    );
+
+    let choose = body_items
+        .iter()
+        .find_map(|item| match item {
+            EventItem::Choose(block) => Some(block),
+            _ => None,
+        })
+        .expect("expected choose block");
+    assert!(
+        choose
+            .body
+            .iter()
+            .any(|item| matches!(item, EventItem::Error(_))),
+        "choose body should retain an explicit error item"
+    );
+    assert!(
+        choose
+            .body
+            .iter()
+            .any(|item| matches!(item, EventItem::LetCall(_))),
+        "choose body should recover and keep later valid items"
+    );
+
+    let for_block = body_items
+        .iter()
+        .find_map(|item| match item {
+            EventItem::For(block) => Some(block),
+            _ => None,
+        })
+        .expect("expected for block");
+    assert!(
+        for_block
+            .body
+            .iter()
+            .any(|item| matches!(item, EventItem::Error(_))),
+        "for body should retain an explicit error item"
+    );
+    assert!(
+        for_block
+            .body
+            .iter()
+            .any(|item| matches!(item, EventItem::LetCall(_))),
+        "for body should recover and keep later valid items"
     );
 }
 
@@ -3276,6 +4530,59 @@ fn field_defaults_accept_core_expression_forms() {
 }
 
 #[test]
+fn field_decl_without_default_leaves_next_system_item_intact() {
+    let src = r"
+        system S {
+            screen: int
+            command refresh() {}
+        }
+    ";
+    let prog = parse_program(src);
+    match &prog.decls[0] {
+        TopDecl::System(system) => {
+            assert_eq!(system.items.len(), 2);
+            let SystemItem::Field(field) = &system.items[0] else {
+                panic!("expected first item to be a field: {:?}", system.items);
+            };
+            assert!(
+                field.default.is_none(),
+                "field without `=` should not parse the next item as a default"
+            );
+            assert!(
+                matches!(system.items[1], SystemItem::Command(_)),
+                "command after field without default should remain a system item: {:?}",
+                system.items
+            );
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+}
+
+#[test]
+fn field_decl_in_default_accepts_trailing_comma() {
+    let src = r"
+        system S {
+            screen: int in { 1, 2, }
+        }
+    ";
+    let prog = parse_program(src);
+    match &prog.decls[0] {
+        TopDecl::System(system) => {
+            let SystemItem::Field(field) = &system.items[0] else {
+                panic!("expected first item to be a field: {:?}", system.items);
+            };
+            let Some(FieldDefault::In(values)) = &field.default else {
+                panic!("expected finite `in` field default: {:?}", field.default);
+            };
+            assert_eq!(values.len(), 2);
+            assert!(matches!(values[0].kind, ExprKind::Int(1)));
+            assert!(matches!(values[1].kind, ExprKind::Int(2)));
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+}
+
+#[test]
 fn pub_keyword_is_not_a_declaration_modifier() {
     let err = parse_program_err("pub enum OrderStatus = Pending | Paid");
     assert!(
@@ -3375,6 +4682,57 @@ program Shop(orders: Store<Order>) {
             assert_eq!(use_decl.alias.as_deref(), Some("charge_flow"));
         }
         other => panic!("expected proc use item, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_proc_composition_chain_desugars_to_adjacent_needs_edges() {
+    let prog = parse_program(
+        r"
+program Shop(orders: Store<Order>) {
+  proc checkout(order: Order) {
+    charge.ok -> ship -> notify
+  }
+}
+",
+    );
+
+    let TopDecl::Program(program) = &prog.decls[0] else {
+        panic!("expected program decl");
+    };
+    let crate::ast::ProgramItem::Proc(proc_decl) = &program.items[0] else {
+        panic!("expected proc decl");
+    };
+    assert_eq!(proc_decl.items.len(), 2);
+    match &proc_decl.items[0] {
+        crate::ast::ProcItem::NeedsEdge {
+            target, condition, ..
+        } => {
+            assert_eq!(target, "ship");
+            assert!(matches!(
+                condition,
+                crate::ast::ProcDepCond::Fact {
+                    node,
+                    qualifier: Some(port)
+                } if node == "charge" && port == "ok"
+            ));
+        }
+        other => panic!("expected first needs edge, got {other:?}"),
+    }
+    match &proc_decl.items[1] {
+        crate::ast::ProcItem::NeedsEdge {
+            target, condition, ..
+        } => {
+            assert_eq!(target, "notify");
+            assert!(matches!(
+                condition,
+                crate::ast::ProcDepCond::Fact {
+                    node,
+                    qualifier: None
+                } if node == "ship"
+            ));
+        }
+        other => panic!("expected second needs edge, got {other:?}"),
     }
 }
 

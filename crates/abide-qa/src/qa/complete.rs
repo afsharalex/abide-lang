@@ -73,10 +73,18 @@ mod tests {
 
     #[test]
     fn qa_command_candidates_include_current_parser_commands() {
+        let candidates = qa_command_candidates();
+        let expected: Vec<String> = QA_COMMANDS
+            .iter()
+            .map(|command| (*command).into())
+            .collect();
+        assert_eq!(candidates, expected);
+
         for command in [
             "abide",
             "ask",
             "assert",
+            "explain",
             "load",
             "verify",
             "simulate",
@@ -97,6 +105,13 @@ mod tests {
 
     #[test]
     fn qa_query_subcommand_candidates_include_current_parser_queries() {
+        let candidates = qa_query_subcommand_candidates();
+        let expected: Vec<String> = QA_QUERY_SUBCOMMANDS
+            .iter()
+            .map(|subcommand| (*subcommand).into())
+            .collect();
+        assert_eq!(candidates, expected);
+
         for subcommand in [
             "reachable",
             "terminal",

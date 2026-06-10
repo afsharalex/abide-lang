@@ -667,3 +667,350 @@ pub(super) fn populate_assumption_set_from_items(
     }
     set.normalize();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{AssumeBlock, AssumeItem, ByLemmaRef, EventPath, Visibility};
+    use crate::elab::env::{DeclInfo, DeclKind};
+    use crate::elab::types::{
+        AssumptionSet, ELemma, ELetBinding, ESystem, ESystemAction, ETheorem, EVerify, EventRef,
+        StutterProvenance, Ty,
+    };
+    use crate::span::Span;
+    use std::collections::HashMap;
+
+    fn span(start: usize) -> Span {
+        Span {
+            start,
+            end: start + 1,
+        }
+    }
+
+    fn event_path(segments: &[&str]) -> EventPath {
+        EventPath {
+            segments: segments
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect(),
+            span: span(1),
+        }
+    }
+
+    fn assume_block(items: Vec<AssumeItem>) -> AssumeBlock {
+        AssumeBlock {
+            items,
+            span: span(0),
+        }
+    }
+
+    fn system_with_actions() -> ESystem {
+        ESystem {
+            name: "S".to_owned(),
+            implements: None,
+            deps: vec![],
+            fields: vec![],
+            store_params: vec![],
+            scopes: vec![],
+            commands: vec![],
+            actions: vec![
+                ESystemAction {
+                    name: "tick".to_owned(),
+                    params: vec![],
+                    requires: vec![],
+                    body: vec![],
+                    return_expr: None,
+                    span: None,
+                },
+                ESystemAction {
+                    name: "param_tick".to_owned(),
+                    params: vec![(
+                        "n".to_owned(),
+                        Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                    )],
+                    requires: vec![],
+                    body: vec![],
+                    return_expr: None,
+                    span: None,
+                },
+            ],
+            queries: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+            proc_uses: vec![],
+            span: None,
+        }
+    }
+
+    fn verify_with_assume(block: AssumeBlock) -> EVerify {
+        EVerify {
+            name: "v".to_owned(),
+            depth: None,
+            stores: vec![],
+            proc_bounds: vec![],
+            let_bindings: vec![ELetBinding {
+                name: "s".to_owned(),
+                system_type: "S".to_owned(),
+                store_bindings: vec![],
+            }],
+            activations: vec![],
+            initial_constraints: vec![],
+            assume_block: Some(block),
+            assumption_set: AssumptionSet::default_for_verify(),
+            asserts: vec![],
+            span: None,
+            file: None,
+        }
+    }
+
+    fn lemma(name: &str, set: AssumptionSet) -> ELemma {
+        ELemma {
+            name: name.to_owned(),
+            assume_block: None,
+            enclosing_under_idx: None,
+            assumption_set: set,
+            body: vec![],
+            span: None,
+            file: None,
+        }
+    }
+
+    fn theorem(name: &str, set: AssumptionSet, by_lemmas: Vec<ByLemmaRef>) -> ETheorem {
+        ETheorem {
+            name: name.to_owned(),
+            targets: vec!["S".to_owned()],
+            assume_block: None,
+            enclosing_under_idx: None,
+            assumption_set: set,
+            invariants: vec![],
+            shows: vec![],
+            by_file: None,
+            by_lemmas,
+            span: None,
+            file: None,
+        }
+    }
+
+    fn decl(kind: DeclKind, name: &str, module: Option<&str>) -> DeclInfo {
+        DeclInfo {
+            kind,
+            name: name.to_owned(),
+            ty: None,
+            visibility: Visibility::Private,
+            module: module.map(str::to_owned),
+            span: None,
+            file: None,
+        }
+    }
+
+    fn by_ref(segments: &[&str]) -> ByLemmaRef {
+        ByLemmaRef {
+            segments: segments
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect(),
+            span: span(3),
+        }
+    }
+
+    #[test]
+    fn assumption_resolve_populates_verify_fairness_and_per_tuple() {
+        let mut env = Env::new();
+        env.systems.insert("S".to_owned(), system_with_actions());
+        env.verifies.push(verify_with_assume(assume_block(vec![
+            AssumeItem::NoStutter { span: span(10) },
+            AssumeItem::StrongFair {
+                path: event_path(&["S", "param_tick"]),
+                span: span(11),
+            },
+        ])));
+
+        resolve_assumption_sets(&mut env);
+
+        let set = &env.verifies[0].assumption_set;
+        assert!(!set.stutter);
+        assert_eq!(set.stutter_provenance, StutterProvenance::ExplicitNoStutter);
+        let param_event = EventRef::new("S", "param_tick");
+        assert!(set.strong_fair.contains(&param_event));
+        assert!(
+            set.per_tuple.contains(&param_event),
+            "parameterized fair actions should default to per-tuple fairness"
+        );
+        assert!(env.errors.is_empty(), "unexpected errors: {:?}", env.errors);
+    }
+
+    #[test]
+    fn assumption_merge_delta_applies_explicit_stutter_and_fairness_sets() {
+        let system_events = HashMap::from([(
+            "S".to_owned(),
+            HashMap::from([("tick".to_owned(), false), ("param_tick".to_owned(), true)]),
+        )]);
+        let mut errors = Vec::new();
+        let delta = build_assume_delta(
+            &assume_block(vec![
+                AssumeItem::Stutter { span: span(20) },
+                AssumeItem::Fair {
+                    path: event_path(&["S", "tick"]),
+                    span: span(21),
+                },
+                AssumeItem::StrongFair {
+                    path: event_path(&["S", "param_tick"]),
+                    span: span(22),
+                },
+            ]),
+            &["S".to_owned()],
+            &system_events,
+            &mut errors,
+        );
+        let mut set = AssumptionSet::default_for_verify();
+        set.stutter = false;
+        set.stutter_provenance = StutterProvenance::ExplicitNoStutter;
+
+        merge_delta_into(&delta, &mut set);
+        set.normalize();
+
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+        assert!(set.stutter);
+        assert_eq!(set.stutter_provenance, StutterProvenance::ExplicitStutter);
+        assert!(set.weak_fair.contains(&EventRef::new("S", "tick")));
+        assert!(set.strong_fair.contains(&EventRef::new("S", "param_tick")));
+        assert!(set.per_tuple.contains(&EventRef::new("S", "param_tick")));
+    }
+
+    #[test]
+    fn assumption_under_add_only_rejects_stutter_toggle_and_strong_to_weak_downgrade() {
+        let mut under = AssumptionSet::default_for_theorem_or_lemma();
+        under.stutter = true;
+        under.strong_fair.insert(EventRef::new("S", "tick"));
+        let delta = AssumeDelta {
+            explicit_stutter: Some((false, span(30))),
+            weak_fair: vec![(EventRef::new("S", "tick"), span(31))],
+            strong_fair: vec![],
+            per_tuple: Default::default(),
+        };
+        let mut errors = Vec::new();
+
+        check_under_add_only_resolved(&under, &delta, &mut errors);
+
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|error| error.message.contains("toggle")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("downgrade")));
+    }
+
+    #[test]
+    fn assumption_by_lemma_resolution_rejects_bad_paths_and_cross_module_refs() {
+        let mut env = Env::new();
+        env.module_name = Some("A".to_owned());
+        env.systems.insert("S".to_owned(), system_with_actions());
+        env.lemmas.push(lemma(
+            "local_helper",
+            AssumptionSet::default_for_theorem_or_lemma(),
+        ));
+        env.decls.insert(
+            "A::local_helper".to_owned(),
+            decl(DeclKind::Lemma, "local_helper", Some("A")),
+        );
+        env.decls.insert(
+            "A::not_a_lemma".to_owned(),
+            decl(DeclKind::Theorem, "not_a_lemma", Some("A")),
+        );
+        env.decls.insert(
+            "B::foreign_helper".to_owned(),
+            decl(DeclKind::Lemma, "foreign_helper", Some("B")),
+        );
+        env.theorems.push(theorem(
+            "main",
+            AssumptionSet::default_for_theorem_or_lemma(),
+            vec![
+                by_ref(&[]),
+                by_ref(&["A", "B", "too_deep"]),
+                by_ref(&["missing"]),
+                by_ref(&["not_a_lemma"]),
+                by_ref(&["B", "foreign_helper"]),
+            ],
+        ));
+
+        resolve_by_lemmas_subset_containment(&mut env);
+
+        assert_eq!(
+            env.errors.len(),
+            5,
+            "expected one diagnostic per invalid by reference, got {:?}",
+            env.errors
+        );
+        assert!(env
+            .errors
+            .iter()
+            .any(|error| error.message.contains("must be `name` or `Mod::name`")));
+        assert!(env
+            .errors
+            .iter()
+            .any(|error| error.message.contains("is not a declared lemma")));
+        assert!(env
+            .errors
+            .iter()
+            .any(|error| error.message.contains("not a lemma")));
+        assert!(env
+            .errors
+            .iter()
+            .any(|error| error.message.contains("cross-module")));
+    }
+
+    #[test]
+    fn assumption_by_lemma_resolution_accepts_usable_local_lemma() {
+        let mut env = Env::new();
+        env.module_name = Some("A".to_owned());
+        env.systems.insert("S".to_owned(), system_with_actions());
+        let mut lemma_set = AssumptionSet::default_for_theorem_or_lemma();
+        lemma_set.weak_fair.insert(EventRef::new("S", "tick"));
+        env.lemmas.push(lemma("helper", lemma_set));
+        env.decls.insert(
+            "A::helper".to_owned(),
+            decl(DeclKind::Lemma, "helper", Some("A")),
+        );
+        let mut theorem_set = AssumptionSet::default_for_theorem_or_lemma();
+        theorem_set.strong_fair.insert(EventRef::new("S", "tick"));
+        env.theorems
+            .push(theorem("main", theorem_set, vec![by_ref(&["helper"])]));
+
+        resolve_by_lemmas_subset_containment(&mut env);
+
+        assert!(
+            env.errors.is_empty(),
+            "usable local lemma should not produce diagnostics: {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn assumption_format_and_missing_list_are_canonical() {
+        let mut lemma_set = AssumptionSet::default_for_theorem_or_lemma();
+        lemma_set.stutter = false;
+        lemma_set.stutter_provenance = StutterProvenance::ExplicitNoStutter;
+        lemma_set.weak_fair.insert(EventRef::new("S", "weak"));
+        lemma_set.strong_fair.insert(EventRef::new("S", "strong"));
+
+        let mut theorem_set = AssumptionSet::default_for_theorem_or_lemma();
+        theorem_set.weak_fair.insert(EventRef::new("S", "other"));
+
+        assert_eq!(
+            format_assumption_set(&lemma_set),
+            "no stutter, fair S::weak, strong fair S::strong"
+        );
+        assert_eq!(
+            compute_missing(&lemma_set, &theorem_set),
+            "no stutter, strong fair S::strong, fair S::weak"
+        );
+
+        theorem_set.stutter = false;
+        theorem_set.strong_fair.insert(EventRef::new("S", "strong"));
+        theorem_set.strong_fair.insert(EventRef::new("S", "weak"));
+        assert_eq!(compute_missing(&lemma_set, &theorem_set), "<none>");
+    }
+}

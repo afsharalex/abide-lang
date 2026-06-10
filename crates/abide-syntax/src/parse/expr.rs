@@ -44,6 +44,38 @@ fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
     Expr { kind, span }
 }
 
+pub(super) fn is_infix_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::PipeGt
+            | Token::Pipe
+            | Token::PipePipe
+            | Token::CaretPipe
+            | Token::Arrow
+            | Token::Amp
+            | Token::Implies
+            | Token::Until
+            | Token::Since
+            | Token::Eq
+            | Token::Or
+            | Token::And
+            | Token::EqEq
+            | Token::BangEq
+            | Token::In
+            | Token::Lt
+            | Token::Gt
+            | Token::LtEq
+            | Token::GtEq
+            | Token::Plus
+            | Token::Minus
+            | Token::Star
+            | Token::Slash
+            | Token::Percent
+            | Token::Diamond
+            | Token::BangStar
+    )
+}
+
 fn make_set_comp(
     start: Span,
     end: Span,
@@ -109,6 +141,9 @@ impl Parser {
             }
 
             // Infix operators (skip `in` when inside let binding values)
+            if !self.peek().is_some_and(is_infix_operator_token) {
+                break;
+            }
             if let Some((l_bp, r_bp)) = self.peek().and_then(|t| {
                 if self.no_in && matches!(t, Token::In) {
                     None
@@ -701,9 +736,10 @@ impl Parser {
     }
 
     fn try_simple_set_comprehension(&mut self, start: Span) -> Result<Option<Expr>, ParseError> {
-        if !matches!(self.peek(), Some(Token::Name(_)))
-            || !matches!(self.peek_at(1), Some(Token::Colon) | Some(Token::In))
-        {
+        if !matches!(self.peek(), Some(Token::Name(_))) {
+            return Ok(None);
+        }
+        if !matches!(self.peek_at(1), Some(Token::Colon) | Some(Token::In)) {
             return Ok(None);
         }
         let saved = self.pos;

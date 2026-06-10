@@ -713,14 +713,47 @@ mod tests {
     }
 
     #[test]
+    fn relation_validate_rejects_tampered_internal_shape() {
+        let mismatched = RelationInstance {
+            arity: 2,
+            tuples: vec![TupleValue::new(vec![WitnessValue::Int(1)])],
+        };
+        assert_eq!(
+            mismatched.validate(),
+            Err(ValidationError::TupleArityMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+
+        let duplicate = RelationInstance {
+            arity: 1,
+            tuples: vec![
+                TupleValue::new(vec![WitnessValue::Int(1)]),
+                TupleValue::new(vec![WitnessValue::Int(1)]),
+            ],
+        };
+        assert_eq!(duplicate.validate(), Err(ValidationError::DuplicateTuple));
+    }
+
+    #[test]
     fn state_exposes_relations_as_primary_representation() {
         let state = sample_state();
         assert!(!state.relation_instances().is_empty());
         assert!(state.store_extent("orders").is_some());
         assert!(state.field_relation("Order", "status").is_some());
+        assert_eq!(
+            state.evaluations().get("cardinality"),
+            Some(&WitnessValue::Int(1))
+        );
+
+        let derived_id = RelationId::derived("cardinality_relation").expect("valid id");
+        let derived = state.relation(&derived_id).expect("derived relation");
+        assert_eq!(derived.arity(), 1);
+        assert_eq!(derived.tuples()[0].values(), &[WitnessValue::Int(1)]);
         assert!(state
-            .relation(&RelationId::derived("cardinality_relation").expect("valid id"))
-            .is_some());
+            .relation(&RelationId::named("missing").expect("valid id"))
+            .is_none());
     }
 
     #[test]
@@ -749,6 +782,188 @@ mod tests {
         assert_eq!(
             err,
             ValidationError::FieldRelationArityMismatch { actual: 1 }
+        );
+    }
+
+    #[test]
+    fn relational_state_validate_rejects_tampered_payloads() {
+        let duplicate_id = RelationId::named("dupe").expect("valid id");
+        let relation = RelationInstance::builder(1)
+            .tuple(TupleValue::new(vec![WitnessValue::Int(1)]))
+            .expect("valid tuple")
+            .build()
+            .expect("valid relation");
+        let duplicate_state = RelationalState {
+            relations: vec![
+                NamedRelationInstance::new(duplicate_id.clone(), relation.clone()),
+                NamedRelationInstance::new(duplicate_id, relation),
+            ],
+            evaluations: BTreeMap::new(),
+        };
+        assert_eq!(
+            duplicate_state.validate(),
+            Err(ValidationError::DuplicateRelationId)
+        );
+
+        let invalid_eval_state = RelationalState {
+            relations: Vec::new(),
+            evaluations: BTreeMap::from([(" ".to_owned(), WitnessValue::Bool(true))]),
+        };
+        assert_eq!(
+            invalid_eval_state.validate(),
+            Err(ValidationError::EmptyEvaluationName)
+        );
+    }
+
+    #[test]
+    fn extent_member_appends_and_deduplicates_store_members() {
+        let state = RelationalState::builder()
+            .extent_member("orders", EntitySlotRef::new("Order", 0))
+            .expect("first member")
+            .extent_member("orders", EntitySlotRef::new("Order", 1))
+            .expect("second member")
+            .extent_member("orders", EntitySlotRef::new("Order", 1))
+            .expect("duplicate member is ignored")
+            .build()
+            .expect("valid state");
+
+        let extent = state.store_extent("orders").expect("orders extent");
+        assert_eq!(extent.arity(), 1);
+        assert_eq!(extent.tuples().len(), 2);
+        assert_eq!(
+            extent.tuples()[1].values(),
+            &[WitnessValue::SlotRef(EntitySlotRef::new("Order", 1))]
+        );
+    }
+
+    #[test]
+    fn extent_member_updates_matching_store_relation_only() {
+        let named = RelationInstance::builder(1)
+            .tuple(TupleValue::new(vec![WitnessValue::Int(9)]))
+            .expect("valid tuple")
+            .build()
+            .expect("valid relation");
+        let existing_extent = RelationInstance::builder(1)
+            .tuple(TupleValue::new(vec![WitnessValue::SlotRef(
+                EntitySlotRef::new("Order", 0),
+            )]))
+            .expect("valid tuple")
+            .build()
+            .expect("valid extent");
+
+        let state = RelationalStateBuilder {
+            relations: vec![NamedRelationInstance::new(
+                RelationId::named("not_orders").expect("valid id"),
+                named,
+            )],
+            evaluations: BTreeMap::new(),
+        }
+        .store_extent("orders", existing_extent)
+        .expect("store extent")
+        .extent_member("orders", EntitySlotRef::new("Order", 1))
+        .expect("new member")
+        .build()
+        .expect("valid state");
+
+        assert_eq!(
+            state
+                .relation(&RelationId::named("not_orders").expect("valid id"))
+                .expect("named relation")
+                .tuples()
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .store_extent("orders")
+                .expect("orders extent")
+                .tuples()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn extent_member_rejects_tampered_store_relation_arity() {
+        let builder = RelationalStateBuilder {
+            relations: vec![NamedRelationInstance::new(
+                RelationId::store_extent("orders").expect("valid id"),
+                RelationInstance {
+                    arity: 2,
+                    tuples: Vec::new(),
+                },
+            )],
+            evaluations: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            builder
+                .extent_member("orders", EntitySlotRef::new("Order", 0))
+                .expect_err("store extent arity mismatch"),
+            ValidationError::StoreExtentArityMismatch { actual: 2 }
+        );
+    }
+
+    #[test]
+    fn temporal_accessors_preserve_states_and_loop_start() {
+        let first = sample_state();
+        let second = sample_state();
+        let temporal = TemporalRelationalWitness::new(vec![first.clone(), second], Some(0))
+            .expect("valid temporal witness");
+
+        assert_eq!(temporal.states().len(), 2);
+        assert_eq!(temporal.states()[0], first);
+        assert_eq!(temporal.loop_start(), Some(0));
+    }
+
+    #[test]
+    fn temporal_validate_rejects_tampered_empty_payload() {
+        let temporal = TemporalRelationalWitness {
+            states: Vec::new(),
+            loop_start: None,
+        };
+
+        assert_eq!(
+            temporal.validate(),
+            Err(ValidationError::EmptyStateSequence)
+        );
+    }
+
+    #[test]
+    fn relational_witness_accessors_and_validate_preserve_variant_shape() {
+        let state = sample_state();
+        let snapshot = RelationalWitness::Snapshot(state.clone());
+        assert_eq!(snapshot.as_snapshot(), Some(&state));
+        assert_eq!(snapshot.as_temporal(), None);
+        assert_eq!(snapshot.validate(), Ok(()));
+
+        let invalid = RelationalWitness::Snapshot(RelationalState {
+            relations: Vec::new(),
+            evaluations: BTreeMap::from([("".to_owned(), WitnessValue::Bool(false))]),
+        });
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::EmptyEvaluationName)
+        );
+    }
+
+    #[test]
+    fn validation_error_display_includes_relational_context() {
+        assert_eq!(
+            ValidationError::TupleArityMismatch {
+                expected: 2,
+                actual: 1,
+            }
+            .to_string(),
+            "relation tuple arity mismatch: expected 2, got 1"
+        );
+        assert_eq!(
+            ValidationError::LoopOutOfBounds {
+                loop_start: 3,
+                states_len: 2,
+            }
+            .to_string(),
+            "relational loop start 3 is out of bounds for 2 states"
         );
     }
 }

@@ -389,7 +389,45 @@ fn format_circular_chain(chain: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::elab::error::{ElabError, ErrorKind};
     use std::io::Write;
+
+    #[test]
+    fn tag_file_errors_only_tags_new_untagged_errors() {
+        let mut env = Env::new();
+        env.errors.push(
+            ElabError::new(ErrorKind::UndefinedRef, "old", "old context")
+                .in_file("already-tagged.ab"),
+        );
+        env.errors.push(ElabError::new(
+            ErrorKind::DuplicateDecl,
+            "new",
+            "new context",
+        ));
+
+        tag_file_errors(&mut env, 1, Path::new("new-file.ab"));
+
+        assert_eq!(env.errors[0].file.as_deref(), Some("already-tagged.ab"));
+        assert_eq!(env.errors[1].file.as_deref(), Some("new-file.ab"));
+    }
+
+    #[test]
+    fn file_scope_restores_parent_module_and_file_after_include() {
+        let mut env = Env::new();
+        env.module_name = Some("Parent".to_owned());
+        env.current_file = Some("parent.ab".to_owned());
+
+        let scope = enter_file_scope(&mut env, Path::new("child.ab"), Some("Parent"));
+        assert_eq!(env.module_name.as_deref(), Some("Parent"));
+        assert!(env.module_inherited);
+        assert_eq!(env.current_file.as_deref(), Some("child.ab"));
+
+        restore_file_scope(&mut env, scope);
+
+        assert_eq!(env.module_name.as_deref(), Some("Parent"));
+        assert!(!env.module_inherited);
+        assert_eq!(env.current_file.as_deref(), Some("parent.ab"));
+    }
 
     #[test]
     fn circular_include_detected() {
@@ -474,6 +512,24 @@ mod tests {
                 .is_some_and(|help| help.contains("break the cycle")),
             "expected circular include help text, got: {:?}",
             diagnostic[0]
+        );
+        assert_eq!(
+            diagnostic[0].message,
+            "circular include detected: a.ab → b.ab → a.ab"
+        );
+    }
+
+    #[test]
+    fn circular_include_message_lists_the_cycle_chain() {
+        let message = format_circular_chain(&[
+            PathBuf::from("one.ab"),
+            PathBuf::from("nested/two.ab"),
+            PathBuf::from("one.ab"),
+        ]);
+
+        assert_eq!(
+            message,
+            "circular include detected: one.ab → nested/two.ab → one.ab"
         );
     }
 
@@ -720,6 +776,30 @@ mod tests {
         assert!(
             env.known_modules.contains("Alpha") && env.known_modules.contains("Beta"),
             "both module names should still be known: {:?}",
+            env.known_modules
+        );
+    }
+
+    #[test]
+    fn single_top_level_file_preserves_declared_root_module() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+
+        let path = dir.path().join("root.ab");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "module Root").unwrap();
+        writeln!(file, "enum Status = Open").unwrap();
+
+        let (env, load_errors, _) = load_files(&[path]);
+
+        assert!(load_errors.is_empty(), "single root should load");
+        assert_eq!(
+            env.module_name.as_deref(),
+            Some("Root"),
+            "a single top-level file remains the root module"
+        );
+        assert!(
+            env.known_modules.contains("Root"),
+            "declared root module should be known: {:?}",
             env.known_modules
         );
     }

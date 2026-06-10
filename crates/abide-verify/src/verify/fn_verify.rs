@@ -55,6 +55,18 @@ fn new_timed_solver() -> AbideSolver {
     solver
 }
 
+fn fn_solver_timeout_ms(config: &VerifyConfig, deadline: Option<Instant>) -> u64 {
+    remaining_budget_ms(deadline)
+        .map(|remaining| {
+            if config.induction_timeout_ms == 0 {
+                remaining
+            } else {
+                config.induction_timeout_ms.min(remaining)
+            }
+        })
+        .unwrap_or(config.induction_timeout_ms)
+}
+
 type RecursiveCallSite = (
     Vec<Bool>,
     Vec<IRExpr>,
@@ -168,16 +180,7 @@ pub(super) fn verify_fn_contracts(
             });
             continue;
         }
-        let effective_timeout_ms = remaining_budget_ms(deadline)
-            .map(|remaining| {
-                if config.induction_timeout_ms == 0 {
-                    remaining
-                } else {
-                    config.induction_timeout_ms.min(remaining)
-                }
-            })
-            .unwrap_or(config.induction_timeout_ms);
-        set_fn_solver_timeout_ms(effective_timeout_ms);
+        set_fn_solver_timeout_ms(fn_solver_timeout_ms(config, deadline));
         // Skip props (system-level properties, not fn contracts)
         if func.prop_target.is_some() {
             continue;
@@ -1462,12 +1465,15 @@ fn verify_fn_termination(
     // Check each recursive call site
     for (path_conds, actual_args, call_env, call_span) in &call_sites {
         // Evaluate actual arg values in the call-site env
+        debug_assert_eq!(
+            actual_args.len(),
+            params.len(),
+            "recursive call collection records only full-arity self-calls"
+        );
         let mut substituted_env = env.clone();
         for (i, (param_name, _)) in params.iter().enumerate() {
-            if i < actual_args.len() {
-                let val = encode_pure_expr(&actual_args[i], call_env, vctx, defs)?;
-                substituted_env.insert(param_name.clone(), val);
-            }
+            let val = encode_pure_expr(&actual_args[i], call_env, vctx, defs)?;
+            substituted_env.insert(param_name.clone(), val);
         }
 
         // Evaluate measures with actual args
@@ -1779,4 +1785,263 @@ pub(super) fn encode_imperative_if_else(
 
     // The value of the if/else expression
     encode_ite(&cond_bool, &then_val, &else_val).map_err(FnContractError::EncodingError)
+}
+
+#[cfg(test)]
+mod fn_contract_residual_mutation_tests {
+    use super::*;
+    use crate::ir::types::{IRProgram, IRType, LitVal};
+
+    fn empty_ir() -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            interfaces: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn int_var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }
+    }
+
+    fn assign(name: &str, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(int_var(name)),
+            right: Box::new(right),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn add_expr(name: &str, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: "OpAdd".to_owned(),
+            left: Box::new(int_var(name)),
+            right: Box::new(right),
+            ty: IRType::Int,
+            span: None,
+        }
+    }
+
+    fn int_fn_var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Fn {
+                param: Box::new(IRType::Int),
+                result: Box::new(IRType::Int),
+            },
+            span: None,
+        }
+    }
+
+    fn int_app(func: IRExpr, arg: IRExpr) -> IRExpr {
+        IRExpr::App {
+            func: Box::new(func),
+            arg: Box::new(arg),
+            ty: IRType::Int,
+            span: None,
+        }
+    }
+
+    #[test]
+    fn fn_contract_timed_solver_applies_positive_timeout_and_skips_zero() {
+        FN_SOLVER_TIMEOUT_MS.with(|cell| cell.set(0));
+        set_fn_solver_timeout_ms(250);
+        assert_eq!(new_timed_solver().configured_timeout_ms(), Some(250));
+
+        FN_SOLVER_TIMEOUT_MS.with(|cell| cell.set(0));
+        assert_eq!(new_timed_solver().configured_timeout_ms(), None);
+    }
+
+    #[test]
+    fn fn_contract_solver_timeout_uses_deadline_when_generic_timeout_is_zero() {
+        let config = VerifyConfig {
+            induction_timeout_ms: 0,
+            ..VerifyConfig::default()
+        };
+        let deadline = Some(Instant::now() + std::time::Duration::from_millis(2_000));
+
+        let timeout_ms = fn_solver_timeout_ms(&config, deadline);
+
+        assert!(
+            timeout_ms > 0,
+            "generic zero timeout should use the remaining deadline budget"
+        );
+    }
+
+    #[test]
+    fn fn_contract_solver_timeout_clamps_generic_timeout_to_remaining_budget() {
+        let config = VerifyConfig {
+            induction_timeout_ms: 10_000,
+            ..VerifyConfig::default()
+        };
+        let deadline = Some(Instant::now() + std::time::Duration::from_millis(10));
+
+        let timeout_ms = fn_solver_timeout_ms(&config, deadline);
+
+        assert!(timeout_ms <= config.induction_timeout_ms);
+        assert!(
+            timeout_ms < 10_000,
+            "generic timeout should be clamped to the smaller remaining budget"
+        );
+    }
+
+    #[test]
+    fn fn_contract_collect_modified_vars_descends_through_structural_loop_body_nodes() {
+        let body = IRExpr::Block {
+            exprs: vec![
+                IRExpr::VarDecl {
+                    name: "tmp".to_owned(),
+                    ty: IRType::Int,
+                    init: Box::new(int_lit(0)),
+                    rest: Box::new(assign("after_decl", int_lit(1))),
+                    span: None,
+                },
+                IRExpr::While {
+                    cond: Box::new(bool_lit(false)),
+                    invariants: vec![],
+                    decreases: None,
+                    body: Box::new(assign("inside_loop", int_lit(2))),
+                    span: None,
+                },
+                add_expr("not_modified", int_lit(3)),
+            ],
+            span: None,
+        };
+
+        let mut modified = Vec::new();
+        collect_modified_vars(&body, &mut modified);
+        modified.sort();
+
+        assert_eq!(
+            modified,
+            vec!["after_decl".to_owned(), "inside_loop".to_owned()]
+        );
+    }
+
+    #[test]
+    fn fn_contract_execute_loop_body_ignores_non_assignment_binary_expressions() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let original = make_z3_var("x", &IRType::Int).expect("int var");
+        let original_repr = format!("{original:?}");
+        let mut env = HashMap::from([("x".to_owned(), original)]);
+        let mut constraints = Vec::new();
+
+        let result = execute_loop_body(
+            &add_expr("x", int_lit(1)),
+            &mut env,
+            &mut constraints,
+            &[],
+            &vctx,
+            &defs,
+        );
+
+        assert!(
+            result.is_ok(),
+            "pure expression should be ignored by loop executor"
+        );
+        assert!(constraints.is_empty());
+        assert_eq!(
+            env.get("x").map(|value| format!("{value:?}")),
+            Some(original_repr),
+            "non-assignment binary expressions must not mutate loop state"
+        );
+    }
+
+    #[test]
+    fn fn_contract_encode_fn_body_peels_direct_lambda_and_binds_parameter() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let fn_requires = Vec::new();
+        let extra_assumptions = Vec::new();
+        let ctx = FnBodyCtx {
+            fn_requires: &fn_requires,
+            extra_assumptions: &extra_assumptions,
+            self_fn: None,
+            vctx: &vctx,
+            defs: &defs,
+        };
+        let expr = IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(int_var("x")),
+            span: None,
+        };
+        let mut env = HashMap::new();
+        let mut solver_constraints = Vec::new();
+
+        let encoded = encode_fn_body(&expr, &mut env, &mut solver_constraints, ctx);
+
+        assert!(encoded.is_ok(), "direct lambda function body should encode");
+        let encoded = encoded.ok().expect("checked above");
+        assert!(encoded.as_int().is_ok());
+        assert!(env.contains_key("x"));
+        assert!(solver_constraints.is_empty());
+    }
+
+    #[test]
+    fn fn_contract_collect_recursive_calls_captures_lambda_parameter_env() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let expr = IRExpr::Lam {
+            param: "n".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(int_app(int_fn_var("f"), int_var("n"))),
+            span: None,
+        };
+        let params = vec![("n".to_owned(), IRType::Int)];
+        let mut env = HashMap::new();
+        let mut path_conds = Vec::new();
+        let mut call_sites = Vec::new();
+        let mut search = RecursiveCallSearch {
+            fn_name: "f",
+            params: &params,
+            vctx: &vctx,
+            defs: &defs,
+            path_conds: &mut path_conds,
+            call_sites: &mut call_sites,
+        };
+
+        collect_recursive_calls(&expr, &mut env, &mut search)
+            .expect("recursive collector should walk lambda body");
+
+        assert_eq!(search.call_sites.len(), 1);
+        assert!(
+            search.call_sites[0].2.contains_key("n"),
+            "call-site env must include lambda parameter bindings"
+        );
+    }
 }

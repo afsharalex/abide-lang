@@ -153,6 +153,215 @@ impl Default for Env {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{AssumptionSet, ELemma, ETheorem, EUnderBlock};
+    use crate::span::Span;
+
+    fn span() -> Span {
+        Span { start: 0, end: 0 }
+    }
+
+    fn under_block(module: Option<&str>) -> EUnderBlock {
+        EUnderBlock {
+            items: Vec::new(),
+            scope: Vec::new(),
+            span: span(),
+            module: module.map(str::to_owned),
+            file: None,
+            resolved_set: AssumptionSet::default_for_theorem_or_lemma(),
+        }
+    }
+
+    fn theorem(name: &str, enclosing_under_idx: Option<usize>) -> ETheorem {
+        ETheorem {
+            name: name.to_owned(),
+            targets: Vec::new(),
+            assume_block: None,
+            enclosing_under_idx,
+            assumption_set: AssumptionSet::default_for_theorem_or_lemma(),
+            invariants: Vec::new(),
+            shows: Vec::new(),
+            by_file: None,
+            by_lemmas: Vec::new(),
+            span: None,
+            file: None,
+        }
+    }
+
+    fn lemma(name: &str, enclosing_under_idx: Option<usize>) -> ELemma {
+        ELemma {
+            name: name.to_owned(),
+            assume_block: None,
+            enclosing_under_idx,
+            assumption_set: AssumptionSet::default_for_theorem_or_lemma(),
+            body: Vec::new(),
+            span: None,
+            file: None,
+        }
+    }
+
+    fn decl(kind: DeclKind, name: &str, module: Option<&str>) -> DeclInfo {
+        DeclInfo {
+            kind,
+            name: name.to_owned(),
+            ty: None,
+            visibility: Visibility::Private,
+            module: module.map(str::to_owned),
+            span: None,
+            file: None,
+        }
+    }
+
+    #[test]
+    fn build_working_namespace_key_matches_module_rules() {
+        assert!(Env::key_matches_module("Thing", Some("A")));
+        assert!(Env::key_matches_module("A::Thing", Some("A")));
+        assert!(!Env::key_matches_module("B::Thing", Some("A")));
+        assert!(Env::key_matches_module("A::Thing", None));
+        assert!(Env::key_matches_module("B::Thing", None));
+    }
+
+    #[test]
+    fn build_working_namespace_flatten_sorted_preserves_module_policy() {
+        let map = HashMap::from([
+            ("B::Thing".to_owned(), 20),
+            ("A::Thing".to_owned(), 10),
+            ("Thing".to_owned(), 0),
+            ("A::OnlyA".to_owned(), 1),
+            ("B::OnlyB".to_owned(), 2),
+        ]);
+
+        let a_scope = Env::flatten_sorted(&map, Some("A"));
+        assert_eq!(a_scope.get("Thing"), Some(&0));
+        assert_eq!(a_scope.get("OnlyA"), Some(&1));
+        assert!(!a_scope.contains_key("OnlyB"));
+
+        let all_scope = Env::flatten_sorted(&map, None);
+        assert_eq!(all_scope.get("Thing"), Some(&0));
+        assert_eq!(all_scope.get("OnlyA"), Some(&1));
+        assert_eq!(all_scope.get("OnlyB"), Some(&2));
+    }
+
+    #[test]
+    fn build_working_namespace_filters_under_members_by_enclosing_under_module() {
+        let mut env = Env::new();
+        env.module_name = Some("A".to_owned());
+        env.under_blocks = vec![under_block(Some("A")), under_block(Some("B"))];
+        env.theorems = vec![
+            theorem("same_member_name", Some(0)),
+            theorem("same_member_name", Some(1)),
+        ];
+        env.lemmas = vec![
+            lemma("same_helper_name", Some(0)),
+            lemma("same_helper_name", Some(1)),
+        ];
+
+        env.build_working_namespace();
+
+        assert_eq!(env.under_blocks.len(), 1);
+        assert_eq!(env.under_blocks[0].module.as_deref(), Some("A"));
+        assert_eq!(
+            env.theorems
+                .iter()
+                .map(|t| (t.name.as_str(), t.enclosing_under_idx))
+                .collect::<Vec<_>>(),
+            vec![("same_member_name", Some(0))]
+        );
+        assert_eq!(
+            env.lemmas
+                .iter()
+                .map(|l| (l.name.as_str(), l.enclosing_under_idx))
+                .collect::<Vec<_>>(),
+            vec![("same_helper_name", Some(0))]
+        );
+    }
+
+    #[test]
+    fn build_working_namespace_filters_standalone_proof_blocks_by_decl_module() {
+        let mut env = Env::new();
+        env.module_name = Some("A".to_owned());
+        env.add_decl(
+            "standalone_a",
+            decl(DeclKind::Theorem, "standalone_a", Some("A")),
+        );
+        env.add_decl(
+            "standalone_b",
+            decl(DeclKind::Theorem, "standalone_b", Some("B")),
+        );
+        env.add_decl("helper_a", decl(DeclKind::Lemma, "helper_a", Some("A")));
+        env.add_decl("helper_b", decl(DeclKind::Lemma, "helper_b", Some("B")));
+        env.theorems = vec![theorem("standalone_a", None), theorem("standalone_b", None)];
+        env.lemmas = vec![lemma("helper_a", None), lemma("helper_b", None)];
+
+        env.build_working_namespace();
+
+        assert_eq!(
+            env.theorems
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["standalone_a"]
+        );
+        assert_eq!(
+            env.lemmas
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["helper_a"]
+        );
+    }
+
+    #[test]
+    fn build_working_namespace_without_current_module_keeps_module_under_blocks() {
+        let mut env = Env::new();
+        env.under_blocks = vec![under_block(Some("A")), under_block(Some("B"))];
+        env.theorems = vec![
+            theorem("t_a", Some(0)),
+            theorem("t_b", Some(1)),
+            theorem("standalone_without_decl", None),
+        ];
+        env.lemmas = vec![
+            lemma("l_a", Some(0)),
+            lemma("l_b", Some(1)),
+            lemma("helper_without_decl", None),
+        ];
+
+        env.build_working_namespace();
+
+        assert_eq!(
+            env.under_blocks
+                .iter()
+                .map(|ub| ub.module.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("A"), Some("B")]
+        );
+        assert_eq!(
+            env.theorems
+                .iter()
+                .map(|t| (t.name.as_str(), t.enclosing_under_idx))
+                .collect::<Vec<_>>(),
+            vec![
+                ("t_a", Some(0)),
+                ("t_b", Some(1)),
+                ("standalone_without_decl", None)
+            ]
+        );
+        assert_eq!(
+            env.lemmas
+                .iter()
+                .map(|l| (l.name.as_str(), l.enclosing_under_idx))
+                .collect::<Vec<_>>(),
+            vec![
+                ("l_a", Some(0)),
+                ("l_b", Some(1)),
+                ("helper_without_decl", None)
+            ]
+        );
+    }
+}
+
 impl Env {
     pub fn new() -> Self {
         Self {
@@ -379,13 +588,7 @@ impl Env {
             .collect();
         // Sort: bare keys first (no::), then qualified keys alphabetically.
         entries.sort_by(|(a, _), (b, _)| {
-            let a_qualified = a.contains("::");
-            let b_qualified = b.contains("::");
-            match (a_qualified, b_qualified) {
-                (false, true) => std::cmp::Ordering::Less,
-                (true, false) => std::cmp::Ordering::Greater,
-                _ => a.cmp(b),
-            }
+            (a.contains("::"), a.as_str()).cmp(&(b.contains("::"), b.as_str()))
         });
         let mut result = HashMap::new();
         for (k, v) in entries {
@@ -457,9 +660,22 @@ impl Env {
         self.verifies
             .retain(|v| is_current_module("verify:", &v.name));
         self.scenes.retain(|s| is_current_module("scene:", &s.name));
-        self.theorems.retain(|t| is_current_module("", &t.name));
+        let under_is_current = |idx: usize| {
+            current.as_deref().is_none_or(|current_module| {
+                self.under_blocks
+                    .get(idx)
+                    .is_some_and(|ub| ub.module.as_deref() == Some(current_module))
+            })
+        };
+        self.theorems.retain(|t| {
+            t.enclosing_under_idx
+                .map_or_else(|| is_current_module("", &t.name), under_is_current)
+        });
         self.axioms.retain(|a| is_current_module("", &a.name));
-        self.lemmas.retain(|l| is_current_module("", &l.name));
+        self.lemmas.retain(|l| {
+            l.enclosing_under_idx
+                .map_or_else(|| is_current_module("", &l.name), under_is_current)
+        });
 
         // filter `under_blocks` to the current
         // module the same way theorems and lemmas are filtered, then
@@ -475,7 +691,7 @@ impl Env {
         let mut kept_unders: Vec<crate::elab::types::EUnderBlock> =
             Vec::with_capacity(original_under_count);
         for (old_idx, ub) in self.under_blocks.iter().enumerate() {
-            if ub.module.as_deref() == cur_mod_for_under {
+            if cur_mod_for_under.is_none() || ub.module.as_deref() == cur_mod_for_under {
                 under_remap[old_idx] = Some(kept_unders.len());
                 kept_unders.push(ub.clone());
             }

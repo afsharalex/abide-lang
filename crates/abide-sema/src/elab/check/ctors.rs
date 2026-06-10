@@ -129,41 +129,45 @@ pub(super) fn check_ctor_records_in_expr(
                     }
                 }
 
-                if all_matches.len() == 1 {
+                match all_matches.as_slice() {
                     // Unique constructor name — use it (validates unknown fields)
-                    declared = Some(all_matches[0].1);
-                    enum_name_found = Some(all_matches[0].0);
-                } else if all_matches.len() > 1 {
-                    // Ambiguous: disambiguate by field names
-                    let field_matched: Vec<_> = all_matches
-                        .iter()
-                        .filter(|(_, vfields)| {
-                            let decl_names: Vec<&str> =
-                                vfields.iter().map(|(n, _)| n.as_str()).collect();
-                            user_field_names.iter().all(|f| decl_names.contains(f))
-                        })
-                        .collect();
-                    if field_matched.len() == 1 {
-                        declared = Some(field_matched[0].1);
-                        enum_name_found = Some(field_matched[0].0);
-                    } else {
-                        // Genuinely ambiguous — reject and require qualification
-                        let mut enum_names: Vec<&str> =
-                            all_matches.iter().map(|(n, _)| *n).collect();
-                        enum_names.sort_unstable();
-                        let mut err = ElabError::new(
-                            ErrorKind::AmbiguousRef,
-                            format!(
-                                "ambiguous constructor '{ctor_name}' — found in enums: {}",
-                                enum_names.join(", "),
-                            ),
-                            ctor_name.clone(),
-                        );
-                        err.span = *span;
-                        err.help = Some(crate::messages::HELP_AMBIGUOUS_CTOR.into());
-                        errors.push(err);
-                        return;
+                    [single] => {
+                        declared = Some(single.1);
+                        enum_name_found = Some(single.0);
                     }
+                    // Ambiguous: disambiguate by field names
+                    [_, ..] => {
+                        let field_matched: Vec<_> = all_matches
+                            .iter()
+                            .filter(|(_, vfields)| {
+                                let decl_names: Vec<&str> =
+                                    vfields.iter().map(|(n, _)| n.as_str()).collect();
+                                user_field_names.iter().all(|f| decl_names.contains(f))
+                            })
+                            .collect();
+                        if field_matched.len() == 1 {
+                            declared = Some(field_matched[0].1);
+                            enum_name_found = Some(field_matched[0].0);
+                        } else {
+                            // Genuinely ambiguous — reject and require qualification
+                            let mut enum_names: Vec<&str> =
+                                all_matches.iter().map(|(n, _)| *n).collect();
+                            enum_names.sort_unstable();
+                            let mut err = ElabError::new(
+                                ErrorKind::AmbiguousRef,
+                                format!(
+                                    "ambiguous constructor '{ctor_name}' — found in enums: {}",
+                                    enum_names.join(", "),
+                                ),
+                                ctor_name.clone(),
+                            );
+                            err.span = *span;
+                            err.help = Some(crate::messages::HELP_AMBIGUOUS_CTOR.into());
+                            errors.push(err);
+                            return;
+                        }
+                    }
+                    [] => {}
                 }
             }
             let Some(declared_fields) = declared else {
@@ -393,5 +397,231 @@ pub(super) fn check_ctor_records_in_expr(
         | EExpr::Unresolved(..)
         | EExpr::Sorry(_)
         | EExpr::Todo(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elab::types::{
+        BuiltinTy, EEventAction, EMatchArm, EMatchScrutinee, EPattern, Literal,
+    };
+
+    fn int_lit(value: i64) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(value), None)
+    }
+
+    fn bool_lit(value: bool) -> EExpr {
+        EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(value), None)
+    }
+
+    fn variant_fields() -> VariantFieldsMap {
+        VariantFieldsMap::from([
+            (
+                "Result".to_string(),
+                vec![
+                    (
+                        "Ok".to_string(),
+                        vec![
+                            ("value".to_string(), Ty::Builtin(BuiltinTy::Int)),
+                            ("code".to_string(), Ty::Builtin(BuiltinTy::Int)),
+                        ],
+                    ),
+                    (
+                        "Err".to_string(),
+                        vec![("message".to_string(), Ty::Builtin(BuiltinTy::String))],
+                    ),
+                ],
+            ),
+            (
+                "Other".to_string(),
+                vec![(
+                    "Ok".to_string(),
+                    vec![("reason".to_string(), Ty::Builtin(BuiltinTy::String))],
+                )],
+            ),
+            (
+                "Left".to_string(),
+                vec![(
+                    "Shared".to_string(),
+                    vec![("a".to_string(), Ty::Builtin(BuiltinTy::Int))],
+                )],
+            ),
+            (
+                "Right".to_string(),
+                vec![(
+                    "Shared".to_string(),
+                    vec![("b".to_string(), Ty::Builtin(BuiltinTy::Bool))],
+                )],
+            ),
+        ])
+    }
+
+    fn ctor(ty: Ty, qual: Option<&str>, name: &str, fields: Vec<(&str, EExpr)>) -> EExpr {
+        EExpr::CtorRecord(
+            ty,
+            qual.map(str::to_string),
+            name.to_string(),
+            fields
+                .into_iter()
+                .map(|(field, expr)| (field.to_string(), expr))
+                .collect(),
+            Some(crate::span::Span { start: 1, end: 2 }),
+        )
+    }
+
+    fn collect_ctor_errors(expr: &EExpr) -> Vec<ElabError> {
+        let mut errors = Vec::new();
+        check_ctor_records_in_expr(expr, &variant_fields(), &mut errors);
+        errors
+    }
+
+    #[test]
+    fn ctor_record_checker_validates_scoped_typed_global_and_ambiguous_records() {
+        let typed_ok = ctor(
+            Ty::Enum(
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+            ),
+            None,
+            "Ok",
+            vec![("value", int_lit(1)), ("code", int_lit(200))],
+        );
+        assert!(collect_ctor_errors(&typed_ok).is_empty());
+
+        let scoped_ok = ctor(
+            Ty::Error,
+            Some("Other"),
+            "Ok",
+            vec![(
+                "reason",
+                EExpr::Lit(
+                    Ty::Builtin(BuiltinTy::String),
+                    Literal::Str("x".to_string()),
+                    None,
+                ),
+            )],
+        );
+        assert!(collect_ctor_errors(&scoped_ok).is_empty());
+
+        let disambiguated = ctor(Ty::Error, None, "Shared", vec![("b", bool_lit(true))]);
+        assert!(collect_ctor_errors(&disambiguated).is_empty());
+
+        let ambiguous = ctor(Ty::Error, None, "Shared", vec![]);
+        let ambiguous_errors = collect_ctor_errors(&ambiguous);
+        assert_eq!(ambiguous_errors.len(), 1);
+        assert_eq!(ambiguous_errors[0].kind, ErrorKind::AmbiguousRef);
+
+        let unknown = ctor(
+            Ty::Enum(
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+            ),
+            None,
+            "Ok",
+            vec![("extra", int_lit(1))],
+        );
+        let unknown_errors = collect_ctor_errors(&unknown);
+        assert!(unknown_errors
+            .iter()
+            .any(|error| error.message.contains("unknown field 'extra'")));
+        assert!(unknown_errors
+            .iter()
+            .any(|error| error.message.contains("missing")));
+
+        let duplicate = ctor(
+            Ty::Enum(
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+            ),
+            None,
+            "Ok",
+            vec![
+                ("value", int_lit(1)),
+                ("value", int_lit(2)),
+                ("code", int_lit(3)),
+            ],
+        );
+        let duplicate_errors = collect_ctor_errors(&duplicate);
+        assert_eq!(duplicate_errors.len(), 1);
+        assert_eq!(duplicate_errors[0].kind, ErrorKind::DuplicateDecl);
+
+        let missing = ctor(
+            Ty::Enum(
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+            ),
+            None,
+            "Ok",
+            vec![("value", int_lit(1))],
+        );
+        let missing_errors = collect_ctor_errors(&missing);
+        assert_eq!(missing_errors.len(), 1);
+        assert!(missing_errors[0].message.contains("missing: code"));
+
+        let unknown_ctor = ctor(Ty::Error, None, "NotKnown", vec![("field", int_lit(1))]);
+        assert!(collect_ctor_errors(&unknown_ctor).is_empty());
+    }
+
+    #[test]
+    fn ctor_record_checker_recurses_into_struct_constructors_and_event_actions() {
+        let nested_bad = ctor(
+            Ty::Enum(
+                "Result".to_string(),
+                vec!["Ok".to_string(), "Err".to_string()],
+            ),
+            None,
+            "Ok",
+            vec![("extra", int_lit(1))],
+        );
+        let struct_expr = EExpr::StructCtor(
+            Ty::Error,
+            "Payload".to_string(),
+            vec![("inner".to_string(), nested_bad.clone())],
+            Some(crate::span::Span { start: 3, end: 4 }),
+        );
+        let struct_errors = collect_ctor_errors(&struct_expr);
+        assert!(struct_errors
+            .iter()
+            .any(|error| error.message.contains("struct constructor")));
+        assert!(struct_errors
+            .iter()
+            .any(|error| error.message.contains("unknown field 'extra'")));
+
+        let event_action = EEventAction::Choose(
+            "x".to_string(),
+            Ty::Builtin(BuiltinTy::Int),
+            nested_bad.clone(),
+            vec![
+                EEventAction::Create(
+                    "Ticket".to_string(),
+                    None,
+                    vec![("status".to_string(), nested_bad.clone())],
+                ),
+                EEventAction::Match(
+                    EMatchScrutinee::CrossCall(
+                        "Sys".to_string(),
+                        "cmd".to_string(),
+                        vec![nested_bad.clone()],
+                    ),
+                    vec![EMatchArm {
+                        pattern: EPattern::Wild,
+                        guard: Some(nested_bad.clone()),
+                        body: vec![EEventAction::Apply(
+                            nested_bad.clone(),
+                            "advance".to_string(),
+                            vec![nested_bad.clone()],
+                            vec![nested_bad],
+                        )],
+                    }],
+                ),
+            ],
+        );
+        let mut action_errors = Vec::new();
+        walk_event_action_for_ctor_check(&event_action, &variant_fields(), &mut action_errors);
+        assert!(
+            action_errors.len() >= 6,
+            "expected constructor errors from guard, create, match arg, arm guard, target, refs, and args: {action_errors:?}"
+        );
     }
 }

@@ -1027,7 +1027,6 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
             Ok(backend!(real_eq, &backend!(int_to_real, x), y))
         }
         (SmtValue::Array(x), SmtValue::Array(y)) => Ok(backend!(array_eq, x, y.clone())),
-        (SmtValue::Dynamic(x), SmtValue::Dynamic(y)) => Ok(backend!(dynamic_eq, x, y)),
         // Cross-variant: coerce both to Dynamic for generic equality
         (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => {
             Ok(backend!(dynamic_eq, d, &other.to_dynamic()))
@@ -1049,11 +1048,14 @@ pub fn smt_ite(cond: &Bool, then_val: &SmtValue, else_val: &SmtValue) -> SmtValu
         (SmtValue::Int(t), SmtValue::Int(e)) => SmtValue::Int(backend!(int_ite, cond, t, e)),
         (SmtValue::Bool(t), SmtValue::Bool(e)) => SmtValue::Bool(backend!(bool_ite, cond, t, e)),
         (SmtValue::Real(t), SmtValue::Real(e)) => SmtValue::Real(backend!(real_ite, cond, t, e)),
+        (SmtValue::Real(t), SmtValue::Int(e)) => {
+            SmtValue::Real(backend!(real_ite, cond, t, &backend!(int_to_real, e)))
+        }
+        (SmtValue::Int(t), SmtValue::Real(e)) => {
+            SmtValue::Real(backend!(real_ite, cond, &backend!(int_to_real, t), e))
+        }
         (SmtValue::Array(t), SmtValue::Array(e)) => {
             SmtValue::Array(backend!(array_ite, cond, t, e))
-        }
-        (SmtValue::Dynamic(t), SmtValue::Dynamic(e)) => {
-            SmtValue::Dynamic(backend!(dynamic_ite, cond, t, e))
         }
         // Cross-variant: coerce to Dynamic
         _ => SmtValue::Dynamic(backend!(
@@ -1412,6 +1414,52 @@ pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
 mod tests {
     use super::*;
 
+    fn assert_unsat_with(assertion: &Bool) {
+        let solver = AbideSolver::new();
+        solver.assert(assertion);
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    fn assert_value_eq(actual: &SmtValue, expected: &SmtValue) {
+        let eq = smt_eq(actual, expected).expect("value equality should encode");
+        assert_unsat_with(&bool_not(&eq));
+    }
+
+    fn assert_bool_value(actual: SmtValue, expected: bool) {
+        assert_value_eq(&actual, &bool_val(expected));
+    }
+
+    fn assert_int_value(actual: SmtValue, expected: i64) {
+        assert_value_eq(&actual, &int_val(expected));
+    }
+
+    fn assert_real_value(actual: SmtValue, numerator: i64, denominator: i64) {
+        assert_value_eq(&actual, &real_val(numerator, denominator));
+    }
+
+    fn int_set(elements: &[i64]) -> SmtValue {
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let set = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let mut array = set
+            .as_array()
+            .expect("set default should decode as array")
+            .clone();
+        for element in elements {
+            array = array.store(
+                &int_val(*element).to_dynamic(),
+                &bool_val(true).to_dynamic(),
+            );
+        }
+        SmtValue::Array(array)
+    }
+
+    fn assert_int_member(set: &SmtValue, element: i64, expected: bool) {
+        let member = binop("OpSetMember", &int_val(element), set).expect("set membership");
+        assert_bool_value(member, expected);
+    }
+
     #[test]
     fn backend_neutral_ast_extension_traits_dispatch_to_active_backend() {
         let t = <Bool as BoolAstExt>::from_bool(true);
@@ -1463,6 +1511,456 @@ mod tests {
             solver.assert(constraint);
         }
         assert_eq!(solver.check(), SatResult::Sat);
+    }
+
+    #[test]
+    fn backend_helper_names_hashes_and_dynamic_projection_are_observable() {
+        assert_eq!(sort_name(&sort_int()), "Int");
+        assert_eq!(sort_name(&sort_bool()), "Bool");
+        assert_eq!(sort_name(&sort_real()), "Real");
+
+        let decl = func_decl("smt_helper_decl", &[&sort_int()], &sort_bool());
+        assert_eq!(func_decl_name(&decl), "smt_helper_decl");
+        assert_eq!(decl.name(), "smt_helper_decl");
+
+        let int_hash = stable_hash_hex("Int");
+        let bool_hash = stable_hash_hex("Bool");
+        assert_eq!(int_hash.len(), 16);
+        assert_eq!(bool_hash.len(), 16);
+        assert_ne!(int_hash, bool_hash);
+
+        let real_dynamic = real_val(3, 2).to_dynamic();
+        let projected_real =
+            dynamic_as_real(&real_dynamic).expect("dynamic should project to real");
+        assert_value_eq(&SmtValue::Real(projected_real), &real_val(3, 2));
+    }
+
+    #[test]
+    fn smt_eq_proves_typed_and_dynamic_equalities() {
+        let int_eq_true = smt_eq(&int_val(1), &int_val(1)).expect("int equality");
+        assert_unsat_with(&bool_not(&int_eq_true));
+
+        let int_eq_false = smt_eq(&int_val(1), &int_val(2)).expect("int disequality");
+        assert_unsat_with(&int_eq_false);
+
+        let real_eq_true = smt_eq(&real_val(1, 2), &real_val(1, 2)).expect("real equality");
+        assert_unsat_with(&bool_not(&real_eq_true));
+
+        let mixed_eq_true = smt_eq(&int_val(1), &real_val(1, 1)).expect("int/real equality");
+        assert_unsat_with(&bool_not(&mixed_eq_true));
+
+        let dynamic_int = SmtValue::Dynamic(int_val(3).to_dynamic());
+        let dynamic_eq = smt_eq(&dynamic_int, &int_val(3)).expect("dynamic/int equality");
+        assert_unsat_with(&bool_not(&dynamic_eq));
+
+        let dynamic_eq = smt_eq(&dynamic_int, &SmtValue::Dynamic(int_val(3).to_dynamic()))
+            .expect("dynamic/dynamic equality");
+        assert_unsat_with(&bool_not(&dynamic_eq));
+
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let empty_left = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let empty_right = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let set_eq = smt_eq(&empty_left, &empty_right).expect("array equality");
+        assert_unsat_with(&bool_not(&set_eq));
+    }
+
+    #[test]
+    fn smt_ite_preserves_branch_sorts_and_values() {
+        let true_cond = bool_val(true).to_bool().expect("bool cond");
+        let int_choice = smt_ite(&true_cond, &int_val(7), &int_val(9));
+        assert!(matches!(int_choice, SmtValue::Int(_)));
+        let int_eq = smt_eq(&int_choice, &int_val(7)).expect("int ite equality");
+        assert_unsat_with(&bool_not(&int_eq));
+
+        let false_cond = bool_val(false).to_bool().expect("bool cond");
+        let bool_choice = smt_ite(&false_cond, &bool_val(true), &bool_val(false));
+        assert!(matches!(bool_choice, SmtValue::Bool(_)));
+        let bool_eq = smt_eq(&bool_choice, &bool_val(false)).expect("bool ite equality");
+        assert_unsat_with(&bool_not(&bool_eq));
+
+        let real_choice = smt_ite(&true_cond, &real_val(7, 2), &real_val(9, 2));
+        assert!(matches!(real_choice, SmtValue::Real(_)));
+        let real_eq = smt_eq(&real_choice, &real_val(7, 2)).expect("real ite equality");
+        assert_unsat_with(&bool_not(&real_eq));
+
+        let mixed_real_int_choice = smt_ite(&true_cond, &real_val(4, 1), &int_val(5));
+        assert!(matches!(mixed_real_int_choice, SmtValue::Real(_)));
+        let mixed_real_int_eq =
+            smt_eq(&mixed_real_int_choice, &real_val(4, 1)).expect("real/int ite equality");
+        assert_unsat_with(&bool_not(&mixed_real_int_eq));
+
+        let dynamic_choice = smt_ite(&true_cond, &int_val(4), &real_val(5, 1));
+        let dynamic_eq = smt_eq(&dynamic_choice, &int_val(4)).expect("dynamic ite equality");
+        assert_unsat_with(&bool_not(&dynamic_eq));
+
+        let dynamic_same_sort_choice = smt_ite(
+            &true_cond,
+            &SmtValue::Dynamic(int_val(4).to_dynamic()),
+            &SmtValue::Dynamic(int_val(5).to_dynamic()),
+        );
+        let dynamic_same_sort_eq =
+            smt_eq(&dynamic_same_sort_choice, &int_val(4)).expect("dynamic/dynamic ite equality");
+        assert_unsat_with(&bool_not(&dynamic_same_sort_eq));
+
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let empty_set = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let singleton_set = binop("OpSetUnion", &empty_set, &empty_set).expect("set union");
+        let array_choice = smt_ite(&true_cond, &empty_set, &singleton_set);
+        assert!(matches!(array_choice, SmtValue::Array(_)));
+    }
+
+    #[test]
+    fn smt_default_dynamic_decodes_to_zero_values_and_empty_collections() {
+        let bool_default = dynamic_to_typed_value(default_dynamic(&IRType::Bool), &IRType::Bool);
+        let bool_eq = smt_eq(&bool_default, &bool_val(false)).expect("bool default equality");
+        assert_unsat_with(&bool_not(&bool_eq));
+
+        let int_default = dynamic_to_typed_value(default_dynamic(&IRType::Int), &IRType::Int);
+        let int_eq = smt_eq(&int_default, &int_val(0)).expect("int default equality");
+        assert_unsat_with(&bool_not(&int_eq));
+
+        let real_default = dynamic_to_typed_value(default_dynamic(&IRType::Real), &IRType::Real);
+        let real_eq = smt_eq(&real_default, &real_val(0, 1)).expect("real default equality");
+        assert_unsat_with(&bool_not(&real_eq));
+
+        let seq_ty = IRType::Seq {
+            element: Box::new(IRType::Int),
+        };
+        let seq_default = dynamic_to_typed_value(default_dynamic(&seq_ty), &seq_ty);
+        let seq_len = seq_length(&seq_default, &IRType::Int).expect("seq length");
+        let seq_len_eq = smt_eq(&seq_len, &int_val(0)).expect("seq length equality");
+        assert_unsat_with(&bool_not(&seq_len_eq));
+
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let set_default = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let member = binop("OpSetMember", &int_val(1), &set_default).expect("set membership");
+        let member_eq = smt_eq(&member, &bool_val(false)).expect("set default membership");
+        assert_unsat_with(&bool_not(&member_eq));
+
+        let map_ty = IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Bool),
+        };
+        let map_default = dynamic_to_typed_value(default_dynamic(&map_ty), &map_ty);
+        let map_has_key = map_has(&map_default, &int_val(1), &IRType::Bool).expect("map has");
+        let map_has_eq = smt_eq(&map_has_key, &bool_val(false)).expect("map default has");
+        assert_unsat_with(&bool_not(&map_has_eq));
+        let map_lookup_value =
+            map_lookup(&map_default, &int_val(1), &IRType::Bool).expect("map lookup");
+        let map_lookup_eq =
+            smt_eq(&map_lookup_value, &bool_val(false)).expect("map default lookup");
+        assert_unsat_with(&bool_not(&map_lookup_eq));
+    }
+
+    #[test]
+    fn binop_evaluates_int_operator_family() {
+        assert_int_value(
+            binop("OpAdd", &int_val(2), &int_val(3)).expect("int add"),
+            5,
+        );
+        assert_int_value(
+            binop("OpSub", &int_val(7), &int_val(4)).expect("int sub"),
+            3,
+        );
+        assert_int_value(
+            binop("OpMul", &int_val(3), &int_val(4)).expect("int mul"),
+            12,
+        );
+        assert_int_value(
+            binop("OpDiv", &int_val(9), &int_val(3)).expect("int div"),
+            3,
+        );
+        assert_int_value(
+            binop("OpMod", &int_val(10), &int_val(4)).expect("int mod"),
+            2,
+        );
+
+        assert_bool_value(
+            binop("OpEq", &int_val(4), &int_val(4)).expect("int eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &int_val(4), &int_val(5)).expect("int neq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLt", &int_val(2), &int_val(3)).expect("int lt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGt", &int_val(3), &int_val(2)).expect("int gt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLe", &int_val(2), &int_val(2)).expect("int le"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGe", &int_val(3), &int_val(3)).expect("int ge"),
+            true,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_real_operator_family() {
+        assert_real_value(
+            binop("OpAdd", &real_val(1, 2), &real_val(3, 2)).expect("real add"),
+            2,
+            1,
+        );
+        assert_real_value(
+            binop("OpSub", &real_val(5, 2), &real_val(1, 2)).expect("real sub"),
+            2,
+            1,
+        );
+        assert_real_value(
+            binop("OpMul", &real_val(2, 1), &real_val(3, 2)).expect("real mul"),
+            3,
+            1,
+        );
+        assert_real_value(
+            binop("OpDiv", &real_val(3, 1), &real_val(2, 1)).expect("real div"),
+            3,
+            2,
+        );
+
+        assert_bool_value(
+            binop("OpEq", &real_val(4, 1), &real_val(4, 1)).expect("real eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &real_val(4, 1), &real_val(5, 1)).expect("real neq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLt", &real_val(2, 1), &real_val(3, 1)).expect("real lt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGt", &real_val(3, 1), &real_val(2, 1)).expect("real gt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLe", &real_val(2, 1), &real_val(2, 1)).expect("real le"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGe", &real_val(3, 1), &real_val(3, 1)).expect("real ge"),
+            true,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_mixed_numeric_operator_family() {
+        assert_real_value(
+            binop("OpAdd", &int_val(1), &real_val(1, 2)).expect("mixed add"),
+            3,
+            2,
+        );
+        assert_real_value(
+            binop("OpSub", &int_val(2), &real_val(1, 2)).expect("mixed sub"),
+            3,
+            2,
+        );
+        assert_real_value(
+            binop("OpMul", &int_val(2), &real_val(3, 2)).expect("mixed mul"),
+            3,
+            1,
+        );
+        assert_real_value(
+            binop("OpDiv", &int_val(3), &real_val(2, 1)).expect("mixed div"),
+            3,
+            2,
+        );
+
+        assert_bool_value(
+            binop("OpEq", &int_val(1), &real_val(1, 1)).expect("mixed eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &int_val(1), &real_val(2, 1)).expect("mixed neq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLt", &int_val(1), &real_val(2, 1)).expect("mixed lt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLe", &int_val(1), &real_val(1, 1)).expect("mixed le"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGt", &int_val(2), &real_val(1, 1)).expect("mixed gt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGe", &int_val(1), &real_val(1, 1)).expect("mixed ge"),
+            true,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_bool_and_array_operator_families() {
+        assert_bool_value(
+            binop("OpEq", &bool_val(true), &bool_val(true)).expect("bool eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &bool_val(true), &bool_val(false)).expect("bool neq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpAnd", &bool_val(true), &bool_val(true)).expect("bool and"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpOr", &bool_val(false), &bool_val(true)).expect("bool or"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpImplies", &bool_val(false), &bool_val(false)).expect("bool implies"),
+            true,
+        );
+
+        let set_ty = IRType::Set {
+            element: Box::new(IRType::Int),
+        };
+        let empty_set = dynamic_to_typed_value(default_dynamic(&set_ty), &set_ty);
+        let singleton_set = SmtValue::Array(
+            empty_set
+                .as_array()
+                .expect("empty set should decode as array")
+                .store(&int_val(1).to_dynamic(), &bool_val(true).to_dynamic()),
+        );
+        assert_bool_value(
+            binop("OpEq", &empty_set, &empty_set).expect("array eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &empty_set, &singleton_set).expect("array neq"),
+            true,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_composition_operator_family() {
+        assert_bool_value(
+            binop("OpSeq", &bool_val(false), &bool_val(false)).expect("seq composition"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpSameStep", &bool_val(true), &bool_val(true)).expect("same-step composition"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpUnord", &bool_val(true), &bool_val(true)).expect("unordered composition"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpConc", &bool_val(true), &bool_val(true)).expect("concurrent composition"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpXor", &bool_val(true), &bool_val(false)).expect("xor composition"),
+            true,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_collection_operator_family() {
+        let left = int_set(&[1, 2]);
+        let right = int_set(&[2, 3]);
+        let singleton = int_set(&[2]);
+        let disjoint = int_set(&[4]);
+
+        let intersection =
+            binop("OpSetIntersect", &left, &right).expect("set intersection should encode");
+        assert_int_member(&intersection, 1, false);
+        assert_int_member(&intersection, 2, true);
+
+        let difference = binop("OpSetDiff", &left, &right).expect("set diff should encode");
+        assert_int_member(&difference, 1, true);
+        assert_int_member(&difference, 2, false);
+
+        assert_bool_value(
+            binop("OpSetSubset", &singleton, &left).expect("set subset"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpSetDisjoint", &singleton, &disjoint).expect("set disjoint"),
+            true,
+        );
+
+        let seq_concat_error = binop("OpSeqConcat", &left, &right)
+            .expect_err("symbolic sequence concat should remain rejected");
+        assert!(seq_concat_error.contains("requires length tracking"));
+    }
+
+    #[test]
+    fn binop_evaluates_dynamic_operator_family() {
+        let dynamic_int = SmtValue::Dynamic(int_val(2).to_dynamic());
+        assert_int_value(
+            binop("OpAdd", &dynamic_int, &int_val(3)).expect("dynamic int on left"),
+            5,
+        );
+
+        let dynamic_rhs = SmtValue::Dynamic(int_val(2).to_dynamic());
+        assert_int_value(
+            binop("OpSub", &int_val(5), &dynamic_rhs).expect("dynamic int on right"),
+            3,
+        );
+
+        let dynamic_bool = SmtValue::Dynamic(bool_val(true).to_dynamic());
+        assert_bool_value(
+            binop("OpAnd", &dynamic_bool, &bool_val(true)).expect("dynamic bool on left"),
+            true,
+        );
+
+        let seq_one = seq_literal(&IRType::Int, &[int_val(1)]);
+        let seq_two = seq_literal(&IRType::Int, &[int_val(2)]);
+        assert_bool_value(binop("OpEq", &seq_one, &seq_one).expect("dynamic eq"), true);
+        assert_bool_value(
+            binop("OpNEq", &seq_one, &seq_two).expect("dynamic neq"),
+            true,
+        );
+    }
+
+    #[test]
+    fn unop_evaluates_scalar_collection_and_error_cases() {
+        assert_bool_value(unop("OpNot", &bool_val(false)).expect("bool not"), true);
+        assert_int_value(unop("OpNeg", &int_val(3)).expect("int neg"), -3);
+
+        let empty = int_set(&[]);
+        let singleton = int_set(&[1]);
+        assert_bool_value(unop("OpSetEmpty", &empty).expect("set empty"), true);
+        assert_bool_value(
+            unop("OpSetEmpty", &singleton).expect("set non-empty"),
+            false,
+        );
+
+        let set_size_error = unop("OpSetSize", &empty).expect_err("set size should be rejected");
+        assert!(set_size_error.contains("cardinality"));
+
+        let seq = seq_literal(&IRType::Int, &[int_val(7), int_val(8)]);
+        let seq_data = SmtValue::Array(seq_data(&seq, &IRType::Int).expect("seq data"));
+        let head = unop("OpSeqHead", &seq_data).expect("seq head");
+        assert_value_eq(&head, &int_val(7));
+
+        let tail = unop("OpSeqTail", &seq_data).expect("seq tail");
+        let tail_head = unop("OpSeqHead", &tail).expect("seq tail head");
+        assert_value_eq(&tail_head, &int_val(8));
+
+        let seq_length_error =
+            unop("OpSeqLength", &seq_data).expect_err("seq length should be rejected");
+        assert!(seq_length_error.contains("cardinality"));
+        let seq_empty_error = unop("OpSeqEmpty", &seq_data).expect_err("seq empty should reject");
+        assert!(seq_empty_error.contains("length tracking"));
     }
 
     #[test]

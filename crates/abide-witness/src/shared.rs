@@ -271,4 +271,16 @@ mod tests {
             ))
         ));
     }
+
+    #[test]
+    fn witness_validation_errors_display_inner_context() {
+        assert_eq!(
+            ValidationError::Operational(op::ValidationError::EmptyBehavior).to_string(),
+            "operational witness behavior must contain at least one state"
+        );
+        assert_eq!(
+            ValidationError::Relational(rel::ValidationError::EmptyStateSequence).to_string(),
+            "relational witness must contain at least one state"
+        );
+    }
 }

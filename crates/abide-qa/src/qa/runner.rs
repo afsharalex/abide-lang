@@ -426,8 +426,76 @@ fn temporal_artifact_name(stmt: &QAStatement) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qa::artifacts::SimulationTermination;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct StubSimulationHooks;
+
+    impl RunnerHooks for StubSimulationHooks {
+        fn simulate(
+            &mut self,
+            _ir_program: &ir::types::IRProgram,
+            request: &SimulationRequest,
+        ) -> Result<SimulationArtifact, String> {
+            let transition = abide_witness::op::Transition::builder()
+                .build()
+                .expect("valid transition");
+            let behavior = abide_witness::op::Behavior::builder()
+                .state(abide_witness::op::State::builder().build())
+                .transition(transition)
+                .state(abide_witness::op::State::builder().build())
+                .build()
+                .expect("valid behavior");
+            Ok(SimulationArtifact {
+                systems: vec![request
+                    .system
+                    .clone()
+                    .unwrap_or_else(|| "Commerce".to_owned())],
+                seed: request.seed,
+                steps_requested: request.steps,
+                steps_executed: 0,
+                termination: SimulationTermination::StepLimit,
+                behavior,
+            })
+        }
+    }
+
+    struct FailingRunnerHooks;
+
+    impl RunnerHooks for FailingRunnerHooks {
+        fn simulate(
+            &mut self,
+            _ir_program: &ir::types::IRProgram,
+            _request: &SimulationRequest,
+        ) -> Result<SimulationArtifact, String> {
+            Err("stub simulation failed".to_owned())
+        }
+
+        fn explore_state_space(
+            &mut self,
+            _ir_program: &ir::types::IRProgram,
+            _request: &StateSpaceRequest,
+        ) -> Result<StateSpaceArtifact, String> {
+            Err("stub exploration failed".to_owned())
+        }
+    }
+
+    fn write_basic_runner_spec(dir: &Path) {
+        fs::write(
+            dir.join("model.ab"),
+            "module QARunner\n\
+             enum TicketStatus = Open | Closed\n\
+             entity Ticket {\n\
+               id: identity\n\
+               status: TicketStatus = @Open\n\
+             }\n\
+             system Commerce(tickets: Store<Ticket>) {\n\
+               command tick() {}\n\
+             }\n",
+        )
+        .expect("write model");
+    }
 
     #[test]
     fn semantic_temporal_failures_are_stored_as_artifacts() {
@@ -673,6 +741,636 @@ explore --system Commerce --scope Missing=1
         assert_eq!(result.passed, 1, "{:?}", result.output);
         assert_eq!(result.failed, 0, "{:?}", result.output);
         assert_eq!(result.executed, 1, "{:?}", result.output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_applies_abide_blocks_and_invalidates_existing_artifacts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-block-ok-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let mut hooks = StubSimulationHooks;
+        let result = run_qa_source_with_hooks(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Customer { id: identity } }\n\
+             simulate --system Commerce --steps 1\n\
+             abide { entity Invoice { id: identity } }\n\
+             artifacts\n",
+            None,
+            false,
+            &mut hooks,
+        );
+
+        assert_eq!(result.failed, 0, "{:?}", result.output);
+        assert_eq!(result.executed, 2, "{:?}", result.output);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line == "  OK: abide block applied (in-memory)"));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line == "  OK: invalidated 1 stored artifacts after model change"));
+        assert!(!result
+            .output
+            .iter()
+            .any(|line| line.contains("invalidated 0 stored artifacts")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("No stored artifacts.")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_abide_block_parse_and_rebuild_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-block-errors-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let parse_error = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: } }\n",
+            None,
+            false,
+        );
+        assert_eq!(parse_error.failed, 1, "{:?}", parse_error.output);
+        assert_eq!(parse_error.executed, 0, "{:?}", parse_error.output);
+        assert!(parse_error
+            .output
+            .iter()
+            .any(|line| line.contains("abide block parse error")));
+
+        let rebuild_error = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: MissingType } }\n",
+            None,
+            false,
+        );
+        assert_eq!(rebuild_error.failed, 1, "{:?}", rebuild_error.output);
+        assert_eq!(rebuild_error.executed, 0, "{:?}", rebuild_error.output);
+        assert!(rebuild_error
+            .output
+            .iter()
+            .any(|line| line.contains("MissingType") || line.contains("unknown type")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_abide_block_lex_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-block-lex-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: int = \" } }\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.failed, 1, "{:?}", result.output);
+        assert_eq!(result.executed, 0, "{:?}", result.output);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("abide block lex error")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_verify_rebuild_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-verify-error-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: MissingType } }\n\
+             verify\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.failed, 2, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("MissingType") || line.contains("unknown type")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_simulate_hook_and_rebuild_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-sim-error-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let mut hooks = FailingRunnerHooks;
+        let hook_error = run_qa_source_with_hooks(
+            &script_path,
+            "load \"model.ab\"\nsimulate --system Commerce --steps 1\n",
+            None,
+            false,
+            &mut hooks,
+        );
+        assert_eq!(hook_error.failed, 1, "{:?}", hook_error.output);
+        assert_eq!(hook_error.executed, 1, "{:?}", hook_error.output);
+        assert!(hook_error
+            .output
+            .iter()
+            .any(|line| line.contains("stub simulation failed")));
+
+        let mut hooks = StubSimulationHooks;
+        let rebuild_error = run_qa_source_with_hooks(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: MissingType } }\n\
+             simulate --system Commerce --steps 1\n",
+            None,
+            false,
+            &mut hooks,
+        );
+        assert_eq!(rebuild_error.failed, 2, "{:?}", rebuild_error.output);
+        assert_eq!(rebuild_error.executed, 1, "{:?}", rebuild_error.output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_explore_hook_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-explore-error-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let mut hooks = FailingRunnerHooks;
+        let result = run_qa_source_with_hooks(
+            &script_path,
+            "load \"model.ab\"\nexplore --system Commerce --depth 1 --slots 1\n",
+            None,
+            false,
+            &mut hooks,
+        );
+
+        assert_eq!(result.failed, 1, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("stub exploration failed")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_explore_rebuild_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-explore-rebuild-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let mut hooks = FailingRunnerHooks;
+        let result = run_qa_source_with_hooks(
+            &script_path,
+            "load \"model.ab\"\n\
+             abide { entity Broken { status: MissingType } }\n\
+             explore --system Commerce --depth 1 --slots 1\n",
+            None,
+            false,
+            &mut hooks,
+        );
+
+        assert_eq!(result.failed, 2, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_artifact_commands_and_failures() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-artifact-error-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\nshow artifact missing\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.failed, 1, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.contains("unknown artifact selector `missing`")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_json_mode_only_counts_assertions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-json-counts-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let ask_result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\nask terminal Ticket.status\n",
+            None,
+            true,
+        );
+        assert_eq!(ask_result.passed, 0, "{:?}", ask_result.output);
+        assert_eq!(ask_result.failed, 0, "{:?}", ask_result.output);
+        assert_eq!(ask_result.executed, 1, "{:?}", ask_result.output);
+
+        let assert_pass = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\nassert terminal Ticket.status\n",
+            None,
+            true,
+        );
+        assert_eq!(assert_pass.passed, 1, "{:?}", assert_pass.output);
+        assert_eq!(assert_pass.failed, 0, "{:?}", assert_pass.output);
+        assert_eq!(assert_pass.executed, 1, "{:?}", assert_pass.output);
+
+        let assert_result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\nassert reachable Ticket.status -> @Closed\n",
+            None,
+            true,
+        );
+        assert_eq!(assert_result.passed, 0, "{:?}", assert_result.output);
+        assert_eq!(assert_result.failed, 1, "{:?}", assert_result.output);
+        assert_eq!(assert_result.executed, 1, "{:?}", assert_result.output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_counts_non_json_assert_results() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-assert-counts-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        write_basic_runner_spec(&dir);
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"model.ab\"\n\
+             assert terminal Ticket.status\n\
+             assert reachable Ticket.status -> @Closed\n\
+             assert reachable Missing.status -> @Closed\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.passed, 1, "{:?}", result.output);
+        assert_eq!(result.failed, 2, "{:?}", result.output);
+        assert_eq!(result.executed, 3, "{:?}", result.output);
+        assert!(result.output.iter().any(|line| line.starts_with("  PASS:")));
+        assert!(result.output.iter().any(|line| line.starts_with("  FAIL:")));
+        assert!(result
+            .output
+            .iter()
+            .any(|line| line.starts_with("  ERROR:")));
+        assert!(!result
+            .output
+            .iter()
+            .any(|line| line.contains("stored 0 temporal artifact")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_reports_stored_temporal_artifacts_for_non_json_asserts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-temporal-assert-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(
+            dir.join("spec.ab"),
+            r#"
+enum OrderStatus = Pending | Shipped
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+}
+
+system Commerce(orders: Store<Order>) {
+  command ship(order: Order) requires order.status == @Pending {
+    order.status' = @Shipped
+  }
+}
+"#,
+        )
+        .expect("write spec");
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"spec.ab\"\nassert always --slots 1 on Commerce false\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.passed, 0, "{:?}", result.output);
+        assert_eq!(result.failed, 1, "{:?}", result.output);
+        assert_eq!(result.executed, 1, "{:?}", result.output);
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line == "  OK: stored 1 temporal artifact(s)"),
+            "{:?}",
+            result.output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_qa_source_reports_stored_temporal_artifacts_for_non_assert_queries() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-temporal-ask-{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(
+            dir.join("spec.ab"),
+            r#"
+enum OrderStatus = Pending | Shipped
+
+entity Order {
+  id: identity
+  status: OrderStatus = @Pending
+}
+
+system Commerce(orders: Store<Order>) {
+  command ship(order: Order) requires order.status == @Pending {
+    order.status' = @Shipped
+  }
+}
+"#,
+        )
+        .expect("write spec");
+
+        let script_path = dir.join("query.qa");
+        let result = run_qa_source(
+            &script_path,
+            "load \"spec.ab\"\n\
+             ask always --slots 1 on Commerce false\n\
+             ask terminal Order.status\n",
+            None,
+            false,
+        );
+
+        assert_eq!(result.failed, 0, "{:?}", result.output);
+        assert_eq!(result.executed, 2, "{:?}", result.output);
+        assert!(
+            result
+                .output
+                .iter()
+                .any(|line| line == "stored 1 artifact(s)"),
+            "{:?}",
+            result.output
+        );
+        assert!(!result
+            .output
+            .iter()
+            .any(|line| line.contains("stored 0 artifact")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporal_artifact_names_are_only_generated_for_temporal_queries() {
+        let statements =
+            parse::parse_qa("ask always --slots 1 on Commerce false\nartifacts\n").unwrap();
+        let name = temporal_artifact_name(&statements[0]).expect("temporal name");
+
+        assert_eq!(name, "qa_temporal_always_slots_1_on_commerce_false");
+        assert_eq!(temporal_artifact_name(&statements[1]), None);
+    }
+
+    #[test]
+    fn simulation_summary_renders_core_execution_details() {
+        let behavior = abide_witness::op::Behavior::builder()
+            .state(abide_witness::op::State::builder().build())
+            .build()
+            .expect("valid behavior");
+        let summary = render_simulation_summary(&SimulationArtifact {
+            systems: vec!["Commerce".to_owned()],
+            seed: 42,
+            steps_requested: 7,
+            steps_executed: 3,
+            termination: SimulationTermination::StepLimit,
+            behavior,
+        });
+
+        assert!(summary.contains("Simulation"));
+        assert!(summary.contains("systems: Commerce"));
+        assert!(summary.contains("seed: 42"));
+        assert!(summary.contains("steps: 3/7"));
+        assert!(summary.contains("termination: step limit reached"));
+    }
+
+    #[test]
+    fn state_space_scope_helpers_use_specific_overrides_and_stable_names() {
+        let request = StateSpaceRequest {
+            depth: Some(2),
+            slots: 4,
+            scopes: vec![
+                ("Order".to_owned(), 2),
+                ("Ticket".to_owned(), 3),
+                ("Order".to_owned(), 5),
+            ],
+            system: None,
+        };
+
+        assert_eq!(slots_for_entity(&request, "Order"), 5);
+        assert_eq!(slots_for_entity(&request, "Ticket"), 3);
+        assert_eq!(slots_for_entity(&request, "Missing"), 4);
+        assert_eq!(
+            sanitize_artifact_name("Billing::Checkout / Main"),
+            "billing_checkout_main"
+        );
+        assert_eq!(sanitize_artifact_name("---"), "state_space");
+    }
+
+    #[test]
+    fn artifact_statement_handler_supports_state_diff_and_export_formats() {
+        let mut store = ArtifactStore::default();
+        let transition = abide_witness::op::Transition::builder()
+            .build()
+            .expect("valid transition");
+        let behavior = abide_witness::op::Behavior::builder()
+            .state(abide_witness::op::State::builder().build())
+            .transition(transition)
+            .state(abide_witness::op::State::builder().build())
+            .build()
+            .expect("valid behavior");
+        store.record_simulation_result(
+            "Commerce".to_owned(),
+            SimulationArtifact {
+                systems: vec!["Commerce".to_owned()],
+                seed: 1,
+                steps_requested: 1,
+                steps_executed: 1,
+                termination: SimulationTermination::StepLimit,
+                behavior,
+            },
+        );
+
+        let state = handle_artifact_statement(
+            &QAStatement::StateArtifact {
+                selector: "simulation:Commerce".to_owned(),
+                index: 0,
+            },
+            &store,
+        )
+        .expect("state statement")
+        .expect("state render");
+        assert!(!state.is_empty());
+
+        let diff = handle_artifact_statement(
+            &QAStatement::DiffArtifact {
+                selector: "simulation:Commerce".to_owned(),
+                from: 0,
+                to: 1,
+            },
+            &store,
+        )
+        .expect("diff statement")
+        .expect("diff render");
+        assert!(!diff.is_empty());
+
+        let exported = handle_artifact_statement(
+            &QAStatement::ExportArtifact {
+                selector: "simulation:Commerce".to_owned(),
+                format: "json".to_owned(),
+            },
+            &store,
+        )
+        .expect("export statement")
+        .expect("json export");
+        assert!(exported.contains("\"systems\""));
+
+        let unsupported = handle_artifact_statement(
+            &QAStatement::ExportArtifact {
+                selector: "simulation:Commerce".to_owned(),
+                format: "text".to_owned(),
+            },
+            &store,
+        )
+        .expect("export statement")
+        .unwrap_err();
+        assert_eq!(unsupported, "unsupported export format `text`");
+    }
+
+    #[test]
+    fn root_module_is_cleared_only_when_multiple_paths_are_loaded() {
+        assert!(!should_clear_root_module(0));
+        assert!(!should_clear_root_module(1));
+        assert!(should_clear_root_module(2));
+    }
+
+    #[test]
+    fn load_blocking_severity_ignores_warnings_only() {
+        assert!(!is_load_blocking_severity(
+            &crate::elab::error::Severity::Warning
+        ));
+        assert!(is_load_blocking_severity(
+            &crate::elab::error::Severity::Error
+        ));
+    }
+
+    #[test]
+    fn collect_abide_files_recurses_and_filters_abide_extensions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("abide-qa-collect-{unique}"));
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).expect("create temp dir");
+        fs::write(dir.join("a.ab"), "").expect("write ab");
+        fs::write(dir.join("b.qa"), "").expect("write qa");
+        fs::write(nested.join("c.abi"), "").expect("write abi");
+        fs::write(nested.join("d.abp"), "").expect("write abp");
+
+        let mut paths = Vec::new();
+        collect_abide_files(&dir, &mut paths);
+        let names = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["a.ab", "c.abi", "d.abp"]);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -956,7 +1654,7 @@ fn load_and_build_model(
     // multiple load statements), don't privilege any single file's module
     // as root. Clear module_name so build_working_namespace includes all
     // modules — otherwise only the first file's module is visible.
-    if paths.len() > 1 {
+    if should_clear_root_module(paths.len()) {
         env.module_name = None;
     }
 
@@ -965,11 +1663,11 @@ fn load_and_build_model(
 
     let has_errors = elab_errors
         .iter()
-        .any(|e| !matches!(e.severity, crate::elab::error::Severity::Warning));
+        .any(|e| is_load_blocking_severity(&e.severity));
     if has_errors {
         let errors: Vec<String> = elab_errors
             .iter()
-            .filter(|e| !matches!(e.severity, crate::elab::error::Severity::Warning))
+            .filter(|e| is_load_blocking_severity(&e.severity))
             .map(|e| format!("error: {e}"))
             .collect();
         return Err(errors);
@@ -977,6 +1675,14 @@ fn load_and_build_model(
 
     let (ir_program, _lower_diag) = ir::lower(&result);
     Ok((base_env, extract::extract(&ir_program)))
+}
+
+fn is_load_blocking_severity(severity: &crate::elab::error::Severity) -> bool {
+    !matches!(severity, crate::elab::error::Severity::Warning)
+}
+
+fn should_clear_root_module(path_count: usize) -> bool {
+    path_count > 1
 }
 
 /// Merge overlay declarations into an env. Entity actions are merged (added to

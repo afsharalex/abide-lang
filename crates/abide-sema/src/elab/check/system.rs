@@ -404,10 +404,6 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                     ));
                 }
             }
-            // Both present but return type is not enum — can't validate
-            // constructor form; accept for now (non-enum return types are
-            // future work).
-            (Some(_), Some(_)) => {}
             _ => {}
         }
     }
@@ -1206,7 +1202,10 @@ fn validate_crosscalls_in_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::{BuiltinTy, ECommand, EInterface, EMay, EQuerySig, Literal};
+    use super::super::super::types::{
+        BuiltinTy, ECommand, EEntity, EField, EFieldDefault, EInterface, EMay, EProc, EProcEdge,
+        EProcNode, EQuery, EQuerySig, EScope, EStoreParam, ESystemAction, Literal,
+    };
     use super::*;
 
     fn ty_string() -> Ty {
@@ -1266,6 +1265,620 @@ mod tests {
             queries: vec![],
             span: None,
         }
+    }
+
+    fn system_with_command(name: &str, return_type: Option<Ty>) -> ESystem {
+        ESystem {
+            name: "Payments".to_string(),
+            implements: None,
+            deps: vec![],
+            fields: vec![],
+            store_params: vec![],
+            scopes: vec![],
+            commands: vec![ECommand {
+                name: name.to_string(),
+                params: vec![],
+                return_type,
+                span: None,
+            }],
+            actions: vec![],
+            queries: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+            proc_uses: vec![],
+            span: None,
+        }
+    }
+
+    fn query(name: &str, params: Vec<(String, Ty)>, body: EExpr) -> EQuery {
+        EQuery {
+            name: name.to_string(),
+            params,
+            body,
+            span: None,
+        }
+    }
+
+    fn entity(name: &str) -> EEntity {
+        EEntity {
+            name: name.to_string(),
+            fields: vec![],
+            actions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+            span: None,
+        }
+    }
+
+    fn store_param(name: &str, entity_type: &str, lo: Option<i64>, hi: Option<i64>) -> EStoreParam {
+        EStoreParam {
+            name: name.to_string(),
+            entity_type: entity_type.to_string(),
+            lo,
+            hi,
+        }
+    }
+
+    fn scope(entity: &str, lo: i64, hi: i64) -> EScope {
+        EScope {
+            entity: entity.to_string(),
+            lo,
+            hi,
+        }
+    }
+
+    fn system_field(name: &str, ty: Ty, default: Option<EFieldDefault>) -> EField {
+        EField {
+            name: name.to_string(),
+            ty,
+            default,
+            span: None,
+        }
+    }
+
+    fn system_action(name: &str, return_expr: Option<EExpr>) -> ESystemAction {
+        ESystemAction {
+            name: name.to_string(),
+            params: vec![],
+            requires: vec![],
+            body: vec![],
+            return_expr,
+            span: Some(crate::span::Span { start: 7, end: 8 }),
+        }
+    }
+
+    fn proc_with_node(command: &str) -> EProc {
+        EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![EProcNode {
+                name: "charge".to_string(),
+                instance: "payments".to_string(),
+                command: command.to_string(),
+                args: vec![],
+            }],
+            edges: vec![],
+            proc_uses: vec![],
+            span: None,
+        }
+    }
+
+    #[test]
+    fn system_checker_validates_store_entities_and_bounds() {
+        let mut env = Env::new();
+        env.entities
+            .insert("Commerce::Ticket".to_string(), entity("Ticket"));
+        env.entities.insert("Order".to_string(), entity("Order"));
+
+        let mut system = system_with_command("noop", None);
+        system.store_params = vec![
+            store_param("tickets", "Ticket", Some(0), Some(1)),
+            store_param("orders", "Order", Some(0), Some(0)),
+        ];
+        assert!(
+            check_system(&env, &system).is_empty(),
+            "canonical and direct entity store params with valid bounds should pass"
+        );
+
+        system.store_params = vec![
+            store_param("missing", "Missing", Some(0), Some(1)),
+            store_param("negative_lo", "Order", Some(-1), Some(1)),
+            store_param("negative_hi", "Order", Some(0), Some(-1)),
+            store_param("reversed", "Order", Some(2), Some(1)),
+        ];
+        let errors = check_system(&env, &system);
+        assert_eq!(errors.len(), 4);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("unknown entity 'Missing'")));
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.message.contains("invalid bounds"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn system_checker_validates_deps_interface_scopes_and_struct_defaults() {
+        let mut env = Env::new();
+        env.externs.insert(
+            "StripeGateway".to_string(),
+            EExtern {
+                name: "StripeGateway".to_string(),
+                implements: None,
+                commands: vec![],
+                mays: vec![],
+                assumes: vec![],
+                span: None,
+            },
+        );
+        let mut system = system_with_command("noop", None);
+        system.deps = vec![
+            "StripeGateway".to_string(),
+            "StripeGateway".to_string(),
+            "MissingGateway".to_string(),
+        ];
+        system.scopes = vec![
+            scope("Ticket", 0, 1),
+            scope("Ticket", -1, 1),
+            scope("Ticket", 2, 1),
+        ];
+        system.fields = vec![system_field(
+            "config",
+            Ty::Record(
+                "Config".to_string(),
+                vec![
+                    ("host".to_string(), ty_string()),
+                    ("retries".to_string(), ty_int()),
+                ],
+            ),
+            Some(EFieldDefault::Value(EExpr::StructCtor(
+                Ty::Error,
+                "Config".to_string(),
+                vec![
+                    ("host".to_string(), lit_string("localhost")),
+                    ("host".to_string(), lit_string("duplicate")),
+                    ("extra".to_string(), lit_int(1)),
+                ],
+                Some(crate::span::Span { start: 9, end: 10 }),
+            ))),
+        )];
+
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("duplicate dep `StripeGateway`")));
+        assert!(errors.iter().any(|error| error
+            .message
+            .contains("unknown extern dep `MissingGateway`")));
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.message.contains("invalid range"))
+                .count(),
+            2
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("unknown field `extra`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("duplicate field `host`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("missing field `retries`")));
+
+        let mut missing_interface_system = system_with_command("noop", None);
+        missing_interface_system.implements = Some("MissingInterface".to_string());
+        missing_interface_system.scopes = vec![scope("Ticket", -1, 1)];
+        let errors = check_system(&Env::new(), &missing_interface_system);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("unknown interface"));
+
+        let mut valid_system = system_with_command("noop", None);
+        valid_system.deps = vec!["StripeGateway".to_string()];
+        valid_system.scopes = vec![scope("Ticket", 0, 1), scope("Ticket", 0, 0)];
+        valid_system.fields = vec![system_field(
+            "config",
+            Ty::Record(
+                "Config".to_string(),
+                vec![
+                    ("host".to_string(), ty_string()),
+                    ("retries".to_string(), ty_int()),
+                ],
+            ),
+            Some(EFieldDefault::Value(EExpr::StructCtor(
+                Ty::Error,
+                "Config".to_string(),
+                vec![
+                    ("host".to_string(), lit_string("localhost")),
+                    ("retries".to_string(), lit_int(3)),
+                ],
+                None,
+            ))),
+        )];
+        assert!(
+            check_system(&env, &valid_system).is_empty(),
+            "unique deps, valid scopes, and complete struct defaults should pass"
+        );
+    }
+
+    #[test]
+    fn system_checker_validates_command_return_expressions() {
+        let outcome_ty = Ty::Enum(
+            "Outcome".to_string(),
+            vec!["Ok".to_string(), "Err".to_string(), "Poison".to_string()],
+        );
+        let mut env = Env::new();
+        env.variant_fields.insert(
+            "Outcome".to_string(),
+            vec![
+                ("Ok".to_string(), vec![]),
+                ("Err".to_string(), vec![("code".to_string(), ty_int())]),
+                ("Poison".to_string(), vec![("value".to_string(), Ty::Error)]),
+            ],
+        );
+
+        let mut system = system_with_command("authorize", None);
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Var(outcome_ty.clone(), "Ok".to_string(), None)),
+        )];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("does not declare a return type")));
+
+        system = system_with_command("authorize", Some(outcome_ty.clone()));
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Var(outcome_ty.clone(), "Ok".to_string(), None)),
+        )];
+        assert!(
+            check_system(&env, &system).is_empty(),
+            "valid enum return constructor should pass"
+        );
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::CtorRecord(
+                outcome_ty,
+                Some("Outcome".to_string()),
+                "Err".to_string(),
+                vec![("code".to_string(), lit_int(1))],
+                None,
+            )),
+        )];
+        assert!(
+            check_system(&env, &system).is_empty(),
+            "valid enum record return constructor should pass"
+        );
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Var(
+                Ty::Enum(
+                    "Outcome".to_string(),
+                    vec!["Ok".to_string(), "Err".to_string()],
+                ),
+                "Missing".to_string(),
+                None,
+            )),
+        )];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("not a variant")));
+
+        let outcome_ty = Ty::Enum(
+            "Outcome".to_string(),
+            vec!["Ok".to_string(), "Err".to_string()],
+        );
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Call(
+                outcome_ty.clone(),
+                Box::new(EExpr::Var(outcome_ty.clone(), "Err".to_string(), None)),
+                vec![lit_string("wrong")],
+                None,
+            )),
+        )];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("with argument 1")));
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Call(
+                outcome_ty.clone(),
+                Box::new(EExpr::Var(outcome_ty.clone(), "Err".to_string(), None)),
+                vec![lit_int(1)],
+                None,
+            )),
+        )];
+        assert!(
+            !check_system(&env, &system)
+                .iter()
+                .any(|error| error.message.contains("with argument 1")),
+            "valid positional payload types should not produce return payload diagnostics"
+        );
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Call(
+                Ty::Enum(
+                    "Outcome".to_string(),
+                    vec!["Ok".to_string(), "Err".to_string(), "Poison".to_string()],
+                ),
+                Box::new(EExpr::Var(
+                    Ty::Enum(
+                        "Outcome".to_string(),
+                        vec!["Ok".to_string(), "Err".to_string(), "Poison".to_string()],
+                    ),
+                    "Err".to_string(),
+                    None,
+                )),
+                vec![EExpr::Var(Ty::Error, "unknown".to_string(), None)],
+                None,
+            )),
+        )];
+        assert!(
+            !check_system(&env, &system)
+                .iter()
+                .any(|error| error.message.contains("with argument 1")),
+            "poison argument types should not produce return payload type diagnostics"
+        );
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::Call(
+                Ty::Enum(
+                    "Outcome".to_string(),
+                    vec!["Ok".to_string(), "Err".to_string(), "Poison".to_string()],
+                ),
+                Box::new(EExpr::Var(
+                    Ty::Enum(
+                        "Outcome".to_string(),
+                        vec!["Ok".to_string(), "Err".to_string(), "Poison".to_string()],
+                    ),
+                    "Poison".to_string(),
+                    None,
+                )),
+                vec![lit_string("anything")],
+                None,
+            )),
+        )];
+        assert!(
+            !check_system(&env, &system)
+                .iter()
+                .any(|error| error.message.contains("with argument 1")),
+            "poison declared payload types should not produce return payload type diagnostics"
+        );
+
+        system.actions = vec![system_action(
+            "authorize",
+            Some(EExpr::CtorRecord(
+                outcome_ty,
+                Some("Outcome".to_string()),
+                "Err".to_string(),
+                vec![("code".to_string(), lit_string("wrong"))],
+                None,
+            )),
+        )];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("with field")));
+
+        system = system_with_command("authorize", Some(ty_int()));
+        system.actions = vec![system_action("authorize", Some(lit_int(1)))];
+        assert!(
+            check_system(&env, &system).is_empty(),
+            "non-enum return types are accepted for now"
+        );
+    }
+
+    #[test]
+    fn system_checker_validates_proc_requires_are_boolean() {
+        let env = Env::new();
+        let mut system = system_with_command("noop", None);
+        let mut proc = proc_with_node("noop");
+        proc.requires = Some(lit_int(1));
+        system.procs = vec![proc];
+
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message == crate::messages::MSG_REQUIRES_SHOULD_BE_BOOL));
+
+        let mut valid_proc = proc_with_node("noop");
+        valid_proc.requires = Some(EExpr::Lit(
+            Ty::Builtin(BuiltinTy::Bool),
+            Literal::Bool(true),
+            None,
+        ));
+        system.procs = vec![valid_proc];
+        let errors = check_system(&env, &system);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.message == crate::messages::MSG_REQUIRES_SHOULD_BE_BOOL),
+            "bool proc requires should not produce requires-type diagnostics"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.message.contains("duplicate proc node")),
+            "single proc node should not be reported as duplicate"
+        );
+
+        let mut duplicate_proc = proc_with_node("noop");
+        duplicate_proc.nodes.push(EProcNode {
+            name: "charge".to_string(),
+            instance: "payments".to_string(),
+            command: "noop".to_string(),
+            args: vec![],
+        });
+        system.procs = vec![duplicate_proc];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("duplicate proc node `charge`")));
+    }
+
+    #[test]
+    fn system_checker_validates_proc_nodes_edges_and_cycles() {
+        let mut env = Env::new();
+        let mut bound_system = system_with_command("charge", None);
+        bound_system.commands[0].params = vec![("amount".to_string(), ty_int())];
+        env.systems
+            .insert("Payments".to_string(), bound_system.clone());
+
+        let mut system = bound_system;
+        let valid_node = EProcNode {
+            name: "charge".to_string(),
+            instance: "self".to_string(),
+            command: "charge".to_string(),
+            args: vec![lit_int(1)],
+        };
+        let valid_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![valid_node.clone()],
+            edges: vec![],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![valid_proc];
+        assert!(
+            check_system(&env, &system).is_empty(),
+            "valid proc node arguments and acyclic empty graph should pass"
+        );
+
+        let bad_type_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![EProcNode {
+                args: vec![lit_string("wrong")],
+                ..valid_node.clone()
+            }],
+            edges: vec![],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![bad_type_proc];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("passes argument 1")));
+
+        let poison_arg_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![EProcNode {
+                args: vec![EExpr::Var(Ty::Error, "unknown".to_string(), None)],
+                ..valid_node.clone()
+            }],
+            edges: vec![],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![poison_arg_proc];
+        assert!(
+            !check_system(&env, &system)
+                .iter()
+                .any(|error| error.message.contains("passes argument 1")),
+            "poison proc node args should not produce type diagnostics"
+        );
+
+        let arity_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![EProcNode {
+                args: vec![],
+                ..valid_node.clone()
+            }],
+            edges: vec![],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![arity_proc];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("passes 0 argument(s)")));
+
+        let unknown_edge_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![valid_node.clone()],
+            edges: vec![EProcEdge {
+                target: "missing".to_string(),
+                condition: EProcDepCond::Fact {
+                    node: "charge".to_string(),
+                    qualifier: None,
+                },
+            }],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![unknown_edge_proc];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("edge target `missing`")));
+
+        let cyclic_proc = EProc {
+            name: "checkout".to_string(),
+            params: vec![],
+            requires: None,
+            nodes: vec![
+                valid_node.clone(),
+                EProcNode {
+                    name: "settle".to_string(),
+                    instance: "self".to_string(),
+                    command: "charge".to_string(),
+                    args: vec![lit_int(1)],
+                },
+            ],
+            edges: vec![
+                EProcEdge {
+                    target: "settle".to_string(),
+                    condition: EProcDepCond::Fact {
+                        node: "charge".to_string(),
+                        qualifier: None,
+                    },
+                },
+                EProcEdge {
+                    target: "charge".to_string(),
+                    condition: EProcDepCond::Fact {
+                        node: "settle".to_string(),
+                        qualifier: None,
+                    },
+                },
+            ],
+            proc_uses: vec![],
+            span: None,
+        };
+        system.procs = vec![cyclic_proc];
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("dependency cycle")));
     }
 
     #[test]
@@ -1371,6 +1984,374 @@ mod tests {
             )),
             "expected missing extern query diagnostic, got: {errors:?}"
         );
+    }
+
+    #[test]
+    fn check_extern_stops_after_unknown_interface() {
+        let env = Env::new();
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: Some("MissingInterface".to_owned()),
+            commands: vec![command("authorize", Some(ty_string()))],
+            mays: vec![],
+            assumes: vec![],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("unknown interface"));
+    }
+
+    #[test]
+    fn check_extern_validates_may_blocks_and_assumptions() {
+        let env = Env::new();
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: None,
+            commands: vec![
+                command("authorize", Some(ty_string())),
+                command("void_command", None),
+                command("missing_may", Some(ty_int())),
+            ],
+            mays: vec![
+                may("authorize", lit_string("ok")),
+                may("authorize", lit_int(1)),
+                may("unknown", lit_int(2)),
+                may("void_command", lit_int(3)),
+            ],
+            assumes: vec![
+                EExternAssume::Fair(vec!["Other".to_string(), "authorize".to_string()], None),
+                EExternAssume::StrongFair(vec!["missing".to_string()], None),
+                EExternAssume::Expr(lit_int(1), None),
+                EExternAssume::Expr(
+                    EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(true), None),
+                    None,
+                ),
+            ],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+        assert_eq!(errors.len(), 8, "unexpected extern diagnostics: {errors:?}");
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("multiple `may authorize`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("returns `int` but command")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("unknown command `unknown`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("has no return type")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("missing a `may missing_may`")));
+        assert!(errors.iter().any(|error| error
+            .message
+            .contains("must reference a local command name")));
+        assert!(errors.iter().any(|error| error
+            .message
+            .contains("references unknown command `missing`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("assume expression must be bool")));
+    }
+
+    #[test]
+    fn check_extern_accepts_bool_and_poison_assume_expressions() {
+        let env = Env::new();
+        let ext = EExtern {
+            name: "StripeGateway".to_owned(),
+            implements: None,
+            commands: vec![command("authorize", Some(ty_string()))],
+            mays: vec![may("authorize", lit_string("ok"))],
+            assumes: vec![
+                EExternAssume::Expr(
+                    EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(true), None),
+                    None,
+                ),
+                EExternAssume::Expr(EExpr::Var(Ty::Error, "Unknown".to_string(), None), None),
+            ],
+            span: None,
+        };
+
+        let errors = check_extern(&env, &ext);
+        assert!(
+            errors.is_empty(),
+            "unexpected extern diagnostics: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn interface_conformance_rejects_command_return_presence_mismatches() {
+        let interface_requires_return = EInterface {
+            name: "PaymentProcessor".to_owned(),
+            commands: vec![command("authorize", Some(ty_string()))],
+            queries: vec![],
+            span: None,
+        };
+        let mut env = env_with_interface(interface_requires_return);
+        let mut system = system_with_command("authorize", None);
+        system.implements = Some("PaymentProcessor".to_string());
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("has no return type")));
+
+        let interface_declares_no_return = EInterface {
+            name: "PaymentProcessor".to_owned(),
+            commands: vec![command("authorize", None)],
+            queries: vec![],
+            span: None,
+        };
+        env = env_with_interface(interface_declares_no_return);
+        system = system_with_command("authorize", Some(ty_int()));
+        system.implements = Some("PaymentProcessor".to_string());
+        let errors = check_system(&env, &system);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("declares no return value")));
+
+        system = system_with_command("authorize", Some(Ty::Error));
+        system.implements = Some("PaymentProcessor".to_string());
+        let errors = check_system(&env, &system);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.message.contains("declares no return value")),
+            "Ty::Error return should not trigger interface return-presence mismatch: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn interface_conformance_rejects_query_parameter_and_return_mismatches() {
+        let interface = EInterface {
+            name: "PaymentProcessor".to_owned(),
+            commands: vec![],
+            queries: vec![EQuerySig {
+                name: "settlement_count".to_owned(),
+                params: vec![("merchant".to_owned(), ty_int())],
+                return_type: ty_int(),
+                span: None,
+            }],
+            span: None,
+        };
+        let env = env_with_interface(interface);
+        let mut system = system_with_command("noop", None);
+        system.commands.clear();
+        system.implements = Some("PaymentProcessor".to_string());
+        system.queries = vec![query(
+            "settlement_count",
+            vec![("merchant".to_string(), ty_string())],
+            EExpr::Lit(Ty::Builtin(BuiltinTy::Bool), Literal::Bool(true), None),
+        )];
+
+        let errors = check_system(&env, &system);
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("parameter 1 has type")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("returns `bool`")));
+
+        system.queries = vec![query(
+            "settlement_count",
+            vec![
+                ("merchant".to_string(), ty_int()),
+                ("extra".to_string(), ty_int()),
+            ],
+            lit_int(1),
+        )];
+        let errors = check_system(&env, &system);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("has 2 parameter(s)"));
+    }
+
+    #[test]
+    fn return_helpers_extract_constructor_names_and_payload_shapes() {
+        let bare = enum_variant(payment_decision_ty(), "Approved");
+        assert_eq!(
+            extract_return_ctor_name(&bare),
+            Some("Approved".to_string())
+        );
+        match extract_return_payload(&bare) {
+            ReturnPayload::Positional(args) => assert!(args.is_empty()),
+            ReturnPayload::Named(_) => panic!("bare constructor should be positional"),
+        }
+
+        let called = EExpr::Call(
+            payment_decision_ty(),
+            Box::new(enum_variant(payment_decision_ty(), "Declined")),
+            vec![lit_int(7), lit_string("no")],
+            None,
+        );
+        assert_eq!(
+            extract_return_ctor_name(&called),
+            Some("Declined".to_string())
+        );
+        match extract_return_payload(&called) {
+            ReturnPayload::Positional(args) => assert_eq!(args.len(), 2),
+            ReturnPayload::Named(_) => panic!("call constructor should be positional"),
+        }
+
+        let record = EExpr::CtorRecord(
+            payment_decision_ty(),
+            Some("PaymentDecision".to_string()),
+            "Approved".to_string(),
+            vec![
+                ("code".to_string(), lit_int(200)),
+                ("label".to_string(), lit_string("ok")),
+            ],
+            None,
+        );
+        assert_eq!(
+            extract_return_ctor_name(&record),
+            Some("Approved".to_string())
+        );
+        match extract_return_payload(&record) {
+            ReturnPayload::Named(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "code");
+                assert_eq!(fields[1].0, "label");
+            }
+            ReturnPayload::Positional(_) => panic!("record constructor should be named"),
+        }
+
+        let non_constructor = EExpr::Field(
+            ty_int(),
+            Box::new(EExpr::Var(ty_int(), "x".to_string(), None)),
+            "value".to_string(),
+            None,
+        );
+        assert_eq!(extract_return_ctor_name(&non_constructor), None);
+        match extract_return_payload(&non_constructor) {
+            ReturnPayload::Positional(args) => assert!(args.is_empty()),
+            ReturnPayload::Named(_) => panic!("non-constructor fallback should be positional"),
+        }
+    }
+
+    #[test]
+    fn proc_dep_condition_checker_validates_nodes_and_outcome_ports() {
+        let outcome_ty = Ty::Enum(
+            "ChargeOutcome".to_string(),
+            vec!["Approved".to_string(), "Declined".to_string()],
+        );
+        let proc = proc_with_node("charge");
+        let node_names = HashSet::from(["charge"]);
+        let let_binding_systems = HashMap::from([("payments", "Payments")]);
+        let mut env = Env::new();
+        env.systems.insert(
+            "Payments".to_string(),
+            system_with_command("charge", Some(outcome_ty)),
+        );
+        let ctx = ProcDepCheckCtx {
+            env: &env,
+            proc: &proc,
+            node_names: &node_names,
+            let_binding_systems: &let_binding_systems,
+            proc_ctx: "proc checkout",
+            span: crate::span::Span { start: 1, end: 2 },
+        };
+
+        let mut errors = Vec::new();
+        validate_proc_dep_cond(
+            &ctx,
+            &EProcDepCond::Fact {
+                node: "missing".to_string(),
+                qualifier: None,
+            },
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("not a declared node"));
+
+        errors.clear();
+        validate_proc_dep_cond(
+            &ctx,
+            &EProcDepCond::Fact {
+                node: "charge".to_string(),
+                qualifier: Some("done".to_string()),
+            },
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        validate_proc_dep_cond(
+            &ctx,
+            &EProcDepCond::Fact {
+                node: "charge".to_string(),
+                qualifier: Some("Approved".to_string()),
+            },
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+
+        validate_proc_dep_cond(
+            &ctx,
+            &EProcDepCond::Fact {
+                node: "charge".to_string(),
+                qualifier: Some("Missing".to_string()),
+            },
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("return type has variants"));
+
+        let proc = proc_with_node("no_return");
+        let mut no_return_env = Env::new();
+        no_return_env.systems.insert(
+            "Payments".to_string(),
+            system_with_command("no_return", None),
+        );
+        let no_return_ctx = ProcDepCheckCtx {
+            env: &no_return_env,
+            proc: &proc,
+            node_names: &node_names,
+            let_binding_systems: &let_binding_systems,
+            proc_ctx: "proc checkout",
+            span: crate::span::Span { start: 3, end: 4 },
+        };
+        let mut no_return_errors = Vec::new();
+        validate_proc_dep_cond(
+            &no_return_ctx,
+            &EProcDepCond::Fact {
+                node: "charge".to_string(),
+                qualifier: Some("Approved".to_string()),
+            },
+            &mut no_return_errors,
+        );
+        assert_eq!(no_return_errors.len(), 1);
+        assert!(no_return_errors[0].message.contains("has no return type"));
+
+        let proc = proc_with_node("count");
+        let mut int_env = Env::new();
+        int_env.systems.insert(
+            "Payments".to_string(),
+            system_with_command("count", Some(ty_int())),
+        );
+        let int_ctx = ProcDepCheckCtx {
+            env: &int_env,
+            proc: &proc,
+            node_names: &node_names,
+            let_binding_systems: &let_binding_systems,
+            proc_ctx: "proc checkout",
+            span: crate::span::Span { start: 5, end: 6 },
+        };
+        let mut int_errors = Vec::new();
+        validate_proc_dep_cond(
+            &int_ctx,
+            &EProcDepCond::Fact {
+                node: "charge".to_string(),
+                qualifier: Some("Approved".to_string()),
+            },
+            &mut int_errors,
+        );
+        assert_eq!(int_errors.len(), 1);
+        assert!(int_errors[0].message.contains("not an enum"));
     }
 }
 
@@ -1575,7 +2556,6 @@ pub(super) enum ReturnPayload<'a> {
 /// Extract the payload from a return expression.
 pub(super) fn extract_return_payload(expr: &EExpr) -> ReturnPayload<'_> {
     match expr {
-        EExpr::Var(..) => ReturnPayload::Positional(vec![]),
         EExpr::Call(_, _, args, _) => ReturnPayload::Positional(args.iter().collect()),
         EExpr::CtorRecord(_, _, _, fields, _) => {
             ReturnPayload::Named(fields.iter().map(|(n, e)| (n.as_str(), e)).collect())

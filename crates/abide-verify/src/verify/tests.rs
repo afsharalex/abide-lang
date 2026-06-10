@@ -9397,6 +9397,19 @@ fn make_pooled_apply_chain_ir() -> IRProgram {
 }
 
 fn make_pooled_create_then_inc_ir() -> IRProgram {
+    make_pooled_create_then_inc_ir_with_create_fields(vec![IRCreateField {
+        name: "x".to_owned(),
+        value: IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: 1 },
+            span: None,
+        },
+    }])
+}
+
+fn make_pooled_create_then_inc_ir_with_create_fields(
+    create_fields: Vec<IRCreateField>,
+) -> IRProgram {
     let entity_ty = IRType::Entity {
         name: "Counter".to_owned(),
     };
@@ -9472,7 +9485,7 @@ fn make_pooled_create_then_inc_ir() -> IRProgram {
             body: vec![
                 IRAction::Create {
                     entity: "Counter".to_owned(),
-                    fields: vec![],
+                    fields: create_fields,
                 },
                 IRAction::Choose {
                     var: "c".to_owned(),
@@ -9564,6 +9577,32 @@ fn make_pooled_create_then_inc_ir() -> IRProgram {
         axioms: vec![],
         lemmas: vec![],
         scenes: vec![],
+    }
+}
+
+#[test]
+fn pooled_create_then_inc_without_initializer_has_real_two_step_counterexample() {
+    let ir = make_pooled_create_then_inc_ir_with_create_fields(vec![]);
+    let config = VerifyConfig {
+        bounded_only: true,
+        no_ic3: true,
+        ..short_solver_regression_config()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    match &results[0] {
+        VerificationResult::Counterexample {
+            name,
+            replay: Some(replay),
+            ..
+        } => {
+            assert_eq!(name, "pooled_create_then_inc_positive");
+            assert!(replay.checked);
+            assert_eq!(replay.steps, 2);
+            assert!(replay.property_violated);
+        }
+        other => panic!("expected uninitialized create-then-inc to be refuted, got: {other:?}"),
     }
 }
 
@@ -19650,6 +19689,1020 @@ fn fn_contract_no_ensures_skipped() {
         results.len(),
         0,
         "fn without ensures should produce no results"
+    );
+}
+
+#[test]
+fn fn_contract_assume_without_ensures_is_admitted() {
+    let func = IRFunction {
+        name: "trusted_assume".to_owned(),
+        ty: IRType::Fn {
+            param: Box::new(IRType::Int),
+            result: Box::new(IRType::Int),
+        },
+        body: IRExpr::Lam {
+            param: "x".to_owned(),
+            param_type: IRType::Int,
+            body: Box::new(IRExpr::Block {
+                exprs: vec![
+                    IRExpr::Assume {
+                        expr: Box::new(IRExpr::BinOp {
+                            op: "OpGe".to_owned(),
+                            left: Box::new(IRExpr::Var {
+                                name: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            right: Box::new(IRExpr::Lit {
+                                ty: IRType::Int,
+                                value: LitVal::Int { value: 0 },
+                                span: None,
+                            }),
+                            ty: IRType::Bool,
+                            span: None,
+                        }),
+                        span: None,
+                    },
+                    IRExpr::Var {
+                        name: "x".to_owned(),
+                        ty: IRType::Int,
+                        span: None,
+                    },
+                ],
+                span: None,
+            }),
+            span: None,
+        },
+        prop_target: None,
+        requires: vec![],
+        ensures: vec![],
+        decreases: None,
+        span: None,
+        file: None,
+    };
+
+    let ir = make_fn_ir(func);
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(&results[0], VerificationResult::FnContractAdmitted { name, reason, .. }
+            if name == "trusted_assume" && reason.contains("assume")),
+        "expected assume-only fn contract to be admitted, got: {}",
+        results[0]
+    );
+}
+
+#[test]
+fn fn_contract_branch_assert_uses_outer_requires() {
+    let ir = lower_source_file(
+        "branch_requires.ab",
+        "module BranchRequires\n\n\
+         fn branch_assert(x: int, flag: bool): int\n\
+         \x20 requires x > 0\n\
+         {\n\
+         \x20 if flag {\n\
+         \x20   assert x > 0\n\
+         \x20 } else {\n\
+         \x20   assert x > 0\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "branch_assert"
+        )),
+        "branch assertions should be proved from the outer requires, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_branch_assert_uses_branch_condition() {
+    let ir = lower_source_file(
+        "branch_condition_assert.ab",
+        "module BranchConditionAssert\n\n\
+         fn branch_condition(flag: bool): bool\n\
+         {\n\
+         \x20 if flag {\n\
+         \x20   assert flag\n\
+         \x20 } else {\n\
+         \x20   assert not flag\n\
+         \x20 }\n\
+         \x20 flag\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "branch_condition"
+        )),
+        "branch assertions should be proved from branch path conditions, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_rejects_bad_invariant_initialization() {
+    let ir = lower_source_file(
+        "bad_loop_init.ab",
+        "module BadLoopInit\n\n\
+         fn bad_loop_init(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var i = 1\n\
+         \x20 while i < n\n\
+         \x20   invariant i == 0\n\
+         \x20   decreases n - i\n\
+         \x20 {\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "fn_bad_loop_init"
+        )),
+        "bad loop invariant initialization should be rejected, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_rejects_bad_invariant_initialization_only() {
+    let ir = lower_source_file(
+        "bad_loop_init_only.ab",
+        "module BadLoopInitOnly\n\n\
+         fn bad_loop_init_only(): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var i = -1\n\
+         \x20 while i < 0\n\
+         \x20   invariant i >= 0\n\
+         \x20   decreases 0 - i\n\
+         \x20 {\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "fn_bad_loop_init_only"
+        )),
+        "bad loop invariant initialization should be rejected even when other loop VCs are vacuous, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_rejects_bad_invariant_preservation() {
+    let ir = lower_source_file(
+        "bad_loop_preservation.ab",
+        "module BadLoopPreservation\n\n\
+         fn bad_loop_preservation(): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var i = 0\n\
+         \x20 while i < 1\n\
+         \x20   invariant i == 0\n\
+         \x20   decreases 1 - i\n\
+         \x20 {\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "fn_bad_loop_preservation"
+        )),
+        "bad loop invariant preservation should be rejected, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_rejects_bad_decreases() {
+    let ir = lower_source_file(
+        "bad_loop_decreases.ab",
+        "module BadLoopDecreases\n\n\
+         fn bad_loop_decreases(): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var i = 0\n\
+         \x20 while i < 1\n\
+         \x20   invariant i >= 0\n\
+         \x20   invariant i <= 1\n\
+         \x20   decreases i\n\
+         \x20 {\n\
+         \x20   i = i + 1\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "fn_bad_loop_decreases"
+        )),
+        "bad loop decreases should be rejected, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_accepts_later_lexicographic_decrease() {
+    let ir = lower_source_file(
+        "good_loop_lex_decreases.ab",
+        "module GoodLoopLexDecreases\n\n\
+         fn good_loop_lex_decreases(): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var m = 1\n\
+         \x20 var n = 3\n\
+         \x20 while n > 0\n\
+         \x20   invariant m == 1\n\
+         \x20   invariant n >= 0\n\
+         \x20   invariant n <= 3\n\
+         \x20   decreases m, n\n\
+         \x20 {\n\
+         \x20   n = n - 1\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. }
+                if name == "good_loop_lex_decreases"
+        )),
+        "lexicographic loop decreases should accept unchanged earlier measures with a later decrease, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_modified_assignment_is_havoced_for_preservation() {
+    let ir = lower_source_file(
+        "bad_loop_modified_assignment.ab",
+        "module BadLoopModifiedAssignment\n\n\
+         fn bad_modified_assignment(): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 10\n\
+         \x20   invariant x >= 0\n\
+         \x20   invariant x <= 10\n\
+         \x20   decreases 10 - x\n\
+         \x20 {\n\
+         \x20   x = x + 2\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_modified_assignment" && hint.contains("loop invariant")
+        )),
+        "loop preservation should use fresh pre-state values for modified assignments, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_executes_branch_and_decl_assignments_for_preservation() {
+    let ir = lower_source_file(
+        "bad_loop_branch_decl_assignment.ab",
+        "module BadLoopBranchDeclAssignment\n\n\
+         fn bad_branch_decl_assignment(flag: bool): int\n\
+         \x20 ensures result == 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 10\n\
+         \x20   invariant x >= 0\n\
+         \x20   invariant x <= 10\n\
+         \x20   decreases 10 - x\n\
+         \x20 {\n\
+         \x20   if flag {\n\
+         \x20     var step = 2\n\
+         \x20     x = x + step\n\
+         \x20   } else {\n\
+         \x20     x = x + 1\n\
+         \x20   }\n\
+         \x20 }\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_branch_decl_assignment" && hint.contains("loop invariant")
+        )),
+        "loop preservation should execute branch and declaration assignments, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_proves_counter_with_block_and_decl_assignments() {
+    let ir = lower_source_file(
+        "good_loop_block_decl_assignment.ab",
+        "module GoodLoopBlockDeclAssignment\n\n\
+         fn good_block_decl_assignment(): int\n\
+         \x20 ensures result == 10\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 10\n\
+         \x20   invariant x >= 0\n\
+         \x20   invariant x <= 10\n\
+         \x20   decreases 10 - x\n\
+         \x20 {\n\
+         \x20   var step = 1\n\
+         \x20   x = x + step\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. }
+                if name == "good_block_decl_assignment"
+        )),
+        "loop body execution should prove the counter reaches 10, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_rejects_assertion_in_body() {
+    let ir = lower_source_file(
+        "bad_loop_assert.ab",
+        "module BadLoopAssert\n\n\
+         fn bad_loop_assert(): int\n\
+         \x20 ensures result == 1\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 1\n\
+         \x20   invariant x >= 0\n\
+         \x20   invariant x <= 1\n\
+         \x20   decreases 1 - x\n\
+         \x20 {\n\
+         \x20   assert false\n\
+         \x20   x = x + 1\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_loop_assert" && hint.contains("assertion")
+        )),
+        "loop body assertions must be checked, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_loop_assume_feeds_later_assertion() {
+    let ir = lower_source_file(
+        "loop_assume_assert.ab",
+        "module LoopAssumeAssert\n\n\
+         fn loop_assume_assert(): int\n\
+         \x20 ensures result == 1\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 1\n\
+         \x20   invariant x >= -10\n\
+         \x20   invariant x <= 1\n\
+         \x20   decreases 1 - x\n\
+         \x20 {\n\
+         \x20   assume x == 0\n\
+         \x20   assert x == 0\n\
+         \x20   x = x + 1\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractAdmitted { name, reason, .. }
+                if name == "loop_assume_assert" && reason.contains("assume")
+        )),
+        "loop body assumptions should feed later assertions and disclose admission, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_nested_loop_abstraction_feeds_outer_body() {
+    let ir = lower_source_file(
+        "nested_loop_abstraction.ab",
+        "module NestedLoopAbstraction\n\n\
+         fn nested_loop_abstraction(): int\n\
+         \x20 ensures result == 1\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 while x < 1\n\
+         \x20   invariant x >= 0\n\
+         \x20   invariant x <= 1\n\
+         \x20   decreases 1 - x\n\
+         \x20 {\n\
+         \x20   var y = 0\n\
+         \x20   while y < 1\n\
+         \x20     invariant y >= 0\n\
+         \x20     invariant y <= 1\n\
+         \x20     decreases 1 - y\n\
+         \x20   {\n\
+         \x20     y = y + 1\n\
+         \x20   }\n\
+         \x20   x = x + y\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. }
+                if name == "nested_loop_abstraction"
+        )),
+        "nested loop abstraction should provide invariant plus exit facts to the outer body, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_lambda_body_application_proves() {
+    let ir = lower_source_file(
+        "lambda_body_application.ab",
+        "module LambdaBodyApplication\n\n\
+         fn apply_single(): int\n\
+         \x20 ensures result == 2\n\
+         {\n\
+         \x20 (fn(y: int): int => y + 1)(1)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "apply_single"
+        )),
+        "lambda application in a function body should prove via its definitional axiom, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_lambda_in_ensures_proves() {
+    let ir = lower_source_file(
+        "lambda_in_ensures.ab",
+        "module LambdaInEnsures\n\n\
+         fn ensures_lambda(): int\n\
+         \x20 ensures (fn(x: int): int => x + 1)(0) == 1\n\
+         {\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "ensures_lambda"
+        )),
+        "lambda application in an ensures clause should prove via its definitional axiom, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_lambda_in_assert_proves() {
+    let ir = lower_source_file(
+        "lambda_in_assert.ab",
+        "module LambdaInAssert\n\n\
+         fn assert_lambda(): int\n\
+         {\n\
+         \x20 assert (fn(x: int): int => x + 1)(0) == 1\n\
+         \x20 0\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "assert_lambda"
+        )),
+        "lambda application in an assert should prove on the assertion VC solver, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_lambda_axiom_accumulator_asserts_on_solver() {
+    clear_lambda_axioms();
+    assert!(clone_lambda_axioms().is_empty());
+
+    push_lambda_axiom(smt::bool_val(false).to_bool().expect("bool axiom"));
+    assert_eq!(clone_lambda_axioms().len(), 1);
+
+    let solver = AbideSolver::new();
+    assert_lambda_axioms_on(&solver);
+    assert_eq!(solver.check(), SatResult::Unsat);
+
+    clear_lambda_axioms();
+    assert!(clone_lambda_axioms().is_empty());
+}
+
+#[test]
+fn fn_contract_assignment_updates_later_result() {
+    let ir = lower_source_file(
+        "assignment_updates_result.ab",
+        "module AssignmentUpdatesResult\n\n\
+         fn assignment_updates_result(): int\n\
+         \x20 ensures result == 1\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 x = x + 1\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. }
+                if name == "assignment_updates_result"
+        )),
+        "imperative assignment should update the environment used by later result expressions, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_mixed_branch_assignment_updates_result() {
+    let ir = lower_source_file(
+        "mixed_branch_assignment.ab",
+        "module MixedBranchAssignment\n\n\
+         fn mixed_branch_assignment(flag: bool): int\n\
+         \x20 ensures flag implies result == 1\n\
+         \x20 ensures (not flag) implies result == 0\n\
+         {\n\
+         \x20 var x = 0\n\
+         \x20 if flag {\n\
+         \x20   x = 1\n\
+         \x20 } else {\n\
+         \x20   0\n\
+         \x20 }\n\
+         \x20 x\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. }
+                if name == "mixed_branch_assignment"
+        )),
+        "imperative if routing should handle one imperative branch and one pure branch, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_self_call_uses_ensures_constraint() {
+    let ir = lower_source_file(
+        "recursive_ensures.ab",
+        "module RecursiveEnsures\n\n\
+         fn countdown(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 decreases n\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { countdown(n - 1) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "countdown"
+        )),
+        "recursive postcondition should use the callee ensures constraint, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_rejects_bad_decrease() {
+    let ir = lower_source_file(
+        "bad_recursive_decrease.ab",
+        "module BadRecursiveDecrease\n\n\
+         fn bad_recurse(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 decreases n\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { bad_recurse(n + 1) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_recurse" && hint.contains("termination")
+        )),
+        "recursive call with increasing measure should fail termination, got: {results:#?}"
+    );
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "bad_recurse"
+        )),
+        "postcondition must not be reported proved after termination failure: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_rejects_equal_measure() {
+    let ir = lower_source_file(
+        "bad_recursive_equal_measure.ab",
+        "module BadRecursiveEqualMeasure\n\n\
+         fn bad_equal(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 decreases n\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { bad_equal(n) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_equal" && hint.contains("termination")
+        )),
+        "recursive call with equal measure should fail strict termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_rejects_bad_lexicographic_prefix() {
+    let ir = lower_source_file(
+        "bad_recursive_lex.ab",
+        "module BadRecursiveLex\n\n\
+         fn bad_lex(m: int, n: int): int\n\
+         \x20 requires m >= 0\n\
+         \x20 requires n >= 0\n\
+         \x20 decreases m, n\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { bad_lex(m + 1, n - 1) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_lex" && hint.contains("termination")
+        )),
+        "lexicographic decrease must reject calls where an earlier measure increases, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_accepts_later_lexicographic_decrease() {
+    let ir = lower_source_file(
+        "good_recursive_lex.ab",
+        "module GoodRecursiveLex\n\n\
+         fn good_lex(m: int, n: int): int\n\
+         \x20 requires m >= 0\n\
+         \x20 requires n >= 0\n\
+         \x20 decreases m, n\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { good_lex(m, n - 1) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "good_lex"
+        )),
+        "lexicographic decrease should accept unchanged earlier measures with a later decrease, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_rejects_bad_callee_requires() {
+    let ir = lower_source_file(
+        "bad_recursive_precondition.ab",
+        "module BadRecursivePrecondition\n\n\
+         fn bad_precond(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { bad_precond(-1) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_precond" && hint.contains("precondition")
+        )),
+        "recursive call violating callee requires should fail precondition checking, got: {results:#?}"
+    );
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "bad_precond"
+        )),
+        "postcondition must not be reported proved after recursive precondition failure: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_termination_tracks_local_actuals() {
+    let ir = lower_source_file(
+        "recursive_local_actual.ab",
+        "module RecursiveLocalActual\n\n\
+         fn via_local(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 {\n\
+         \x20   0\n\
+         \x20 } else {\n\
+         \x20   var m = n - 1\n\
+         \x20   via_local(m)\n\
+         \x20 }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "via_local"
+        )),
+        "recursive termination should evaluate actual args in the call-site environment, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_ignores_non_self_calls() {
+    let ir = lower_source_file(
+        "recursive_non_self_call.ab",
+        "module RecursiveNonSelfCall\n\n\
+         fn helper(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         {\n\
+         \x20 n\n\
+         }\n\n\
+         fn caller(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 helper(n + 1)\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "caller"
+        )),
+        "non-recursive calls must not be collected as recursive call sites, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_binop() {
+    let ir = lower_source_file(
+        "recursive_binop_call.ab",
+        "module RecursiveBinopCall\n\n\
+         fn bad_binop(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { bad_binop(n) + 0 }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_binop" && hint.contains("termination")
+        )),
+        "recursive calls nested in binary expressions must be checked for termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_match() {
+    let ir = lower_source_file(
+        "recursive_match_call.ab",
+        "module RecursiveMatchCall\n\n\
+         fn bad_match(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 match n {\n\
+         \x20   _ if n == 0 => 0\n\
+         \x20   _ => bad_match(n)\n\
+         \x20 }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_match" && hint.contains("termination")
+        )),
+        "recursive calls nested in match arms must be checked for termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_var_decl_body() {
+    let ir = lower_source_file(
+        "recursive_var_decl_call.ab",
+        "module RecursiveVarDeclCall\n\n\
+         fn bad_var(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 {\n\
+         \x20   0\n\
+         \x20 } else {\n\
+         \x20   var m = n\n\
+         \x20   bad_var(m)\n\
+         \x20 }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_var" && hint.contains("termination")
+        )),
+        "recursive calls after var declarations must be checked for termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_let_expr() {
+    let ir = lower_source_file(
+        "recursive_let_call.ab",
+        "module RecursiveLetCall\n\n\
+         fn bad_let(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { let m = n in bad_let(m) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_let" && hint.contains("termination")
+        )),
+        "recursive calls nested in let expressions must be checked for termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_unary_expr() {
+    let ir = lower_source_file(
+        "recursive_unary_call.ab",
+        "module RecursiveUnaryCall\n\n\
+         fn bad_unary(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures true\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { -bad_unary(n) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_unary" && hint.contains("termination")
+        )),
+        "recursive calls nested in unary expressions must be checked for termination, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_invoked_lambda() {
+    let ir = lower_source_file(
+        "recursive_lambda_call.ab",
+        "module RecursiveLambdaCall\n\n\
+         fn bad_lambda(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures true\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 { 0 } else { (fn(x: int) => bad_lambda(x))(n) }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "fn_bad_lambda"
+        )),
+        "recursive calls nested in invoked lambdas must produce a recursive-call obligation, got: {results:#?}"
+    );
+}
+
+#[test]
+fn fn_contract_recursive_collection_finds_calls_in_assert_expr() {
+    let ir = lower_source_file(
+        "recursive_assert_call.ab",
+        "module RecursiveAssertCall\n\n\
+         fn bad_assert(n: int): int\n\
+         \x20 requires n >= 0\n\
+         \x20 ensures result >= 0\n\
+         \x20 decreases n\n\
+         {\n\
+         \x20 if n == 0 {\n\
+         \x20   0\n\
+         \x20 } else {\n\
+         \x20   assert bad_assert(n) >= 0\n\
+         \x20   0\n\
+         \x20 }\n\
+         }\n",
+    );
+
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "fn_bad_assert" && hint.contains("termination")
+        )),
+        "recursive calls nested in assert expressions must be checked for termination, got: {results:#?}"
     );
 }
 

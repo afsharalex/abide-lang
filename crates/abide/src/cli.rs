@@ -1264,12 +1264,18 @@ fn collect_qa_scripts_in_directory(
 }
 
 fn print_qa_summary(result: &crate::qa::runner::QARunResult, json_mode: bool) {
-    if !json_mode {
-        println!(
+    if let Some(message) = qa_summary_message(result, json_mode) {
+        println!("{message}");
+    }
+}
+
+fn qa_summary_message(result: &crate::qa::runner::QARunResult, json_mode: bool) -> Option<String> {
+    (!json_mode).then(|| {
+        format!(
             "\n=== QA: {} passed, {} failed ({} executed) ===",
             result.passed, result.failed, result.executed
-        );
-    }
+        )
+    })
 }
 
 fn parse_simulation_scope_overrides(entries: &[String]) -> miette::Result<BTreeMap<String, usize>> {
@@ -1538,6 +1544,68 @@ mod tests {
     }
 
     #[test]
+    fn verify_names_normalize_solver_and_witness_display_names() {
+        let mut args = verify_command_for_config_tests();
+        args.solver = VerifySolver::Auto;
+        args.chc_solver = VerifyChcSolver::Auto;
+        args.witness_semantics = VerifyWitnessSemantics::Relational;
+
+        let names = verify_names(&args);
+
+        assert_eq!(names.solver, "auto");
+        assert_eq!(names.chc_solver, "auto");
+        assert_eq!(names.witness_semantics, "relational");
+    }
+
+    #[test]
+    fn verify_solver_options_reject_cvc5_sygus_without_cvc5_solver_selection() {
+        let mut args = verify_command_for_config_tests();
+        args.solver = VerifySolver::Z3;
+        args.solver_flags.cvc5_sygus = true;
+
+        let error = validate_verify_solver_options(&args)
+            .expect_err("cvc5 SyGuS requires a cvc5-capable solver");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--cvc5-sygus requires `--solver cvc5` or `--solver both`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_solver_options_accept_default_z3_without_cvc5_sygus() {
+        let mut args = verify_command_for_config_tests();
+        args.solver = VerifySolver::Z3;
+        args.solver_flags.cvc5_sygus = false;
+
+        validate_verify_solver_options(&args).expect("plain z3 solver options should be valid");
+    }
+
+    #[test]
+    fn verify_solver_options_accept_cvc5_solver_when_available() {
+        if !cvc5_available() {
+            return;
+        }
+        let mut args = verify_command_for_config_tests();
+        args.solver = VerifySolver::Cvc5;
+
+        validate_verify_solver_options(&args).expect("available cvc5 solver should be valid");
+    }
+
+    #[test]
+    fn verify_solver_options_accept_cvc5_chc_solver_when_available() {
+        if !cvc5_available() {
+            return;
+        }
+        let mut args = verify_command_for_config_tests();
+        args.chc_solver = VerifyChcSolver::Cvc5;
+
+        validate_verify_solver_options(&args).expect("available cvc5 CHC solver should be valid");
+    }
+
+    #[test]
     fn verify_timeout_policy_uses_generic_timeout_without_granular_overrides() {
         let mut args = verify_command_for_config_tests();
         args.timeouts.generic = Some(7);
@@ -1593,5 +1661,63 @@ mod tests {
         assert_eq!(config.induction_timeout_ms, 120_000);
         assert_eq!(config.bmc_timeout_ms, 30_000);
         assert_eq!(config.ic3_timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn verify_timeout_policy_zero_backend_timeout_disables_overall_timeout() {
+        let mut args = verify_command_for_config_tests();
+        args.timeouts.induction = Some(0);
+        args.timeouts.bmc = Some(5);
+        args.timeouts.ic3 = Some(7);
+
+        let config = build_verify_config(&args).expect("verify config");
+
+        assert_eq!(config.overall_timeout_ms, 0);
+        assert_eq!(config.induction_timeout_ms, 0);
+        assert_eq!(config.bmc_timeout_ms, 5_000);
+        assert_eq!(config.ic3_timeout_ms, 7_000);
+    }
+
+    #[test]
+    fn parse_simulation_scope_overrides_trims_names_and_overwrites_duplicates() {
+        let overrides = parse_simulation_scope_overrides(&[
+            " Account =2".to_owned(),
+            "Session=10".to_owned(),
+            "Account=3".to_owned(),
+        ])
+        .expect("scope overrides");
+
+        assert_eq!(overrides.get("Account"), Some(&3));
+        assert_eq!(overrides.get("Session"), Some(&10));
+        assert_eq!(overrides.len(), 2);
+    }
+
+    #[test]
+    fn parse_simulation_scope_overrides_rejects_malformed_entries() {
+        for entry in ["Account", "=2", "Account=-1", "Account=abc"] {
+            let error = parse_simulation_scope_overrides(&[entry.to_owned()])
+                .expect_err("malformed scope override should fail");
+            assert!(
+                error.to_string().contains("invalid `--scope"),
+                "unexpected error for {entry}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn qa_summary_message_renders_text_summary_and_suppresses_json_mode() {
+        let result = crate::qa::runner::QARunResult {
+            passed: 2,
+            failed: 1,
+            executed: 3,
+            output: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        assert_eq!(
+            qa_summary_message(&result, false).as_deref(),
+            Some("\n=== QA: 2 passed, 1 failed (3 executed) ===")
+        );
+        assert_eq!(qa_summary_message(&result, true), None);
     }
 }

@@ -920,38 +920,33 @@ fn render_record(fields: &BTreeMap<String, WitnessValue>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abide_verify::verify::{ExplicitStateSpaceStoreBound, ExplicitStateSpaceTransition};
 
-    fn sample_operational_evidence() -> EvidenceEnvelope {
-        let state0 = op::State::builder()
+    fn order_status(variant: &str) -> WitnessValue {
+        WitnessValue::EnumVariant {
+            enum_name: "OrderStatus".to_owned(),
+            variant: variant.to_owned(),
+            fields: BTreeMap::new(),
+        }
+    }
+
+    fn sample_state(status: &str) -> op::State {
+        op::State::builder()
             .entity_slot(
                 EntitySlotRef::new("Order", 0),
                 op::EntityState::builder(true)
-                    .field(
-                        "status",
-                        WitnessValue::EnumVariant {
-                            enum_name: "OrderStatus".to_owned(),
-                            variant: "Pending".to_owned(),
-                            fields: std::collections::BTreeMap::new(),
-                        },
-                    )
+                    .field("status", order_status(status))
                     .build(),
             )
-            .build();
-        let state1 = op::State::builder()
-            .entity_slot(
-                EntitySlotRef::new("Order", 0),
-                op::EntityState::builder(true)
-                    .field(
-                        "status",
-                        WitnessValue::EnumVariant {
-                            enum_name: "OrderStatus".to_owned(),
-                            variant: "Shipped".to_owned(),
-                            fields: std::collections::BTreeMap::new(),
-                        },
-                    )
-                    .build(),
+            .system_field(
+                "Shop",
+                "phase",
+                WitnessValue::String(format!("phase-{status}")),
             )
-            .build();
+            .build()
+    }
+
+    fn sample_behavior() -> op::Behavior {
         let transition = op::Transition::builder()
             .atomic_step(
                 op::AtomicStep::builder(
@@ -964,17 +959,143 @@ mod tests {
             )
             .build()
             .expect("valid transition");
-        let witness = op::OperationalWitness::counterexample(
-            op::Behavior::builder()
-                .state(state0)
-                .transition(transition)
-                .state(state1)
-                .build()
-                .expect("valid behavior"),
-        )
-        .expect("valid witness");
+
+        op::Behavior::builder()
+            .state(sample_state("Pending"))
+            .transition(transition)
+            .state(sample_state("Shipped"))
+            .build()
+            .expect("valid behavior")
+    }
+
+    fn operational_evidence(witness: op::OperationalWitness) -> EvidenceEnvelope {
         EvidenceEnvelope::witness(WitnessEnvelope::operational(witness).expect("valid envelope"))
             .expect("valid evidence")
+    }
+
+    fn sample_operational_evidence() -> EvidenceEnvelope {
+        operational_evidence(
+            op::OperationalWitness::counterexample(sample_behavior()).expect("valid witness"),
+        )
+    }
+
+    fn sample_liveness_evidence() -> EvidenceEnvelope {
+        operational_evidence(
+            op::OperationalWitness::liveness(sample_behavior(), 1).expect("valid witness"),
+        )
+    }
+
+    fn sample_relational_state(open: bool) -> rel::RelationalState {
+        rel::RelationalState::builder()
+            .extent_member("tickets", EntitySlotRef::new("Ticket", 0))
+            .expect("valid extent")
+            .field_relation(
+                "Ticket",
+                "status",
+                rel::RelationInstance::builder(2)
+                    .tuple(rel::TupleValue::new(vec![
+                        WitnessValue::SlotRef(EntitySlotRef::new("Ticket", 0)),
+                        if open {
+                            WitnessValue::String("Open".to_owned())
+                        } else {
+                            WitnessValue::String("Closed".to_owned())
+                        },
+                    ]))
+                    .expect("valid tuple")
+                    .build()
+                    .expect("valid relation"),
+            )
+            .expect("valid field relation")
+            .evaluation("is_open", WitnessValue::Bool(open))
+            .expect("valid eval")
+            .build()
+            .expect("valid relational state")
+    }
+
+    fn relational_evidence(witness: rel::RelationalWitness) -> EvidenceEnvelope {
+        EvidenceEnvelope::witness(WitnessEnvelope::relational(witness).expect("valid envelope"))
+            .expect("valid evidence")
+    }
+
+    fn sample_relational_snapshot_evidence() -> EvidenceEnvelope {
+        relational_evidence(
+            rel::RelationalWitness::snapshot(sample_relational_state(true))
+                .expect("valid snapshot"),
+        )
+    }
+
+    fn sample_relational_temporal_evidence() -> EvidenceEnvelope {
+        relational_evidence(
+            rel::RelationalWitness::temporal(
+                rel::TemporalRelationalWitness::new(
+                    vec![
+                        sample_relational_state(true),
+                        sample_relational_state(false),
+                    ],
+                    Some(1),
+                )
+                .expect("valid temporal"),
+            )
+            .expect("valid temporal witness"),
+        )
+    }
+
+    fn sample_countermodel_evidence() -> EvidenceEnvelope {
+        EvidenceEnvelope::countermodel(
+            Countermodel::new()
+                .backend("z3")
+                .summary("negated VC is satisfiable")
+                .binding(
+                    abide_witness::CountermodelBinding::new("x", WitnessValue::Int(42))
+                        .expect("valid binding"),
+                ),
+        )
+        .expect("valid countermodel")
+    }
+
+    fn sample_proof_ref_evidence() -> EvidenceEnvelope {
+        EvidenceEnvelope::proof_artifact_ref(
+            ProofArtifactRef::new("proofs/no_overdraft.agda")
+                .expect("valid proof ref")
+                .backend("agda")
+                .label("no_overdraft")
+                .checked(true),
+        )
+        .expect("valid proof ref evidence")
+    }
+
+    fn evidence_artifact(
+        result_kind: &'static str,
+        name: &str,
+        evidence: EvidenceEnvelope,
+    ) -> Artifact {
+        Artifact {
+            id: 1,
+            name: name.to_owned(),
+            result_kind,
+            payload: ArtifactPayload::Evidence(evidence),
+            evidence_extraction_error: None,
+        }
+    }
+
+    fn sample_state_space() -> ExplicitStateSpace {
+        ExplicitStateSpace {
+            systems: vec!["Shop".to_owned()],
+            stutter: true,
+            depth_bound: Some(2),
+            store_bounds: vec![ExplicitStateSpaceStoreBound {
+                name: "orders".to_owned(),
+                entity_type: "Order".to_owned(),
+                slots: 1,
+            }],
+            states: vec![sample_state("Pending"), sample_state("Shipped")],
+            initial_state: 0,
+            transitions: vec![ExplicitStateSpaceTransition {
+                from: 0,
+                to: 1,
+                label: "Shop::ship".to_owned(),
+            }],
+        }
     }
 
     #[test]
@@ -1023,22 +1144,93 @@ mod tests {
     }
 
     #[test]
+    fn store_records_admitted_liveness_and_payload_variants() {
+        let mut store = ArtifactStore::default();
+        let results = vec![
+            VerificationResult::Admitted {
+                name: "external_proof".to_owned(),
+                reason: "trusted proof".to_owned(),
+                time_ms: 2,
+                evidence: Some(sample_proof_ref_evidence()),
+                assumptions: vec![],
+                span: None,
+                file: None,
+            },
+            VerificationResult::LivenessViolation {
+                name: "eventually_paid".to_owned(),
+                evidence: Some(sample_liveness_evidence()),
+                evidence_extraction_error: Some("partial lasso".to_owned()),
+                loop_start: 1,
+                fairness_analysis: vec![],
+                assumptions: vec![],
+                span: None,
+                file: None,
+            },
+        ];
+
+        assert_eq!(store.record_verify_results(&results), 2);
+        let admitted = store.resolve("admitted:external_proof").expect("admitted");
+        assert_eq!(admitted.result_kind, "admitted");
+        assert!(admitted.summary_line().contains("proof-artifact-ref"));
+
+        let liveness = store
+            .resolve("liveness-violation:eventually_paid")
+            .expect("liveness");
+        assert_eq!(liveness.result_kind, "liveness-violation");
+        assert_eq!(
+            liveness.evidence_extraction_error.as_deref(),
+            Some("partial lasso")
+        );
+        assert!(liveness.summary_line().contains("operational-witness"));
+    }
+
+    #[test]
+    fn payload_kind_labels_cover_all_artifact_payloads() {
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::Evidence(sample_operational_evidence())),
+            "operational-witness"
+        );
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::Evidence(
+                sample_relational_snapshot_evidence()
+            )),
+            "relational-witness"
+        );
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::Evidence(sample_countermodel_evidence())),
+            "countermodel"
+        );
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::Evidence(sample_proof_ref_evidence())),
+            "proof-artifact-ref"
+        );
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::Simulation(SimulationArtifact {
+                systems: vec!["Shop".to_owned()],
+                seed: 1,
+                steps_requested: 0,
+                steps_executed: 0,
+                termination: SimulationTermination::StepLimit,
+                behavior: op::Behavior::builder().build().expect("empty behavior"),
+            })),
+            "simulation"
+        );
+        assert_eq!(
+            payload_kind_label(&ArtifactPayload::StateSpace(sample_state_space())),
+            "state-space"
+        );
+    }
+
+    #[test]
     fn simulation_artifact_renders_and_exports() {
         let mut store = ArtifactStore::default();
-        let transition = op::Transition::builder().build().expect("valid transition");
-        let behavior = op::Behavior::builder()
-            .state(op::State::builder().build())
-            .transition(transition)
-            .state(op::State::builder().build())
-            .build()
-            .expect("valid behavior");
         let simulation = SimulationArtifact {
             systems: vec!["Shop".to_owned()],
             seed: 11,
             steps_requested: 4,
             steps_executed: 1,
             termination: SimulationTermination::StepLimit,
-            behavior,
+            behavior: sample_behavior(),
         };
 
         assert_eq!(
@@ -1048,10 +1240,274 @@ mod tests {
         let artifact = store
             .resolve("simulation:Shop")
             .expect("simulation selector");
-        assert!(artifact.render_draw().expect("draw").contains("[state 0]"));
+        let draw = artifact.render_draw().expect("draw");
+        assert!(draw.contains("[state 0]"));
+        assert!(draw.contains("Shop::ship"));
+        assert!(artifact
+            .render_state(0)
+            .expect("state")
+            .contains("Order#0.status = OrderStatus::Pending"));
+        assert!(artifact
+            .render_diff(0, 1)
+            .expect("diff")
+            .contains("OrderStatus::Shipped"));
         assert!(artifact
             .export_json()
             .expect("json")
             .contains("\"systems\""));
+    }
+
+    #[test]
+    fn state_space_artifact_renders_graph_state_and_diff() {
+        let artifact = Artifact {
+            id: 1,
+            name: "explore_shop".to_owned(),
+            result_kind: "state-space",
+            payload: ArtifactPayload::StateSpace(sample_state_space()),
+            evidence_extraction_error: None,
+        };
+
+        let show = artifact.render_show();
+        assert!(show.contains("bounded state-space exploration"));
+        assert!(show.contains("Store<Order>[1]"));
+
+        let graph = artifact.render_draw().expect("graph");
+        assert!(graph.contains("[state 0]  <initial>"));
+        assert!(graph.contains("-- Shop::ship --> [state 1]"));
+
+        assert!(artifact
+            .render_state(1)
+            .expect("state")
+            .contains("Shop.phase = phase-Shipped"));
+        assert!(artifact.render_diff(0, 1).expect("diff").contains("added"));
+        assert!(artifact.render_state(9).is_err());
+    }
+
+    #[test]
+    fn operational_witness_artifact_renders_summary_timeline_state_and_diff() {
+        let artifact =
+            evidence_artifact("counterexample", "bad_trace", sample_operational_evidence());
+
+        let show = artifact.render_show();
+        assert!(show.contains("witness kind: counterexample"));
+        assert!(show.contains("states: 2  transitions: 1"));
+
+        let timeline = artifact.render_draw().expect("timeline");
+        assert!(timeline.contains("[state 0]"));
+        assert!(timeline.contains("-- Shop::ship -->"));
+
+        assert!(artifact
+            .render_state(0)
+            .expect("state")
+            .contains("Order#0 active = true"));
+        let diff = artifact.render_diff(0, 1).expect("diff");
+        assert!(diff.contains("removed"));
+        assert!(diff.contains("added"));
+        assert!(artifact.render_state(3).is_err());
+    }
+
+    #[test]
+    fn liveness_witness_timeline_marks_loop_start() {
+        let artifact = evidence_artifact(
+            "liveness-violation",
+            "eventually_paid",
+            sample_liveness_evidence(),
+        );
+
+        let show = artifact.render_show();
+        assert!(show.contains("witness kind: liveness"));
+        assert!(show.contains("loop_start: 1"));
+        assert!(artifact
+            .render_draw()
+            .expect("timeline")
+            .contains("[state 1]  <loop-start>"));
+    }
+
+    #[test]
+    fn relational_snapshot_witness_renders_state_and_rejects_timeline() {
+        let evidence = sample_relational_snapshot_evidence();
+        let EvidencePayload::Witness(witness) = evidence.payload() else {
+            panic!("expected witness evidence");
+        };
+        assert!(witness_state_lines(witness, 0).is_ok());
+        assert!(witness_state_lines(witness, 1).is_err());
+
+        let artifact = evidence_artifact("scene-pass", "snapshot", evidence);
+
+        let show = artifact.render_show();
+        assert!(show.contains("witness kind: relational-snapshot"));
+        assert!(show.contains("relations: 2  evaluations: 1"));
+        assert!(artifact.render_draw().is_err());
+
+        let state = artifact.render_state(0).expect("snapshot state");
+        assert!(state.contains("relation store tickets"));
+        assert!(state.contains("eval is_open = true"));
+        assert!(artifact.render_state(1).is_err());
+        assert!(artifact.render_diff(1, 0).is_err());
+    }
+
+    #[test]
+    fn relational_temporal_witness_renders_timeline_state_and_diff() {
+        let artifact = evidence_artifact(
+            "counterexample",
+            "rel_trace",
+            sample_relational_temporal_evidence(),
+        );
+
+        let show = artifact.render_show();
+        assert!(show.contains("witness kind: relational-temporal"));
+        assert!(show.contains("states: 2  loop_start: 1"));
+
+        let timeline = artifact.render_draw().expect("timeline");
+        assert_eq!(
+            timeline,
+            "[state 0]\n  -- next -->\n[state 1]  <loop-start>\n"
+        );
+
+        assert!(artifact.render_state(1).expect("state").contains("Closed"));
+        assert!(artifact
+            .render_diff(0, 1)
+            .expect("diff")
+            .contains("is_open = false"));
+    }
+
+    #[test]
+    fn countermodel_and_proof_ref_artifacts_render_summaries_and_reject_views() {
+        let countermodel =
+            evidence_artifact("counterexample", "bad_vc", sample_countermodel_evidence());
+        let countermodel_show = countermodel.render_show();
+        assert!(countermodel_show.contains("countermodel"));
+        assert!(countermodel_show.contains("backend: z3"));
+        assert!(countermodel_show.contains("bindings: 1"));
+        assert!(countermodel.render_draw().is_err());
+        assert!(countermodel.render_state(0).is_err());
+        assert!(countermodel.render_diff(0, 1).is_err());
+
+        let proof = evidence_artifact("admitted", "trusted", sample_proof_ref_evidence());
+        let proof_show = proof.render_show();
+        assert!(proof_show.contains("proof artifact"));
+        assert!(proof_show.contains("locator: proofs/no_overdraft.agda"));
+        assert!(proof_show.contains("backend: agda"));
+        assert!(proof_show.contains("checked: true"));
+        assert!(proof.render_draw().is_err());
+    }
+
+    #[test]
+    fn witness_value_rendering_covers_structural_values() {
+        let mut record = BTreeMap::new();
+        record.insert("status".to_owned(), order_status("Paid"));
+        record.insert("total".to_owned(), WitnessValue::Int(42));
+
+        assert_eq!(render_witness_value(&WitnessValue::Unknown), "?");
+        assert_eq!(render_witness_value(&WitnessValue::Bool(true)), "true");
+        assert_eq!(
+            render_witness_value(&WitnessValue::Real("1/3".to_owned())),
+            "1/3"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Float("1.5".to_owned())),
+            "1.5"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Identity("order-1".to_owned())),
+            "order-1"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::SlotRef(EntitySlotRef::new("Order", 2))),
+            "Order#2"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Tuple(vec![
+                WitnessValue::Int(1),
+                WitnessValue::String("ok".to_owned()),
+            ])),
+            "(1, ok)"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Record(record)),
+            "{status: OrderStatus::Paid, total: 42}"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Set(vec![
+                WitnessValue::Int(1),
+                WitnessValue::Int(2),
+            ])),
+            "{1, 2}"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Seq(vec![
+                WitnessValue::String("a".to_owned()),
+                WitnessValue::String("b".to_owned()),
+            ])),
+            "[a, b]"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Map(vec![(
+                WitnessValue::String("key".to_owned()),
+                WitnessValue::Bool(false),
+            )])),
+            "{key: false}"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Opaque {
+                display: "opaque".to_owned(),
+                ty: Some("T".to_owned()),
+            }),
+            "opaque:T"
+        );
+        assert_eq!(
+            render_witness_value(&WitnessValue::Opaque {
+                display: "opaque".to_owned(),
+                ty: None,
+            }),
+            "opaque"
+        );
+    }
+
+    #[test]
+    fn state_diff_reports_no_changes_removed_and_added() {
+        assert!(
+            render_state_diff(vec!["a".to_owned()], vec!["a".to_owned()], 0, 1)
+                .expect("no changes")
+                .contains("(no semantic changes)")
+        );
+
+        let added_only =
+            render_state_diff(Vec::new(), vec!["c".to_owned()], 0, 1).expect("added-only diff");
+        assert!(!added_only.contains("(no semantic changes)"));
+        assert!(added_only.contains("added"));
+        assert!(added_only.contains("+ c"));
+
+        let diff = render_state_diff(
+            vec!["a".to_owned(), "b".to_owned()],
+            vec!["b".to_owned(), "c".to_owned()],
+            0,
+            1,
+        )
+        .expect("diff");
+        assert!(diff.contains("removed"));
+        assert!(diff.contains("- a"));
+        assert!(diff.contains("added"));
+        assert!(diff.contains("+ c"));
+    }
+
+    #[test]
+    fn witness_diff_reports_added_only_changes() {
+        let transition = op::Transition::builder().build().expect("valid transition");
+        let behavior = op::Behavior::builder()
+            .state(op::State::builder().build())
+            .transition(transition)
+            .state(sample_state("Pending"))
+            .build()
+            .expect("valid behavior");
+        let witness = WitnessEnvelope::operational(
+            op::OperationalWitness::counterexample(behavior).expect("valid witness"),
+        )
+        .expect("valid envelope");
+
+        let diff = render_witness_diff(&witness, 0, 1).expect("witness diff");
+        assert!(!diff.contains("(no semantic changes)"));
+        assert!(diff.contains("added"));
+        assert!(diff.contains("Order#0.status = OrderStatus::Pending"));
     }
 }

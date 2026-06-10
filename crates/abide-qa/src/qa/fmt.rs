@@ -95,10 +95,8 @@ fn format_table(columns: &[String], rows: &[Vec<String>]) -> String {
     // Calculate column widths
     let mut widths: Vec<usize> = columns.iter().map(String::len).collect();
     for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() && cell.len() > widths[i] {
-                widths[i] = cell.len();
-            }
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.len());
         }
     }
 
@@ -274,10 +272,105 @@ mod tests {
     }
 
     #[test]
+    fn fmt_assert_bool_with_mode_uses_pass_fail_and_mode() {
+        let pass = QueryResult::BoolWithMode {
+            value: true,
+            mode: "bounded".into(),
+        };
+        let fail = QueryResult::BoolWithMode {
+            value: false,
+            mode: "bounded".into(),
+        };
+
+        assert_eq!(format_result(Verb::Assert, &pass), "PASS [bounded]");
+        assert_eq!(format_result(Verb::Assert, &fail), "FAIL [bounded]");
+        assert_eq!(format_result(Verb::Ask, &pass), "true [bounded]");
+    }
+
+    #[test]
+    fn fmt_transitions_prints_one_edge_per_line() {
+        let result = QueryResult::Transitions(vec![
+            TransitionInfo {
+                from: "Draft".into(),
+                action: "submit".into(),
+                to: "Submitted".into(),
+            },
+            TransitionInfo {
+                from: "Submitted".into(),
+                action: "approve".into(),
+                to: "Approved".into(),
+            },
+        ]);
+
+        assert_eq!(
+            format_result(Verb::Ask, &result),
+            "@Draft -> submit -> @Submitted\n@Submitted -> approve -> @Approved"
+        );
+    }
+
+    #[test]
+    fn fmt_table_aligns_columns_to_widest_cell() {
+        let result = QueryResult::Table {
+            columns: vec!["name".into(), "state".into()],
+            rows: vec![
+                vec!["Order".into(), "Paid".into()],
+                vec!["CustomerAccount".into(), "Suspended".into()],
+            ],
+        };
+
+        assert_eq!(
+            format_result(Verb::Ask, &result),
+            "name             state    \n---------------  ---------\nOrder            Paid     \nCustomerAccount  Suspended\n"
+        );
+    }
+
+    #[test]
     fn fmt_json_bool() {
         let json = format_result_json(Verb::Assert, &QueryResult::Bool(true));
         assert!(json.contains("\"status\":\"pass\""));
         assert!(json.contains("\"value\":true"));
+    }
+
+    #[test]
+    fn fmt_json_bool_with_mode_uses_assert_status_and_mode_payload() {
+        let result = QueryResult::BoolWithMode {
+            value: false,
+            mode: "unbounded".into(),
+        };
+
+        assert_eq!(
+            format_result_json(Verb::Assert, &result),
+            "{\"verb\":\"assert\",\"status\":\"fail\",\"value\":false,\"mode\":\"unbounded\"}"
+        );
+        assert_eq!(
+            format_result_json(Verb::Ask, &result),
+            "{\"verb\":\"ask\",\"status\":\"ok\",\"value\":false,\"mode\":\"unbounded\"}"
+        );
+    }
+
+    #[test]
+    fn fmt_json_structured_results_include_payloads() {
+        assert_eq!(
+            format_result_json(
+                Verb::Ask,
+                &QueryResult::StateSet(vec!["Open".into(), "Closed".into()])
+            ),
+            "{\"verb\":\"ask\",\"status\":\"ok\",\"states\":[\"Open\",\"Closed\"]}"
+        );
+        assert_eq!(
+            format_result_json(
+                Verb::Ask,
+                &QueryResult::NameList(vec!["Order".into(), "Ticket".into()])
+            ),
+            "{\"verb\":\"ask\",\"status\":\"ok\",\"names\":[\"Order\",\"Ticket\"]}"
+        );
+        assert_eq!(
+            format_result_json(
+                Verb::Ask,
+                &QueryResult::Path(vec![("submit".into(), "Submitted".into())])
+            ),
+            "{\"verb\":\"ask\",\"status\":\"ok\",\"path\":[{\"action\":\"submit\",\"state\":\"Submitted\"}]}"
+        );
     }
 
     #[test]

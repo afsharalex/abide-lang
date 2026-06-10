@@ -382,10 +382,41 @@ mod tests {
     fn error_code_format() {
         assert_eq!(ErrorKind::DuplicateDecl.code(), "E001");
         assert_eq!(ErrorKind::UndefinedRef.code(), "E002");
+        assert_eq!(ErrorKind::AmbiguousRef.code(), "E007");
         assert_eq!(ErrorKind::TypeMismatch.code(), "E003");
         assert_eq!(ErrorKind::InvalidPrime.code(), "E004");
+        assert_eq!(ErrorKind::ParamMismatch.code(), "E008");
+        assert_eq!(ErrorKind::InvalidDefault.code(), "E009");
+        assert_eq!(ErrorKind::MissingField.code(), "E010");
         assert_eq!(ErrorKind::CyclicDefinition.code(), "E005");
+        assert_eq!(ErrorKind::CyclicImport.code(), "E011");
         assert_eq!(ErrorKind::InvalidScope.code(), "E006");
+        assert_eq!(ErrorKind::NonExhaustiveMatch.code(), "E012");
+    }
+
+    #[test]
+    fn error_kind_titles_are_stable() {
+        assert_eq!(ErrorKind::DuplicateDecl.title(), "duplicate declaration");
+        assert_eq!(ErrorKind::UndefinedRef.title(), "undefined reference");
+        assert_eq!(ErrorKind::AmbiguousRef.title(), "ambiguous reference");
+        assert_eq!(ErrorKind::TypeMismatch.title(), "type mismatch");
+        assert_eq!(ErrorKind::InvalidPrime.title(), "invalid primed variable");
+        assert_eq!(ErrorKind::ParamMismatch.title(), "parameter mismatch");
+        assert_eq!(ErrorKind::InvalidDefault.title(), "invalid default value");
+        assert_eq!(ErrorKind::MissingField.title(), "missing required field");
+        assert_eq!(ErrorKind::CyclicDefinition.title(), "cyclic definition");
+        assert_eq!(
+            ErrorKind::CyclicImport.title(),
+            "circular import dependency"
+        );
+        assert_eq!(
+            ErrorKind::InvalidScope.title(),
+            "invalid scope or visibility"
+        );
+        assert_eq!(
+            ErrorKind::NonExhaustiveMatch.title(),
+            "non-exhaustive match"
+        );
     }
 
     #[test]
@@ -394,6 +425,32 @@ mod tests {
         let text = format!("{err}");
         assert!(text.starts_with("error[E001]:"), "got: {text}");
         assert!(text.contains("duplicate 'Foo'"), "got: {text}");
+        assert!(
+            !text.contains("()"),
+            "empty context should not be rendered: {text}"
+        );
+
+        let with_context =
+            ElabError::new(ErrorKind::DuplicateDecl, "duplicate 'Foo'", "in module A");
+        assert_eq!(
+            format!("{with_context}"),
+            "error[E001]: duplicate 'Foo' (in module A)"
+        );
+
+        let warning = ElabError::warning("suspicious", "while importing");
+        assert_eq!(
+            format!("{warning}"),
+            "warning[E003]: suspicious (while importing)"
+        );
+    }
+
+    #[test]
+    fn miette_severity_matches_elab_severity() {
+        let err = ElabError::new(ErrorKind::UndefinedRef, "unknown", "");
+        assert_eq!(err.severity(), Some(miette::Severity::Error));
+
+        let warning = ElabError::warning("suspicious", "");
+        assert_eq!(warning.severity(), Some(miette::Severity::Warning));
     }
 
     #[test]
@@ -428,6 +485,24 @@ mod tests {
         );
         let labels: Vec<_> = err.labels().unwrap().collect();
         assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].label(), Some("here"));
+        assert_eq!(labels[0].offset(), 10);
+        assert_eq!(labels[0].len(), 10);
+    }
+
+    #[test]
+    fn empty_context_span_uses_default_here_label() {
+        let err = ElabError::with_span(
+            ErrorKind::UndefinedRef,
+            "unknown",
+            "",
+            Span { start: 3, end: 8 },
+        );
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].label(), Some("here"));
+        assert_eq!(labels[0].offset(), 3);
+        assert_eq!(labels[0].len(), 5);
     }
 
     #[test]
@@ -447,6 +522,12 @@ mod tests {
             2,
             "same-file secondary should produce 2 labels"
         );
+        assert_eq!(labels[0].label(), Some("duplicate here"));
+        assert_eq!(labels[0].offset(), 50);
+        assert_eq!(labels[0].len(), 10);
+        assert_eq!(labels[1].label(), Some("first declared here"));
+        assert_eq!(labels[1].offset(), 10);
+        assert_eq!(labels[1].len(), 10);
     }
 
     #[test]
@@ -465,6 +546,9 @@ mod tests {
             1,
             "cross-file secondary should produce only 1 label (primary)"
         );
+        assert_eq!(labels[0].label(), Some("duplicate here"));
+        assert_eq!(labels[0].offset(), 50);
+        assert_eq!(labels[0].len(), 10);
     }
 
     #[test]

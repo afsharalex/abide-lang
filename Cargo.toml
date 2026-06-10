@@ -12,3 +12,7 @@ members = [
 ]
 default-members = ["crates/abide"]
 resolver = "2"
+
+[profile.mutants]
+inherits = "test"
+debug = "none"

@@ -325,9 +325,20 @@ impl Parser {
         self.pos >= self.tokens.len()
     }
 
+    fn ensure_progress(&self, pos_before: usize, context: &str) -> Result<(), ParseError> {
+        if self.pos == pos_before {
+            return Err(ParseError::expected(
+                "parser to consume input",
+                context,
+                self.cur_span(),
+            ));
+        }
+        Ok(())
+    }
+
     fn advance(&mut self) -> (Token, Span) {
         let item = self.tokens[self.pos].clone();
-        self.pos += 1;
+        self.pos = self.pos.saturating_add(1);
         item
     }
 
@@ -349,17 +360,20 @@ impl Parser {
         let mut bracket_depth = 0usize;
         let mut consumed_any = false;
 
-        while !self.at_end() {
-            if consumed_any
-                && should_stop(
+        loop {
+            if self.at_end() {
+                break;
+            }
+            if consumed_any {
+                if should_stop(
                     self.peek().expect("not at end"),
                     self.peek_at(1),
                     brace_depth,
                     paren_depth,
                     bracket_depth,
-                )
-            {
-                break;
+                ) {
+                    break;
+                }
             }
             let (tok, span) = self.advance();
             consumed_any = true;
@@ -382,9 +396,13 @@ impl Parser {
         }
     }
 
+    fn recovery_at_outer_depth(braces: usize, parens: usize, brackets: usize) -> bool {
+        matches!((braces, parens, brackets), (0, 0, 0))
+    }
+
     fn recover_to_top_level(&mut self) -> crate::ast::ErrorNode {
         self.recover_node(|tok, _next, braces, parens, brackets| {
-            braces == 0 && parens == 0 && brackets == 0 && is_top_level_starter(tok)
+            Self::recovery_at_outer_depth(braces, parens, brackets) && is_top_level_starter(tok)
         })
     }
 
@@ -408,9 +426,7 @@ impl Parser {
         is_item_starter: fn(&Token, Option<&Token>) -> bool,
     ) -> crate::ast::ErrorNode {
         self.recover_node(|tok, next, braces, parens, brackets| {
-            braces == 0
-                && parens == 0
-                && brackets == 0
+            Self::recovery_at_outer_depth(braces, parens, brackets)
                 && (matches!(tok, Token::RBrace) || is_item_starter(tok, next))
         })
     }
@@ -420,9 +436,7 @@ impl Parser {
             return self.consume_current_as_error_node();
         }
         self.recover_node(|tok, _next, braces, parens, brackets| {
-            braces == 0
-                && parens == 0
-                && brackets == 0
+            Self::recovery_at_outer_depth(braces, parens, brackets)
                 && (matches!(tok, Token::RBrace | Token::Semi | Token::Return)
                     || is_event_item_starter(tok))
         })
@@ -433,9 +447,7 @@ impl Parser {
             return self.consume_current_as_error_node();
         }
         self.recover_node(|tok, _next, braces, parens, brackets| {
-            braces == 0
-                && parens == 0
-                && brackets == 0
+            Self::recovery_at_outer_depth(braces, parens, brackets)
                 && matches!(tok, Token::RBrace | Token::Semi)
         })
     }
@@ -804,7 +816,7 @@ impl Parser {
         let (name, _) = self.expect_name()?;
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.entity_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -1115,7 +1127,7 @@ impl Parser {
     fn parse_block(&mut self) -> Result<Expr, ParseError> {
         let start = self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.block_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -1150,7 +1162,6 @@ impl Parser {
         match self.peek() {
             Some(Token::Var) => self.parse_var_decl(),
             Some(Token::While) => self.parse_while(),
-            Some(Token::If) => self.parse_if_else(),
             _ => self.expr(),
         }
     }
@@ -1809,7 +1820,7 @@ impl Parser {
 
         self.expect(&Token::LBrace)?;
         let mut items = Vec::new();
-        while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+        while !matches!(self.peek(), Some(Token::RBrace) | None) {
             match self.scene_item() {
                 Ok(item) => items.push(item),
                 Err(err) if self.recovering => {
@@ -1838,7 +1849,7 @@ impl Parser {
                 if matches!(self.peek(), Some(Token::LBrace)) {
                     self.advance();
                     let mut items = Vec::new();
-                    while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+                    while !matches!(self.peek(), Some(Token::RBrace) | None) {
                         match self.given_item() {
                             Ok(item) => items.push(item),
                             Err(err) if self.recovering => {
@@ -1877,7 +1888,7 @@ impl Parser {
                 if matches!(self.peek(), Some(Token::LBrace)) {
                     self.advance();
                     let mut items = Vec::new();
-                    while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+                    while !matches!(self.peek(), Some(Token::RBrace) | None) {
                         match self.when_item() {
                             Ok(item) => items.push(item),
                             Err(err) if self.recovering => {
@@ -1909,7 +1920,7 @@ impl Parser {
                 if matches!(self.peek(), Some(Token::LBrace)) {
                     self.advance();
                     let mut items = Vec::new();
-                    while !matches!(self.peek(), Some(Token::RBrace)) && !self.at_end() {
+                    while !matches!(self.peek(), Some(Token::RBrace) | None) {
                         match self.then_item() {
                             Ok(item) => items.push(item),
                             Err(err) if self.recovering => {
@@ -2022,11 +2033,9 @@ impl Parser {
     }
 
     /// parse `activate {instances} in store`.
-    /// Accepts both `Token::Activate` (keyword) and `Token::Name("activate")`.
     fn activate_decl(&mut self) -> Result<ActivateDecl, ParseError> {
         let start = match self.peek() {
             Some(Token::Activate) => self.advance().1,
-            Some(Token::Name(n)) if n == "activate" => self.advance().1,
             _ => {
                 return Err(ParseError::expected(
                     "`activate`",
