@@ -80,7 +80,7 @@ fn make_set_comp(
     start: Span,
     end: Span,
     projection: Option<Expr>,
-    var: String,
+    binder: crate::ast::SetCompBinder,
     domain: Option<crate::ast::TypeRef>,
     source: Option<Box<Expr>>,
     filter: Expr,
@@ -88,7 +88,7 @@ fn make_set_comp(
     Expr {
         kind: ExprKind::SetComp {
             projection: projection.map(Box::new),
-            var,
+            binder,
             domain,
             source,
             filter: Box::new(filter),
@@ -744,6 +744,11 @@ impl Parser {
         }
         let saved = self.pos;
         let (var, _) = self.expect_name()?;
+        let binder = if var == "_" {
+            crate::ast::SetCompBinder::Wildcard
+        } else {
+            crate::ast::SetCompBinder::Name(var)
+        };
         let domain = self.parse_optional_comprehension_domain()?;
         let source = self.parse_optional_comprehension_source()?;
         if !matches!(self.peek(), Some(Token::Where)) {
@@ -754,14 +759,14 @@ impl Parser {
         let filter = self.expr()?;
         let end = self.expect(&Token::RBrace)?;
         Ok(Some(make_set_comp(
-            start, end, None, var, domain, source, filter,
+            start, end, None, binder, domain, source, filter,
         )))
     }
 
     fn expr_projected_set_comprehension(&mut self, start: Span) -> Result<Expr, ParseError> {
         let projection = self.expr_bp(BP_CHOICE.1)?;
         self.expect(&Token::Pipe)?;
-        let (var, _) = self.expect_name()?;
+        let binder = self.parse_set_comp_binder()?;
         let domain = self.parse_optional_comprehension_domain()?;
         let source = self.parse_optional_comprehension_source()?;
         self.expect(&Token::Where)?;
@@ -771,11 +776,48 @@ impl Parser {
             start,
             end,
             Some(projection),
-            var,
+            binder,
             domain,
             source,
             filter,
         ))
+    }
+
+    fn parse_set_comp_binder(&mut self) -> Result<crate::ast::SetCompBinder, ParseError> {
+        match self.peek() {
+            Some(Token::Underscore) => {
+                self.advance();
+                Ok(crate::ast::SetCompBinder::Wildcard)
+            }
+            Some(Token::Name(_)) => {
+                let (name, _) = self.expect_name()?;
+                Ok(if name == "_" {
+                    crate::ast::SetCompBinder::Wildcard
+                } else {
+                    crate::ast::SetCompBinder::Name(name)
+                })
+            }
+            Some(Token::LParen) => {
+                self.advance();
+                let mut items = Vec::new();
+                if !matches!(self.peek(), Some(Token::RParen)) {
+                    loop {
+                        items.push(self.parse_set_comp_binder()?);
+                        if self.eat(&Token::Comma).is_none() {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                Ok(crate::ast::SetCompBinder::Tuple(items))
+            }
+            Some(tok) => Err(ParseError::expected(
+                "set-comprehension binder",
+                &format!("`{tok}`"),
+                self.cur_span(),
+            )),
+            None => Err(ParseError::eof(self.cur_span())),
+        }
     }
 
     fn parse_optional_comprehension_domain(

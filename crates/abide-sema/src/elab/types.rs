@@ -1035,7 +1035,7 @@ pub enum EExpr {
     SetComp(
         Ty,
         Option<Box<EExpr>>,
-        String,
+        ESetCompBinder,
         Ty,
         Option<Box<EExpr>>,
         Box<EExpr>,
@@ -1115,6 +1115,42 @@ pub enum EExpr {
     /// Struct constructor: UiState { screen: @home, mode: @normal }
     /// StructCtor(ty, struct_name, fields, span)
     StructCtor(Ty, String, Vec<(String, EExpr)>, Option<crate::span::Span>),
+}
+
+/// Elaborated collection-comprehension binder pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ESetCompBinder {
+    Var(String),
+    Wild,
+    Tuple(Vec<ESetCompBinder>),
+}
+
+impl ESetCompBinder {
+    pub fn bound_names(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        self.push_bound_names(&mut names);
+        names
+    }
+
+    pub fn binds(&self, name: &str) -> bool {
+        match self {
+            Self::Var(var) => var == name,
+            Self::Wild => false,
+            Self::Tuple(items) => items.iter().any(|item| item.binds(name)),
+        }
+    }
+
+    fn push_bound_names<'a>(&'a self, names: &mut Vec<&'a str>) {
+        match self {
+            Self::Var(name) => names.push(name),
+            Self::Wild => {}
+            Self::Tuple(items) => {
+                for item in items {
+                    item.push_bound_names(names);
+                }
+            }
+        }
+    }
 }
 
 /// Elaborated match pattern.

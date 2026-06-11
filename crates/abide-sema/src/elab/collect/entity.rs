@@ -1066,19 +1066,23 @@ pub(super) fn collect_var_names_inner(
                 collect_var_names_inner(item, bound, into);
             }
         }
-        // set comprehension binds the
-        // comprehension variable in head and predicate.
-        EExpr::SetComp(_, head, comp_var, _, source, pred, _) => {
+        // set comprehension binds its binder names in head and predicate.
+        EExpr::SetComp(_, head, binder, _, source, pred, _) => {
             if let Some(source) = source {
                 collect_var_names_inner(source, bound, into);
             }
-            let was_new = bound.insert(comp_var.clone());
+            let mut added = Vec::new();
+            for name in binder.bound_names() {
+                if bound.insert(name.to_owned()) {
+                    added.push(name.to_owned());
+                }
+            }
             if let Some(h) = head {
                 collect_var_names_inner(h, bound, into);
             }
             collect_var_names_inner(pred, bound, into);
-            if was_new {
-                bound.remove(comp_var);
+            for name in added {
+                bound.remove(&name);
             }
         }
         EExpr::RelComp(_, projection, bindings, filter, _) => {

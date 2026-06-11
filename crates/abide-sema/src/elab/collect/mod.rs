@@ -448,15 +448,15 @@ fn rename_var_in_expr(e: &mut EExpr, from: &str, to: &str) {
             rename_var_in_expr(key, from, to);
             rename_var_in_expr(value, from, to);
         }
-        EExpr::SetComp(_, source, var, _, filter, projection, _) => {
+        EExpr::SetComp(_, projection, binder, _, source, filter, _) => {
             if let Some(source) = source {
                 rename_var_in_expr(source, from, to);
             }
-            if var != from {
-                if let Some(filter) = filter {
-                    rename_var_in_expr(filter, from, to);
+            if !binder.binds(from) {
+                if let Some(projection) = projection {
+                    rename_var_in_expr(projection, from, to);
                 }
-                rename_var_in_expr(projection, from, to);
+                rename_var_in_expr(filter, from, to);
             }
         }
         EExpr::RelComp(_, projection, bindings, filter, _) => {
@@ -1593,7 +1593,7 @@ extern StripeGateway implements PaymentProcessor {
                 EExpr::SetComp(
                     int_ty(),
                     Some(Box::new(var("x"))),
-                    "y".to_owned(),
+                    crate::elab::types::ESetCompBinder::Var("y".to_owned()),
                     int_ty(),
                     Some(Box::new(bool_var("x"))),
                     Box::new(var("x")),
@@ -1783,7 +1783,7 @@ extern StripeGateway implements PaymentProcessor {
                 EExpr::SetComp(
                     int_ty(),
                     Some(Box::new(var("x"))),
-                    "x".to_owned(),
+                    crate::elab::types::ESetCompBinder::Var("x".to_owned()),
                     int_ty(),
                     Some(Box::new(bool_var("x"))),
                     Box::new(var("x")),

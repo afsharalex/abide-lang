@@ -1855,9 +1855,11 @@ fn collect_name_refs(
             collect_name_refs(m, known_names, bound, refs);
             collect_name_refs(k, known_names, bound, refs);
         }
-        EExpr::SetComp(_, proj, var, _, source, filter, _) => {
+        EExpr::SetComp(_, proj, binder, _, source, filter, _) => {
             let mut inner_bound = bound.clone();
-            inner_bound.insert(var.clone());
+            for name in binder.bound_names() {
+                inner_bound.insert(name.to_owned());
+            }
             if let Some(source) = source {
                 collect_name_refs(source, known_names, bound, refs);
             }

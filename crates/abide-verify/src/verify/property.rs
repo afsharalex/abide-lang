@@ -3439,18 +3439,10 @@ fn encode_prop_sourced_set_comp_value(
         );
     }
 
-    let elements = match source {
-        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
-        _ => {
-            return Err(
-                "sourced SetComp in verifier properties currently requires a finite Set or Seq literal source"
-                    .to_owned(),
-            );
-        }
-    };
+    let elements = finite_sourced_set_comp_elements(source)?;
     let mut arr = empty_set_comp_array(enc.vctx, ty)?;
     let true_val = smt::bool_val(true).to_dynamic();
-    for element_expr in elements {
+    for element_expr in &elements {
         let value = encode_prop_value(
             enc.pool,
             enc.vctx,
@@ -3472,6 +3464,25 @@ fn encode_prop_sourced_set_comp_value(
         arr = smt::array_ite(&cond, &stored, &arr);
     }
     Ok(SmtValue::Array(arr))
+}
+
+fn finite_sourced_set_comp_elements(source: &IRExpr) -> Result<Vec<IRExpr>, String> {
+    match source {
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => Ok(elements.clone()),
+        IRExpr::UnOp { op, operand, .. } if op == "OpMapDomain" => match operand.as_ref() {
+            IRExpr::MapLit { entries, .. } => {
+                Ok(entries.iter().map(|(key, _)| key.clone()).collect())
+            }
+            _ => Err(
+                "sourced SetComp over Map::domain currently requires a finite Map literal source"
+                    .to_owned(),
+            ),
+        },
+        _ => Err(
+            "sourced SetComp in verifier properties currently requires a finite Set, Seq, or Map::domain literal source"
+                .to_owned(),
+        ),
+    }
 }
 
 fn store_source_range(

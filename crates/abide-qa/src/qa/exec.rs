@@ -1912,7 +1912,7 @@ fn rewrite_owner_scoped_expr(
             )?),
             *span,
         ),
-        EExpr::SetComp(ty, projection, name, domain_ty, source, filter, span) => {
+        EExpr::SetComp(ty, projection, binder, domain_ty, source, filter, span) => {
             let rewritten_source = source
                 .as_ref()
                 .map(|source| {
@@ -1926,7 +1926,10 @@ fn rewrite_owner_scoped_expr(
                     )
                 })
                 .transpose()?;
-            bound_vars.push(name.clone());
+            let added = binder.bound_names();
+            for name in &added {
+                bound_vars.push((*name).to_owned());
+            }
             let rewritten_projection = projection
                 .as_ref()
                 .map(|projection| {
@@ -1948,11 +1951,13 @@ fn rewrite_owner_scoped_expr(
                 owner_fields,
                 bound_vars,
             )?;
-            bound_vars.pop();
+            for _ in added {
+                bound_vars.pop();
+            }
             EExpr::SetComp(
                 ty.clone(),
                 rewritten_projection.map(Box::new),
-                name.clone(),
+                binder.clone(),
                 domain_ty.clone(),
                 rewritten_source.map(Box::new),
                 Box::new(rewritten_filter),

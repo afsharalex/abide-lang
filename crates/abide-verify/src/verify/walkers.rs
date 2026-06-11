@@ -1290,19 +1290,13 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             filter,
             projection,
             ..
-        } if matches!(
-            source.as_ref(),
-            IRExpr::SetLit { .. } | IRExpr::SeqLit { .. }
-        ) =>
-        {
-            find_unsupported_scene_expr(source)
-                .or_else(|| find_unsupported_scene_expr(filter))
-                .or_else(|| {
-                    projection
-                        .as_ref()
-                        .and_then(|p| find_unsupported_scene_expr(p))
-                })
-        }
+        } if is_supported_finite_setcomp_source(source) => find_unsupported_scene_expr(source)
+            .or_else(|| find_unsupported_scene_expr(filter))
+            .or_else(|| {
+                projection
+                    .as_ref()
+                    .and_then(|p| find_unsupported_scene_expr(p))
+            }),
         IRExpr::SetComp {
             domain: IRType::Entity { .. },
             source,
@@ -1478,6 +1472,18 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
                     .and_then(|e| find_unsupported_scene_expr(e))
             }),
     }
+}
+
+fn is_supported_finite_setcomp_source(source: &IRExpr) -> bool {
+    matches!(source, IRExpr::SetLit { .. } | IRExpr::SeqLit { .. })
+        || matches!(
+            source,
+            IRExpr::UnOp {
+                op,
+                operand,
+                ..
+            } if op == "OpMapDomain" && matches!(operand.as_ref(), IRExpr::MapLit { .. })
+        )
 }
 
 fn is_finite_scene_cardinality_target(expr: &IRExpr) -> bool {

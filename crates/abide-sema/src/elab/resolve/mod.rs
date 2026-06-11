@@ -999,25 +999,22 @@ fn substitute_expr(expr: &EExpr, bindings: &HashMap<String, String>) -> EExpr {
             Box::new(substitute_expr(key, bindings)),
             *span,
         ),
-        EExpr::SetComp(ty, body, var, domain_ty, source, pred, span) => EExpr::SetComp(
-            ty.clone(),
-            body.as_ref().map(|expr| {
-                Box::new(substitute_expr(
-                    expr,
-                    &bindings_without(bindings, &[var.as_str()]),
-                ))
-            }),
-            var.clone(),
-            domain_ty.clone(),
-            source
-                .as_ref()
-                .map(|expr| Box::new(substitute_expr(expr, bindings))),
-            Box::new(substitute_expr(
-                pred,
-                &bindings_without(bindings, &[var.as_str()]),
-            )),
-            *span,
-        ),
+        EExpr::SetComp(ty, body, binder, domain_ty, source, pred, span) => {
+            let bound_names = binder.bound_names();
+            let inner_bindings = bindings_without(bindings, &bound_names);
+            EExpr::SetComp(
+                ty.clone(),
+                body.as_ref()
+                    .map(|expr| Box::new(substitute_expr(expr, &inner_bindings))),
+                binder.clone(),
+                domain_ty.clone(),
+                source
+                    .as_ref()
+                    .map(|expr| Box::new(substitute_expr(expr, bindings))),
+                Box::new(substitute_expr(pred, &inner_bindings)),
+                *span,
+            )
+        }
         EExpr::RelComp(ty, projection, rel_bindings, filter, span) => {
             let bound_names = rel_bindings
                 .iter()
@@ -2251,7 +2248,7 @@ mod tests {
     use super::*;
     use crate::ast::Visibility;
     use crate::elab::collect;
-    use crate::elab::types::{BinOp, EExpr, EFieldDefault};
+    use crate::elab::types::{BinOp, EExpr, EFieldDefault, ESetCompBinder};
     use crate::lex;
     use crate::parse::Parser;
 
@@ -3715,10 +3712,10 @@ mod tests {
         let env = elaborate_src("const doubled = { x * 2 | x in Set(1, 2, 3) where x > 0 }");
 
         let body = &env.consts.get("doubled").expect("doubled const").body;
-        let EExpr::SetComp(ty, projection, var, domain, source, _, _) = body else {
+        let EExpr::SetComp(ty, projection, binder, domain, source, _, _) = body else {
             panic!("expected sourced set comprehension, got {body:?}");
         };
-        assert_eq!(var, "x");
+        assert_eq!(binder, &ESetCompBinder::Var("x".to_owned()));
         assert!(source.is_some());
         assert!(matches!(
             domain,
@@ -3739,10 +3736,10 @@ mod tests {
         let env = elaborate_src("const positive = { x | x in Seq(1.0, 2.0) where x > 0.0 }");
 
         let body = &env.consts.get("positive").expect("positive const").body;
-        let EExpr::SetComp(ty, projection, var, domain, source, _, _) = body else {
+        let EExpr::SetComp(ty, projection, binder, domain, source, _, _) = body else {
             panic!("expected sourced set comprehension, got {body:?}");
         };
-        assert_eq!(var, "x");
+        assert_eq!(binder, &ESetCompBinder::Var("x".to_owned()));
         assert!(source.is_some());
         assert!(matches!(
             domain,
@@ -3755,6 +3752,52 @@ mod tests {
         assert!(matches!(
             ty,
             Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(crate::elab::types::BuiltinTy::Real))
+        ));
+    }
+
+    #[test]
+    fn set_comprehension_infers_tuple_binder_components_from_map_source() {
+        let env =
+            elaborate_src(r#"const keys = { k | (k, _) in Map(1, "one", 2, "two") where k > 1 }"#);
+
+        let body = &env.consts.get("keys").expect("keys const").body;
+        let EExpr::SetComp(ty, projection, binder, domain, source, filter, _) = body else {
+            panic!("expected sourced set comprehension, got {body:?}");
+        };
+        assert!(matches!(
+            binder,
+            ESetCompBinder::Tuple(items)
+                if matches!(items.as_slice(), [
+                    ESetCompBinder::Var(k),
+                    ESetCompBinder::Wild,
+                ] if k == "k")
+        ));
+        assert!(source.is_some());
+        assert!(matches!(
+            domain,
+            Ty::Tuple(columns)
+                if matches!(columns.as_slice(), [
+                    Ty::Builtin(crate::elab::types::BuiltinTy::Int),
+                    Ty::Builtin(crate::elab::types::BuiltinTy::String)
+                ])
+        ));
+        assert!(matches!(
+            projection.as_deref().map(EExpr::ty),
+            Some(Ty::Builtin(crate::elab::types::BuiltinTy::Int))
+        ));
+        assert!(matches!(
+            filter.as_ref(),
+            EExpr::BinOp(
+                Ty::Builtin(crate::elab::types::BuiltinTy::Bool),
+                BinOp::Gt,
+                left,
+                _,
+                _
+            ) if matches!(left.ty(), Ty::Builtin(crate::elab::types::BuiltinTy::Int))
+        ));
+        assert!(matches!(
+            ty,
+            Ty::Set(inner) if matches!(inner.as_ref(), Ty::Builtin(crate::elab::types::BuiltinTy::Int))
         ));
     }
 

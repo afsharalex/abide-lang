@@ -1,0 +1,39 @@
+module MapComprehensions
+
+// Finite map-source comprehensions iterate key/value entries.
+// Destructuring binders must be parenthesized.
+
+entity Dummy {
+  id: identity
+}
+
+system Fixture(dummies: Store<Dummy>) {
+  command noop() { }
+}
+
+verify map_comprehension_keys {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { k | (k, _) in Map(1, 10, 2, 20, 3, 30) where k >= 2 } == Set(2, 3)
+}
+
+verify map_comprehension_values {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { v | (_, v) in Map(1, 10, 2, 20, 3, 30) where v < 30 } == Set(10, 20)
+}
+
+verify map_comprehension_key_value_pairs {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { k + v | (k, v) in Map(1, 10, 2, 20, 3, 30) where v >= 20 } == Set(22, 33)
+}

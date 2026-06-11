@@ -35,3 +35,14 @@ verify seq_source_comprehension {
   assert { amount | amount in Seq(10.0, 25.0, 50.0) where amount >= 25.0 }
     == Set(25.0, 50.0)
 }
+
+verify map_source_destructuring_comprehension {
+  assume {
+    store dummies: Dummy[0..1]
+    let fixture = Fixture { dummies: dummies }
+  }
+
+  assert { k | (k, _) in Map(1, 10, 2, 20) where k > 1 } == Set(2)
+  assert { v | (_, v) in Map(1, 10, 2, 20) where v >= 20 } == Set(20)
+  assert { k + v | (k, v) in Map(1, 10, 2, 20) where v > 10 } == Set(22)
+}

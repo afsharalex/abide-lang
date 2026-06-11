@@ -3,7 +3,8 @@
 use super::resolve_type_ref;
 use crate::ast;
 use crate::elab::types::{
-    BinOp, BuiltinTy, EContract, EExpr, EPattern, ERelCompBinding, Literal, Ty, UnOp,
+    BinOp, BuiltinTy, EContract, EExpr, EPattern, ERelCompBinding, ESetCompBinder, Literal, Ty,
+    UnOp,
 };
 
 /// Recognize qualified built-in collection calls: `Set::union`, `Map::domain`, etc.
@@ -82,6 +83,16 @@ pub(super) fn quant_guard_body(
             )
         }
         None => collected_body,
+    }
+}
+
+fn collect_set_comp_binder(binder: &ast::SetCompBinder) -> ESetCompBinder {
+    match binder {
+        ast::SetCompBinder::Name(name) => ESetCompBinder::Var(name.clone()),
+        ast::SetCompBinder::Wildcard => ESetCompBinder::Wild,
+        ast::SetCompBinder::Tuple(items) => {
+            ESetCompBinder::Tuple(items.iter().map(collect_set_comp_binder).collect())
+        }
     }
 }
 
@@ -482,7 +493,7 @@ pub(super) fn collect_expr(expr: &ast::Expr) -> EExpr {
         ),
         ast::ExprKind::SetComp {
             projection,
-            var,
+            binder,
             domain,
             source,
             filter,
@@ -492,7 +503,7 @@ pub(super) fn collect_expr(expr: &ast::Expr) -> EExpr {
             EExpr::SetComp(
                 u(),
                 proj,
-                var.clone(),
+                collect_set_comp_binder(binder),
                 dom,
                 source.as_ref().map(|expr| Box::new(collect_expr(expr))),
                 Box::new(collect_expr(filter)),

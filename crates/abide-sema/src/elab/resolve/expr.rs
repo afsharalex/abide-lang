@@ -1,6 +1,6 @@
 //! Expression resolution — name and constructor resolution in expression trees.
 
-use super::super::types::{BinOp, EExpr, EPattern, Literal, Ty};
+use super::super::types::{BinOp, EExpr, EPattern, ESetCompBinder, Literal, Ty};
 use std::collections::HashMap;
 
 use super::Ctx;
@@ -93,6 +93,22 @@ fn set_source_element_type(source_ty: &Ty) -> Ty {
         Ty::Map(key, value) => Ty::Tuple(vec![key.as_ref().clone(), value.as_ref().clone()]),
         Ty::Store(entity) => Ty::Entity(entity.clone()),
         _ => Ty::Error,
+    }
+}
+
+fn bind_set_comp_binder(bound: &mut HashMap<String, Ty>, binder: &ESetCompBinder, binder_ty: &Ty) {
+    match binder {
+        ESetCompBinder::Var(name) => {
+            bound.insert(name.clone(), binder_ty.clone());
+        }
+        ESetCompBinder::Wild => {}
+        ESetCompBinder::Tuple(items) => {
+            if let Ty::Tuple(columns) = binder_ty {
+                for (item, item_ty) in items.iter().zip(columns) {
+                    bind_set_comp_binder(bound, item, item_ty);
+                }
+            }
+        }
     }
 }
 
@@ -579,7 +595,7 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 *sp,
             )
         }
-        EExpr::SetComp(_ty, proj, var, vty, source, filter, sp) => {
+        EExpr::SetComp(_ty, proj, binder, vty, source, filter, sp) => {
             let resolved_source = source
                 .as_ref()
                 .map(|source| Box::new(resolve_expr(ctx, bound, source)));
@@ -594,7 +610,7 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 explicit_vty
             };
             let mut inner_bound = bound.clone();
-            inner_bound.insert(var.clone(), resolved_vty.clone());
+            bind_set_comp_binder(&mut inner_bound, binder, &resolved_vty);
             let resolved_proj = proj
                 .as_ref()
                 .map(|p| Box::new(resolve_expr(ctx, &inner_bound, p)));
@@ -605,7 +621,7 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
             EExpr::SetComp(
                 Ty::Set(Box::new(element_ty)),
                 resolved_proj,
-                var.clone(),
+                binder.clone(),
                 resolved_vty,
                 resolved_source,
                 Box::new(resolve_expr(ctx, &inner_bound, filter)),

@@ -2367,13 +2367,13 @@ fn set_comp_simple() {
     match &e.kind {
         ExprKind::SetComp {
             projection,
-            var,
+            binder,
             domain,
             source,
             filter,
         } => {
             assert!(projection.is_none());
-            assert_eq!(var, "a");
+            assert!(matches!(binder, crate::ast::SetCompBinder::Name(name) if name == "a"));
             let domain = domain.as_ref().expect("explicit domain");
             assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
             assert!(source.is_none());
@@ -2389,7 +2389,7 @@ fn set_comp_projection() {
     match &e.kind {
         ExprKind::SetComp {
             projection,
-            var,
+            binder,
             domain,
             source,
             filter,
@@ -2397,7 +2397,7 @@ fn set_comp_projection() {
             assert!(projection.is_some());
             let proj = projection.as_ref().unwrap();
             assert!(matches!(&proj.kind, ExprKind::Field(_, ref f) if f == "balance"));
-            assert_eq!(var, "a");
+            assert!(matches!(binder, crate::ast::SetCompBinder::Name(name) if name == "a"));
             let domain = domain.as_ref().expect("explicit domain");
             assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "Account"));
             assert!(source.is_none());
@@ -2413,7 +2413,7 @@ fn set_comp_projection_with_source() {
     match &e.kind {
         ExprKind::SetComp {
             projection,
-            var,
+            binder,
             domain,
             source,
             filter,
@@ -2422,7 +2422,7 @@ fn set_comp_projection_with_source() {
                 projection.as_deref().map(|expr| &expr.kind),
                 Some(ExprKind::Mul(_, _))
             ));
-            assert_eq!(var, "x");
+            assert!(matches!(binder, crate::ast::SetCompBinder::Name(name) if name == "x"));
             let domain = domain.as_ref().expect("explicit domain");
             assert!(matches!(&domain.kind, TypeRefKind::Simple(ref n) if n == "int"));
             assert!(matches!(
@@ -2441,7 +2441,7 @@ fn set_comp_projection_with_inferred_source_type() {
     match &e.kind {
         ExprKind::SetComp {
             projection,
-            var,
+            binder,
             domain,
             source,
             filter,
@@ -2450,11 +2450,45 @@ fn set_comp_projection_with_inferred_source_type() {
                 projection.as_deref().map(|expr| &expr.kind),
                 Some(ExprKind::Mul(_, _))
             ));
-            assert_eq!(var, "x");
+            assert!(matches!(binder, crate::ast::SetCompBinder::Name(name) if name == "x"));
             assert!(domain.is_none());
             assert!(matches!(
                 source.as_deref().map(|expr| &expr.kind),
                 Some(ExprKind::Var(ref n)) if n == "values"
+            ));
+            assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
+        }
+        other => panic!("expected SetComp, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_comp_projection_with_tuple_binder_pattern() {
+    let e = parse_expr("{ k | (k, _) in prices where k > 0 }");
+    match &e.kind {
+        ExprKind::SetComp {
+            projection,
+            binder,
+            domain,
+            source,
+            filter,
+        } => {
+            assert!(matches!(
+                projection.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Var(ref n)) if n == "k"
+            ));
+            assert!(matches!(
+                binder,
+                crate::ast::SetCompBinder::Tuple(items)
+                    if matches!(items.as_slice(), [
+                        crate::ast::SetCompBinder::Name(k),
+                        crate::ast::SetCompBinder::Wildcard,
+                    ] if k == "k")
+            ));
+            assert!(domain.is_none());
+            assert!(matches!(
+                source.as_deref().map(|expr| &expr.kind),
+                Some(ExprKind::Var(ref n)) if n == "prices"
             ));
             assert!(matches!(filter.kind, ExprKind::Gt(_, _)));
         }

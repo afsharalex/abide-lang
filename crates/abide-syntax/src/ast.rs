@@ -1181,6 +1181,14 @@ pub enum SawArg {
     Expr(Expr),
 }
 
+/// Binder pattern accepted by finite collection comprehensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetCompBinder {
+    Name(String),
+    Wildcard,
+    Tuple(Vec<SetCompBinder>),
+}
+
 /// Surface expression vocabulary.
 ///
 /// Variants are grouped by precedence level (Level 0 = loosest), which
@@ -1310,7 +1318,7 @@ pub enum ExprKind {
     /// or `{ var in source where filter }`.
     SetComp {
         projection: Option<Box<Expr>>,
-        var: String,
+        binder: SetCompBinder,
         domain: Option<TypeRef>,
         source: Option<Box<Expr>>,
         filter: Box<Expr>,

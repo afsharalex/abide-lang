@@ -977,27 +977,28 @@ fn subst_dollar_elab(name: &str, expr: &E::EExpr) -> E::EExpr {
             Box::new(subst_dollar_elab(name, key)),
             *span,
         ),
-        E::EExpr::SetComp(ty, source, var, domain_ty, filter, projection, span) => {
+        E::EExpr::SetComp(ty, projection, binder, domain_ty, source, filter, span) => {
             let source = source
                 .as_ref()
                 .map(|source| Box::new(subst_dollar_elab(name, source)));
+            let shadows_dollar = binder.binds("$");
             E::EExpr::SetComp(
                 ty.clone(),
-                source,
-                var.clone(),
-                domain_ty.clone(),
-                if var == "$" {
-                    filter.clone()
-                } else {
-                    filter
-                        .as_ref()
-                        .map(|filter| Box::new(subst_dollar_elab(name, filter)))
-                },
-                if var == "$" {
+                if shadows_dollar {
                     projection.clone()
                 } else {
-                    Box::new(subst_dollar_elab(name, projection))
+                    projection
+                        .as_ref()
+                        .map(|projection| Box::new(subst_dollar_elab(name, projection)))
                 },
+                binder.clone(),
+                domain_ty.clone(),
+                source,
+                Box::new(if shadows_dollar {
+                    filter.as_ref().clone()
+                } else {
+                    subst_dollar_elab(name, filter)
+                }),
                 *span,
             )
         }

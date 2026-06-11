@@ -2349,6 +2349,14 @@ fn verify_file(path: &str) -> Vec<abide::verify::VerificationResult> {
     abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default())
 }
 
+fn verify_file_with_config(
+    path: &str,
+    config: abide::verify::VerifyConfig,
+) -> Vec<abide::verify::VerificationResult> {
+    let prog = lower_file(path);
+    abide::verify::verify_all(&prog, &config)
+}
+
 #[test]
 fn public_example_verify_blocks_run_with_bounded_targets() {
     let binary = env!("CARGO_BIN_EXE_abide");
@@ -9355,11 +9363,18 @@ verify finite_set_operator_cardinality {
 
 #[test]
 fn collection_comprehensions_all_proved() {
-    let results = verify_file("tests/fixtures/collection_comprehensions.ab");
+    let results = verify_file_with_config(
+        "tests/fixtures/collection_comprehensions.ab",
+        abide::verify::VerifyConfig {
+            unbounded_only: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
     let expected = [
         "set_source_comprehension",
         "typed_set_source_comprehension",
         "seq_source_comprehension",
+        "map_source_destructuring_comprehension",
     ];
     for name in &expected {
         let result = results.iter().find(|result| match result {

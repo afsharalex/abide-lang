@@ -5085,6 +5085,40 @@ fn eval_expr(
                 }
                 Ok(ExplicitValue::Bool(false))
             }
+            IRExpr::MapLit { entries, .. } => {
+                let key = eval_expr(
+                    state,
+                    key,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?;
+                for (entry_key, entry_value) in entries {
+                    let candidate = eval_expr(
+                        state,
+                        entry_key,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )?;
+                    if candidate == key {
+                        return eval_expr(
+                            state,
+                            entry_value,
+                            current_system,
+                            system_fields,
+                            entity_specs,
+                            value_locals,
+                            slot_locals,
+                        );
+                    }
+                }
+                Err("map key not present in explicit-state Map literal".to_owned())
+            }
             IRExpr::SetComp { .. } => Ok(ExplicitValue::Bool(eval_setcomp_membership(
                 eval_ctx, map, key,
             )?)),
@@ -5344,6 +5378,13 @@ fn is_finite_set_expr(expr: &IRExpr) -> bool {
     matches!(
         expr,
         IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::SetComp { .. }
+    ) || matches!(
+        expr,
+        IRExpr::UnOp {
+            op,
+            operand,
+            ..
+        } if op == "OpMapDomain" && matches!(operand.as_ref(), IRExpr::MapLit { .. })
     )
 }
 
@@ -5366,6 +5407,26 @@ fn eval_finite_set_values(
             value_locals,
             slot_locals,
         ),
+        IRExpr::UnOp { op, operand, .. }
+            if op == "OpMapDomain" && matches!(operand.as_ref(), IRExpr::MapLit { .. }) =>
+        {
+            let IRExpr::MapLit { entries, .. } = operand.as_ref() else {
+                unreachable!("guard checked MapLit")
+            };
+            let mut values = HashSet::new();
+            for (key, _) in entries {
+                values.insert(eval_expr(
+                    state,
+                    key,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )?);
+            }
+            Ok(values)
+        }
         IRExpr::SetComp {
             var,
             domain,
@@ -5376,17 +5437,16 @@ fn eval_finite_set_values(
         } => {
             let mut values = HashSet::new();
             match (domain, source.as_deref()) {
-                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
-                    for element in elements {
-                        let value = eval_expr(
-                            state,
-                            element,
-                            current_system,
-                            system_fields,
-                            entity_specs,
-                            value_locals,
-                            slot_locals,
-                        )?;
+                (_, Some(source)) if is_finite_set_expr(source) => {
+                    for value in eval_finite_set_values(
+                        state,
+                        source,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )? {
                         let mut nested_values = value_locals.clone();
                         nested_values.insert(var.clone(), value.clone());
                         if eval_bool_with_locals(
@@ -5456,17 +5516,16 @@ fn eval_setcomp_membership(
     )?;
 
     match (domain, source.as_deref()) {
-        (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
-            for element in elements {
-                let value = eval_expr(
-                    state,
-                    element,
-                    current_system,
-                    system_fields,
-                    entity_specs,
-                    value_locals,
-                    slot_locals,
-                )?;
+        (_, Some(source)) if is_finite_set_expr(source) => {
+            for value in eval_finite_set_values(
+                state,
+                source,
+                current_system,
+                system_fields,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )? {
                 let mut nested_values = value_locals.clone();
                 nested_values.insert(var.clone(), value.clone());
                 if eval_bool_with_locals(

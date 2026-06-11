@@ -176,7 +176,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             SetCompLowering {
                 ty,
                 projection: proj,
-                var,
+                binder: var,
                 domain,
                 source,
                 filter,
@@ -661,7 +661,7 @@ fn lower_match_expr(
 struct SetCompLowering<'a> {
     ty: &'a E::Ty,
     projection: &'a Option<Box<E::EExpr>>,
-    var: &'a str,
+    binder: &'a E::ESetCompBinder,
     domain: &'a E::Ty,
     source: &'a Option<Box<E::EExpr>>,
     filter: &'a E::EExpr,
@@ -669,8 +669,19 @@ struct SetCompLowering<'a> {
 }
 
 fn lower_set_comp_expr(input: SetCompLowering<'_>, ctx: &LowerCtx<'_>) -> IRExpr {
+    if let Some(expr) = lower_map_entry_var_set_comp(&input, ctx) {
+        return expr;
+    }
+    if let Some(expr) = lower_map_destructuring_set_comp(&input, ctx) {
+        return expr;
+    }
+    let var = match input.binder {
+        E::ESetCompBinder::Var(name) => name.clone(),
+        E::ESetCompBinder::Wild => "__abide_set_item".to_owned(),
+        E::ESetCompBinder::Tuple(_) => "__abide_set_item".to_owned(),
+    };
     IRExpr::SetComp {
-        var: input.var.to_owned(),
+        var,
         domain: lower_ty(input.domain, ctx),
         source: input
             .source
@@ -684,6 +695,185 @@ fn lower_set_comp_expr(input: SetCompLowering<'_>, ctx: &LowerCtx<'_>) -> IRExpr
         ty: lower_ty(input.ty, ctx),
         span: input.span,
     }
+}
+
+fn lower_map_entry_var_set_comp(input: &SetCompLowering<'_>, ctx: &LowerCtx<'_>) -> Option<IRExpr> {
+    let E::ESetCompBinder::Var(entry_var) = input.binder else {
+        return None;
+    };
+    let E::Ty::Tuple(columns) = input.domain else {
+        return None;
+    };
+    let [key_ty, value_ty] = columns.as_slice() else {
+        return None;
+    };
+    let source = input.source.as_ref()?;
+    if !matches!(source.ty(), E::Ty::Map(_, _)) {
+        return None;
+    }
+
+    let key_var = format!("__abide_map_key_for_{entry_var}");
+    let lowered_map = lower_expr(source, ctx);
+    let key_ir_ty = lower_ty(key_ty, ctx);
+    let value_ir_ty = lower_ty(value_ty, ctx);
+    let entry_ir_ty = lower_ty(input.domain, ctx);
+    let domain_source = IRExpr::UnOp {
+        op: "OpMapDomain".to_owned(),
+        operand: Box::new(lowered_map.clone()),
+        ty: IRType::Set {
+            element: Box::new(key_ir_ty.clone()),
+        },
+        span: input.span,
+    };
+    let entry_expr = map_entry_tuple_expr(
+        &key_var,
+        &key_ir_ty,
+        lowered_map,
+        &value_ir_ty,
+        &entry_ir_ty,
+        input.span,
+    );
+    let wrap_entry_binding = |body: IRExpr| IRExpr::Let {
+        bindings: vec![LetBinding {
+            name: entry_var.clone(),
+            ty: entry_ir_ty.clone(),
+            expr: entry_expr.clone(),
+        }],
+        body: Box::new(body),
+        span: input.span,
+    };
+    let projection = input
+        .projection
+        .as_ref()
+        .map(|projection| lower_expr(projection, ctx))
+        .unwrap_or_else(|| IRExpr::Var {
+            name: entry_var.clone(),
+            ty: entry_ir_ty.clone(),
+            span: input.span,
+        });
+
+    Some(IRExpr::SetComp {
+        var: key_var,
+        domain: key_ir_ty,
+        source: Some(Box::new(domain_source)),
+        filter: Box::new(wrap_entry_binding(lower_expr(input.filter, ctx))),
+        projection: Some(Box::new(wrap_entry_binding(projection))),
+        ty: lower_ty(input.ty, ctx),
+        span: input.span,
+    })
+}
+
+fn lower_map_destructuring_set_comp(
+    input: &SetCompLowering<'_>,
+    ctx: &LowerCtx<'_>,
+) -> Option<IRExpr> {
+    let E::ESetCompBinder::Tuple(items) = input.binder else {
+        return None;
+    };
+    let [key_binder, value_binder] = items.as_slice() else {
+        return None;
+    };
+    let E::Ty::Tuple(columns) = input.domain else {
+        return None;
+    };
+    let [key_ty, value_ty] = columns.as_slice() else {
+        return None;
+    };
+    let source = input.source.as_ref()?;
+
+    let key_var = match key_binder {
+        E::ESetCompBinder::Var(name) => name.clone(),
+        E::ESetCompBinder::Wild => "__abide_map_key".to_owned(),
+        E::ESetCompBinder::Tuple(_) => return None,
+    };
+    let value_var = match value_binder {
+        E::ESetCompBinder::Var(name) => Some(name.clone()),
+        E::ESetCompBinder::Wild => None,
+        E::ESetCompBinder::Tuple(_) => return None,
+    };
+
+    let lowered_map = lower_expr(source, ctx);
+    let key_ir_ty = lower_ty(key_ty, ctx);
+    let value_ir_ty = lower_ty(value_ty, ctx);
+    let domain_source = IRExpr::UnOp {
+        op: "OpMapDomain".to_owned(),
+        operand: Box::new(lowered_map.clone()),
+        ty: IRType::Set {
+            element: Box::new(key_ir_ty.clone()),
+        },
+        span: input.span,
+    };
+    let wrap_value_binding = |body: IRExpr| {
+        if let Some(value_name) = &value_var {
+            IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: value_name.clone(),
+                    ty: value_ir_ty.clone(),
+                    expr: IRExpr::Index {
+                        map: Box::new(lowered_map.clone()),
+                        key: Box::new(IRExpr::Var {
+                            name: key_var.clone(),
+                            ty: key_ir_ty.clone(),
+                            span: input.span,
+                        }),
+                        ty: value_ir_ty.clone(),
+                        span: input.span,
+                    },
+                }],
+                body: Box::new(body),
+                span: input.span,
+            }
+        } else {
+            body
+        }
+    };
+
+    Some(IRExpr::SetComp {
+        var: key_var.clone(),
+        domain: key_ir_ty.clone(),
+        source: Some(Box::new(domain_source)),
+        filter: Box::new(wrap_value_binding(lower_expr(input.filter, ctx))),
+        projection: input
+            .projection
+            .as_ref()
+            .map(|projection| Box::new(wrap_value_binding(lower_expr(projection, ctx)))),
+        ty: lower_ty(input.ty, ctx),
+        span: input.span,
+    })
+}
+
+fn map_entry_tuple_expr(
+    key_var: &str,
+    key_ty: &IRType,
+    map: IRExpr,
+    value_ty: &IRType,
+    entry_ty: &IRType,
+    span: Option<crate::span::Span>,
+) -> IRExpr {
+    let key_expr = IRExpr::Var {
+        name: key_var.to_owned(),
+        ty: key_ty.clone(),
+        span,
+    };
+    let value_expr = IRExpr::Index {
+        map: Box::new(map),
+        key: Box::new(key_expr.clone()),
+        ty: value_ty.clone(),
+        span,
+    };
+    [key_expr, value_expr].into_iter().fold(
+        IRExpr::Var {
+            name: "Tuple".to_owned(),
+            ty: entry_ty.clone(),
+            span,
+        },
+        |func, arg| IRExpr::App {
+            func: Box::new(func),
+            arg: Box::new(arg),
+            ty: entry_ty.clone(),
+            span,
+        },
+    )
 }
 
 fn lower_rel_comp_expr(
