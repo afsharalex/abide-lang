@@ -374,6 +374,9 @@ pub(in crate::verify::ic3) fn ic3_expr_mentions_var(expr: &IRExpr, target: &str)
         IRExpr::Ctor { args, .. } => args
             .iter()
             .any(|(_, expr)| ic3_expr_mentions_var(expr, target)),
+        IRExpr::Tuple { elements, .. } => elements
+            .iter()
+            .any(|expr| ic3_expr_mentions_var(expr, target)),
         IRExpr::Match {
             scrutinee, arms, ..
         } => {

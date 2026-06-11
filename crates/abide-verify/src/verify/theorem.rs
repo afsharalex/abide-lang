@@ -104,6 +104,9 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
         }
         | IRExpr::SeqLit {
             elements: items, ..
+        }
+        | IRExpr::Tuple {
+            elements: items, ..
         } => items.iter().any(needs_property_encoder),
         IRExpr::MapLit { entries, .. } => entries
             .iter()

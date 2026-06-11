@@ -38,6 +38,41 @@ fn lower_expr_propagates_none_span() {
 }
 
 #[test]
+fn lower_tuple_literal_uses_first_class_tuple_ir() {
+    let tuple_ty = E::Ty::Tuple(vec![
+        E::Ty::Builtin(E::BuiltinTy::Int),
+        E::Ty::Builtin(E::BuiltinTy::Bool),
+    ]);
+    let expr = E::EExpr::TupleLit(
+        tuple_ty,
+        vec![
+            E::EExpr::Lit(E::Ty::Builtin(E::BuiltinTy::Int), E::Literal::Int(1), None),
+            E::EExpr::Lit(
+                E::Ty::Builtin(E::BuiltinTy::Bool),
+                E::Literal::Bool(true),
+                None,
+            ),
+        ],
+        None,
+    );
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let ir = lower_expr(&expr, &ctx);
+    match ir {
+        IRExpr::Tuple { elements, ty, .. } => {
+            assert_eq!(elements.len(), 2);
+            assert_eq!(
+                ty,
+                IRType::Tuple {
+                    elements: vec![IRType::Int, IRType::Bool],
+                }
+            );
+        }
+        other => panic!("expected first-class Tuple IR, got {other:?}"),
+    }
+}
+
+#[test]
 fn lower_expr_binop_propagates_span() {
     let sp = Span { start: 5, end: 15 };
     let a = E::EExpr::Lit(E::Ty::Builtin(E::BuiltinTy::Int), E::Literal::Int(1), None);

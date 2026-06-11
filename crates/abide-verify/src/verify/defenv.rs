@@ -807,6 +807,11 @@ fn free_vars_inner(expr: &IRExpr, bound: &mut HashSet<String>, fv: &mut HashSet<
             free_vars_inner(func, bound, fv);
             free_vars_inner(arg, bound, fv);
         }
+        IRExpr::Tuple { elements, .. } => {
+            for element in elements {
+                free_vars_inner(element, bound, fv);
+            }
+        }
         IRExpr::Lam { param, body, .. } => {
             free_vars_under_binder(param, body, bound, fv);
         }
@@ -1097,6 +1102,14 @@ fn substitute_var_inner(
         IRExpr::App { func, arg, ty, .. } => IRExpr::App {
             func: Box::new(substitute_var_inner(*func, var_name, replacement, repl_fv)),
             arg: Box::new(substitute_var_inner(*arg, var_name, replacement, repl_fv)),
+            ty,
+            span: None,
+        },
+        IRExpr::Tuple { elements, ty, .. } => IRExpr::Tuple {
+            elements: elements
+                .into_iter()
+                .map(|element| substitute_var_inner(element, var_name, replacement, repl_fv))
+                .collect(),
             ty,
             span: None,
         },

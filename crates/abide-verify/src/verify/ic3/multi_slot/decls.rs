@@ -225,6 +225,11 @@ pub(in crate::verify::ic3) fn collect_ic3_expr_datatype_enums<'a>(
             collect_ic3_expr_datatype_enums(right, out);
         }
         IRExpr::Field { expr, .. } => collect_ic3_expr_datatype_enums(expr, out),
+        IRExpr::Tuple { elements, .. } => {
+            for element in elements {
+                collect_ic3_expr_datatype_enums(element, out);
+            }
+        }
         IRExpr::IfElse {
             cond,
             then_body,

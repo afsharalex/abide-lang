@@ -924,6 +924,7 @@ pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
             arg: right,
             ..
         } => contains_liveness(left) || contains_liveness(right),
+        IRExpr::Tuple { elements, .. } => elements.iter().any(contains_liveness),
         IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
         | IRExpr::One { body, .. }
@@ -1037,6 +1038,7 @@ pub(super) fn contains_temporal(expr: &IRExpr) -> bool {
             arg: right,
             ..
         } => contains_temporal(left) || contains_temporal(right),
+        IRExpr::Tuple { elements, .. } => elements.iter().any(contains_temporal),
         IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
         | IRExpr::One { body, .. }
@@ -1147,6 +1149,7 @@ pub(super) fn contains_past_time(expr: &IRExpr) -> bool {
             arg: right,
             ..
         } => contains_past_time(left) || contains_past_time(right),
+        IRExpr::Tuple { elements, .. } => elements.iter().any(contains_past_time),
         IRExpr::Forall { body, .. }
         | IRExpr::Exists { body, .. }
         | IRExpr::One { body, .. }

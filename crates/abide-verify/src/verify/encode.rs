@@ -48,6 +48,9 @@ pub(super) fn make_z3_var_from_smt(name: &str, template: &SmtValue) -> SmtValue 
             // For arrays/dynamic/func, fall back to int (best effort)
             smt::int_var(name)
         }
+        SmtValue::Tuple { value, .. } => {
+            SmtValue::Dynamic(smt::dynamic_const(name, &smt::dynamic_sort(value)))
+        }
         SmtValue::Dynamic(d) => SmtValue::Dynamic(smt::dynamic_const(name, &smt::dynamic_sort(d))),
         SmtValue::Func(_) => {
             // For arrays/dynamic/func, fall back to int (best effort)
@@ -109,6 +112,10 @@ pub(super) fn make_z3_var_ctx(
             name,
             &smt::seq_sort(element).sort(),
         ))),
+        IRType::Tuple { elements } => Ok(SmtValue::Dynamic(smt::dynamic_const(
+            name,
+            &smt::tuple_sort(elements).sort(),
+        ))),
         _ => Err(format!(
             "unsupported parameter type for fn contract verification: {ty:?}"
         )),
@@ -128,6 +135,7 @@ fn expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::Index { ty, .. }
         | IRExpr::SetLit { ty, .. }
         | IRExpr::SeqLit { ty, .. }
+        | IRExpr::Tuple { ty, .. }
         | IRExpr::MapLit { ty, .. }
         | IRExpr::SetComp { ty, .. } => Some(ty),
         IRExpr::Prime { expr, .. } => expr_type(expr),
@@ -188,6 +196,9 @@ fn expr_mentions_var(expr: &IRExpr, target: &str) -> bool {
             elements: items, ..
         }
         | IRExpr::SeqLit {
+            elements: items, ..
+        }
+        | IRExpr::Tuple {
             elements: items, ..
         } => items.iter().any(|item| expr_mentions_var(item, target)),
         IRExpr::MapLit { entries, .. } => entries
@@ -314,6 +325,19 @@ pub(super) fn encode_pure_expr_inner(
         }
         IRExpr::RelComp { .. } => {
             Err("relation comprehension is not supported in fn contract encoding".to_owned())
+        }
+        IRExpr::Tuple { elements, ty, .. } => {
+            let IRType::Tuple {
+                elements: element_tys,
+            } = ty
+            else {
+                return Err(format!("Tuple expression with non-Tuple type: {ty:?}"));
+            };
+            let encoded = elements
+                .iter()
+                .map(|element| encode_pure_expr_inner(element, env, vctx, defs, precheck))
+                .collect::<Result<Vec<_>, _>>()?;
+            smt::tuple_value(element_tys, encoded)
         }
 
         IRExpr::Ctor {

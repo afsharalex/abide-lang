@@ -45,4 +45,5 @@ verify map_source_destructuring_comprehension {
   assert { k | (k, _) in Map(1, 10, 2, 20) where k > 1 } == Set(2)
   assert { v | (_, v) in Map(1, 10, 2, 20) where v >= 20 } == Set(20)
   assert { k + v | (k, v) in Map(1, 10, 2, 20) where v > 10 } == Set(22)
+  assert #{ entry | entry in Map(1, 10, 2, 20) where true } == 2
 }

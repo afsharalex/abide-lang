@@ -114,6 +114,11 @@ pub(super) fn qualify_query_vars_scoped(
             ty: ty.clone(),
             span: *span,
         },
+        IRExpr::Tuple { elements, ty, span } => IRExpr::Tuple {
+            elements: elements.iter().map(&r).collect(),
+            ty: ty.clone(),
+            span: *span,
+        },
 
         // ── Lambda / Let — extend bound set ─────────────────────────
         IRExpr::Lam {

@@ -871,6 +871,11 @@ pub(super) fn collect_saw_systems_expr(expr: &IRExpr, targets: &mut Vec<String>)
             collect_saw_systems_expr(func, targets);
             collect_saw_systems_expr(arg, targets);
         }
+        IRExpr::Tuple { elements, .. } => {
+            for element in elements {
+                collect_saw_systems_expr(element, targets);
+            }
+        }
         IRExpr::Let { bindings, body, .. } => {
             for binding in bindings {
                 collect_saw_systems_expr(&binding.expr, targets);

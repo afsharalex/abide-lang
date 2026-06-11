@@ -1702,6 +1702,11 @@ impl<'a> Runtime<'a> {
             IRExpr::App { .. } => self.eval_app(expr, env),
             IRExpr::SetLit { elements, .. } => self.eval_set_lit_expr(elements, env),
             IRExpr::SeqLit { elements, .. } => self.eval_seq_lit_expr(elements, env),
+            IRExpr::Tuple { elements, .. } => elements
+                .iter()
+                .map(|element| self.eval_expr(element, env))
+                .collect::<Result<Vec<_>, _>>()
+                .map(WitnessValue::Tuple),
             IRExpr::MapLit { entries, .. } => self.eval_map_lit_expr(entries, env),
             IRExpr::MapUpdate {
                 map, key, value, ..
@@ -2750,6 +2755,7 @@ fn expr_kind(expr: &IRExpr) -> &'static str {
         IRExpr::Index { .. } => "index",
         IRExpr::SetLit { .. } => "set_lit",
         IRExpr::SeqLit { .. } => "seq_lit",
+        IRExpr::Tuple { .. } => "tuple",
         IRExpr::MapLit { .. } => "map_lit",
         IRExpr::SetComp { .. } => "set_comp",
         IRExpr::RelComp { .. } => "rel_comp",

@@ -362,6 +362,13 @@ pub enum IRExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+    Tuple {
+        elements: Vec<IRExpr>,
+        #[serde(rename = "type")]
+        ty: IRType,
+        #[serde(skip)]
+        span: Option<Span>,
+    },
     MapLit {
         entries: Vec<(IRExpr, IRExpr)>,
         #[serde(rename = "type")]

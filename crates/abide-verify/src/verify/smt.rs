@@ -53,6 +53,8 @@ thread_local! {
         RefCell::new(HashMap::new());
     static SEQ_SORT_CACHE: RefCell<HashMap<(SolverFamily, String), Rc<DatatypeSort>>> =
         RefCell::new(HashMap::new());
+    static TUPLE_SORT_CACHE: RefCell<HashMap<(SolverFamily, String), Rc<DatatypeSort>>> =
+        RefCell::new(HashMap::new());
 }
 
 fn with_backend_context<R>(f: impl FnOnce(&<AB as SolverBackend>::Context) -> R) -> R {
@@ -594,6 +596,34 @@ pub fn seq_sort(element_ty: &IRType) -> Rc<DatatypeSort> {
     })
 }
 
+pub fn tuple_sort(elements: &[IRType]) -> Rc<DatatypeSort> {
+    let family = AB::family();
+    let key = format!("{elements:?}");
+    TUPLE_SORT_CACHE.with(|cache| {
+        if let Some(found) = cache.borrow().get(&(family, key.clone())) {
+            return Rc::clone(found);
+        }
+
+        let name = format!("TupleVal_{}", stable_hash_hex(&key));
+        let field_names = (0..elements.len())
+            .map(|idx| format!("field{idx}"))
+            .collect::<Vec<_>>();
+        let field_accessors = elements
+            .iter()
+            .map(|ty| datatype_accessor_sort(ir_type_to_sort(ty)))
+            .collect::<Vec<_>>();
+        let field_refs = field_names
+            .iter()
+            .zip(field_accessors)
+            .map(|(name, accessor)| (name.as_str(), accessor))
+            .collect::<Vec<_>>();
+        let builder = datatype_builder_variant(datatype_builder(&name), "Tuple", field_refs);
+        let sort = Rc::new(datatype_builder_finish(builder));
+        cache.borrow_mut().insert((family, key), Rc::clone(&sort));
+        sort
+    })
+}
+
 // ── Z3 value wrapper ────────────────────────────────────────────────
 
 /// An SMT AST value — wraps the concrete sort variants.
@@ -609,6 +639,11 @@ pub enum SmtValue {
     Real(Real),
     /// Array sort — used for `Map<K,V>` (store/select), `Set<T>` (characteristic function).
     Array(Array),
+    /// Tuple/product value with its structural elements retained for fieldwise equality.
+    Tuple {
+        value: Dynamic,
+        elements: Vec<SmtValue>,
+    },
     /// Uninterpreted/dynamic sort — used for complex types and array select results.
     Dynamic(Dynamic),
     /// Uninterpreted function — used for lambda encodings.
@@ -658,6 +693,7 @@ impl SmtValue {
             SmtValue::Bool(b) => backend!(dynamic_from_bool, b),
             SmtValue::Real(r) => backend!(dynamic_from_real, r),
             SmtValue::Array(a) => backend!(dynamic_from_array, a),
+            SmtValue::Tuple { value, .. } => value.clone(),
             SmtValue::Dynamic(d) => d.clone(),
             SmtValue::Func(f) => {
                 // A function value as Dynamic: create a nullary application
@@ -700,8 +736,8 @@ pub fn dynamic_to_typed_value(d: Dynamic, ty: &IRType) -> SmtValue {
         | IRType::Enum { .. }
         | IRType::Entity { .. }
         | IRType::Fn { .. }
-        | IRType::Record { .. }
-        | IRType::Tuple { .. } => int_like_dynamic_to_smt_value(d),
+        | IRType::Record { .. } => int_like_dynamic_to_smt_value(d),
+        IRType::Tuple { .. } => SmtValue::Dynamic(d),
         IRType::Real | IRType::Float => {
             dynamic_as_real(&d).map_or(SmtValue::Dynamic(d), SmtValue::Real)
         }
@@ -831,6 +867,26 @@ pub fn seq_length(value: &SmtValue, element_ty: &IRType) -> Result<SmtValue, Str
     ))
 }
 
+pub fn tuple_value(element_tys: &[IRType], elements: Vec<SmtValue>) -> Result<SmtValue, String> {
+    if element_tys.len() != elements.len() {
+        return Err(format!(
+            "tuple arity mismatch: type has {} elements, value has {}",
+            element_tys.len(),
+            elements.len()
+        ));
+    }
+    let sort = tuple_sort(element_tys);
+    let args = elements
+        .iter()
+        .map(SmtValue::to_dynamic)
+        .collect::<Vec<_>>();
+    let arg_refs = args.iter().collect::<Vec<_>>();
+    Ok(SmtValue::Tuple {
+        value: func_decl_apply(&sort.variants[0].constructor, &arg_refs),
+        elements,
+    })
+}
+
 pub fn seq_data(value: &SmtValue, element_ty: &IRType) -> Result<Array, String> {
     let seq = seq_dynamic(value)?;
     let sort = seq_sort(element_ty);
@@ -926,7 +982,7 @@ pub fn ir_type_to_sort(ty: &IRType) -> Sort {
             let option_sort = map_option_sort(value);
             backend!(array_sort, &ir_type_to_sort(key), &option_sort.sort)
         }
-        IRType::Tuple { .. } => backend!(int_sort), // tuples as uninterpreted for now
+        IRType::Tuple { elements } => tuple_sort(elements).sort(),
         IRType::Refinement { base, .. } => ir_type_to_sort(base), // use base type sort
     }
 }
@@ -1027,6 +1083,18 @@ pub fn smt_eq(a: &SmtValue, b: &SmtValue) -> Result<Bool, String> {
             Ok(backend!(real_eq, &backend!(int_to_real, x), y))
         }
         (SmtValue::Array(x), SmtValue::Array(y)) => Ok(backend!(array_eq, x, y.clone())),
+        (SmtValue::Tuple { elements: xs, .. }, SmtValue::Tuple { elements: ys, .. }) => {
+            if xs.len() != ys.len() {
+                return Ok(bool_const(false));
+            }
+            let equalities = xs
+                .iter()
+                .zip(ys)
+                .map(|(x, y)| smt_eq(x, y))
+                .collect::<Result<Vec<_>, _>>()?;
+            let refs = equalities.iter().collect::<Vec<_>>();
+            Ok(bool_and(&refs))
+        }
         // Cross-variant: coerce both to Dynamic for generic equality
         (SmtValue::Dynamic(d), other) | (other, SmtValue::Dynamic(d)) => {
             Ok(backend!(dynamic_eq, d, &other.to_dynamic()))
@@ -1344,6 +1412,7 @@ fn coerce_dynamic(op: &str, dynamic: &Dynamic, other: &SmtValue) -> BinopResult 
             .ok_or_else(|| format!("type error: Dynamic->Real cast failed in {op}")),
         SmtValue::Dynamic(_) => unreachable!("handled by dynamic_binop"),
         SmtValue::Array(_) => Err(format!("type error: cannot apply {op} to Array operand")),
+        SmtValue::Tuple { .. } => Err(format!("type error: cannot apply {op} to Tuple operand")),
         SmtValue::Func(_) => Err(format!("type error: cannot apply {op} to function value")),
     }
 }

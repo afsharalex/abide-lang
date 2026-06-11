@@ -92,6 +92,7 @@ fn expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::Index { ty, .. }
         | IRExpr::SetLit { ty, .. }
         | IRExpr::SeqLit { ty, .. }
+        | IRExpr::Tuple { ty, .. }
         | IRExpr::MapLit { ty, .. }
         | IRExpr::SetComp { ty, .. } => Some(ty),
         IRExpr::Prime { expr, .. } => expr_type(expr),
@@ -1347,6 +1348,9 @@ fn property_expr_mentions_var(expr: &IRExpr, target: &str) -> bool {
             elements: items, ..
         }
         | IRExpr::SeqLit {
+            elements: items, ..
+        }
+        | IRExpr::Tuple {
             elements: items, ..
         } => items
             .iter()
@@ -2657,6 +2661,7 @@ fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result
         IRExpr::MapLit { entries, ty, .. } => encode_prop_map_lit_value(enc, entries, ty),
         IRExpr::SetLit { elements, ty, .. } => encode_prop_set_lit_value(enc, elements, ty),
         IRExpr::SeqLit { elements, ty, .. } => encode_prop_seq_lit_value(enc, elements, ty),
+        IRExpr::Tuple { elements, ty, .. } => encode_prop_tuple_value(enc, elements, ty),
         IRExpr::SetComp { .. } => encode_prop_set_comp_value(enc, expr),
         IRExpr::Aggregate { .. } => encode_prop_aggregate_value(enc, expr),
         IRExpr::Card { expr: inner, .. } => {
@@ -3358,6 +3363,24 @@ fn encode_prop_seq_lit_value(
         .map(|elem| encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(smt::seq_literal(elem_ty, &elems))
+}
+
+fn encode_prop_tuple_value(
+    enc: PropertyEncodingCtx<'_>,
+    elements: &[IRExpr],
+    ty: &IRType,
+) -> Result<SmtValue, String> {
+    let IRType::Tuple {
+        elements: element_tys,
+    } = ty
+    else {
+        return Err(format!("Tuple expression with non-Tuple type: {ty:?}"));
+    };
+    let encoded = elements
+        .iter()
+        .map(|elem| encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step))
+        .collect::<Result<Vec<_>, _>>()?;
+    smt::tuple_value(element_tys, encoded)
 }
 
 fn encode_prop_set_comp_value(
@@ -4299,15 +4322,12 @@ pub(super) fn encode_card(
             projection,
             ..
         } => {
-            let elements = match source.as_ref() {
-                IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements,
-                _ => return Err(format!("unsupported cardinality expression: {inner:?}")),
-            };
+            let elements = finite_sourced_set_comp_elements(source)?;
             let one = smt::int_lit(1);
             let zero = smt::int_lit(0);
             let mut terms = Vec::new();
             let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
-            for element_expr in elements {
+            for element_expr in &elements {
                 let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
@@ -5153,6 +5173,75 @@ mod tests {
             )));
             assert_eq!(solver.check(), SatResult::Unsat);
         }
+    }
+
+    #[test]
+    fn encode_card_counts_tuple_projection_from_finite_map_domain_source() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let ctx = PropertyCtx::new();
+        let pool = empty_pool();
+        let int_lit = |value| IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        };
+        let map_ty = IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Int),
+        };
+        let tuple_ty = IRType::Tuple {
+            elements: vec![IRType::Int, IRType::Int],
+        };
+        let map_lit = IRExpr::MapLit {
+            entries: vec![(int_lit(1), int_lit(10)), (int_lit(2), int_lit(20))],
+            ty: map_ty,
+            span: None,
+        };
+        let entry_var = IRExpr::Var {
+            name: "entry".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        };
+        let set_comp = IRExpr::SetComp {
+            var: "entry".to_owned(),
+            domain: IRType::Int,
+            source: Some(Box::new(IRExpr::UnOp {
+                op: "OpMapDomain".to_owned(),
+                operand: Box::new(map_lit.clone()),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            })),
+            filter: Box::new(bool_literal(true)),
+            projection: Some(Box::new(IRExpr::Tuple {
+                elements: vec![
+                    entry_var.clone(),
+                    IRExpr::Index {
+                        map: Box::new(map_lit),
+                        key: Box::new(entry_var),
+                        ty: IRType::Int,
+                        span: None,
+                    },
+                ],
+                ty: tuple_ty.clone(),
+                span: None,
+            })),
+            ty: IRType::Set {
+                element: Box::new(tuple_ty),
+            },
+            span: None,
+        };
+
+        let card = encode_card(&pool, &vctx, &defs, &ctx, &set_comp, 0).expect("tuple set card");
+        let solver = AbideSolver::new();
+        solver.assert(&smt::bool_not(&smt::int_eq(
+            card.as_int().expect("card int"),
+            &smt::int_lit(2),
+        )));
+        assert_eq!(solver.check(), SatResult::Unsat);
     }
 
     #[test]

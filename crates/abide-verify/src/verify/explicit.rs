@@ -37,6 +37,7 @@ enum ExplicitValue {
         variant: String,
         fields: Vec<(String, ExplicitValue)>,
     },
+    Tuple(Vec<ExplicitValue>),
     Identity(String),
     SlotRef(op::EntitySlotRef),
 }
@@ -4300,6 +4301,7 @@ fn explicit_expr_type(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::UnOp { ty, .. }
         | IRExpr::Field { ty, .. }
         | IRExpr::App { ty, .. }
+        | IRExpr::Tuple { ty, .. }
         | IRExpr::Choose { ty, .. }
         | IRExpr::Lam { param_type: ty, .. } => Some(ty),
         IRExpr::Card { .. } => Some(&IRType::Int),
@@ -4396,6 +4398,17 @@ fn supports_state_expr(
                 slot_locals,
             )
         }),
+        IRExpr::Tuple { elements, .. } => elements.iter().all(|element| {
+            supports_state_expr(
+                element,
+                current_system,
+                system_fields,
+                system_field_types,
+                entity_specs,
+                value_locals,
+                slot_locals,
+            )
+        }),
         IRExpr::Var { name, .. } => {
             resolve_system_field_index(name, current_system, system_fields).is_some()
                 || value_locals.contains(name)
@@ -4444,6 +4457,35 @@ fn supports_state_expr(
                 ) && elements.iter().all(|element| {
                     supports_state_expr(
                         element,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )
+                })
+            }
+            IRExpr::MapLit { entries, .. } => {
+                supports_state_expr(
+                    key,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                ) && entries.iter().all(|(entry_key, entry_value)| {
+                    supports_state_expr(
+                        entry_key,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    ) && supports_state_expr(
+                        entry_value,
                         current_system,
                         system_fields,
                         system_field_types,
@@ -4880,6 +4922,32 @@ fn supports_cardinality_expr(
                 )
             })
         }
+        IRExpr::UnOp { op, operand, .. }
+            if op == "OpMapDomain" && matches!(operand.as_ref(), IRExpr::MapLit { .. }) =>
+        {
+            let IRExpr::MapLit { entries, .. } = operand.as_ref() else {
+                unreachable!("guard checked MapLit")
+            };
+            entries.iter().all(|(key, value)| {
+                supports_state_expr(
+                    key,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                ) && supports_state_expr(
+                    value,
+                    current_system,
+                    system_fields,
+                    system_field_types,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+            })
+        }
         IRExpr::MapLit { entries, .. } => entries.iter().all(|(key, value)| {
             supports_state_expr(
                 key,
@@ -4910,19 +4978,17 @@ fn supports_cardinality_expr(
             let mut nested_value_locals = value_locals.clone();
             let mut nested_slot_locals = slot_locals.clone();
             let domain_supported = match (domain, source.as_deref()) {
-                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
+                (_, Some(source)) if is_finite_set_expr(source) => {
                     nested_value_locals.insert(var.clone());
-                    elements.iter().all(|element| {
-                        supports_state_expr(
-                            element,
-                            current_system,
-                            system_fields,
-                            system_field_types,
-                            entity_specs,
-                            value_locals,
-                            slot_locals,
-                        )
-                    })
+                    supports_cardinality_expr(
+                        source,
+                        current_system,
+                        system_fields,
+                        system_field_types,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )
                 }
                 (IRType::Entity { name }, None) => {
                     let Some((entity_index, _)) = entity_specs
@@ -5240,6 +5306,21 @@ fn eval_expr(
                 slot_locals,
             )
         }
+        IRExpr::Tuple { elements, .. } => elements
+            .iter()
+            .map(|element| {
+                eval_expr(
+                    state,
+                    element,
+                    current_system,
+                    system_fields,
+                    entity_specs,
+                    value_locals,
+                    slot_locals,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ExplicitValue::Tuple),
         IRExpr::IfElse {
             cond,
             then_body,
@@ -5689,17 +5770,16 @@ fn eval_cardinality_expr(
         } => {
             let mut unique = HashSet::new();
             match (domain, source.as_deref()) {
-                (_, Some(IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. })) => {
-                    for element in elements {
-                        let value = eval_expr(
-                            state,
-                            element,
-                            current_system,
-                            system_fields,
-                            entity_specs,
-                            value_locals,
-                            slot_locals,
-                        )?;
+                (_, Some(source)) if is_finite_set_expr(source) => {
+                    for value in eval_finite_set_values(
+                        state,
+                        source,
+                        current_system,
+                        system_fields,
+                        entity_specs,
+                        value_locals,
+                        slot_locals,
+                    )? {
                         let mut nested_values = value_locals.clone();
                         nested_values.insert(var.clone(), value.clone());
                         if eval_bool_with_locals(
@@ -6605,6 +6685,9 @@ fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
                 .map(|(name, value)| (name.clone(), witness_value(value)))
                 .collect::<BTreeMap<_, _>>(),
         },
+        ExplicitValue::Tuple(values) => {
+            op::WitnessValue::Tuple(values.iter().map(witness_value).collect())
+        }
         ExplicitValue::Identity(value) => op::WitnessValue::Identity(value.clone()),
         ExplicitValue::SlotRef(slot_ref) => op::WitnessValue::SlotRef(slot_ref.clone()),
     }
@@ -6648,6 +6731,14 @@ fn render_explicit_value(value: &ExplicitValue) -> String {
         ExplicitValue::Bool(value) => value.to_string(),
         ExplicitValue::Str(value) => value.clone(),
         ExplicitValue::Enum { variant, .. } => variant.clone(),
+        ExplicitValue::Tuple(values) => format!(
+            "({})",
+            values
+                .iter()
+                .map(render_explicit_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ExplicitValue::Identity(value) => value.clone(),
         ExplicitValue::SlotRef(slot_ref) => format!("{}#{}", slot_ref.entity(), slot_ref.slot()),
     }
@@ -8865,6 +8956,87 @@ mod tests {
             )
             .unwrap(),
             ExplicitValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn explicit_state_evaluates_tuple_projection_from_finite_map_domain_source() {
+        let state = sample_state();
+        let specs = vec![entity_spec()];
+        let system_fields = HashMap::new();
+        let system_field_types = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+        let value_names = HashSet::new();
+        let slot_names = HashMap::new();
+        let map_ty = IRType::Map {
+            key: Box::new(IRType::Int),
+            value: Box::new(IRType::Int),
+        };
+        let tuple_ty = IRType::Tuple {
+            elements: vec![IRType::Int, IRType::Int],
+        };
+        let map_lit = IRExpr::MapLit {
+            entries: vec![(int_lit(1), int_lit(10)), (int_lit(2), int_lit(20))],
+            ty: map_ty,
+            span: None,
+        };
+        let entry_var = var("entry", IRType::Int);
+        let card = IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "entry".to_owned(),
+                domain: IRType::Int,
+                source: Some(Box::new(IRExpr::UnOp {
+                    op: "OpMapDomain".to_owned(),
+                    operand: Box::new(map_lit.clone()),
+                    ty: IRType::Set {
+                        element: Box::new(IRType::Int),
+                    },
+                    span: None,
+                })),
+                filter: Box::new(bool_lit(true)),
+                projection: Some(Box::new(IRExpr::Tuple {
+                    elements: vec![
+                        entry_var.clone(),
+                        IRExpr::Index {
+                            map: Box::new(map_lit),
+                            key: Box::new(entry_var),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                    ],
+                    ty: tuple_ty.clone(),
+                    span: None,
+                })),
+                ty: IRType::Set {
+                    element: Box::new(tuple_ty),
+                },
+                span: None,
+            }),
+            span: None,
+        };
+
+        assert!(supports_state_expr(
+            &card,
+            Some("Orders"),
+            &system_fields,
+            &system_field_types,
+            &specs,
+            &value_names,
+            &slot_names,
+        ));
+        assert_eq!(
+            eval_expr(
+                &state,
+                &card,
+                Some("Orders"),
+                &system_fields,
+                &specs,
+                &value_locals,
+                &slot_locals,
+            )
+            .unwrap(),
+            ExplicitValue::Int(2)
         );
     }
 

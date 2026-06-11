@@ -984,6 +984,12 @@ fn collect_relation_project_columns(expr: &IRExpr, out: &mut Vec<usize>) -> Resu
             collect_relation_project_columns(func, out)?;
             collect_relation_project_columns(arg, out)
         }
+        IRExpr::Tuple { elements, .. } => {
+            for element in elements {
+                collect_relation_project_columns(element, out)?;
+            }
+            Ok(())
+        }
         IRExpr::Var { name, .. } if name == "Tuple" => Ok(()),
         other => Err(format!(
             "relation project columns must be int literals, got `{other:?}`"
@@ -1040,6 +1046,10 @@ fn tuple_values_for_relation_element(expr: &IRExpr, arity: usize) -> Result<Vec<
 }
 
 fn tuple_app_values(expr: &IRExpr) -> Result<Vec<String>, String> {
+    if let IRExpr::Tuple { elements, .. } = expr {
+        return elements.iter().map(atom_value).collect();
+    }
+
     let mut values = Vec::new();
     let mut current = expr;
     loop {
@@ -1512,6 +1522,7 @@ fn contains_relation_surface(expr: &IRExpr) -> bool {
         IRExpr::App { func, arg, .. } => {
             contains_relation_surface(func) || contains_relation_surface(arg)
         }
+        IRExpr::Tuple { elements, .. } => elements.iter().any(contains_relation_surface),
         IRExpr::Card { expr, .. }
         | IRExpr::Assert { expr, .. }
         | IRExpr::Assume { expr, .. }
@@ -1534,6 +1545,7 @@ fn contains_set_comprehension(expr: &IRExpr) -> bool {
         IRExpr::App { func, arg, .. } => {
             contains_set_comprehension(func) || contains_set_comprehension(arg)
         }
+        IRExpr::Tuple { elements, .. } => elements.iter().any(contains_set_comprehension),
         _ => false,
     }
 }
@@ -1554,6 +1566,7 @@ fn ir_expr_ty(expr: &IRExpr) -> Option<&IRType> {
         | IRExpr::Index { ty, .. }
         | IRExpr::SetLit { ty, .. }
         | IRExpr::SeqLit { ty, .. }
+        | IRExpr::Tuple { ty, .. }
         | IRExpr::MapLit { ty, .. }
         | IRExpr::SetComp { ty, .. }
         | IRExpr::RelComp { ty, .. }

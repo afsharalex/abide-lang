@@ -3474,6 +3474,12 @@ fn collect_relation_project_columns(expr: &IRExpr, out: &mut Vec<usize>) -> Opti
             collect_relation_project_columns(func, out)?;
             collect_relation_project_columns(arg, out)
         }
+        IRExpr::Tuple { elements, .. } => {
+            for element in elements {
+                collect_relation_project_columns(element, out)?;
+            }
+            Some(())
+        }
         IRExpr::Var { name, .. } if name == "Tuple" => Some(()),
         _ => None,
     }
@@ -3522,6 +3528,10 @@ fn parse_relation_projection(
 }
 
 fn relation_projection_items(expr: &IRExpr) -> Option<Vec<&IRExpr>> {
+    if let IRExpr::Tuple { elements, .. } = expr {
+        return Some(elements.iter().collect());
+    }
+
     let mut items = Vec::new();
     let mut current = expr;
     loop {

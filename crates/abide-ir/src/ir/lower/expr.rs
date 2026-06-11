@@ -621,20 +621,14 @@ fn lower_tuple_lit_expr(
     ctx: &LowerCtx<'_>,
 ) -> IRExpr {
     let tuple_ty = lower_ty(ty, ctx);
-    let tuple_ctor = IRExpr::Var {
-        name: "Tuple".to_owned(),
+    IRExpr::Tuple {
+        elements: elements
+            .iter()
+            .map(|element| lower_expr(element, ctx))
+            .collect(),
         ty: tuple_ty.clone(),
         span,
-    };
-    elements
-        .iter()
-        .map(|element| lower_expr(element, ctx))
-        .fold(tuple_ctor, |acc, arg| IRExpr::App {
-            func: Box::new(acc),
-            arg: Box::new(arg),
-            ty: tuple_ty.clone(),
-            span,
-        })
+    }
 }
 
 fn lower_match_expr(
@@ -861,19 +855,11 @@ fn map_entry_tuple_expr(
         ty: value_ty.clone(),
         span,
     };
-    [key_expr, value_expr].into_iter().fold(
-        IRExpr::Var {
-            name: "Tuple".to_owned(),
-            ty: entry_ty.clone(),
-            span,
-        },
-        |func, arg| IRExpr::App {
-            func: Box::new(func),
-            arg: Box::new(arg),
-            ty: entry_ty.clone(),
-            span,
-        },
-    )
+    IRExpr::Tuple {
+        elements: vec![key_expr, value_expr],
+        ty: entry_ty.clone(),
+        span,
+    }
 }
 
 fn lower_rel_comp_expr(

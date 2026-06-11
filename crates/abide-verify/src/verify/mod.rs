@@ -2865,6 +2865,7 @@ pub(super) fn expr_span(e: &IRExpr) -> Option<crate::span::Span> {
         | IRExpr::Index { span, .. }
         | IRExpr::SetLit { span, .. }
         | IRExpr::SeqLit { span, .. }
+        | IRExpr::Tuple { span, .. }
         | IRExpr::MapLit { span, .. }
         | IRExpr::SetComp { span, .. }
         | IRExpr::RelComp { span, .. }

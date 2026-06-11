@@ -268,9 +268,9 @@ pub(super) fn body_contains_assert(expr: &IRExpr) -> bool {
                         .is_some_and(|source| body_contains_assert(source))
                 })
         }
-        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
-            elements.iter().any(body_contains_assert)
-        }
+        IRExpr::SetLit { elements, .. }
+        | IRExpr::SeqLit { elements, .. }
+        | IRExpr::Tuple { elements, .. } => elements.iter().any(body_contains_assert),
         IRExpr::MapLit { entries, .. } => entries
             .iter()
             .any(|(k, v)| body_contains_assert(k) || body_contains_assert(v)),
@@ -486,7 +486,9 @@ fn body_contains_admitted_stub(expr: &IRExpr, predicate: fn(&IRExpr) -> bool) ->
                         .is_some_and(|source| body_contains_admitted_stub(source, predicate))
                 })
         }
-        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements
+        IRExpr::SetLit { elements, .. }
+        | IRExpr::SeqLit { elements, .. }
+        | IRExpr::Tuple { elements, .. } => elements
             .iter()
             .any(|element| body_contains_admitted_stub(element, predicate)),
         IRExpr::MapLit { entries, .. } => entries.iter().any(|(key, value)| {
@@ -1437,9 +1439,9 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
         IRExpr::MapLit { entries, .. } => entries.iter().find_map(|(k, v)| {
             find_unsupported_scene_expr(k).or_else(|| find_unsupported_scene_expr(v))
         }),
-        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => {
-            elements.iter().find_map(find_unsupported_scene_expr)
-        }
+        IRExpr::SetLit { elements, .. }
+        | IRExpr::SeqLit { elements, .. }
+        | IRExpr::Tuple { elements, .. } => elements.iter().find_map(find_unsupported_scene_expr),
         IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
         IRExpr::Aggregate {
             body, in_filter, ..
@@ -1661,6 +1663,26 @@ pub(super) fn extract_witness_value(
                     .ok_or_else(|| {
                         "failed to evaluate Array-backed opaque witness value".to_owned()
                     }),
+                SmtValue::Tuple { elements, .. } => {
+                    let IRType::Tuple {
+                        elements: element_tys,
+                    } = ty
+                    else {
+                        return Ok(op::WitnessValue::Opaque {
+                            display: "?".to_owned(),
+                            ty: Some(ty_name),
+                        });
+                    };
+                    Ok(op::WitnessValue::Tuple(
+                        elements
+                            .iter()
+                            .zip(element_tys)
+                            .map(|(element, element_ty)| {
+                                extract_witness_value(model, element, variants, element_ty)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ))
+                }
                 SmtValue::Func(_) => Ok(op::WitnessValue::Opaque {
                     display: "?".to_owned(),
                     ty: Some(ty_name),
