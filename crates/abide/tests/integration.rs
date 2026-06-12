@@ -870,7 +870,7 @@ verify safety {
 #[test]
 fn execute_verification_parallel_lanes_preserves_deterministic_results() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
     use abide::verify::{
@@ -915,6 +915,7 @@ fn execute_verification_parallel_lanes_preserves_deterministic_results() {
     let plan = classify_verification_parallel_lanes(&schedule);
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new((Mutex::new(0_usize), Condvar::new()));
 
     let results = execute_verification_lane_plan(
         &plan,
@@ -922,12 +923,21 @@ fn execute_verification_parallel_lanes_preserves_deterministic_results() {
         {
             let active = Arc::clone(&active);
             let max_active = Arc::clone(&max_active);
+            let entered = Arc::clone(&entered);
             move |obligation| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(now, Ordering::SeqCst);
-                if obligation.id.as_str() == "scene:slow" {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                let (lock, cvar) = &*entered;
+                let mut entered_count = lock.lock().expect("entered count lock");
+                *entered_count += 1;
+                cvar.notify_all();
+                let _entered_wait = cvar
+                    .wait_timeout_while(
+                        entered_count,
+                        Duration::from_millis(500),
+                        |count| *count < 2,
+                    )
+                    .expect("entered count wait");
                 active.fetch_sub(1, Ordering::SeqCst);
                 obligation.id.as_str().to_owned()
             }
@@ -10097,6 +10107,43 @@ verify finite_payload_enum_setcomp {
 
     let results = verify_source(src);
     assert_verify_result_success(&results, "finite_payload_enum_setcomp");
+}
+
+#[test]
+fn verifier_property_supports_payload_constructor_field_and_choose_projection() {
+    let src = r"module T
+
+enum Decision = Accept { allowed: bool } | Reject
+enum Mode = Idle | Busy
+
+system Gate {
+  command tick() {}
+}
+
+verify payload_constructor_field_and_choose_projection [depth: 1] {
+  assume {
+    let gate = Gate {}
+    stutter
+  }
+
+  assert always @Idle == @Mode::Idle
+  assert always @Accept { allowed: true } == @Decision::Accept { allowed: true }
+  assert always (@Accept { allowed: true }).allowed
+  assert always not (@Accept { allowed: false }).allowed
+  assert always ((choose d: Decision where d == @Accept { allowed: false }).allowed == false)
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert_verify_result_success(&results, "payload_constructor_field_and_choose_projection");
 }
 
 #[test]

@@ -4,8 +4,8 @@ use super::super::smt::{self, AbideSolver, SatResult};
 use super::*;
 use crate::ir::types::{
     IRAction, IRAssumptionSet, IRCommand, IRCommandRef, IRField, IRFsm, IRFsmTransition, IRProgram,
-    IRQuery, IRStutterProvenance, IRSystem, IRSystemAction, IRTransRef, IRUpdate, IRVariant,
-    LitVal,
+    IRQuery, IRStutterProvenance, IRSystem, IRSystemAction, IRTransRef, IRTypeEntry, IRUpdate,
+    IRVariant, IRVariantField, LitVal,
 };
 
 fn make_order_entity() -> IREntity {
@@ -309,6 +309,408 @@ fn assert_value_eq(actual: &SmtValue, expected: &SmtValue) {
     let solver = AbideSolver::new();
     solver.assert(&smt::smt_eq(actual, expected).expect("value equality"));
     assert_eq!(solver.check(), SatResult::Sat);
+}
+
+#[test]
+fn slot_expr_family_helpers_cover_representative_dispatch() {
+    let entity = make_order_entity();
+    let vctx = make_vctx();
+    let pool = create_slot_pool(
+        std::slice::from_ref(&entity),
+        &HashMap::from([(entity.name.clone(), 1_usize)]),
+        2,
+    );
+    let entity_param_types = HashMap::new();
+    let store_param_types = HashMap::new();
+    let ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+
+    let int_lit = IRExpr::Lit {
+        ty: IRType::Int,
+        value: LitVal::Int { value: 4 },
+        span: None,
+    };
+    assert_value_eq(
+        &super::expr::try_encode_slot_literal_expr(&int_lit).expect("literal family"),
+        &smt::int_val(4),
+    );
+
+    let status_var = IRExpr::Var {
+        name: "status".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let status_value = super::expr::try_encode_slot_var_or_field_expr(&ctx, &status_var, 0)
+        .expect("var family")
+        .expect("var value");
+    assert_value_eq(
+        &status_value,
+        pool.field_at("Order", 0, "status", 0).unwrap(),
+    );
+
+    let other_total_expr = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "other".to_owned(),
+            ty: IRType::Identity,
+            span: None,
+        }),
+        field: "total".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let bound_ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::from([("other".to_owned(), ("Order".to_owned(), 0_usize))]),
+        system_name: "",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+    let other_total = super::expr::try_encode_slot_var_or_field_expr(&bound_ctx, &other_total_expr, 0)
+        .expect("field family")
+        .expect("field value");
+    assert_value_eq(
+        &other_total,
+        pool.field_at("Order", 0, "total", 0).unwrap(),
+    );
+
+    let pending_ctor = IRExpr::Ctor {
+        enum_name: "OrderStatus".to_owned(),
+        ctor: "Pending".to_owned(),
+        args: vec![],
+        span: None,
+    };
+    super::expr::try_encode_slot_constructor_expr(&ctx, &pending_ctor, 0)
+        .expect("ctor family")
+        .expect("ctor value");
+
+    let decision_ty = IRType::Enum {
+        name: "Decision".to_owned(),
+        variants: vec![
+            IRVariant {
+                name: "Accept".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "allowed".to_owned(),
+                    ty: IRType::Bool,
+                }],
+            },
+            IRVariant::simple("Reject"),
+        ],
+    };
+    let payload_ir = IRProgram {
+        types: vec![IRTypeEntry {
+            name: "Decision".to_owned(),
+            ty: decision_ty,
+        }],
+        ..IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    };
+    let payload_vctx = VerifyContext::from_ir(&payload_ir);
+    let payload_ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &payload_vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+    let accept_true = IRExpr::Ctor {
+        enum_name: "Decision".to_owned(),
+        ctor: "Accept".to_owned(),
+        args: vec![(
+            "allowed".to_owned(),
+            IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+        )],
+        span: None,
+    };
+    assert!(matches!(
+        super::expr::try_encode_slot_constructor_expr(&payload_ctx, &accept_true, 0)
+            .expect("payload ctor family")
+            .expect("payload ctor value"),
+        SmtValue::Dynamic(_)
+    ));
+    let reject = IRExpr::Ctor {
+        enum_name: "Decision".to_owned(),
+        ctor: "Reject".to_owned(),
+        args: vec![],
+        span: None,
+    };
+    assert!(matches!(
+        super::expr::try_encode_slot_constructor_expr(&payload_ctx, &reject, 0)
+            .expect("fieldless payload enum ctor family")
+            .expect("fieldless payload enum ctor value"),
+        SmtValue::Dynamic(_)
+    ));
+    let accept_missing_field = IRExpr::Ctor {
+        enum_name: "Decision".to_owned(),
+        ctor: "Accept".to_owned(),
+        args: vec![],
+        span: None,
+    };
+    let missing_field_error =
+        super::expr::try_encode_slot_constructor_expr(&payload_ctx, &accept_missing_field, 0)
+            .expect("payload ctor family")
+            .expect_err("payload ctor should require its field");
+    assert!(
+        missing_field_error.contains("requires 1 field argument"),
+        "{missing_field_error}"
+    );
+
+    let equals_expr = IRExpr::BinOp {
+        op: "OpEq".to_owned(),
+        left: Box::new(int_lit.clone()),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: 4 },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    assert_value_eq(
+        &super::expr::try_encode_slot_operator_expr(&ctx, &equals_expr, 0)
+            .expect("operator family")
+            .expect("operator value"),
+        &smt::bool_val(true),
+    );
+
+    let seq_expr = IRExpr::SeqLit {
+        elements: vec![int_lit.clone()],
+        ty: IRType::Seq {
+            element: Box::new(IRType::Int),
+        },
+        span: None,
+    };
+    assert!(matches!(
+        super::expr::try_encode_slot_collection_expr(&ctx, &seq_expr, 0)
+            .expect("collection family")
+            .expect("collection value"),
+        SmtValue::Dynamic(_)
+    ));
+
+    let choose_expr = IRExpr::Choose {
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        predicate: Some(Box::new(IRExpr::BinOp {
+            op: "OpGe".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 3 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        })),
+        ty: IRType::Int,
+        span: None,
+    };
+    assert_value_eq(
+        &super::expr::try_encode_slot_choose_expr(&ctx, &choose_expr, 0)
+            .expect("choose family")
+            .expect("choose value"),
+        &smt::int_val(3),
+    );
+
+    let prime_total = IRExpr::Prime {
+        expr: Box::new(IRExpr::Var {
+            name: "total".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        span: None,
+    };
+    let next_total = super::expr::try_encode_slot_control_expr(&ctx, &prime_total, 1)
+        .expect("control family")
+        .expect("control value");
+    let total_t0 = pool.field_at("Order", 0, "total", 0).unwrap();
+    let total_t1 = pool.field_at("Order", 0, "total", 1).unwrap();
+    let total_t2 = pool.field_at("Order", 0, "total", 2).unwrap();
+    let solver = AbideSolver::new();
+    solver.assert(smt::smt_neq(total_t0, total_t2).expect("distinguish step 0"));
+    solver.assert(smt::smt_neq(total_t1, total_t2).expect("distinguish step 1"));
+    solver.assert(smt::smt_eq(&next_total, total_t2).expect("prime step"));
+    assert_eq!(solver.check(), SatResult::Sat);
+}
+
+#[test]
+fn slot_expr_field_respects_system_struct_context() {
+    let entity = make_order_entity();
+    let vctx = make_vctx();
+    let system = IRSystem {
+        fields: vec![IRField {
+            name: "ui.screen".to_owned(),
+            ty: IRType::Int,
+            default: None,
+            initial_constraint: None,
+        }],
+        ..make_system_with_int_fields()
+    };
+    let pool = create_slot_pool_with_systems(
+        std::slice::from_ref(&entity),
+        &HashMap::from([(entity.name.clone(), 1_usize)]),
+        0,
+        std::slice::from_ref(&system),
+    );
+    let entity_param_types = HashMap::new();
+    let store_param_types = HashMap::new();
+    let ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "Ui",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+
+    let struct_field_expr = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "ui".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        field: "screen".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let encoded = super::expr::try_encode_slot_var_or_field_expr(&ctx, &struct_field_expr, 0)
+        .expect("system struct field family")
+        .expect("system struct field value");
+    assert_value_eq(
+        &encoded,
+        pool.system_field_at("Ui", "ui.screen", 0)
+            .expect("ui.screen"),
+    );
+
+    let mut pool_with_unregistered_system_field = create_slot_pool_with_systems(
+        std::slice::from_ref(&entity),
+        &HashMap::from([(entity.name.clone(), 1_usize)]),
+        0,
+        std::slice::from_ref(&system),
+    );
+    pool_with_unregistered_system_field.system_field_vars.insert(
+        ("Ui".to_owned(), "ghost.total".to_owned()),
+        vec![smt::int_val(999)],
+    );
+    let ctx_with_unregistered_system_field = SlotEncodeCtx {
+        pool: &pool_with_unregistered_system_field,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "Ui",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+    let unregistered_struct_field_expr = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "ghost".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        field: "total".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let encoded = super::expr::try_encode_slot_var_or_field_expr(
+        &ctx_with_unregistered_system_field,
+        &unregistered_struct_field_expr,
+        0,
+    )
+    .expect("field family")
+    .expect("field value");
+    let current_total = pool_with_unregistered_system_field
+        .field_at("Order", 0, "total", 0)
+        .expect("current slot total");
+    let solver = AbideSolver::new();
+    solver.assert(smt::smt_neq(current_total, &smt::int_val(999)).expect("distinguishing value"));
+    solver.assert(smt::smt_eq(&encoded, current_total).expect("field resolution"));
+    assert_eq!(solver.check(), SatResult::Sat);
+}
+
+#[test]
+fn slot_expr_field_ignores_system_fields_without_system_context() {
+    let entity = make_order_entity();
+    let vctx = make_vctx();
+    let mut pool = create_slot_pool(
+        std::slice::from_ref(&entity),
+        &HashMap::from([(entity.name.clone(), 1_usize)]),
+        0,
+    );
+    pool.system_field_vars.insert(
+        ("".to_owned(), "ghost.total".to_owned()),
+        vec![smt::int_val(999)],
+    );
+    let entity_param_types = HashMap::new();
+    let store_param_types = HashMap::new();
+    let ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::new(),
+        bindings: HashMap::new(),
+        system_name: "",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+
+    let field_expr = IRExpr::Field {
+        expr: Box::new(IRExpr::Var {
+            name: "ghost".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        field: "total".to_owned(),
+        ty: IRType::Int,
+        span: None,
+    };
+    let encoded = super::expr::try_encode_slot_var_or_field_expr(&ctx, &field_expr, 0)
+        .expect("field family")
+        .expect("field value");
+    assert_value_eq(
+        &encoded,
+        pool.field_at("Order", 0, "total", 0)
+            .expect("current slot total"),
+    );
 }
 
 #[test]
@@ -2403,6 +2805,34 @@ fn try_encode_slot_expr_supports_collections_bindings_and_store_quantifiers() {
     .expect("sourced set comprehension card");
     assert_value_eq(&sourced_setcomp_card, &smt::int_val(2));
 
+    let unsupported_int_setcomp_card = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Card {
+            expr: Box::new(IRExpr::SetComp {
+                var: "n".to_owned(),
+                domain: IRType::Int,
+                source: None,
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                projection: None,
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            }),
+            span: None,
+        },
+        0,
+    )
+    .expect_err("unsourced Int set comprehension cardinality should be unsupported");
+    assert!(
+        unsupported_int_setcomp_card.contains("unsupported cardinality in action context"),
+        "{unsupported_int_setcomp_card}"
+    );
+
     let map_card = super::expr::try_encode_slot_expr(
         &ctx,
         &IRExpr::Card {
@@ -3185,7 +3615,7 @@ fn try_encode_slot_expr_supports_seq_map_ops_and_reports_type_errors() {
         &ctx,
         &IRExpr::UnOp {
             op: "OpMapRange".to_owned(),
-            operand: Box::new(map_expr),
+            operand: Box::new(map_expr.clone()),
             ty: IRType::Set {
                 element: Box::new(IRType::Int),
             },
@@ -3195,6 +3625,191 @@ fn try_encode_slot_expr_supports_seq_map_ops_and_reports_type_errors() {
     )
     .expect("map range");
     assert!(matches!(map_range, SmtValue::Array(_)));
+
+    let bool_map_ty = IRType::Map {
+        key: Box::new(IRType::Bool),
+        value: Box::new(IRType::Bool),
+    };
+    let bool_map_expr = IRExpr::MapLit {
+        entries: vec![(
+            IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: false },
+                span: None,
+            },
+        )],
+        ty: bool_map_ty,
+        span: None,
+    };
+    let bool_domain_has_true = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::UnOp {
+                op: "OpMapDomain".to_owned(),
+                operand: Box::new(bool_map_expr.clone()),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        },
+        0,
+    )
+    .expect("bool map literal domain membership");
+    assert_value_eq(&bool_domain_has_true, &smt::bool_val(true));
+
+    let bool_range_has_false = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::UnOp {
+                op: "OpMapRange".to_owned(),
+                operand: Box::new(bool_map_expr),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: false },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        },
+        0,
+    )
+    .expect("bool map literal range membership");
+    assert_value_eq(&bool_range_has_false, &smt::bool_val(true));
+
+    let map_param_value =
+        super::expr::try_encode_slot_expr(&ctx, &map_expr, 0).expect("map param value");
+    let map_param_ctx = SlotEncodeCtx {
+        pool: &pool,
+        vctx: &vctx,
+        entity: "Order",
+        slot: 0,
+        params: HashMap::from([("m".to_owned(), map_param_value)]),
+        bindings: HashMap::new(),
+        system_name: "",
+        entity_param_types: &entity_param_types,
+        store_param_types: &store_param_types,
+    };
+    let map_var = IRExpr::Var {
+        name: "m".to_owned(),
+        ty: map_ty.clone(),
+        span: None,
+    };
+    let map_domain_has_key = super::expr::try_encode_slot_expr(
+        &map_param_ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::UnOp {
+                op: "OpMapDomain".to_owned(),
+                operand: Box::new(map_var.clone()),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        },
+        0,
+    )
+    .expect("symbolic map domain membership");
+    assert_value_eq(&map_domain_has_key, &smt::bool_val(true));
+
+    let map_range_has_value = super::expr::try_encode_slot_expr(
+        &map_param_ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::UnOp {
+                op: "OpMapRange".to_owned(),
+                operand: Box::new(map_var),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 7 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        },
+        0,
+    )
+    .expect("symbolic map range membership");
+    assert_value_eq(&map_range_has_value, &smt::bool_val(true));
+
+    let updated_lookup = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::Index {
+            map: Box::new(IRExpr::MapUpdate {
+                map: Box::new(map_expr.clone()),
+                key: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 1 },
+                    span: None,
+                }),
+                value: Box::new(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 11 },
+                    span: None,
+                }),
+                ty: map_ty.clone(),
+                span: None,
+            }),
+            key: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Int,
+            span: None,
+        },
+        0,
+    )
+    .expect("map update lookup");
+    assert_value_eq(&updated_lookup, &smt::int_val(11));
+
+    let unsupported_int_set_comp = IRExpr::SetComp {
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        source: None,
+        filter: Box::new(IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        }),
+        projection: None,
+        ty: IRType::Set {
+            element: Box::new(IRType::Int),
+        },
+        span: None,
+    };
+    assert!(
+        super::expr::try_encode_slot_collection_expr(&ctx, &unsupported_int_set_comp, 0).is_none(),
+        "unsourced Int set comprehensions are not finite slot collection expressions"
+    );
 
     let bad_concat = super::expr::try_encode_slot_expr(
         &ctx,

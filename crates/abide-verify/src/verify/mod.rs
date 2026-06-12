@@ -11,6 +11,7 @@
 //! - `mod`: Tiered dispatch (`verify_all`), property encoding, counterexample extraction
 
 pub mod chc;
+mod collections;
 pub mod context;
 pub mod defenv;
 mod explicit;

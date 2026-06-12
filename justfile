@@ -31,9 +31,14 @@ mutants_ide_timeout := env_var_or_default("ABIDE_MUTANTS_IDE_TIMEOUT_SECS", "120
 mutants_ide_focused_timeout := env_var_or_default("ABIDE_MUTANTS_IDE_FOCUSED_TIMEOUT_SECS", "300")
 mutants_ide_per_test_timeout := env_var_or_default("ABIDE_MUTANTS_IDE_PER_TEST_TIMEOUT_SECS", "75")
 mutants_ide_build_timeout := env_var_or_default("ABIDE_MUTANTS_IDE_BUILD_TIMEOUT_SECS", "600")
+mutants_verifier_expr_shard_total := "4"
+mutants_verifier_expr_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_EXPR_TIMEOUT_SECS", "1800")
+mutants_verifier_expr_per_test_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_EXPR_PER_TEST_TIMEOUT_SECS", "75")
+mutants_verifier_expr_build_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_EXPR_BUILD_TIMEOUT_SECS", "900")
 runner := "python3 tools/run_with_timeout.py"
-mutants_env := "env CARGO_BUILD_JOBS=" + mutants_cargo_build_jobs + " CMAKE_BUILD_PARALLEL_LEVEL=" + mutants_cmake_build_parallel_level
+mutants_env := "env RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=" + mutants_cargo_build_jobs + " CMAKE_BUILD_PARALLEL_LEVEL=" + mutants_cmake_build_parallel_level
 mutants_common_args := "--profile " + mutants_profile + " --jobs " + mutants_jobs + " --timeout " + mutants_per_test_timeout + " --build-timeout " + mutants_build_timeout
+mutants_verifier_expr_common_args := "--profile " + mutants_profile + " --timeout " + mutants_verifier_expr_per_test_timeout + " --build-timeout " + mutants_verifier_expr_build_timeout + " --in-place --baseline skip"
 mutants_cli_common_args := "--profile " + mutants_profile + " --timeout " + mutants_cli_per_test_timeout + " --build-timeout " + mutants_cli_build_timeout + " --in-place --baseline skip"
 mutants_qa_common_args := "--profile " + mutants_profile + " --timeout " + mutants_qa_per_test_timeout + " --build-timeout " + mutants_qa_build_timeout + " --in-place --baseline skip"
 mutants_lsp_common_args := "--profile " + mutants_profile + " --timeout " + mutants_lsp_per_test_timeout + " --build-timeout " + mutants_lsp_build_timeout + " --in-place --baseline skip"
@@ -50,6 +55,15 @@ lsp_re := "verification_options|server_capabilities|verify_config_for_editor_pol
 lsp_semantic_re := "quickfix_actions_requested|code_actions_for_document|missing_load_code_action|close_qa_abide_block_code_action|removed_field_keyword_code_action|quickfix_action|single_file_edit|diagnostic_code|range_to_offsets|symbol_at_document_position|occurrence_resolves_to_symbol|reference_locations_for_symbol|rename_changes_for_symbol|resolve_occurrence_symbol|symbol_declared_at|best_symbol_match|same_symbol_identity|completion_symbols_for_context|embedded_qa_abide_completion_items|qualifier_before_dot|qualifier_before_scope|qualifier_before_trigger|qa_completion_items_for_document|qa_model_reference_completion_kind|qa_model_reference_completion_items|qa_load_path_completion_items|qa_load_path_prefix|loaded_qa_flow_model|loaded_qa_workspace_index|qa_load_paths|qa_load_path_from_line"
 lsp_project_re := "for_path|is_project_source|discover|empty|root|files|register_file|discover_dir|normalize_under_root|normalize_path_lexical|should_skip_project_dir|from_project|file_id|file_kind|file_kind_for_id|path|source_text|upsert_open_document|set_file_source|parse|lower|diagnostics|workspace_index|identifier_at|file_revision|file_state_mut|invalidate_file|invalidate_qa_diagnostics|qa_diagnostics|canonicalize|read_to_string|should_accept_document_version|document_version|uri_published_elsewhere|initialize|did_open|did_change|did_save|did_close|upsert_document|refresh_diagnostics|collect_diagnostics_for_root|collect_qa_diagnostics_for_root|collect_lsp_diagnostic|snapshot_source_for_path"
 ide_workspace_index_re := "symbols_named|completion_symbols|symbols_in_module|module_exports|members_by_owner|enum_variants_by_type|visible_symbols|references_named|completion_context|classify_abide_cursor|classify_qa_cursor|current_line_prefix|clamp_to_char_boundary|starts_with_keyword|is_word_boundary|pending_contract_context|block_frames|block_depth|block_frame_from_header|declaration_block_kind|last_callable_decl_keyword|words|build_workspace_index|is_abide_source_path|identifier_at|dedup_symbols|dedup_occurrences|dedup_symbol_clones|name_occurrences_from_tokens|collect_program_symbols|module_name|collect_program_imports_and_includes|collect_use_decl|collect_program|collect_top_decl|collect_type_decl|collect_entity_decl|collect_interface_decl|collect_system_decl|collect_proc_decl|collect_proc_nodes|collect_program_decl|collect_proc_decl_with_owner|find_name_span|symbol_detail"
+verifier_expr_property_quantifier_re := "property_quantifier_parts|encode_prop_quantifier_expr|encode_entity_quantifier_expr|encode_finite_enum_quantifier_expr|combine_finite_quantifier_predicates|encode_native_quantifier_expr|narrow_entity_quantifier_slots|extract_store_scoped_quantifier_body"
+verifier_expr_property_constructor_re := "encode_prop_constructor_field_or_call_value|encode_prop_payload_field_value|encode_static_payload_field_value|payload_accessor_for_field|ctor_name_matches_for_payload_accessor|encode_prop_field_value|encode_prop_ctor_value|encode_prop_adt_ctor_value"
+verifier_expr_slot_re := "try_encode_slot_expr|try_encode_slot_literal_expr|try_encode_slot_var_or_field_expr|try_encode_slot_field_expr|try_encode_slot_constructor_expr|try_encode_slot_constructor|try_encode_slot_choose_expr|try_encode_slot_operator_expr|try_encode_slot_binop_expr|try_encode_slot_unop_expr|try_encode_slot_app_expr|try_encode_slot_app|try_encode_slot_collection_expr|try_encode_slot_map_update_expr|try_encode_slot_index_expr|try_encode_slot_map_lit_expr|try_encode_slot_set_lit_expr|try_encode_slot_seq_lit_expr|try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier"
+verifier_expr_slot_shard_1_re := "try_encode_slot_expr|try_encode_slot_literal_expr|try_encode_slot_var_or_field_expr|try_encode_slot_field_expr"
+verifier_expr_slot_shard_2_re := "try_encode_slot_constructor_expr|try_encode_slot_constructor|try_encode_slot_choose_expr|try_encode_slot_operator_expr|try_encode_slot_binop_expr|try_encode_slot_unop_expr"
+verifier_expr_slot_shard_3_re := "try_encode_slot_app_expr|try_encode_slot_app|try_encode_slot_collection_expr|try_encode_slot_map_update_expr|try_encode_slot_index_expr|try_encode_slot_map_lit_expr|try_encode_slot_set_lit_expr|try_encode_slot_seq_lit_expr"
+verifier_expr_slot_shard_4_re := "try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier"
+verifier_expr_collection_re := "encode_set_literal|encode_seq_literal|encode_map_literal|encode_collection_index|encode_collection_update|finite_literal_cardinality|encode_unique_projected_cardinality|int_sum_or_zero|unique_expr_count"
+verifier_expr_pooled_support_re := "diagnose_pooled_sygus_expr_support|diagnose_pooled_sygus_expr_support_inner|unsupported_expr|is_pooled_sygus_finite_scalar_domain|ensure_pooled_sygus_expr_supported|ensure_pooled_sygus_action_supported|ensure_pooled_sygus_actions_supported|ensure_pooled_sygus_system_supported"
 
 build:
   {{runner}} --timeout-secs {{cargo_timeout}} --label "workspace build" -- cargo build --workspace
@@ -428,6 +442,46 @@ check-lang-mutants-ide-workspace-index-block-frames:
 check-lang-mutants-ide-workspace-index-find-name-span:
   {{runner}} --timeout-secs {{mutants_ide_focused_timeout}} --label "abide IDE name-span helper mutants" -- {{mutants_env}} cargo mutants {{mutants_ide_common_args}} -p abide --file crates/abide/src/ide.rs --re 'find_name_span' --output {{mutants_output_dir}}/mutants.out.ide-workspace-index.find-name-span -- --lib name_span_and_symbol_detail_are_scoped_to_decl_span {{mutants_libtest_args}}
 
+check-lang-mutants-verifier-expr:
+  just check-lang-mutants-verifier-expr-property-quantifier
+  just check-lang-mutants-verifier-expr-property-constructor
+  just check-lang-mutants-verifier-expr-slot
+  just check-lang-mutants-verifier-expr-collections
+  just check-lang-mutants-verifier-expr-pooled-support
+
+check-lang-mutants-verifier-expr-property-quantifier:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier property quantifier helper mutants" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/property.rs --re '{{verifier_expr_property_quantifier_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.property-quantifier -- --lib encode_prop_quantifier {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-property-constructor:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier property constructor/field/call helper mutants" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/property.rs --re '{{verifier_expr_property_constructor_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.property-constructor -- --lib encode_prop_constructor_field_or_call_helper_covers_dispatch_family {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-slot:
+  just check-lang-mutants-verifier-expr-slot-shard-1
+  just check-lang-mutants-verifier-expr-slot-shard-2
+  just check-lang-mutants-verifier-expr-slot-shard-3
+  just check-lang-mutants-verifier-expr-slot-shard-4
+
+check-lang-mutants-verifier-expr-slot-shard shard:
+  just check-lang-mutants-verifier-expr-slot-shard-{{shard}}
+
+check-lang-mutants-verifier-expr-slot-shard-1:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier slot expression helper mutants shard 1/{{mutants_verifier_expr_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '{{verifier_expr_slot_shard_1_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.slot.1-of-{{mutants_verifier_expr_shard_total}} -- --lib slot_expr {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-slot-shard-2:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier slot expression helper mutants shard 2/{{mutants_verifier_expr_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '{{verifier_expr_slot_shard_2_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.slot.2-of-{{mutants_verifier_expr_shard_total}} -- --lib slot_expr {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-slot-shard-3:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier slot expression helper mutants shard 3/{{mutants_verifier_expr_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '{{verifier_expr_slot_shard_3_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.slot.3-of-{{mutants_verifier_expr_shard_total}} -- --lib slot_expr {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-slot-shard-4:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier slot expression helper mutants shard 4/{{mutants_verifier_expr_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '{{verifier_expr_slot_shard_4_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.slot.4-of-{{mutants_verifier_expr_shard_total}} -- --lib slot_expr {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-collections:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier finite collection helper mutants" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/collections.rs --re '{{verifier_expr_collection_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.collections -- --lib finite_collection_helpers {{mutants_libtest_args}}
+
+check-lang-mutants-verifier-expr-pooled-support:
+  {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier pooled SyGuS support diagnostic mutants" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/sygus/pooled.rs --re '{{verifier_expr_pooled_support_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.pooled-support -- --lib pooled_sygus {{mutants_libtest_args}}
+
 check-lang-mutants-fn-vc:
   {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify function VC mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/fn_verify.rs --output {{mutants_output_dir}}/mutants.out.fn-vc -- --lib fn_contract {{mutants_libtest_args}}
 
@@ -440,7 +494,7 @@ check-lang-mutants-solver-routing:
 check-lang-mutants-runtime-backend:
   {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify runtime backend mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'RuntimeBackend|RuntimeModel|RuntimeDynamic|RuntimeBool|RuntimeReal|RuntimeArray|RuntimeModelEval' --output {{mutants_output_dir}}/mutants.out.runtime-backend -- --lib solver {{mutants_libtest_args}}
 
-check-lang-mutants-verify: check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend
+check-lang-mutants-verify: check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend check-lang-mutants-verifier-expr
 
 coverage:
   {{runner}} --timeout-secs {{cargo_timeout}} --label "abide coverage" -- cargo llvm-cov -p abide --lib --tests

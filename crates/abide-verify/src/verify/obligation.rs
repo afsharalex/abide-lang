@@ -1782,7 +1782,7 @@ mod tests {
     #[test]
     fn parallel_lane_executor_runs_parallel_safe_lanes_concurrently() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Condvar, Mutex};
         use std::time::Duration;
 
         let safe_a = VerificationObligation::new(
@@ -1821,6 +1821,7 @@ mod tests {
         let plan = classify_verification_parallel_lanes(&schedule);
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new((Mutex::new(0_usize), Condvar::new()));
 
         let results = execute_verification_lane_plan(
             &plan,
@@ -1828,12 +1829,21 @@ mod tests {
             {
                 let active = Arc::clone(&active);
                 let max_active = Arc::clone(&max_active);
+                let entered = Arc::clone(&entered);
                 move |obligation| {
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_active.fetch_max(now, Ordering::SeqCst);
-                    if obligation.id.as_str() == "scene:slow" {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+                    let (lock, cvar) = &*entered;
+                    let mut entered_count = lock.lock().expect("entered count lock");
+                    *entered_count += 1;
+                    cvar.notify_all();
+                    let _entered_wait = cvar
+                        .wait_timeout_while(
+                            entered_count,
+                            Duration::from_millis(500),
+                            |count| *count < 2,
+                        )
+                        .expect("entered count wait");
                     active.fetch_sub(1, Ordering::SeqCst);
                     obligation.id.as_str().to_owned()
                 }

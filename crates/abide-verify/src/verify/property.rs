@@ -19,6 +19,7 @@ use super::smt::{AbideSolver, Bool, Dynamic, Int, SatResult};
 
 use crate::ir::types::{IRExpr, IRSystem, IRType};
 
+use super::collections;
 use super::context::VerifyContext;
 use super::defenv;
 use super::encode::{
@@ -110,6 +111,60 @@ fn finite_domain_values(domain: &IRType) -> Option<Vec<SmtValue>> {
                 .map(|idx| smt::int_val(idx as i64))
                 .collect(),
         ),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyQuantifierKind {
+    Forall,
+    Exists,
+    One,
+    Lone,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PropertyQuantifierParts<'a> {
+    kind: PropertyQuantifierKind,
+    var: &'a str,
+    domain: &'a IRType,
+    body: &'a IRExpr,
+}
+
+fn property_quantifier_parts(expr: &IRExpr) -> Option<PropertyQuantifierParts<'_>> {
+    match expr {
+        IRExpr::Forall {
+            var, domain, body, ..
+        } => Some(PropertyQuantifierParts {
+            kind: PropertyQuantifierKind::Forall,
+            var,
+            domain,
+            body,
+        }),
+        IRExpr::Exists {
+            var, domain, body, ..
+        } => Some(PropertyQuantifierParts {
+            kind: PropertyQuantifierKind::Exists,
+            var,
+            domain,
+            body,
+        }),
+        IRExpr::One {
+            var, domain, body, ..
+        } => Some(PropertyQuantifierParts {
+            kind: PropertyQuantifierKind::One,
+            var,
+            domain,
+            body,
+        }),
+        IRExpr::Lone {
+            var, domain, body, ..
+        } => Some(PropertyQuantifierParts {
+            kind: PropertyQuantifierKind::Lone,
+            var,
+            domain,
+            body,
+        }),
         _ => None,
     }
 }
@@ -489,6 +544,237 @@ pub(super) fn encode_prop_value_with_ctx(
     Ok((value, Vec::new()))
 }
 
+fn encode_prop_quantifier_expr(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    expr: &IRExpr,
+    step: usize,
+) -> Result<Option<Bool>, String> {
+    let Some(parts) = property_quantifier_parts(expr) else {
+        return Ok(None);
+    };
+
+    let encoded = match parts.domain {
+        IRType::Entity { name } => {
+            encode_entity_quantifier_expr(pool, vctx, defs, ctx, parts, name, step)?
+        }
+        domain @ IRType::Enum { .. } if !domain.has_variant_fields() => {
+            encode_finite_enum_quantifier_expr(pool, vctx, defs, ctx, parts, step)?
+        }
+        _ => encode_native_quantifier_expr(pool, vctx, defs, ctx, parts, step)?,
+    };
+    Ok(Some(encoded))
+}
+
+fn encode_entity_quantifier_expr(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    parts: PropertyQuantifierParts<'_>,
+    entity_name: &str,
+    step: usize,
+) -> Result<Bool, String> {
+    let guard_op = match parts.kind {
+        PropertyQuantifierKind::Forall => "OpImplies",
+        PropertyQuantifierKind::Exists
+        | PropertyQuantifierKind::One
+        | PropertyQuantifierKind::Lone => "OpAnd",
+    };
+    let n_slots = pool.slots_for(entity_name);
+    let (slots, body) =
+        narrow_entity_quantifier_slots(ctx, parts.var, entity_name, parts.body, guard_op, n_slots);
+
+    let mut predicates = Vec::new();
+    for slot in slots {
+        let Some(SmtValue::Bool(active)) = pool.active_at(entity_name, slot, step) else {
+            continue;
+        };
+        let inner_ctx = ctx.with_binding(parts.var, entity_name, slot);
+        let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
+        let pred = match parts.kind {
+            PropertyQuantifierKind::Forall => smt::bool_implies(active, &body_bool),
+            PropertyQuantifierKind::Exists
+            | PropertyQuantifierKind::One
+            | PropertyQuantifierKind::Lone => smt::bool_and(&[active, &body_bool]),
+        };
+        predicates.push(pred);
+    }
+
+    Ok(combine_finite_quantifier_predicates(parts.kind, predicates))
+}
+
+fn encode_finite_enum_quantifier_expr(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    parts: PropertyQuantifierParts<'_>,
+    step: usize,
+) -> Result<Bool, String> {
+    let mut predicates = Vec::new();
+    for idx in 0..enum_variant_count(parts.domain) {
+        let inner_ctx = ctx.with_local(parts.var, smt::int_val(idx as i64));
+        predicates.push(encode_prop_expr(
+            pool, vctx, defs, &inner_ctx, parts.body, step,
+        )?);
+    }
+    Ok(combine_finite_quantifier_predicates(parts.kind, predicates))
+}
+
+fn combine_finite_quantifier_predicates(
+    kind: PropertyQuantifierKind,
+    predicates: Vec<Bool>,
+) -> Bool {
+    match kind {
+        PropertyQuantifierKind::Forall => bool_conjunction_or_true(predicates),
+        PropertyQuantifierKind::Exists => bool_disjunction_or_false(predicates),
+        PropertyQuantifierKind::One => bool_exactly_one(predicates),
+        PropertyQuantifierKind::Lone => bool_at_most_one(predicates),
+    }
+}
+
+fn bool_conjunction_or_true(predicates: Vec<Bool>) -> Bool {
+    if predicates.is_empty() {
+        return smt::bool_const(true);
+    }
+    let refs: Vec<&Bool> = predicates.iter().collect();
+    smt::bool_and(&refs)
+}
+
+fn bool_disjunction_or_false(predicates: Vec<Bool>) -> Bool {
+    if predicates.is_empty() {
+        return smt::bool_const(false);
+    }
+    let refs: Vec<&Bool> = predicates.iter().collect();
+    smt::bool_or(&refs)
+}
+
+fn bool_exactly_one(predicates: Vec<Bool>) -> Bool {
+    if predicates.is_empty() {
+        return smt::bool_const(false);
+    }
+    let at_least_one = {
+        let refs: Vec<&Bool> = predicates.iter().collect();
+        smt::bool_or(&refs)
+    };
+    let at_most_one = bool_at_most_one(predicates);
+    smt::bool_and(&[&at_least_one, &at_most_one])
+}
+
+fn bool_at_most_one(predicates: Vec<Bool>) -> Bool {
+    if predicates.len() <= 1 {
+        return smt::bool_const(true);
+    }
+    let mut exclusions = Vec::new();
+    for i in 0..predicates.len() {
+        for j in (i + 1)..predicates.len() {
+            exclusions.push(smt::bool_not(&smt::bool_and(&[
+                &predicates[i],
+                &predicates[j],
+            ])));
+        }
+    }
+    let refs: Vec<&Bool> = exclusions.iter().collect();
+    smt::bool_and(&refs)
+}
+
+fn encode_native_quantifier_expr(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    parts: PropertyQuantifierParts<'_>,
+    step: usize,
+) -> Result<Bool, String> {
+    match parts.kind {
+        PropertyQuantifierKind::Forall => {
+            let bound_var = make_z3_bound_var_ctx(parts.var, parts.domain, Some(vctx))?;
+            let inner_ctx = ctx.with_local(parts.var, bound_var.clone());
+            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, parts.body, step)?;
+            let dp = prop_domain_predicate(parts.domain, &bound_var, &inner_ctx, vctx, defs)?;
+            let guarded = match dp {
+                Some(d) => smt::bool_implies(&d, &body_bool),
+                None => body_bool,
+            };
+            build_z3_quantifier(true, &bound_var, &guarded, parts.var, parts.domain)
+        }
+        PropertyQuantifierKind::Exists => {
+            let bound_var = make_z3_bound_var_ctx(parts.var, parts.domain, Some(vctx))?;
+            let inner_ctx = ctx.with_local(parts.var, bound_var.clone());
+            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, parts.body, step)?;
+            let dp = prop_domain_predicate(parts.domain, &bound_var, &inner_ctx, vctx, defs)?;
+            let guarded = match dp {
+                Some(d) => smt::bool_and(&[&d, &body_bool]),
+                None => body_bool,
+            };
+            build_z3_quantifier(false, &bound_var, &guarded, parts.var, parts.domain)
+        }
+        PropertyQuantifierKind::One => {
+            let x_var = make_z3_bound_var_ctx(parts.var, parts.domain, Some(vctx))?;
+            let x_ctx = ctx.with_local(parts.var, x_var.clone());
+            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, parts.body, step)?;
+            let d_x = prop_domain_predicate(parts.domain, &x_var, &x_ctx, vctx, defs)?;
+            let x_satisfies = match &d_x {
+                Some(dp) => smt::bool_and(&[dp, &p_x]),
+                None => p_x.clone(),
+            };
+
+            let y_name = format!("{}__unique", parts.var);
+            let y_var = make_z3_bound_var_ctx(&y_name, parts.domain, Some(vctx))?;
+            let y_ctx = ctx.with_local(parts.var, y_var.clone());
+            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, parts.body, step)?;
+            let d_y = prop_domain_predicate(parts.domain, &y_var, &y_ctx, vctx, defs)?;
+            let y_satisfies = match &d_y {
+                Some(dp) => smt::bool_and(&[dp, &p_y]),
+                None => p_y,
+            };
+
+            let y_eq_x = smt::smt_eq(&y_var, &x_var)?;
+            let forall_unique = build_z3_quantifier(
+                true,
+                &y_var,
+                &smt::bool_implies(&y_satisfies, &y_eq_x),
+                &y_name,
+                parts.domain,
+            )?;
+            let exists_body = smt::bool_and(&[&x_satisfies, &forall_unique]);
+            build_z3_quantifier(false, &x_var, &exists_body, parts.var, parts.domain)
+        }
+        PropertyQuantifierKind::Lone => {
+            let x_var = make_z3_bound_var_ctx(parts.var, parts.domain, Some(vctx))?;
+            let x_ctx = ctx.with_local(parts.var, x_var.clone());
+            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, parts.body, step)?;
+            let d_x = prop_domain_predicate(parts.domain, &x_var, &x_ctx, vctx, defs)?;
+
+            let y_name = format!("{}__unique", parts.var);
+            let y_var = make_z3_bound_var_ctx(&y_name, parts.domain, Some(vctx))?;
+            let y_ctx = ctx.with_local(parts.var, y_var.clone());
+            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, parts.body, step)?;
+            let d_y = prop_domain_predicate(parts.domain, &y_var, &y_ctx, vctx, defs)?;
+
+            let mut antecedents = Vec::new();
+            if let Some(dp) = &d_x {
+                antecedents.push(dp.clone());
+            }
+            if let Some(dp) = &d_y {
+                antecedents.push(dp.clone());
+            }
+            antecedents.push(p_x);
+            antecedents.push(p_y);
+            let antecedent_refs: Vec<&Bool> = antecedents.iter().collect();
+            let lhs = smt::bool_and(&antecedent_refs);
+
+            let x_eq_y = smt::smt_eq(&x_var, &y_var)?;
+            let forall_body = smt::bool_implies(&lhs, &x_eq_y);
+            let inner = build_z3_quantifier(true, &y_var, &forall_body, &y_name, parts.domain)?;
+            build_z3_quantifier(true, &x_var, &inner, parts.var, parts.domain)
+        }
+    }
+}
+
 /// Encode a property expression with quantifier context.
 ///
 /// Handles entity quantifiers (`all o: Order | P(o)`) by expanding
@@ -503,37 +789,19 @@ pub(super) fn encode_prop_expr(
     expr: &IRExpr,
     step: usize,
 ) -> Result<Bool, String> {
-    // Try def expansion — but only if the name is NOT shadowed by a local binding
-    // (quantifier-bound variables take precedence over definitions).
-    if let IRExpr::Var { name, .. } = expr {
-        if !ctx.bindings.contains_key(name) {
-            if let Some(expanded) = defs.expand_var(name) {
-                return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
-            }
-        }
+    let enc = PropertyEncodingCtx {
+        pool,
+        vctx,
+        defs,
+        property: ctx,
+        step,
+    };
+    if let Some(expanded) = expand_prop_expr(enc, expr) {
+        return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
     }
-    if let IRExpr::App { .. } = expr {
-        // Record context-sensitive precondition obligations.
-        // Each obligation is guarded by the current path condition,
-        // so calls inside `A implies f(0)` only require the precondition
-        // when A is true.
-        if let Some(preconditions) = defs.call_preconditions(expr) {
-            let fn_name =
-                defenv::decompose_app_chain_name(expr).unwrap_or_else(|| "(unknown)".to_owned());
-            let path_guard = current_path_guard();
-            for pre in &preconditions {
-                if let Ok(pre_bool) = encode_prop_expr(pool, vctx, defs, ctx, pre, step) {
-                    // Obligation: path_guard → precondition
-                    record_prop_precondition_obligation(
-                        smt::bool_implies(&path_guard, &pre_bool),
-                        fn_name.clone(),
-                    );
-                }
-            }
-        }
-        if let Some(expanded) = defs.expand_app(expr) {
-            return encode_prop_expr(pool, vctx, defs, ctx, &expanded, step);
-        }
+
+    if let Some(encoded) = encode_prop_quantifier_expr(pool, vctx, defs, ctx, expr, step)? {
+        return Ok(encoded);
     }
 
     match expr {
@@ -564,346 +832,6 @@ pub(super) fn encode_prop_expr(
             let scrut = encode_prop_value(pool, vctx, defs, ctx, scrutinee, step)?;
             let result = encode_prop_match(pool, vctx, defs, ctx, &scrut, arms, step)?;
             result.to_bool()
-        }
-        // `all x: Entity | P(x)` — conjunction over entity slots.
-        // When sema lowered `all x: Entity in store | P(x)` to
-        // `(x in store) implies P(x)`, detect that guard pattern here and
-        // restrict iteration to the store's slot range.
-        IRExpr::Forall {
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            let (slots, body) =
-                narrow_entity_quantifier_slots(ctx, var, entity_name, body, "OpImplies", n_slots);
-            let mut conjuncts = Vec::new();
-            for slot in slots {
-                let active = pool.active_at(entity_name, slot, step);
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-                if let Some(SmtValue::Bool(act)) = active {
-                    // active => P(slot)
-                    conjuncts.push(smt::bool_implies(act, &body_val));
-                }
-            }
-            if conjuncts.is_empty() {
-                return Ok(smt::bool_const(true));
-            }
-            let refs: Vec<&Bool> = conjuncts.iter().collect();
-            Ok(smt::bool_and(&refs))
-        }
-        // `exists x: Entity | P(x)` — disjunction over active entity slots.
-        // `exists x: Entity in store | P(x)` lowers to
-        // `(x in store) and P(x)`; detect that guard pattern and iterate only
-        // the store's slot range.
-        IRExpr::Exists {
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            let (slots, body) =
-                narrow_entity_quantifier_slots(ctx, var, entity_name, body, "OpAnd", n_slots);
-            let mut disjuncts = Vec::new();
-            for slot in slots {
-                let active = pool.active_at(entity_name, slot, step);
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-                if let Some(SmtValue::Bool(act)) = active {
-                    // active AND P(slot)
-                    disjuncts.push(smt::bool_and(&[act, &body_val]));
-                }
-            }
-            if disjuncts.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            let refs: Vec<&Bool> = disjuncts.iter().collect();
-            Ok(smt::bool_or(&refs))
-        }
-        // `one x: Entity | P(x)` — exactly one active slot satisfies P
-        IRExpr::One {
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            let (slots, body) =
-                narrow_entity_quantifier_slots(ctx, var, entity_name, body, "OpAnd", n_slots);
-            // Encode P(slot) for each slot, paired with active flag
-            let mut slot_preds = Vec::new();
-            for slot in slots {
-                let active = pool.active_at(entity_name, slot, step);
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-                if let Some(SmtValue::Bool(act)) = active {
-                    slot_preds.push(smt::bool_and(&[act, &body_val]));
-                }
-            }
-            if slot_preds.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            // Exactly one: at least one AND at most one (pairwise exclusion)
-            let at_least_one = {
-                let refs: Vec<&Bool> = slot_preds.iter().collect();
-                smt::bool_or(&refs)
-            };
-            let mut exclusion_conjuncts = Vec::new();
-            for i in 0..slot_preds.len() {
-                for j in (i + 1)..slot_preds.len() {
-                    // ¬(P(i) ∧ P(j))
-                    exclusion_conjuncts.push(smt::bool_not(&smt::bool_and(&[
-                        &slot_preds[i],
-                        &slot_preds[j],
-                    ])));
-                }
-            }
-            if exclusion_conjuncts.is_empty() {
-                // Only one slot — at_least_one is sufficient
-                Ok(at_least_one)
-            } else {
-                let excl_refs: Vec<&Bool> = exclusion_conjuncts.iter().collect();
-                let at_most_one = smt::bool_and(&excl_refs);
-                Ok(smt::bool_and(&[&at_least_one, &at_most_one]))
-            }
-        }
-        // `lone x: Entity | P(x)` — at most one active slot satisfies P
-        IRExpr::Lone {
-            var,
-            domain: crate::ir::types::IRType::Entity { name: entity_name },
-            body,
-            ..
-        } => {
-            let n_slots = pool.slots_for(entity_name);
-            let (slots, body) =
-                narrow_entity_quantifier_slots(ctx, var, entity_name, body, "OpAnd", n_slots);
-            let mut slot_preds = Vec::new();
-            for slot in slots {
-                let active = pool.active_at(entity_name, slot, step);
-                let inner_ctx = ctx.with_binding(var, entity_name, slot);
-                let body_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-                if let Some(SmtValue::Bool(act)) = active {
-                    slot_preds.push(smt::bool_and(&[act, &body_val]));
-                }
-            }
-            if slot_preds.len() <= 1 {
-                // 0 or 1 slots — at most one trivially true
-                return Ok(smt::bool_const(true));
-            }
-            // Pairwise exclusion: no two slots both satisfy
-            let mut exclusion_conjuncts = Vec::new();
-            for i in 0..slot_preds.len() {
-                for j in (i + 1)..slot_preds.len() {
-                    exclusion_conjuncts.push(smt::bool_not(&smt::bool_and(&[
-                        &slot_preds[i],
-                        &slot_preds[j],
-                    ])));
-                }
-            }
-            let refs: Vec<&Bool> = exclusion_conjuncts.iter().collect();
-            Ok(smt::bool_and(&refs))
-        }
-        // ── Non-entity domain quantifiers ──────────────────────────────
-        //
-        // Two strategies:
-        // 1. Fieldless enums: finite expansion over variant indices (decidable).
-        // 2. Everything else (ADT enums, refinement types, Int/Bool/Real):
-        // Z3 native quantifiers with domain predicates.
-        //
-        // Fieldless-enum finite expansion (Forall = conjunction, Exists = disjunction):
-        IRExpr::Forall {
-            var,
-            domain: domain @ crate::ir::types::IRType::Enum { .. },
-            body,
-            ..
-        } if !domain.has_variant_fields() => {
-            let n = enum_variant_count(domain);
-            let mut conjuncts = Vec::new();
-            for idx in 0..n {
-                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
-                conjuncts.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
-            }
-            if conjuncts.is_empty() {
-                return Ok(smt::bool_const(true));
-            }
-            let refs: Vec<&Bool> = conjuncts.iter().collect();
-            Ok(smt::bool_and(&refs))
-        }
-        IRExpr::Exists {
-            var,
-            domain: domain @ crate::ir::types::IRType::Enum { .. },
-            body,
-            ..
-        } if !domain.has_variant_fields() => {
-            let n = enum_variant_count(domain);
-            let mut disjuncts = Vec::new();
-            for idx in 0..n {
-                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
-                disjuncts.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
-            }
-            if disjuncts.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            let refs: Vec<&Bool> = disjuncts.iter().collect();
-            Ok(smt::bool_or(&refs))
-        }
-        IRExpr::One {
-            var,
-            domain: domain @ crate::ir::types::IRType::Enum { .. },
-            body,
-            ..
-        } if !domain.has_variant_fields() => {
-            let n = enum_variant_count(domain);
-            let mut preds = Vec::new();
-            for idx in 0..n {
-                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
-                preds.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
-            }
-            if preds.is_empty() {
-                return Ok(smt::bool_const(false));
-            }
-            // Exactly one: at least one AND pairwise exclusion
-            let at_least_one = {
-                let refs: Vec<&Bool> = preds.iter().collect();
-                smt::bool_or(&refs)
-            };
-            let mut exclusions = Vec::new();
-            for i in 0..preds.len() {
-                for j in (i + 1)..preds.len() {
-                    exclusions.push(smt::bool_not(&smt::bool_and(&[&preds[i], &preds[j]])));
-                }
-            }
-            if exclusions.is_empty() {
-                Ok(at_least_one)
-            } else {
-                let excl_refs: Vec<&Bool> = exclusions.iter().collect();
-                Ok(smt::bool_and(&[&at_least_one, &smt::bool_and(&excl_refs)]))
-            }
-        }
-        IRExpr::Lone {
-            var,
-            domain: domain @ crate::ir::types::IRType::Enum { .. },
-            body,
-            ..
-        } if !domain.has_variant_fields() => {
-            let n = enum_variant_count(domain);
-            let mut preds = Vec::new();
-            for idx in 0..n {
-                let inner_ctx = ctx.with_local(var, smt::int_val(idx as i64));
-                preds.push(encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?);
-            }
-            if preds.len() <= 1 {
-                return Ok(smt::bool_const(true));
-            }
-            let mut exclusions = Vec::new();
-            for i in 0..preds.len() {
-                for j in (i + 1)..preds.len() {
-                    exclusions.push(smt::bool_not(&smt::bool_and(&[&preds[i], &preds[j]])));
-                }
-            }
-            let refs: Vec<&Bool> = exclusions.iter().collect();
-            Ok(smt::bool_and(&refs))
-        }
-        // Z3 native quantifiers for all other non-entity domains:
-        // ADT enums (infinite values per constructor), refinement types
-        // (domain predicate restricts range), Int/Bool/Real.
-        //
-        // Domain predicates are applied via build_domain_predicate to
-        // constrain bound variables to their declared domain.
-        IRExpr::Forall {
-            var, domain, body, ..
-        } => {
-            let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-            let inner_ctx = ctx.with_local(var, bound_var.clone());
-            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-            let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
-            let guarded = match dp {
-                Some(d) => smt::bool_implies(&d, &body_bool),
-                None => body_bool,
-            };
-            build_z3_quantifier(true, &bound_var, &guarded, var, domain)
-        }
-        IRExpr::Exists {
-            var, domain, body, ..
-        } => {
-            let bound_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-            let inner_ctx = ctx.with_local(var, bound_var.clone());
-            let body_bool = encode_prop_expr(pool, vctx, defs, &inner_ctx, body, step)?;
-            let dp = prop_domain_predicate(domain, &bound_var, &inner_ctx, vctx, defs)?;
-            let guarded = match dp {
-                Some(d) => smt::bool_and(&[&d, &body_bool]),
-                None => body_bool,
-            };
-            build_z3_quantifier(false, &bound_var, &guarded, var, domain)
-        }
-        IRExpr::One {
-            var, domain, body, ..
-        } => {
-            // Exactly one: ∃x. D(x) ∧ P(x) ∧ ∀y. D(y) ∧ P(y) → y = x
-            let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-            let x_ctx = ctx.with_local(var, x_var.clone());
-            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
-            let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
-            let x_satisfies = match &d_x {
-                Some(dp) => smt::bool_and(&[dp, &p_x]),
-                None => p_x.clone(),
-            };
-
-            let y_name = format!("{var}__unique");
-            let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
-            let y_ctx = ctx.with_local(var, y_var.clone());
-            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
-            let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
-            let y_satisfies = match &d_y {
-                Some(dp) => smt::bool_and(&[dp, &p_y]),
-                None => p_y,
-            };
-
-            let y_eq_x = smt::smt_eq(&y_var, &x_var)?;
-            let forall_unique = build_z3_quantifier(
-                true,
-                &y_var,
-                &smt::bool_implies(&y_satisfies, &y_eq_x),
-                &y_name,
-                domain,
-            )?;
-            let exists_body = smt::bool_and(&[&x_satisfies, &forall_unique]);
-            build_z3_quantifier(false, &x_var, &exists_body, var, domain)
-        }
-        IRExpr::Lone {
-            var, domain, body, ..
-        } => {
-            // At most one: ∀x, y. D(x) ∧ D(y) ∧ P(x) ∧ P(y) → x = y
-            let x_var = make_z3_bound_var_ctx(var, domain, Some(vctx))?;
-            let x_ctx = ctx.with_local(var, x_var.clone());
-            let p_x = encode_prop_expr(pool, vctx, defs, &x_ctx, body, step)?;
-            let d_x = prop_domain_predicate(domain, &x_var, &x_ctx, vctx, defs)?;
-
-            let y_name = format!("{var}__unique");
-            let y_var = make_z3_bound_var_ctx(&y_name, domain, Some(vctx))?;
-            let y_ctx = ctx.with_local(var, y_var.clone());
-            let p_y = encode_prop_expr(pool, vctx, defs, &y_ctx, body, step)?;
-            let d_y = prop_domain_predicate(domain, &y_var, &y_ctx, vctx, defs)?;
-
-            let mut antecedents = Vec::new();
-            if let Some(dp) = &d_x {
-                antecedents.push(dp.clone());
-            }
-            if let Some(dp) = &d_y {
-                antecedents.push(dp.clone());
-            }
-            antecedents.push(p_x);
-            antecedents.push(p_y);
-            let antecedent_refs: Vec<&Bool> = antecedents.iter().collect();
-            let lhs = smt::bool_and(&antecedent_refs);
-
-            let x_eq_y = smt::smt_eq(&x_var, &y_var)?;
-            let forall_body = smt::bool_implies(&lhs, &x_eq_y);
-            let inner = build_z3_quantifier(true, &y_var, &forall_body, &y_name, domain)?;
-            build_z3_quantifier(true, &x_var, &inner, var, domain)
         }
         // Boolean connectives — recurse
         IRExpr::BinOp {
@@ -2595,6 +2523,9 @@ fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result
             enc.step,
         );
     }
+    if let Some(value) = encode_prop_constructor_field_or_call_value(enc, expr)? {
+        return Ok(value);
+    }
     match expr {
         IRExpr::Choose { .. } => {
             Err("choose is only supported through let-binding in verifier properties".to_owned())
@@ -2614,12 +2545,6 @@ fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result
             expr: recv, field, ..
         } => encode_prop_field_value(enc, recv, field),
         IRExpr::Var { name, .. } => encode_prop_var_value(enc, name),
-        IRExpr::Ctor {
-            enum_name,
-            ctor,
-            args,
-            ..
-        } => encode_prop_ctor_value(enc, enum_name, ctor, args),
         IRExpr::BinOp {
             op, left, right, ..
         } => encode_prop_binop_value(enc, op, left, right),
@@ -2672,7 +2597,7 @@ fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result
     }
 }
 
-fn expand_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Option<IRExpr> {
+fn expand_prop_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Option<IRExpr> {
     match expr {
         IRExpr::Var { name, .. } if !enc.property.bindings.contains_key(name) => {
             enc.defs.expand_var(name)
@@ -2681,6 +2606,16 @@ fn expand_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Option
             record_prop_app_preconditions(enc, expr);
             enc.defs.expand_app(expr)
         }
+        _ => None,
+    }
+}
+
+fn expand_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Option<IRExpr> {
+    match expr {
+        IRExpr::Var { name, .. } if !enc.property.bindings.contains_key(name) => {
+            enc.defs.expand_var(name)
+        }
+        IRExpr::App { .. } => None,
         _ => None,
     }
 }
@@ -2700,6 +2635,38 @@ fn record_prop_app_preconditions(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) {
                 fn_name.clone(),
             );
         }
+    }
+}
+
+fn encode_prop_constructor_field_or_call_value(
+    enc: PropertyEncodingCtx<'_>,
+    expr: &IRExpr,
+) -> Result<Option<SmtValue>, String> {
+    match expr {
+        IRExpr::Field {
+            expr: recv, field, ..
+        } => encode_prop_payload_field_value(enc, recv, field),
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            ..
+        } => Ok(Some(encode_prop_ctor_value(enc, enum_name, ctor, args)?)),
+        IRExpr::App { func, .. } => {
+            record_prop_app_preconditions(enc, expr);
+            if let Some(expanded) = enc.defs.expand_app(expr) {
+                return Ok(Some(encode_prop_value(
+                    enc.pool,
+                    enc.vctx,
+                    enc.defs,
+                    enc.property,
+                    &expanded,
+                    enc.step,
+                )?));
+            }
+            encode_unexpanded_app_error(func, expr).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -2793,11 +2760,101 @@ fn encode_prop_lit_value(value: &crate::ir::types::LitVal) -> Result<SmtValue, S
     }
 }
 
+fn encode_prop_payload_field_value(
+    enc: PropertyEncodingCtx<'_>,
+    recv: &IRExpr,
+    field: &str,
+) -> Result<Option<SmtValue>, String> {
+    if let Some(static_projection) = encode_static_payload_field_value(enc, recv, field)? {
+        return Ok(Some(static_projection));
+    }
+    let Some(accessor) = payload_accessor_for_field(enc.vctx, expr_type(recv), field)? else {
+        return Ok(None);
+    };
+    let recv_value = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, recv, enc.step)?;
+    let recv_dynamic = recv_value.to_dynamic();
+    Ok(Some(dynamic_to_smt_value(smt::func_decl_apply(
+        accessor,
+        &[&recv_dynamic],
+    ))))
+}
+
+fn encode_static_payload_field_value(
+    enc: PropertyEncodingCtx<'_>,
+    recv: &IRExpr,
+    field: &str,
+) -> Result<Option<SmtValue>, String> {
+    let IRExpr::Ctor { args, .. } = recv else {
+        return Ok(None);
+    };
+    let Some((_, arg_expr)) = args.iter().find(|(arg_name, _)| arg_name == field) else {
+        return Ok(None);
+    };
+    encode_prop_value(
+        enc.pool,
+        enc.vctx,
+        enc.defs,
+        enc.property,
+        arg_expr,
+        enc.step,
+    )
+    .map(Some)
+}
+
+fn payload_accessor_for_field<'a>(
+    vctx: &'a VerifyContext,
+    receiver_ty: Option<&IRType>,
+    field: &str,
+) -> Result<Option<&'a smt::FuncDecl>, String> {
+    let Some(IRType::Enum { name, variants }) = receiver_ty else {
+        return Ok(None);
+    };
+    let Some(dt) = vctx.adt_sorts.get(name) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for ir_variant in variants {
+        let Some(field_index) = ir_variant
+            .fields
+            .iter()
+            .position(|candidate| candidate.name == field)
+        else {
+            continue;
+        };
+        let Some(smt_variant) = dt.variants.iter().find(|candidate| {
+            ctor_name_matches_for_payload_accessor(&candidate.name, name, &ir_variant.name)
+        }) else {
+            continue;
+        };
+        let Some(accessor) = smt_variant.accessors.get(field_index) else {
+            return Err(format!(
+                "payload field projection `{name}.{field}` has no accessor for constructor `{}`",
+                ir_variant.name
+            ));
+        };
+        if found.replace(accessor).is_some() {
+            return Err(format!(
+                "payload field projection `{name}.{field}` is ambiguous across constructors"
+            ));
+        }
+    }
+    Ok(found)
+}
+
+fn ctor_name_matches_for_payload_accessor(candidate: &str, enum_name: &str, ctor: &str) -> bool {
+    candidate == ctor
+        || candidate == format!("{enum_name}::{ctor}")
+        || format!("{enum_name}::{candidate}") == ctor
+}
+
 fn encode_prop_field_value(
     enc: PropertyEncodingCtx<'_>,
     recv: &IRExpr,
     field: &str,
 ) -> Result<SmtValue, String> {
+    if let Some(value) = encode_prop_payload_field_value(enc, recv, field)? {
+        return Ok(value);
+    }
     if let IRExpr::Var { name, .. } = recv {
         if let Some((entity, slot)) = enc.property.bindings.get(name) {
             if let Some(val) = enc.pool.field_at(entity, *slot, field, enc.step) {
@@ -3220,15 +3277,7 @@ fn encode_prop_map_update_value(
     let arr = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, map, enc.step)?;
     let k = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, key, enc.step)?;
     let v = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, value, enc.step)?;
-    if let Some(IRType::Map {
-        value: value_ty, ..
-    }) = expr_type(map)
-    {
-        return smt::map_store(&arr, &k, &v, value_ty);
-    }
-    Ok(SmtValue::Array(
-        arr.as_array()?.store(&k.to_dynamic(), &v.to_dynamic()),
-    ))
+    collections::encode_collection_update(&arr, &k, &v, expr_type(map))
 }
 
 fn encode_prop_index_value(
@@ -3242,16 +3291,7 @@ fn encode_prop_index_value(
     }
     let arr = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, map, enc.step)?;
     let k = encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, key, enc.step)?;
-    if let Some(IRType::Map { value, .. }) = expr_type(map) {
-        return smt::map_lookup(&arr, &k, value);
-    }
-    if let Some(IRType::Seq { element }) = expr_type(map) {
-        return smt::seq_index(&arr, &k, element);
-    }
-    Ok(smt::dynamic_to_typed_value(
-        arr.as_array()?.select(&k.to_dynamic()),
-        ty,
-    ))
+    collections::encode_collection_index(&arr, &k, expr_type(map), ty)
 }
 
 fn encode_prop_store_membership_index(
@@ -3299,33 +3339,9 @@ fn encode_prop_map_lit_value(
     entries: &[(IRExpr, IRExpr)],
     ty: &IRType,
 ) -> Result<SmtValue, String> {
-    let (key_ty, val_ty) = match ty {
-        IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
-        _ => return Err(format!("MapLit with non-Map type: {ty:?}")),
-    };
-    let key_sort = smt::ir_type_to_sort(key_ty);
-    let default_val = smt::map_none_dynamic(val_ty);
-    let mut arr = smt::const_array(&key_sort, &default_val);
-    for (key_expr, value_expr) in entries {
-        let key = encode_prop_value(
-            enc.pool,
-            enc.vctx,
-            enc.defs,
-            enc.property,
-            key_expr,
-            enc.step,
-        )?;
-        let value = encode_prop_value(
-            enc.pool,
-            enc.vctx,
-            enc.defs,
-            enc.property,
-            value_expr,
-            enc.step,
-        )?;
-        arr = arr.store(&key.to_dynamic(), &smt::map_some_dynamic(val_ty, &value));
-    }
-    Ok(SmtValue::Array(arr))
+    collections::encode_map_literal(entries, ty, |expr| {
+        encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, expr, enc.step)
+    })
 }
 
 fn encode_prop_set_lit_value(
@@ -3354,15 +3370,9 @@ fn encode_prop_seq_lit_value(
     elements: &[IRExpr],
     ty: &IRType,
 ) -> Result<SmtValue, String> {
-    let elem_ty = match ty {
-        IRType::Seq { element } => element.as_ref(),
-        _ => return Err(format!("SeqLit with non-Seq type: {ty:?}")),
-    };
-    let elems = elements
-        .iter()
-        .map(|elem| encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(smt::seq_literal(elem_ty, &elems))
+    collections::encode_seq_literal(elements, ty, |elem| {
+        encode_prop_value(enc.pool, enc.vctx, enc.defs, enc.property, elem, enc.step)
+    })
 }
 
 fn encode_prop_tuple_value(
@@ -4302,18 +4312,9 @@ pub(super) fn encode_card(
     }
 
     match inner {
-        IRExpr::SetLit { elements, .. } => {
-            let unique: std::collections::HashSet<String> =
-                elements.iter().map(|e| format!("{e:?}")).collect();
-            Ok(smt::int_val(i64::try_from(unique.len()).unwrap_or(0)))
-        }
-        IRExpr::SeqLit { elements, .. } => {
-            Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0)))
-        }
-        IRExpr::MapLit { entries, .. } => {
-            let unique_keys: std::collections::HashSet<String> =
-                entries.iter().map(|(k, _)| format!("{k:?}")).collect();
-            Ok(smt::int_val(i64::try_from(unique_keys.len()).unwrap_or(0)))
+        IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => {
+            let count = collections::finite_literal_cardinality(inner).unwrap_or(0);
+            Ok(smt::int_val(i64::try_from(count).unwrap_or(0)))
         }
         IRExpr::SetComp {
             var,
@@ -4323,11 +4324,7 @@ pub(super) fn encode_card(
             ..
         } => {
             let elements = finite_sourced_set_comp_elements(source)?;
-            let one = smt::int_lit(1);
-            let zero = smt::int_lit(0);
-            let mut terms = Vec::new();
-            let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
-            for element_expr in &elements {
+            collections::encode_unique_projected_cardinality(elements.iter(), |element_expr| {
                 let value = encode_prop_value(pool, vctx, defs, ctx, element_expr, step)?;
                 let inner_ctx = ctx.with_local(var, value.clone());
                 let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
@@ -4338,28 +4335,8 @@ pub(super) fn encode_card(
                 } else {
                     (value, vec![])
                 };
-                let mut include_once = if projection_constraints.is_empty() {
-                    filter_val.clone()
-                } else {
-                    let mut conjuncts = vec![filter_val.clone()];
-                    conjuncts.extend(projection_constraints);
-                    let refs: Vec<&Bool> = conjuncts.iter().collect();
-                    smt::bool_and(&refs)
-                };
-                for (prior_key, prior_filter) in &prior_keys {
-                    let same_key = smt::smt_eq(&key, prior_key)?;
-                    let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
-                    include_once =
-                        smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
-                }
-                terms.push(smt::int_ite(&include_once, &one, &zero));
-                prior_keys.push((key, include_once));
-            }
-            if terms.is_empty() {
-                return Ok(smt::int_val(0));
-            }
-            let refs: Vec<&Int> = terms.iter().collect();
-            Ok(SmtValue::Int(smt::int_add(&refs)))
+                Ok((set_comp_condition(filter_val, projection_constraints), key))
+            })
         }
         IRExpr::SetComp {
             var,
@@ -4369,43 +4346,21 @@ pub(super) fn encode_card(
             projection,
             ..
         } if finite_domain_values_with_payloads(vctx, domain).is_some() => {
-            let one = smt::int_lit(1);
-            let zero = smt::int_lit(0);
-            let mut terms = Vec::new();
-            let mut prior_keys: Vec<(SmtValue, Bool)> = Vec::new();
-            for value in finite_domain_values_with_payloads(vctx, domain).unwrap_or_default() {
-                let inner_ctx = ctx.with_local(var, value.clone());
-                let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
-                let (key, projection_constraints) = if let Some(projection) = projection {
-                    encode_prop_value_with_choose_constraints(
-                        pool, vctx, defs, &inner_ctx, projection, step,
-                    )?
-                } else {
-                    (value, vec![])
-                };
-                let include_raw = if projection_constraints.is_empty() {
-                    filter_val
-                } else {
-                    let mut conjuncts = vec![filter_val];
-                    conjuncts.extend(projection_constraints);
-                    let refs: Vec<&Bool> = conjuncts.iter().collect();
-                    smt::bool_and(&refs)
-                };
-                let mut include_once = include_raw.clone();
-                for (prior_key, prior_filter) in &prior_keys {
-                    let same_key = smt::smt_eq(&key, prior_key)?;
-                    let prior_included_same_key = smt::bool_and(&[prior_filter, &same_key]);
-                    include_once =
-                        smt::bool_and(&[&include_once, &smt::bool_not(&prior_included_same_key)]);
-                }
-                terms.push(smt::int_ite(&include_once, &one, &zero));
-                prior_keys.push((key, include_raw));
-            }
-            if terms.is_empty() {
-                return Ok(smt::int_val(0));
-            }
-            let refs: Vec<&Int> = terms.iter().collect();
-            Ok(SmtValue::Int(smt::int_add(&refs)))
+            collections::encode_unique_projected_cardinality(
+                finite_domain_values_with_payloads(vctx, domain).unwrap_or_default(),
+                |value| {
+                    let inner_ctx = ctx.with_local(var, value.clone());
+                    let filter_val = encode_prop_expr(pool, vctx, defs, &inner_ctx, filter, step)?;
+                    let (key, projection_constraints) = if let Some(projection) = projection {
+                        encode_prop_value_with_choose_constraints(
+                            pool, vctx, defs, &inner_ctx, projection, step,
+                        )?
+                    } else {
+                        (value, vec![])
+                    };
+                    Ok((set_comp_condition(filter_val, projection_constraints), key))
+                },
+            )
         }
         // Entity-domain set comprehension: bounded sum over slots
         IRExpr::SetComp {
@@ -4500,8 +4455,8 @@ fn finite_set_algebra_keys(expr: &IRExpr) -> Option<HashSet<String>> {
 mod tests {
     use super::*;
     use crate::ir::types::{
-        IREntity, IRField, IRMatchArm, IRPattern, IRProgram, IRSystem, IRType, IRTypeEntry,
-        IRVariant, IRVariantField, LitVal,
+        IREntity, IRField, IRFunction, IRMatchArm, IRPattern, IRProgram, IRSystem, IRType,
+        IRTypeEntry, IRVariant, IRVariantField, LitVal,
     };
     use crate::verify::harness::create_slot_pool;
 
@@ -4934,6 +4889,145 @@ mod tests {
             solver.assert(smt::bool_not(&encoded));
             assert_eq!(solver.check(), SatResult::Unsat);
         }
+    }
+
+    #[test]
+    fn encode_prop_constructor_field_or_call_helper_covers_dispatch_family() {
+        let decision_ty = IRType::Enum {
+            name: "Decision".to_owned(),
+            variants: vec![
+                IRVariant {
+                    name: "Accept".to_owned(),
+                    fields: vec![IRVariantField {
+                        name: "allowed".to_owned(),
+                        ty: IRType::Bool,
+                    }],
+                },
+                IRVariant::simple("Reject"),
+            ],
+        };
+        let mode_ty = IRType::Enum {
+            name: "Mode".to_owned(),
+            variants: vec![IRVariant::simple("Idle"), IRVariant::simple("Busy")],
+        };
+        let call_expr = IRExpr::App {
+            func: Box::new(IRExpr::Var {
+                name: "needs_true".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            arg: Box::new(bool_literal(true)),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![
+                IRTypeEntry {
+                    name: "Decision".to_owned(),
+                    ty: decision_ty.clone(),
+                },
+                IRTypeEntry {
+                    name: "Mode".to_owned(),
+                    ty: mode_ty.clone(),
+                },
+            ],
+            functions: vec![IRFunction {
+                name: "needs_true".to_owned(),
+                ty: IRType::Fn {
+                    param: Box::new(IRType::Bool),
+                    result: Box::new(IRType::Bool),
+                },
+                body: IRExpr::Lam {
+                    param: "x".to_owned(),
+                    param_type: IRType::Bool,
+                    body: Box::new(bool_literal(true)),
+                    span: None,
+                },
+                prop_target: None,
+                requires: vec![IRExpr::Var {
+                    name: "x".to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }],
+                ensures: vec![],
+                decreases: None,
+                span: None,
+                file: None,
+            }],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+        let enc = PropertyEncodingCtx {
+            pool: &pool,
+            vctx: &vctx,
+            defs: &defs,
+            property: &ctx,
+            step: 0,
+        };
+
+        let idle = IRExpr::Ctor {
+            enum_name: "Mode".to_owned(),
+            ctor: "Idle".to_owned(),
+            args: vec![],
+            span: None,
+        };
+        let idle_value =
+            encode_prop_constructor_field_or_call_value(enc, &idle).expect("fieldless ctor");
+        assert!(matches!(idle_value, Some(SmtValue::Int(_))));
+
+        let accept_true = IRExpr::Ctor {
+            enum_name: "Decision".to_owned(),
+            ctor: "Accept".to_owned(),
+            args: vec![("allowed".to_owned(), bool_literal(true))],
+            span: None,
+        };
+        let accept_value = encode_prop_constructor_field_or_call_value(enc, &accept_true)
+            .expect("payload ctor")
+            .expect("payload ctor value");
+        assert!(matches!(accept_value, SmtValue::Dynamic(_)));
+
+        let static_projection = IRExpr::Field {
+            expr: Box::new(accept_true.clone()),
+            field: "allowed".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let static_allowed = encode_prop_constructor_field_or_call_value(enc, &static_projection)
+            .expect("static payload field")
+            .expect("static field value")
+            .to_bool()
+            .expect("bool");
+        let solver = AbideSolver::new();
+        solver.assert(smt::bool_not(&static_allowed));
+        assert_eq!(solver.check(), SatResult::Unsat);
+
+        let dynamic_ctx = ctx.with_local("d", accept_value);
+        let dynamic_enc = enc.with_property(&dynamic_ctx);
+        let dynamic_projection = IRExpr::Field {
+            expr: Box::new(IRExpr::Var {
+                name: "d".to_owned(),
+                ty: decision_ty,
+                span: None,
+            }),
+            field: "allowed".to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        assert!(
+            encode_prop_constructor_field_or_call_value(dynamic_enc, &dynamic_projection)
+                .expect("dynamic payload field")
+                .is_some()
+        );
+
+        clear_prop_precondition_obligations();
+        assert!(encode_prop_constructor_field_or_call_value(enc, &call_expr)
+            .expect("call expansion")
+            .is_some());
+        assert_eq!(check_prop_precondition_obligations(), None);
     }
 
     #[test]
@@ -7009,6 +7103,93 @@ mod tests {
         );
         solver.assert(&archived_membership);
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_quantifier_helper_recognizes_quantifier_families() {
+        let entity = make_order_entity();
+        let enum_domain = IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![IRTypeEntry {
+                name: "Status".to_owned(),
+                ty: enum_domain.clone(),
+            }],
+            entities: vec![entity.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let mut scopes = HashMap::new();
+        scopes.insert("Order".to_owned(), 2usize);
+        let pool = create_slot_pool(&[entity], &scopes, 0);
+        let ctx = PropertyCtx::new();
+
+        let make_quantifier = |kind: &str, var: &str, domain: IRType| match kind {
+            "forall" => IRExpr::Forall {
+                var: var.to_owned(),
+                domain,
+                body: Box::new(bool_literal(true)),
+                span: None,
+            },
+            "exists" => IRExpr::Exists {
+                var: var.to_owned(),
+                domain,
+                body: Box::new(bool_literal(true)),
+                span: None,
+            },
+            "one" => IRExpr::One {
+                var: var.to_owned(),
+                domain,
+                body: Box::new(bool_literal(true)),
+                span: None,
+            },
+            "lone" => IRExpr::Lone {
+                var: var.to_owned(),
+                domain,
+                body: Box::new(bool_literal(true)),
+                span: None,
+            },
+            other => panic!("unknown quantifier kind: {other}"),
+        };
+
+        for kind in ["forall", "exists", "one", "lone"] {
+            let entity_expr = make_quantifier(
+                kind,
+                "o",
+                IRType::Entity {
+                    name: "Order".to_owned(),
+                },
+            );
+            assert!(
+                encode_prop_quantifier_expr(&pool, &vctx, &defs, &ctx, &entity_expr, 0)
+                    .expect("entity quantifier")
+                    .is_some()
+            );
+
+            let enum_expr = make_quantifier(kind, "s", enum_domain.clone());
+            assert!(
+                encode_prop_quantifier_expr(&pool, &vctx, &defs, &ctx, &enum_expr, 0)
+                    .expect("fieldless enum quantifier")
+                    .is_some()
+            );
+
+            let native_expr = make_quantifier(kind, "b", IRType::Bool);
+            assert!(
+                encode_prop_quantifier_expr(&pool, &vctx, &defs, &ctx, &native_expr, 0)
+                    .expect("native quantifier")
+                    .is_some()
+            );
+        }
+
+        assert!(
+            encode_prop_quantifier_expr(&pool, &vctx, &defs, &ctx, &bool_literal(true), 0)
+                .expect("non-quantifier")
+                .is_none()
+        );
     }
 
     #[test]

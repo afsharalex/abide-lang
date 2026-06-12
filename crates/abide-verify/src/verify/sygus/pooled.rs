@@ -128,6 +128,472 @@ struct PooledActionResult {
     locals: PooledLocalBindings,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PooledSyGuSUnsupportedExpr {
+    pub backend: &'static str,
+    pub feature: &'static str,
+    pub reason: String,
+    pub span: Option<crate::span::Span>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PooledSyGuSExprSupport {
+    Supported,
+    Unsupported(PooledSyGuSUnsupportedExpr),
+}
+
+impl PooledSyGuSExprSupport {
+    pub(super) fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    pub(super) fn diagnostic(&self) -> Option<&PooledSyGuSUnsupportedExpr> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported(diagnostic) => Some(diagnostic),
+        }
+    }
+}
+
+pub(super) fn diagnose_pooled_sygus_expr_support(expr: &IRExpr) -> PooledSyGuSExprSupport {
+    diagnose_pooled_sygus_expr_support_inner(expr).map_or(
+        PooledSyGuSExprSupport::Supported,
+        PooledSyGuSExprSupport::Unsupported,
+    )
+}
+
+fn unsupported_expr(
+    expr: &IRExpr,
+    feature: &'static str,
+    reason: impl Into<String>,
+) -> PooledSyGuSUnsupportedExpr {
+    PooledSyGuSUnsupportedExpr {
+        backend: "cvc5 SyGuS pooled",
+        feature,
+        reason: reason.into(),
+        span: crate::verify::expr_span(expr),
+    }
+}
+
+fn diagnose_pooled_sygus_expr_support_inner(expr: &IRExpr) -> Option<PooledSyGuSUnsupportedExpr> {
+    match expr {
+        IRExpr::Lit { value, .. } => match value {
+            LitVal::Int { .. } | LitVal::Real { .. } | LitVal::Bool { .. } => None,
+            LitVal::Float { .. } | LitVal::Str { .. } => Some(unsupported_expr(
+                expr,
+                "literal",
+                "pooled SyGuS supports integer, real, and boolean literals today",
+            )),
+        },
+        IRExpr::Sorry { .. } => None,
+        IRExpr::Todo { .. } => Some(unsupported_expr(
+            expr,
+            "todo",
+            "todo expressions are not admitted in pooled SyGuS verification",
+        )),
+        IRExpr::Var { .. } => None,
+        IRExpr::Ctor { args, .. } => args
+            .iter()
+            .find_map(|(_, arg)| diagnose_pooled_sygus_expr_support_inner(arg)),
+        IRExpr::App { func, arg, .. } => {
+            if !matches!(func.as_ref(), IRExpr::Lam { .. }) {
+                return Some(unsupported_expr(
+                    expr,
+                    "application",
+                    "pooled SyGuS only supports inline lambda application today",
+                ));
+            }
+            diagnose_pooled_sygus_expr_support_inner(func)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(arg))
+        }
+        IRExpr::Lam { body, .. } => diagnose_pooled_sygus_expr_support_inner(body),
+        IRExpr::Field { expr: recv, .. } | IRExpr::Prime { expr: recv, .. } => {
+            diagnose_pooled_sygus_expr_support_inner(recv)
+        }
+        IRExpr::Index { map, key, .. } => diagnose_pooled_sygus_expr_support_inner(map)
+            .or_else(|| diagnose_pooled_sygus_expr_support_inner(key)),
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => diagnose_pooled_sygus_expr_support_inner(map)
+            .or_else(|| diagnose_pooled_sygus_expr_support_inner(key))
+            .or_else(|| diagnose_pooled_sygus_expr_support_inner(value)),
+        IRExpr::UnOp { op, operand, .. } => {
+            if !matches!(op.as_str(), "OpNot" | "not" | "!" | "OpNeg" | "-") {
+                return Some(unsupported_expr(
+                    expr,
+                    "unary operator",
+                    format!("unsupported unary op `{op}` in pooled SyGuS"),
+                ));
+            }
+            diagnose_pooled_sygus_expr_support_inner(operand)
+        }
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            if !matches!(
+                op.as_str(),
+                "OpSetSubset"
+                    | "OpDisjoint"
+                    | "disjoint"
+                    | "OpSetUnion"
+                    | "OpSetIntersect"
+                    | "OpSetDiff"
+                    | "OpAnd"
+                    | "and"
+                    | "&&"
+                    | "OpOr"
+                    | "or"
+                    | "||"
+                    | "OpImplies"
+                    | "implies"
+                    | "=>"
+                    | "OpXor"
+                    | "xor"
+                    | "OpEq"
+                    | "=="
+                    | "OpNEq"
+                    | "!="
+                    | "OpLt"
+                    | "<"
+                    | "OpLe"
+                    | "<="
+                    | "OpGt"
+                    | ">"
+                    | "OpGe"
+                    | ">="
+                    | "OpAdd"
+                    | "+"
+                    | "OpSub"
+                    | "-"
+                    | "OpMul"
+                    | "*"
+                    | "OpDiv"
+                    | "/"
+                    | "OpMod"
+                    | "%"
+            ) {
+                return Some(unsupported_expr(
+                    expr,
+                    "binary operator",
+                    format!("unsupported binary op `{op}` in pooled SyGuS"),
+                ));
+            }
+            diagnose_pooled_sygus_expr_support_inner(left)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(right))
+        }
+        IRExpr::Let { bindings, body, .. } => bindings
+            .iter()
+            .find_map(|binding| diagnose_pooled_sygus_expr_support_inner(&binding.expr))
+            .or_else(|| diagnose_pooled_sygus_expr_support_inner(body)),
+        IRExpr::Block { exprs, .. } => exprs
+            .iter()
+            .find_map(diagnose_pooled_sygus_expr_support_inner),
+        IRExpr::VarDecl { init, rest, .. } => diagnose_pooled_sygus_expr_support_inner(init)
+            .or_else(|| diagnose_pooled_sygus_expr_support_inner(rest)),
+        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
+            diagnose_pooled_sygus_expr_support_inner(expr)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            if else_body.is_none() {
+                return Some(unsupported_expr(
+                    expr,
+                    "if/else",
+                    "pooled SyGuS requires an explicit else branch",
+                ));
+            }
+            diagnose_pooled_sygus_expr_support_inner(cond)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(then_body))
+                .or_else(|| {
+                    else_body
+                        .as_deref()
+                        .and_then(diagnose_pooled_sygus_expr_support_inner)
+                })
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => diagnose_pooled_sygus_expr_support_inner(scrutinee).or_else(|| {
+            arms.iter().find_map(|arm| {
+                arm.guard
+                    .as_ref()
+                    .and_then(diagnose_pooled_sygus_expr_support_inner)
+                    .or_else(|| diagnose_pooled_sygus_expr_support_inner(&arm.body))
+            })
+        }),
+        IRExpr::Choose {
+            domain, predicate, ..
+        } => {
+            if !is_pooled_sygus_finite_scalar_domain(domain) {
+                return Some(unsupported_expr(
+                    expr,
+                    "choose",
+                    "pooled SyGuS only supports finite Bool/enum domains for choose",
+                ));
+            }
+            predicate
+                .as_deref()
+                .and_then(diagnose_pooled_sygus_expr_support_inner)
+        }
+        IRExpr::Aggregate {
+            domain,
+            body,
+            in_filter,
+            ..
+        } => {
+            if !is_pooled_sygus_finite_scalar_domain(domain) {
+                return Some(unsupported_expr(
+                    expr,
+                    "aggregate",
+                    "pooled SyGuS only supports finite Bool/enum domains for finite aggregates",
+                ));
+            }
+            in_filter
+                .as_deref()
+                .and_then(diagnose_pooled_sygus_expr_support_inner)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(body))
+        }
+        IRExpr::Forall { domain, body, .. }
+        | IRExpr::Exists { domain, body, .. }
+        | IRExpr::One { domain, body, .. }
+        | IRExpr::Lone { domain, body, .. } => {
+            if !matches!(domain, IRType::Entity { .. } | IRType::Int)
+                && !is_pooled_sygus_finite_scalar_domain(domain)
+            {
+                return Some(unsupported_expr(
+                    expr,
+                    "quantifier",
+                    "pooled SyGuS only supports entity, store-slot Int, or finite Bool/enum quantifier domains",
+                ));
+            }
+            diagnose_pooled_sygus_expr_support_inner(body)
+        }
+        IRExpr::Card { expr: inner, .. } => diagnose_pooled_sygus_expr_support_inner(inner),
+        IRExpr::SetLit { elements, .. } | IRExpr::SeqLit { elements, .. } => elements
+            .iter()
+            .find_map(diagnose_pooled_sygus_expr_support_inner),
+        IRExpr::MapLit { entries, .. } => entries.iter().find_map(|(key, value)| {
+            diagnose_pooled_sygus_expr_support_inner(key)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(value))
+        }),
+        IRExpr::SetComp {
+            source,
+            filter,
+            projection,
+            domain,
+            ..
+        } => {
+            if source.is_none() && !is_pooled_sygus_finite_scalar_domain(domain) {
+                return Some(unsupported_expr(
+                    expr,
+                    "set comprehension",
+                    "pooled SyGuS only supports sourced comprehensions or finite Bool/enum domains",
+                ));
+            }
+            source
+                .as_deref()
+                .and_then(diagnose_pooled_sygus_expr_support_inner)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(filter))
+                .or_else(|| {
+                    projection
+                        .as_deref()
+                        .and_then(diagnose_pooled_sygus_expr_support_inner)
+                })
+        }
+        IRExpr::Tuple { elements, .. } => elements
+            .iter()
+            .find_map(diagnose_pooled_sygus_expr_support_inner),
+        IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. }
+        | IRExpr::Historically { body, .. }
+        | IRExpr::Once { body, .. }
+        | IRExpr::Previously { body, .. } => diagnose_pooled_sygus_expr_support_inner(body),
+        IRExpr::Until { left, right, .. } | IRExpr::Since { left, right, .. } => {
+            diagnose_pooled_sygus_expr_support_inner(left)
+                .or_else(|| diagnose_pooled_sygus_expr_support_inner(right))
+        }
+        IRExpr::RelComp { .. } => Some(unsupported_expr(
+            expr,
+            "relation comprehension",
+            "relation comprehensions are not supported in pooled SyGuS",
+        )),
+        IRExpr::While { .. } => Some(unsupported_expr(
+            expr,
+            "while",
+            "imperative while expressions are not supported in pooled SyGuS expression encoding",
+        )),
+        IRExpr::Saw { .. } => Some(unsupported_expr(
+            expr,
+            "saw",
+            "saw expressions are not supported in pooled SyGuS",
+        )),
+    }
+}
+
+fn is_pooled_sygus_finite_scalar_domain(domain: &IRType) -> bool {
+    matches!(domain, IRType::Bool | IRType::Enum { .. })
+}
+
+fn ensure_pooled_sygus_expr_supported(expr: &IRExpr, context: &str) -> Result<(), String> {
+    let support = diagnose_pooled_sygus_expr_support(expr);
+    if support.is_supported() {
+        return Ok(());
+    }
+    let diagnostic = support
+        .diagnostic()
+        .expect("unsupported support result should carry a diagnostic");
+    Err(format!(
+        "{} expression unsupported in {context}: feature `{}`: {}{}",
+        diagnostic.backend,
+        diagnostic.feature,
+        diagnostic.reason,
+        diagnostic
+            .span
+            .map(|span| format!(" at {}..{}", span.start, span.end))
+            .unwrap_or_default()
+    ))
+}
+
+fn ensure_pooled_sygus_action_supported(action: &IRAction, context: &str) -> Result<(), String> {
+    match action {
+        IRAction::Choose { filter, ops, .. } => {
+            ensure_pooled_sygus_expr_supported(filter, context)?;
+            ensure_pooled_sygus_actions_supported(ops, context)
+        }
+        IRAction::ForAll { ops, .. } => ensure_pooled_sygus_actions_supported(ops, context),
+        IRAction::Create { fields, .. } => fields
+            .iter()
+            .try_for_each(|field| ensure_pooled_sygus_expr_supported(&field.value, context)),
+        IRAction::LetCrossCall { args, .. }
+        | IRAction::Apply { args, .. }
+        | IRAction::CrossCall { args, .. } => args
+            .iter()
+            .try_for_each(|arg| ensure_pooled_sygus_expr_supported(arg, context)),
+        IRAction::Match { scrutinee, arms } => {
+            if let crate::ir::types::IRActionMatchScrutinee::CrossCall { args, .. } = scrutinee {
+                args.iter()
+                    .try_for_each(|arg| ensure_pooled_sygus_expr_supported(arg, context))?;
+            }
+            arms.iter().try_for_each(|arm| {
+                if let Some(guard) = &arm.guard {
+                    ensure_pooled_sygus_expr_supported(guard, context)?;
+                }
+                ensure_pooled_sygus_actions_supported(&arm.body, context)
+            })
+        }
+        IRAction::ExprStmt { expr } => ensure_pooled_sygus_expr_supported(expr, context),
+    }
+}
+
+fn ensure_pooled_sygus_actions_supported(
+    actions: &[IRAction],
+    context: &str,
+) -> Result<(), String> {
+    actions
+        .iter()
+        .try_for_each(|action| ensure_pooled_sygus_action_supported(action, context))
+}
+
+fn ensure_pooled_sygus_system_supported(
+    root_system: &IRSystem,
+    systems: &[IRSystem],
+    entities: &[IREntity],
+    property: &IRExpr,
+) -> Result<(), String> {
+    ensure_pooled_sygus_expr_supported(property, "pooled safety property")?;
+    for entity in entities {
+        for field in &entity.fields {
+            if let Some(default) = &field.default {
+                ensure_pooled_sygus_expr_supported(
+                    default,
+                    &format!("default for {}.{}", entity.name, field.name),
+                )?;
+            }
+        }
+        for derived in &entity.derived_fields {
+            ensure_pooled_sygus_expr_supported(
+                &derived.body,
+                &format!("derived field {}.{}", entity.name, derived.name),
+            )?;
+        }
+        for transition in &entity.transitions {
+            ensure_pooled_sygus_expr_supported(
+                &transition.guard,
+                &format!("transition {}.{}", entity.name, transition.name),
+            )?;
+            for update in &transition.updates {
+                ensure_pooled_sygus_expr_supported(
+                    &update.value,
+                    &format!(
+                        "transition update {}.{}.{}",
+                        entity.name, transition.name, update.field
+                    ),
+                )?;
+            }
+        }
+        for invariant in &entity.invariants {
+            ensure_pooled_sygus_expr_supported(
+                &invariant.body,
+                &format!("entity invariant {}.{}", entity.name, invariant.name),
+            )?;
+        }
+    }
+    for system in systems {
+        for field in &system.fields {
+            if let Some(default) = &field.default {
+                ensure_pooled_sygus_expr_supported(
+                    default,
+                    &format!("default for {}.{}", system.name, field.name),
+                )?;
+            }
+        }
+        for derived in &system.derived_fields {
+            ensure_pooled_sygus_expr_supported(
+                &derived.body,
+                &format!("derived field {}.{}", system.name, derived.name),
+            )?;
+        }
+        for invariant in &system.invariants {
+            ensure_pooled_sygus_expr_supported(
+                &invariant.body,
+                &format!("system invariant {}.{}", system.name, invariant.name),
+            )?;
+        }
+        for action in &system.actions {
+            ensure_pooled_sygus_expr_supported(
+                &action.guard,
+                &format!("action {}.{}", system.name, action.name),
+            )?;
+            ensure_pooled_sygus_actions_supported(
+                &action.body,
+                &format!("action {}.{}", system.name, action.name),
+            )?;
+            if let Some(return_expr) = &action.return_expr {
+                ensure_pooled_sygus_expr_supported(
+                    return_expr,
+                    &format!("action return {}.{}", system.name, action.name),
+                )?;
+            }
+        }
+    }
+    if !systems.iter().any(|system| system.name == root_system.name) {
+        for action in &root_system.actions {
+            ensure_pooled_sygus_expr_supported(
+                &action.guard,
+                &format!("action {}.{}", root_system.name, action.name),
+            )?;
+            ensure_pooled_sygus_actions_supported(
+                &action.body,
+                &format!("action {}.{}", root_system.name, action.name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn try_cvc5_sygus_multi_pooled_system_safety(
     system: &IRSystem,
@@ -223,6 +689,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
 ) -> Result<(), String> {
     let entities_by_name: HashMap<_, _> = entities.iter().map(|e| (e.name.clone(), e)).collect();
     let systems_by_name: HashMap<_, _> = systems.iter().map(|s| (s.name.clone(), s)).collect();
+    ensure_pooled_sygus_system_supported(root_system, systems, entities, property)?;
     if root_system.entities.is_empty() {
         return Err(
             "cvc5 SyGuS pooled system safety needs at least one pooled entity type".to_owned(),

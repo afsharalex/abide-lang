@@ -7,6 +7,7 @@ use super::smt::{AbideSolver, Bool, Dynamic, FuncDecl, Int, SatResult, Sort};
 
 use crate::ir::types::{IRExpr, IRType};
 
+use super::collections;
 use super::context::VerifyContext;
 use super::defenv;
 use super::smt::{self, SmtValue};
@@ -584,15 +585,7 @@ pub(super) fn encode_pure_expr_inner(
         IRExpr::Index { map, key, ty, .. } => {
             let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
             let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
-            if let Some(IRType::Map { value, .. }) = expr_type(map) {
-                return smt::map_lookup(&map_val, &key_val, value);
-            }
-            if let Some(IRType::Seq { element }) = expr_type(map) {
-                return smt::seq_index(&map_val, &key_val, element);
-            }
-            let arr = map_val.as_array()?;
-            let result = arr.select(&key_val.to_dynamic());
-            Ok(smt::dynamic_to_typed_value(result, ty))
+            collections::encode_collection_index(&map_val, &key_val, expr_type(map), ty)
         }
 
         IRExpr::MapUpdate {
@@ -601,62 +594,44 @@ pub(super) fn encode_pure_expr_inner(
             let map_val = encode_pure_expr_inner(map, env, vctx, defs, precheck)?;
             let key_val = encode_pure_expr_inner(key, env, vctx, defs, precheck)?;
             let val = encode_pure_expr_inner(value, env, vctx, defs, precheck)?;
-            if let Some(IRType::Map { value: value_ty, .. }) = expr_type(map) {
-                return smt::map_store(&map_val, &key_val, &val, value_ty);
-            }
-            let arr = map_val.as_array()?;
-            Ok(SmtValue::Array(
-                arr.store(&key_val.to_dynamic(), &val.to_dynamic()),
-            ))
+            collections::encode_collection_update(&map_val, &key_val, &val, expr_type(map))
         }
 
         IRExpr::SetLit { elements, ty, .. } => {
-            let elem_ty = match ty {
-                crate::ir::types::IRType::Set { element } => element.as_ref(),
- // Unresolved type: infer element type from first element (Int default)
-                _ => &crate::ir::types::IRType::Int,
+            let literal_ty = match ty {
+                IRType::Set { .. } => ty.clone(),
+                _ => IRType::Set {
+                    element: Box::new(IRType::Int),
+                },
             };
-            let elem_sort = smt::ir_type_to_sort(elem_ty);
-            let false_dyn = smt::default_dynamic(&crate::ir::types::IRType::Bool);
-            let mut arr = smt::const_array(&elem_sort, &false_dyn);
-            let true_dyn = smt::bool_to_dynamic(&smt::bool_const(true));
-            for e in elements {
-                let elem = encode_pure_expr_inner(e, env, vctx, defs, precheck)?;
-                arr = arr.store(&elem.to_dynamic(), &true_dyn);
-            }
-            Ok(SmtValue::Array(arr))
+            collections::encode_set_literal(elements, &literal_ty, |elem| {
+                encode_pure_expr_inner(elem, env, vctx, defs, precheck)
+            })
         }
 
         IRExpr::SeqLit { elements, ty, .. } => {
-            let elem_ty = match ty {
-                crate::ir::types::IRType::Seq { element } => element.as_ref(),
-                _ => &crate::ir::types::IRType::Int,
+            let literal_ty = match ty {
+                IRType::Seq { .. } => ty.clone(),
+                _ => IRType::Seq {
+                    element: Box::new(IRType::Int),
+                },
             };
-            let elems = elements
-                .iter()
-                .map(|e| encode_pure_expr_inner(e, env, vctx, defs, precheck))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(smt::seq_literal(elem_ty, &elems))
+            collections::encode_seq_literal(elements, &literal_ty, |elem| {
+                encode_pure_expr_inner(elem, env, vctx, defs, precheck)
+            })
         }
 
         IRExpr::MapLit { entries, ty, .. } => {
-            let (key_ty, val_ty) = match ty {
-                crate::ir::types::IRType::Map { key, value } => (key.as_ref(), value.as_ref()),
- // Unresolved type: infer from entries (Int keys, Bool values as default)
-                _ => (
-                    &crate::ir::types::IRType::Int,
-                    &crate::ir::types::IRType::Bool,
-                ),
+            let literal_ty = match ty {
+                IRType::Map { .. } => ty.clone(),
+                _ => IRType::Map {
+                    key: Box::new(IRType::Int),
+                    value: Box::new(IRType::Bool),
+                },
             };
-            let key_sort = smt::ir_type_to_sort(key_ty);
-            let default = smt::map_none_dynamic(val_ty);
-            let mut arr = smt::const_array(&key_sort, &default);
-            for (k, v) in entries {
-                let key_val = encode_pure_expr_inner(k, env, vctx, defs, precheck)?;
-                let val_val = encode_pure_expr_inner(v, env, vctx, defs, precheck)?;
-                arr = arr.store(&key_val.to_dynamic(), &smt::map_some_dynamic(val_ty, &val_val));
-            }
-            Ok(SmtValue::Array(arr))
+            collections::encode_map_literal(entries, &literal_ty, |expr| {
+                encode_pure_expr_inner(expr, env, vctx, defs, precheck)
+            })
         }
 
         IRExpr::Card { expr: inner, .. } => encode_pure_card(

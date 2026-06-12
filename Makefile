@@ -34,8 +34,13 @@ MUTANTS_IDE_TIMEOUT_SECS ?= 1200
 MUTANTS_IDE_FOCUSED_TIMEOUT_SECS ?= 300
 MUTANTS_IDE_PER_TEST_TIMEOUT_SECS ?= 75
 MUTANTS_IDE_BUILD_TIMEOUT_SECS ?= 600
-MUTANTS_ENV := env CARGO_BUILD_JOBS=$(MUTANTS_CARGO_BUILD_JOBS) CMAKE_BUILD_PARALLEL_LEVEL=$(MUTANTS_CMAKE_BUILD_PARALLEL_LEVEL)
+MUTANTS_VERIFY_EXPR_SHARD_TOTAL := 4
+MUTANTS_VERIFY_EXPR_TIMEOUT_SECS ?= 1800
+MUTANTS_VERIFY_EXPR_PER_TEST_TIMEOUT_SECS ?= 75
+MUTANTS_VERIFY_EXPR_BUILD_TIMEOUT_SECS ?= 900
+MUTANTS_ENV := env RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=$(MUTANTS_CARGO_BUILD_JOBS) CMAKE_BUILD_PARALLEL_LEVEL=$(MUTANTS_CMAKE_BUILD_PARALLEL_LEVEL)
 MUTANTS_COMMON_ARGS := --profile $(MUTANTS_PROFILE) --jobs $(MUTANTS_JOBS) --timeout $(MUTANTS_PER_TEST_TIMEOUT_SECS) --build-timeout $(MUTANTS_BUILD_TIMEOUT_SECS)
+MUTANTS_VERIFY_EXPR_COMMON_ARGS := --profile $(MUTANTS_PROFILE) --timeout $(MUTANTS_VERIFY_EXPR_PER_TEST_TIMEOUT_SECS) --build-timeout $(MUTANTS_VERIFY_EXPR_BUILD_TIMEOUT_SECS) --in-place --baseline skip
 MUTANTS_CLI_COMMON_ARGS := --profile $(MUTANTS_PROFILE) --timeout $(MUTANTS_CLI_PER_TEST_TIMEOUT_SECS) --build-timeout $(MUTANTS_CLI_BUILD_TIMEOUT_SECS) --in-place --baseline skip
 MUTANTS_QA_COMMON_ARGS := --profile $(MUTANTS_PROFILE) --timeout $(MUTANTS_QA_PER_TEST_TIMEOUT_SECS) --build-timeout $(MUTANTS_QA_BUILD_TIMEOUT_SECS) --in-place --baseline skip
 MUTANTS_LSP_COMMON_ARGS := --profile $(MUTANTS_PROFILE) --timeout $(MUTANTS_LSP_PER_TEST_TIMEOUT_SECS) --build-timeout $(MUTANTS_LSP_BUILD_TIMEOUT_SECS) --in-place --baseline skip
@@ -49,6 +54,15 @@ LSP_RE := verification_options|server_capabilities|verify_config_for_editor_poli
 LSP_SEMANTIC_RE := quickfix_actions_requested|code_actions_for_document|missing_load_code_action|close_qa_abide_block_code_action|removed_field_keyword_code_action|quickfix_action|single_file_edit|diagnostic_code|range_to_offsets|symbol_at_document_position|occurrence_resolves_to_symbol|reference_locations_for_symbol|rename_changes_for_symbol|resolve_occurrence_symbol|symbol_declared_at|best_symbol_match|same_symbol_identity|completion_symbols_for_context|embedded_qa_abide_completion_items|qualifier_before_dot|qualifier_before_scope|qualifier_before_trigger|qa_completion_items_for_document|qa_model_reference_completion_kind|qa_model_reference_completion_items|qa_load_path_completion_items|qa_load_path_prefix|loaded_qa_flow_model|loaded_qa_workspace_index|qa_load_paths|qa_load_path_from_line
 LSP_PROJECT_RE := for_path|is_project_source|discover|empty|root|files|register_file|discover_dir|normalize_under_root|normalize_path_lexical|should_skip_project_dir|from_project|file_id|file_kind|file_kind_for_id|path|source_text|upsert_open_document|set_file_source|parse|lower|diagnostics|workspace_index|identifier_at|file_revision|file_state_mut|invalidate_file|invalidate_qa_diagnostics|qa_diagnostics|canonicalize|read_to_string|should_accept_document_version|document_version|uri_published_elsewhere|initialize|did_open|did_change|did_save|did_close|upsert_document|refresh_diagnostics|collect_diagnostics_for_root|collect_qa_diagnostics_for_root|collect_lsp_diagnostic|snapshot_source_for_path
 IDE_WORKSPACE_INDEX_RE := symbols_named|completion_symbols|symbols_in_module|module_exports|members_by_owner|enum_variants_by_type|visible_symbols|references_named|completion_context|classify_abide_cursor|classify_qa_cursor|current_line_prefix|clamp_to_char_boundary|starts_with_keyword|is_word_boundary|pending_contract_context|block_frames|block_depth|block_frame_from_header|declaration_block_kind|last_callable_decl_keyword|words|build_workspace_index|is_abide_source_path|identifier_at|dedup_symbols|dedup_occurrences|dedup_symbol_clones|name_occurrences_from_tokens|collect_program_symbols|module_name|collect_program_imports_and_includes|collect_use_decl|collect_program|collect_top_decl|collect_type_decl|collect_entity_decl|collect_interface_decl|collect_system_decl|collect_proc_decl|collect_proc_nodes|collect_program_decl|collect_proc_decl_with_owner|find_name_span|symbol_detail
+VERIFIER_EXPR_PROPERTY_QUANTIFIER_RE := property_quantifier_parts|encode_prop_quantifier_expr|encode_entity_quantifier_expr|encode_finite_enum_quantifier_expr|combine_finite_quantifier_predicates|encode_native_quantifier_expr|narrow_entity_quantifier_slots|extract_store_scoped_quantifier_body
+VERIFIER_EXPR_PROPERTY_CONSTRUCTOR_RE := encode_prop_constructor_field_or_call_value|encode_prop_payload_field_value|encode_static_payload_field_value|payload_accessor_for_field|ctor_name_matches_for_payload_accessor|encode_prop_field_value|encode_prop_ctor_value|encode_prop_adt_ctor_value
+VERIFIER_EXPR_SLOT_RE := try_encode_slot_expr|try_encode_slot_literal_expr|try_encode_slot_var_or_field_expr|try_encode_slot_field_expr|try_encode_slot_constructor_expr|try_encode_slot_constructor|try_encode_slot_choose_expr|try_encode_slot_operator_expr|try_encode_slot_binop_expr|try_encode_slot_unop_expr|try_encode_slot_app_expr|try_encode_slot_app|try_encode_slot_collection_expr|try_encode_slot_map_update_expr|try_encode_slot_index_expr|try_encode_slot_map_lit_expr|try_encode_slot_set_lit_expr|try_encode_slot_seq_lit_expr|try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier
+VERIFIER_EXPR_SLOT_SHARD_1_RE := try_encode_slot_expr|try_encode_slot_literal_expr|try_encode_slot_var_or_field_expr|try_encode_slot_field_expr
+VERIFIER_EXPR_SLOT_SHARD_2_RE := try_encode_slot_constructor_expr|try_encode_slot_constructor|try_encode_slot_choose_expr|try_encode_slot_operator_expr|try_encode_slot_binop_expr|try_encode_slot_unop_expr
+VERIFIER_EXPR_SLOT_SHARD_3_RE := try_encode_slot_app_expr|try_encode_slot_app|try_encode_slot_collection_expr|try_encode_slot_map_update_expr|try_encode_slot_index_expr|try_encode_slot_map_lit_expr|try_encode_slot_set_lit_expr|try_encode_slot_seq_lit_expr
+VERIFIER_EXPR_SLOT_SHARD_4_RE := try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier
+VERIFIER_EXPR_COLLECTION_RE := encode_set_literal|encode_seq_literal|encode_map_literal|encode_collection_index|encode_collection_update|finite_literal_cardinality|encode_unique_projected_cardinality|int_sum_or_zero|unique_expr_count
+VERIFIER_EXPR_POOLED_SUPPORT_RE := diagnose_pooled_sygus_expr_support|diagnose_pooled_sygus_expr_support_inner|unsupported_expr|is_pooled_sygus_finite_scalar_domain|ensure_pooled_sygus_expr_supported|ensure_pooled_sygus_action_supported|ensure_pooled_sygus_actions_supported|ensure_pooled_sygus_system_supported
 CLI_PROJECT_SHARDS := 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
 QA_SHARDS := 1 2 3 4 5 6 7 8
 LSP_SHARDS := 1 2 3 4 5 6 7 8
@@ -62,14 +76,18 @@ LSP_SHARD_TARGETS := $(addprefix check-lang-mutants-lsp-shard-,$(LSP_SHARDS))
 LSP_SEMANTIC_SHARD_TARGETS := $(addprefix check-lang-mutants-lsp-semantic-shard-,$(LSP_SHARDS))
 LSP_PROJECT_SHARD_TARGETS := $(addprefix check-lang-mutants-lsp-project-shard-,$(LSP_SHARDS))
 IDE_SHARDS := 1 2 3 4 5 6 7 8
+VERIFIER_EXPR_SLOT_SHARDS := 1 2 3 4
 IDE_WORKSPACE_INDEX_SHARD_TARGETS := $(addprefix check-lang-mutants-ide-workspace-index-shard-,$(IDE_SHARDS))
+VERIFIER_EXPR_SLOT_SHARD_TARGETS := $(addprefix check-lang-mutants-verifier-expr-slot-shard-,$(VERIFIER_EXPR_SLOT_SHARDS))
 
 .PHONY: check-lang-mutants-lsp check-lang-mutants-lsp-baseline check-lang-mutants-lsp-semantic check-lang-mutants-lsp-project $(CLI_PROJECT_TARGET_SHARD_TARGETS) $(CLI_PROJECT_HELPER_SHARD_TARGETS) $(QA_PARSE_SHARD_TARGETS) $(QA_EXEC_SHARD_TARGETS) $(QA_RUNNER_SHARD_TARGETS) $(QA_EXTRACT_SHARD_TARGETS) $(LSP_SHARD_TARGETS) $(LSP_SEMANTIC_SHARD_TARGETS) $(LSP_PROJECT_SHARD_TARGETS) $(IDE_WORKSPACE_INDEX_SHARD_TARGETS) check-lang-mutants-ide-workspace-index-focused check-lang-mutants-ide-workspace-index-boundary check-lang-mutants-ide-workspace-index-block-frames check-lang-mutants-ide-workspace-index-find-name-span
+.PHONY: check-lang-mutants-verifier-expr check-lang-mutants-verifier-expr-property-quantifier check-lang-mutants-verifier-expr-property-constructor check-lang-mutants-verifier-expr-slot $(VERIFIER_EXPR_SLOT_SHARD_TARGETS) check-lang-mutants-verifier-expr-collections check-lang-mutants-verifier-expr-pooled-support
 .PHONY: check-lang-mutants-core check-lang-mutants-core-baseline check-lang-mutants-core-diagnostics check-lang-mutants-core-support
 .PHONY: check-lang-mutants-witness check-lang-mutants-witness-baseline check-lang-mutants-witness-operational check-lang-mutants-witness-relational-values check-lang-mutants-witness-envelopes
 
 .NOTPARALLEL: check-lang-mutants-core
 .NOTPARALLEL: check-lang-mutants-witness
+.NOTPARALLEL: check-lang-mutants-verifier-expr check-lang-mutants-verifier-expr-slot
 
 help:
 	@printf "Available targets:\n"
@@ -108,6 +126,7 @@ help:
 	@printf "  make check-lang-mutants-smt-facade       Run SMT facade mutation lane\n"
 	@printf "  make check-lang-mutants-solver-routing   Run solver routing mutation lane\n"
 	@printf "  make check-lang-mutants-runtime-backend  Run runtime backend mutation lane\n"
+	@printf "  make check-lang-mutants-verifier-expr    Run verifier expression helper mutation lanes\n"
 	@printf "  make check-lang-mutants-verify           Run all verifier mutation lanes\n"
 	@printf "  Mutation lanes default to MUTANTS_JOBS=1, MUTANTS_CARGO_BUILD_JOBS=1, MUTANTS_TEST_THREADS=1, and profile=mutants\n"
 	@printf "  Heavy mutation lanes are split into sequential shards with isolated output directories\n"
@@ -491,6 +510,34 @@ check-lang-mutants-ide-workspace-index-block-frames:
 check-lang-mutants-ide-workspace-index-find-name-span:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_IDE_FOCUSED_TIMEOUT_SECS) --label "abide IDE name-span helper mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_IDE_COMMON_ARGS) -p abide --file crates/abide/src/ide.rs --re 'find_name_span' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.ide-workspace-index.find-name-span -- --lib name_span_and_symbol_detail_are_scoped_to_decl_span $(MUTANTS_LIBTEST_ARGS)
 
+check-lang-mutants-verifier-expr: check-lang-mutants-verifier-expr-property-quantifier check-lang-mutants-verifier-expr-property-constructor check-lang-mutants-verifier-expr-slot check-lang-mutants-verifier-expr-collections check-lang-mutants-verifier-expr-pooled-support
+
+check-lang-mutants-verifier-expr-property-quantifier:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier property quantifier helper mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/property.rs --re '$(VERIFIER_EXPR_PROPERTY_QUANTIFIER_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.property-quantifier -- --lib encode_prop_quantifier $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-property-constructor:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier property constructor/field/call helper mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/property.rs --re '$(VERIFIER_EXPR_PROPERTY_CONSTRUCTOR_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.property-constructor -- --lib encode_prop_constructor_field_or_call_helper_covers_dispatch_family $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-slot: $(VERIFIER_EXPR_SLOT_SHARD_TARGETS)
+
+check-lang-mutants-verifier-expr-slot-shard-1:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier slot expression helper mutants shard 1/$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL)" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '$(VERIFIER_EXPR_SLOT_SHARD_1_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.slot.1-of-$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL) -- --lib slot_expr $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-slot-shard-2:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier slot expression helper mutants shard 2/$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL)" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '$(VERIFIER_EXPR_SLOT_SHARD_2_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.slot.2-of-$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL) -- --lib slot_expr $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-slot-shard-3:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier slot expression helper mutants shard 3/$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL)" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '$(VERIFIER_EXPR_SLOT_SHARD_3_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.slot.3-of-$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL) -- --lib slot_expr $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-slot-shard-4:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier slot expression helper mutants shard 4/$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL)" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/harness/expr.rs --re '$(VERIFIER_EXPR_SLOT_SHARD_4_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.slot.4-of-$(MUTANTS_VERIFY_EXPR_SHARD_TOTAL) -- --lib slot_expr $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-collections:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier finite collection helper mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/collections.rs --re '$(VERIFIER_EXPR_COLLECTION_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.collections -- --lib finite_collection_helpers $(MUTANTS_LIBTEST_ARGS)
+
+check-lang-mutants-verifier-expr-pooled-support:
+	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_VERIFY_EXPR_TIMEOUT_SECS) --label "abide verifier pooled SyGuS support diagnostic mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_VERIFY_EXPR_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/sygus/pooled.rs --re '$(VERIFIER_EXPR_POOLED_SUPPORT_RE)' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.verifier-expr.pooled-support -- --lib pooled_sygus $(MUTANTS_LIBTEST_ARGS)
+
 check-lang-mutants-fn-vc:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_TIMEOUT_SECS) --label "abide-verify function VC mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/fn_verify.rs --output $(MUTANTS_OUTPUT_DIR)/mutants.out.fn-vc -- --lib fn_contract $(MUTANTS_LIBTEST_ARGS)
 
@@ -503,7 +550,7 @@ check-lang-mutants-solver-routing:
 check-lang-mutants-runtime-backend:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(MUTANTS_TIMEOUT_SECS) --label "abide-verify runtime backend mutants" -- $(MUTANTS_ENV) $(CARGO_MUTANTS) $(MUTANTS_COMMON_ARGS) -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'RuntimeBackend|RuntimeModel|RuntimeDynamic|RuntimeBool|RuntimeInt|RuntimeReal|RuntimeArray|RuntimeModelEval' --output $(MUTANTS_OUTPUT_DIR)/mutants.out.runtime-backend -- --lib solver $(MUTANTS_LIBTEST_ARGS)
 
-check-lang-mutants-verify: check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend
+check-lang-mutants-verify: check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend check-lang-mutants-verifier-expr
 
 coverage:
 	$(RUN_WITH_TIMEOUT) --timeout-secs $(CARGO_TIMEOUT_SECS) --label "abide coverage" -- $(LLVM_COV) -p abide --lib --tests

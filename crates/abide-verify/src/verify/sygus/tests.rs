@@ -525,6 +525,73 @@ fn sygus_expr_encoder_keeps_non_finite_domains_as_boundary() {
 }
 
 #[test]
+fn pooled_sygus_support_diagnostics_report_feature_reason_and_span() {
+    let span = crate::span::Span { start: 10, end: 22 };
+    let unsupported = IRExpr::Choose {
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        predicate: Some(Box::new(bin_expr(
+            "OpGe",
+            IRExpr::Var {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                span: Some(span),
+            },
+            int_lit(0),
+            IRType::Bool,
+        ))),
+        ty: IRType::Int,
+        span: Some(span),
+    };
+
+    let result = diagnose_pooled_sygus_expr_support(&unsupported);
+    assert!(!result.is_supported(), "{result:?}");
+    let diagnostic = result.diagnostic().expect("unsupported diagnostic");
+    assert_eq!(diagnostic.backend, "cvc5 SyGuS pooled");
+    assert_eq!(diagnostic.feature, "choose");
+    assert_eq!(diagnostic.span, Some(span));
+    assert!(
+        diagnostic.reason.contains("finite Bool/enum domains"),
+        "{diagnostic:?}"
+    );
+}
+
+#[test]
+fn pooled_sygus_preflight_reports_support_diagnostic_before_backend_setup() {
+    let span = crate::span::Span { start: 30, end: 45 };
+    let mut system = make_counter_system();
+    system.entities.push("Counter".to_owned());
+    let entity = make_counter_entity();
+    let unsupported_property = IRExpr::Always {
+        body: Box::new(IRExpr::Choose {
+            var: "n".to_owned(),
+            domain: IRType::Int,
+            predicate: Some(Box::new(bin_expr(
+                "OpGe",
+                IRExpr::Var {
+                    name: "n".to_owned(),
+                    ty: IRType::Int,
+                    span: Some(span),
+                },
+                int_lit(0),
+                IRType::Bool,
+            ))),
+            ty: IRType::Int,
+            span: Some(span),
+        }),
+        span: Some(span),
+    };
+
+    let err =
+        try_cvc5_sygus_pooled_system_safety_inner(&system, &entity, 1, &unsupported_property, 0)
+            .expect_err("unsupported property should fail during support preflight");
+    assert!(err.contains("cvc5 SyGuS pooled"), "{err}");
+    assert!(err.contains("feature `choose`"), "{err}");
+    assert!(err.contains("finite Bool/enum domains"), "{err}");
+    assert!(err.contains("30..45"), "{err}");
+}
+
+#[test]
 fn sygus_expr_encoder_supports_inline_lambda_application() {
     let tm = Cvc5Tm::new();
     let vars = HashMap::new();
