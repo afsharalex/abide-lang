@@ -3,6 +3,7 @@
 *.swo
 
 /target
+.mutants-out/
 mutants.out*/
 **/.z3-trace
 vendor/z3/.github/

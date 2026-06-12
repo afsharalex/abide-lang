@@ -39,9 +39,34 @@ enum BaseEnv {
     Invalid,
 }
 
+#[derive(Default)]
+struct FsSourceProvider;
+
+impl loader::SourceProvider for FsSourceProvider {
+    fn canonicalize(&mut self, path: &Path) -> Result<PathBuf, String> {
+        std::fs::canonicalize(path).map_err(|error| error.to_string())
+    }
+
+    fn read_to_string(&mut self, path: &Path) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|error| error.to_string())
+    }
+}
+
 /// Validate one QA script source as it would be seen from `script_path`.
 #[must_use]
 pub fn validate_qa_source(script_path: &Path, source: &str) -> Vec<Diagnostic> {
+    let mut provider = FsSourceProvider;
+    validate_qa_source_with_provider(script_path, source, &mut provider)
+}
+
+/// Validate one QA script source using a caller-supplied source provider for
+/// loaded specs and their includes.
+#[must_use]
+pub fn validate_qa_source_with_provider<P: loader::SourceProvider>(
+    script_path: &Path,
+    source: &str,
+    provider: &mut P,
+) -> Vec<Diagnostic> {
     let script_file = script_path.display().to_string();
     let statements = match parse_qa(source) {
         Ok(_) => located_statements(source),
@@ -62,17 +87,17 @@ pub fn validate_qa_source(script_path: &Path, source: &str) -> Vec<Diagnostic> {
         };
         let resolved = resolve_load_path(script_dir, path);
         load_spans.push(span);
-        if !resolved.exists() {
+        if resolved.is_dir() {
+            collect_abide_files(&resolved, &mut load_paths);
+        } else if provider.canonicalize(&resolved).is_ok() {
+            load_paths.push(resolved);
+        } else {
             diagnostics.push(
                 Diagnostic::error(format!("QA load target `{path}` does not exist"))
                     .with_code(QA_SEMANTIC_MISSING_LOAD)
                     .with_span(span)
                     .in_file(script_file.clone()),
             );
-        } else if resolved.is_dir() {
-            collect_abide_files(&resolved, &mut load_paths);
-        } else {
-            load_paths.push(resolved);
         }
     }
 
@@ -81,7 +106,7 @@ pub fn validate_qa_source(script_path: &Path, source: &str) -> Vec<Diagnostic> {
     }
 
     let first_load_span = load_spans.first().copied();
-    let model = match build_flow_model_from_paths(&load_paths) {
+    let model = match build_flow_model_from_paths_with_provider(provider, &load_paths) {
         Ok(model) => model,
         Err(messages) => {
             let span = first_load_span.unwrap_or(Span { start: 0, end: 1 });
@@ -108,6 +133,18 @@ pub fn validate_qa_source(script_path: &Path, source: &str) -> Vec<Diagnostic> {
 /// Validate embedded `abide { ... }` blocks as QA overlays against loaded specs.
 #[must_use]
 pub fn validate_embedded_abide_blocks(script_path: &Path, source: &str) -> Vec<Diagnostic> {
+    let mut provider = FsSourceProvider;
+    validate_embedded_abide_blocks_with_provider(script_path, source, &mut provider)
+}
+
+/// Validate embedded `abide { ... }` blocks using a caller-supplied source
+/// provider for loaded base specs and includes.
+#[must_use]
+pub fn validate_embedded_abide_blocks_with_provider<P: loader::SourceProvider>(
+    script_path: &Path,
+    source: &str,
+    provider: &mut P,
+) -> Vec<Diagnostic> {
     let Ok(blocks) = embedded_abide_blocks(source) else {
         return Vec::new();
     };
@@ -116,7 +153,7 @@ pub fn validate_embedded_abide_blocks(script_path: &Path, source: &str) -> Vec<D
     }
 
     let script_file = script_path.display().to_string();
-    let base_env = base_env_for_qa_source(script_path, source);
+    let base_env = base_env_for_qa_source_with_provider(script_path, source, provider);
     if matches!(base_env, BaseEnv::Invalid) {
         return Vec::new();
     }
@@ -127,7 +164,17 @@ pub fn validate_embedded_abide_blocks(script_path: &Path, source: &str) -> Vec<D
         .collect()
 }
 
+#[cfg(test)]
 fn base_env_for_qa_source(script_path: &Path, source: &str) -> BaseEnv {
+    let mut provider = FsSourceProvider;
+    base_env_for_qa_source_with_provider(script_path, source, &mut provider)
+}
+
+fn base_env_for_qa_source_with_provider<P: loader::SourceProvider>(
+    script_path: &Path,
+    source: &str,
+    provider: &mut P,
+) -> BaseEnv {
     let Ok(_) = parse_qa(source) else {
         return BaseEnv::Invalid;
     };
@@ -139,13 +186,12 @@ fn base_env_for_qa_source(script_path: &Path, source: &str) -> BaseEnv {
             continue;
         };
         let resolved = resolve_load_path(script_dir, &path);
-        if !resolved.exists() {
-            return BaseEnv::Invalid;
-        }
         if resolved.is_dir() {
             collect_abide_files(&resolved, &mut load_paths);
-        } else {
+        } else if provider.canonicalize(&resolved).is_ok() {
             load_paths.push(resolved);
+        } else {
+            return BaseEnv::Invalid;
         }
     }
 
@@ -153,7 +199,7 @@ fn base_env_for_qa_source(script_path: &Path, source: &str) -> BaseEnv {
         return BaseEnv::NoLoads;
     }
 
-    match build_base_env_from_paths(&load_paths) {
+    match build_base_env_from_paths(provider, &load_paths) {
         Ok(env) => BaseEnv::Loaded(Box::new(env)),
         Err(()) => BaseEnv::Invalid,
     }
@@ -214,8 +260,11 @@ fn validate_embedded_abide_block(
     diagnostics
 }
 
-fn build_base_env_from_paths(paths: &[PathBuf]) -> Result<elab::env::Env, ()> {
-    let (mut env, load_errors, _all_paths) = loader::load_files(paths);
+fn build_base_env_from_paths<P: loader::SourceProvider>(
+    provider: &mut P,
+    paths: &[PathBuf],
+) -> Result<elab::env::Env, ()> {
+    let (mut env, load_errors, _all_paths) = loader::load_files_with_provider(provider, paths);
     if !load_errors.is_empty() || !env.include_load_errors.is_empty() {
         return Err(());
     }
@@ -396,8 +445,17 @@ fn collect_abide_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(test)]
 fn build_flow_model_from_paths(paths: &[PathBuf]) -> Result<FlowModel, Vec<String>> {
-    let (mut env, load_errors, _all_paths) = loader::load_files(paths);
+    let mut provider = FsSourceProvider;
+    build_flow_model_from_paths_with_provider(&mut provider, paths)
+}
+
+fn build_flow_model_from_paths_with_provider<P: loader::SourceProvider>(
+    provider: &mut P,
+    paths: &[PathBuf],
+) -> Result<FlowModel, Vec<String>> {
+    let (mut env, load_errors, _all_paths) = loader::load_files_with_provider(provider, paths);
     if !load_errors.is_empty() {
         return Err(load_errors
             .iter()

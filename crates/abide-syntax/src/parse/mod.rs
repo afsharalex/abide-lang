@@ -364,16 +364,16 @@ impl Parser {
             if self.at_end() {
                 break;
             }
-            if consumed_any {
-                if should_stop(
+            if consumed_any
+                && should_stop(
                     self.peek().expect("not at end"),
                     self.peek_at(1),
                     brace_depth,
                     paren_depth,
                     bracket_depth,
-                ) {
-                    break;
-                }
+                )
+            {
+                break;
             }
             let (tok, span) = self.advance();
             consumed_any = true;

@@ -48,7 +48,9 @@ name = "abide-lsp"
 version = "0.1.0"
 dependencies = [
  "abide",
+ "miette",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower-lsp",
 ]
