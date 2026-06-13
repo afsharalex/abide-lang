@@ -531,7 +531,7 @@ mod tests {
             countermodel.summary_text(),
             Some("model satisfies negated goal")
         );
-        assert_eq!(countermodel.bindings(), &[binding.clone()]);
+        assert_eq!(countermodel.bindings(), std::slice::from_ref(&binding));
         assert_eq!(countermodel.validate(), Ok(()));
         assert_eq!(binding.name(), "n");
         assert_eq!(binding.value(), &WitnessValue::Int(42));

@@ -1515,8 +1515,10 @@ mod tests {
         ir.functions.push(named_fn("other", 20));
         ir.verifies
             .push(verify_block("safety", vec![bool_lit(true, 40)], 40));
-        let mut config = VerifyConfig::default();
-        config.target = Some("fn:selected".parse().expect("target"));
+        let config = VerifyConfig {
+            target: Some("fn:selected".parse().expect("target")),
+            ..VerifyConfig::default()
+        };
 
         let obligations = collect_verification_obligations(&ir, &config);
         let ids: Vec<_> = obligations.iter().map(|id| id.id.as_str()).collect();
@@ -1548,8 +1550,10 @@ mod tests {
             .collect();
         assert_eq!(default_ids, vec!["verify:uses_prop"]);
 
-        let mut targeted = VerifyConfig::default();
-        targeted.target = Some("prop:visible".parse().expect("target"));
+        let targeted = VerifyConfig {
+            target: Some("prop:visible".parse().expect("target")),
+            ..VerifyConfig::default()
+        };
         let targeted_obligations = collect_verification_obligations(&ir, &targeted);
         let targeted_ids: Vec<_> = targeted_obligations
             .iter()

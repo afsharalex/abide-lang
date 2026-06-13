@@ -18951,7 +18951,7 @@ fn verify_all_with_events_streams_blocking_preflight_failure_before_stopping() {
     assert!(events.iter().any(|event| matches!(
         event,
         VerificationStreamEvent::ResultReady { result }
-            if matches!(result, VerificationResult::FnContractFailed { name, .. } if name == "bad")
+            if matches!(&**result, VerificationResult::FnContractFailed { name, .. } if name == "bad")
     )));
     assert!(matches!(
         events.last(),

@@ -3462,13 +3462,15 @@ fn encode_prop_sourced_set_comp_value(
     {
         return encode_prop_store_sourced_entity_set_comp_value(
             enc,
-            var,
-            &entity_name,
-            start_slot,
-            slot_count,
-            filter,
-            projection,
-            ty,
+            StoreSourcedSetComp {
+                var,
+                entity_name: &entity_name,
+                start_slot,
+                slot_count,
+                filter,
+                projection,
+                ty,
+            },
         );
     }
 
@@ -3546,30 +3548,41 @@ fn store_source_range(
     ))
 }
 
-fn encode_prop_store_sourced_entity_set_comp_value(
-    enc: PropertyEncodingCtx<'_>,
-    var: &str,
-    entity_name: &str,
+struct StoreSourcedSetComp<'a> {
+    var: &'a str,
+    entity_name: &'a str,
     start_slot: usize,
     slot_count: usize,
-    filter: &IRExpr,
-    projection: Option<&IRExpr>,
-    ty: &IRType,
+    filter: &'a IRExpr,
+    projection: Option<&'a IRExpr>,
+    ty: &'a IRType,
+}
+
+fn encode_prop_store_sourced_entity_set_comp_value(
+    enc: PropertyEncodingCtx<'_>,
+    comp: StoreSourcedSetComp<'_>,
 ) -> Result<SmtValue, String> {
-    let result_elem_sort = entity_set_comp_sort(enc.vctx, projection, ty)?;
+    let result_elem_sort = entity_set_comp_sort(enc.vctx, comp.projection, comp.ty)?;
     let false_val = smt::bool_val(false).to_dynamic();
     let true_val = smt::bool_val(true).to_dynamic();
     let mut arr = smt::const_array(&result_elem_sort, &false_val);
-    for slot in start_slot..start_slot.saturating_add(slot_count) {
-        let Some(SmtValue::Bool(active)) = enc.pool.active_at(entity_name, slot, enc.step) else {
+    for slot in comp.start_slot..comp.start_slot.saturating_add(comp.slot_count) {
+        let Some(SmtValue::Bool(active)) = enc.pool.active_at(comp.entity_name, slot, enc.step)
+        else {
             continue;
         };
-        let inner_ctx = enc.property.with_binding(var, entity_name, slot);
-        let filter_val =
-            encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        let inner_ctx = enc.property.with_binding(comp.var, comp.entity_name, slot);
+        let filter_val = encode_prop_expr(
+            enc.pool,
+            enc.vctx,
+            enc.defs,
+            &inner_ctx,
+            comp.filter,
+            enc.step,
+        )?;
         let fallback = smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic();
         let (key, constraints) =
-            encode_set_comp_key(enc.with_property(&inner_ctx), projection, fallback)?;
+            encode_set_comp_key(enc.with_property(&inner_ctx), comp.projection, fallback)?;
         let mut cond_parts = vec![active.clone(), filter_val];
         cond_parts.extend(constraints);
         let cond = bool_and_values(&cond_parts);

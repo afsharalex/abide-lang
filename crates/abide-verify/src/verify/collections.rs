@@ -178,7 +178,7 @@ mod tests {
     fn assert_bool_value(value: SmtValue, expected: bool) {
         let actual = value.to_bool().expect("boolean value");
         let solver = AbideSolver::new();
-        solver.assert(&smt::bool_not(
+        solver.assert(smt::bool_not(
             &smt::smt_eq(&SmtValue::Bool(actual), &smt::bool_val(expected)).expect("bool equality"),
         ));
         assert_eq!(solver.check(), SatResult::Unsat);
@@ -186,7 +186,7 @@ mod tests {
 
     fn assert_value_eq(actual: &SmtValue, expected: &SmtValue) {
         let solver = AbideSolver::new();
-        solver.assert(&smt::bool_not(
+        solver.assert(smt::bool_not(
             &smt::smt_eq(actual, expected).expect("value equality"),
         ));
         assert_eq!(solver.check(), SatResult::Unsat);

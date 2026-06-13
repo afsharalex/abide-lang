@@ -1387,7 +1387,7 @@ pub enum VerificationStreamEvent {
         name: String,
     },
     ResultReady {
-        result: VerificationResult,
+        result: Box<VerificationResult>,
     },
     TargetSkipped {
         kind: VerifyTargetKind,
@@ -2159,7 +2159,7 @@ fn emit_stream_result(
     result: &VerificationResult,
 ) {
     event_sink(&VerificationStreamEvent::ResultReady {
-        result: result.clone(),
+        result: Box::new(result.clone()),
     });
 }
 

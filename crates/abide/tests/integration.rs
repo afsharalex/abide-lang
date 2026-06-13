@@ -22,7 +22,7 @@
     clippy::used_underscore_binding
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use abide::elab;
 use abide::ir;
@@ -861,7 +861,7 @@ verify safety {
     assert_eq!(
         plan.deterministic_result_order
             .iter()
-            .map(|id| id.as_str())
+            .map(abide::verify::VerificationObligationId::as_str)
             .collect::<Vec<_>>(),
         flattened_lane_ids
     );
@@ -1051,7 +1051,7 @@ fn zero(): int
     assert!(events.iter().any(|event| matches!(
         event,
         VerificationStreamEvent::ResultReady { result }
-            if matches!(result, VerificationResult::FnContractProved { name, .. } if name == "zero")
+            if matches!(&**result, VerificationResult::FnContractProved { name, .. } if name == "zero")
     )));
     assert!(matches!(
         events.last(),
@@ -1129,6 +1129,96 @@ fn validation_gates_split_cargo_mutants_verify_lanes() {
         .and_then(|path| path.parent())
         .expect("abide crate should live under workspace/crates/abide");
 
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert_mutation_lane_defaults(file_name, &contents);
+        assert_mutation_shard_indexing(file_name, &contents);
+        assert_syntax_mutation_lanes(file_name, &contents);
+        assert_core_mutation_lanes(file_name, &contents);
+        assert_solver_mutation_lanes_are_split(file_name, &contents);
+    }
+
+    assert_workspace_mutants_config(workspace_dir);
+}
+
+fn assert_mutation_lane_defaults(file_name: &str, contents: &str) {
+    assert!(
+        contents.contains("cargo mutants"),
+        "{file_name} must expose cargo-mutants validation gates"
+    );
+    assert!(
+        contents.contains("900"),
+        "{file_name} must default mutation lanes to a 15-minute timeout"
+    );
+    assert!(
+        contents.contains("mutants"),
+        "{file_name} must use the cargo mutants profile"
+    );
+    assert!(
+        contents.contains("--jobs") && contents.contains('1'),
+        "{file_name} must default cargo-mutants to one concurrent mutation job"
+    );
+    assert!(
+        contents.contains("--timeout") && contents.contains("60"),
+        "{file_name} must set an explicit one-minute per-mutant test timeout"
+    );
+    assert!(
+        contents.contains("--build-timeout") && contents.contains("180"),
+        "{file_name} must set an explicit mutant build timeout"
+    );
+    assert!(
+        contents.contains("CARGO_BUILD_JOBS") && contents.contains("--test-threads"),
+        "{file_name} must constrain cargo build jobs and libtest threads"
+    );
+}
+
+fn assert_mutation_shard_indexing(file_name: &str, contents: &str) {
+    assert!(
+        contents.contains("--shard")
+            && ((contents.contains("1-of-") && contents.contains("4-of-"))
+                || contents.contains("{{shard}}-of-")),
+        "{file_name} must split heavy mutation lanes into isolated sequential shards"
+    );
+    if file_name == "Makefile" {
+        assert!(
+            contents.contains("--shard 0/$(MUTANTS_SHARD_TOTAL)")
+                && contents.contains("--shard 3/$(MUTANTS_SHARD_TOTAL)")
+                && !contents.contains("--shard 4/$(MUTANTS_SHARD_TOTAL)"),
+            "{file_name} must pass zero-based shard indexes to cargo-mutants"
+        );
+    } else {
+        assert!(
+            contents.contains("$(({{shard}} - 1))/{{mutants_shard_total}}"),
+            "{file_name} must map human-facing shard numbers to zero-based cargo-mutants shard indexes"
+        );
+    }
+}
+
+fn assert_syntax_mutation_lanes(file_name: &str, contents: &str) {
+    assert!(
+        contents.contains("check-lang-mutants-syntax-parser"),
+        "{file_name} must expose an aggregate syntax parser cargo-mutants lane"
+    );
+    if file_name == "Makefile" {
+        assert!(
+            contents.contains("check-lang-mutants-syntax-expr-shard-1")
+                && contents.contains("check-lang-mutants-syntax-expr-shard-4")
+                && contents.contains("mutants.out.syntax-expr.1-of-")
+                && contents.contains("mutants.out.syntax-expr.4-of-"),
+            "{file_name} must split the expression parser mutation lane into isolated shards"
+        );
+    } else {
+        assert!(
+            contents.contains("check-lang-mutants-syntax-expr-shard")
+                && contents.contains("mutants.out.syntax-expr.{{shard}}-of-"),
+            "{file_name} must split the expression parser mutation lane into isolated shards"
+        );
+    }
+}
+
+fn assert_core_mutation_lanes(file_name: &str, contents: &str) {
     let required_lanes = [
         (
             "check-lang-mutants-fn-vc",
@@ -1172,97 +1262,31 @@ fn validation_gates_split_cargo_mutants_verify_lanes() {
         ),
     ];
 
-    for file_name in ["Makefile", "justfile"] {
-        let path = workspace_dir.join(file_name);
-        let contents =
-            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+    for (target, file_filter, output_dir) in required_lanes {
         assert!(
-            contents.contains("cargo mutants"),
-            "{file_name} must expose cargo-mutants validation gates"
+            contents.contains(target),
+            "{file_name} must expose the {target} cargo-mutants lane"
         );
         assert!(
-            contents.contains("900"),
-            "{file_name} must default mutation lanes to a 15-minute timeout"
+            contents.contains(file_filter),
+            "{file_name} {target} must restrict mutants to {file_filter}"
         );
         assert!(
-            contents.contains("mutants"),
-            "{file_name} must use the cargo mutants profile"
-        );
-        assert!(
-            contents.contains("--jobs") && contents.contains("1"),
-            "{file_name} must default cargo-mutants to one concurrent mutation job"
-        );
-        assert!(
-            contents.contains("--timeout") && contents.contains("60"),
-            "{file_name} must set an explicit one-minute per-mutant test timeout"
-        );
-        assert!(
-            contents.contains("--build-timeout") && contents.contains("180"),
-            "{file_name} must set an explicit mutant build timeout"
-        );
-        assert!(
-            contents.contains("CARGO_BUILD_JOBS") && contents.contains("--test-threads"),
-            "{file_name} must constrain cargo build jobs and libtest threads"
-        );
-        assert!(
-            contents.contains("--shard")
-                && ((contents.contains("1-of-") && contents.contains("4-of-"))
-                    || contents.contains("{{shard}}-of-")),
-            "{file_name} must split heavy mutation lanes into isolated sequential shards"
-        );
-        if file_name == "Makefile" {
-            assert!(
-                contents.contains("--shard 0/$(MUTANTS_SHARD_TOTAL)")
-                    && contents.contains("--shard 3/$(MUTANTS_SHARD_TOTAL)")
-                    && !contents.contains("--shard 4/$(MUTANTS_SHARD_TOTAL)"),
-                "{file_name} must pass zero-based shard indexes to cargo-mutants"
-            );
-        } else {
-            assert!(
-                contents.contains("$(({{shard}} - 1))/{{mutants_shard_total}}"),
-                "{file_name} must map human-facing shard numbers to zero-based cargo-mutants shard indexes"
-            );
-        }
-        assert!(
-            contents.contains("check-lang-mutants-syntax-parser"),
-            "{file_name} must expose an aggregate syntax parser cargo-mutants lane"
-        );
-        if file_name == "Makefile" {
-            assert!(
-                contents.contains("check-lang-mutants-syntax-expr-shard-1")
-                    && contents.contains("check-lang-mutants-syntax-expr-shard-4")
-                    && contents.contains("mutants.out.syntax-expr.1-of-")
-                    && contents.contains("mutants.out.syntax-expr.4-of-"),
-                "{file_name} must split the expression parser mutation lane into isolated shards"
-            );
-        } else {
-            assert!(
-                contents.contains("check-lang-mutants-syntax-expr-shard")
-                    && contents.contains("mutants.out.syntax-expr.{{shard}}-of-"),
-                "{file_name} must split the expression parser mutation lane into isolated shards"
-            );
-        }
-        for (target, file_filter, output_dir) in required_lanes {
-            assert!(
-                contents.contains(target),
-                "{file_name} must expose the {target} cargo-mutants lane"
-            );
-            assert!(
-                contents.contains(file_filter),
-                "{file_name} {target} must restrict mutants to {file_filter}"
-            );
-            assert!(
-                contents.contains(output_dir),
-                "{file_name} {target} must write an isolated report directory"
-            );
-        }
-        assert!(
-            contents.contains("SolverCapabilities|backend_score")
-                && contents.contains("RuntimeBackend|RuntimeModel"),
-            "{file_name} must separate solver routing mutants from runtime backend mutants"
+            contents.contains(output_dir),
+            "{file_name} {target} must write an isolated report directory"
         );
     }
+}
 
+fn assert_solver_mutation_lanes_are_split(file_name: &str, contents: &str) {
+    assert!(
+        contents.contains("SolverCapabilities|backend_score")
+            && contents.contains("RuntimeBackend|RuntimeModel"),
+        "{file_name} must separate solver routing mutants from runtime backend mutants"
+    );
+}
+
+fn assert_workspace_mutants_config(workspace_dir: &Path) {
     let cargo_toml = std::fs::read_to_string(workspace_dir.join("Cargo.toml"))
         .expect("workspace Cargo.toml should be readable");
     assert!(
@@ -9490,8 +9514,8 @@ const bad = { k | (k, _, _) in Map(1, 10, 2, 20) where true }
     assert!(
         errors.iter().any(|error| {
             error.message.contains("tuple binder")
-                && error.message.contains("3")
-                && error.message.contains("2")
+                && error.message.contains('3')
+                && error.message.contains('2')
         }),
         "wrong-arity map-source tuple binder should be rejected, got: {errors:?}"
     );
@@ -12717,7 +12741,7 @@ extern StripeGateway implements PaymentProcessor {
 
 #[test]
 fn interface_extern_enum_command_return_conformance_succeeds() {
-    let src = r#"module T
+    let src = r"module T
 
 enum PaymentDecision = Approved | Declined
 
@@ -12733,7 +12757,7 @@ extern StripeGateway implements PaymentProcessor {
     return @Declined
   }
 }
-"#;
+";
     let result = elaborate_source(src);
     assert_eq!(result.externs.len(), 1);
     assert_eq!(
@@ -12744,7 +12768,7 @@ extern StripeGateway implements PaymentProcessor {
 
 #[test]
 fn interface_extern_missing_required_command_is_rejected() {
-    let src = r#"module T
+    let src = "module T
 
 interface PaymentProcessor {
   command authorize(amount: int) -> string
@@ -12754,10 +12778,10 @@ extern StripeGateway implements PaymentProcessor {
   command capture(amount: int) -> string
 
   may capture {
-    return "ok"
+    return \"ok\"
   }
 }
-"#;
+";
     let (_, errors) = elab_with_errors(src);
     assert!(
         errors.iter().any(|e| e.message.contains(
@@ -12769,7 +12793,7 @@ extern StripeGateway implements PaymentProcessor {
 
 #[test]
 fn interface_extern_command_return_mismatch_is_rejected() {
-    let src = r#"module T
+    let src = r"module T
 
 interface PaymentProcessor {
   command authorize(amount: int) -> string
@@ -12782,7 +12806,7 @@ extern StripeGateway implements PaymentProcessor {
     return 1
   }
 }
-"#;
+";
     let (_, errors) = elab_with_errors(src);
     assert!(
         errors.iter().any(|e| e.message.contains(

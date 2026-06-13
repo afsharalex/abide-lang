@@ -1690,23 +1690,11 @@ impl<'a> Runtime<'a> {
                 then_body,
                 else_body,
                 ..
-            } => {
-                if self.eval_bool(cond, env)? {
-                    self.eval_expr(then_body, env)
-                } else if let Some(else_body) = else_body {
-                    self.eval_expr(else_body, env)
-                } else {
-                    Ok(WitnessValue::Bool(true))
-                }
-            }
+            } => self.eval_if_else_expr(cond, then_body, else_body.as_deref(), env),
             IRExpr::App { .. } => self.eval_app(expr, env),
             IRExpr::SetLit { elements, .. } => self.eval_set_lit_expr(elements, env),
             IRExpr::SeqLit { elements, .. } => self.eval_seq_lit_expr(elements, env),
-            IRExpr::Tuple { elements, .. } => elements
-                .iter()
-                .map(|element| self.eval_expr(element, env))
-                .collect::<Result<Vec<_>, _>>()
-                .map(WitnessValue::Tuple),
+            IRExpr::Tuple { elements, .. } => self.eval_tuple_expr(elements, env),
             IRExpr::MapLit { entries, .. } => self.eval_map_lit_expr(entries, env),
             IRExpr::MapUpdate {
                 map, key, value, ..
@@ -1736,6 +1724,34 @@ impl<'a> Runtime<'a> {
                 expr_kind(expr)
             )),
         }
+    }
+
+    fn eval_if_else_expr(
+        &self,
+        cond: &IRExpr,
+        then_body: &IRExpr,
+        else_body: Option<&IRExpr>,
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        if self.eval_bool(cond, env)? {
+            self.eval_expr(then_body, env)
+        } else if let Some(else_body) = else_body {
+            self.eval_expr(else_body, env)
+        } else {
+            Ok(WitnessValue::Bool(true))
+        }
+    }
+
+    fn eval_tuple_expr(
+        &self,
+        elements: &[IRExpr],
+        env: &EvalEnv<'_>,
+    ) -> Result<WitnessValue, String> {
+        elements
+            .iter()
+            .map(|element| self.eval_expr(element, env))
+            .collect::<Result<Vec<_>, _>>()
+            .map(WitnessValue::Tuple)
     }
 
     fn eval_var_expr(&self, name: &str, env: &EvalEnv<'_>) -> Result<WitnessValue, String> {

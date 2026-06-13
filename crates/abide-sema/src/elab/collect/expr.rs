@@ -124,7 +124,7 @@ fn collect_call_expr(
                 );
             }
             "Seq" => return EExpr::SeqLit(error_ty(), args.iter().map(collect_expr).collect(), sp),
-            "Map" if args.len() % 2 == 0 => {
+            "Map" if args.len().is_multiple_of(2) => {
                 let collected: Vec<EExpr> = args.iter().map(collect_expr).collect();
                 let entries = collected
                     .chunks_exact(2)

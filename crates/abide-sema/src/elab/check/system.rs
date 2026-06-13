@@ -1200,6 +1200,324 @@ fn validate_crosscalls_in_actions(
     }
 }
 
+fn command_return_type<'a>(env: &'a Env, target: &str, command: &str) -> Option<&'a Ty> {
+    if let Some(system) = env.systems.get(target) {
+        return system
+            .commands
+            .iter()
+            .find(|candidate| candidate.name == command)
+            .and_then(|candidate| candidate.return_type.as_ref());
+    }
+    env.externs.get(target).and_then(|ext| {
+        ext.commands
+            .iter()
+            .find(|candidate| candidate.name == command)
+            .and_then(|candidate| candidate.return_type.as_ref())
+    })
+}
+
+fn validate_crosscall_target(
+    ctx: &CrossCallValidationCtx<'_>,
+    target: &str,
+    command: &str,
+    args: &[EExpr],
+    errors: &mut Vec<ElabError>,
+) {
+    let is_system = ctx.env.systems.contains_key(target);
+    let is_extern = ctx.env.externs.contains_key(target);
+    let span = ctx
+        .fallback_span
+        .unwrap_or(crate::span::Span { start: 0, end: 0 });
+
+    if is_system && is_extern {
+        errors.push(ElabError::with_span(
+            ErrorKind::AmbiguousRef,
+            format!("cross-call target `{target}` is ambiguous between a system and an extern"),
+            ctx.sys_ctx,
+            span,
+        ));
+        return;
+    }
+
+    if is_extern {
+        if !ctx.deps.iter().any(|dep| dep == target) {
+            errors.push(ElabError::with_span(
+                ErrorKind::InvalidScope,
+                format!(
+                    "system `{}` calls extern `{target}` without declaring `dep {target}`",
+                    ctx.system_name
+                ),
+                ctx.sys_ctx,
+                span,
+            ));
+            return;
+        }
+
+        if let Some(ext) = ctx.env.externs.get(target) {
+            match ext.commands.iter().find(|c| c.name == command) {
+                Some(cmd) => {
+                    if cmd.params.len() != args.len() {
+                        errors.push(ElabError::with_span(
+                            ErrorKind::ParamMismatch,
+                            format!(
+                                "extern call `{target}::{command}` expects {} args but got {}",
+                                cmd.params.len(),
+                                args.len()
+                            ),
+                            ctx.sys_ctx,
+                            span,
+                        ));
+                    }
+                }
+                None => errors.push(ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!("extern `{target}` has no command `{command}`"),
+                    ctx.sys_ctx,
+                    span,
+                )),
+            }
+        }
+    } else if is_system {
+        if let Some(target_sys) = ctx.env.systems.get(target) {
+            if let Some(cmd) = target_sys.commands.iter().find(|cmd| cmd.name == *command) {
+                if cmd.params.len() != args.len() {
+                    errors.push(ElabError::with_span(
+                        ErrorKind::ParamMismatch,
+                        format!(
+                            "cross-call `{target}::{command}` expects {} args but got {}",
+                            cmd.params.len(),
+                            args.len()
+                        ),
+                        ctx.sys_ctx,
+                        span,
+                    ));
+                }
+            } else {
+                errors.push(ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!("system `{target}` has no command `{command}`"),
+                    ctx.sys_ctx,
+                    span,
+                ));
+            }
+        }
+    } else {
+        errors.push(ElabError::with_span(
+            ErrorKind::UndefinedRef,
+            format!("cross-call target `{target}` is not a known system or extern"),
+            ctx.sys_ctx,
+            span,
+        ));
+    }
+}
+
+fn expr_span(expr: &EExpr) -> Option<crate::span::Span> {
+    match expr {
+        EExpr::Lit(_, _, span)
+        | EExpr::Var(_, _, span)
+        | EExpr::Prime(_, _, span)
+        | EExpr::Always(_, _, span)
+        | EExpr::Eventually(_, _, span)
+        | EExpr::Historically(_, _, span)
+        | EExpr::Once(_, _, span)
+        | EExpr::Previously(_, _, span)
+        | EExpr::Assert(_, _, span)
+        | EExpr::Assume(_, _, span)
+        | EExpr::Match(_, _, span)
+        | EExpr::Choose(_, _, _, _, span)
+        | EExpr::TupleLit(_, _, span)
+        | EExpr::SetLit(_, _, span)
+        | EExpr::SeqLit(_, _, span)
+        | EExpr::MapLit(_, _, span)
+        | EExpr::Sorry(span)
+        | EExpr::Todo(span)
+        | EExpr::Block(_, span)
+        | EExpr::StructCtor(_, _, _, span) => *span,
+        EExpr::Field(_, _, _, span)
+        | EExpr::BinOp(_, _, _, _, span)
+        | EExpr::UnOp(_, _, _, span)
+        | EExpr::Call(_, _, _, span)
+        | EExpr::CallR(_, _, _, _, span)
+        | EExpr::Qual(_, _, _, span)
+        | EExpr::Quant(_, _, _, _, _, span)
+        | EExpr::Let(_, _, span)
+        | EExpr::Until(_, _, _, span)
+        | EExpr::Since(_, _, _, span)
+        | EExpr::Assign(_, _, _, span)
+        | EExpr::NamedPair(_, _, _, span)
+        | EExpr::Seq(_, _, _, span)
+        | EExpr::SameStep(_, _, _, span)
+        | EExpr::IfElse(_, _, _, span)
+        | EExpr::In(_, _, _, span)
+        | EExpr::Card(_, _, span)
+        | EExpr::Pipe(_, _, _, span)
+        | EExpr::MapUpdate(_, _, _, _, span)
+        | EExpr::Index(_, _, _, span)
+        | EExpr::SetComp(_, _, _, _, _, _, span)
+        | EExpr::RelComp(_, _, _, _, span)
+        | EExpr::QualCall(_, _, _, _, span)
+        | EExpr::Lam(_, _, _, span)
+        | EExpr::VarDecl(_, _, _, _, span)
+        | EExpr::While(_, _, _, span)
+        | EExpr::Aggregate(_, _, _, _, _, _, span)
+        | EExpr::Saw(_, _, _, _, span)
+        | EExpr::CtorRecord(_, _, _, _, span)
+        | EExpr::Unresolved(_, span) => *span,
+    }
+}
+
+/// Extract the constructor name from a return expression.
+///
+/// Handles common forms:
+/// - `@ok` → `Var(Ty::Enum(..), "ok")` → Some("ok")
+/// - `@ok(42)` → `Call(_, Var(_, "ok"), [42])` → Some("ok")
+/// - `@ok(Receipt {... })` → `Call(_, Var(_, "ok"), [StructCtor(...)])` → Some("ok")
+pub(super) fn extract_return_ctor_name(expr: &EExpr) -> Option<String> {
+    match expr {
+        // Bare constructor: @ok
+        EExpr::Var(_, name, _) => Some(name.clone()),
+        // Constructor with args: @ok(42), @ok(Receipt {... })
+        EExpr::Call(_, callee, _, _) => {
+            if let EExpr::Var(_, name, _) = callee.as_ref() {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        // CtorRecord: @ok { field: val }
+        EExpr::CtorRecord(_, _, name, _, _) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Payload form: positional (tuple variant) or named (record variant).
+pub(super) enum ReturnPayload<'a> {
+    /// Positional args: `@ok(42)`, `@ok(1, 2)`, or bare `@ok`
+    Positional(Vec<&'a EExpr>),
+    /// Named fields: `@ok { a: 1, b: true }`
+    Named(Vec<(&'a str, &'a EExpr)>),
+}
+
+/// Extract the payload from a return expression.
+pub(super) fn extract_return_payload(expr: &EExpr) -> ReturnPayload<'_> {
+    match expr {
+        EExpr::Call(_, _, args, _) => ReturnPayload::Positional(args.iter().collect()),
+        EExpr::CtorRecord(_, _, _, fields, _) => {
+            ReturnPayload::Named(fields.iter().map(|(n, e)| (n.as_str(), e)).collect())
+        }
+        _ => ReturnPayload::Positional(vec![]),
+    }
+}
+
+struct ProcDepCheckCtx<'a> {
+    env: &'a Env,
+    proc: &'a super::super::types::EProc,
+    node_names: &'a HashSet<&'a str>,
+    let_binding_systems: &'a HashMap<&'a str, &'a str>,
+    proc_ctx: &'a str,
+    span: crate::span::Span,
+}
+
+fn validate_proc_dep_cond(
+    ctx: &ProcDepCheckCtx<'_>,
+    cond: &EProcDepCond,
+    errors: &mut Vec<ElabError>,
+) {
+    match cond {
+        EProcDepCond::Fact { node, qualifier } => {
+            if !ctx.node_names.contains(node.as_str()) {
+                errors.push(ElabError::with_span(
+                    ErrorKind::UndefinedRef,
+                    format!(
+                        "needs condition references source `{node}` which is not a declared node in proc `{}`",
+                        ctx.proc.name
+                    ),
+                    ctx.proc_ctx,
+                    ctx.span,
+                ));
+                return;
+            }
+            match qualifier.as_deref() {
+                None | Some("done") => {}
+                Some(port) => {
+                    let source_node = ctx.proc.nodes.iter().find(|n| n.name == *node);
+                    if let Some(node) = source_node {
+                        if let Some(sys_type) = ctx.let_binding_systems.get(node.instance.as_str())
+                        {
+                            if let Some(bound_sys) = ctx.env.systems.get(*sys_type) {
+                                if let Some(cmd) =
+                                    bound_sys.commands.iter().find(|c| c.name == node.command)
+                                {
+                                    match &cmd.return_type {
+                                        None => {
+                                            errors.push(ElabError::with_span(
+                                                ErrorKind::TypeMismatch,
+                                                format!(
+                                                    "needs condition references port `.{port}` on `{}` but command `{}` has no return type",
+                                                    node.name, node.command
+                                                ),
+                                                ctx.proc_ctx,
+                                                ctx.span,
+                                            ));
+                                        }
+                                        Some(Ty::Enum(_, variants)) => {
+                                            if !variants.iter().any(|v| v == port) {
+                                                errors.push(ElabError::with_span(
+                                                    ErrorKind::UndefinedRef,
+                                                    format!(
+                                                        "needs condition references port `.{port}` but command `{}` return type has variants: {}",
+                                                        node.command,
+                                                        variants
+                                                            .iter()
+                                                            .map(|v| format!(".{v}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    ),
+                                                    ctx.proc_ctx,
+                                                    ctx.span,
+                                                ));
+                                            }
+                                        }
+                                        Some(other_ty) => {
+                                            errors.push(ElabError::with_span(
+                                                ErrorKind::TypeMismatch,
+                                                format!(
+                                                    "needs condition references port `.{port}` on `{}` but command `{}` returns `{}`, not an enum; outcome ports require an enum return type",
+                                                    node.name, node.command, other_ty.name()
+                                                ),
+                                                ctx.proc_ctx,
+                                                ctx.span,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        EProcDepCond::Not(inner) => {
+            validate_proc_dep_cond(ctx, inner, errors);
+        }
+        EProcDepCond::And(left, right) | EProcDepCond::Or(left, right) => {
+            validate_proc_dep_cond(ctx, left, errors);
+            validate_proc_dep_cond(ctx, right, errors);
+        }
+    }
+}
+
+fn collect_proc_dep_sources<'a>(cond: &'a EProcDepCond, out: &mut Vec<&'a str>) {
+    match cond {
+        EProcDepCond::Fact { node, .. } => out.push(node.as_str()),
+        EProcDepCond::Not(inner) => collect_proc_dep_sources(inner, out),
+        EProcDepCond::And(left, right) | EProcDepCond::Or(left, right) => {
+            collect_proc_dep_sources(left, out);
+            collect_proc_dep_sources(right, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::types::{
@@ -2352,323 +2670,5 @@ mod tests {
         );
         assert_eq!(int_errors.len(), 1);
         assert!(int_errors[0].message.contains("not an enum"));
-    }
-}
-
-fn command_return_type<'a>(env: &'a Env, target: &str, command: &str) -> Option<&'a Ty> {
-    if let Some(system) = env.systems.get(target) {
-        return system
-            .commands
-            .iter()
-            .find(|candidate| candidate.name == command)
-            .and_then(|candidate| candidate.return_type.as_ref());
-    }
-    env.externs.get(target).and_then(|ext| {
-        ext.commands
-            .iter()
-            .find(|candidate| candidate.name == command)
-            .and_then(|candidate| candidate.return_type.as_ref())
-    })
-}
-
-fn validate_crosscall_target(
-    ctx: &CrossCallValidationCtx<'_>,
-    target: &str,
-    command: &str,
-    args: &[EExpr],
-    errors: &mut Vec<ElabError>,
-) {
-    let is_system = ctx.env.systems.contains_key(target);
-    let is_extern = ctx.env.externs.contains_key(target);
-    let span = ctx
-        .fallback_span
-        .unwrap_or(crate::span::Span { start: 0, end: 0 });
-
-    if is_system && is_extern {
-        errors.push(ElabError::with_span(
-            ErrorKind::AmbiguousRef,
-            format!("cross-call target `{target}` is ambiguous between a system and an extern"),
-            ctx.sys_ctx,
-            span,
-        ));
-        return;
-    }
-
-    if is_extern {
-        if !ctx.deps.iter().any(|dep| dep == target) {
-            errors.push(ElabError::with_span(
-                ErrorKind::InvalidScope,
-                format!(
-                    "system `{}` calls extern `{target}` without declaring `dep {target}`",
-                    ctx.system_name
-                ),
-                ctx.sys_ctx,
-                span,
-            ));
-            return;
-        }
-
-        if let Some(ext) = ctx.env.externs.get(target) {
-            match ext.commands.iter().find(|c| c.name == command) {
-                Some(cmd) => {
-                    if cmd.params.len() != args.len() {
-                        errors.push(ElabError::with_span(
-                            ErrorKind::ParamMismatch,
-                            format!(
-                                "extern call `{target}::{command}` expects {} args but got {}",
-                                cmd.params.len(),
-                                args.len()
-                            ),
-                            ctx.sys_ctx,
-                            span,
-                        ));
-                    }
-                }
-                None => errors.push(ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    format!("extern `{target}` has no command `{command}`"),
-                    ctx.sys_ctx,
-                    span,
-                )),
-            }
-        }
-    } else if is_system {
-        if let Some(target_sys) = ctx.env.systems.get(target) {
-            if let Some(cmd) = target_sys.commands.iter().find(|cmd| cmd.name == *command) {
-                if cmd.params.len() != args.len() {
-                    errors.push(ElabError::with_span(
-                        ErrorKind::ParamMismatch,
-                        format!(
-                            "cross-call `{target}::{command}` expects {} args but got {}",
-                            cmd.params.len(),
-                            args.len()
-                        ),
-                        ctx.sys_ctx,
-                        span,
-                    ));
-                }
-            } else {
-                errors.push(ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    format!("system `{target}` has no command `{command}`"),
-                    ctx.sys_ctx,
-                    span,
-                ));
-            }
-        }
-    } else {
-        errors.push(ElabError::with_span(
-            ErrorKind::UndefinedRef,
-            format!("cross-call target `{target}` is not a known system or extern"),
-            ctx.sys_ctx,
-            span,
-        ));
-    }
-}
-
-fn expr_span(expr: &EExpr) -> Option<crate::span::Span> {
-    match expr {
-        EExpr::Lit(_, _, span)
-        | EExpr::Var(_, _, span)
-        | EExpr::Prime(_, _, span)
-        | EExpr::Always(_, _, span)
-        | EExpr::Eventually(_, _, span)
-        | EExpr::Historically(_, _, span)
-        | EExpr::Once(_, _, span)
-        | EExpr::Previously(_, _, span)
-        | EExpr::Assert(_, _, span)
-        | EExpr::Assume(_, _, span)
-        | EExpr::Match(_, _, span)
-        | EExpr::Choose(_, _, _, _, span)
-        | EExpr::TupleLit(_, _, span)
-        | EExpr::SetLit(_, _, span)
-        | EExpr::SeqLit(_, _, span)
-        | EExpr::MapLit(_, _, span)
-        | EExpr::Sorry(span)
-        | EExpr::Todo(span)
-        | EExpr::Block(_, span)
-        | EExpr::StructCtor(_, _, _, span) => *span,
-        EExpr::Field(_, _, _, span)
-        | EExpr::BinOp(_, _, _, _, span)
-        | EExpr::UnOp(_, _, _, span)
-        | EExpr::Call(_, _, _, span)
-        | EExpr::CallR(_, _, _, _, span)
-        | EExpr::Qual(_, _, _, span)
-        | EExpr::Quant(_, _, _, _, _, span)
-        | EExpr::Let(_, _, span)
-        | EExpr::Until(_, _, _, span)
-        | EExpr::Since(_, _, _, span)
-        | EExpr::Assign(_, _, _, span)
-        | EExpr::NamedPair(_, _, _, span)
-        | EExpr::Seq(_, _, _, span)
-        | EExpr::SameStep(_, _, _, span)
-        | EExpr::IfElse(_, _, _, span)
-        | EExpr::In(_, _, _, span)
-        | EExpr::Card(_, _, span)
-        | EExpr::Pipe(_, _, _, span)
-        | EExpr::MapUpdate(_, _, _, _, span)
-        | EExpr::Index(_, _, _, span)
-        | EExpr::SetComp(_, _, _, _, _, _, span)
-        | EExpr::RelComp(_, _, _, _, span)
-        | EExpr::QualCall(_, _, _, _, span)
-        | EExpr::Lam(_, _, _, span)
-        | EExpr::VarDecl(_, _, _, _, span)
-        | EExpr::While(_, _, _, span)
-        | EExpr::Aggregate(_, _, _, _, _, _, span)
-        | EExpr::Saw(_, _, _, _, span)
-        | EExpr::CtorRecord(_, _, _, _, span)
-        | EExpr::Unresolved(_, span) => *span,
-    }
-}
-
-/// Extract the constructor name from a return expression.
-///
-/// Handles common forms:
-/// - `@ok` → `Var(Ty::Enum(..), "ok")` → Some("ok")
-/// - `@ok(42)` → `Call(_, Var(_, "ok"), [42])` → Some("ok")
-/// - `@ok(Receipt {... })` → `Call(_, Var(_, "ok"), [StructCtor(...)])` → Some("ok")
-pub(super) fn extract_return_ctor_name(expr: &EExpr) -> Option<String> {
-    match expr {
-        // Bare constructor: @ok
-        EExpr::Var(_, name, _) => Some(name.clone()),
-        // Constructor with args: @ok(42), @ok(Receipt {... })
-        EExpr::Call(_, callee, _, _) => {
-            if let EExpr::Var(_, name, _) = callee.as_ref() {
-                Some(name.clone())
-            } else {
-                None
-            }
-        }
-        // CtorRecord: @ok { field: val }
-        EExpr::CtorRecord(_, _, name, _, _) => Some(name.clone()),
-        _ => None,
-    }
-}
-
-/// Payload form: positional (tuple variant) or named (record variant).
-pub(super) enum ReturnPayload<'a> {
-    /// Positional args: `@ok(42)`, `@ok(1, 2)`, or bare `@ok`
-    Positional(Vec<&'a EExpr>),
-    /// Named fields: `@ok { a: 1, b: true }`
-    Named(Vec<(&'a str, &'a EExpr)>),
-}
-
-/// Extract the payload from a return expression.
-pub(super) fn extract_return_payload(expr: &EExpr) -> ReturnPayload<'_> {
-    match expr {
-        EExpr::Call(_, _, args, _) => ReturnPayload::Positional(args.iter().collect()),
-        EExpr::CtorRecord(_, _, _, fields, _) => {
-            ReturnPayload::Named(fields.iter().map(|(n, e)| (n.as_str(), e)).collect())
-        }
-        _ => ReturnPayload::Positional(vec![]),
-    }
-}
-
-struct ProcDepCheckCtx<'a> {
-    env: &'a Env,
-    proc: &'a super::super::types::EProc,
-    node_names: &'a HashSet<&'a str>,
-    let_binding_systems: &'a HashMap<&'a str, &'a str>,
-    proc_ctx: &'a str,
-    span: crate::span::Span,
-}
-
-fn validate_proc_dep_cond(
-    ctx: &ProcDepCheckCtx<'_>,
-    cond: &EProcDepCond,
-    errors: &mut Vec<ElabError>,
-) {
-    match cond {
-        EProcDepCond::Fact { node, qualifier } => {
-            if !ctx.node_names.contains(node.as_str()) {
-                errors.push(ElabError::with_span(
-                    ErrorKind::UndefinedRef,
-                    format!(
-                        "needs condition references source `{node}` which is not a declared node in proc `{}`",
-                        ctx.proc.name
-                    ),
-                    ctx.proc_ctx,
-                    ctx.span,
-                ));
-                return;
-            }
-            match qualifier.as_deref() {
-                None | Some("done") => {}
-                Some(port) => {
-                    let source_node = ctx.proc.nodes.iter().find(|n| n.name == *node);
-                    if let Some(node) = source_node {
-                        if let Some(sys_type) = ctx.let_binding_systems.get(node.instance.as_str())
-                        {
-                            if let Some(bound_sys) = ctx.env.systems.get(*sys_type) {
-                                if let Some(cmd) =
-                                    bound_sys.commands.iter().find(|c| c.name == node.command)
-                                {
-                                    match &cmd.return_type {
-                                        None => {
-                                            errors.push(ElabError::with_span(
-                                                ErrorKind::TypeMismatch,
-                                                format!(
-                                                    "needs condition references port `.{port}` on `{}` but command `{}` has no return type",
-                                                    node.name, node.command
-                                                ),
-                                                ctx.proc_ctx,
-                                                ctx.span,
-                                            ));
-                                        }
-                                        Some(Ty::Enum(_, variants)) => {
-                                            if !variants.iter().any(|v| v == port) {
-                                                errors.push(ElabError::with_span(
-                                                    ErrorKind::UndefinedRef,
-                                                    format!(
-                                                        "needs condition references port `.{port}` but command `{}` return type has variants: {}",
-                                                        node.command,
-                                                        variants
-                                                            .iter()
-                                                            .map(|v| format!(".{v}"))
-                                                            .collect::<Vec<_>>()
-                                                            .join(", ")
-                                                    ),
-                                                    ctx.proc_ctx,
-                                                    ctx.span,
-                                                ));
-                                            }
-                                        }
-                                        Some(other_ty) => {
-                                            errors.push(ElabError::with_span(
-                                                ErrorKind::TypeMismatch,
-                                                format!(
-                                                    "needs condition references port `.{port}` on `{}` but command `{}` returns `{}`, not an enum; outcome ports require an enum return type",
-                                                    node.name, node.command, other_ty.name()
-                                                ),
-                                                ctx.proc_ctx,
-                                                ctx.span,
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        EProcDepCond::Not(inner) => {
-            validate_proc_dep_cond(ctx, inner, errors);
-        }
-        EProcDepCond::And(left, right) | EProcDepCond::Or(left, right) => {
-            validate_proc_dep_cond(ctx, left, errors);
-            validate_proc_dep_cond(ctx, right, errors);
-        }
-    }
-}
-
-fn collect_proc_dep_sources<'a>(cond: &'a EProcDepCond, out: &mut Vec<&'a str>) {
-    match cond {
-        EProcDepCond::Fact { node, .. } => out.push(node.as_str()),
-        EProcDepCond::Not(inner) => collect_proc_dep_sources(inner, out),
-        EProcDepCond::And(left, right) | EProcDepCond::Or(left, right) => {
-            collect_proc_dep_sources(left, out);
-            collect_proc_dep_sources(right, out);
-        }
     }
 }

@@ -1681,8 +1681,7 @@ fn render_terminal_summary_with_color(
     let row = TerminalResultRow::from_result(result);
     let time = row
         .time
-        .map(|time_ms| format!("{time_ms}ms"))
-        .unwrap_or_else(|| "-".to_owned());
+        .map_or_else(|| "-".to_owned(), |time_ms| format!("{time_ms}ms"));
     let status = render_terminal_status_column(row.status, color_policy);
     let prefix = format!(
         "  {status} {subject:<subject_width$} {time:>time_width$}  ",
@@ -1780,8 +1779,8 @@ fn wrap_terminal_detail(detail: &str, width: usize) -> Vec<String> {
             current.push(' ');
             current.push_str(word);
         } else {
-            lines.push(current);
-            current = word.to_owned();
+            lines.push(std::mem::take(&mut current));
+            word.clone_into(&mut current);
         }
 
         while current.chars().count() > width {
@@ -3769,7 +3768,8 @@ mod tests {
                 "{status} should be rendered as a green verdict"
             );
         }
-        for status in ["ADMITTED"] {
+        {
+            let status = "ADMITTED";
             assert_eq!(
                 terminal_status_style(status),
                 yellow,

@@ -2081,8 +2081,7 @@ mod tests {
         let second_start = source.find("second").expect("second fn");
         let second_end = source[second_start..]
             .find('\n')
-            .map(|offset| second_start + offset)
-            .unwrap_or(source.len());
+            .map_or(source.len(), |offset| second_start + offset);
         let second_span = Span {
             start: second_decl_start,
             end: second_end,
@@ -2104,8 +2103,7 @@ mod tests {
             .expect("command declaration");
         let command_end = interface_source[command_start..]
             .find('\n')
-            .map(|offset| command_start + offset)
-            .unwrap_or(interface_source.len());
+            .map_or(interface_source.len(), |offset| command_start + offset);
         let command_span = Span {
             start: command_start,
             end: command_end,

@@ -290,7 +290,7 @@ fn try_encode_slot_binop_expr(
         };
         return smt::map_merge(&l, &r, key, value);
     }
-    Ok(smt::binop(op, &l, &r)?)
+    smt::binop(op, &l, &r)
 }
 
 fn try_encode_slot_unop_expr(
@@ -371,7 +371,7 @@ fn try_encode_slot_unop_expr(
         };
         return smt::map_range(&v, key, value);
     }
-    Ok(smt::unop(op, &v)?)
+    smt::unop(op, &v)
 }
 
 pub(super) fn try_encode_slot_app_expr(

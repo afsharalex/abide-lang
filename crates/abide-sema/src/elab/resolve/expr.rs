@@ -1457,7 +1457,7 @@ mod tests {
             "relation union-style ops should preserve matching relation shape"
         );
         assert!(
-            matches!(infer_relation_set_op_type(BinOp::Eq, &left, &right), None),
+            infer_relation_set_op_type(BinOp::Eq, &left, &right).is_none(),
             "non relation-set operators should not infer a relation set op type"
         );
         assert!(

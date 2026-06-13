@@ -2166,7 +2166,7 @@ fn enumerate_initial_active_slot_options(
 ) -> Result<Vec<HashSet<(usize, usize)>>, String> {
     let mut active_slots = required_active_slots.clone();
     let mut ranges = store_ranges.iter().collect::<Vec<_>>();
-    ranges.sort_by(|(left, _), (right, _)| left.cmp(right));
+    ranges.sort_by_key(|(left, _)| *left);
 
     for (store_name, range) in ranges {
         let Some(&entity_index) = entity_indices.get(&range.entity_type) else {
