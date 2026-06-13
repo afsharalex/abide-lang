@@ -378,13 +378,11 @@ fn slot_expr_family_helpers_cover_representative_dispatch() {
         entity_param_types: &entity_param_types,
         store_param_types: &store_param_types,
     };
-    let other_total = super::expr::try_encode_slot_var_or_field_expr(&bound_ctx, &other_total_expr, 0)
-        .expect("field family")
-        .expect("field value");
-    assert_value_eq(
-        &other_total,
-        pool.field_at("Order", 0, "total", 0).unwrap(),
-    );
+    let other_total =
+        super::expr::try_encode_slot_var_or_field_expr(&bound_ctx, &other_total_expr, 0)
+            .expect("field family")
+            .expect("field value");
+    assert_value_eq(&other_total, pool.field_at("Order", 0, "total", 0).unwrap());
 
     let pending_ctor = IRExpr::Ctor {
         enum_name: "OrderStatus".to_owned(),
@@ -625,10 +623,12 @@ fn slot_expr_field_respects_system_struct_context() {
         0,
         std::slice::from_ref(&system),
     );
-    pool_with_unregistered_system_field.system_field_vars.insert(
-        ("Ui".to_owned(), "ghost.total".to_owned()),
-        vec![smt::int_val(999)],
-    );
+    pool_with_unregistered_system_field
+        .system_field_vars
+        .insert(
+            ("Ui".to_owned(), "ghost.total".to_owned()),
+            vec![smt::int_val(999)],
+        );
     let ctx_with_unregistered_system_field = SlotEncodeCtx {
         pool: &pool_with_unregistered_system_field,
         vctx: &vctx,

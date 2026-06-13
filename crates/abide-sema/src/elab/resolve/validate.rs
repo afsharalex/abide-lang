@@ -2,8 +2,384 @@
 
 use super::super::env::Env;
 use super::super::error::{ElabError, ErrorKind};
-use super::super::types::{BuiltinTy, EContract, EEventAction, EExpr, EFieldDefault, Ty};
+use super::super::types::{
+    BuiltinTy, EContract, EEventAction, EExpr, EExternAssume, EFieldDefault, EMatchScrutinee,
+    ESceneWhen, Ty,
+};
+use super::collection::validate_set_comp_binder_shape;
 use std::collections::{HashMap, HashSet};
+
+fn walk_expr(expr: &EExpr, visit: &mut impl FnMut(&EExpr)) {
+    visit(expr);
+    match expr {
+        EExpr::Always(_, e, _)
+        | EExpr::Eventually(_, e, _)
+        | EExpr::Historically(_, e, _)
+        | EExpr::Once(_, e, _)
+        | EExpr::Previously(_, e, _)
+        | EExpr::UnOp(_, _, e, _)
+        | EExpr::Field(_, e, _, _)
+        | EExpr::Prime(_, e, _)
+        | EExpr::Assert(_, e, _)
+        | EExpr::Assume(_, e, _)
+        | EExpr::Card(_, e, _)
+        | EExpr::NamedPair(_, _, e, _) => walk_expr(e, visit),
+        EExpr::Choose(_, _, _, predicate, _) => {
+            if let Some(predicate) = predicate {
+                walk_expr(predicate, visit);
+            }
+        }
+        EExpr::BinOp(_, _, a, b, _)
+        | EExpr::Until(_, a, b, _)
+        | EExpr::Since(_, a, b, _)
+        | EExpr::Assign(_, a, b, _)
+        | EExpr::Seq(_, a, b, _)
+        | EExpr::SameStep(_, a, b, _)
+        | EExpr::In(_, a, b, _)
+        | EExpr::Pipe(_, a, b, _)
+        | EExpr::Index(_, a, b, _) => {
+            walk_expr(a, visit);
+            walk_expr(b, visit);
+        }
+        EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
+            walk_expr(body, visit);
+        }
+        EExpr::Call(_, f, args, _) => {
+            walk_expr(f, visit);
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        EExpr::CallR(_, f, args, refs, _) => {
+            walk_expr(f, visit);
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+            for reference in refs {
+                walk_expr(reference, visit);
+            }
+        }
+        EExpr::Let(bindings, body, _) => {
+            for (_, _, value) in bindings {
+                walk_expr(value, visit);
+            }
+            walk_expr(body, visit);
+        }
+        EExpr::Match(scrutinee, arms, _) => {
+            walk_expr(scrutinee, visit);
+            for (_, guard, body) in arms {
+                if let Some(guard) = guard {
+                    walk_expr(guard, visit);
+                }
+                walk_expr(body, visit);
+            }
+        }
+        EExpr::MapUpdate(_, map, key, value, _) => {
+            walk_expr(map, visit);
+            walk_expr(key, visit);
+            walk_expr(value, visit);
+        }
+        EExpr::SetComp(_, projection, _, _, source, filter, _) => {
+            if let Some(projection) = projection {
+                walk_expr(projection, visit);
+            }
+            if let Some(source) = source {
+                walk_expr(source, visit);
+            }
+            walk_expr(filter, visit);
+        }
+        EExpr::RelComp(_, projection, bindings, filter, _) => {
+            walk_expr(projection, visit);
+            for binding in bindings {
+                if let Some(source) = &binding.source {
+                    walk_expr(source, visit);
+                }
+            }
+            walk_expr(filter, visit);
+        }
+        EExpr::TupleLit(_, elems, _) | EExpr::SetLit(_, elems, _) | EExpr::SeqLit(_, elems, _) => {
+            for elem in elems {
+                walk_expr(elem, visit);
+            }
+        }
+        EExpr::MapLit(_, entries, _) => {
+            for (key, value) in entries {
+                walk_expr(key, visit);
+                walk_expr(value, visit);
+            }
+        }
+        EExpr::QualCall(_, _, _, args, _) => {
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
+            for (_, value) in fields {
+                walk_expr(value, visit);
+            }
+        }
+        EExpr::Aggregate(_, _, _, _, body, in_filter, _) => {
+            walk_expr(body, visit);
+            if let Some(in_filter) = in_filter {
+                walk_expr(in_filter, visit);
+            }
+        }
+        EExpr::Saw(_, _, _, args, _) => {
+            for arg in args.iter().flatten() {
+                walk_expr(arg, visit);
+            }
+        }
+        EExpr::Block(exprs, _) => {
+            for expr in exprs {
+                walk_expr(expr, visit);
+            }
+        }
+        EExpr::VarDecl(_, _, init, rest, _) => {
+            walk_expr(init, visit);
+            walk_expr(rest, visit);
+        }
+        EExpr::While(cond, contracts, body, _) => {
+            walk_expr(cond, visit);
+            for contract in contracts {
+                walk_contract(contract, visit);
+            }
+            walk_expr(body, visit);
+        }
+        EExpr::IfElse(cond, then_body, else_body, _) => {
+            walk_expr(cond, visit);
+            walk_expr(then_body, visit);
+            if let Some(else_body) = else_body {
+                walk_expr(else_body, visit);
+            }
+        }
+        EExpr::Lit(..)
+        | EExpr::Var(..)
+        | EExpr::Qual(..)
+        | EExpr::Sorry(_)
+        | EExpr::Todo(_)
+        | EExpr::Unresolved(..) => {}
+    }
+}
+
+fn walk_contract(contract: &EContract, visit: &mut impl FnMut(&EExpr)) {
+    match contract {
+        EContract::Requires(expr) | EContract::Ensures(expr) | EContract::Invariant(expr) => {
+            walk_expr(expr, visit);
+        }
+        EContract::Decreases { measures, .. } => {
+            for measure in measures {
+                walk_expr(measure, visit);
+            }
+        }
+    }
+}
+
+fn walk_field_default(default: &EFieldDefault, visit: &mut impl FnMut(&EExpr)) {
+    match default {
+        EFieldDefault::Value(expr) | EFieldDefault::Where(expr) => walk_expr(expr, visit),
+        EFieldDefault::In(values) => {
+            for value in values {
+                walk_expr(value, visit);
+            }
+        }
+    }
+}
+
+fn walk_event_action(action: &EEventAction, visit: &mut impl FnMut(&EExpr)) {
+    match action {
+        EEventAction::Choose(_, _, guard, body) => {
+            walk_expr(guard, visit);
+            for action in body {
+                walk_event_action(action, visit);
+            }
+        }
+        EEventAction::ForAll(_, _, body) => {
+            for action in body {
+                walk_event_action(action, visit);
+            }
+        }
+        EEventAction::Create(_, _, fields) => {
+            for (_, value) in fields {
+                walk_expr(value, visit);
+            }
+        }
+        EEventAction::CrossCall(_, _, args) | EEventAction::LetCrossCall(_, _, _, args) => {
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        EEventAction::Match(scrutinee, arms) => {
+            if let EMatchScrutinee::CrossCall(_, _, args) = scrutinee {
+                for arg in args {
+                    walk_expr(arg, visit);
+                }
+            }
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    walk_expr(guard, visit);
+                }
+                for action in &arm.body {
+                    walk_event_action(action, visit);
+                }
+            }
+        }
+        EEventAction::Apply(target, _, refs, args) => {
+            walk_expr(target, visit);
+            for reference in refs {
+                walk_expr(reference, visit);
+            }
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        EEventAction::Expr(expr) => walk_expr(expr, visit),
+    }
+}
+
+fn walk_scene_when(when: &ESceneWhen, visit: &mut impl FnMut(&EExpr)) {
+    match when {
+        ESceneWhen::Action { args, .. } => {
+            for arg in args {
+                walk_expr(arg, visit);
+            }
+        }
+        ESceneWhen::Assume(expr) => walk_expr(expr, visit),
+    }
+}
+
+fn walk_env_exprs(env: &Env, visit: &mut impl FnMut(&EExpr)) {
+    for verify in &env.verifies {
+        for constraint in &verify.initial_constraints {
+            walk_expr(constraint, visit);
+        }
+        for assert in &verify.asserts {
+            walk_expr(assert, visit);
+        }
+    }
+    for theorem in &env.theorems {
+        for show in &theorem.shows {
+            walk_expr(show, visit);
+        }
+        for invariant in &theorem.invariants {
+            walk_expr(invariant, visit);
+        }
+    }
+    for lemma in &env.lemmas {
+        for expr in &lemma.body {
+            walk_expr(expr, visit);
+        }
+    }
+    for axiom in &env.axioms {
+        walk_expr(&axiom.body, visit);
+    }
+    for scene in &env.scenes {
+        for given in &scene.givens {
+            if let Some(condition) = &given.condition {
+                walk_expr(condition, visit);
+            }
+        }
+        for when in &scene.whens {
+            walk_scene_when(when, visit);
+        }
+        for constraint in &scene.given_constraints {
+            walk_expr(constraint, visit);
+        }
+        for then_expr in &scene.thens {
+            walk_expr(then_expr, visit);
+        }
+    }
+    for prop in env.props.values() {
+        walk_expr(&prop.body, visit);
+    }
+    for pred in env.preds.values() {
+        walk_expr(&pred.body, visit);
+    }
+    for constant in env.consts.values() {
+        walk_expr(&constant.body, visit);
+    }
+    for external in env.externs.values() {
+        for may in &external.mays {
+            for value in &may.returns {
+                walk_expr(value, visit);
+            }
+        }
+        for assume in &external.assumes {
+            if let EExternAssume::Expr(expr, _) = assume {
+                walk_expr(expr, visit);
+            }
+        }
+    }
+    for entity in env.entities.values() {
+        for field in &entity.fields {
+            if let Some(default) = &field.default {
+                walk_field_default(default, visit);
+            }
+        }
+        for action in &entity.actions {
+            for req in &action.requires {
+                walk_expr(req, visit);
+            }
+            for ens in &action.ensures {
+                walk_expr(ens, visit);
+            }
+            for expr in &action.body {
+                walk_expr(expr, visit);
+            }
+        }
+        for invariant in &entity.invariants {
+            walk_expr(&invariant.body, visit);
+        }
+        for derived in &entity.derived_fields {
+            walk_expr(&derived.body, visit);
+        }
+    }
+    for system in env.systems.values() {
+        for field in &system.fields {
+            if let Some(default) = &field.default {
+                walk_field_default(default, visit);
+            }
+        }
+        for action in &system.actions {
+            for req in &action.requires {
+                walk_expr(req, visit);
+            }
+            for body_item in &action.body {
+                walk_event_action(body_item, visit);
+            }
+            if let Some(return_expr) = &action.return_expr {
+                walk_expr(return_expr, visit);
+            }
+        }
+        for query in &system.queries {
+            walk_expr(&query.body, visit);
+        }
+        for pred in &system.preds {
+            walk_expr(&pred.body, visit);
+        }
+        for invariant in &system.invariants {
+            walk_expr(&invariant.body, visit);
+        }
+        for derived in &system.derived_fields {
+            walk_expr(&derived.body, visit);
+        }
+        for proc in &system.procs {
+            if let Some(requires) = &proc.requires {
+                walk_expr(requires, visit);
+            }
+            for node in &proc.nodes {
+                for arg in &node.args {
+                    walk_expr(arg, visit);
+                }
+            }
+        }
+    }
+    for func in env.fns.values() {
+        walk_expr(&func.body, visit);
+        for contract in &func.contracts {
+            walk_contract(contract, visit);
+        }
+    }
+}
 
 /// Resolve and validate extern-boundary `saw` expressions.
 ///
@@ -16,215 +392,44 @@ use std::collections::{HashMap, HashSet};
 pub(super) fn validate_saw_expressions(env: &mut Env, ctx: &super::Ctx) {
     let mut errors = Vec::new();
 
-    // ── Inner walker: mutates Saw nodes and collects errors ──────────
-    fn walk(
-        expr: &mut EExpr,
+    fn validate_saw_expr(
+        expr: &EExpr,
         arities: &HashMap<(String, String), usize>,
         extern_names: &HashSet<String>,
         errors: &mut Vec<(String, Option<crate::span::Span>)>,
     ) {
-        match expr {
-            EExpr::Saw(_, sys, evt, args, sp) => {
-                if sys.is_empty() {
-                    errors.push((crate::messages::SAW_EXTERN_QUALIFIED_ONLY.to_owned(), *sp));
-                }
+        let EExpr::Saw(_, sys, evt, args, sp) = expr else {
+            return;
+        };
 
-                if !sys.is_empty() {
-                    if sys.contains("::") || !extern_names.contains(sys) {
-                        errors.push((crate::messages::SAW_EXTERN_QUALIFIED_ONLY.to_owned(), *sp));
-                    } else {
-                        let key = (sys.clone(), evt.clone());
-                        if let Some(&expected) = arities.get(&key) {
-                            if args.len() != expected {
-                                errors.push((
-                                    crate::messages::saw_arity_mismatch(
-                                        sys,
-                                        evt,
-                                        expected,
-                                        args.len(),
-                                    ),
-                                    *sp,
-                                ));
-                            }
-                        } else {
-                            errors.push((crate::messages::SAW_UNKNOWN_EVENT.to_owned(), *sp));
-                        }
-                    }
-                }
+        if sys.is_empty() {
+            errors.push((crate::messages::SAW_EXTERN_QUALIFIED_ONLY.to_owned(), *sp));
+        }
 
-                // Recurse into arg expressions.
-                for a in args.iter_mut().flatten() {
-                    walk(a, arities, extern_names, errors);
-                }
-            }
-            // Recurse into all subexpressions.
-            EExpr::Always(_, e, _)
-            | EExpr::Eventually(_, e, _)
-            | EExpr::Historically(_, e, _)
-            | EExpr::Once(_, e, _)
-            | EExpr::Previously(_, e, _)
-            | EExpr::UnOp(_, _, e, _)
-            | EExpr::Field(_, e, _, _)
-            | EExpr::Prime(_, e, _)
-            | EExpr::Assert(_, e, _)
-            | EExpr::Assume(_, e, _)
-            | EExpr::Card(_, e, _)
-            | EExpr::NamedPair(_, _, e, _) => walk(e, arities, extern_names, errors),
-            EExpr::Choose(_, _, _, predicate, _) => {
-                if let Some(pred) = predicate {
-                    walk(pred, arities, extern_names, errors);
-                }
-            }
-            EExpr::BinOp(_, _, a, b, _)
-            | EExpr::Until(_, a, b, _)
-            | EExpr::Since(_, a, b, _)
-            | EExpr::Assign(_, a, b, _)
-            | EExpr::Seq(_, a, b, _)
-            | EExpr::SameStep(_, a, b, _)
-            | EExpr::In(_, a, b, _)
-            | EExpr::Pipe(_, a, b, _)
-            | EExpr::Index(_, a, b, _) => {
-                walk(a, arities, extern_names, errors);
-                walk(b, arities, extern_names, errors);
-            }
-            EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
-                walk(body, arities, extern_names, errors);
-            }
-            EExpr::Call(_, f, args, _) => {
-                walk(f, arities, extern_names, errors);
-                for a in args {
-                    walk(a, arities, extern_names, errors);
-                }
-            }
-            EExpr::CallR(_, f, args, refs, _) => {
-                walk(f, arities, extern_names, errors);
-                for a in args {
-                    walk(a, arities, extern_names, errors);
-                }
-                for r in refs {
-                    walk(r, arities, extern_names, errors);
-                }
-            }
-            EExpr::Let(binds, body, _) => {
-                for (_, _, e) in binds {
-                    walk(e, arities, extern_names, errors);
-                }
-                walk(body, arities, extern_names, errors);
-            }
-            EExpr::Match(scrut, arms, _) => {
-                walk(scrut, arities, extern_names, errors);
-                for (_, guard, body) in arms {
-                    if let Some(g) = guard {
-                        walk(g, arities, extern_names, errors);
+        if !sys.is_empty() {
+            if sys.contains("::") || !extern_names.contains(sys) {
+                errors.push((crate::messages::SAW_EXTERN_QUALIFIED_ONLY.to_owned(), *sp));
+            } else {
+                let key = (sys.clone(), evt.clone());
+                if let Some(&expected) = arities.get(&key) {
+                    if args.len() != expected {
+                        errors.push((
+                            crate::messages::saw_arity_mismatch(sys, evt, expected, args.len()),
+                            *sp,
+                        ));
                     }
-                    walk(body, arities, extern_names, errors);
+                } else {
+                    errors.push((crate::messages::SAW_UNKNOWN_EVENT.to_owned(), *sp));
                 }
             }
-            EExpr::MapUpdate(_, m, k, v, _) => {
-                walk(m, arities, extern_names, errors);
-                walk(k, arities, extern_names, errors);
-                walk(v, arities, extern_names, errors);
-            }
-            EExpr::SetComp(_, proj, _, _, source, filter, _) => {
-                if let Some(p) = proj {
-                    walk(p, arities, extern_names, errors);
-                }
-                if let Some(source) = source {
-                    walk(source, arities, extern_names, errors);
-                }
-                walk(filter, arities, extern_names, errors);
-            }
-            EExpr::RelComp(_, projection, bindings, filter, _) => {
-                walk(projection, arities, extern_names, errors);
-                for binding in bindings {
-                    if let Some(source) = &mut binding.source {
-                        walk(source, arities, extern_names, errors);
-                    }
-                }
-                walk(filter, arities, extern_names, errors);
-            }
-            EExpr::TupleLit(_, elems, _)
-            | EExpr::SetLit(_, elems, _)
-            | EExpr::SeqLit(_, elems, _) => {
-                for e in elems {
-                    walk(e, arities, extern_names, errors);
-                }
-            }
-            EExpr::MapLit(_, entries, _) => {
-                for (k, v) in entries {
-                    walk(k, arities, extern_names, errors);
-                    walk(v, arities, extern_names, errors);
-                }
-            }
-            EExpr::QualCall(_, _, _, args, _) => {
-                for a in args {
-                    walk(a, arities, extern_names, errors);
-                }
-            }
-            EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
-                for (_, e) in fields {
-                    walk(e, arities, extern_names, errors);
-                }
-            }
-            EExpr::Aggregate(_, _, _, _, body, in_filter, _) => {
-                walk(body, arities, extern_names, errors);
-                if let Some(f) = in_filter {
-                    walk(f, arities, extern_names, errors);
-                }
-            }
-            EExpr::Block(exprs, _) => {
-                for e in exprs {
-                    walk(e, arities, extern_names, errors);
-                }
-            }
-            EExpr::VarDecl(_, _, init, rest, _) => {
-                walk(init, arities, extern_names, errors);
-                walk(rest, arities, extern_names, errors);
-            }
-            EExpr::While(cond, _, body, _) => {
-                walk(cond, arities, extern_names, errors);
-                walk(body, arities, extern_names, errors);
-            }
-            EExpr::IfElse(cond, then_b, else_b, _) => {
-                walk(cond, arities, extern_names, errors);
-                walk(then_b, arities, extern_names, errors);
-                if let Some(e) = else_b {
-                    walk(e, arities, extern_names, errors);
-                }
-            }
-            EExpr::Lit(..)
-            | EExpr::Var(..)
-            | EExpr::Qual(..)
-            | EExpr::Sorry(_)
-            | EExpr::Todo(_)
-            | EExpr::Unresolved(..) => {}
         }
     }
 
     let arities = ctx.event_arities.clone();
     let extern_names: HashSet<String> = env.externs.keys().cloned().collect();
-
-    for v in &mut env.verifies {
-        for a in &mut v.asserts {
-            walk(a, &arities, &extern_names, &mut errors);
-        }
-    }
-    for t in &mut env.theorems {
-        for s in &mut t.shows {
-            walk(s, &arities, &extern_names, &mut errors);
-        }
-        for inv in &mut t.invariants {
-            walk(inv, &arities, &extern_names, &mut errors);
-        }
-    }
-    for l in &mut env.lemmas {
-        for b in &mut l.body {
-            walk(b, &arities, &extern_names, &mut errors);
-        }
-    }
-    for p in env.props.values_mut() {
-        walk(&mut p.body, &arities, &extern_names, &mut errors);
-    }
+    walk_env_exprs(env, &mut |expr| {
+        validate_saw_expr(expr, &arities, &extern_names, &mut errors);
+    });
 
     for (msg, sp) in errors {
         let mut err = crate::elab::error::ElabError::new(
@@ -245,248 +450,50 @@ pub(super) fn validate_aggregate_bodies(env: &mut Env) {
     use crate::ast::AggKind;
     use crate::elab::types::{BuiltinTy, Ty};
 
-    fn walk(expr: &EExpr, errors: &mut Vec<(String, Option<crate::span::Span>)>) {
-        match expr {
-            EExpr::Aggregate(_, kind, _, _, body, _in_filter, sp) => {
-                let body_ty = body.ty();
-                match kind {
-                    AggKind::Count => {
-                        // Body must be bool
-                        if !matches!(body_ty, Ty::Builtin(BuiltinTy::Bool))
-                            && !matches!(body_ty, Ty::Error)
-                        {
-                            errors.push((
-                                format!(
-                                    "`count` body must be a bool predicate, got `{}`",
-                                    body_ty.name()
-                                ),
-                                *sp,
-                            ));
-                        }
-                    }
-                    AggKind::Sum | AggKind::Product | AggKind::Min | AggKind::Max => {
-                        // Body must be numeric
-                        let is_numeric = matches!(
-                            body_ty,
-                            Ty::Builtin(BuiltinTy::Int | BuiltinTy::Real | BuiltinTy::Float)
-                                | Ty::Error
-                        );
-                        if !is_numeric {
-                            errors.push((
-                                format!(
-                                    "`{kind:?}` body must be numeric (int, real, or float), got `{}`",
-                                    body_ty.name()
-                                ),
-                                *sp,
-                            ));
-                        }
-                    }
-                }
-                // Recurse into body
-                walk(body, errors);
-            }
-            // Recurse into subexpressions
-            EExpr::Always(_, e, _)
-            | EExpr::Eventually(_, e, _)
-            | EExpr::Historically(_, e, _)
-            | EExpr::Once(_, e, _)
-            | EExpr::Previously(_, e, _)
-            | EExpr::UnOp(_, _, e, _)
-            | EExpr::Field(_, e, _, _)
-            | EExpr::Prime(_, e, _)
-            | EExpr::Assert(_, e, _)
-            | EExpr::Assume(_, e, _)
-            | EExpr::Card(_, e, _)
-            | EExpr::NamedPair(_, _, e, _) => walk(e, errors),
-            EExpr::BinOp(_, _, a, b, _)
-            | EExpr::Until(_, a, b, _)
-            | EExpr::Since(_, a, b, _)
-            | EExpr::Assign(_, a, b, _)
-            | EExpr::Seq(_, a, b, _)
-            | EExpr::SameStep(_, a, b, _)
-            | EExpr::In(_, a, b, _)
-            | EExpr::Pipe(_, a, b, _)
-            | EExpr::Index(_, a, b, _) => {
-                walk(a, errors);
-                walk(b, errors);
-            }
-            EExpr::Quant(_, _, _, _, body, _) | EExpr::Lam(_, _, body, _) => {
-                walk(body, errors);
-            }
-            EExpr::Choose(_, _, _, predicate, _) => {
-                if let Some(pred) = predicate {
-                    walk(pred, errors);
+    fn validate_aggregate_expr(
+        expr: &EExpr,
+        errors: &mut Vec<(String, Option<crate::span::Span>)>,
+    ) {
+        let EExpr::Aggregate(_, kind, _, _, body, _in_filter, sp) = expr else {
+            return;
+        };
+
+        let body_ty = body.ty();
+        match kind {
+            AggKind::Count => {
+                if !matches!(body_ty, Ty::Builtin(BuiltinTy::Bool)) && !matches!(body_ty, Ty::Error)
+                {
+                    errors.push((
+                        format!(
+                            "`count` body must be a bool predicate, got `{}`",
+                            body_ty.name()
+                        ),
+                        *sp,
+                    ));
                 }
             }
-            EExpr::Call(_, f, args, _) => {
-                walk(f, errors);
-                for a in args {
-                    walk(a, errors);
+            AggKind::Sum | AggKind::Product | AggKind::Min | AggKind::Max => {
+                let is_numeric = matches!(
+                    body_ty,
+                    Ty::Builtin(BuiltinTy::Int | BuiltinTy::Real | BuiltinTy::Float) | Ty::Error
+                );
+                if !is_numeric {
+                    errors.push((
+                        format!(
+                            "`{kind:?}` body must be numeric (int, real, or float), got `{}`",
+                            body_ty.name()
+                        ),
+                        *sp,
+                    ));
                 }
             }
-            EExpr::CallR(_, f, args, refs, _) => {
-                walk(f, errors);
-                for a in args {
-                    walk(a, errors);
-                }
-                for r in refs {
-                    walk(r, errors);
-                }
-            }
-            EExpr::Let(binds, body, _) => {
-                for (_, _, e) in binds {
-                    walk(e, errors);
-                }
-                walk(body, errors);
-            }
-            EExpr::Match(scrut, arms, _) => {
-                walk(scrut, errors);
-                for (_, guard, body) in arms {
-                    if let Some(g) = guard {
-                        walk(g, errors);
-                    }
-                    walk(body, errors);
-                }
-            }
-            EExpr::MapUpdate(_, m, k, v, _) => {
-                walk(m, errors);
-                walk(k, errors);
-                walk(v, errors);
-            }
-            EExpr::SetComp(_, proj, _, _, source, filter, _) => {
-                if let Some(p) = proj {
-                    walk(p, errors);
-                }
-                if let Some(source) = source {
-                    walk(source, errors);
-                }
-                walk(filter, errors);
-            }
-            EExpr::RelComp(_, projection, bindings, filter, _) => {
-                walk(projection, errors);
-                for binding in bindings {
-                    if let Some(source) = &binding.source {
-                        walk(source, errors);
-                    }
-                }
-                walk(filter, errors);
-            }
-            EExpr::TupleLit(_, elems, _)
-            | EExpr::SetLit(_, elems, _)
-            | EExpr::SeqLit(_, elems, _) => {
-                for e in elems {
-                    walk(e, errors);
-                }
-            }
-            EExpr::MapLit(_, entries, _) => {
-                for (k, v) in entries {
-                    walk(k, errors);
-                    walk(v, errors);
-                }
-            }
-            EExpr::QualCall(_, _, _, args, _) => {
-                for a in args {
-                    walk(a, errors);
-                }
-            }
-            EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
-                for (_, e) in fields {
-                    walk(e, errors);
-                }
-            }
-            EExpr::Saw(_, _, _, args, _) => {
-                for a in args.iter().flatten() {
-                    walk(a, errors);
-                }
-            }
-            EExpr::Block(exprs, _) => {
-                for e in exprs {
-                    walk(e, errors);
-                }
-            }
-            EExpr::VarDecl(_, _, init, rest, _) => {
-                walk(init, errors);
-                walk(rest, errors);
-            }
-            EExpr::While(cond, _, body, _) => {
-                walk(cond, errors);
-                walk(body, errors);
-            }
-            EExpr::IfElse(cond, then_b, else_b, _) => {
-                walk(cond, errors);
-                walk(then_b, errors);
-                if let Some(e) = else_b {
-                    walk(e, errors);
-                }
-            }
-            EExpr::Lit(..)
-            | EExpr::Var(..)
-            | EExpr::Qual(..)
-            | EExpr::Sorry(_)
-            | EExpr::Todo(_)
-            | EExpr::Unresolved(..) => {}
         }
     }
 
     let mut errors = Vec::new();
-
-    for v in &env.verifies {
-        for a in &v.asserts {
-            walk(a, &mut errors);
-        }
-    }
-    for t in &env.theorems {
-        for s in &t.shows {
-            walk(s, &mut errors);
-        }
-        for inv in &t.invariants {
-            walk(inv, &mut errors);
-        }
-    }
-    for l in &env.lemmas {
-        for b in &l.body {
-            walk(b, &mut errors);
-        }
-    }
-    for p in env.props.values() {
-        walk(&p.body, &mut errors);
-    }
-    for p in env.preds.values() {
-        walk(&p.body, &mut errors);
-    }
-    // Entity/system invariants and derived fields
-    for e in env.entities.values() {
-        for inv in &e.invariants {
-            walk(&inv.body, &mut errors);
-        }
-        for d in &e.derived_fields {
-            walk(&d.body, &mut errors);
-        }
-    }
-    for s in env.systems.values() {
-        for inv in &s.invariants {
-            walk(&inv.body, &mut errors);
-        }
-        for d in &s.derived_fields {
-            walk(&d.body, &mut errors);
-        }
-    }
-    // Fn declarations: contracts (requires/ensures) and bodies
-    for f in env.fns.values() {
-        walk(&f.body, &mut errors);
-        for c in &f.contracts {
-            match c {
-                crate::elab::types::EContract::Requires(e)
-                | crate::elab::types::EContract::Ensures(e)
-                | crate::elab::types::EContract::Invariant(e) => walk(e, &mut errors),
-                crate::elab::types::EContract::Decreases { measures, .. } => {
-                    for m in measures {
-                        walk(m, &mut errors);
-                    }
-                }
-            }
-        }
-    }
+    walk_env_exprs(env, &mut |expr| {
+        validate_aggregate_expr(expr, &mut errors);
+    });
 
     for (msg, sp) in errors {
         let mut err = crate::elab::error::ElabError::new(
@@ -618,7 +625,7 @@ pub(super) fn validate_set_comprehension_sources(env: &mut Env) {
 
 fn validate_set_comprehension_expr(expr: &EExpr, errors: &mut Vec<ElabError>) {
     match expr {
-        EExpr::SetComp(_, projection, _, domain, source, filter, span) => {
+        EExpr::SetComp(_, projection, binder, domain, source, filter, span) => {
             if source.is_none() && is_real_domain(domain) {
                 let mut err = ElabError::new(
                     ErrorKind::InvalidScope,
@@ -627,6 +634,15 @@ fn validate_set_comprehension_expr(expr: &EExpr, errors: &mut Vec<ElabError>) {
                 )
                 .with_help(
                     "Use a finite source such as `{ x | x in Set(0.0, 0.5, 1.0) where ... }`; real intervals are not enumerable.",
+                );
+                err.span = *span;
+                errors.push(err);
+            }
+            if let Some(shape_error) = validate_set_comp_binder_shape(binder, domain) {
+                let mut err = ElabError::new(
+                    ErrorKind::TypeMismatch,
+                    shape_error.message(),
+                    "set comprehension binder",
                 );
                 err.span = *span;
                 errors.push(err);
@@ -1494,7 +1510,10 @@ fn rewrite_named_types_to_error(env: &mut Env) {
 mod tests {
     use super::*;
     use crate::ast::Visibility;
-    use crate::elab::types::{BinOp, ESystem, ESystemAction, GenericTypeDef, Literal};
+    use crate::elab::types::{
+        BinOp, ECommand, EConst, EExtern, EScene, ESetCompBinder, ESystem, ESystemAction,
+        GenericTypeDef, Literal,
+    };
     use crate::span::Span;
 
     fn int_ty() -> Ty {
@@ -1515,6 +1534,42 @@ mod tests {
 
     fn lit_bool(value: bool) -> EExpr {
         EExpr::Lit(bool_ty(), Literal::Bool(value), None)
+    }
+
+    fn sum_bool_body() -> EExpr {
+        EExpr::Aggregate(
+            int_ty(),
+            crate::ast::AggKind::Sum,
+            "c".to_owned(),
+            bool_ty(),
+            Box::new(lit_bool(true)),
+            None,
+            None,
+        )
+    }
+
+    fn count_body(body: EExpr) -> EExpr {
+        EExpr::Aggregate(
+            int_ty(),
+            crate::ast::AggKind::Count,
+            "c".to_owned(),
+            int_ty(),
+            Box::new(body),
+            None,
+            None,
+        )
+    }
+
+    fn real_set_comp(source: Option<EExpr>) -> EExpr {
+        EExpr::SetComp(
+            Ty::Set(Box::new(Ty::Builtin(BuiltinTy::Real))),
+            None,
+            ESetCompBinder::Var("x".to_owned()),
+            Ty::Builtin(BuiltinTy::Real),
+            source.map(Box::new),
+            Box::new(lit_bool(true)),
+            None,
+        )
     }
 
     fn generic_def(name: &str, type_params: &[&str]) -> GenericTypeDef {
@@ -1569,6 +1624,14 @@ mod tests {
         out.into_iter().map(|(name, _)| name).collect()
     }
 
+    fn record_var_names<'a>(names: &'a mut Vec<String>) -> impl FnMut(&EExpr) + 'a {
+        |expr| {
+            if let EExpr::Var(_, name, _) = expr {
+                names.push(name.clone());
+            }
+        }
+    }
+
     #[test]
     fn collect_ty_params_in_expr_walks_choose_and_while_contracts() {
         let expr = EExpr::While(
@@ -1616,6 +1679,212 @@ mod tests {
     }
 
     #[test]
+    fn validate_expression_walkers_cover_contract_defaults_actions_and_scenes() {
+        let mut contract_names = Vec::new();
+        {
+            let mut visit = record_var_names(&mut contract_names);
+            walk_contract(
+                &EContract::Decreases {
+                    measures: vec![var_with_ty("measure", int_ty())],
+                    star: false,
+                },
+                &mut visit,
+            );
+        }
+        assert_eq!(contract_names, vec!["measure"]);
+
+        let mut default_names = Vec::new();
+        {
+            let mut visit = record_var_names(&mut default_names);
+            walk_field_default(
+                &EFieldDefault::In(vec![
+                    var_with_ty("default_a", int_ty()),
+                    var_with_ty("default_b", int_ty()),
+                ]),
+                &mut visit,
+            );
+        }
+        assert_eq!(default_names, vec!["default_a", "default_b"]);
+
+        let mut action_names = Vec::new();
+        {
+            let mut visit = record_var_names(&mut action_names);
+            walk_event_action(
+                &EEventAction::Choose(
+                    "item".to_owned(),
+                    int_ty(),
+                    var_with_ty("guard", bool_ty()),
+                    vec![
+                        EEventAction::Create(
+                            "Order".to_owned(),
+                            None,
+                            vec![("id".to_owned(), var_with_ty("created_id", int_ty()))],
+                        ),
+                        EEventAction::CrossCall(
+                            "Gateway".to_owned(),
+                            "authorize".to_owned(),
+                            vec![var_with_ty("cross_arg", int_ty())],
+                        ),
+                        EEventAction::Apply(
+                            var_with_ty("target", int_ty()),
+                            "step".to_owned(),
+                            vec![var_with_ty("ref_arg", int_ty())],
+                            vec![var_with_ty("apply_arg", int_ty())],
+                        ),
+                    ],
+                ),
+                &mut visit,
+            );
+        }
+        for expected in [
+            "guard",
+            "created_id",
+            "cross_arg",
+            "target",
+            "ref_arg",
+            "apply_arg",
+        ] {
+            assert!(
+                action_names.iter().any(|name| name == expected),
+                "expected event action walker to visit {expected}, got {action_names:?}"
+            );
+        }
+
+        let mut scene_action_names = Vec::new();
+        {
+            let mut visit = record_var_names(&mut scene_action_names);
+            walk_scene_when(
+                &ESceneWhen::Action {
+                    var: "seen".to_owned(),
+                    system: "Gateway".to_owned(),
+                    event: "authorize".to_owned(),
+                    args: vec![var_with_ty("scene_arg", int_ty())],
+                    card: None,
+                },
+                &mut visit,
+            );
+        }
+        assert_eq!(scene_action_names, vec!["scene_arg"]);
+
+        let mut scene_assume_names = Vec::new();
+        {
+            let mut visit = record_var_names(&mut scene_assume_names);
+            walk_scene_when(
+                &ESceneWhen::Assume(var_with_ty("scene_assume", bool_ty())),
+                &mut visit,
+            );
+        }
+        assert_eq!(scene_assume_names, vec!["scene_assume"]);
+    }
+
+    #[test]
+    fn validate_saw_expressions_reports_qualification_and_arity_errors() {
+        let mut env = Env::new();
+        env.externs.insert(
+            "Gateway".to_owned(),
+            EExtern {
+                name: "Gateway".to_owned(),
+                implements: None,
+                commands: vec![ECommand {
+                    name: "authorize".to_owned(),
+                    params: vec![("amount".to_owned(), int_ty())],
+                    return_type: None,
+                    span: None,
+                }],
+                mays: vec![],
+                assumes: vec![],
+                span: None,
+            },
+        );
+        env.externs.insert(
+            "Commerce::Gateway".to_owned(),
+            EExtern {
+                name: "Commerce::Gateway".to_owned(),
+                implements: None,
+                commands: vec![ECommand {
+                    name: "authorize".to_owned(),
+                    params: vec![],
+                    return_type: None,
+                    span: None,
+                }],
+                mays: vec![],
+                assumes: vec![],
+                span: None,
+            },
+        );
+        env.scenes.push(EScene {
+            name: "saw_checks".to_owned(),
+            stores: vec![],
+            let_bindings: vec![],
+            givens: vec![],
+            whens: vec![
+                ESceneWhen::Assume(EExpr::Saw(
+                    bool_ty(),
+                    String::new(),
+                    "authorize".to_owned(),
+                    vec![],
+                    None,
+                )),
+                ESceneWhen::Assume(EExpr::Saw(
+                    bool_ty(),
+                    "Commerce::Gateway".to_owned(),
+                    "authorize".to_owned(),
+                    vec![],
+                    None,
+                )),
+                ESceneWhen::Assume(EExpr::Saw(
+                    bool_ty(),
+                    "Gateway".to_owned(),
+                    "authorize".to_owned(),
+                    vec![],
+                    None,
+                )),
+                ESceneWhen::Assume(EExpr::Saw(
+                    bool_ty(),
+                    "Gateway".to_owned(),
+                    "missing".to_owned(),
+                    vec![Some(Box::new(var_with_ty("amount", int_ty())))],
+                    None,
+                )),
+            ],
+            thens: vec![],
+            given_constraints: vec![],
+            activations: vec![],
+            span: None,
+            file: None,
+        });
+
+        let ctx = super::super::Ctx::from_env(&env);
+        validate_saw_expressions(&mut env, &ctx);
+
+        let messages: Vec<&str> = env
+            .errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.contains(crate::messages::SAW_EXTERN_QUALIFIED_ONLY))
+                .count()
+                >= 2,
+            "expected unqualified and multi-segment saw diagnostics, got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("expects 1") && message.contains("got 0")),
+            "expected saw arity diagnostic, got {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains(crate::messages::SAW_UNKNOWN_EVENT)),
+            "expected unknown saw event diagnostic, got {messages:?}"
+        );
+    }
+
+    #[test]
     fn validate_remaining_type_params_reports_wrong_arity_from_event_actions() {
         let mut env = Env::new();
         env.generic_types
@@ -1644,6 +1913,126 @@ mod tests {
             1,
             "wrong arity should be reported and deduplicated, got {:?}",
             env.errors
+        );
+    }
+
+    #[test]
+    fn validate_aggregate_bodies_checks_const_initializers() {
+        let mut env = Env::new();
+        env.consts.insert(
+            "bad".to_owned(),
+            EConst {
+                name: "bad".to_owned(),
+                body: sum_bool_body(),
+                span: None,
+            },
+        );
+
+        validate_aggregate_bodies(&mut env);
+
+        assert!(
+            env.errors
+                .iter()
+                .any(|error| error.message.contains("Sum") && error.message.contains("numeric")),
+            "expected aggregate body diagnostic from const initializer, got {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn validate_aggregate_bodies_accepts_bool_count_and_rejects_numeric_count_body() {
+        let mut valid = Env::new();
+        valid.consts.insert(
+            "count_bool".to_owned(),
+            EConst {
+                name: "count_bool".to_owned(),
+                body: count_body(lit_bool(true)),
+                span: None,
+            },
+        );
+        validate_aggregate_bodies(&mut valid);
+        assert!(
+            valid.errors.is_empty(),
+            "count with bool predicate should be accepted, got {:?}",
+            valid.errors
+        );
+
+        let mut invalid = Env::new();
+        invalid.consts.insert(
+            "count_int".to_owned(),
+            EConst {
+                name: "count_int".to_owned(),
+                body: count_body(var_with_ty("n", int_ty())),
+                span: None,
+            },
+        );
+        validate_aggregate_bodies(&mut invalid);
+        assert!(
+            invalid
+                .errors
+                .iter()
+                .any(|error| error.message.contains("count") && error.message.contains("bool")),
+            "count with int body should report a bool predicate diagnostic, got {:?}",
+            invalid.errors
+        );
+    }
+
+    #[test]
+    fn validate_set_comprehension_sources_rejects_real_domains_across_contexts() {
+        let mut env = Env::new();
+        env.consts.insert(
+            "bad_comp".to_owned(),
+            EConst {
+                name: "bad_comp".to_owned(),
+                body: real_set_comp(None),
+                span: None,
+            },
+        );
+        validate_set_comprehension_sources(&mut env);
+        assert!(
+            env.errors.iter().any(|error| error
+                .message
+                .contains("set comprehension over real requires an explicit finite source")),
+            "top-level set comprehension source validator should reject implicit real domains, got {:?}",
+            env.errors
+        );
+
+        let mut valid_errors = Vec::new();
+        validate_set_comprehension_expr(
+            &real_set_comp(Some(EExpr::SetLit(
+                Ty::Set(Box::new(Ty::Builtin(BuiltinTy::Real))),
+                vec![],
+                None,
+            ))),
+            &mut valid_errors,
+        );
+        assert!(
+            valid_errors.is_empty(),
+            "real-domain set comprehension with finite source should be accepted, got {valid_errors:?}"
+        );
+
+        let mut action_errors = Vec::new();
+        validate_set_comprehension_event_action(
+            &EEventAction::Expr(real_set_comp(None)),
+            &mut action_errors,
+        );
+        assert!(
+            action_errors.iter().any(|error| error
+                .message
+                .contains("set comprehension over real requires an explicit finite source")),
+            "event-action set comprehension validator should reject implicit real domains, got {action_errors:?}"
+        );
+
+        let mut default_errors = Vec::new();
+        validate_set_comprehension_field_default(
+            &EFieldDefault::Value(real_set_comp(None)),
+            &mut default_errors,
+        );
+        assert!(
+            default_errors.iter().any(|error| error
+                .message
+                .contains("set comprehension over real requires an explicit finite source")),
+            "field-default set comprehension validator should reject implicit real domains, got {default_errors:?}"
         );
     }
 

@@ -1,8 +1,13 @@
 //! Expression resolution — name and constructor resolution in expression trees.
 
-use super::super::types::{BinOp, EExpr, EPattern, ESetCompBinder, Literal, Ty};
+use super::super::types::{BinOp, EExpr, EPattern, Literal, Ty};
 use std::collections::HashMap;
 
+use super::collection::{bind_set_comp_binder, set_source_element_type};
+use super::constructor::{
+    expected_constructor_call, resolve_comparison_ctor_from_context,
+    resolve_ctor_type_from_context, resolve_var_type,
+};
 use super::Ctx;
 
 fn infer_field_type(ctx: &Ctx, base: &EExpr, field_name: &str) -> Ty {
@@ -84,31 +89,6 @@ fn relation_type_from_projection(projection: &EExpr) -> Ty {
     match projection.ty() {
         Ty::Tuple(columns) => relation_type_from_columns(columns.clone()),
         ty => relation_type_from_columns(vec![ty.clone()]),
-    }
-}
-
-fn set_source_element_type(source_ty: &Ty) -> Ty {
-    match source_ty {
-        Ty::Set(element) | Ty::Seq(element) => element.as_ref().clone(),
-        Ty::Map(key, value) => Ty::Tuple(vec![key.as_ref().clone(), value.as_ref().clone()]),
-        Ty::Store(entity) => Ty::Entity(entity.clone()),
-        _ => Ty::Error,
-    }
-}
-
-fn bind_set_comp_binder(bound: &mut HashMap<String, Ty>, binder: &ESetCompBinder, binder_ty: &Ty) {
-    match binder {
-        ESetCompBinder::Var(name) => {
-            bound.insert(name.clone(), binder_ty.clone());
-        }
-        ESetCompBinder::Wild => {}
-        ESetCompBinder::Tuple(items) => {
-            if let Ty::Tuple(columns) = binder_ty {
-                for (item, item_ty) in items.iter().zip(columns) {
-                    bind_set_comp_binder(bound, item, item_ty);
-                }
-            }
-        }
     }
 }
 
@@ -300,6 +280,259 @@ fn infer_index_type(map: &EExpr) -> Ty {
         Ty::Map(_, value) => value.as_ref().clone(),
         Ty::Seq(element) => element.as_ref().clone(),
         _ => Ty::Error,
+    }
+}
+
+fn resolve_if_else_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    cond: &EExpr,
+    then_body: &EExpr,
+    else_body: Option<&EExpr>,
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    EExpr::IfElse(
+        Box::new(resolve_expr(ctx, bound, cond)),
+        Box::new(resolve_expr(ctx, bound, then_body)),
+        else_body.map(|e| Box::new(resolve_expr(ctx, bound, e))),
+        sp,
+    )
+}
+
+fn resolve_if_else_with_expected_type(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    cond: &EExpr,
+    then_body: &EExpr,
+    else_body: Option<&EExpr>,
+    sp: Option<crate::span::Span>,
+    expected_ty: &Ty,
+) -> EExpr {
+    EExpr::IfElse(
+        Box::new(resolve_expr(ctx, bound, cond)),
+        Box::new(resolve_expr_with_expected_type(
+            ctx,
+            bound,
+            then_body,
+            expected_ty,
+        )),
+        else_body.map(|e| Box::new(resolve_expr_with_expected_type(ctx, bound, e, expected_ty))),
+        sp,
+    )
+}
+
+fn resolve_block_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    items: &[EExpr],
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    EExpr::Block(
+        items.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
+        sp,
+    )
+}
+
+fn resolve_var_decl_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    name: &str,
+    ty: &Option<Ty>,
+    init: &EExpr,
+    rest: &EExpr,
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    let resolved_ty = ty.as_ref().map(|t| ctx.resolve_ty(t));
+    let resolved_init = if let Some(expected_ty) = ty {
+        resolve_expr_with_expected_type(ctx, bound, init, expected_ty)
+    } else {
+        resolve_expr(ctx, bound, init)
+    };
+    let mut inner_bound = bound.clone();
+    inner_bound.insert(name.to_owned(), resolved_ty.clone().unwrap_or(Ty::Error));
+    EExpr::VarDecl(
+        name.to_owned(),
+        resolved_ty,
+        Box::new(resolved_init),
+        Box::new(resolve_expr(ctx, &inner_bound, rest)),
+        sp,
+    )
+}
+
+fn resolve_while_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    cond: &EExpr,
+    contracts: &[super::super::types::EContract],
+    body: &EExpr,
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    let resolved_contracts = contracts
+        .iter()
+        .map(|c| super::resolve_contract(ctx, bound, bound, c))
+        .collect();
+    EExpr::While(
+        Box::new(resolve_expr(ctx, bound, cond)),
+        resolved_contracts,
+        Box::new(resolve_expr(ctx, bound, body)),
+        sp,
+    )
+}
+
+fn resolve_set_literal_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    ty: &Ty,
+    elems: &[EExpr],
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    let resolved_elems: Vec<EExpr> = elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+    let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
+    let collection_ty = if matches!(ty, Ty::Relation(_)) {
+        match elem_ty {
+            Ty::Tuple(columns) => Ty::Relation(columns),
+            Ty::Error => Ty::Error,
+            single => Ty::Relation(vec![single]),
+        }
+    } else {
+        Ty::Set(Box::new(elem_ty))
+    };
+    EExpr::SetLit(collection_ty, resolved_elems, sp)
+}
+
+fn resolve_seq_literal_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    elems: &[EExpr],
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    let resolved_elems: Vec<EExpr> = elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+    let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
+    EExpr::SeqLit(Ty::Seq(Box::new(elem_ty)), resolved_elems, sp)
+}
+
+fn resolve_map_literal_expr(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    entries: &[(EExpr, EExpr)],
+    sp: Option<crate::span::Span>,
+) -> EExpr {
+    let resolved_entries: Vec<(EExpr, EExpr)> = entries
+        .iter()
+        .map(|(k, v)| (resolve_expr(ctx, bound, k), resolve_expr(ctx, bound, v)))
+        .collect();
+    let key_ty = resolved_entries
+        .first()
+        .map_or(Ty::Error, |(k, _)| k.ty().clone());
+    let val_ty = resolved_entries
+        .first()
+        .map_or(Ty::Error, |(_, v)| v.ty().clone());
+    EExpr::MapLit(
+        Ty::Map(Box::new(key_ty), Box::new(val_ty)),
+        resolved_entries,
+        sp,
+    )
+}
+
+fn resolve_collection_literal_with_expected_type(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    expr: &EExpr,
+    written_expected_ty: &Ty,
+    expected_ty: &Ty,
+) -> Option<EExpr> {
+    match (expr, expected_ty) {
+        (EExpr::SetLit(_, elements, sp), Ty::Set(element_ty)) => {
+            let written_element_ty = match written_expected_ty {
+                Ty::Set(element) => element.as_ref(),
+                _ => element_ty.as_ref(),
+            };
+            let resolved_items = elements
+                .iter()
+                .map(|element| {
+                    resolve_expr_with_expected_type(ctx, bound, element, written_element_ty)
+                })
+                .collect::<Vec<_>>();
+            let item_ty = resolved_items
+                .first()
+                .map(EExpr::ty)
+                .unwrap_or_else(|| element_ty.as_ref().clone());
+            Some(EExpr::SetLit(
+                Ty::Set(Box::new(item_ty)),
+                resolved_items,
+                *sp,
+            ))
+        }
+        (EExpr::SetLit(_, elements, sp), Ty::Relation(columns)) => {
+            let resolved_element_ty = match columns.as_slice() {
+                [single] => single.clone(),
+                _ => Ty::Tuple(columns.clone()),
+            };
+            let written_element_ty = match written_expected_ty {
+                Ty::Relation(written_columns) => match written_columns.as_slice() {
+                    [single] => single.clone(),
+                    _ => Ty::Tuple(written_columns.clone()),
+                },
+                _ => resolved_element_ty,
+            };
+            let resolved_items = elements
+                .iter()
+                .map(|element| {
+                    resolve_expr_with_expected_type(ctx, bound, element, &written_element_ty)
+                })
+                .collect::<Vec<_>>();
+            Some(EExpr::SetLit(expected_ty.clone(), resolved_items, *sp))
+        }
+        (EExpr::SeqLit(_, elements, sp), Ty::Seq(element_ty)) => {
+            let written_element_ty = match written_expected_ty {
+                Ty::Seq(element) => element.as_ref(),
+                _ => element_ty.as_ref(),
+            };
+            let resolved_items = elements
+                .iter()
+                .map(|element| {
+                    resolve_expr_with_expected_type(ctx, bound, element, written_element_ty)
+                })
+                .collect::<Vec<_>>();
+            let item_ty = resolved_items
+                .first()
+                .map(EExpr::ty)
+                .unwrap_or_else(|| element_ty.as_ref().clone());
+            Some(EExpr::SeqLit(
+                Ty::Seq(Box::new(item_ty)),
+                resolved_items,
+                *sp,
+            ))
+        }
+        (EExpr::MapLit(_, entries, sp), Ty::Map(key_ty, value_ty)) => {
+            let (written_key_ty, written_value_ty) = match written_expected_ty {
+                Ty::Map(key, value) => (key.as_ref(), value.as_ref()),
+                _ => (key_ty.as_ref(), value_ty.as_ref()),
+            };
+            let resolved_entries = entries
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        resolve_expr_with_expected_type(ctx, bound, key, written_key_ty),
+                        resolve_expr_with_expected_type(ctx, bound, value, written_value_ty),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let resolved_key_ty = resolved_entries
+                .first()
+                .map(|(key, _)| key.ty().clone())
+                .unwrap_or_else(|| key_ty.as_ref().clone());
+            let resolved_value_ty = resolved_entries
+                .first()
+                .map(|(_, value)| value.ty().clone())
+                .unwrap_or_else(|| value_ty.as_ref().clone());
+            Some(EExpr::MapLit(
+                Ty::Map(Box::new(resolved_key_ty), Box::new(resolved_value_ty)),
+                resolved_entries,
+                *sp,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -536,11 +769,12 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 .iter()
                 .map(|(n, mt, e)| {
                     let resolved_mt = mt.as_ref().map(|t| ctx.resolve_ty(t));
-                    let resolved = (
-                        n.clone(),
-                        resolved_mt.clone(),
-                        resolve_expr(ctx, &inner_bound, e),
-                    );
+                    let resolved_init = if let Some(expected_ty) = mt {
+                        resolve_expr_with_expected_type(ctx, &inner_bound, e, expected_ty)
+                    } else {
+                        resolve_expr(ctx, &inner_bound, e)
+                    };
+                    let resolved = (n.clone(), resolved_mt.clone(), resolved_init);
                     inner_bound.insert(n.clone(), resolved_mt.unwrap_or(Ty::Error));
                     resolved
                 })
@@ -736,84 +970,20 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
                 *sp,
             )
         }
-        EExpr::Block(items, sp) => EExpr::Block(
-            items.iter().map(|e| resolve_expr(ctx, bound, e)).collect(),
-            *sp,
-        ),
+        EExpr::Block(items, sp) => resolve_block_expr(ctx, bound, items, *sp),
         EExpr::VarDecl(name, ty, init, rest, sp) => {
-            let resolved_ty = ty.as_ref().map(|t| ctx.resolve_ty(t));
-            let resolved_init = resolve_expr(ctx, bound, init);
-            let mut inner_bound = bound.clone();
-            inner_bound.insert(name.clone(), resolved_ty.clone().unwrap_or(Ty::Error));
-            let resolved_rest = resolve_expr(ctx, &inner_bound, rest);
-            EExpr::VarDecl(
-                name.clone(),
-                resolved_ty,
-                Box::new(resolved_init),
-                Box::new(resolved_rest),
-                *sp,
-            )
+            resolve_var_decl_expr(ctx, bound, name, ty, init, rest, *sp)
         }
         EExpr::While(cond, contracts, body, sp) => {
-            let resolved_contracts = contracts
-                .iter()
-                .map(|c| super::resolve_contract(ctx, bound, bound, c))
-                .collect();
-            EExpr::While(
-                Box::new(resolve_expr(ctx, bound, cond)),
-                resolved_contracts,
-                Box::new(resolve_expr(ctx, bound, body)),
-                *sp,
-            )
+            resolve_while_expr(ctx, bound, cond, contracts, body, *sp)
         }
-        EExpr::IfElse(cond, then_body, else_body, sp) => EExpr::IfElse(
-            Box::new(resolve_expr(ctx, bound, cond)),
-            Box::new(resolve_expr(ctx, bound, then_body)),
-            else_body
-                .as_ref()
-                .map(|e| Box::new(resolve_expr(ctx, bound, e))),
-            *sp,
-        ),
+        EExpr::IfElse(cond, then_body, else_body, sp) => {
+            resolve_if_else_expr(ctx, bound, cond, then_body, else_body.as_deref(), *sp)
+        }
         // ── Collection literals: resolve elements and infer collection type ──
-        EExpr::SetLit(ty, elems, sp) => {
-            let resolved_elems: Vec<EExpr> =
-                elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
-            // Infer element type from first element (or leave as unresolved)
-            let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
-            let collection_ty = if matches!(ty, Ty::Relation(_)) {
-                match elem_ty {
-                    Ty::Tuple(columns) => Ty::Relation(columns),
-                    Ty::Error => Ty::Error,
-                    single => Ty::Relation(vec![single]),
-                }
-            } else {
-                Ty::Set(Box::new(elem_ty))
-            };
-            EExpr::SetLit(collection_ty, resolved_elems, *sp)
-        }
-        EExpr::SeqLit(_ty, elems, sp) => {
-            let resolved_elems: Vec<EExpr> =
-                elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
-            let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
-            EExpr::SeqLit(Ty::Seq(Box::new(elem_ty)), resolved_elems, *sp)
-        }
-        EExpr::MapLit(_ty, entries, sp) => {
-            let resolved_entries: Vec<(EExpr, EExpr)> = entries
-                .iter()
-                .map(|(k, v)| (resolve_expr(ctx, bound, k), resolve_expr(ctx, bound, v)))
-                .collect();
-            let key_ty = resolved_entries
-                .first()
-                .map_or(Ty::Error, |(k, _)| k.ty().clone());
-            let val_ty = resolved_entries
-                .first()
-                .map_or(Ty::Error, |(_, v)| v.ty().clone());
-            EExpr::MapLit(
-                Ty::Map(Box::new(key_ty), Box::new(val_ty)),
-                resolved_entries,
-                *sp,
-            )
-        }
+        EExpr::SetLit(ty, elems, sp) => resolve_set_literal_expr(ctx, bound, ty, elems, *sp),
+        EExpr::SeqLit(_ty, elems, sp) => resolve_seq_literal_expr(ctx, bound, elems, *sp),
+        EExpr::MapLit(_ty, entries, sp) => resolve_map_literal_expr(ctx, bound, entries, *sp),
         // resolve aggregate domain + body,
         // then infer the result type. count → Int; others → body type.
         EExpr::Aggregate(_ty, kind, var, domain, body, in_filter, sp) => {
@@ -876,6 +1046,91 @@ pub(super) fn resolve_expr(ctx: &Ctx, bound: &HashMap<String, Ty>, expr: &EExpr)
     }
 }
 
+fn resolve_expr_with_expected_type(
+    ctx: &Ctx,
+    bound: &HashMap<String, Ty>,
+    expr: &EExpr,
+    expected_ty: &Ty,
+) -> EExpr {
+    let written_expected_ty = expected_ty;
+    let expected_ty = ctx.resolve_ty(written_expected_ty);
+    match (expr, &expected_ty) {
+        (EExpr::TupleLit(_, elements, sp), Ty::Tuple(expected_items))
+            if elements.len() == expected_items.len() =>
+        {
+            let written_items = match written_expected_ty {
+                Ty::Tuple(items) => Some(items.as_slice()),
+                _ => None,
+            };
+            let resolved_items = elements
+                .iter()
+                .enumerate()
+                .zip(expected_items.iter())
+                .map(|((idx, element), expected)| {
+                    let recursive_expected = written_items
+                        .and_then(|items| items.get(idx))
+                        .unwrap_or(expected);
+                    resolve_expr_with_expected_type(ctx, bound, element, recursive_expected)
+                })
+                .collect::<Vec<_>>();
+            let item_tys = resolved_items
+                .iter()
+                .map(|item| item.ty().clone())
+                .collect();
+            return EExpr::TupleLit(Ty::Tuple(item_tys), resolved_items, *sp);
+        }
+        (EExpr::IfElse(cond, then_body, else_body, sp), _) => {
+            return resolve_if_else_with_expected_type(
+                ctx,
+                bound,
+                cond,
+                then_body,
+                else_body.as_deref(),
+                *sp,
+                written_expected_ty,
+            );
+        }
+        (EExpr::SetLit(..) | EExpr::SeqLit(..) | EExpr::MapLit(..), _) => {
+            if let Some(resolved) = resolve_collection_literal_with_expected_type(
+                ctx,
+                bound,
+                expr,
+                written_expected_ty,
+                &expected_ty,
+            ) {
+                return resolved;
+            }
+        }
+        (EExpr::Call(_, callee, args, sp), Ty::Enum(_, _)) => {
+            if let Some(constructor) = expected_constructor_call(ctx, written_expected_ty, callee) {
+                let resolved_callee = constructor.resolve_callee(callee);
+                let resolved_args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, arg)| {
+                        if let Some(expected_arg_ty) = constructor.payload_tys.get(idx) {
+                            resolve_expr_with_expected_type(ctx, bound, arg, expected_arg_ty)
+                        } else {
+                            resolve_expr(ctx, bound, arg)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return EExpr::Call(
+                    constructor.expected_ty,
+                    Box::new(resolved_callee),
+                    resolved_args,
+                    *sp,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    let mut resolved = resolve_expr(ctx, bound, expr);
+    resolve_ctor_type_from_context(&mut resolved, &expected_ty);
+    resolved
+}
+
 /// Collect variable names bound by a pattern into the given map.
 pub(super) fn collect_epattern_vars(pat: &EPattern, vars: &mut HashMap<String, Ty>) {
     match pat {
@@ -919,121 +1174,11 @@ fn collect_epattern_vars_for_scrutinee(
     }
 }
 
-fn resolve_comparison_ctor_from_context(ctx: &Ctx, expr: EExpr, expected_ty: &Ty) -> EExpr {
-    let expected_ty = ctx.resolve_ty(expected_ty);
-    let Ty::Enum(enum_name, ctors) = &expected_ty else {
-        return expr;
-    };
-    match expr {
-        EExpr::Qual(_, scope, ctor, sp)
-            if enum_scope_matches(enum_name, &scope) && ctors.iter().any(|c| c == &ctor) =>
-        {
-            EExpr::Qual(expected_ty, scope, ctor, sp)
-        }
-        EExpr::Var(ty, ctor, sp) if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == &ctor) => {
-            EExpr::Var(expected_ty, ctor, sp)
-        }
-        other => other,
-    }
-}
-
-fn enum_scope_matches(concrete_enum: &str, written_scope: &str) -> bool {
-    let concrete_base = enum_name_without_args(concrete_enum);
-    concrete_base == written_scope
-        || concrete_base
-            .rsplit_once("::")
-            .is_some_and(|(_, bare)| bare == written_scope)
-}
-
-fn enum_name_without_args(name: &str) -> &str {
-    name.split_once('<').map_or(name, |(base, _)| base)
-}
-
 fn enum_constructors_for_ty(ctx: &Ctx, ty: &Ty) -> Option<Vec<String>> {
     match ctx.resolve_ty(ty) {
         Ty::Enum(_, ctors) => Some(ctors),
         _ => None,
     }
-}
-
-pub(super) fn resolve_var_type(ctx: &Ctx, name: &str) -> Ty {
-    if let Some(parent_ty) = find_constructor_type(ctx, name) {
-        return parent_ty;
-    }
-    if let Some(t) = ctx.types.get(name) {
-        return t.clone();
-    }
-    Ty::Error
-}
-
-/// When a constructor expression has `Ty::Error` (e.g. `@None` ambiguous across
-/// multiple monomorphized generics), use the declared field type to resolve it.
-/// If the field type is an enum and the constructor name is one of its variants,
-/// patch the expression's type to the field's enum type.
-pub(super) fn resolve_ctor_type_from_context(expr: &mut EExpr, field_ty: &Ty) {
-    let Ty::Enum(_, ctors) = field_ty else { return };
-    match expr {
-        EExpr::Var(ref mut ty, name, _)
-            if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == name) =>
-        {
-            *ty = field_ty.clone();
-        }
-        // Call wrapping a constructor: @Some(42) → Call(Var(@Some), [42])
-        EExpr::Call(ref mut ty, ref mut callee, _, _) if matches!(ty, Ty::Error) => {
-            if let EExpr::Var(ref mut inner_ty, name, _) = callee.as_mut() {
-                if matches!(inner_ty, Ty::Error) && ctors.iter().any(|c| c == name) {
-                    *inner_ty = field_ty.clone();
-                    *ty = field_ty.clone();
-                }
-            }
-        }
-        EExpr::CtorRecord(ref mut ty, _, name, _, _)
-            if matches!(ty, Ty::Error) && ctors.iter().any(|c| c == name) =>
-        {
-            *ty = field_ty.clone();
-        }
-        _ => {}
-    }
-}
-
-pub(super) fn find_constructor_type(ctx: &Ctx, name: &str) -> Option<Ty> {
-    let mut matches: Vec<&Ty> = Vec::new();
-    for ty in ctx.types.values() {
-        if let Ty::Enum(_, ctors) = ty {
-            if ctors.iter().any(|c| c == name) {
-                matches.push(ty);
-            }
-        }
-    }
-    if matches.len() == 1 {
-        return Some(matches[0].clone());
-    }
-    if matches.len() > 1 {
-        // Prefer non-monomorphized (non-generic) types over monomorphized ones.
-        // Monomorphized types have `<` in their name (e.g. "Option<Int>").
-        let non_mono: Vec<&Ty> = matches
-            .iter()
-            .filter(|t| {
-                if let Ty::Enum(n, _) = t {
-                    !n.contains('<')
-                } else {
-                    true
-                }
-            })
-            .copied()
-            .collect();
-        if non_mono.len() == 1 {
-            return Some(non_mono[0].clone());
-        }
-        if non_mono.is_empty() {
-            // All matches are monomorphized instances of generic(s).
-            // Don't pick arbitrarily — leave unresolved for context-driven resolution.
-            return None;
-        }
-        // Multiple non-monomorphized matches — pre-existing ambiguity, return first
-        return Some(non_mono[0].clone());
-    }
-    None
 }
 
 pub(super) fn last_segment(s: &str) -> &str {
@@ -1043,8 +1188,9 @@ pub(super) fn last_segment(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Visibility;
     use crate::elab::env::Env;
-    use crate::elab::types::{BuiltinTy, EEntity, EField};
+    use crate::elab::types::{BuiltinTy, EEntity, EField, GenericTypeDef};
 
     fn int_ty() -> Ty {
         Ty::Builtin(BuiltinTy::Int)
@@ -1499,6 +1645,764 @@ mod tests {
         }
     }
 
+    fn ctx_with_monomorphized_options() -> Ctx {
+        let mut env = Env::new();
+        env.generic_types.insert(
+            "Option".to_owned(),
+            GenericTypeDef {
+                name: "Option".to_owned(),
+                type_params: vec!["T".to_owned()],
+                variant_names: vec!["Some".to_owned(), "None".to_owned()],
+                variant_fields: vec![
+                    (
+                        "Some".to_owned(),
+                        vec![("_0".to_owned(), Ty::Named("T".to_owned()))],
+                    ),
+                    ("None".to_owned(), vec![]),
+                ],
+                visibility: Visibility::Private,
+                span: crate::span::Span { start: 0, end: 0 },
+            },
+        );
+        env.types.insert(
+            "Option<int>".to_owned(),
+            Ty::Enum(
+                "Option<int>".to_owned(),
+                vec!["Some".to_owned(), "None".to_owned()],
+            ),
+        );
+        env.types.insert(
+            "Option<bool>".to_owned(),
+            Ty::Enum(
+                "Option<bool>".to_owned(),
+                vec!["Some".to_owned(), "None".to_owned()],
+            ),
+        );
+        env.variant_fields.insert(
+            "Option<int>".to_owned(),
+            vec![("Some".to_owned(), vec![("_0".to_owned(), int_ty())])],
+        );
+        env.variant_fields.insert(
+            "Option<bool>".to_owned(),
+            vec![("Some".to_owned(), vec![("_0".to_owned(), bool_ty())])],
+        );
+        env.types.insert(
+            "MaybeIntRel".to_owned(),
+            Ty::Relation(vec![Ty::Named("Option<int>".to_owned())]),
+        );
+        env.types.insert(
+            "MaybePairRel".to_owned(),
+            Ty::Relation(vec![
+                Ty::Named("Option<int>".to_owned()),
+                Ty::Named("Option<bool>".to_owned()),
+            ]),
+        );
+        Ctx::from_env(&env)
+    }
+
+    #[test]
+    fn resolve_expr_infers_let_initializer_constructor_from_annotation() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::Let(
+                vec![(
+                    "x".to_owned(),
+                    Some(Ty::Named("Option<int>".to_owned())),
+                    var("None", Ty::Error),
+                )],
+                Box::new(EExpr::Lit(bool_ty(), Literal::Bool(true), None)),
+                None,
+            ),
+        );
+
+        let EExpr::Let(bindings, _, _) = resolved else {
+            panic!("expected let expression");
+        };
+        let (_, annotation, init) = bindings.first().expect("let binding");
+        assert!(
+            matches!(annotation, Some(Ty::Enum(name, _)) if name == "Option<int>"),
+            "let annotation should resolve to Option<int>, got {annotation:?}"
+        );
+        assert!(
+            matches!(init.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "constructor initializer should infer Option<int>, got {init:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_infers_var_initializer_constructor_from_annotation() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::VarDecl(
+                "x".to_owned(),
+                Some(Ty::Named("Option<int>".to_owned())),
+                Box::new(var("None", Ty::Error)),
+                Box::new(EExpr::Lit(bool_ty(), Literal::Bool(true), None)),
+                None,
+            ),
+        );
+
+        let EExpr::VarDecl(_, ref annotation, ref init, _, _) = resolved else {
+            panic!("expected var declaration");
+        };
+        assert!(
+            matches!(annotation, Some(Ty::Enum(name, _)) if name == "Option<int>"),
+            "var annotation should resolve to Option<int>, got {annotation:?}"
+        );
+        assert!(
+            matches!(init.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "constructor initializer should infer Option<int>, got {init:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_tuple_initializer_items() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::TupleLit(
+                Ty::Error,
+                vec![var("None", Ty::Error), var("None", Ty::Error)],
+                None,
+            ),
+            &Ty::Tuple(vec![
+                Ty::Named("Option<int>".to_owned()),
+                Ty::Named("Option<bool>".to_owned()),
+            ]),
+        );
+
+        let EExpr::TupleLit(_, elements, _) = resolved else {
+            panic!("expected tuple literal");
+        };
+        assert!(
+            matches!(elements[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "first tuple element should infer Option<int>, got {:?}",
+            elements[0]
+        );
+        assert!(
+            matches!(elements[1].ty(), Ty::Enum(name, _) if name == "Option<bool>"),
+            "second tuple element should infer Option<bool>, got {:?}",
+            elements[1]
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_collection_literals() {
+        let ctx = ctx_with_monomorphized_options();
+
+        let resolved_set = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![var("None", Ty::Error)], None),
+            &Ty::Set(Box::new(Ty::Named("Option<int>".to_owned()))),
+        );
+        let EExpr::SetLit(_, set_items, _) = resolved_set else {
+            panic!("expected set literal");
+        };
+        assert!(
+            matches!(set_items[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "set element should infer Option<int>, got {:?}",
+            set_items[0]
+        );
+
+        let resolved_seq = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SeqLit(Ty::Error, vec![var("None", Ty::Error)], None),
+            &Ty::Seq(Box::new(Ty::Named("Option<bool>".to_owned()))),
+        );
+        let EExpr::SeqLit(_, seq_items, _) = resolved_seq else {
+            panic!("expected seq literal");
+        };
+        assert!(
+            matches!(seq_items[0].ty(), Ty::Enum(name, _) if name == "Option<bool>"),
+            "seq element should infer Option<bool>, got {:?}",
+            seq_items[0]
+        );
+
+        let resolved_map = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::MapLit(
+                Ty::Error,
+                vec![(var("None", Ty::Error), var("None", Ty::Error))],
+                None,
+            ),
+            &Ty::Map(
+                Box::new(Ty::Named("Option<int>".to_owned())),
+                Box::new(Ty::Named("Option<bool>".to_owned())),
+            ),
+        );
+        let EExpr::MapLit(_, entries, _) = resolved_map else {
+            panic!("expected map literal");
+        };
+        let (key, value) = entries.first().expect("map entry");
+        assert!(
+            matches!(key.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "map key should infer Option<int>, got {key:?}"
+        );
+        assert!(
+            matches!(value.ty(), Ty::Enum(name, _) if name == "Option<bool>"),
+            "map value should infer Option<bool>, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_empty_collection_literals() {
+        let ctx = ctx_with_monomorphized_options();
+
+        let resolved_set = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![], None),
+            &Ty::Set(Box::new(Ty::Named("Option<int>".to_owned()))),
+        );
+        assert!(
+            matches!(resolved_set.ty(), Ty::Set(inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<int>")),
+            "empty set should retain expected element type, got {resolved_set:?}"
+        );
+
+        let resolved_seq = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SeqLit(Ty::Error, vec![], None),
+            &Ty::Seq(Box::new(Ty::Named("Option<bool>".to_owned()))),
+        );
+        assert!(
+            matches!(resolved_seq.ty(), Ty::Seq(inner) if matches!(inner.as_ref(), Ty::Enum(name, _) if name == "Option<bool>")),
+            "empty seq should retain expected element type, got {resolved_seq:?}"
+        );
+
+        let resolved_map = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::MapLit(Ty::Error, vec![], None),
+            &Ty::Map(
+                Box::new(Ty::Named("Option<int>".to_owned())),
+                Box::new(Ty::Named("Option<bool>".to_owned())),
+            ),
+        );
+        assert!(
+            matches!(resolved_map.ty(), Ty::Map(key, value)
+                if matches!(key.as_ref(), Ty::Enum(name, _) if name == "Option<int>")
+                    && matches!(value.as_ref(), Ty::Enum(name, _) if name == "Option<bool>")),
+            "empty map should retain expected key/value types, got {resolved_map:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_relation_literals() {
+        let ctx = ctx_with_monomorphized_options();
+
+        let resolved_single = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![var("None", Ty::Error)], None),
+            &Ty::Relation(vec![Ty::Named("Option<int>".to_owned())]),
+        );
+        let EExpr::SetLit(single_ty, single_items, _) = resolved_single else {
+            panic!("expected single-column relation literal");
+        };
+        assert!(
+            matches!(&single_ty, Ty::Relation(columns)
+                if matches!(columns.as_slice(), [Ty::Enum(name, _)] if name == "Option<int>")),
+            "single-column relation should retain relation type, got {single_ty:?}"
+        );
+        assert!(
+            matches!(single_items[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "single-column relation row should infer Option<int>, got {:?}",
+            single_items[0]
+        );
+
+        let resolved_multi = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(
+                Ty::Error,
+                vec![EExpr::TupleLit(
+                    Ty::Error,
+                    vec![var("None", Ty::Error), var("None", Ty::Error)],
+                    None,
+                )],
+                None,
+            ),
+            &Ty::Relation(vec![
+                Ty::Named("Option<int>".to_owned()),
+                Ty::Named("Option<bool>".to_owned()),
+            ]),
+        );
+        let EExpr::SetLit(multi_ty, multi_items, _) = resolved_multi else {
+            panic!("expected multi-column relation literal");
+        };
+        assert!(
+            matches!(&multi_ty, Ty::Relation(columns)
+                if matches!(columns.as_slice(), [Ty::Enum(int_name, _), Ty::Enum(bool_name, _)] if int_name == "Option<int>" && bool_name == "Option<bool>")),
+            "multi-column relation should retain relation type, got {multi_ty:?}"
+        );
+        let EExpr::TupleLit(_, row_items, _) = &multi_items[0] else {
+            panic!(
+                "expected multi-column relation row tuple, got {:?}",
+                multi_items[0]
+            );
+        };
+        assert!(
+            matches!(row_items[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "first relation column should infer Option<int>, got {:?}",
+            row_items[0]
+        );
+        assert!(
+            matches!(row_items[1].ty(), Ty::Enum(name, _) if name == "Option<bool>"),
+            "second relation column should infer Option<bool>, got {:?}",
+            row_items[1]
+        );
+
+        let resolved_alias = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![var("None", Ty::Error)], None),
+            &Ty::Named("MaybeIntRel".to_owned()),
+        );
+        let EExpr::SetLit(_, alias_items, _) = resolved_alias else {
+            panic!("expected aliased relation literal");
+        };
+        assert!(
+            matches!(alias_items[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "aliased single-column relation row should infer Option<int>, got {:?}",
+            alias_items[0]
+        );
+    }
+
+    #[test]
+    fn resolve_expr_uses_written_expected_type_for_nested_collection_payloads() {
+        let ctx = ctx_with_monomorphized_options();
+        let nested_option = Ty::Param(
+            "Option".to_owned(),
+            vec![Ty::Param("Option".to_owned(), vec![int_ty()])],
+        );
+        let nested_bool_option = Ty::Param(
+            "Option".to_owned(),
+            vec![Ty::Param("Option".to_owned(), vec![bool_ty()])],
+        );
+        let nested_some = EExpr::Call(
+            Ty::Error,
+            Box::new(var("Some", Ty::Error)),
+            vec![var("None", Ty::Error)],
+            None,
+        );
+        let nested_bool_some = EExpr::Call(
+            Ty::Error,
+            Box::new(var("Some", Ty::Error)),
+            vec![var("None", Ty::Error)],
+            None,
+        );
+
+        let resolved_set = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![nested_some.clone()], None),
+            &Ty::Set(Box::new(nested_option.clone())),
+        );
+        let EExpr::SetLit(_, set_items, _) = resolved_set else {
+            panic!("expected set literal");
+        };
+        let EExpr::Call(_, _, set_args, _) = &set_items[0] else {
+            panic!("expected nested constructor in set, got {:?}", set_items[0]);
+        };
+        assert!(
+            matches!(set_args[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "set element constructor payload should infer Option<int> from written generic type, got {:?}",
+            set_args[0]
+        );
+
+        let resolved_seq = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SeqLit(Ty::Error, vec![nested_some.clone()], None),
+            &Ty::Seq(Box::new(nested_option.clone())),
+        );
+        let EExpr::SeqLit(_, seq_items, _) = resolved_seq else {
+            panic!("expected seq literal");
+        };
+        let EExpr::Call(_, _, seq_args, _) = &seq_items[0] else {
+            panic!("expected nested constructor in seq, got {:?}", seq_items[0]);
+        };
+        assert!(
+            matches!(seq_args[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "seq element constructor payload should infer Option<int> from written generic type, got {:?}",
+            seq_args[0]
+        );
+
+        let resolved_map = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::MapLit(
+                Ty::Error,
+                vec![(nested_some.clone(), nested_bool_some)],
+                None,
+            ),
+            &Ty::Map(
+                Box::new(nested_option.clone()),
+                Box::new(nested_bool_option),
+            ),
+        );
+        let EExpr::MapLit(_, map_entries, _) = resolved_map else {
+            panic!("expected map literal");
+        };
+        let (map_key, map_value) = map_entries.first().expect("map entry");
+        let EExpr::Call(_, _, key_args, _) = map_key else {
+            panic!("expected nested constructor in map key, got {map_key:?}");
+        };
+        assert!(
+            matches!(key_args[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "map key constructor payload should infer Option<int> from written generic type, got {:?}",
+            key_args[0]
+        );
+        let EExpr::Call(_, _, value_args, _) = map_value else {
+            panic!("expected nested constructor in map value, got {map_value:?}");
+        };
+        assert!(
+            matches!(value_args[0].ty(), Ty::Enum(name, _) if name == "Option<bool>"),
+            "map value constructor payload should infer Option<bool> from written generic type, got {:?}",
+            value_args[0]
+        );
+
+        let resolved_relation = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::SetLit(Ty::Error, vec![nested_some], None),
+            &Ty::Relation(vec![nested_option]),
+        );
+        let EExpr::SetLit(_, relation_items, _) = resolved_relation else {
+            panic!("expected relation literal");
+        };
+        let EExpr::Call(_, _, relation_args, _) = &relation_items[0] else {
+            panic!(
+                "expected nested constructor in relation, got {:?}",
+                relation_items[0]
+            );
+        };
+        assert!(
+            matches!(relation_args[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "relation row constructor payload should infer Option<int> from written generic type, got {:?}",
+            relation_args[0]
+        );
+    }
+
+    #[test]
+    fn resolve_expr_falls_back_when_tuple_expected_arity_does_not_match() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::TupleLit(
+                Ty::Error,
+                vec![
+                    EExpr::Lit(int_ty(), Literal::Int(1), None),
+                    EExpr::Lit(bool_ty(), Literal::Bool(true), None),
+                ],
+                None,
+            ),
+            &Ty::Tuple(vec![Ty::Named("Option<int>".to_owned())]),
+        );
+
+        let EExpr::TupleLit(_, elements, _) = resolved else {
+            panic!("expected tuple literal");
+        };
+        assert_eq!(
+            elements.len(),
+            2,
+            "mismatched expected tuple arity should not truncate resolved tuple elements"
+        );
+        assert!(
+            matches!(elements[0].ty(), Ty::Builtin(BuiltinTy::Int)),
+            "fallback resolution should preserve first literal type, got {:?}",
+            elements[0]
+        );
+        assert!(
+            matches!(elements[1].ty(), Ty::Builtin(BuiltinTy::Bool)),
+            "fallback resolution should preserve second literal type, got {:?}",
+            elements[1]
+        );
+    }
+
+    #[test]
+    fn resolve_expr_uses_written_expected_type_for_tuple_constructor_payloads() {
+        let ctx = ctx_with_monomorphized_options();
+        let nested_option = Ty::Param(
+            "Option".to_owned(),
+            vec![Ty::Param("Option".to_owned(), vec![int_ty()])],
+        );
+
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::TupleLit(
+                Ty::Error,
+                vec![EExpr::Call(
+                    Ty::Error,
+                    Box::new(var("Some", Ty::Error)),
+                    vec![var("None", Ty::Error)],
+                    None,
+                )],
+                None,
+            ),
+            &Ty::Tuple(vec![nested_option]),
+        );
+
+        let EExpr::TupleLit(_, elements, _) = resolved else {
+            panic!("expected tuple literal");
+        };
+        let EExpr::Call(_, _, args, _) = &elements[0] else {
+            panic!(
+                "expected nested constructor in tuple, got {:?}",
+                elements[0]
+            );
+        };
+        assert!(
+            matches!(args[0].ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "tuple element constructor payload should infer Option<int> from written generic type, got {:?}",
+            args[0]
+        );
+    }
+
+    #[test]
+    fn resolve_expr_rejects_expected_constructor_non_members_and_wrong_scopes() {
+        let ctx = ctx_with_status_types();
+        let expected = Ty::Named("Status".to_owned());
+
+        assert!(
+            expected_constructor_call(&ctx, &expected, &var("Missing", Ty::Error)).is_none(),
+            "unqualified constructors must belong to the expected enum"
+        );
+        assert!(
+            expected_constructor_call(
+                &ctx,
+                &expected,
+                &EExpr::Qual(Ty::Error, "Outcome".to_owned(), "Open".to_owned(), None),
+            )
+            .is_none(),
+            "qualified constructors must use the expected enum scope"
+        );
+        assert!(
+            expected_constructor_call(
+                &ctx,
+                &expected,
+                &EExpr::Qual(Ty::Error, "Status".to_owned(), "Missing".to_owned(), None),
+            )
+            .is_none(),
+            "qualified constructors must belong to the expected enum"
+        );
+
+        let mut env = Env::new();
+        env.types.insert(
+            "Commerce::Status".to_owned(),
+            Ty::Enum(
+                "Commerce::Status".to_owned(),
+                vec!["Open".to_owned(), "Closed".to_owned()],
+            ),
+        );
+        let module_ctx = Ctx::from_env(&env);
+        assert!(
+            expected_constructor_call(
+                &module_ctx,
+                &Ty::Named("Commerce::Status".to_owned()),
+                &EExpr::Qual(Ty::Error, "Status".to_owned(), "Open".to_owned(), None),
+            )
+            .is_some(),
+            "bare qualified scope should match a module-qualified enum name"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_selects_expected_constructor_payloads_by_variant_name() {
+        let mut env = Env::new();
+        env.types.insert(
+            "Result".to_owned(),
+            Ty::Enum(
+                "Result".to_owned(),
+                vec!["Done".to_owned(), "Failed".to_owned()],
+            ),
+        );
+        env.variant_fields.insert(
+            "Result".to_owned(),
+            vec![
+                ("Done".to_owned(), vec![("value".to_owned(), int_ty())]),
+                ("Failed".to_owned(), vec![("reason".to_owned(), bool_ty())]),
+            ],
+        );
+        let ctx = Ctx::from_env(&env);
+
+        let constructor = expected_constructor_call(
+            &ctx,
+            &Ty::Named("Result".to_owned()),
+            &var("Done", Ty::Error),
+        )
+        .expect("Done should be a Result constructor");
+
+        assert!(
+            matches!(
+                constructor.payload_tys.as_slice(),
+                [Ty::Builtin(BuiltinTy::Int)]
+            ),
+            "Done payload should be selected by variant name, got {:?}",
+            constructor.payload_tys
+        );
+    }
+
+    #[test]
+    fn resolve_expr_uses_wrapped_generic_expected_constructor_payloads() {
+        let ctx = ctx_with_monomorphized_options();
+        let nested_option = Ty::Param(
+            "Option".to_owned(),
+            vec![Ty::Param("Option".to_owned(), vec![int_ty()])],
+        );
+
+        for written_expected in [
+            Ty::Alias("AliasOption".to_owned(), Box::new(nested_option.clone())),
+            Ty::Newtype("NewOption".to_owned(), Box::new(nested_option.clone())),
+            Ty::Refinement(
+                Box::new(nested_option.clone()),
+                Box::new(EExpr::Lit(bool_ty(), Literal::Bool(true), None)),
+            ),
+        ] {
+            let constructor =
+                expected_constructor_call(&ctx, &written_expected, &var("Some", Ty::Error))
+                    .expect("wrapped generic option should resolve constructor payloads");
+
+            assert!(
+                matches!(constructor.payload_tys.as_slice(), [Ty::Enum(name, _)] if name == "Option<int>"),
+                "wrapped generic constructor payload should resolve to Option<int>, got {:?}",
+                constructor.payload_tys
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_constructor_call_payloads() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::Call(
+                Ty::Error,
+                Box::new(var("Some", Ty::Error)),
+                vec![var("None", Ty::Error)],
+                None,
+            ),
+            &Ty::Param(
+                "Option".to_owned(),
+                vec![Ty::Param("Option".to_owned(), vec![int_ty()])],
+            ),
+        );
+
+        let EExpr::Call(ref call_ty, callee, args, _) = resolved else {
+            panic!("expected constructor call");
+        };
+        assert!(
+            matches!(call_ty, Ty::Enum(name, _) if name == "Option<Option<int>>"),
+            "constructor call should infer Option<Option<int>>, got {call_ty:?}"
+        );
+        assert!(
+            matches!(callee.as_ref(), EExpr::Var(Ty::Enum(name, _), ctor, _) if name == "Option<Option<int>>" && ctor == "Some"),
+            "constructor callee should infer Option<Option<int>>::Some, got {callee:?}"
+        );
+        let payload = args.first().expect("constructor payload");
+        assert!(
+            matches!(payload.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "constructor payload should infer Option<int>, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_qualified_constructor_call_payloads() {
+        let ctx = ctx_with_monomorphized_options();
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &HashMap::new(),
+            &EExpr::Call(
+                Ty::Error,
+                Box::new(EExpr::Qual(
+                    Ty::Error,
+                    "Option".to_owned(),
+                    "Some".to_owned(),
+                    None,
+                )),
+                vec![EExpr::Qual(
+                    Ty::Error,
+                    "Option".to_owned(),
+                    "None".to_owned(),
+                    None,
+                )],
+                None,
+            ),
+            &Ty::Param(
+                "Option".to_owned(),
+                vec![Ty::Param("Option".to_owned(), vec![int_ty()])],
+            ),
+        );
+
+        let EExpr::Call(ref call_ty, callee, args, _) = resolved else {
+            panic!("expected constructor call");
+        };
+        assert!(
+            matches!(call_ty, Ty::Enum(name, _) if name == "Option<Option<int>>"),
+            "constructor call should infer Option<Option<int>>, got {call_ty:?}"
+        );
+        assert!(
+            matches!(callee.as_ref(), EExpr::Qual(Ty::Enum(name, _), scope, ctor, _) if name == "Option<Option<int>>" && scope == "Option" && ctor == "Some"),
+            "qualified constructor callee should infer Option<Option<int>>::Some, got {callee:?}"
+        );
+        let payload = args.first().expect("constructor payload");
+        assert!(
+            matches!(payload.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "qualified constructor payload should infer Option<int>, got {payload:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_expr_propagates_expected_type_into_if_branches() {
+        let ctx = ctx_with_monomorphized_options();
+        let mut bound = HashMap::new();
+        bound.insert("flag".to_owned(), bool_ty());
+        let resolved = resolve_expr_with_expected_type(
+            &ctx,
+            &bound,
+            &EExpr::IfElse(
+                Box::new(var("flag", Ty::Error)),
+                Box::new(var("None", Ty::Error)),
+                Some(Box::new(EExpr::Call(
+                    Ty::Error,
+                    Box::new(var("Some", Ty::Error)),
+                    vec![EExpr::Lit(int_ty(), Literal::Int(1), None)],
+                    None,
+                ))),
+                None,
+            ),
+            &Ty::Named("Option<int>".to_owned()),
+        );
+
+        let EExpr::IfElse(cond, then_branch, Some(else_branch), _) = resolved else {
+            panic!("expected if expression");
+        };
+        assert!(
+            matches!(cond.ty(), Ty::Builtin(BuiltinTy::Bool)),
+            "condition should resolve from bound variables, got {cond:?}"
+        );
+        assert!(
+            matches!(then_branch.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "then branch should infer Option<int>, got {then_branch:?}"
+        );
+        assert!(
+            matches!(else_branch.ty(), Ty::Enum(name, _) if name == "Option<int>"),
+            "else branch should infer Option<int>, got {else_branch:?}"
+        );
+    }
+
     #[test]
     fn resolve_expr_disambiguates_ctor_records_by_variant_field_names() {
         let mut env = Env::new();
@@ -1659,6 +2563,29 @@ mod tests {
             "already typed constructor vars should not be overwritten"
         );
 
+        let mut ctor_qual = EExpr::Qual(Ty::Error, "Status".to_owned(), "Open".to_owned(), None);
+        resolve_ctor_type_from_context(&mut ctor_qual, &status_ty);
+        assert!(
+            matches!(ctor_qual, EExpr::Qual(Ty::Enum(name, _), scope, ctor, _) if name == "Status" && scope == "Status" && ctor == "Open"),
+            "matching qualified constructors should be patched"
+        );
+
+        let mut wrong_scope_qual =
+            EExpr::Qual(Ty::Error, "Outcome".to_owned(), "Open".to_owned(), None);
+        resolve_ctor_type_from_context(&mut wrong_scope_qual, &status_ty);
+        assert!(
+            matches!(wrong_scope_qual, EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Outcome" && ctor == "Open"),
+            "qualified constructors with the wrong scope should remain unresolved"
+        );
+
+        let mut wrong_member_qual =
+            EExpr::Qual(Ty::Error, "Status".to_owned(), "Missing".to_owned(), None);
+        resolve_ctor_type_from_context(&mut wrong_member_qual, &status_ty);
+        assert!(
+            matches!(wrong_member_qual, EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Status" && ctor == "Missing"),
+            "qualified constructors outside the expected enum should remain unresolved"
+        );
+
         let mut ctor_call =
             EExpr::Call(Ty::Error, Box::new(var("Closed", Ty::Error)), vec![], None);
         resolve_ctor_type_from_context(&mut ctor_call, &status_ty);
@@ -1682,6 +2609,70 @@ mod tests {
                     if matches!(callee.as_ref(), EExpr::Var(Ty::Error, ctor, _) if ctor == "Missing")
             ),
             "non-member constructor calls should remain unresolved"
+        );
+
+        let mut wrong_qualified_call = EExpr::Call(
+            Ty::Error,
+            Box::new(EExpr::Qual(
+                Ty::Error,
+                "Outcome".to_owned(),
+                "Open".to_owned(),
+                None,
+            )),
+            vec![],
+            None,
+        );
+        resolve_ctor_type_from_context(&mut wrong_qualified_call, &status_ty);
+        assert!(
+            matches!(
+                wrong_qualified_call,
+                EExpr::Call(Ty::Error, ref callee, _, _)
+                    if matches!(callee.as_ref(), EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Outcome" && ctor == "Open")
+            ),
+            "constructor calls with wrong qualified callee scope should remain unresolved"
+        );
+
+        let mut wrong_qualified_member_call = EExpr::Call(
+            Ty::Error,
+            Box::new(EExpr::Qual(
+                Ty::Error,
+                "Status".to_owned(),
+                "Missing".to_owned(),
+                None,
+            )),
+            vec![],
+            None,
+        );
+        resolve_ctor_type_from_context(&mut wrong_qualified_member_call, &status_ty);
+        assert!(
+            matches!(
+                wrong_qualified_member_call,
+                EExpr::Call(Ty::Error, ref callee, _, _)
+                    if matches!(callee.as_ref(), EExpr::Qual(Ty::Error, scope, ctor, _) if scope == "Status" && ctor == "Missing")
+            ),
+            "constructor calls with wrong qualified callee member should remain unresolved"
+        );
+
+        let mut qualified_call = EExpr::Call(
+            Ty::Error,
+            Box::new(EExpr::Qual(
+                Ty::Error,
+                "Status".to_owned(),
+                "Closed".to_owned(),
+                None,
+            )),
+            vec![],
+            None,
+        );
+        resolve_ctor_type_from_context(&mut qualified_call, &status_ty);
+        assert!(
+            matches!(
+                qualified_call,
+                EExpr::Call(Ty::Enum(ref call_ty, _), ref callee, _, _)
+                    if call_ty == "Status"
+                        && matches!(callee.as_ref(), EExpr::Qual(Ty::Enum(name, _), scope, ctor, _) if name == "Status" && scope == "Status" && ctor == "Closed")
+            ),
+            "matching qualified constructor calls should patch both call and callee types"
         );
 
         let mut already_typed_call = EExpr::Call(
@@ -1713,6 +2704,50 @@ mod tests {
         assert!(
             matches!(wrong_record, EExpr::CtorRecord(Ty::Error, _, ctor, _, _) if ctor == "Missing"),
             "non-member record constructors should remain unresolved"
+        );
+    }
+
+    #[test]
+    fn resolve_constructor_var_type_finds_unique_and_prefers_non_monomorphized() {
+        let mut env = Env::new();
+        env.types.insert(
+            "Unique".to_owned(),
+            Ty::Enum("Unique".to_owned(), vec!["Only".to_owned()]),
+        );
+        let unique_ctx = Ctx::from_env(&env);
+        assert!(
+            matches!(resolve_var_type(&unique_ctx, "Only"), Ty::Enum(name, _) if name == "Unique"),
+            "unique constructor should resolve to its enum"
+        );
+        assert!(
+            matches!(resolve_var_type(&unique_ctx, "Missing"), Ty::Error),
+            "missing constructor should not resolve to an enum"
+        );
+
+        let mut env = Env::new();
+        env.types.insert(
+            "Option".to_owned(),
+            Ty::Enum("Option".to_owned(), vec!["Some".to_owned()]),
+        );
+        env.types.insert(
+            "Option<int>".to_owned(),
+            Ty::Enum("Option<int>".to_owned(), vec!["Some".to_owned()]),
+        );
+        let generic_ctx = Ctx::from_env(&env);
+        assert!(
+            matches!(resolve_var_type(&generic_ctx, "Some"), Ty::Enum(name, _) if name == "Option"),
+            "shared constructor should prefer the non-monomorphized enum"
+        );
+
+        let mut env = Env::new();
+        env.types.insert(
+            "Option<int>".to_owned(),
+            Ty::Enum("Option<int>".to_owned(), vec!["Some".to_owned()]),
+        );
+        let monomorphized_ctx = Ctx::from_env(&env);
+        assert!(
+            matches!(resolve_var_type(&monomorphized_ctx, "Some"), Ty::Enum(name, _) if name == "Option<int>"),
+            "single monomorphized constructor match should still resolve"
         );
     }
 }

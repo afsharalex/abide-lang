@@ -55,6 +55,10 @@ lsp_re := "verification_options|server_capabilities|verify_config_for_editor_pol
 lsp_semantic_re := "quickfix_actions_requested|code_actions_for_document|missing_load_code_action|close_qa_abide_block_code_action|removed_field_keyword_code_action|quickfix_action|single_file_edit|diagnostic_code|range_to_offsets|symbol_at_document_position|occurrence_resolves_to_symbol|reference_locations_for_symbol|rename_changes_for_symbol|resolve_occurrence_symbol|symbol_declared_at|best_symbol_match|same_symbol_identity|completion_symbols_for_context|embedded_qa_abide_completion_items|qualifier_before_dot|qualifier_before_scope|qualifier_before_trigger|qa_completion_items_for_document|qa_model_reference_completion_kind|qa_model_reference_completion_items|qa_load_path_completion_items|qa_load_path_prefix|loaded_qa_flow_model|loaded_qa_workspace_index|qa_load_paths|qa_load_path_from_line"
 lsp_project_re := "for_path|is_project_source|discover|empty|root|files|register_file|discover_dir|normalize_under_root|normalize_path_lexical|should_skip_project_dir|from_project|file_id|file_kind|file_kind_for_id|path|source_text|upsert_open_document|set_file_source|parse|lower|diagnostics|workspace_index|identifier_at|file_revision|file_state_mut|invalidate_file|invalidate_qa_diagnostics|qa_diagnostics|canonicalize|read_to_string|should_accept_document_version|document_version|uri_published_elsewhere|initialize|did_open|did_change|did_save|did_close|upsert_document|refresh_diagnostics|collect_diagnostics_for_root|collect_qa_diagnostics_for_root|collect_lsp_diagnostic|snapshot_source_for_path"
 ide_workspace_index_re := "symbols_named|completion_symbols|symbols_in_module|module_exports|members_by_owner|enum_variants_by_type|visible_symbols|references_named|completion_context|classify_abide_cursor|classify_qa_cursor|current_line_prefix|clamp_to_char_boundary|starts_with_keyword|is_word_boundary|pending_contract_context|block_frames|block_depth|block_frame_from_header|declaration_block_kind|last_callable_decl_keyword|words|build_workspace_index|is_abide_source_path|identifier_at|dedup_symbols|dedup_occurrences|dedup_symbol_clones|name_occurrences_from_tokens|collect_program_symbols|module_name|collect_program_imports_and_includes|collect_use_decl|collect_program|collect_top_decl|collect_type_decl|collect_entity_decl|collect_interface_decl|collect_system_decl|collect_proc_decl|collect_proc_nodes|collect_program_decl|collect_proc_decl_with_owner|find_name_span|symbol_detail"
+sema_resolution_expr_expected_re := "resolve_if_else_with_expected_type|resolve_var_decl_expr|resolve_set_literal_expr|resolve_seq_literal_expr|resolve_map_literal_expr|resolve_collection_literal_with_expected_type|resolve_expr_with_expected_type"
+sema_resolution_expr_constructor_re := "expected_constructor_call|expected_enum_constructor_name|expected_constructor_payload_types|expected_generic_constructor_payload_types|resolve_comparison_ctor_from_context|enum_scope_matches|enum_name_without_args|resolve_var_type|resolve_ctor_type_from_context|patch_constructor_callee|can_patch_constructor_ty|find_constructor_type"
+sema_collection_expr_re := "collect_qualified_call|quant_guard_body|collect_set_comp_binder|collect_call_expr|collect_quantifier_expr|collect_aggregate_expr|collect_let_expr|collect_lambda_expr|collect_match_expr|collect_set_comp_expr|collect_rel_comp_expr|collect_saw_expr|collect_control_expr|collect_expr"
+sema_validation_context_re := "walk_expr|walk_contract|walk_field_default|walk_event_action|walk_scene_when|walk_env_exprs|validate_saw_expressions|validate_aggregate_bodies|validate_set_comprehension_sources|validate_set_comprehension_expr|validate_set_comprehension_event_action|validate_set_comprehension_field_default"
 verifier_expr_property_quantifier_re := "property_quantifier_parts|encode_prop_quantifier_expr|encode_entity_quantifier_expr|encode_finite_enum_quantifier_expr|combine_finite_quantifier_predicates|encode_native_quantifier_expr|narrow_entity_quantifier_slots|extract_store_scoped_quantifier_body"
 verifier_expr_property_constructor_re := "encode_prop_constructor_field_or_call_value|encode_prop_payload_field_value|encode_static_payload_field_value|payload_accessor_for_field|ctor_name_matches_for_payload_accessor|encode_prop_field_value|encode_prop_ctor_value|encode_prop_adt_ctor_value"
 verifier_expr_slot_re := "try_encode_slot_expr|try_encode_slot_literal_expr|try_encode_slot_var_or_field_expr|try_encode_slot_field_expr|try_encode_slot_constructor_expr|try_encode_slot_constructor|try_encode_slot_choose_expr|try_encode_slot_operator_expr|try_encode_slot_binop_expr|try_encode_slot_unop_expr|try_encode_slot_app_expr|try_encode_slot_app|try_encode_slot_collection_expr|try_encode_slot_map_update_expr|try_encode_slot_index_expr|try_encode_slot_map_lit_expr|try_encode_slot_set_lit_expr|try_encode_slot_seq_lit_expr|try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier"
@@ -213,6 +217,48 @@ check-lang-mutants-sema-resolution-expr-relation:
 
 check-lang-mutants-sema-resolution-expr-relation-shard shard:
   {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-sema relation expression mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-sema --file crates/abide-sema/src/elab/resolve/expr.rs --re 'relation_columns|relation_type_from_columns|relation_type_from_projection|ty_same|infer_relation_join_type|infer_relation_set_op_type|infer_relation_product_type|relation_project_indices|infer_relation_project_type|infer_relation_transpose_type|infer_relation_closure_type|infer_relation_field_type' --output {{mutants_output_dir}}/mutants.out.sema-resolution-expr-relation.{{shard}}-of-{{mutants_shard_total}} -- --lib relation {{mutants_libtest_args}}
+
+check-lang-mutants-sema-expr-helpers:
+  just check-lang-mutants-sema-resolution-expr-expected
+  just check-lang-mutants-sema-resolution-expr-constructor
+  just check-lang-mutants-sema-collection-expr
+  just check-lang-mutants-sema-validation-context
+
+check-lang-mutants-sema-resolution-expr-expected:
+  just check-lang-mutants-sema-resolution-expr-expected-shard 1
+  just check-lang-mutants-sema-resolution-expr-expected-shard 2
+  just check-lang-mutants-sema-resolution-expr-expected-shard 3
+  just check-lang-mutants-sema-resolution-expr-expected-shard 4
+
+check-lang-mutants-sema-resolution-expr-expected-shard shard:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-sema expected expression type mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-sema --file crates/abide-sema/src/elab/resolve/expr.rs --re '{{sema_resolution_expr_expected_re}}' --output {{mutants_output_dir}}/mutants.out.sema-resolution-expr-expected.{{shard}}-of-{{mutants_shard_total}} -- --lib resolve {{mutants_libtest_args}}
+
+check-lang-mutants-sema-resolution-expr-constructor:
+  just check-lang-mutants-sema-resolution-expr-constructor-shard 1
+  just check-lang-mutants-sema-resolution-expr-constructor-shard 2
+  just check-lang-mutants-sema-resolution-expr-constructor-shard 3
+  just check-lang-mutants-sema-resolution-expr-constructor-shard 4
+
+check-lang-mutants-sema-resolution-expr-constructor-shard shard:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-sema constructor resolution mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-sema --file crates/abide-sema/src/elab/resolve/constructor.rs --re '{{sema_resolution_expr_constructor_re}}' --output {{mutants_output_dir}}/mutants.out.sema-resolution-expr-constructor.{{shard}}-of-{{mutants_shard_total}} -- --lib constructor {{mutants_libtest_args}}
+
+check-lang-mutants-sema-collection-expr:
+  just check-lang-mutants-sema-collection-expr-shard 1
+  just check-lang-mutants-sema-collection-expr-shard 2
+  just check-lang-mutants-sema-collection-expr-shard 3
+  just check-lang-mutants-sema-collection-expr-shard 4
+
+check-lang-mutants-sema-collection-expr-shard shard:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-sema expression collection mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-sema --file crates/abide-sema/src/elab/collect/expr.rs --re '{{sema_collection_expr_re}}' --output {{mutants_output_dir}}/mutants.out.sema-collection-expr.{{shard}}-of-{{mutants_shard_total}} -- --lib collect {{mutants_libtest_args}}
+
+check-lang-mutants-sema-validation-context:
+  just check-lang-mutants-sema-validation-context-shard 1
+  just check-lang-mutants-sema-validation-context-shard 2
+  just check-lang-mutants-sema-validation-context-shard 3
+  just check-lang-mutants-sema-validation-context-shard 4
+
+check-lang-mutants-sema-validation-context-shard shard:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-sema expression validation context mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-sema --file crates/abide-sema/src/elab/resolve/validate.rs --re '{{sema_validation_context_re}}' --output {{mutants_output_dir}}/mutants.out.sema-validation-context.{{shard}}-of-{{mutants_shard_total}} -- --lib validate {{mutants_libtest_args}}
 
 check-lang-mutants-sema-resolution-assumptions:
   just check-lang-mutants-sema-resolution-assumptions-core

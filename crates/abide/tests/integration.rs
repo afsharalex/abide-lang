@@ -932,11 +932,9 @@ fn execute_verification_parallel_lanes_preserves_deterministic_results() {
                 *entered_count += 1;
                 cvar.notify_all();
                 let _entered_wait = cvar
-                    .wait_timeout_while(
-                        entered_count,
-                        Duration::from_millis(500),
-                        |count| *count < 2,
-                    )
+                    .wait_timeout_while(entered_count, Duration::from_millis(500), |count| {
+                        *count < 2
+                    })
                     .expect("entered count wait");
                 active.fetch_sub(1, Ordering::SeqCst);
                 obligation.id.as_str().to_owned()
@@ -1280,6 +1278,87 @@ fn validation_gates_split_cargo_mutants_verify_lanes() {
             && mutants_toml.contains("copy_vcs = false"),
         ".cargo/mutants.toml must configure lightweight defaults"
     );
+}
+
+#[test]
+fn validation_gates_expose_focused_sema_expression_mutants() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    let required_lanes = [
+        (
+            "check-lang-mutants-sema-resolution-expr-expected",
+            "crates/abide-sema/src/elab/resolve/expr.rs",
+            "mutants.out.sema-resolution-expr-expected",
+            "resolve_expr_with_expected_type",
+        ),
+        (
+            "check-lang-mutants-sema-resolution-expr-constructor",
+            "crates/abide-sema/src/elab/resolve/constructor.rs",
+            "mutants.out.sema-resolution-expr-constructor",
+            "expected_constructor_call",
+        ),
+        (
+            "check-lang-mutants-sema-collection-expr",
+            "crates/abide-sema/src/elab/collect/expr.rs",
+            "mutants.out.sema-collection-expr",
+            "collect_control_expr",
+        ),
+        (
+            "check-lang-mutants-sema-validation-context",
+            "crates/abide-sema/src/elab/resolve/validate.rs",
+            "mutants.out.sema-validation-context",
+            "walk_env_exprs",
+        ),
+    ];
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+
+        assert!(
+            contents.contains("check-lang-mutants-sema-expr-helpers"),
+            "{file_name} must expose one focused sema expression-helper aggregate lane"
+        );
+        assert!(
+            contents.contains("--shard")
+                && contents.contains("mutants.out.sema-resolution-expr-expected")
+                && contents.contains("mutants.out.sema-validation-context"),
+            "{file_name} must shard the focused sema expression-helper mutation lanes"
+        );
+        assert!(
+            contents.contains("$(MUTANTS_OUTPUT_DIR)")
+                || contents.contains("{{mutants_output_dir}}"),
+            "{file_name} must write focused sema mutation output under the configured mutants output directory"
+        );
+        assert!(
+            contents.contains("CARGO_BUILD_JOBS") && contents.contains("--test-threads"),
+            "{file_name} must keep focused sema mutation lanes resource-bounded"
+        );
+
+        for (target, file_filter, output_dir, regex_fragment) in required_lanes {
+            assert!(
+                contents.contains(target),
+                "{file_name} must expose the {target} focused sema mutation lane"
+            );
+            assert!(
+                contents.contains(file_filter),
+                "{file_name} {target} must restrict mutants to {file_filter}"
+            );
+            assert!(
+                contents.contains(output_dir),
+                "{file_name} {target} must write an isolated report directory"
+            );
+            assert!(
+                contents.contains(regex_fragment),
+                "{file_name} {target} must focus cargo-mutants on the extracted helper boundary"
+            );
+        }
+    }
 }
 
 /// Commerce fixture: multi-file via include (commerce.ab includes billing.ab).
@@ -9399,6 +9478,46 @@ fn collection_comprehensions_all_proved() {
 }
 
 #[test]
+fn map_source_comprehension_rejects_wrong_arity_tuple_binder() {
+    let program = parse_source(
+        r"module T
+
+const bad = { k | (k, _, _) in Map(1, 10, 2, 20) where true }
+",
+    );
+    let (_result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.iter().any(|error| {
+            error.message.contains("tuple binder")
+                && error.message.contains("3")
+                && error.message.contains("2")
+        }),
+        "wrong-arity map-source tuple binder should be rejected, got: {errors:?}"
+    );
+}
+
+#[test]
+fn odd_arity_map_literal_is_rejected_without_dropping_trailing_argument() {
+    let program = parse_source(
+        r"module T
+
+const bad = Map(1, 10, 2)
+",
+    );
+    let (_result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.iter().any(|error| {
+            error.message.contains("Map literal")
+                && error.message.contains("key/value argument pairs")
+                && error.message.contains("3 arguments")
+        }),
+        "odd-arity map literal should report a key/value pair diagnostic, got: {errors:?}"
+    );
+}
+
+#[test]
 fn real_set_comprehension_without_finite_source_has_actionable_diagnostic() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("real_set_comprehension.ab");
@@ -16912,6 +17031,31 @@ verify v {
     );
 }
 
+/// Aggregate body validation should run for every sema expression
+/// root, not just verifier-facing declarations. A const initializer
+/// with a non-numeric `sum` body used to fall through the validation
+/// pass because aggregate checks walked a hand-picked declaration list.
+#[test]
+fn aggregator_sum_bool_body_rejected_in_const_initializer() {
+    let src = r"module T
+
+enum Color = red | green | blue
+
+const bad = sum c: Color | true
+";
+    let (_result, errors) = elab_with_errors(src);
+    let real_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    assert!(
+        real_errors
+            .iter()
+            .any(|e| e.message.contains("Sum") && e.message.contains("numeric")),
+        "expected sum-body-must-be-numeric error, got: {real_errors:?}"
+    );
+}
+
 /// aggregator in fn ensures clause — count over enum in
 /// fn contract should work (finite unfolding in pure-expression encoder).
 #[test]
@@ -19989,6 +20133,336 @@ fn check(): bool {
     assert!(
         errors.iter().any(|e| e.contains("expects 1 type argument")),
         "expected arity mismatch in var declaration, got: {errors:?}"
+    );
+}
+
+#[test]
+fn typed_let_initializer_infers_generic_constructor_from_annotation() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(): bool =
+  let x: Option<int> = @None
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed let constructor initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &check.body else {
+        panic!("expected let body, got {:?}", check.body);
+    };
+    let (_, annotation, init) = bindings.first().expect("let binding");
+    assert!(
+        matches!(annotation, Some(abide::elab::types::Ty::Enum(name, _)) if name == "Option<int>"),
+        "let annotation should resolve to Option<int>, got {annotation:?}"
+    );
+    assert!(
+        matches!(init.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "constructor initializer should infer Option<int> from let annotation, got {init:?}"
+    );
+}
+
+#[test]
+fn typed_var_initializer_infers_generic_constructor_from_annotation() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(): bool {
+  var x: Option<int> = @None
+  true
+}
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed var constructor initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::VarDecl(_, annotation, init, _, _) = &check.body else {
+        panic!("expected var declaration body, got {:?}", check.body);
+    };
+    assert!(
+        matches!(annotation, Some(abide::elab::types::Ty::Enum(name, _)) if name == "Option<int>"),
+        "var annotation should resolve to Option<int>, got {annotation:?}"
+    );
+    assert!(
+        matches!(init.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "constructor initializer should infer Option<int> from var annotation, got {init:?}"
+    );
+}
+
+#[test]
+fn typed_tuple_initializer_propagates_expected_constructor_types() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(): bool =
+  let pair: (Option<int>, Option<bool>) = (@None, @None)
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed tuple constructor initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &check.body else {
+        panic!("expected let body, got {:?}", check.body);
+    };
+    let (_, _, init) = bindings.first().expect("let binding");
+    let abide::elab::types::EExpr::TupleLit(_, elements, _) = init else {
+        panic!("expected tuple initializer, got {init:?}");
+    };
+    assert!(
+        matches!(elements[0].ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "first tuple constructor should infer Option<int>, got {:?}",
+        elements[0]
+    );
+    assert!(
+        matches!(elements[1].ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<bool>"),
+        "second tuple constructor should infer Option<bool>, got {:?}",
+        elements[1]
+    );
+}
+
+#[test]
+fn typed_collection_initializers_propagate_expected_constructor_types() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn set_check(): bool =
+  let xs: Set<Option<int>> = Set(@None)
+  in true
+
+fn seq_check(): bool =
+  let ys: Seq<Option<bool>> = Seq(@None)
+  in true
+
+fn map_check(): bool =
+  let lookup: Map<Option<int>, Option<bool>> = Map(@None, @None)
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed collection constructor initializers should elaborate cleanly, got: {errors:?}"
+    );
+    let set_check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "set_check")
+        .expect("set_check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &set_check.body else {
+        panic!("expected set let body, got {:?}", set_check.body);
+    };
+    let (_, _, xs) = &bindings[0];
+    let abide::elab::types::EExpr::SetLit(_, xs_elements, _) = xs else {
+        panic!("expected set initializer, got {xs:?}");
+    };
+    assert!(
+        matches!(xs_elements[0].ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "set element constructor should infer Option<int>, got {:?}",
+        xs_elements[0]
+    );
+
+    let seq_check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "seq_check")
+        .expect("seq_check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &seq_check.body else {
+        panic!("expected seq let body, got {:?}", seq_check.body);
+    };
+    let (_, _, ys) = &bindings[0];
+    let abide::elab::types::EExpr::SeqLit(_, ys_elements, _) = ys else {
+        panic!("expected seq initializer, got {ys:?}");
+    };
+    assert!(
+        matches!(ys_elements[0].ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<bool>"),
+        "seq element constructor should infer Option<bool>, got {:?}",
+        ys_elements[0]
+    );
+
+    let map_check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "map_check")
+        .expect("map_check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &map_check.body else {
+        panic!("expected map let body, got {:?}", map_check.body);
+    };
+    let (_, _, lookup) = &bindings[0];
+    let abide::elab::types::EExpr::MapLit(_, entries, _) = lookup else {
+        panic!("expected map initializer, got {lookup:?}");
+    };
+    let (key, value) = entries.first().expect("map entry");
+    assert!(
+        matches!(key.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "map key constructor should infer Option<int>, got {key:?}"
+    );
+    assert!(
+        matches!(value.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<bool>"),
+        "map value constructor should infer Option<bool>, got {value:?}"
+    );
+}
+
+#[test]
+fn typed_constructor_call_initializer_propagates_expected_payload_type() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(): bool =
+  let nested: Option<Option<int>> = @Some(@None)
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed constructor call initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &check.body else {
+        panic!("expected let body, got {:?}", check.body);
+    };
+    let (_, _, init) = bindings.first().expect("let binding");
+    let abide::elab::types::EExpr::Call(_, _, args, _) = init else {
+        panic!("expected constructor call initializer, got {init:?}");
+    };
+    let arg = args.first().expect("constructor payload");
+    assert!(
+        matches!(arg.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "constructor payload should infer Option<int>, got {arg:?}"
+    );
+}
+
+#[test]
+fn typed_qualified_constructor_call_initializer_propagates_payload_type() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(): bool =
+  let nested: Option<Option<int>> = @Option::Some(@Option::None)
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed qualified constructor call initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &check.body else {
+        panic!("expected let body, got {:?}", check.body);
+    };
+    let (_, _, init) = bindings.first().expect("let binding");
+    let abide::elab::types::EExpr::Call(_, callee, args, _) = init else {
+        panic!("expected constructor call initializer, got {init:?}");
+    };
+    assert!(
+        matches!(callee.as_ref(), abide::elab::types::EExpr::Qual(abide::elab::types::Ty::Enum(name, _), scope, ctor, _) if name == "Option<Option<int>>" && scope == "Option" && ctor == "Some"),
+        "qualified constructor callee should infer Option<Option<int>>, got {callee:?}"
+    );
+    let arg = args.first().expect("constructor payload");
+    assert!(
+        matches!(arg.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "qualified constructor payload should infer Option<int>, got {arg:?}"
+    );
+}
+
+#[test]
+fn typed_if_initializer_propagates_expected_constructor_types() {
+    let program = parse_source(
+        r"module T
+
+enum Option<T> = Some(T) | None
+
+fn check(flag: bool): bool =
+  let selected: Option<int> = if flag { @None } else { @Some(1) }
+  in true
+",
+    );
+    let (result, errors) = elab::elaborate(&program);
+
+    assert!(
+        errors.is_empty(),
+        "typed if initializer should elaborate cleanly, got: {errors:?}"
+    );
+    let check = result
+        .fns
+        .iter()
+        .find(|f| f.name == "check")
+        .expect("check fn");
+    let abide::elab::types::EExpr::Let(bindings, _, _) = &check.body else {
+        panic!("expected let body, got {:?}", check.body);
+    };
+    let (_, _, init) = bindings.first().expect("let binding");
+    let abide::elab::types::EExpr::IfElse(_, then_branch, Some(else_branch), _) = init else {
+        panic!("expected if initializer, got {init:?}");
+    };
+    assert!(
+        matches!(then_branch.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "then branch constructor should infer Option<int>, got {then_branch:?}"
+    );
+    let abide::elab::types::EExpr::Call(_, _, args, _) = else_branch.as_ref() else {
+        panic!("expected else branch constructor call, got {else_branch:?}");
+    };
+    assert!(
+        matches!(else_branch.ty(), abide::elab::types::Ty::Enum(name, _) if name == "Option<int>"),
+        "else branch constructor call should infer Option<int>, got {else_branch:?}"
+    );
+    assert!(
+        matches!(
+            args.first().expect("constructor payload").ty(),
+            abide::elab::types::Ty::Builtin(abide::elab::types::BuiltinTy::Int)
+        ),
+        "constructor payload should remain int, got {:?}",
+        args.first()
     );
 }
 

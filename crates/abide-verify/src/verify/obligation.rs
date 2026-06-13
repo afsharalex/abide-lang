@@ -1838,11 +1838,9 @@ mod tests {
                     *entered_count += 1;
                     cvar.notify_all();
                     let _entered_wait = cvar
-                        .wait_timeout_while(
-                            entered_count,
-                            Duration::from_millis(500),
-                            |count| *count < 2,
-                        )
+                        .wait_timeout_while(entered_count, Duration::from_millis(500), |count| {
+                            *count < 2
+                        })
                         .expect("entered count wait");
                     active.fetch_sub(1, Ordering::SeqCst);
                     obligation.id.as_str().to_owned()

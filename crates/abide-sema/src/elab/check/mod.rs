@@ -583,6 +583,17 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
         }
         EExpr::Call(_, f, args, span) => {
             if let EExpr::Var(_, name, _) = f.as_ref() {
+                if name == "Map" && args.len() % 2 != 0 {
+                    errors.push(ElabError::new(
+                        ErrorKind::TypeMismatch,
+                        format!(
+                            "Map literal expects key/value argument pairs, got {} argument{}",
+                            args.len(),
+                            if args.len() == 1 { "" } else { "s" }
+                        ),
+                        ctx,
+                    ));
+                }
                 if is_relation_operation_name(name) {
                     push_relation_error(
                         errors,

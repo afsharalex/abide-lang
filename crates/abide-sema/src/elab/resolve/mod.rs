@@ -15,11 +15,14 @@ use super::types::{
 use crate::ast::UseDecl;
 
 mod expr;
-use expr::{collect_epattern_vars, resolve_ctor_type_from_context, resolve_expr};
+use expr::{collect_epattern_vars, resolve_expr};
+mod collection;
 mod monomorphize;
 use monomorphize::{
     collect_all_param_uses, format_mono_name, monomorphize_generics, monomorphize_inline,
 };
+mod constructor;
+use constructor::resolve_ctor_type_from_context;
 mod assumptions;
 use assumptions::{resolve_assumption_sets, resolve_by_lemmas_subset_containment};
 mod validate;
