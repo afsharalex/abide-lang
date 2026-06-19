@@ -12,6 +12,10 @@ use crate::lex::Token;
 use crate::span::Span;
 
 fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
+    if matches!(op, Token::And | Token::Or) {
+        return make_boolean_associative_infix(lhs, op, rhs);
+    }
+
     let kind = match op {
         Token::PipeGt => ExprKind::Pipe(Box::new(lhs), Box::new(rhs)),
         Token::Pipe => ExprKind::Unord(Box::new(lhs), Box::new(rhs)),
@@ -42,6 +46,71 @@ fn make_infix(lhs: Expr, op: &Token, rhs: Expr, span: Span) -> Expr {
         _ => unreachable!("not an infix operator: {op}"),
     };
     Expr { kind, span }
+}
+
+fn make_boolean_associative_infix(lhs: Expr, op: &Token, rhs: Expr) -> Expr {
+    let mut operands = Vec::new();
+    match op {
+        Token::And => {
+            flatten_and(lhs, &mut operands);
+            flatten_and(rhs, &mut operands);
+            build_balanced_associative(operands, |left, right| {
+                ExprKind::And(Box::new(left), Box::new(right))
+            })
+        }
+        Token::Or => {
+            flatten_or(lhs, &mut operands);
+            flatten_or(rhs, &mut operands);
+            build_balanced_associative(operands, |left, right| {
+                ExprKind::Or(Box::new(left), Box::new(right))
+            })
+        }
+        _ => unreachable!("boolean associative infix called for non-boolean token"),
+    }
+}
+
+fn flatten_and(expr: Expr, operands: &mut Vec<Expr>) {
+    match expr.kind {
+        ExprKind::And(left, right) => {
+            flatten_and(*left, operands);
+            flatten_and(*right, operands);
+        }
+        _ => operands.push(expr),
+    }
+}
+
+fn flatten_or(expr: Expr, operands: &mut Vec<Expr>) {
+    match expr.kind {
+        ExprKind::Or(left, right) => {
+            flatten_or(*left, operands);
+            flatten_or(*right, operands);
+        }
+        _ => operands.push(expr),
+    }
+}
+
+fn build_balanced_associative(
+    mut operands: Vec<Expr>,
+    make_kind: impl Copy + Fn(Expr, Expr) -> ExprKind,
+) -> Expr {
+    debug_assert!(!operands.is_empty());
+    while operands.len() > 1 {
+        let mut next = Vec::with_capacity(operands.len().div_ceil(2));
+        let mut iter = operands.into_iter();
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                let span = left.span.merge(right.span);
+                next.push(Expr {
+                    kind: make_kind(left, right),
+                    span,
+                });
+            } else {
+                next.push(left);
+            }
+        }
+        operands = next;
+    }
+    operands.pop().expect("non-empty associative operands")
 }
 
 pub(super) fn is_infix_operator_token(token: &Token) -> bool {
@@ -105,18 +174,48 @@ impl Parser {
     }
 
     pub(super) fn expr_bp(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        // Bound recursive descent so deeply nested input (e.g. `((((…))))` or a
+        // right-associated chain) yields a diagnostic rather than overflowing
+        // the stack here or in any downstream walker.
+        self.expr_depth += 1;
+        if self.expr_depth > super::MAX_EXPR_DEPTH {
+            self.expr_depth -= 1;
+            return Err(self.expr_too_deep_error());
+        }
+        let result = self.expr_bp_inner(min_bp);
+        self.expr_depth -= 1;
+        result
+    }
+
+    /// Build the cross-crate "expression too deeply nested" parse error.
+    fn expr_too_deep_error(&self) -> ParseError {
+        ParseError::general_with_help(
+            &crate::messages::expression_too_deeply_nested(super::MAX_EXPR_DEPTH),
+            self.cur_span(),
+            crate::messages::HELP_EXPRESSION_TOO_DEEP,
+        )
+    }
+
+    fn expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let start = self.cur_span();
         let mut lhs = self.expr_prefix(min_bp)?;
 
+        // Bound non-flattened left-associative folds. Boolean `and`/`or`
+        // chains are rebuilt as shallow balanced trees in `make_infix`, so they
+        // are allowed to exceed this adversarial structural-nesting limit.
+        let mut folds = 0usize;
         loop {
             if self.at_end() {
                 break;
             }
-
             // Postfix operators (level 13, bp 27)
             if let Some(l_bp) = self.peek().and_then(postfix_bp) {
                 if l_bp < min_bp {
                     break;
+                }
+                folds += 1;
+                if folds > super::MAX_EXPR_DEPTH {
+                    return Err(self.expr_too_deep_error());
                 }
                 lhs = self.parse_postfix(lhs)?;
                 continue;
@@ -129,6 +228,10 @@ impl Parser {
             {
                 if let ExprKind::Var(name) = &lhs.kind {
                     let name = name.clone();
+                    folds += 1;
+                    if folds > super::MAX_EXPR_DEPTH {
+                        return Err(self.expr_too_deep_error());
+                    }
                     self.advance(); // consume :
                     let rhs = self.expr_bp(BP_NAMED_PAIR_RHS)?;
                     let span = start.merge(rhs.span);
@@ -157,6 +260,12 @@ impl Parser {
                 let (op, _) = self.advance();
                 let rhs = self.expr_bp(r_bp)?;
                 let span = start.merge(rhs.span);
+                if !matches!(op, Token::And | Token::Or) {
+                    folds += 1;
+                    if folds > super::MAX_EXPR_DEPTH {
+                        return Err(self.expr_too_deep_error());
+                    }
+                }
                 lhs = make_infix(lhs, &op, rhs, span);
                 continue;
             }

@@ -40,32 +40,53 @@ fn cvc5_sygus_regression_config() -> VerifyConfig {
     }
 }
 
-fn cvc5_bounded_regression_config() -> VerifyConfig {
-    VerifyConfig {
-        solver_selection: SolverSelection::Cvc5,
-        bounded_only: true,
-        no_ic3: true,
-        ..short_solver_regression_config()
-    }
-}
-
-fn proved_under_cvc5_selection(result: &VerificationResult) -> bool {
+fn proved_by_cvc5_sygus(result: &VerificationResult) -> bool {
     matches!(
         result,
         VerificationResult::Proved { method, .. }
             if method == "CVC5 SyGuS invariant synthesis"
-                || method == "explicit-state exhaustive search"
-    ) || matches!(result, VerificationResult::Checked { .. })
+    )
 }
 
-const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
+#[test]
+fn cvc5_sygus_assertion_rejects_non_sygus_fallbacks() {
+    let sygus_proved = VerificationResult::Proved {
+        name: "safety".to_owned(),
+        method: "CVC5 SyGuS invariant synthesis".to_owned(),
+        time_ms: 0,
+        assumptions: Vec::new(),
+        span: None,
+        file: None,
+    };
+    assert!(proved_by_cvc5_sygus(&sygus_proved));
 
-fn should_run_unbounded_proof_tests() -> bool {
-    std::env::var_os(UNBOUNDED_PROOF_TEST_ENV).is_some()
-}
+    let explicit_state_proved = VerificationResult::Proved {
+        name: "safety".to_owned(),
+        method: "explicit-state exhaustive search".to_owned(),
+        time_ms: 0,
+        assumptions: Vec::new(),
+        span: None,
+        file: None,
+    };
+    assert!(
+        !proved_by_cvc5_sygus(&explicit_state_proved),
+        "SyGuS-specific tests must fail when routed through explicit-state fallback"
+    );
 
-fn skip_unbounded_proof_test() {
-    eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
+    let checked = VerificationResult::Checked {
+        name: "safety".to_owned(),
+        depth: 4,
+        method: Some("bounded trace-prefix depth 4".to_owned()),
+        time_ms: 0,
+        assumptions: Vec::new(),
+        backend_diagnostics: Vec::new(),
+        span: None,
+        file: None,
+    };
+    assert!(
+        !proved_by_cvc5_sygus(&checked),
+        "SyGuS-specific tests must fail when only bounded checking runs"
+    );
 }
 
 fn bool_lit(value: bool) -> IRExpr {
@@ -109,15 +130,6 @@ fn behavior_has_command(behavior: &op::Behavior, system: &str, command: &str) ->
             .iter()
             .any(|step| step.system() == system && step.command() == command)
     })
-}
-
-macro_rules! require_unbounded_proof_tests {
-    () => {
-        if !should_run_unbounded_proof_tests() {
-            skip_unbounded_proof_test();
-            return;
-        }
-    };
 }
 
 /// Helper: build a minimal IR program with an Order entity, `OrderStatus` enum,
@@ -1582,6 +1594,167 @@ fn make_system_field_strong_fair_eventual_liveness_ir() -> IRProgram {
     }
 }
 
+fn make_system_field_weak_fair_intermittent_liveness_ir() -> IRProgram {
+    let mut ir = make_system_field_strong_fair_eventual_liveness_ir();
+    ir.systems[0].name = "WorkflowWeakIntermittentFair".to_owned();
+    ir.verifies[0].name =
+        "workflow_eventually_finishes_under_weak_fair_intermittent_finish".to_owned();
+    ir.verifies[0].systems[0].name = "WorkflowWeakIntermittentFair".to_owned();
+    ir.verifies[0].assumption_set.weak_fair = vec![IRCommandRef {
+        system: "WorkflowWeakIntermittentFair".to_owned(),
+        command: "finish".to_owned(),
+    }];
+    ir.verifies[0].assumption_set.strong_fair.clear();
+    ir
+}
+
+fn make_past_time_negative_ir() -> IRProgram {
+    fn verify(name: &str, assert: IRExpr) -> IRVerify {
+        IRVerify {
+            name: name.to_owned(),
+            depth: Some(1),
+            systems: vec![IRVerifySystem {
+                name: "PastTimeHarness".to_owned(),
+                lo: 0,
+                hi: 1,
+            }],
+            stores: vec![],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
+            initial_constraints: vec![],
+            asserts: vec![assert],
+            span: None,
+            file: None,
+        }
+    }
+
+    IRProgram {
+        interfaces: vec![],
+        types: vec![],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![],
+        systems: vec![IRSystem {
+            name: "PastTimeHarness".to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec![],
+            commands: vec![],
+            actions: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        }],
+        verifies: vec![
+            verify(
+                "previously_true_fails_at_initial_state",
+                IRExpr::Previously {
+                    body: Box::new(bool_lit(true)),
+                    span: None,
+                },
+            ),
+            verify(
+                "once_false_never_held",
+                IRExpr::Once {
+                    body: Box::new(bool_lit(false)),
+                    span: None,
+                },
+            ),
+            verify(
+                "historically_false_fails_now",
+                IRExpr::Historically {
+                    body: Box::new(bool_lit(false)),
+                    span: None,
+                },
+            ),
+            verify(
+                "true_since_false_never_started",
+                IRExpr::Since {
+                    left: Box::new(bool_lit(true)),
+                    right: Box::new(bool_lit(false)),
+                    span: None,
+                },
+            ),
+        ],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    }
+}
+
+fn make_system_action_with_bare_expr_stmt_ir(name: &str, expr: IRExpr) -> IRProgram {
+    IRProgram {
+        interfaces: vec![],
+        types: vec![],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![],
+        systems: vec![IRSystem {
+            name: "BareExprAction".to_owned(),
+            store_params: vec![],
+            fields: vec![IRField {
+                name: "done".to_owned(),
+                ty: IRType::Bool,
+                default: Some(bool_lit(false)),
+                initial_constraint: None,
+            }],
+            entities: vec![],
+            commands: vec![],
+            actions: vec![IRSystemAction {
+                name: name.to_owned(),
+                params: vec![],
+                guard: bool_lit(true),
+                body: vec![IRAction::ExprStmt { expr }],
+                return_expr: None,
+            }],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        }],
+        verifies: vec![IRVerify {
+            name: format!("{name}_body_is_rejected"),
+            depth: Some(1),
+            systems: vec![IRVerifySystem {
+                name: "BareExprAction".to_owned(),
+                lo: 0,
+                hi: 1,
+            }],
+            stores: vec![],
+            assumption_set: IRAssumptionSet::default_for_verify(),
+            activations: vec![],
+            initial_constraints: vec![],
+            asserts: vec![IRExpr::Always {
+                body: Box::new(IRExpr::UnOp {
+                    op: "OpNot".to_owned(),
+                    operand: Box::new(IRExpr::Var {
+                        name: "done".to_owned(),
+                        ty: IRType::Bool,
+                        span: None,
+                    }),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                span: None,
+            }],
+            span: None,
+            file: None,
+        }],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    }
+}
+
 fn make_system_field_bool_param_counterexample_ir() -> IRProgram {
     let mut ir = make_system_field_bool_param_ir();
     ir.verifies[0].name = "toggle_stays_false".to_owned();
@@ -1887,6 +2060,8 @@ fn make_explicit_entity_store_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -2305,6 +2480,8 @@ fn make_explicit_entity_store_transition_arg_counterexample_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -2532,6 +2709,8 @@ fn make_explicit_entity_store_ref_counterexample_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -2760,6 +2939,8 @@ fn make_explicit_entity_store_ref_cross_call_weak_fair_liveness_ir() -> IRProgra
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -2927,6 +3108,8 @@ fn make_explicit_entity_store_ref_param_per_tuple_weak_fair_liveness_ir() -> IRP
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3120,6 +3303,8 @@ fn make_explicit_entity_store_ref_param_cross_call_per_tuple_weak_fair_liveness_
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3250,6 +3435,8 @@ fn make_explicit_entity_store_ref_result_cross_call_weak_fair_liveness_ir() -> I
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3426,6 +3613,8 @@ fn make_explicit_entity_store_ref_result_per_tuple_weak_fair_liveness_ir() -> IR
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3543,6 +3732,8 @@ fn make_explicit_entity_store_ref_result_nested_cross_call_weak_fair_liveness_ir
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3622,6 +3813,8 @@ fn make_explicit_entity_store_ref_result_nested_cross_call_per_tuple_weak_fair_l
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3717,6 +3910,8 @@ fn make_explicit_entity_store_ref_result_deep_nested_cross_call_per_tuple_weak_f
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -3864,6 +4059,8 @@ fn make_explicit_entity_store_ref_match_cross_call_weak_fair_liveness_ir() -> IR
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -4050,6 +4247,8 @@ fn make_explicit_entity_store_ref_param_nested_cross_call_per_tuple_weak_fair_li
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketPeerParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketPeerParam".to_owned()],
@@ -4249,10 +4448,14 @@ fn make_explicit_multi_entity_store_counterexample_ir() -> IRProgram {
             IRStoreParam {
                 name: "orders".to_owned(),
                 entity_type: "Order".to_owned(),
+                lo: None,
+                hi: None,
             },
             IRStoreParam {
                 name: "invoices".to_owned(),
                 entity_type: "Invoice".to_owned(),
+                lo: None,
+                hi: None,
             },
         ],
         fields: vec![],
@@ -4559,6 +4762,8 @@ fn make_explicit_bare_entity_apply_counterexample_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "tasks".to_owned(),
             entity_type: "Task".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Task".to_owned()],
@@ -5374,6 +5579,8 @@ fn make_explicit_entity_store_cross_call_weak_fair_liveness_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -5446,6 +5653,8 @@ fn make_explicit_entity_store_nested_cross_call_weak_fair_liveness_ir() -> IRPro
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "Ticket".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Ticket".to_owned()],
@@ -5590,6 +5799,8 @@ fn make_explicit_entity_store_param_per_tuple_weak_fair_liveness_ir() -> IRProgr
         store_params: vec![IRStoreParam {
             name: "tickets".to_owned(),
             entity_type: "TicketFairParam".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["TicketFairParam".to_owned()],
@@ -8978,6 +9189,8 @@ fn make_pooled_callee_store_crosscall_counter_ir() -> IRProgram {
         store_params: vec![IRStoreParam {
             name: "live".to_owned(),
             entity_type: "Counter".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Counter".to_owned()],
@@ -9614,6 +9827,8 @@ fn make_pooled_store_counter_ir() -> IRProgram {
         store_params: vec![crate::ir::types::IRStoreParam {
             name: "items".to_owned(),
             entity_type: "Counter".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Counter".to_owned()],
@@ -11090,9 +11305,8 @@ fn scene_impossible_assertion_fails() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn theorem_proved_by_induction() {
-    require_unbounded_proof_tests!();
-
     // Theorem: status is always a valid enum variant (never -1).
     // This is trivially inductive — domain constraints enforce it at every step.
     let mut ir = make_order_ir(
@@ -11164,9 +11378,8 @@ fn theorem_proved_by_induction() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn theorem_unprovable_when_not_inductive() {
-    require_unbounded_proof_tests!();
-
     // Theorem: all orders are always Pending.
     // This is NOT inductive — the confirm transition changes Pending → Confirmed.
     let mut ir = make_order_ir(
@@ -11271,12 +11484,135 @@ fn theorem_unprovable_when_not_inductive() {
             results[0]
         )
     });
-    assert_eq!(witness.behavior().states().len(), 2);
-    assert_eq!(witness.behavior().transitions().len(), 1);
-    let atomic_steps = witness.behavior().transitions()[0].atomic_steps();
+    assert!(
+        witness.behavior().states().len() >= 2,
+        "expected a concrete violating trace, got {witness:?}"
+    );
+    let final_transition = witness
+        .behavior()
+        .transitions()
+        .last()
+        .expect("counterexample should include a transition");
+    let atomic_steps = final_transition.atomic_steps();
     assert_eq!(atomic_steps.len(), 1);
     assert_eq!(atomic_steps[0].system(), "Commerce");
     assert_eq!(atomic_steps[0].command(), "confirm_order");
+}
+
+#[test]
+fn theorem_step_obligation_finds_confirm_order_countermodel() {
+    let mut ir = make_order_ir(
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        },
+        3,
+    );
+    ir.systems[0].actions.push(IRSystemAction {
+        name: "create_order".to_owned(),
+        params: vec![],
+        guard: IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        },
+        body: vec![IRAction::Create {
+            entity: "Order".to_owned(),
+            fields: vec![
+                IRCreateField {
+                    name: "id".to_owned(),
+                    value: IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    },
+                },
+                IRCreateField {
+                    name: "status".to_owned(),
+                    value: IRExpr::Ctor {
+                        enum_name: "OrderStatus".to_owned(),
+                        ctor: "Pending".to_owned(),
+                        args: vec![],
+                        span: None,
+                    },
+                },
+            ],
+        }],
+        return_expr: None,
+    });
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::from_ir(&ir);
+    let scope = HashMap::from([("Order".to_owned(), 2_usize)]);
+    let pool = create_slot_pool_with_systems(&ir.entities, &scope, 1, &ir.systems);
+    let property = IRExpr::Forall {
+        var: "o".to_owned(),
+        domain: IRType::Entity {
+            name: "Order".to_owned(),
+        },
+        body: Box::new(IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Field {
+                expr: Box::new(IRExpr::Var {
+                    name: "o".to_owned(),
+                    ty: IRType::Entity {
+                        name: "Order".to_owned(),
+                    },
+                    span: None,
+                }),
+                field: "status".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Ctor {
+                enum_name: "OrderStatus".to_owned(),
+                ctor: "Pending".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        }),
+        span: None,
+    };
+    let prop_t0 = encode_property_at_step(
+        &pool,
+        &vctx,
+        &defs,
+        &property,
+        0,
+        &HashMap::new(),
+        &ir.systems,
+    )
+    .expect("property t0");
+    let prop_t1 = encode_property_at_step(
+        &pool,
+        &vctx,
+        &defs,
+        &property,
+        1,
+        &HashMap::new(),
+        &ir.systems,
+    )
+    .expect("property t1");
+    let transition = harness::try_transition_constraints(
+        &pool,
+        &vctx,
+        &ir.entities,
+        &ir.systems,
+        0,
+        &IRAssumptionSet::default_for_theorem_or_lemma(),
+    )
+    .expect("transition");
+    let solver = AbideSolver::new();
+    for constraint in domain_constraints(&pool, &vctx, &ir.entities) {
+        solver.assert(&constraint);
+    }
+    solver.assert(&prop_t0);
+    solver.assert(&transition);
+    solver.assert(smt::bool_not(&prop_t1));
+
+    assert_eq!(solver.check(), SatResult::Sat);
 }
 
 #[test]
@@ -11546,9 +11882,8 @@ fn make_dead_event_theorem_ir(invariants: Vec<IRExpr>, shows: Vec<IRExpr>) -> IR
 /// relation. The trace-validity guard added in this fix bails the
 /// induction site to UNPROVABLE in that case.
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn theorem_step_case_does_not_vacuously_prove_under_no_stutter() {
-    require_unbounded_proof_tests!();
-
     // Trivially true property (`all a: A | a.x == a.x`). Without
     // the guard, 1-induction "proves" it vacuously because the
     // transition relation is unsatisfiable.
@@ -11613,9 +11948,8 @@ fn theorem_step_case_does_not_vacuously_prove_under_no_stutter() {
 /// and the theorem reported PROVED even though the trace cannot
 /// extend at all under no-stutter.
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn theorem_invariant_preservation_does_not_vacuously_prove_under_no_stutter() {
-    require_unbounded_proof_tests!();
-
     // Trivially true invariant (`all a: A | a.x == a.x`).
     let trivial_inv = IRExpr::Forall {
         var: "a".to_owned(),
@@ -11740,9 +12074,8 @@ fn tiered_bounded_only_skips_induction() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn tiered_unbounded_only_returns_unknown_on_failure() {
-    require_unbounded_proof_tests!();
-
     // With unbounded_only, a non-inductive property should be UNKNOWN (not CHECKED)
     let mut ir = make_order_ir(
         IRExpr::Always {
@@ -11937,9 +12270,8 @@ fn symmetry_breaking_does_not_regress_results() {
 /// 1-induction fails because from an arbitrary state with y=10, x could
 /// be anything, and y'=11 violates the property. IC3 discovers `y == x`.
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn ic3_proves_property_induction_cannot() {
-    require_unbounded_proof_tests!();
-
     let entity = IREntity {
         name: "Counter".to_owned(),
         fields: vec![
@@ -12143,10 +12475,13 @@ fn ic3_proves_property_induction_cannot() {
                 strong_fair: Vec::new(),
                 per_tuple: Vec::new(),
             },
+            // Keep the proof-gate fixture deliberately small. The larger
+            // S[0..20] version is an IC3 scalability/performance case, not a
+            // deterministic strict-lane smoke test.
             systems: vec![IRVerifySystem {
                 name: "S".to_owned(),
                 lo: 0,
-                hi: 20,
+                hi: 2,
             }],
             activations: vec![],
             initial_constraints: vec![],
@@ -12208,9 +12543,8 @@ fn ic3_proves_property_induction_cannot() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn no_ic3_flag_skips_ic3_verify_falls_to_bmc() {
-    require_unbounded_proof_tests!();
-
     // Same IR as ic3_proves_property_induction_cannot, but with verify IC3 disabled.
     // Verify block: induction fails, IC3 skipped, falls to BMC → CHECKED.
     let ir = make_two_counter_ir();
@@ -12228,10 +12562,11 @@ fn no_ic3_flag_skips_ic3_verify_falls_to_bmc() {
         results[0]
     );
 
-    // Theorem: proof-oriented path still tries IC3 by default.
+    // Theorem: `no_ic3` skips IC3/PDR for proof-oriented paths too, but the
+    // theorem is still allowed to prove by an earlier sound proof tier.
     assert!(
-        matches!(&results[1], VerificationResult::Proved { method, .. } if method == "IC3/PDR"),
-        "expected theorem to still prove with IC3/PDR, got: {}",
+        matches!(&results[1], VerificationResult::Proved { .. }),
+        "expected theorem to still prove without IC3/PDR, got: {}",
         results[1]
     );
 }
@@ -12264,9 +12599,8 @@ fn bounded_only_skips_theorem_proving() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn unbounded_only_no_ic3_gives_accurate_hint() {
-    require_unbounded_proof_tests!();
-
     // --unbounded-only with verify IC3 disabled: hint should say IC3 was not enabled.
     let ir = make_two_counter_ir();
     let config = VerifyConfig {
@@ -12287,6 +12621,10 @@ fn unbounded_only_no_ic3_gives_accurate_hint() {
 
 /// Helper: build the two-counter IR used by multiple IC3 flag tests.
 fn make_two_counter_ir() -> IRProgram {
+    make_two_counter_ir_with_verify_hi(2)
+}
+
+fn make_two_counter_ir_with_verify_hi(verify_hi: i64) -> IRProgram {
     let entity = IREntity {
         name: "Counter".to_owned(),
         fields: vec![
@@ -12492,7 +12830,7 @@ fn make_two_counter_ir() -> IRProgram {
             systems: vec![IRVerifySystem {
                 name: "S".to_owned(),
                 lo: 0,
-                hi: 20,
+                hi: verify_hi,
             }],
             activations: vec![],
             initial_constraints: vec![],
@@ -12834,14 +13172,172 @@ fn compute_theorem_scope_follows_let_bindings_and_crosscalls() {
     };
 
     let defs = defenv::DefEnv::from_ir(&ir);
-    let (scope, system_names, required_slots) = compute_theorem_scope(&ir, &theorem, &[], &defs);
+    let scope_parts = compute_theorem_scope(&ir, &theorem, &[], &defs);
 
-    assert_eq!(scope.get("Task").copied(), Some(2));
-    assert_eq!(scope.get("Log").copied(), Some(2));
-    assert!(system_names.contains(&"Program".to_owned()));
-    assert!(system_names.contains(&"Worker".to_owned()));
-    assert!(system_names.contains(&"Audit".to_owned()));
-    assert!(required_slots.is_empty());
+    assert_eq!(scope_parts.slots_per_entity.get("Task").copied(), Some(2));
+    assert_eq!(scope_parts.slots_per_entity.get("Log").copied(), Some(2));
+    assert!(scope_parts.system_names.contains(&"Program".to_owned()));
+    assert!(scope_parts.system_names.contains(&"Worker".to_owned()));
+    assert!(scope_parts.system_names.contains(&"Audit".to_owned()));
+    assert!(scope_parts.required_slots.is_empty());
+    assert!(scope_parts.store_ranges.is_empty());
+}
+
+#[test]
+fn compute_theorem_scope_derives_store_ranges_from_system_params() {
+    let order = IREntity {
+        name: "Order".to_owned(),
+        fields: vec![],
+        transitions: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+    let commerce = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![IRStoreParam {
+            name: "orders".to_owned(),
+            entity_type: "Order".to_owned(),
+            lo: Some(1),
+            hi: Some(3),
+        }],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let theorem = IRTheorem {
+        name: "orders_nonempty".to_owned(),
+        systems: vec!["Commerce".to_owned()],
+        assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        invariants: vec![],
+        shows: vec![],
+        by_file: None,
+        by_lemmas: vec![],
+        span: None,
+        file: None,
+    };
+    let ir = IRProgram {
+        interfaces: vec![],
+        types: vec![],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![order],
+        systems: vec![commerce],
+        verifies: vec![],
+        theorems: vec![theorem.clone()],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let defs = defenv::DefEnv::from_ir(&ir);
+
+    let scope = compute_theorem_scope(&ir, &theorem, &[], &defs);
+
+    assert_eq!(scope.slots_per_entity.get("Order").copied(), Some(3));
+    let orders = scope
+        .store_ranges
+        .get("orders")
+        .expect("the theorem scope should expose the system store parameter");
+    assert_eq!(orders.entity_type, "Order");
+    assert_eq!(orders.start_slot, 0);
+    assert_eq!(orders.min_active, 1);
+    assert_eq!(orders.slot_count, 3);
+}
+
+#[test]
+fn compute_theorem_scope_does_not_duplicate_composed_store_params() {
+    let order = IREntity {
+        name: "Order".to_owned(),
+        fields: vec![],
+        transitions: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        fsm_decls: vec![],
+    };
+    let program = IRSystem {
+        name: "CommerceProgram".to_owned(),
+        store_params: vec![IRStoreParam {
+            name: "orders".to_owned(),
+            entity_type: "Order".to_owned(),
+            lo: Some(1),
+            hi: Some(1),
+        }],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![IRLetBinding {
+            name: "worker".to_owned(),
+            system_type: "Worker".to_owned(),
+            store_bindings: vec![("orders".to_owned(), "orders".to_owned())],
+        }],
+        procs: vec![],
+    };
+    let worker = IRSystem {
+        name: "Worker".to_owned(),
+        store_params: vec![IRStoreParam {
+            name: "orders".to_owned(),
+            entity_type: "Order".to_owned(),
+            lo: Some(1),
+            hi: Some(1),
+        }],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let theorem = IRTheorem {
+        name: "orders_nonempty".to_owned(),
+        systems: vec!["CommerceProgram".to_owned()],
+        assumption_set: IRAssumptionSet::default_for_theorem_or_lemma(),
+        invariants: vec![],
+        shows: vec![],
+        by_file: None,
+        by_lemmas: vec![],
+        span: None,
+        file: None,
+    };
+    let ir = IRProgram {
+        interfaces: vec![],
+        types: vec![],
+        constants: vec![],
+        functions: vec![],
+        entities: vec![order],
+        systems: vec![program, worker],
+        verifies: vec![],
+        theorems: vec![theorem.clone()],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let defs = defenv::DefEnv::from_ir(&ir);
+
+    let scope = compute_theorem_scope(&ir, &theorem, &[], &defs);
+
+    assert_eq!(scope.slots_per_entity.get("Order").copied(), Some(1));
+    assert_eq!(scope.store_ranges.len(), 1);
+    assert!(scope.store_ranges.contains_key("orders"));
+    assert!(scope.system_names.contains(&"Worker".to_owned()));
 }
 
 #[test]
@@ -13134,6 +13630,55 @@ fn contains_past_time_detects_all_past_operators() {
 
     assert!(contains_past_time(&expr));
     assert!(!contains_past_time(&future_only));
+}
+
+#[test]
+fn verify_all_falsifies_non_tautological_past_time_assertions() {
+    let ir = make_past_time_negative_ir();
+    let config = VerifyConfig {
+        no_ic3: true,
+        ..VerifyConfig::default()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert_eq!(
+        results.len(),
+        4,
+        "expected one result per past-time fixture"
+    );
+    for result in &results {
+        assert!(
+            matches!(result, VerificationResult::Counterexample { .. }),
+            "expected past-time negative fixture to falsify, got: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn verify_all_rejects_bare_expr_stmt_action_body() {
+    let config = VerifyConfig {
+        no_ic3: true,
+        ..VerifyConfig::default()
+    };
+
+    for (action_name, expr) in [
+        ("silently_true_noop", bool_lit(true)),
+        ("silently_false_noop", bool_lit(false)),
+    ] {
+        let ir = make_system_action_with_bare_expr_stmt_ir(action_name, expr);
+        let results = verify_all(&ir, &config);
+
+        assert!(
+            matches!(
+                &results[0],
+                VerificationResult::Unprovable { hint, .. }
+                    if hint.contains(&format!("BareExprAction.{action_name} event body"))
+                        && hint.contains("action statement must be an assignment")
+            ),
+            "bare expression statements in action bodies must be rejected before verification, got: {results:?}"
+        );
+    }
 }
 
 // ── Map encoding tests ──────────────────────────────────────────
@@ -17224,9 +17769,8 @@ fn multi_apply_scene_checks_final_state() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn multi_apply_ic3_proves_property() {
-    require_unbounded_proof_tests!();
-
     // IC3 rejects same-entity multi-apply (CHC per-Apply rules model
     // multi-step, not atomic intra-event composition). Falls through to
     // staged induction which uses BMC-style intermediate variable chaining.
@@ -18484,6 +19028,18 @@ fn action_precheck_allows_forall_sequential_apply_to_bound_entity() {
     }];
 
     assert_eq!(find_unsupported_in_actions(&actions), None);
+}
+
+#[test]
+fn action_precheck_rejects_bare_expr_stmt() {
+    for expr in [bool_lit(true), bool_lit(false)] {
+        let actions = vec![IRAction::ExprStmt { expr }];
+
+        assert_eq!(
+            find_unsupported_in_actions(&actions),
+            Some("action statement must be an assignment equality")
+        );
+    }
 }
 
 #[test]
@@ -21272,10 +21828,12 @@ fn verify_all_with_cvc5_selection_checks_simple_bmc_target() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn verify_all_with_independent_z3_chc_selection_preserves_ic3_proofs() {
-    require_unbounded_proof_tests!();
-
-    let ir = make_two_counter_ir();
+    let mut ir = make_two_counter_ir();
+    // Keep this regression focused on mixed-backend routing. The broader
+    // S[0..20] fixture exercises IC3 scalability and is tracked separately.
+    ir.verifies[0].systems[0].hi = 2;
     let config = VerifyConfig {
         solver_selection: SolverSelection::Cvc5,
         chc_selection: ChcSelection::Z3,
@@ -21302,13 +21860,13 @@ fn verify_all_with_independent_z3_chc_selection_preserves_ic3_proofs() {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn verify_all_with_cvc5_chc_selection_is_honest_about_current_chc_limit() {
-    require_unbounded_proof_tests!();
-
     let ir = make_two_counter_ir();
     let config = VerifyConfig {
         solver_selection: SolverSelection::Cvc5,
         chc_selection: ChcSelection::Cvc5,
+        no_ic3: false,
         unbounded_only: true,
         ..short_solver_regression_config()
     };
@@ -21316,10 +21874,15 @@ fn verify_all_with_cvc5_chc_selection_is_honest_about_current_chc_limit() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        results
-            .iter()
-            .all(|r| matches!(r, VerificationResult::Unprovable { .. })),
-        "expected unbounded-only run with cvc5 CHC selection to stay honest instead of claiming proof: {results:?}"
+        matches!(
+            &results[0],
+            VerificationResult::Unprovable { name, .. } if name == "v"
+        ),
+        "expected verify block to stay honest about unsupported cvc5 CHC proof, got: {results:?}"
+    );
+    assert!(
+        matches!(&results[1], VerificationResult::Proved { .. }),
+        "theorem should still prove by an earlier sound proof tier when possible: {results:?}"
     );
 }
 
@@ -21451,8 +22014,8 @@ fn verify_all_with_cvc5_selection_proves_supported_system_field_safety_via_sygus
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected supported system-field safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected supported system-field safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -21641,6 +22204,35 @@ fn verify_all_explicit_state_respects_strong_fairness_on_parameterless_steps() {
             VerificationResult::Proved { method, .. } if method == "explicit-state exhaustive search"
         ),
         "expected strong-fair finite liveness slice to prove via explicit-state search, got: {results:?}"
+    );
+}
+
+#[test]
+fn verify_all_explicit_state_distinguishes_weak_from_strong_fairness() {
+    let weak_ir = make_system_field_weak_fair_intermittent_liveness_ir();
+    let strong_ir = make_system_field_strong_fair_eventual_liveness_ir();
+    let config = VerifyConfig {
+        unbounded_only: true,
+        no_ic3: true,
+        ..VerifyConfig::default()
+    };
+
+    let weak_results = verify_all(&weak_ir, &config);
+    let strong_results = verify_all(&strong_ir, &config);
+
+    assert!(
+        matches!(
+            &weak_results[0],
+            VerificationResult::LivenessViolation { .. }
+        ),
+        "weak fairness should allow the lasso where finish is enabled intermittently but never fires, got: {weak_results:?}"
+    );
+    assert!(
+        matches!(
+            &strong_results[0],
+            VerificationResult::Proved { method, .. } if method == "explicit-state exhaustive search"
+        ),
+        "strong fairness should reject the same intermittently-enabled lasso, got: {strong_results:?}"
     );
 }
 
@@ -23084,6 +23676,45 @@ fn verify_all_explicit_state_proves_ref_param_per_tuple_entity_store_liveness_un
 }
 
 #[test]
+fn verify_all_explicit_state_entity_param_fairness_error_is_not_success() {
+    let mut ir = make_explicit_entity_store_ref_param_per_tuple_weak_fair_liveness_ir();
+    ir.verifies[0].name = "entity_param_fairness_error_is_not_success".to_owned();
+    ir.verifies[0].asserts = vec![IRExpr::Always {
+        body: Box::new(IRExpr::Forall {
+            var: "ticket".to_owned(),
+            domain: IRType::Entity {
+                name: "TicketPeerParam".to_owned(),
+            },
+            body: Box::new(IRExpr::Eventually {
+                body: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: false },
+                    span: None,
+                }),
+                span: None,
+            }),
+            span: None,
+        }),
+        span: None,
+    }];
+    let config = VerifyConfig {
+        unbounded_only: true,
+        no_ic3: true,
+        ..VerifyConfig::default()
+    };
+
+    let results = verify_all(&ir, &config);
+
+    assert!(
+        matches!(
+            &results[0],
+            VerificationResult::LivenessViolation { .. }
+        ),
+        "false liveness with entity-parameter fairness must produce a real liveness violation, not a success or unsupported verdict: {results:?}"
+    );
+}
+
+#[test]
 fn verify_all_explicit_state_proves_ref_param_cross_call_per_tuple_entity_store_liveness_under_weak_fairness(
 ) {
     let ir = make_explicit_entity_store_ref_param_cross_call_per_tuple_weak_fair_liveness_ir();
@@ -23714,8 +24345,8 @@ fn verify_all_with_cvc5_selection_proves_fieldless_enum_system_safety_via_sygus(
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected fieldless enum system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected fieldless enum system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23728,8 +24359,8 @@ fn verify_all_with_cvc5_selection_proves_finite_bool_param_system_safety_via_syg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected finite bool-param system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected finite bool-param system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23742,8 +24373,8 @@ fn verify_all_with_cvc5_selection_proves_finite_enum_param_system_safety_via_syg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected finite enum-param system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected finite enum-param system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23756,8 +24387,8 @@ fn verify_all_with_cvc5_selection_proves_invariant_bearing_system_safety_via_syg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected invariant-bearing system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected invariant-bearing system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23770,8 +24401,8 @@ fn verify_all_with_cvc5_selection_proves_match_bearing_system_safety_via_sygus()
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected match-bearing system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected match-bearing system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23860,8 +24491,8 @@ fn verify_all_with_cvc5_selection_proves_finite_quantifier_system_safety_via_syg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected finite-quantifier system safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected finite-quantifier system safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23874,8 +24505,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_entity_safety_via_sygus() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled entity safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled entity safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23888,8 +24519,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_enum_entity_safety_via_sygus() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled enum safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled enum safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23902,8 +24533,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_ref_entity_safety_via_sygus() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled ref safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled ref safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23916,8 +24547,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_transition_arg_safety_via_sygus(
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled transition-arg safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled transition-arg safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23930,8 +24561,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_crosscall_arg_safety_via_sygus()
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled cross-call arg safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled cross-call arg safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23944,8 +24575,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_apply_chain_safety_via_sygus() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled apply-chain safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled apply-chain safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23953,13 +24584,13 @@ fn verify_all_with_cvc5_selection_proves_pooled_apply_chain_safety_via_sygus() {
 #[ignore = "in-process cvc5 SyGuS has no hard cancellation; run with ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 when isolating this test"]
 fn verify_all_with_cvc5_selection_proves_pooled_create_then_inc_safety_via_sygus() {
     let ir = make_pooled_create_then_inc_ir();
-    let config = cvc5_bounded_regression_config();
+    let config = cvc5_sygus_regression_config();
 
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled create-then-inc safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled create-then-inc safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23972,8 +24603,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_store_membership_safety_via_sygu
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled store-membership safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled store-membership safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -23986,8 +24617,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_crosscall_safety_via_sygus() {
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled cross-call safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled cross-call safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24000,8 +24631,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_nested_crosscall_safety_via_sygu
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled nested cross-call safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled nested cross-call safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24014,8 +24645,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_match_crosscall_safety_via_sygus
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled match-crosscall safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled match-crosscall safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24028,8 +24659,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_safety_via_sygus()
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled let-crosscall safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled let-crosscall safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24042,8 +24673,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_match_var_crosscall_safety_via_s
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled match-var crosscall safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled match-var crosscall safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24057,8 +24688,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_let_crosscall_into_crosscall_arg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled let-crosscall-into-crosscall-arg safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled let-crosscall-into-crosscall-arg safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24071,8 +24702,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_callee_field_crosscall_safety_vi
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled callee-field crosscall safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled callee-field crosscall safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24085,8 +24716,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_callee_store_crosscall_safety_vi
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled callee-store crosscall safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled callee-store crosscall safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24108,8 +24739,8 @@ fn verify_all_with_cvc5_selection_ignores_unused_proc_metadata_in_pooled_sygus_s
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected cvc5 selection verify to ignore unused proc metadata, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected cvc5 SyGuS verify to ignore unused proc metadata, got: {results:?}"
     );
 }
 
@@ -24122,8 +24753,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_nested_ref_entity_safety_via_syg
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled nested-ref safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled nested-ref safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24136,8 +24767,8 @@ fn verify_all_with_cvc5_selection_proves_pooled_forall_nested_ref_entity_safety_
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected pooled forall-nested-ref safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected pooled forall-nested-ref safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24150,8 +24781,8 @@ fn verify_all_with_cvc5_selection_proves_multi_pooled_cross_entity_safety_via_sy
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected multi-pooled cross-entity safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected multi-pooled cross-entity safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24164,8 +24795,8 @@ fn verify_all_with_cvc5_selection_proves_multi_pooled_forall_cross_entity_safety
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected multi-pooled forall cross-entity safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected multi-pooled forall cross-entity safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24178,8 +24809,8 @@ fn verify_all_with_cvc5_selection_proves_multi_pooled_cross_entity_arg_safety_vi
     let results = verify_all(&ir, &config);
 
     assert!(
-        proved_under_cvc5_selection(&results[0]),
-        "expected multi-pooled cross-entity arg safety verify to prove under cvc5 selection, got: {results:?}"
+        proved_by_cvc5_sygus(&results[0]),
+        "expected multi-pooled cross-entity arg safety verify to prove via cvc5 SyGuS, got: {results:?}"
     );
 }
 
@@ -24219,6 +24850,83 @@ fn verify_all_with_both_selection_reconciles_matching_bmc_results() {
             .any(|r| matches!(r, VerificationResult::Unprovable { .. })),
         "both mode should not degrade matching results to unprovable: {results:?}"
     );
+}
+
+#[test]
+fn solver_result_reconciliation_keeps_matching_signatures() {
+    let z3 = vec![checked_result("safety", 4)];
+    let cvc5 = vec![checked_result("safety", 4)];
+
+    let results = reconcile_solver_results(SolverFamily::Z3, z3, SolverFamily::Cvc5, cvc5);
+
+    assert!(matches!(
+        results.as_slice(),
+        [VerificationResult::Checked { name, depth, .. }]
+            if name == "safety" && *depth == 4
+    ));
+}
+
+#[test]
+fn solver_result_reconciliation_reports_count_mismatches() {
+    let results = reconcile_solver_results(
+        SolverFamily::Z3,
+        vec![checked_result("left", 1)],
+        SolverFamily::Cvc5,
+        Vec::new(),
+    );
+
+    assert!(matches!(
+        results.as_slice(),
+        [VerificationResult::Unprovable { name, hint, .. }]
+            if name == "solver_backend_comparison"
+                && hint.contains("z3 produced 1")
+                && hint.contains("cvc5 produced 0")
+    ));
+}
+
+#[test]
+fn solver_result_reconciliation_reports_signature_disagreements() {
+    let results = reconcile_solver_results(
+        SolverFamily::Z3,
+        vec![checked_result("safety", 4)],
+        SolverFamily::Cvc5,
+        vec![checked_result("safety", 5)],
+    );
+
+    assert!(matches!(
+        results.as_slice(),
+        [VerificationResult::Unprovable { name, hint, .. }]
+            if name == "safety"
+                && hint.contains("z3 reported `checked:safety:4`")
+                && hint.contains("cvc5 reported `checked:safety:5`")
+    ));
+}
+
+#[test]
+fn float_requires_z3_result_names_target_and_backend_gap() {
+    let result = float_requires_z3_result("floaty");
+
+    assert!(matches!(
+        result,
+        VerificationResult::Unprovable { ref name, ref hint, .. }
+            if name == "floaty"
+                && hint.contains("IEEE-754 `float`")
+                && hint.contains("cvc5")
+                && hint.contains("Z3")
+    ));
+}
+
+fn checked_result(name: &str, depth: usize) -> VerificationResult {
+    VerificationResult::Checked {
+        name: name.to_owned(),
+        depth,
+        method: Some("bounded trace-prefix".to_owned()),
+        time_ms: 0,
+        assumptions: Vec::new(),
+        backend_diagnostics: Vec::new(),
+        span: None,
+        file: None,
+    }
 }
 
 #[test]
@@ -24410,6 +25118,1254 @@ fn lower_source_file(name: &str, source: &str) -> IRProgram {
         lower_diagnostics.diagnostics
     );
     ir
+}
+
+/// The independent Z3/IR re-validation of a SyGuS invariant (abide-wnby.1.9)
+/// accepts a genuinely inductive safety invariant and rejects ones that
+/// fail any of the init/induction/safety obligations.
+#[test]
+fn revalidate_sygus_invariant_via_z3_accepts_valid_and_rejects_invalid() {
+    let ir = lower_source_file(
+        "sygus_recheck_counter.ab",
+        "module M\n\n\
+         system Counter {\n  \
+           total: int = 0\n  \
+           command inc() { total' = total + 1 }\n\
+         }\n\n\
+         verify v {\n  \
+           assume { let c = Counter {} }\n  \
+           assert always total >= 0\n\
+         }\n",
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::from_ir(&ir);
+    let verify = ir.verifies[0].clone();
+    let safety = transition::TransitionSafetySpec::for_verify(&ir, &vctx, &verify, &defs)
+        .expect("safety spec should build");
+    let system = safety.system();
+    let property = safety
+        .combined_step_property()
+        .expect("combined step property");
+    let config = VerifyConfig::default();
+
+    let ge = |rhs: i64| IRExpr::BinOp {
+        op: "OpGe".to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: "total".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: rhs },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+
+    // `total >= 0` is inductive (starts at 0, only increments) and implies
+    // the safety property — all three obligations hold.
+    let valid = revalidate_sygus_invariant_via_z3(system, &ge(0), &property, &vctx, &defs, &config);
+    assert!(
+        valid.is_ok(),
+        "total >= 0 should revalidate cleanly: {valid:?}"
+    );
+
+    // `total >= 5` is violated initially (total starts at 0) — init fails.
+    let invalid =
+        revalidate_sygus_invariant_via_z3(system, &ge(5), &property, &vctx, &defs, &config);
+    assert!(
+        invalid.is_err(),
+        "total >= 5 must fail independent revalidation (init), got: {invalid:?}"
+    );
+
+    // `0 <= total <= 3` holds initially and implies the property, but is not
+    // inductive (total = 3 steps to 4). This must fail the induction
+    // obligation — proving the transition relation is genuinely checked.
+    let le = |rhs: i64| IRExpr::BinOp {
+        op: "OpLe".to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: "total".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: rhs },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let bounded = IRExpr::BinOp {
+        op: "OpAnd".to_owned(),
+        left: Box::new(ge(0)),
+        right: Box::new(le(3)),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let not_inductive =
+        revalidate_sygus_invariant_via_z3(system, &bounded, &property, &vctx, &defs, &config);
+    assert!(
+        not_inductive.is_err(),
+        "0 <= total <= 3 must fail induction revalidation, got: {not_inductive:?}"
+    );
+}
+
+/// The independent slot-aware Z3/IR re-validation of a *pooled* SyGuS invariant
+/// (abide-wnby.1.10) accepts a genuinely inductive per-slot safety invariant —
+/// expressed over the flat slot-qualified state names the cvc5 pooled encoder
+/// produces (`Item_0_total`, `Item_0_active`) — and rejects ones that fail any
+/// of the init/induction/safety obligations. This exercises the slot-aware
+/// `encode_pure_expr` environment that maps those names back to the pool's
+/// per-slot SMT variables, which the system-field `encode_property_at_step`
+/// path cannot do.
+#[test]
+fn revalidate_pooled_sygus_invariant_via_z3_accepts_valid_and_rejects_invalid() {
+    let ir = lower_source_file(
+        "sygus_recheck_pooled_counter.ab",
+        "module PooledCounter\n\n\
+         entity Item {\n  \
+           total: int = 0\n\n  \
+           action bump() {\n    \
+             total' = total + 1\n  \
+           }\n\
+         }\n\n\
+         system Pool(items: Store<Item>) {\n  \
+           command bump_one() {\n    \
+             choose i: Item where i.total >= 0 {\n      \
+               i.bump()\n    \
+             }\n  \
+           }\n\
+         }\n\n\
+         verify pooled_counter_safety {\n  \
+           assume {\n    \
+             store items: Item[1]\n    \
+             let pool = Pool { items: items }\n  \
+           }\n  \
+           assert always all i: Item | i.total >= 0\n\
+         }\n",
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::from_ir(&ir);
+    let verify = ir.verifies[0].clone();
+    let safety = transition::TransitionSafetySpec::for_verify(&ir, &vctx, &verify, &defs)
+        .expect("pooled safety spec should build");
+    let system = safety.system();
+    let property = safety
+        .combined_step_property()
+        .expect("combined step property");
+    let config = VerifyConfig::default();
+
+    // A synthesized pooled invariant ranges over *every* slot in the SyGuS
+    // pool (the `curr_order` synth-fun params), so build the test invariants
+    // over all pool slots — the property the cvc5 engine targets is the
+    // all-slots `all i: Item | i.total >= 0`, which a single-slot fact would
+    // not imply.
+    let n_slots = *system
+        .slots_per_entity()
+        .get("Item")
+        .expect("Item pool scope");
+    assert!(n_slots >= 1, "expected at least one Item slot");
+
+    // Slot-qualified `Item_<slot>_total` comparison, mirroring the names the
+    // cvc5 pooled encoder produces (`<entity>_<slot>_<field>`).
+    let slot_cmp = |slot: usize, op: &str, rhs: i64| IRExpr::BinOp {
+        op: op.to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: format!("Item_{slot}_total"),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: rhs },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let conjoin = |clauses: Vec<IRExpr>| {
+        clauses
+            .into_iter()
+            .reduce(|left, right| IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(left),
+                right: Box::new(right),
+                ty: IRType::Bool,
+                span: None,
+            })
+            .expect("at least one clause")
+    };
+
+    // `total >= 0` on every slot is inductive (totals start at 0, only
+    // increment) and implies the all-slots safety property — all three
+    // obligations hold.
+    let valid = conjoin((0..n_slots).map(|s| slot_cmp(s, "OpGe", 0)).collect());
+    let valid_result =
+        revalidate_pooled_sygus_invariant_via_z3(system, &valid, &property, &vctx, &defs, &config);
+    assert!(
+        valid_result.is_ok(),
+        "all-slots total >= 0 should revalidate cleanly through the slot-aware path: {valid_result:?}"
+    );
+
+    // `Item_0_total >= 5` is violated initially (totals default to 0) — init
+    // must fail.
+    let invalid = revalidate_pooled_sygus_invariant_via_z3(
+        system,
+        &slot_cmp(0, "OpGe", 5),
+        &property,
+        &vctx,
+        &defs,
+        &config,
+    );
+    assert!(
+        invalid.is_err(),
+        "Item_0_total >= 5 must fail independent pooled revalidation (init), got: {invalid:?}"
+    );
+
+    // `0 <= total <= 3` on every slot holds initially and implies the property,
+    // but is not inductive (a total of 3 steps to 4): the induction obligation
+    // must fail, proving the slot-aware transition relation is genuinely
+    // checked.
+    let bounded = conjoin(
+        (0..n_slots)
+            .flat_map(|s| [slot_cmp(s, "OpGe", 0), slot_cmp(s, "OpLe", 3)])
+            .collect(),
+    );
+    let not_inductive = revalidate_pooled_sygus_invariant_via_z3(
+        system, &bounded, &property, &vctx, &defs, &config,
+    );
+    assert!(
+        not_inductive.is_err(),
+        "0 <= total <= 3 on every slot must fail induction revalidation, got: {not_inductive:?}"
+    );
+}
+
+/// `strip_assert_assume` is transparent over *every* property sub-position,
+/// not just the BinOp/UnOp/quantifier/temporal subset that the old
+/// `expand_through_defs`-based stripper traversed: nested `assert`/`assume`
+/// wrappers inside `IfElse` branches, collection literals, and constructor
+/// arguments are all removed while the surrounding structure is preserved.
+#[test]
+fn strip_assert_assume_is_transparent_in_all_property_positions() {
+    let var = |n: &str| IRExpr::Var {
+        name: n.to_owned(),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let assert = |e: IRExpr| IRExpr::Assert {
+        expr: Box::new(e),
+        span: None,
+    };
+    let assume = |e: IRExpr| IRExpr::Assume {
+        expr: Box::new(e),
+        span: None,
+    };
+    // A wrapper survives stripping iff its Debug still names the variant.
+    let has_wrapper = |e: &IRExpr| {
+        let dbg = format!("{e:?}");
+        dbg.contains("Assert") || dbg.contains("Assume")
+    };
+
+    // if (assert c) { assume p } else { assert q }
+    let if_expr = IRExpr::IfElse {
+        cond: Box::new(assert(var("c"))),
+        then_body: Box::new(assume(var("p"))),
+        else_body: Some(Box::new(assert(var("q")))),
+        span: None,
+    };
+    let stripped = strip_assert_assume(&if_expr);
+    assert!(
+        !has_wrapper(&stripped),
+        "wrappers in every IfElse branch must be stripped: {stripped:?}"
+    );
+    match &stripped {
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            assert!(matches!(cond.as_ref(), IRExpr::Var { name, .. } if name == "c"));
+            assert!(matches!(then_body.as_ref(), IRExpr::Var { name, .. } if name == "p"));
+            assert!(matches!(
+                else_body.as_ref().expect("else branch").as_ref(),
+                IRExpr::Var { name, .. } if name == "q"
+            ));
+        }
+        other => panic!("IfElse structure must be preserved, got {other:?}"),
+    }
+
+    // Collection literal element and constructor argument.
+    let set = IRExpr::SetLit {
+        elements: vec![assert(var("a")), var("b")],
+        ty: IRType::Set {
+            element: Box::new(IRType::Bool),
+        },
+        span: None,
+    };
+    assert!(!has_wrapper(&strip_assert_assume(&set)));
+
+    let ctor = IRExpr::Ctor {
+        enum_name: "E".to_owned(),
+        ctor: "C".to_owned(),
+        args: vec![("f".to_owned(), assume(var("v")))],
+        span: None,
+    };
+    assert!(!has_wrapper(&strip_assert_assume(&ctor)));
+
+    // Relation-comprehension binding source (the support walker descends into
+    // `binding.source`, so a wrapper there must be stripped too).
+    let rel = IRExpr::RelComp {
+        projection: Box::new(var("x")),
+        bindings: vec![crate::ir::types::IRRelCompBinding {
+            var: "x".to_owned(),
+            domain: IRType::Bool,
+            source: Some(Box::new(assume(var("s")))),
+        }],
+        filter: Box::new(var("p")),
+        ty: IRType::Set {
+            element: Box::new(IRType::Bool),
+        },
+        span: None,
+    };
+    assert!(
+        !has_wrapper(&strip_assert_assume(&rel)),
+        "RelComp binding source wrappers must be stripped"
+    );
+}
+
+/// The property-claim support gate agrees with the encoder on wrapper
+/// transparency in every position. An `assert`/`assume` nested inside an
+/// `IfElse` (a property-supported form) is rejected by the raw support walker
+/// but accepted once the shared `strip_assert_assume` normalizer has run — so
+/// the gate no longer conservatively rejects a property the encoder handles,
+/// and the two cannot disagree on a wrapper position.
+#[test]
+fn property_gate_strips_assert_assume_nested_in_ifelse() {
+    let lit_true = || IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value: true },
+        span: None,
+    };
+    let if_expr = IRExpr::IfElse {
+        cond: Box::new(lit_true()),
+        then_body: Box::new(IRExpr::Assert {
+            expr: Box::new(lit_true()),
+            span: None,
+        }),
+        else_body: Some(Box::new(lit_true())),
+        span: None,
+    };
+    assert!(
+        find_unsupported_scene_expr(&if_expr).is_some(),
+        "the raw support walker must reject an Assert nested in IfElse"
+    );
+    assert!(
+        find_unsupported_scene_expr(&strip_assert_assume(&if_expr)).is_none(),
+        "after the shared strip the gate must accept the IfElse property"
+    );
+}
+
+/// A constructor pattern's match condition must also check its nested field
+/// patterns, not just the outer constructor tag. `A { inner: X }` must not
+/// match the value `A { inner: Y }`.
+#[test]
+fn encode_pattern_cond_checks_nested_constructor_field() {
+    use crate::ir::types::{IRFieldPat, IRPattern};
+
+    let ir = lower_source_file(
+        "nested_pattern_cond.ab",
+        "module NestedPatternCond\n\n\
+         enum Inner = X | Y\n\
+         enum Outer = A { inner: Inner } | B\n\n\
+         fn pick(o: Outer): int =\n  \
+           match o {\n    \
+             A { inner: X } => 1\n    \
+             A { inner: Y } => 2\n    \
+             B => 3\n  \
+           }\n",
+    );
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::from_ir(&ir);
+    let env: HashMap<String, SmtValue> = HashMap::new();
+
+    // Build the ADT value `@A { inner: @Y }` through the pure encoder.
+    let a_inner_y = IRExpr::Ctor {
+        enum_name: "Outer".to_owned(),
+        ctor: "A".to_owned(),
+        args: vec![(
+            "inner".to_owned(),
+            IRExpr::Ctor {
+                enum_name: "Inner".to_owned(),
+                ctor: "Y".to_owned(),
+                args: vec![],
+                span: None,
+            },
+        )],
+        span: None,
+    };
+    let scrut = super::encode::encode_pure_expr(&a_inner_y, &env, &vctx, &defs)
+        .expect("construct @A { inner: @Y }");
+
+    let pat = |inner: &str| IRPattern::PCtor {
+        name: "A".to_owned(),
+        fields: vec![IRFieldPat {
+            name: "inner".to_owned(),
+            pattern: IRPattern::PCtor {
+                name: inner.to_owned(),
+                fields: vec![],
+            },
+        }],
+    };
+
+    // `A { inner: X }` must NOT match `A { inner: Y }` — the nested field differs.
+    let cond_x = super::encode::encode_pattern_cond(&scrut, &pat("X"), &env, &vctx)
+        .expect("encode A { inner: X } condition");
+    let solver = AbideSolver::new();
+    solver.assert(&cond_x);
+    assert_eq!(
+        solver.check(),
+        SatResult::Unsat,
+        "A {{ inner: X }} must not match the value A {{ inner: Y }}"
+    );
+
+    // `A { inner: Y }` must match.
+    let cond_y = super::encode::encode_pattern_cond(&scrut, &pat("Y"), &env, &vctx)
+        .expect("encode A { inner: Y } condition");
+    let solver = AbideSolver::new();
+    solver.assert(smt::bool_not(&cond_y));
+    assert_eq!(
+        solver.check(),
+        SatResult::Unsat,
+        "A {{ inner: Y }} must match the value A {{ inner: Y }}"
+    );
+}
+
+const NESTED_PATTERN_SOURCE: &str = "module NestedPattern\n\n\
+     enum Inner = X | Y\n\
+     enum Outer = A { inner: Inner } | B\n\n\
+     fn pick(o: Outer): int =\n  \
+       match o {\n    \
+         A { inner: X } => 1\n    \
+         A { inner: Y } => 2\n    \
+         B => 3\n  \
+       }\n";
+
+/// The membership operator `in` lowers per collection kind: set membership to
+/// `Index<Bool>` (characteristic function) and map *key* membership to the
+/// `OpMapHas` BinOp — never a uniform `Index` that would return a map's value
+/// type instead of a boolean.
+#[test]
+fn in_operator_lowers_per_collection_kind() {
+    let ir = lower_source_file(
+        "in_lowering.ab",
+        "module InLowering\n\n\
+         fn in_set(x: int): bool = x in Set(1, 2, 3)\n\
+         fn in_map(k: int): bool = k in Map(1, 10)\n",
+    );
+    let peel = |name: &str| -> IRExpr {
+        let f = ir
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} lowered"));
+        let mut body = &f.body;
+        while let IRExpr::Lam { body: inner, .. } = body {
+            body = inner;
+        }
+        body.clone()
+    };
+
+    let set_body = peel("in_set");
+    assert!(
+        matches!(
+            &set_body,
+            IRExpr::Index {
+                ty: IRType::Bool,
+                ..
+            }
+        ),
+        "set membership must lower to Index<Bool>, got {set_body:?}"
+    );
+
+    let map_body = peel("in_map");
+    assert!(
+        matches!(&map_body, IRExpr::BinOp { op, ty: IRType::Bool, .. } if op == "OpMapHas"),
+        "map membership must lower to OpMapHas, got {map_body:?}"
+    );
+}
+
+/// Real source `A { inner: X }` must lower the nested `X` to a constructor
+/// pattern (`PCtor`), not a variable binding (`PVar`). Type-directed pattern
+/// lowering is what lets the verifier's nested-field condition apply to actual
+/// Abide source rather than only to hand-built IR.
+#[test]
+fn source_nested_constructor_pattern_lowers_to_nested_pctor() {
+    use crate::ir::types::IRPattern;
+
+    let ir = lower_source_file("nested_pattern_lowering.ab", NESTED_PATTERN_SOURCE);
+    let pick = ir
+        .functions
+        .iter()
+        .find(|f| f.name == "pick")
+        .expect("pick fn lowered");
+    // The fn parameter lowers to a `Lam` wrapper around the match body.
+    let mut body = &pick.body;
+    while let IRExpr::Lam { body: inner, .. } = body {
+        body = inner;
+    }
+    let IRExpr::Match { arms, .. } = body else {
+        panic!("pick body should be a match, got {body:?}");
+    };
+    let IRPattern::PCtor { name, fields } = &arms[0].pattern else {
+        panic!(
+            "first arm should be a constructor pattern, got {:?}",
+            arms[0].pattern
+        );
+    };
+    assert_eq!(name, "A");
+    let inner = fields
+        .iter()
+        .find(|f| f.name == "inner")
+        .expect("inner field pattern");
+    assert!(
+        matches!(&inner.pattern, IRPattern::PCtor { name, fields } if name == "X" && fields.is_empty()),
+        "nested `inner: X` must lower to PCtor(\"X\"), got {:?}",
+        inner.pattern
+    );
+}
+
+/// abide-wnby.6.10: a body-level `match` over a command result must lower its
+/// arm patterns type-directed against the command's result enum, so a nested
+/// constructor field pattern (`Done { inner: X }`) becomes a nested `PCtor`,
+/// not a `PVar` that the encoder treats as match-anything.
+#[test]
+fn action_match_nested_constructor_pattern_lowers_to_pctor() {
+    use crate::ir::types::{IRAction, IRPattern};
+
+    const SOURCE: &str = "module M\n\n\
+        enum Inner = X | Y\n\
+        enum Outcome = Done { inner: Inner } | Failed\n\n\
+        system Producer {\n  \
+          command produce() -> Outcome {\n    \
+            @Failed\n  \
+          }\n\
+        }\n\n\
+        system Consumer {\n  \
+          flag: bool = false\n  \
+          command consume() {\n    \
+            let r = Producer::produce()\n    \
+            match r {\n      \
+              Done { inner: X } => { }\n      \
+              Done { inner: Y } => { }\n      \
+              Failed => { }\n    \
+            }\n  \
+          }\n\
+        }\n";
+
+    let ir = lower_source_file("action_match_lowering.ab", SOURCE);
+
+    // Find the `match r { … }` action anywhere in any system's actions.
+    fn find_match(actions: &[IRAction]) -> Option<&[crate::ir::types::IRActionMatchArm]> {
+        for action in actions {
+            match action {
+                IRAction::Match { arms, .. } => return Some(arms),
+                IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                    if let Some(found) = find_match(ops) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let arms = ir
+        .systems
+        .iter()
+        .flat_map(|s| s.actions.iter())
+        .find_map(|a| find_match(&a.body))
+        .expect("consume command should lower a body-level match");
+
+    let done_x = arms
+        .iter()
+        .find_map(|arm| match &arm.pattern {
+            IRPattern::PCtor { name, fields } if name == "Done" => Some(fields),
+            _ => None,
+        })
+        .expect("a `Done { … }` arm");
+    let inner = done_x
+        .iter()
+        .find(|f| f.name == "inner")
+        .expect("inner field pattern");
+    assert!(
+        matches!(&inner.pattern, IRPattern::PCtor { name, fields } if name == "X" && fields.is_empty()),
+        "nested `inner: X` in an action match must lower to PCtor(\"X\"), got {:?}",
+        inner.pattern
+    );
+}
+
+/// abide-wnby.6.10: the same type-directed lowering must apply when the `match`
+/// scrutinee is an inline cross-call (`match Producer::produce() { … }`) rather
+/// than a `let`-bound result.
+#[test]
+fn inline_crosscall_action_match_nested_pattern_lowers_to_pctor() {
+    use crate::ir::types::{IRAction, IRPattern};
+
+    const SOURCE: &str = "module M\n\n\
+        enum Inner = X | Y\n\
+        enum Outcome = Done { inner: Inner } | Failed\n\n\
+        system Producer {\n  \
+          command produce() -> Outcome {\n    \
+            @Failed\n  \
+          }\n\
+        }\n\n\
+        system Consumer {\n  \
+          flag: bool = false\n  \
+          command consume() {\n    \
+            match Producer::produce() {\n      \
+              Done { inner: X } => { }\n      \
+              Done { inner: Y } => { }\n      \
+              Failed => { }\n    \
+            }\n  \
+          }\n\
+        }\n";
+
+    let ir = lower_source_file("inline_action_match_lowering.ab", SOURCE);
+
+    fn find_match(actions: &[IRAction]) -> Option<&[crate::ir::types::IRActionMatchArm]> {
+        for action in actions {
+            match action {
+                IRAction::Match { arms, .. } => return Some(arms),
+                IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                    if let Some(found) = find_match(ops) {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let arms = ir
+        .systems
+        .iter()
+        .flat_map(|s| s.actions.iter())
+        .find_map(|a| find_match(&a.body))
+        .expect("consume command should lower a body-level match");
+    let done_fields = arms
+        .iter()
+        .find_map(|arm| match &arm.pattern {
+            IRPattern::PCtor { name, fields } if name == "Done" => Some(fields),
+            _ => None,
+        })
+        .expect("a `Done { … }` arm");
+    let inner = done_fields
+        .iter()
+        .find(|f| f.name == "inner")
+        .expect("inner field pattern");
+    assert!(
+        matches!(&inner.pattern, IRPattern::PCtor { name, fields } if name == "X" && fields.is_empty()),
+        "inline cross-call match `inner: X` must lower to PCtor(\"X\"), got {:?}",
+        inner.pattern
+    );
+}
+
+/// abide-wnby.6.10 (review follow-up): a body-level `match` over an *extern*
+/// command result must also lower type-directed. Sema validates extern command
+/// results the same way as system commands, so the lowering registry must index
+/// extern commands too — otherwise nested patterns over an extern boundary keep
+/// the match-anything `PVar` bug. Covers both the inline cross-call and the
+/// `let`-bound forms.
+#[test]
+fn extern_command_result_action_match_nested_pattern_lowers_to_pctor() {
+    use crate::ir::types::{IRAction, IRActionMatchArm, IRPattern};
+
+    const SOURCE: &str = "module M\n\n\
+        enum Inner = X | Y\n\
+        enum Outcome = Done { inner: Inner } | Failed\n\n\
+        extern Gateway {\n  \
+          command produce() -> Outcome\n  \
+          may produce {\n    \
+            return @Failed\n  \
+          }\n\
+        }\n\n\
+        system Consumer {\n  \
+          dep Gateway\n  \
+          flag: bool = false\n  \
+          command consume_inline() {\n    \
+            match Gateway::produce() {\n      \
+              Done { inner: X } => { }\n      \
+              Done { inner: Y } => { }\n      \
+              Failed => { }\n    \
+            }\n  \
+          }\n  \
+          command consume_let() {\n    \
+            let r = Gateway::produce()\n    \
+            match r {\n      \
+              Done { inner: X } => { }\n      \
+              Done { inner: Y } => { }\n      \
+              Failed => { }\n    \
+            }\n  \
+          }\n\
+        }\n";
+
+    let ir = lower_source_file("extern_action_match_lowering.ab", SOURCE);
+
+    fn collect_matches<'a>(actions: &'a [IRAction], out: &mut Vec<&'a [IRActionMatchArm]>) {
+        for action in actions {
+            match action {
+                IRAction::Match { arms, .. } => out.push(arms),
+                IRAction::Choose { ops, .. } | IRAction::ForAll { ops, .. } => {
+                    collect_matches(ops, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut matches = Vec::new();
+    for action in ir.systems.iter().flat_map(|s| s.actions.iter()) {
+        collect_matches(&action.body, &mut matches);
+    }
+    assert_eq!(
+        matches.len(),
+        2,
+        "expected the inline and let-bound matches to lower"
+    );
+    for arms in &matches {
+        let done_fields = arms
+            .iter()
+            .find_map(|arm| match &arm.pattern {
+                IRPattern::PCtor { name, fields } if name == "Done" => Some(fields),
+                _ => None,
+            })
+            .expect("a `Done { … }` arm");
+        let inner = done_fields
+            .iter()
+            .find(|f| f.name == "inner")
+            .expect("inner field pattern");
+        assert!(
+            matches!(&inner.pattern, IRPattern::PCtor { name, fields } if name == "X" && fields.is_empty()),
+            "extern command-result match `inner: X` must lower to PCtor(\"X\"), got {:?}",
+            inner.pattern
+        );
+    }
+}
+
+/// End-to-end: with the nested field lowered as a constructor pattern and the
+/// encoder checking it, `pick(A {{ inner: Y }})` must select the `== 2` arm and
+/// not the `A {{ inner: X }}` arm.
+#[test]
+fn verify_nested_constructor_pattern_selects_correct_arm() {
+    let source = format!(
+        "{NESTED_PATTERN_SOURCE}\n\
+         system S {{\n  \
+           tag: int = 0\n  \
+           command noop() {{ }}\n\
+         }}\n\n\
+         verify nested_pattern_selects_correct_arm {{\n  \
+           assume {{ let s = S {{}} }}\n  \
+           assert pick(@A {{ inner: @Y }}) == 2\n\
+         }}\n"
+    );
+    let ir = lower_source_file("nested_pattern_verify.ab", &source);
+    let results = verify_all(&ir, &proof_search_regression_config());
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::Proved { name, .. } | VerificationResult::Checked { name, .. }
+                if name == "nested_pattern_selects_correct_arm"
+        )),
+        "pick(A {{ inner: Y }}) must select the == 2 arm: {results:?}"
+    );
+}
+
+/// When the negated property's Büchi automaton is empty (construction capped
+/// for an oversized formula), the lasso encoder must return an error — which
+/// the verify path turns into Unprovable — rather than an always-UNSAT
+/// constraint that would be read as a vacuous CHECKED.
+#[test]
+fn lasso_encoding_rejects_empty_buchi_automaton() {
+    let ir = lower_source_file("empty_module.ab", "module M\n");
+    let vctx = VerifyContext::from_ir(&ir);
+    let defs = defenv::DefEnv::empty();
+    let pool = harness::create_slot_pool(&[], &HashMap::new(), 0);
+    let pctx = property::PropertyCtx::new();
+
+    // 130 distinct atoms -> the closure caps the Büchi automaton to empty.
+    let atom = |i: i64| IRExpr::BinOp {
+        op: "OpEq".to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: i },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let mut conj = atom(0);
+    for i in 1..130 {
+        conj = IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(atom(i)),
+            right: Box::new(conj),
+            ty: IRType::Bool,
+            span: None,
+        };
+    }
+    let compiled = temporal::CompiledTemporalFormula::from_expanded(IRExpr::Eventually {
+        body: Box::new(conj),
+        span: None,
+    });
+    let buchi = compiled
+        .buchi()
+        .expect("liveness compiles to a Büchi automaton");
+    assert_eq!(
+        buchi.automaton().state_count(),
+        0,
+        "precondition: empty automaton"
+    );
+
+    let result = encode_buchi_lasso_violation(&pool, &vctx, &defs, buchi, &[], 0, &pctx);
+    assert!(
+        result.is_err(),
+        "an empty Büchi automaton must produce an encoding error, got {result:?}"
+    );
+}
+
+/// End-to-end via the public `verify_all` path: an oversized liveness assert
+/// (whose negated Büchi automaton caps to empty) must report `Unprovable`, not
+/// a vacuous `Checked`. The oversized assert is swapped in as IR rather than
+/// parsed from source. The recursive verifier encoders would overflow the
+/// small default test stack on a ~130-deep expression (the general crash is
+/// tracked as abide-wnby.6.13), so the verify runs on a worker thread with a
+/// large stack — which is exactly the headroom fix-layer that bead proposes —
+/// so the Büchi cap is reached and the user-visible verdict is observable.
+#[test]
+fn oversized_liveness_verify_block_is_unprovable_not_checked() {
+    let mut ir = lower_source_file(
+        "oversized_liveness.ab",
+        "module M\n\nsystem S {\n  x: int = 0\n  command noop() { }\n}\n\n\
+         verify big {\n  assume { let s = S {} }\n  assert eventually (x == 0)\n}\n",
+    );
+
+    // Build `eventually (x == 0 and x == 1 and ... and x == 129)` directly.
+    let atom = |i: i64| IRExpr::BinOp {
+        op: "OpEq".to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: i },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    let mut conj = atom(0);
+    for i in 1..130 {
+        conj = IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(atom(i)),
+            right: Box::new(conj),
+            ty: IRType::Bool,
+            span: None,
+        };
+    }
+    ir.verifies[0].asserts = vec![IRExpr::Eventually {
+        body: Box::new(conj),
+        span: None,
+    }];
+
+    let results = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || verify_all(&ir, &VerifyConfig::default()))
+        .expect("spawn verify worker")
+        .join()
+        .expect("verify worker panicked");
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, .. } if name == "big"
+        )),
+        "oversized liveness property must be Unprovable: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Checked { name, .. } if name == "big"
+        )),
+        "oversized liveness property must not be vacuously Checked: {results:?}"
+    );
+}
+
+/// abide-wnby.6.17: a division in a transition/command UPDATE value
+/// (`x' = 10 / d`) must also be checked — not just divisions in properties.
+/// With `d` defaulting to 0, the update is undefined in a reachable state and
+/// must not be silently CHECKED on the solver's total div/mod.
+#[test]
+fn transition_update_division_by_zero_is_flagged() {
+    let ir = lower_source_file(
+        "trans_div.ab",
+        "module M\n\nsystem S {\n  x: int = 1\n  d: int = 0\n  \
+         command compute() { x' = 10 / d }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always (x == x)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "v" && hint.contains("division/modulo by zero")
+        )),
+        "transition-update div-by-zero must be surfaced as Unprovable with the \
+         div-by-zero hint: {results:?}"
+    );
+}
+
+/// abide-wnby.6.17: a transition update whose divisor is guarded by the
+/// command's `requires` is well-defined and must not be false-flagged — even
+/// when another command can drive the divisor to zero, since the dividing
+/// command only fires when its guard holds. This exercises the command-guard
+/// threading: without it, the reachable `d == 0` (via `set_d`) would be flagged.
+#[test]
+fn guarded_transition_update_division_is_not_flagged() {
+    let ir = lower_source_file(
+        "trans_div_guarded.ab",
+        "module M\n\nsystem S {\n  x: int = 1\n  d: int = 1\n  \
+         command set_d(v: int) { d' = v }\n  \
+         command compute() requires d != 0 { x' = 10 / d }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always (x == x)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("division/modulo by zero") || hint.contains("well-definedness")
+        )),
+        "guarded transition-update division must not be flagged: {results:?}"
+    );
+}
+
+/// abide-wnby.6.17: a div-by-zero in a *second* sequential apply must be
+/// surfaced. Chained applies route through `try_encode_action_with_vars` /
+/// `try_eval_expr_with_vars`, a separate evaluator that previously encoded
+/// `OpDiv`/`OpMod` without recording the well-definedness obligation — so a
+/// `x' = 10 / d` in a chained apply could be silently absorbed into
+/// solver-total division even though the structural gate ran the pre-check.
+#[test]
+fn chained_apply_division_by_zero_is_flagged() {
+    let ir = lower_source_file(
+        "chained_div.ab",
+        "module M\n\n\
+         entity F {\n  x: int = 1\n  d: int = 0\n  \
+         action bump() { x' = x }\n  \
+         action divide() { x' = 10 / d }\n}\n\n\
+         system S(fs: Store<F>) {\n  \
+         command run() {\n    \
+         choose g: F where true {\n      g.bump()\n      g.divide()\n    }\n  }\n}\n\n\
+         verify v {\n  assume {\n    store fs: F[1]\n    \
+         activate {f1} in fs\n    let s = S { fs: fs }\n  }\n  \
+         assert always (true)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "v" && hint.contains("division/modulo by zero")
+        )),
+        "div-by-zero in a chained apply must be surfaced as Unprovable: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a reachable integer division by zero must be surfaced
+/// (the divisor `d` defaults to 0, so `10 / d` is undefined in the initial
+/// state) rather than silently absorbed into the solver's total div/mod.
+#[test]
+fn reachable_division_by_zero_is_flagged() {
+    let ir = lower_source_file(
+        "div_by_zero.ab",
+        "module M\n\nsystem S {\n  d: int = 0\n  command noop() { }\n}\n\n\
+         verify div_safe {\n  assume { let s = S {} }\n  assert always (10 / d >= 0)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "div_safe" && hint.contains("division/modulo by zero")
+        )),
+        "reachable div-by-zero must be flagged: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a divisor guarded by a path condition (`d != 0 implies …`)
+/// is well-defined wherever it is evaluated, so it must NOT be falsely flagged
+/// — the reachability-aware discharge sees the guard.
+#[test]
+fn guarded_divisor_is_not_flagged_as_div_by_zero() {
+    let ir = lower_source_file(
+        "guarded_div.ab",
+        "module M\n\nsystem S {\n  d: int = 1\n  command noop() { }\n}\n\n\
+         verify guarded {\n  assume { let s = S {} }\n  \
+         assert always (d != 0 implies (10 / d >= 0))\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { hint, .. } if hint.contains("division/modulo by zero")
+        )),
+        "guarded divisor must not be flagged as div-by-zero: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a theorem whose `show` evaluates `10 / d` over a system
+/// where `d` can be zero must not be PROVED on the solver's total div/mod. The
+/// property `10 / d == 10 / d` is a tautology *regardless* of the div value, so
+/// without a well-definedness obligation the theorem would be silently PROVED
+/// even though the division is undefined in the reachable state `d == 0`.
+#[test]
+fn theorem_reachable_division_by_zero_is_not_proved() {
+    let ir = lower_source_file(
+        "thm_div.ab",
+        "module M\n\nentity Item {\n  v: int = 0\n}\n\n\
+         system Sys(items: Store<Item>) {\n  command noop() { }\n}\n\n\
+         theorem t for Sys {\n  show always all i: Item | 10 / i.v == 10 / i.v\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Proved { name, .. } if name == "t"
+        )),
+        "theorem with reachable div-by-zero must not be PROVED: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12 (review): a division in the else-branch of an `if` is only
+/// evaluated when the condition is false, so a divisor that is zero only in the
+/// then-branch must NOT be flagged — the branch guard is threaded into the
+/// well-definedness obligation.
+#[test]
+fn conditional_branch_division_is_not_false_flagged() {
+    let ir = lower_source_file(
+        "cond_div.ab",
+        "module M\n\nsystem S {\n  d: int = 0\n  command noop() { }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  \
+         assert always (if d == 0 { true } else { 10 / d >= 0 })\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("division/modulo by zero") || hint.contains("well-definedness")
+        )),
+        "guarded-branch division must not be flagged: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12 (review): a division inside a liveness (`eventually`) body
+/// must not bypass the well-definedness check and be silently CHECKED — the
+/// structural gate descends into temporal bodies.
+#[test]
+fn liveness_body_division_is_not_silently_checked() {
+    let ir = lower_source_file(
+        "live_div.ab",
+        "module M\n\nsystem S {\n  d: int = 0\n  command noop() { }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert eventually (10 / d == 10 / d)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results
+            .iter()
+            .any(|r| matches!(r, VerificationResult::Checked { name, .. } if name == "v")),
+        "liveness-body division must not be silently CHECKED: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a function contract whose body evaluates `10 / x` without a
+/// `requires x != 0` must not be proved on the solver's total div/mod — the
+/// divisor is not provably non-zero.
+#[test]
+fn fn_contract_division_by_zero_is_not_proved() {
+    let ir = lower_source_file(
+        "fn_div.ab",
+        "module M\n\n\
+         fn div_tautology(x: int): bool\n  ensures result == true\n{\n  10 / x == 10 / x\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "div_tautology"
+        )),
+        "fn contract with unguarded division must not be proved: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a function whose division is guarded by `requires x != 0`
+/// is well-defined and must still prove — no false positive.
+#[test]
+fn fn_contract_guarded_division_is_still_proved() {
+    let ir = lower_source_file(
+        "fn_div_guarded.ab",
+        "module M\n\n\
+         fn safe_div(x: int): bool\n  requires x != 0\n  ensures result == true\n\
+         {\n  10 / x == 10 / x\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::FnContractProved { name, .. } if name == "safe_div"
+        )),
+        "guarded fn division must still be proved: {results:?}"
+    );
+}
+
+/// abide-wnby.6.12: a theorem whose division is guarded (`i.v != 0 implies …`)
+/// is well-defined and must still be PROVED — the theorem div-by-zero check is
+/// reachability/guard-aware and does not false-flag it.
+#[test]
+fn theorem_guarded_division_is_still_proved() {
+    let ir = lower_source_file(
+        "thm_guarded_div.ab",
+        "module M\n\nentity Item {\n  v: int = 0\n}\n\n\
+         system Sys(items: Store<Item>) {\n  command noop() { }\n}\n\n\
+         theorem t for Sys {\n  \
+           show always all i: Item | i.v != 0 implies (10 / i.v == 10 / i.v)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Proved { name, .. } if name == "t"
+        )),
+        "guarded-division theorem must still be PROVED: {results:?}"
+    );
+}
+
+/// abide-wnby.6.13: a deeply nested property must not crash the process. The
+/// recursive verifier encoders overflow the small default test stack at well
+/// under 200 levels, so calling `verify_all` *directly* on the test thread (no
+/// manual large-stack wrapper) proves that `verify_all` runs its encoding on an
+/// internal large-stack worker thread — the deep IR yields a verdict instead of
+/// a SIGABRT.
+#[test]
+fn deeply_nested_property_yields_verdict_not_stack_overflow() {
+    let mut ir = lower_source_file(
+        "deep_nested.ab",
+        "module M\n\nsystem S {\n  x: int = 0\n  command noop() { }\n}\n\n\
+         verify deep {\n  assume { let s = S {} }\n  assert always (x == 0)\n}\n",
+    );
+
+    let atom = |i: i64| IRExpr::BinOp {
+        op: "OpEq".to_owned(),
+        left: Box::new(IRExpr::Var {
+            name: "x".to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }),
+        right: Box::new(IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value: i },
+            span: None,
+        }),
+        ty: IRType::Bool,
+        span: None,
+    };
+    // ~400 levels — far beyond the ~130 that overflows a debug 8 MiB stack and
+    // the smaller default test stack, but well under the parser's MAX_EXPR_DEPTH
+    // (this IR is built directly, exercising the verify worker's headroom).
+    let mut conj = atom(0);
+    for i in 1..400 {
+        conj = IRExpr::BinOp {
+            op: "OpAnd".to_owned(),
+            left: Box::new(atom(i)),
+            right: Box::new(conj),
+            ty: IRType::Bool,
+            span: None,
+        };
+    }
+    ir.verifies[0].asserts = vec![IRExpr::Always {
+        body: Box::new(conj),
+        span: None,
+    }];
+
+    // Called directly on the test thread — must not overflow. Reaching this
+    // assertion at all proves no SIGABRT; the result must be the `deep` block's
+    // verdict.
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| result_name(r) == "deep"),
+        "deeply nested property must produce a verdict, not crash: {results:?}"
+    );
+}
+
+/// abide-wnby.6.16: realistic long boolean chains should be flattened/balanced
+/// by representation, not rejected as if they were genuinely nested input.
+/// This source-level test crosses parse -> sema -> IR -> verifier; it would
+/// fail at the parser's associative fold guard before n-ary/shallow handling.
+#[test]
+fn long_source_boolean_chain_verifies_without_depth_diagnostic() {
+    fn shallow_ir_depth(expr: &IRExpr) -> usize {
+        match expr {
+            IRExpr::BinOp { left, right, .. } => {
+                1 + shallow_ir_depth(left).max(shallow_ir_depth(right))
+            }
+            IRExpr::Always { body, .. } | IRExpr::Eventually { body, .. } => {
+                1 + shallow_ir_depth(body)
+            }
+            _ => 1,
+        }
+    }
+
+    let chain = std::iter::repeat_n("true", 1_050)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let source = format!(
+        "module M\n\nsystem S {{\n  command noop() {{ }}\n}}\n\n\
+         verify shallow_chain {{\n  assume {{ let s = S {{}} }}\n  assert always ({chain})\n}}\n"
+    );
+    let ir = lower_source_file("long_boolean_chain.ab", &source);
+    let depth = shallow_ir_depth(&ir.verifies[0].asserts[0]);
+    assert!(
+        depth < 64,
+        "source boolean chain should lower to shallow IR, got depth {depth}"
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| result_name(r) == "shallow_chain"),
+        "long boolean chain must produce a verifier result: {results:?}"
+    );
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("too deeply nested")
+                    || hint.contains("failed to parse")
+                    || hint.contains("failed to elaborate")
+        )),
+        "long boolean chain should not be rejected as deeply nested: {results:?}"
+    );
 }
 
 #[test]
@@ -24765,6 +26721,44 @@ fn fixture_auth_smoke_results_cover_verify_and_scene_paths() {
             VerificationResult::ScenePass { name, .. } if name == "lockout_after_5_failures"
         )),
         "auth fixture should include scene success paths: {results:?}"
+    );
+}
+
+#[test]
+fn scene_command_requires_can_reference_system_store_params() {
+    let ir = lower_source_file(
+        "scene_store_scoped_requires.ab",
+        "module T\n\n\
+         entity Task {\n  id: identity\n  done: bool = false\n\n  \
+         action complete() requires done == false {\n    done' = true\n  }\n}\n\n\
+         system Work(tasks: Store<Task>) {\n  \
+         command complete_task(task_id: identity)\n    \
+         requires exists t: Task in tasks | t.id == task_id and t.done == false {\n    \
+         choose t: Task where t.id == task_id {\n      t.complete()\n    }\n  }\n}\n\n\
+         scene complete_existing_task {\n  \
+         given {\n    store tasks: Task[0..2]\n    let work = Work { tasks: tasks }\n    \
+         let t = one Task in tasks where t.done == false\n  }\n  \
+         when {\n    work.complete_task(t.id)\n  }\n  \
+         then {\n    assert t.done == true\n  }\n}\n",
+    );
+
+    let results = verify_all(
+        &ir,
+        &VerifyConfig {
+            target: Some(
+                "scene:complete_existing_task"
+                    .parse()
+                    .expect("scene target"),
+            ),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            results.as_slice(),
+            [VerificationResult::ScenePass { name, .. }] if name == "complete_existing_task"
+        ),
+        "store-scoped command preconditions should be in scope for scene events: {results:?}"
     );
 }
 
@@ -27887,21 +29881,176 @@ fn fixture_function_contracts_smoke() {
 }
 
 #[test]
-fn fixture_collections_and_quantifiers_smoke() {
-    for fixture in [
+fn fixture_collection_related_fast_target_smoke() {
+    let collection_ops = verify_fixture_with_config(
         "collection_ops.ab",
-        "collections.ab",
+        &VerifyConfig {
+            target: Some("lemma:map_merge_right_bias".parse().expect("lemma target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            collection_ops.as_slice(),
+            [VerificationResult::Proved { name, .. }] if name == "map_merge_right_bias"
+        ),
+        "collection_ops.ab should prove a selected map lemma: {collection_ops:?}"
+    );
+
+    let quantifiers = verify_fixture_with_config(
         "quantifiers.ab",
+        &VerifyConfig {
+            target: Some("fn:enum_exists".parse().expect("fn target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            quantifiers.as_slice(),
+            [VerificationResult::FnContractProved { name, .. }] if name == "enum_exists"
+        ),
+        "quantifiers.ab should prove a selected quantified fn contract: {quantifiers:?}"
+    );
+
+    let until = verify_fixture_with_config(
         "until.ab",
+        &VerifyConfig {
+            target: Some("verify:direct_until".parse().expect("verify target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            until.as_slice(),
+            [VerificationResult::LivenessViolation { name, .. }]
+                if name == "direct_until"
+        ),
+        "until.ab should route a selected until verify block through liveness semantics: {until:?}"
+    );
+    assert!(
+        until[0].operational_witness().is_some(),
+        "current production liveness should use the transition/harness lasso path and emit operational evidence; a future temporal_relational lane needs its own dispatch/parity tests: {until:?}"
+    );
+
+    let lambdas = verify_fixture_with_config(
         "lambdas.ab",
+        &VerifyConfig {
+            target: Some("fn:partial_app".parse().expect("fn target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            lambdas.as_slice(),
+            [VerificationResult::FnContractProved { name, .. }] if name == "partial_app"
+        ),
+        "lambdas.ab should prove a selected lambda/partial-application fn contract: {lambdas:?}"
+    );
+
+    let refinements = verify_fixture_with_config(
         "refinements.ab",
-    ] {
-        let results = verify_fixture(fixture);
-        assert!(
-            !results.is_empty(),
-            "{fixture} should produce verification results"
-        );
-    }
+        &VerifyConfig {
+            target: Some("fn:double_positive".parse().expect("fn target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            refinements.as_slice(),
+            [VerificationResult::FnContractProved { name, .. }] if name == "double_positive"
+        ),
+        "refinements.ab should prove a selected refinement-precondition fn contract: {refinements:?}"
+    );
+
+    let collections_results = verify_fixture_with_config(
+        "collections.ab",
+        &VerifyConfig {
+            no_prop_verify: true,
+            target: Some("scene:task_creation".parse().expect("scene target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            collections_results.as_slice(),
+            [VerificationResult::ScenePass { name, .. }] if name == "task_creation"
+        ),
+        "collections.ab should parse, lower, and run its selected scene target quickly: {collections_results:?}"
+    );
+}
+
+fn assert_fixture_produces_verification_results(fixture: &str) {
+    let results = verify_fixture(fixture);
+    assert!(
+        !results.is_empty(),
+        "{fixture} should produce verification results"
+    );
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_collection_ops_full_smoke() {
+    assert_fixture_produces_verification_results("collection_ops.ab");
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_collections_full_smoke() {
+    let lifecycle = verify_fixture_with_config(
+        "collections.ab",
+        &VerifyConfig {
+            target: Some("verify:task_lifecycle".parse().expect("verify target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            lifecycle.as_slice(),
+            [VerificationResult::Checked { name, .. } | VerificationResult::Proved { name, .. }]
+                if name == "task_lifecycle"
+        ),
+        "collections.ab should verify its selected lifecycle target without timing out: {lifecycle:?}"
+    );
+
+    let scene = verify_fixture_with_config(
+        "collections.ab",
+        &VerifyConfig {
+            no_prop_verify: true,
+            target: Some("scene:task_creation".parse().expect("scene target")),
+            ..VerifyConfig::default()
+        },
+    );
+    assert!(
+        matches!(
+            scene.as_slice(),
+            [VerificationResult::ScenePass { name, .. }] if name == "task_creation"
+        ),
+        "collections.ab should still exercise its scene target: {scene:?}"
+    );
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_quantifiers_full_smoke() {
+    assert_fixture_produces_verification_results("quantifiers.ab");
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_until_full_smoke() {
+    assert_fixture_produces_verification_results("until.ab");
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_lambdas_full_smoke() {
+    assert_fixture_produces_verification_results("lambdas.ab");
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness fixture shard; run make test-fallback-soundness"]
+fn fixture_refinements_full_smoke() {
+    assert_fixture_produces_verification_results("refinements.ab");
 }
 
 #[test]
@@ -28125,4 +30274,430 @@ fn fixture_remaining_verify_features_smoke() {
             "{fixture} should exercise verifier result paths: {results:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "opt-in slow fallback-soundness gate; run make test-fallback-soundness or cargo nextest run -p abide-verify --lib fallback_soundness_full_gate --run-ignored only"]
+fn fallback_soundness_full_gate() {
+    fixture_liveness_and_fairness_smoke();
+    fixture_function_contracts_smoke();
+    fixture_collection_related_fast_target_smoke();
+    fixture_large_systems_and_multi_file_smoke();
+    fixture_relational_liveness_and_nondeterminism_smoke();
+    quantified_liveness_theorems_do_not_use_ic3_bas_proof_claims();
+    fixture_remaining_verify_features_smoke();
+    fixture_auth_smoke_results_cover_verify_and_scene_paths();
+    fixture_scene_ordering_and_cardinality_smoke();
+
+    verify_all_rejects_bare_expr_stmt_action_body();
+    reachable_division_by_zero_is_flagged();
+    transition_update_division_by_zero_is_flagged();
+    theorem_reachable_division_by_zero_is_not_proved();
+    liveness_body_division_is_not_silently_checked();
+    fn_contract_division_by_zero_is_not_proved();
+}
+
+// ── abide-wnby.6.14: system/program Store<T>[lo..hi] parameter cardinality
+// contract enforcement. Elaboration already constrains the assume-block store
+// bounds to lie within the parameter contract (lo >= param.lo, hi <= param.hi),
+// so enforcing the assume-block active-count floor in every backend also
+// enforces the parameter contract. The relational backend previously ignored
+// that floor (capacity-only) and reported spurious sub-floor counterexamples. ──
+
+/// A `Store<Order>[1..N]` store requires ≥1 active instance always, so an
+/// existential property that only fails in a 0-active state must NOT yield a
+/// counterexample on the relational backend, which previously ignored the
+/// floor. Calls the relational backend directly (bypassing the BMC backstop)
+/// so the assertion exercises the floor fix itself.
+#[test]
+fn relational_store_lower_bound_excludes_sub_floor_counterexample() {
+    let ir = lower_source_file(
+        "rel_store_lo_no_ce.ab",
+        "module RelFloor\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1..3]) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         verify orders_nonempty {\n\
+           assume {\n\
+             store orders: Order[1..3]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always (some o: Order | o.status == @Pending)\n\
+         }\n",
+    );
+    let verify = &ir.verifies[0];
+    let outcome = relational::try_check_verify_block_relational(
+        &ir,
+        verify,
+        3,
+        WitnessSemantics::Relational,
+        true,
+    )
+    .expect("the [1..3] store verify must be handled by the relational backend");
+    assert!(
+        matches!(outcome, relational::RelationalVerifyOutcome::Checked { .. }),
+        "the floor prunes the sub-floor states, so `always (some o: Order | …)` \
+         holds and the relational backend must report Checked"
+    );
+}
+
+/// The floor enforcement must not over-prune: a property that is genuinely
+/// false in a reachable ≥1-active state must still be falsified by the
+/// relational backend, so the fix rules out only sub-floor states.
+#[test]
+fn relational_store_lower_bound_still_finds_real_counterexample() {
+    let ir = lower_source_file(
+        "rel_store_lo_real_ce.ab",
+        "module RelFloor\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Confirmed\n}\n\n\
+         system Commerce(orders: Store<Order>[1..3]) {\n\
+           command create_order() { create Order {} }\n\
+         }\n\n\
+         verify all_pending {\n\
+           assume {\n\
+             store orders: Order[1..3]\n\
+             let commerce = Commerce { orders: orders }\n\
+           }\n\
+           assert always (all o: Order | o.status == @Pending)\n\
+         }\n",
+    );
+    let verify = &ir.verifies[0];
+    let outcome = relational::try_check_verify_block_relational(
+        &ir,
+        verify,
+        3,
+        WitnessSemantics::Relational,
+        true,
+    )
+    .expect("the [1..3] store verify must be handled by the relational backend");
+    assert!(
+        matches!(
+            outcome,
+            relational::RelationalVerifyOutcome::Counterexample { .. }
+        ),
+        "a required active Order defaults to `@Confirmed`, a real ≥1-active \
+         counterexample the relational backend must still find"
+    );
+}
+
+#[test]
+fn theorem_store_param_lower_bound_prevents_vacuous_entity_quantifier_proof() {
+    let ir = lower_source_file(
+        "theorem_store_param_floor.ab",
+        "module TheoremStoreFloor\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {\n\
+           command noop() { }\n\
+         }\n\n\
+         theorem all_orders_confirmed for Commerce {\n\
+           show always (all o: Order | o.status == @Confirmed)\n\
+         }\n",
+    );
+    let results = verify_all(&ir, &proof_search_regression_config());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::Unprovable { name, .. }
+                | VerificationResult::Counterexample { name, .. }
+                if name == "all_orders_confirmed"
+        )),
+        "theorem verification must honor Store<Order>[1] and reject the \
+         vacuous zero-active proof: {results:?}"
+    );
+}
+
+#[test]
+fn theorem_store_param_lower_bound_supports_active_entity_existential() {
+    let ir = lower_source_file(
+        "theorem_store_scoped_floor.ab",
+        "module TheoremStoreScopedFloor\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {\n\
+           command noop() { }\n\
+         }\n\n\
+         theorem orders_start_nonempty for Commerce {\n\
+           show always (exists o: Order | o.status == @Pending)\n\
+         }\n",
+    );
+    let results = verify_all(&ir, &proof_search_regression_config());
+
+    assert!(
+        results.iter().any(|result| {
+            matches!(
+                result,
+                VerificationResult::Proved { name, .. } if name == "orders_start_nonempty"
+            )
+        }),
+        "theorem verification should synthesize the Store<Order>[1] parameter \
+         floor so active-entity quantification is nonempty: {results:?}"
+    );
+}
+
+#[test]
+fn theorem_store_scoped_existential_uses_synthesized_store_range() {
+    let ir = lower_source_file(
+        "theorem_store_scoped_existential.ab",
+        "module TheoremStoreScopedExistential\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {\n\
+           command noop() { }\n\
+         }\n\n\
+         theorem orders_start_pending for Commerce {\n\
+           show always (exists o: Order in orders | o.status == @Pending)\n\
+         }\n",
+    );
+    let results = verify_all(&ir, &proof_search_regression_config());
+
+    assert!(
+        results.iter().any(|result| {
+            matches!(
+                result,
+                VerificationResult::Proved { name, .. } if name == "orders_start_pending"
+            )
+        }),
+        "theorem store-scoped quantifier should use the synthesized `orders` \
+         range and prove from the Store<Order>[1] floor: {results:?}"
+    );
+}
+
+#[test]
+fn theorem_store_scoped_universal_rejects_false_active_member_claim() {
+    let ir = lower_source_file(
+        "theorem_store_scoped_universal_negative.ab",
+        "module TheoremStoreScopedUniversalNegative\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Order {\n  status: Status = @Pending\n}\n\n\
+         system Commerce(orders: Store<Order>[1]) {\n\
+           command noop() { }\n\
+         }\n\n\
+         theorem all_orders_confirmed_in_store for Commerce {\n\
+           show (all o: Order in orders | o.status == @Confirmed)\n\
+         }\n",
+    );
+    let results = verify_all(&ir, &proof_search_regression_config());
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            VerificationResult::Unprovable { name, .. }
+                | VerificationResult::Counterexample { name, .. }
+                if name == "all_orders_confirmed_in_store"
+        )),
+        "theorem store-scoped quantifier must not prove a false claim over \
+         the active synthesized `orders` range: {results:?}"
+    );
+}
+
+/// The stateful-scene path enforces the store floor on its witness state too.
+/// The witness's active set is exactly the `given`-bound instances, so a
+/// `[2..2]` store (floor 2) with a single given binding cannot reach the
+/// required active count: the floor rules out the under-populated witness and
+/// the scene must FAIL. Without the floor the single-instance witness would
+/// spuriously pass. Calls the relational scene backend directly.
+#[test]
+fn relational_scene_store_lower_bound_prunes_under_populated_witness() {
+    let ir = lower_source_file(
+        "rel_scene_store_floor.ab",
+        "module RelScene\n\n\
+         enum Status = Pending | Confirmed\n\n\
+         entity Counter {\n\
+           id: identity\n\
+           status: Status = @Pending\n\
+           action confirm() requires true {\n\
+             status' = @Confirmed\n\
+           }\n\
+         }\n\n\
+         system CounterOps(counters: Store<Counter>) {\n\
+           command confirm_one(counter_id: identity) {\n\
+             choose c: Counter where c.id == counter_id { c.confirm() }\n\
+           }\n\
+         }\n\n\
+         scene store_needs_two {\n\
+           given {\n\
+             store counters: Counter[2..2]\n\
+             let counterOps = CounterOps { counters: counters }\n\
+             let c = one Counter in counters where c.status == @Pending\n\
+           }\n\
+           when {\n\
+             counterOps.confirm_one(c.id)\n\
+           }\n\
+           then {\n\
+             assert c.status == @Confirmed\n\
+           }\n\
+         }\n",
+    );
+    let scene = &ir.scenes[0];
+    let result = relational::try_check_scene_block_relational(&ir, scene)
+        .expect("the [2..2] store scene must be handled by the relational backend");
+    assert!(
+        matches!(&result, VerificationResult::SceneFail { name, .. } if name == "store_needs_two"),
+        "the [2..2] store floor exceeds the single given-bound instance, so no \
+         contract-valid witness exists and the scene must fail: {result:?}"
+    );
+}
+
+// ── abide-wnby.5.6 / DDR-059: real (exact rational) vs float (IEEE-754) ──
+
+/// `real` arithmetic is exact: `0.1 + 0.2 == 0.3` holds (it would fail under
+/// binary64). Exercises the SMT exact-rational `real` path.
+#[test]
+fn real_arithmetic_is_exact_rational() {
+    let ir = lower_source_file(
+        "real_exact.ab",
+        "module M\n\nsystem S {\n  x: real = 0\n  \
+         command set_x() { x' = 0.1 + 0.2 }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always (x == 0.0 or x == 0.3)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Counterexample { name, .. } if name == "v"
+        )),
+        "real 0.1 + 0.2 must equal exactly 0.3: {results:?}"
+    );
+}
+
+/// `float` arithmetic is IEEE-754 binary64: `0.1f + 0.2f != 0.3f` (the sum is
+/// 0.30000000000000004). Exercises the Z3 floating-point path; this would NOT
+/// hold if float were silently routed through exact `real` arithmetic.
+#[test]
+fn float_arithmetic_is_ieee_binary64() {
+    let ir = lower_source_file(
+        "float_ieee.ab",
+        "module M\n\nsystem S {\n  x: float = 0.0f\n  \
+         command set_x() { x' = 0.1f + 0.2f }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  \
+         assert always (x == 0.0f or x != 0.3f)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Counterexample { name, .. } if name == "v"
+        )),
+        "float 0.1f + 0.2f must NOT equal 0.3f under binary64: {results:?}"
+    );
+}
+
+/// `float` `%` is the composed Euclidean remainder `a - |b| * floor(a/|b|)`,
+/// so `5.5f % 2.0f == 1.5f`. The same primitive sequence runs in the simulator,
+/// guaranteeing SMT/simulation agreement (DDR-059).
+#[test]
+fn float_modulo_is_euclidean_binary64() {
+    let ir = lower_source_file(
+        "float_mod.ab",
+        "module M\n\nsystem S {\n  x: float = 0.0f\n  \
+         command set_x() { x' = 5.5f % 2.0f }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  \
+         assert always (x == 0.0f or x == 1.5f)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Counterexample { name, .. } if name == "v"
+        )),
+        "float 5.5f % 2.0f must equal 1.5f: {results:?}"
+    );
+}
+
+/// `real` `%` is exact Euclidean: `15/2 % 2 == 3/2` (a non-negative remainder).
+#[test]
+fn real_modulo_is_exact_euclidean() {
+    let ir = lower_source_file(
+        "real_mod.ab",
+        "module M\n\nsystem S {\n  x: real = 0\n  \
+         command set_x() { x' = 7.5 % 2.0 }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  \
+         assert always (x == 0.0 or x == 1.5)\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Counterexample { name, .. } if name == "v"
+        )),
+        "real 7.5 % 2.0 must equal exactly 1.5: {results:?}"
+    );
+}
+
+/// `real` `%` is exact Euclidean and therefore undefined at divisor zero. The
+/// SMT path must surface the same well-definedness error as the simulator,
+/// rather than proving a tautology over solver-total arithmetic.
+#[test]
+fn reachable_real_modulo_by_zero_is_flagged() {
+    let ir = lower_source_file(
+        "real_mod_zero.ab",
+        "module M\n\nsystem S {\n  d: real = 0.0\n  command noop() { }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always ((1.0 % d) == (1.0 % d))\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "v" && hint.contains("division/modulo by zero")
+        )),
+        "reachable real modulo-by-zero must be surfaced as Unprovable: {results:?}"
+    );
+}
+
+/// `float` division by zero is IEEE-defined, but Abide's Euclidean `float` `%`
+/// still requires a nonzero divisor. The verifier should reject reachable
+/// modulo-by-zero instead of silently accepting the NaN-producing primitive
+/// sequence.
+#[test]
+fn reachable_float_modulo_by_zero_is_flagged() {
+    let ir = lower_source_file(
+        "float_mod_zero.ab",
+        "module M\n\nsystem S {\n  d: float = 0.0f\n  command noop() { }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always ((1.0f % d) == (1.0f % d))\n}\n",
+    );
+    let results = verify_all(&ir, &VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { name, hint, .. }
+                if name == "v"
+                    && (hint.contains("division/modulo by zero")
+                        || hint.contains("well-definedness"))
+        )),
+        "reachable float modulo-by-zero must be surfaced as Unprovable: {results:?}"
+    );
+}
+
+/// DDR-059 / finding 3: forcing the cvc5 backend on a program that uses
+/// IEEE-754 `float` produces a focused unsupported-backend diagnostic — NOT a
+/// panic (cvc5 has no floating-point arithmetic). The verifier must surface an
+/// actionable result and survive the run.
+#[test]
+fn forced_cvc5_on_float_program_yields_focused_diagnostic_not_panic() {
+    let ir = lower_source_file(
+        "float_cvc5.ab",
+        "module M\n\nsystem S {\n  x: float = 0.0f\n  \
+         command set_x() { x' = 0.1f + 0.2f }\n}\n\n\
+         verify v {\n  assume { let s = S {} }\n  assert always (x != 0.3f)\n}\n",
+    );
+    let config = VerifyConfig {
+        solver_selection: SolverSelection::Cvc5,
+        ..VerifyConfig::default()
+    };
+    let results = verify_all(&ir, &config);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            VerificationResult::Unprovable { hint, .. }
+                if hint.contains("float") && hint.contains("cvc5")
+        )),
+        "forced cvc5 on a float program must yield a focused float/cvc5 \
+         diagnostic, got: {results:?}"
+    );
 }

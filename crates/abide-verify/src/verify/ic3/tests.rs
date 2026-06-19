@@ -1,6 +1,7 @@
 use super::*;
 use crate::ir::types::*;
 use crate::verify::context::VerifyContext;
+use crate::verify::unsupported_corpus;
 
 const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
 
@@ -2285,6 +2286,8 @@ fn build_system_chc_supports_top_level_pure_finite_payload_enum_cardinality() {
         store_params: vec![IRStoreParam {
             name: "orders".to_owned(),
             entity_type: "Order".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Order".to_owned()],
@@ -5466,6 +5469,50 @@ fn make_system_program() -> (IRProgram, IRExpr) {
     (ir, property)
 }
 
+/// Soundness: IC3 encodes each top-level action of an event body as an
+/// independent CHC rule and cannot model their atomic sequential
+/// composition (and silently drops no-rule forms), under-approximating
+/// the system. A multi-op event body must therefore NOT yield a definitive
+/// PROVED — IC3 must downgrade conservatively to Unknown. The single-op
+/// variant still proves (see `ic3_system_with_events_proves_safety`), so
+/// supported atomic bodies retain their proofs.
+///
+/// This runs without the unbounded-proof solver gate because the multi-op
+/// body is rejected during CHC encoding, before any solver call.
+#[test]
+fn ic3_rejects_multi_op_event_body_conservatively() {
+    let (mut ir, property) = make_system_program();
+    // Append a second top-level action so the event body becomes multi-op.
+    let second_op = IRAction::Choose {
+        var: "o2".to_owned(),
+        entity: "Order".to_owned(),
+        filter: Box::new(ic3_bool_lit(true)),
+        ops: vec![IRAction::Apply {
+            target: "o2".to_owned(),
+            transition: "ship".to_owned(),
+            refs: vec![],
+            args: vec![],
+        }],
+    };
+    ir.systems[0].actions[0].body.push(second_op);
+
+    let vctx = VerifyContext::from_ir(&ir);
+    let mut slots = HashMap::new();
+    slots.insert("Order".to_owned(), 2);
+    let result = try_ic3_system(
+        &ir,
+        &vctx,
+        &["Commerce".to_owned()],
+        &property,
+        &slots,
+        10000,
+    );
+    assert!(
+        matches!(result, Ic3Result::Unknown(ref r) if r.contains("multi-op")),
+        "multi-op event body must be conservatively rejected as Unknown, got: {result:?}"
+    );
+}
+
 #[test]
 fn ic3_system_with_events_proves_safety() {
     require_unbounded_proof_tests!();
@@ -6610,6 +6657,37 @@ fn build_liveness_chc_emits_monitor_columns_and_accepting_rule() {
     assert!(chc.contains("accepting"));
 }
 
+/// Soundness: the IC3 liveness-to-safety monitor's weak-fairness encoding
+/// is incomplete (it can miss a reachable accepting loop where a fair
+/// event is disabled forever, or a stutter-only loop), so a CHC `Proved`
+/// does NOT entail the liveness property. The verdict mapping must guard
+/// `Proved` — downgrading it to `Unknown` with a diagnostic — rather than
+/// returning `Ic3Result::Proved`. Counterexample/Unknown pass through.
+#[test]
+fn liveness_chc_proved_is_guarded_to_unknown() {
+    let proved = super::liveness::guarded_liveness_chc_verdict(ChcResult::Proved);
+    assert!(
+        matches!(proved, Ic3Result::Unknown(ref r) if r.contains("liveness") && r.contains("withheld")),
+        "CHC Proved must be guarded to Unknown with a soundness diagnostic, got: {proved:?}"
+    );
+    assert!(
+        matches!(
+            super::liveness::guarded_liveness_chc_verdict(ChcResult::Counterexample(
+                "cex".to_owned()
+            )),
+            Ic3Result::Violated(_)
+        ),
+        "a monitor counterexample must still surface as Violated"
+    );
+    assert!(
+        matches!(
+            super::liveness::guarded_liveness_chc_verdict(ChcResult::Unknown("timeout".to_owned())),
+            Ic3Result::Unknown(ref r) if r == "timeout"
+        ),
+        "an existing Unknown reason must pass through unchanged"
+    );
+}
+
 #[test]
 fn try_ic3_liveness_reports_missing_quantified_entity() {
     require_unbounded_proof_tests!();
@@ -6973,6 +7051,8 @@ fn build_system_chc_supports_entity_choose_scoped_properties() {
         store_params: vec![IRStoreParam {
             name: "orders".to_owned(),
             entity_type: "Order".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Order".to_owned()],
@@ -7090,12 +7170,13 @@ fn build_system_chc_supports_entity_choose_scoped_properties() {
 
 #[test]
 fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
-    let (entity, tys) = make_simple_entity();
+    let (mut entity, tys) = make_simple_entity();
+    entity.transitions.truncate(1);
     let helper = IRSystem {
         name: "Decision".to_owned(),
         store_params: vec![],
         fields: vec![],
-        entities: vec![],
+        entities: vec!["Order".to_owned()],
         commands: vec![],
         actions: vec![IRSystemAction {
             name: "decide".to_owned(),
@@ -7105,7 +7186,16 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
                 value: LitVal::Bool { value: true },
                 span: None,
             },
-            body: vec![],
+            body: vec![IRAction::ForAll {
+                var: "candidate".to_owned(),
+                entity: "Order".to_owned(),
+                ops: vec![IRAction::Apply {
+                    target: "candidate".to_owned(),
+                    transition: "confirm".to_owned(),
+                    args: vec![],
+                    refs: vec![],
+                }],
+            }],
             return_expr: None,
         }],
         fsm_decls: vec![],
@@ -7127,7 +7217,7 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
             params: vec![],
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
-                value: LitVal::Bool { value: true },
+                value: LitVal::Bool { value: false },
                 span: None,
             },
             body: vec![
@@ -7145,6 +7235,10 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
                         args: vec![],
                         refs: vec![],
                     }],
+                },
+                IRAction::Create {
+                    entity: "Order".to_owned(),
+                    fields: vec![],
                 },
                 IRAction::CrossCall {
                     system: "Decision".to_owned(),
@@ -7239,8 +7333,481 @@ fn build_liveness_chc_supports_choose_and_crosscall_event_paths() {
         slots_per_entity: &slots,
     })
     .expect("liveness choose/crosscall chc");
-    assert!(chc.contains("tick_choose_0_s0"));
+    let choose_rule = rule_line(&chc, "Shop_tick_choose_0_s0");
+    assert!(
+        choose_rule.contains("(and Order_0_active true (= Order_0_f1 0) false)"),
+        "non-true system guard should constrain choose event rules, got: {choose_rule}"
+    );
+    assert!(
+        choose_rule.contains("Order_0_active"),
+        "choose rules should require the selected slot to be active, got: {choose_rule}"
+    );
+    assert!(
+        chc.contains("Shop_tick_create_0"),
+        "liveness event encoding should include create action rules, got:\n{chc}"
+    );
+    assert!(
+        !chc.contains("Order_-1_active"),
+        "slot-zero create guard must not depend on a nonexistent previous slot"
+    );
+    assert!(
+        chc.contains("Shop_tick_cc_Decision_decide_forall_0_s0"),
+        "cross-call targets should recursively encode nested forall/apply rules, got:\n{chc}"
+    );
     assert!(chc.contains("accepting"));
+}
+
+#[test]
+fn try_ic3_liveness_expands_crosscall_reachable_systems_before_encoding() {
+    let (mut entity, tys) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let helper = IRSystem {
+        name: "Decision".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "decide".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let shop = IRSystem {
+        name: "Shop".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "tick".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![IRAction::CrossCall {
+                system: "Decision".to_owned(),
+                command: "decide".to_owned(),
+                args: vec![],
+            }],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let decoy = IRSystem {
+        name: "Decoy".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec![],
+        commands: vec![],
+        actions: vec![],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let ir = IRProgram {
+        interfaces: vec![],
+        types: tys,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity],
+        systems: vec![shop, decoy, helper],
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let trigger = IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value: true },
+        span: None,
+    };
+    let response = IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value: true },
+        span: None,
+    };
+    let slots = HashMap::from([("Order".to_owned(), 1_usize)]);
+
+    let result = try_ic3_liveness(Ic3LivenessInput {
+        ir: &ir,
+        vctx: &vctx,
+        system_names: &["Shop".to_owned()],
+        monitor: LivenessMonitorInput {
+            trigger: &trigger,
+            response: &response,
+            entity_var: Some("o"),
+            entity_name_for_binding: Some("Order"),
+            fair_events: &[],
+            is_oneshot: false,
+            target_slot: Some(0),
+        },
+        slots_per_entity: &slots,
+        timeout_ms: 1,
+    });
+
+    assert!(
+        !matches!(result, Ic3Result::Unknown(ref reason) if reason.contains("CrossCall target system Decision not found")),
+        "cross-call reachable systems should be included before liveness CHC encoding, got: {result:?}"
+    );
+}
+
+fn rule_line<'a>(chc: &'a str, rule_name: &str) -> &'a str {
+    chc.lines()
+        .find(|line| line.contains(rule_name))
+        .unwrap_or_else(|| panic!("expected CHC rule `{rule_name}` in:\n{chc}"))
+}
+
+fn bool_lit(value: bool) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value },
+        span: None,
+    }
+}
+
+fn confirm_bound_order_action(var: &str) -> IRAction {
+    IRAction::Apply {
+        target: var.to_owned(),
+        transition: "confirm".to_owned(),
+        args: vec![],
+        refs: vec![],
+    }
+}
+
+fn choose_confirm_action() -> IRAction {
+    IRAction::Choose {
+        var: "o".to_owned(),
+        entity: "Order".to_owned(),
+        filter: Box::new(bool_lit(true)),
+        ops: vec![confirm_bound_order_action("o")],
+    }
+}
+
+fn one_action_system(name: &str, action_name: &str, guard: IRExpr, body: Vec<IRAction>) -> IRSystem {
+    IRSystem {
+        name: name.to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: action_name.to_owned(),
+            params: vec![],
+            guard,
+            body,
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    }
+}
+
+fn build_system_chc_for_test(
+    entity: &IREntity,
+    types: Vec<IRTypeEntry>,
+    systems: Vec<IRSystem>,
+) -> Result<String, String> {
+    let ir = IRProgram {
+        interfaces: vec![],
+        types,
+        constants: vec![],
+        functions: vec![],
+        entities: vec![entity.clone()],
+        systems,
+        verifies: vec![],
+        theorems: vec![],
+        axioms: vec![],
+        lemmas: vec![],
+        scenes: vec![],
+    };
+    let vctx = VerifyContext::from_ir(&ir);
+    let property = IRExpr::Forall {
+        var: "o".to_owned(),
+        domain: IRType::Entity {
+            name: "Order".to_owned(),
+        },
+        body: Box::new(bool_lit(true)),
+        span: None,
+    };
+    let system_refs: Vec<_> = ir.systems.iter().collect();
+    build_system_chc(
+        &[entity],
+        &system_refs,
+        &vctx,
+        &property,
+        &HashMap::from([("Order".to_owned(), 1_usize)]),
+    )
+}
+
+#[test]
+fn system_action_encoder_treats_exprstmt_as_non_mutating_prelude() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(true),
+        vec![
+            IRAction::ExprStmt {
+                expr: bool_lit(true),
+            },
+            choose_confirm_action(),
+        ],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop])
+        .expect("pure ExprStmt prelude plus one mutating action should encode");
+    assert!(
+        chc.contains("Shop_tick_choose_1_s0_confirm"),
+        "choose action after pure ExprStmt should still encode, got:\n{chc}"
+    );
+}
+
+#[test]
+fn system_action_encoder_emits_forall_rules_for_matching_entity() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(true),
+        vec![IRAction::ForAll {
+            var: "o".to_owned(),
+            entity: "Order".to_owned(),
+            ops: vec![confirm_bound_order_action("o")],
+        }],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop])
+        .expect("forall over the scoped entity should encode");
+    assert!(
+        chc.contains("Shop_tick_forall_0_s0_confirm"),
+        "forall action should emit a transition rule, got:\n{chc}"
+    );
+}
+
+#[test]
+fn system_action_encoder_propagates_top_level_create_guard() {
+    let (entity, types) = make_simple_entity();
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(false),
+        vec![IRAction::Create {
+            entity: "Order".to_owned(),
+            fields: vec![],
+        }],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop])
+        .expect("top-level create should encode");
+    let create_rule = rule_line(&chc, "Shop_tick_create_0_Order_s0");
+    assert!(
+        create_rule.contains(" false (not Order_0_active)"),
+        "top-level create should include the event guard and inactive-slot guard, got: {create_rule}"
+    );
+}
+
+#[test]
+fn system_action_encoder_routes_crosscall_targets_and_detects_new_edges_as_noncycles() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let mut helper = one_action_system(
+        "Decision",
+        "decide",
+        bool_lit(true),
+        vec![IRAction::ForAll {
+            var: "candidate".to_owned(),
+            entity: "Order".to_owned(),
+            ops: vec![confirm_bound_order_action("candidate")],
+        }],
+    );
+    helper.actions[0].return_expr = Some(bool_lit(true));
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(false),
+        vec![IRAction::CrossCall {
+            system: "Decision".to_owned(),
+            command: "decide".to_owned(),
+            args: vec![],
+        }],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop, helper])
+        .expect("acyclic cross-call should encode its target event");
+    assert!(
+        chc.contains("Shop_tick_cc_Decision_decide_forall_0_s0_confirm"),
+        "cross-call should route to the target event body, got:\n{chc}"
+    );
+    let routed_rule = rule_line(&chc, "Shop_tick_cc_Decision_decide_forall_0_s0_confirm");
+    assert!(
+        routed_rule.contains(" false "),
+        "top-level event guard should propagate through cross-call target rules, got: {routed_rule}"
+    );
+}
+
+#[test]
+fn system_action_encoder_routes_nested_bound_crosscall_targets() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let mut helper = one_action_system(
+        "Decision",
+        "decide",
+        bool_lit(true),
+        vec![IRAction::ForAll {
+            var: "candidate".to_owned(),
+            entity: "Order".to_owned(),
+            ops: vec![confirm_bound_order_action("candidate")],
+        }],
+    );
+    helper.actions[0].return_expr = Some(bool_lit(true));
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(true),
+        vec![IRAction::Choose {
+            var: "o".to_owned(),
+            entity: "Order".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![IRAction::CrossCall {
+                system: "Decision".to_owned(),
+                command: "decide".to_owned(),
+                args: vec![],
+            }],
+        }],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop, helper])
+        .expect("nested cross-call should encode its target event");
+    assert!(
+        chc.contains("Shop_tick_choose_0_s0_cc_0_Decision_decide_forall_0_s0_confirm"),
+        "nested cross-call should route to the target event body, got:\n{chc}"
+    );
+}
+
+#[test]
+fn system_action_encoder_routes_nested_choose_and_forall_entities() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let nested_choose = one_action_system(
+        "Shop",
+        "choose_tick",
+        bool_lit(true),
+        vec![IRAction::Choose {
+            var: "outer".to_owned(),
+            entity: "Order".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![IRAction::Choose {
+                var: "inner".to_owned(),
+                entity: "Order".to_owned(),
+                filter: Box::new(bool_lit(true)),
+                ops: vec![confirm_bound_order_action("inner")],
+            }],
+        }],
+    );
+    let nested_forall = one_action_system(
+        "Shop",
+        "forall_tick",
+        bool_lit(true),
+        vec![IRAction::Choose {
+            var: "outer".to_owned(),
+            entity: "Order".to_owned(),
+            filter: Box::new(bool_lit(true)),
+            ops: vec![IRAction::ForAll {
+                var: "inner".to_owned(),
+                entity: "Order".to_owned(),
+                ops: vec![confirm_bound_order_action("inner")],
+            }],
+        }],
+    );
+
+    let choose_chc = build_system_chc_for_test(&entity, types.clone(), vec![nested_choose])
+        .expect("nested choose over the scoped entity should encode");
+    assert!(
+        choose_chc.contains("Shop_choose_tick_choose_0_s0_choose_0_s0_confirm"),
+        "nested choose should route to the inner entity action, got:\n{choose_chc}"
+    );
+
+    let forall_chc = build_system_chc_for_test(&entity, types, vec![nested_forall])
+        .expect("nested forall over the scoped entity should encode");
+    assert!(
+        forall_chc.contains("Shop_forall_tick_choose_0_s0_forall_0_s0_confirm"),
+        "nested forall should route to the inner entity action, got:\n{forall_chc}"
+    );
+}
+
+#[test]
+fn system_action_encoder_propagates_top_level_guards_into_macro_call_rules() {
+    let (mut entity, types) = make_simple_entity();
+    entity.transitions.truncate(1);
+    let mut helper = one_action_system(
+        "Decision",
+        "decide",
+        bool_lit(true),
+        vec![IRAction::ForAll {
+            var: "candidate".to_owned(),
+            entity: "Order".to_owned(),
+            ops: vec![confirm_bound_order_action("candidate")],
+        }],
+    );
+    helper.actions[0].return_expr = Some(bool_lit(true));
+    let shop = one_action_system(
+        "Shop",
+        "tick",
+        bool_lit(false),
+        vec![IRAction::LetCrossCall {
+            name: "decision".to_owned(),
+            system: "Decision".to_owned(),
+            command: "decide".to_owned(),
+            args: vec![],
+        }],
+    );
+
+    let chc = build_system_chc_for_test(&entity, types, vec![shop, helper])
+        .expect("macro call target body should encode");
+    let macro_rule = rule_line(&chc, "Shop_tick_let_0_Decision_decide_forall_0_s0_confirm");
+    assert!(
+        macro_rule.contains(" false "),
+        "top-level action guards should constrain emitted macro-call target rules, got: {macro_rule}"
+    );
+    assert!(
+        !macro_rule.contains("xyzzy"),
+        "macro-call guard vector should come from the event guard, not a synthetic mutant value"
+    );
 }
 
 #[test]
@@ -7297,7 +7864,7 @@ fn build_system_chc_supports_macro_step_let_match_routing() {
             params: vec![],
             guard: IRExpr::Lit {
                 ty: IRType::Bool,
-                value: LitVal::Bool { value: true },
+                value: LitVal::Bool { value: false },
                 span: None,
             },
             body: vec![
@@ -7394,7 +7961,19 @@ fn build_system_chc_supports_macro_step_let_match_routing() {
         &HashMap::from([("Order".to_owned(), 1_usize)]),
     )
     .expect("system CHC should route macro-step let/match actions");
-    assert!(chc.contains("Shop_tick_match_1_arm0_choose_0_s0_confirm"));
+    let routed_rule = rule_line(&chc, "Shop_tick_match_1_arm0_choose_0_s0_confirm");
+    assert!(
+        routed_rule.contains(" false "),
+        "macro-step match routing should preserve the top-level event guard, got: {routed_rule}"
+    );
+    assert!(
+        routed_rule.contains("(= 3 3)"),
+        "macro-step match routing should use the encoded call return value, got: {routed_rule}"
+    );
+    assert!(
+        !routed_rule.contains("xyzzy"),
+        "macro-step match routing should not accept synthetic mutant return terms"
+    );
 }
 
 #[test]
@@ -8038,6 +8617,20 @@ fn system_expr_translators_cover_branchy_forms_and_errors() {
 }
 
 #[test]
+fn ic3_encoders_reject_shared_unsupported_ir_corpus() {
+    let (entity, tys) = make_simple_entity();
+    let ir = make_ir_for_entity(&entity, tys);
+    let vctx = VerifyContext::from_ir(&ir);
+
+    for case in unsupported_corpus::pure_expression_rejection_cases() {
+        constraint_to_smt_with_dollar(&case.expr, "candidate", &entity, &vctx)
+            .expect_err("unsupported multi-slot IC3 corpus case must not encode");
+        guard_to_smt_sys(&case.expr, &entity, &vctx, "Order", 0)
+            .expect_err("unsupported system IC3 corpus case must not encode");
+    }
+}
+
+#[test]
 fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
     let (entity, tys) = make_simple_entity();
     let ir = make_ir_for_entity(&entity, tys.clone());
@@ -8085,25 +8678,22 @@ fn system_expr_translators_cover_remaining_let_quantifier_and_error_paths() {
                 ),
             },
         ],
-        &IRExpr::Assume {
-            expr: Box::new(ic3_bin(
-                "OpImplies",
-                ic3_var("ok", IRType::Bool),
-                IRExpr::Lone {
-                    var: "candidate".to_owned(),
-                    domain: status_ty.clone(),
-                    body: Box::new(ic3_bin(
-                        "OpNEq",
-                        ic3_var("candidate", status_ty.clone()),
-                        ic3_status_ctor("Shipped"),
-                        IRType::Bool,
-                    )),
-                    span: None,
-                },
-                IRType::Bool,
-            )),
-            span: None,
-        },
+        &ic3_bin(
+            "OpImplies",
+            ic3_var("ok", IRType::Bool),
+            IRExpr::Lone {
+                var: "candidate".to_owned(),
+                domain: status_ty.clone(),
+                body: Box::new(ic3_bin(
+                    "OpNEq",
+                    ic3_var("candidate", status_ty.clone()),
+                    ic3_status_ctor("Shipped"),
+                    IRType::Bool,
+                )),
+                span: None,
+            },
+            IRType::Bool,
+        ),
         &entity,
         &vctx,
         "Order",

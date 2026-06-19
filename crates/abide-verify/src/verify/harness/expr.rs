@@ -1,5 +1,7 @@
 use super::*;
+use crate::ir::types::IRMatchArm;
 use crate::verify::collections;
+use crate::verify::encode;
 use crate::verify::walkers;
 
 fn finite_slot_domain_values(ctx: &SlotEncodeCtx<'_>, domain: &IRType) -> Option<Vec<SmtValue>> {
@@ -52,6 +54,9 @@ pub fn try_encode_slot_expr(
         return value;
     }
     if let Some(value) = try_encode_slot_control_expr(ctx, expr, step) {
+        return value;
+    }
+    if let Some(value) = try_encode_slot_match_expr(ctx, expr, step) {
         return value;
     }
 
@@ -183,7 +188,7 @@ fn try_encode_slot_constructor(
 ) -> Result<SmtValue, String> {
     if let Some(dt) = ctx.vctx.adt_sorts.get(enum_name) {
         for variant in &dt.variants {
-            if smt::func_decl_name(&variant.constructor) == ctor {
+            if ctor_name_matches(enum_name, &smt::func_decl_name(&variant.constructor), ctor) {
                 let arity = variant.accessors.len();
                 if arity > 0 && args.is_empty() {
                     return Err(format!(
@@ -223,8 +228,21 @@ fn try_encode_slot_constructor(
             }
         }
     }
-    let id = ctx.vctx.variants.try_id_of(enum_name, ctor)?;
+    let id = ctx
+        .vctx
+        .variants
+        .try_id_of(enum_name, unqualify_ctor_name(ctor))?;
     Ok(smt::int_val(id))
+}
+
+fn unqualify_ctor_name(ctor: &str) -> &str {
+    ctor.rsplit_once("::").map_or(ctor, |(_, name)| name)
+}
+
+fn ctor_name_matches(enum_name: &str, declared_ctor: &str, candidate: &str) -> bool {
+    declared_ctor == candidate
+        || unqualify_ctor_name(candidate) == declared_ctor
+        || format!("{enum_name}::{declared_ctor}") == candidate
 }
 
 pub(super) fn try_encode_slot_choose_expr(
@@ -289,6 +307,13 @@ fn try_encode_slot_binop_expr(
             return Err("Map::merge requires map operands".to_owned());
         };
         return smt::map_merge(&l, &r, key, value);
+    }
+    // Numeric `/`/`%` in a transition guard/update may be undefined when the
+    // divisor is zero; record a well-definedness obligation (guarded by the
+    // surrounding command/action guard) so a reachable transition-update
+    // div-by-zero is surfaced rather than absorbed into solver-total arithmetic.
+    if crate::verify::property::div_mod_requires_nonzero(op, &r) {
+        crate::verify::property::record_harness_div_obligation(r.clone());
     }
     smt::binop(op, &l, &r)
 }
@@ -618,7 +643,11 @@ fn try_encode_slot_finite_set_comp_expr(
     let true_val = smt::bool_val(true).to_dynamic();
     let mut arr = smt::const_array(&elem_sort, &false_val);
 
-    for value in finite_slot_domain_values(ctx, domain).unwrap_or_default() {
+    let domain_values = finite_slot_domain_values(ctx, domain).ok_or_else(|| {
+        format!("unsupported finite set comprehension domain in action context: {domain:?}")
+    })?;
+
+    for value in domain_values {
         let mut params = ctx.params.clone();
         params.insert(var.to_owned(), value.clone());
         let inner_ctx = SlotEncodeCtx {
@@ -652,7 +681,9 @@ fn try_encode_slot_card_expr(
 ) -> Result<SmtValue, String> {
     Ok(match inner {
         IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => {
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             let count = collections::finite_literal_cardinality(inner).unwrap_or(0);
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             smt::int_val(i64::try_from(count).unwrap_or(0))
         }
         IRExpr::SetComp {
@@ -747,31 +778,32 @@ fn try_encode_slot_finite_set_comp_card(
     projection: Option<&IRExpr>,
     step: usize,
 ) -> Result<SmtValue, String> {
-    collections::encode_unique_projected_cardinality(
-        finite_slot_domain_values(ctx, domain).unwrap_or_default(),
-        |value| {
-            let mut params = ctx.params.clone();
-            params.insert(var.to_owned(), value.clone());
-            let inner_ctx = SlotEncodeCtx {
-                pool: ctx.pool,
-                vctx: ctx.vctx,
-                entity: ctx.entity,
-                slot: ctx.slot,
-                params,
-                bindings: ctx.bindings.clone(),
-                system_name: ctx.system_name,
-                entity_param_types: ctx.entity_param_types,
-                store_param_types: ctx.store_param_types,
-            };
-            let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
-            let key = if let Some(projection) = projection {
-                try_encode_slot_expr(&inner_ctx, projection, step)?
-            } else {
-                value
-            };
-            Ok((filter_val, key))
-        },
-    )
+    let domain_values = finite_slot_domain_values(ctx, domain).ok_or_else(|| {
+        format!("unsupported finite set comprehension domain in action context: {domain:?}")
+    })?;
+
+    collections::encode_unique_projected_cardinality(domain_values, |value| {
+        let mut params = ctx.params.clone();
+        params.insert(var.to_owned(), value.clone());
+        let inner_ctx = SlotEncodeCtx {
+            pool: ctx.pool,
+            vctx: ctx.vctx,
+            entity: ctx.entity,
+            slot: ctx.slot,
+            params,
+            bindings: ctx.bindings.clone(),
+            system_name: ctx.system_name,
+            entity_param_types: ctx.entity_param_types,
+            store_param_types: ctx.store_param_types,
+        };
+        let filter_val = try_encode_slot_expr(&inner_ctx, filter, step)?.to_bool()?;
+        let key = if let Some(projection) = projection {
+            try_encode_slot_expr(&inner_ctx, projection, step)?
+        } else {
+            value
+        };
+        Ok((filter_val, key))
+    })
 }
 
 pub(super) fn try_encode_slot_control_expr(
@@ -799,6 +831,63 @@ pub(super) fn try_encode_slot_control_expr(
         )),
         _ => None,
     }
+}
+
+pub(super) fn try_encode_slot_match_expr(
+    ctx: &SlotEncodeCtx<'_>,
+    expr: &IRExpr,
+    step: usize,
+) -> Option<Result<SmtValue, String>> {
+    let IRExpr::Match {
+        scrutinee, arms, ..
+    } = expr
+    else {
+        return None;
+    };
+    Some(try_encode_slot_match(ctx, scrutinee, arms, step))
+}
+
+fn try_encode_slot_match(
+    ctx: &SlotEncodeCtx<'_>,
+    scrutinee: &IRExpr,
+    arms: &[IRMatchArm],
+    step: usize,
+) -> Result<SmtValue, String> {
+    if arms.is_empty() {
+        return Err("slot match expression has no arms".to_owned());
+    }
+    let scrut = try_encode_slot_expr(ctx, scrutinee, step)?;
+    let mut result: Option<SmtValue> = None;
+
+    for arm in arms.iter().rev() {
+        let mut arm_params = ctx.params.clone();
+        encode::bind_pattern_vars(&arm.pattern, &scrut, &mut arm_params, ctx.vctx)?;
+        let arm_ctx = SlotEncodeCtx {
+            pool: ctx.pool,
+            vctx: ctx.vctx,
+            entity: ctx.entity,
+            slot: ctx.slot,
+            params: arm_params,
+            bindings: ctx.bindings.clone(),
+            system_name: ctx.system_name,
+            entity_param_types: ctx.entity_param_types,
+            store_param_types: ctx.store_param_types,
+        };
+
+        let mut arm_cond =
+            encode::encode_pattern_cond(&scrut, &arm.pattern, &HashMap::new(), ctx.vctx)?;
+        if let Some(guard) = &arm.guard {
+            let guard_bool = try_encode_slot_expr(&arm_ctx, guard, step)?.to_bool()?;
+            arm_cond = smt::bool_and(&[&arm_cond, &guard_bool]);
+        }
+        let arm_value = try_encode_slot_expr(&arm_ctx, &arm.body, step)?;
+        result = Some(match result {
+            Some(else_value) => smt::smt_ite(&arm_cond, &arm_value, &else_value),
+            None => arm_value,
+        });
+    }
+
+    Ok(result.expect("non-empty match arms should produce a value"))
 }
 
 fn try_encode_slot_store_quantifier(
@@ -922,7 +1011,7 @@ fn direct_slot_choose_witness(
     let predicate = predicate?;
     let mut bounds = IntChooseBounds::default();
     collect_int_choose_bounds(predicate, var, &mut bounds).then(|| {
-        let value = bounds.equal.or(bounds.lower).unwrap_or(0);
+        let value = bounds.equal?;
         let valid_lower = bounds.lower.is_none_or(|lower| value >= lower);
         let valid_upper = bounds.upper.is_none_or(|upper| value <= upper);
         (valid_lower && valid_upper).then_some(IRExpr::Lit {
@@ -1029,11 +1118,245 @@ pub(super) fn encode_slot_literal(lit: &LitVal) -> SmtValue {
     match lit {
         LitVal::Int { value } => smt::int_val(*value),
         LitVal::Bool { value } => smt::bool_val(*value),
-        LitVal::Real { value } | LitVal::Float { value } => {
-            #[allow(clippy::cast_possible_truncation)]
-            let scaled = (*value * 1_000_000.0) as i64;
-            smt::real_val(scaled, 1_000_000)
+        LitVal::Real { value } => {
+            // Canonical real semantics: quantize to the shared millionth scale
+            // so the SMT encoding matches the concrete witness (abide_core::arith).
+            let (num, den) = abide_core::arith::real_to_rational(*value);
+            smt::real_val(num, den)
         }
-        LitVal::Str { .. } => smt::int_val(0),
+        // `float` is IEEE-754 binary64, a distinct sort from `real` (DDR-059).
+        LitVal::Float { value } => smt::float_lit(*value),
+        LitVal::Str { value } => smt::int_val(crate::verify::literal::string_literal_id(value)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{IRPattern, IRProgram, IRTypeEntry, IRVariant};
+    use crate::verify::smt::{AbideSolver, SatResult};
+    use crate::verify::unsupported_corpus;
+
+    fn empty_test_program() -> IRProgram {
+        IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    fn enum_test_program() -> IRProgram {
+        IRProgram {
+            types: vec![IRTypeEntry {
+                name: "Status".to_owned(),
+                ty: status_ty(),
+            }],
+            ..empty_test_program()
+        }
+    }
+
+    fn status_ty() -> IRType {
+        IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
+        }
+    }
+
+    fn empty_slot_encode_ctx<'a>(
+        pool: &'a SlotPool,
+        vctx: &'a VerifyContext,
+        entity_param_types: &'a HashMap<String, String>,
+        store_param_types: &'a HashMap<String, String>,
+    ) -> SlotEncodeCtx<'a> {
+        SlotEncodeCtx {
+            pool,
+            vctx,
+            entity: "",
+            slot: 0,
+            params: HashMap::new(),
+            bindings: HashMap::new(),
+            system_name: "",
+            entity_param_types,
+            store_param_types,
+        }
+    }
+
+    #[test]
+    fn slot_literal_encoding_distinguishes_string_literals() {
+        let good = encode_slot_literal(&LitVal::Str {
+            value: "good".to_owned(),
+        });
+        let bad = encode_slot_literal(&LitVal::Str {
+            value: "bad".to_owned(),
+        });
+
+        assert_eq!(
+            good.as_int().expect("good string int").as_i64(),
+            Some(crate::verify::literal::string_literal_id("good"))
+        );
+        assert_eq!(
+            bad.as_int().expect("bad string int").as_i64(),
+            Some(crate::verify::literal::string_literal_id("bad"))
+        );
+        assert_ne!(
+            good.as_int().expect("good string int").as_i64(),
+            bad.as_int().expect("bad string int").as_i64()
+        );
+    }
+
+    #[test]
+    fn slot_constructor_accepts_qualified_fieldless_enum_variant() {
+        let program = enum_test_program();
+        let vctx = VerifyContext::from_ir(&program);
+        let pool = create_slot_pool(&[], &HashMap::new(), 0);
+        let entity_param_types = HashMap::new();
+        let store_param_types = HashMap::new();
+        let ctx = empty_slot_encode_ctx(&pool, &vctx, &entity_param_types, &store_param_types);
+
+        let plain = try_encode_slot_constructor(&ctx, "Status", "Pending", &[], 0)
+            .expect("plain constructor");
+        let qualified = try_encode_slot_constructor(&ctx, "Status", "Status::Pending", &[], 0)
+            .expect("qualified constructor");
+
+        assert_eq!(
+            plain.as_int().expect("plain int").as_i64(),
+            qualified.as_int().expect("qualified int").as_i64()
+        );
+    }
+
+    #[test]
+    fn slot_match_encodes_fieldless_enum_arms() {
+        let program = enum_test_program();
+        let vctx = VerifyContext::from_ir(&program);
+        let pool = create_slot_pool(&[], &HashMap::new(), 0);
+        let entity_param_types = HashMap::new();
+        let store_param_types = HashMap::new();
+        let ctx = empty_slot_encode_ctx(&pool, &vctx, &entity_param_types, &store_param_types);
+
+        let match_expr = IRExpr::Match {
+            scrutinee: Box::new(IRExpr::Ctor {
+                enum_name: "Status".to_owned(),
+                ctor: "Status::Pending".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+            arms: vec![
+                IRMatchArm {
+                    pattern: IRPattern::PCtor {
+                        name: "Status::Pending".to_owned(),
+                        fields: vec![],
+                    },
+                    guard: None,
+                    body: IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 1 },
+                        span: None,
+                    },
+                },
+                IRMatchArm {
+                    pattern: IRPattern::PWild,
+                    guard: None,
+                    body: IRExpr::Lit {
+                        ty: IRType::Int,
+                        value: LitVal::Int { value: 2 },
+                        span: None,
+                    },
+                },
+            ],
+            span: None,
+        };
+
+        let encoded = try_encode_slot_expr(&ctx, &match_expr, 0).expect("slot match should encode");
+        let solver = AbideSolver::new();
+        solver.assert(&smt::bool_not(&smt::int_eq(
+            encoded.as_int().expect("match int"),
+            &smt::int_lit(1),
+        )));
+        assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn set_comprehension_cardinality_rejects_unsupported_domain_without_zero_fallback() {
+        let program = empty_test_program();
+        let vctx = VerifyContext::from_ir(&program);
+        let pool = create_slot_pool(&[], &HashMap::new(), 0);
+        let entity_param_types = HashMap::new();
+        let store_param_types = HashMap::new();
+        let ctx = empty_slot_encode_ctx(&pool, &vctx, &entity_param_types, &store_param_types);
+
+        let err = try_encode_slot_finite_set_comp_card(
+            &ctx,
+            "n",
+            &IRType::Int,
+            &IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            None,
+            0,
+        )
+        .expect_err("unsupported set-comprehension cardinality must not encode as zero");
+
+        assert!(
+            err.contains("unsupported finite set comprehension domain"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn set_comprehension_value_rejects_unsupported_domain_without_empty_fallback() {
+        let program = empty_test_program();
+        let vctx = VerifyContext::from_ir(&program);
+        let pool = create_slot_pool(&[], &HashMap::new(), 0);
+        let entity_param_types = HashMap::new();
+        let store_param_types = HashMap::new();
+        let ctx = empty_slot_encode_ctx(&pool, &vctx, &entity_param_types, &store_param_types);
+
+        let err = try_encode_slot_finite_set_comp_expr(
+            &ctx,
+            "n",
+            &IRType::Int,
+            &IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            None,
+            &IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            0,
+        )
+        .expect_err("unsupported set-comprehension value must not encode as empty");
+
+        assert!(
+            err.contains("unsupported finite set comprehension domain"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn slot_encoder_rejects_shared_unsupported_ir_corpus() {
+        let program = empty_test_program();
+        let vctx = VerifyContext::from_ir(&program);
+        let pool = create_slot_pool(&[], &HashMap::new(), 0);
+        let entity_param_types = HashMap::new();
+        let store_param_types = HashMap::new();
+        let ctx = empty_slot_encode_ctx(&pool, &vctx, &entity_param_types, &store_param_types);
+
+        for case in unsupported_corpus::pure_expression_rejection_cases() {
+            try_encode_slot_expr(&ctx, &case.expr, 0).expect_err(
+                "unsupported slot corpus case must not encode to a successful SMT value",
+            );
+        }
     }
 }

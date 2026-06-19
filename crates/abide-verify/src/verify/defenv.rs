@@ -50,6 +50,17 @@ pub enum AppHeadKind {
 }
 
 impl DefEnv {
+    /// An empty definition environment — no functions, preds/props, or
+    /// derived fields to expand. Used to drive `expand_through_defs` as a
+    /// pure transparent-wrapper strip (no definition expansion).
+    pub fn empty() -> Self {
+        Self {
+            defs: HashMap::new(),
+            entity_derived: HashMap::new(),
+            entity_field_names: HashMap::new(),
+        }
+    }
+
     /// Build a definition environment from the IR program. Walks
     /// functions, entities, and systems.
     pub fn from_ir(program: &IRProgram) -> Self {
@@ -1963,6 +1974,7 @@ fn find_var_type(expr: &IRExpr, name: &str) -> Option<IRType> {
             ..
         } => bindings
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|binding| binding.source.as_deref())
             .find_map(|source| find_var_type(source, name))
             .or_else(|| find_var_type(projection, name))
@@ -2166,7 +2178,113 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_self_field_refs_covers_recursive_expression_shapes() {
+    fn pure_scene_rewrite_self_field_refs_rewrites_only_unbound_entity_fields() {
+        let receiver = var("self", order_ty());
+        let field_names = HashSet::from(["status".to_owned()]);
+
+        let rewritten = rewrite_self_field_refs(
+            var("status", IRType::Bool),
+            &receiver,
+            &field_names,
+        );
+        assert!(matches!(
+            rewritten,
+            IRExpr::Field { field, .. } if field == "status"
+        ));
+
+        let non_field = rewrite_self_field_refs(var("local", IRType::Bool), &receiver, &field_names);
+        assert!(matches!(non_field, IRExpr::Var { name, .. } if name == "local"));
+
+        let shadowed = rewrite_self_field_refs(
+            IRExpr::Let {
+                bindings: vec![LetBinding {
+                    name: "status".to_owned(),
+                    ty: IRType::Bool,
+                    expr: bool_lit(true),
+                }],
+                body: Box::new(var("status", IRType::Bool)),
+                span: None,
+            },
+            &receiver,
+            &field_names,
+        );
+        let IRExpr::Let { body, .. } = shadowed else {
+            panic!("expected let expression");
+        };
+        assert!(
+            matches!(*body, IRExpr::Var { name, .. } if name == "status"),
+            "let-bound names should shadow entity fields"
+        );
+    }
+
+    #[test]
+    fn pure_scene_free_vars_tracks_unbound_names_and_binders() {
+        let expr = IRExpr::Let {
+            bindings: vec![LetBinding {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                expr: var("y", IRType::Int),
+            }],
+            body: Box::new(bin(
+                "OpAdd",
+                var("x", IRType::Int),
+                var("z", IRType::Int),
+                IRType::Int,
+            )),
+            span: None,
+        };
+
+        let fv = free_vars(&expr);
+        assert!(fv.contains("y"), "binding initializer should see y as free");
+        assert!(fv.contains("z"), "body should see z as free");
+        assert!(!fv.contains("x"), "let-bound x should not be free in the body");
+    }
+
+    #[test]
+    fn pure_scene_substitute_var_replaces_only_target_and_respects_vardecl_shadowing() {
+        let replacement = int_lit(42);
+        let substituted = substitute_var(
+            bin(
+                "OpAdd",
+                var("x", IRType::Int),
+                var("y", IRType::Int),
+                IRType::Int,
+            ),
+            "x",
+            &replacement,
+        );
+        let IRExpr::BinOp { left, right, .. } = substituted else {
+            panic!("expected substituted binary expression");
+        };
+        assert!(matches!(*left, IRExpr::Lit { value: LitVal::Int { value: 42 }, .. }));
+        assert!(matches!(*right, IRExpr::Var { name, .. } if name == "y"));
+
+        let shadowed = substitute_var(
+            IRExpr::VarDecl {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                init: Box::new(var("x", IRType::Int)),
+                rest: Box::new(var("x", IRType::Int)),
+                span: None,
+            },
+            "x",
+            &replacement,
+        );
+        let IRExpr::VarDecl { init, rest, .. } = shadowed else {
+            panic!("expected var declaration");
+        };
+        assert!(
+            matches!(*init, IRExpr::Lit { value: LitVal::Int { value: 42 }, .. }),
+            "initializer is outside the new binding and should be substituted"
+        );
+        assert!(
+            matches!(*rest, IRExpr::Var { name, .. } if name == "x"),
+            "rest is shadowed by the var declaration and should not be substituted"
+        );
+    }
+
+    #[test]
+    fn pure_scene_rewrite_self_field_refs_covers_recursive_expression_shapes() {
         let receiver = var("self", order_ty());
         let field_names = HashSet::from(["status".to_owned(), "count".to_owned()]);
         let status_ref = var("status", IRType::Bool);
@@ -2721,7 +2839,7 @@ mod tests {
     }
 
     #[test]
-    fn decompose_app_chain_public_and_name_helpers_match() {
+    fn pure_scene_decompose_app_chain_public_and_name_helpers_match() {
         let expr = IRExpr::App {
             func: Box::new(IRExpr::App {
                 func: Box::new(IRExpr::Var {
@@ -2766,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_app_chain_public_distinguishes_query_from_pure_def() {
+    fn pure_scene_classify_app_chain_public_distinguishes_query_from_pure_def() {
         let query = IRQuery {
             name: "payable".to_owned(),
             params: vec![IRTransParam {

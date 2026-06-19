@@ -108,7 +108,7 @@ fn comp_enum_membership(x: int): bool
 fn comp_enum_non_membership(x: int): bool
   ensures result == true
 {
-  not (99 in { c: Color where true })
+  not (@Color::Red in { c: Color where c != @Color::Red })
 }
 
 type Positive = int { $ > 0 }

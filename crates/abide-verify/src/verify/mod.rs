@@ -15,6 +15,7 @@ mod collections;
 pub mod context;
 pub mod defenv;
 mod explicit;
+mod float_route;
 pub mod harness;
 pub mod ic3;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -22,6 +23,11 @@ mod ltl;
 pub mod smt;
 mod sygus;
 mod temporal;
+// Experimental Alloy/Pardinus-style temporal relational core.
+//
+// This module is compiled but not currently routed by production verification.
+// It appears to have been built as a future relation-native temporal solver
+// lane; wiring it into dispatch needs a dedicated semantics/parity bead.
 #[cfg_attr(not(test), allow(dead_code))]
 mod temporal_relational;
 pub mod transition;
@@ -44,6 +50,7 @@ use encode::*;
 mod fn_verify;
 #[allow(clippy::wildcard_imports)]
 use fn_verify::*;
+mod literal;
 mod property;
 #[allow(clippy::wildcard_imports)]
 use property::*;
@@ -58,6 +65,11 @@ use scene::*;
 mod obligation;
 mod relational;
 pub mod solver;
+#[cfg_attr(not(test), allow(dead_code))]
+mod support;
+
+#[cfg(test)]
+mod unsupported_corpus;
 
 pub use obligation::{
     analyze_verification_dependency_graph, classify_verification_parallel_lanes,
@@ -94,8 +106,9 @@ use crate::ir::types::{
 pub use self::chc::ChcSelection;
 use self::context::VerifyContext;
 use self::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints_with_store_ranges,
-    store_active_cardinality_constraints, SlotPool,
+    create_slot_pool_with_systems, domain_constraints, initial_active_slots_with_store_ranges,
+    initial_state_constraints_with_store_ranges, store_active_cardinality_constraints,
+    try_entity_field_initial_constraints, SlotPool,
 };
 use self::smt::SmtValue;
 use self::solver::{
@@ -509,6 +522,18 @@ impl BackendDiagnostic {
             backend: "verify".to_owned(),
             severity: "info".to_owned(),
             message: "ordinary verify ran bounded/exploration checking; rerun with --ic3 or --unbounded-only to attempt an unbounded proof".to_owned(),
+        }
+    }
+
+    /// Emitted when a fairness-based liveness property falls back to bounded
+    /// checking because the unbounded IC3 liveness-to-safety proof is
+    /// withheld for soundness (its weak-fairness monitor is incomplete).
+    fn liveness_proof_withheld() -> Self {
+        Self {
+            phase: "unbounded_liveness".to_owned(),
+            backend: "IC3/PDR".to_owned(),
+            severity: "info".to_owned(),
+            message: crate::messages::LIVENESS_IC3_PROOF_WITHHELD.to_owned(),
         }
     }
 }
@@ -1840,6 +1865,21 @@ fn unavailable_solver_result(name: &str, hint: String) -> VerificationResult {
     }
 }
 
+/// Focused diagnostic for the case where the user forced (or requested a
+/// comparison against) the cvc5 backend on a program that uses IEEE-754
+/// `float` (DDR-059). cvc5 has no floating-point arithmetic, so rather than
+/// reaching the solver's hard floating-point stop we surface an actionable
+/// unsupported-backend result and point the user at Z3.
+fn float_requires_z3_result(name: &str) -> VerificationResult {
+    unavailable_solver_result(
+        name,
+        "this program uses IEEE-754 `float`, which the cvc5 backend cannot \
+         solve (it has no floating-point arithmetic); re-run with the default \
+         Z3 backend or `--solver auto`"
+            .to_owned(),
+    )
+}
+
 pub(super) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(msg) = payload.downcast_ref::<String>() {
         msg.clone()
@@ -1964,9 +2004,18 @@ fn check_prop_bmc_fallback(
 /// (IC3 → induction). Hard function preflight failures gate later targets;
 /// admitted obligations remain visible but allow later verification to run.
 /// Returns one result per target, each carrying source location for diagnostic rendering.
+/// Stack size for the verification worker thread. Verification encoders recurse
+/// on expression structure; the parser caps a single expression at
+/// `MAX_EXPR_DEPTH` (~1000) levels, but each level can use a fat encoder frame,
+/// so the default thread stack is far too small. A generous worker stack keeps
+/// the depth-guarded worst case (≈1000 nested levels) comfortably within
+/// bounds, so an oversized-but-accepted spec yields a verdict and an
+/// over-the-limit one was already rejected at parse time — never a stack
+/// overflow / SIGABRT.
+const VERIFY_WORKER_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 pub fn verify_all(ir: &IRProgram, config: &VerifyConfig) -> Vec<VerificationResult> {
-    let mut event_sink = ignore_verification_stream_event;
-    verify_all_inner(ir, config, &mut event_sink, false)
+    verify_all_on_worker(ir, config, ignore_verification_stream_event, false)
 }
 
 /// Verify all targets and notify a caller-provided sink as each finalized
@@ -1983,11 +2032,48 @@ pub fn verify_all_with_events<F>(
 where
     F: FnMut(&VerificationStreamEvent),
 {
-    let results = verify_all_inner(ir, config, &mut event_sink, true);
+    let results = verify_all_on_worker(ir, config, &mut event_sink, true);
     event_sink(&VerificationStreamEvent::RunCompleted {
         result_count: results.len(),
     });
     results
+}
+
+/// Run [`verify_all_inner`] on a dedicated worker thread with a large stack
+/// ([`VERIFY_WORKER_STACK_SIZE`]), so deeply nested (but depth-guarded)
+/// expressions cannot overflow the default thread stack during encoding.
+///
+/// Stream events are forwarded from the worker to the caller-thread
+/// `event_sink` over a channel, so the sink itself need not be `Send` — only
+/// the (owned, `Send`) event values cross the thread boundary.
+fn verify_all_on_worker<F>(
+    ir: &IRProgram,
+    config: &VerifyConfig,
+    mut event_sink: F,
+    streaming: bool,
+) -> Vec<VerificationResult>
+where
+    F: FnMut(&VerificationStreamEvent),
+{
+    let (tx, rx) = std::sync::mpsc::channel::<VerificationStreamEvent>();
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .stack_size(VERIFY_WORKER_STACK_SIZE)
+            .spawn_scoped(scope, move || {
+                let mut sink = |event: &VerificationStreamEvent| {
+                    // Best-effort: a dropped receiver never aborts the run.
+                    let _ = tx.send(event.clone());
+                };
+                verify_all_inner(ir, config, &mut sink, streaming)
+            })
+            .expect("spawn verification worker thread");
+        // Forward events on the caller thread while the worker runs; `rx`
+        // closes when the worker drops its `tx`, ending the loop.
+        for event in &rx {
+            event_sink(&event);
+        }
+        worker.join().expect("verification worker thread panicked")
+    })
 }
 
 fn verify_all_inner(
@@ -2010,6 +2096,12 @@ fn verify_all_inner(
         }
     };
 
+    // IEEE-754 `float` obligations can only be solved with Z3 (DDR-059). Detect
+    // float use once so cvc5-bound selections route to Z3 when allowed, or
+    // surface a focused diagnostic when cvc5 is forced — never the solver's
+    // hard floating-point stop.
+    let uses_float = float_route::program_uses_float(ir);
+
     match config.solver_selection {
         SolverSelection::Z3 => verify_all_single(
             ir,
@@ -2020,6 +2112,11 @@ fn verify_all_inner(
             event_sink,
         ),
         SolverSelection::Cvc5 => {
+            if uses_float {
+                let result = float_requires_z3_result("verification");
+                emit_stream_result(event_sink, &result);
+                return vec![result];
+            }
             if !is_solver_family_available(SolverFamily::Cvc5) {
                 let result = unavailable_solver_result(
                     "verification",
@@ -2038,7 +2135,13 @@ fn verify_all_inner(
             )
         }
         SolverSelection::Auto => {
-            let scene_family = auto_solver_for_scene();
+            // Z3 is permitted under `auto`, so route float-bearing scenes there
+            // too rather than to the cvc5 scene default.
+            let scene_family = if uses_float {
+                SolverFamily::Z3
+            } else {
+                auto_solver_for_scene()
+            };
             verify_all_single(
                 ir,
                 config,
@@ -2049,6 +2152,14 @@ fn verify_all_inner(
             )
         }
         SolverSelection::Both => {
+            if uses_float {
+                // The `both` comparison strictly requires both backends; cvc5
+                // cannot participate on a float program, so surface that rather
+                // than crash the cvc5 half.
+                let result = float_requires_z3_result("solver_backend_comparison");
+                emit_stream_result(event_sink, &result);
+                return vec![result];
+            }
             if !is_solver_family_available(SolverFamily::Cvc5) {
                 let result = unavailable_solver_result(
                     "solver_backend_comparison",
@@ -2176,6 +2287,9 @@ pub fn verify_function_contracts_only(
 ) -> Vec<VerificationResult> {
     let solver_family = match config.solver_selection {
         SolverSelection::Cvc5 => {
+            if float_route::program_uses_float(ir) {
+                return vec![float_requires_z3_result("verification")];
+            }
             if !is_solver_family_available(SolverFamily::Cvc5) {
                 return vec![unavailable_solver_result(
                     "verification",
@@ -2221,6 +2335,9 @@ pub fn verify_proof_obligations_only(
 ) -> Vec<VerificationResult> {
     let solver_family = match config.solver_selection {
         SolverSelection::Cvc5 => {
+            if float_route::program_uses_float(ir) {
+                return vec![float_requires_z3_result("proof_verification")];
+            }
             if !is_solver_family_available(SolverFamily::Cvc5) {
                 return vec![unavailable_solver_result(
                     "proof_verification",
@@ -3260,7 +3377,7 @@ fn check_verify_block_tiered(
     // downstream proof paths (induction, IC3, BMC, lasso) each call
     // compute_verify_scope independently and thread store_ranges to
     // PropertyCtx when applicable.
-    let (relevant_entities, _relevant_systems) = select_verify_relevant(ir, &scope, &system_names);
+    let (relevant_entities, relevant_systems) = select_verify_relevant(ir, &scope, &system_names);
     let target_system_names: HashSet<String> = verify_block
         .systems
         .iter()
@@ -3300,7 +3417,25 @@ fn check_verify_block_tiered(
         .as_ref()
         .is_some_and(transition::TransitionVerifyObligation::has_liveness);
 
+    clear_prop_div_obligations();
     record_verify_assert_precondition_obligations(ir, vctx, defs, effective_block);
+
+    // Well-definedness: surface a reachable integer div-by-zero before any proof
+    // technique runs, so it cannot be silently absorbed or proved around. Only
+    // run the (more expensive, all-steps) discharge when integer div/mod is
+    // actually present, so a div-free block never pays for — or risks a backend
+    // quirk in — the extra bounded encoding. The single-step encoding above
+    // detects div in non-temporal positions (including expanded derived fields);
+    // the structural scan additionally catches div inside temporal bodies
+    // (`eventually`/`until`/…) that the single-step encoder does not descend.
+    if prop_div_obligations_present()
+        || effective_block.asserts.iter().any(contains_integer_div)
+        || transitions_contain_integer_div(&relevant_entities, &relevant_systems)
+    {
+        if let Some(result) = check_div_by_zero_reachable(ir, vctx, defs, effective_block, config) {
+            return result;
+        }
+    }
 
     if !config.unbounded_only
         && effective_block.systems.is_empty()
@@ -3386,6 +3521,31 @@ fn check_verify_block_tiered(
     });
     let mut bounded_checked_result: Option<VerificationResult> = None;
     let mut backend_diagnostics: Vec<BackendDiagnostic> = Vec::new();
+
+    // In the opt-in cvc5-SyGuS-only proof mode, the caller is deliberately
+    // exercising SyGuS. Finite explicit-state proof is sound, but if it runs
+    // first it masks whether the selected SyGuS backend can prove the block.
+    let cvc5_sygus_exclusive_proof_search = config.cvc5_sygus
+        && config.unbounded_only
+        && config.no_ic3
+        && !config.bounded_only
+        && !has_liveness
+        && config.chc_selection != ChcSelection::Cvc5;
+    if cvc5_sygus_exclusive_proof_search {
+        let Some(sygus_config) = clamp_config_to_deadline(config, deadline) else {
+            return VerificationResult::Unprovable {
+                name: effective_block.name.clone(),
+                hint: verification_timeout_hint(config),
+                span: effective_block.span,
+                file: effective_block.file.clone(),
+            };
+        };
+        if let Some(result) =
+            try_cvc5_sygus_on_verify(ir, vctx, defs, effective_block, &sygus_config)
+        {
+            return result;
+        }
+    }
 
     if let Some(result) =
         explicit::try_check_verify_block_explicit(ir, vctx, defs, effective_block, config, deadline)
@@ -3506,6 +3666,7 @@ fn check_verify_block_tiered(
         && !config.bounded_only
         && !has_liveness
         && config.chc_selection != ChcSelection::Cvc5
+        && !cvc5_sygus_exclusive_proof_search
     {
         let Some(sygus_config) = clamp_config_to_deadline(config, deadline) else {
             return VerificationResult::Unprovable {
@@ -3588,6 +3749,15 @@ fn check_verify_block_tiered(
                     {
                         return proved;
                     }
+                    // No sound unbounded liveness proof was obtained: the
+                    // IC3 liveness-to-safety reduction is withheld for
+                    // soundness (incomplete weak-fairness monitor) and
+                    // 1-induction did not suffice. Explain the conservative
+                    // downgrade on the bounded CHECKED result.
+                    return attach_backend_diagnostics(
+                        lasso_result,
+                        &[BackendDiagnostic::liveness_proof_withheld()],
+                    );
                 }
                 // Reduction failed or is not applicable — return CHECKED from lasso.
                 return attach_proof_mode_hint(lasso_result, config);
@@ -3728,25 +3898,77 @@ fn try_cvc5_sygus_on_verify(
         system.invariants.clear();
     }
     root_system.invariants.clear();
-    let sygus_result = if system.relevant_entities().is_empty() {
-        sygus::try_cvc5_sygus_system_safety_opted_in(
+    let sygus_result: transition::TransitionResult = if system.relevant_entities().is_empty() {
+        // System-safety: cvc5 synthesizes + plain-SMT pre-filters, then
+        // returns the invariant translated to IRExpr. Re-validate it through
+        // the independent Z3/IR encoding path (different encoder than cvc5)
+        // before reporting PROVED; any failure or an untranslatable invariant
+        // downgrades conservatively.
+        match sygus::try_cvc5_sygus_system_safety_opted_in(
             &root_system,
             &combined_property,
             config.induction_timeout_ms,
-        )
+        ) {
+            Err(reason) => transition::TransitionResult::Unknown(reason),
+            Ok(None) => transition::TransitionResult::Unknown(
+                "synthesized invariant could not be translated for independent \
+                 Z3/IR re-validation; downgrading conservatively"
+                    .to_owned(),
+            ),
+            Ok(Some(inv_ir)) => match revalidate_sygus_invariant_via_z3(
+                system,
+                &inv_ir,
+                &combined_property,
+                vctx,
+                defs,
+                config,
+            ) {
+                Ok(()) => transition::TransitionResult::Proved,
+                Err(reason) => transition::TransitionResult::Unknown(format!(
+                    "independent Z3/IR re-validation of the synthesized invariant \
+                     did not pass: {reason}"
+                )),
+            },
+        }
     } else if !system.relevant_entities().is_empty() {
+        // Pooled multi-system safety: cvc5 synthesizes + plain-SMT pre-filters,
+        // then returns the invariant translated to IRExpr over the flat,
+        // slot-qualified state names. Re-validate it through the independent
+        // slot-aware Z3/IR encoding path before reporting PROVED; any failure
+        // or an untranslatable invariant downgrades conservatively.
         let mut entities = system.relevant_entities().to_vec();
         for entity in &mut entities {
             entity.invariants.clear();
         }
-        sygus::try_cvc5_sygus_multi_system_pooled_safety_opted_in(
+        match sygus::try_cvc5_sygus_multi_system_pooled_safety_opted_in(
             &root_system,
             &sygus_systems,
             &entities,
             system.slots_per_entity(),
             &combined_property,
             config.induction_timeout_ms,
-        )
+        ) {
+            Err(reason) => transition::TransitionResult::Unknown(reason),
+            Ok(None) => transition::TransitionResult::Unknown(
+                "synthesized pooled invariant could not be translated for independent \
+                 Z3/IR re-validation; downgrading conservatively"
+                    .to_owned(),
+            ),
+            Ok(Some(inv_ir)) => match revalidate_pooled_sygus_invariant_via_z3(
+                system,
+                &inv_ir,
+                &combined_property,
+                vctx,
+                defs,
+                config,
+            ) {
+                Ok(()) => transition::TransitionResult::Proved,
+                Err(reason) => transition::TransitionResult::Unknown(format!(
+                    "independent Z3/IR re-validation of the synthesized pooled invariant \
+                     did not pass: {reason}"
+                )),
+            },
+        }
     } else {
         return None;
     };
@@ -3872,11 +4094,25 @@ fn prove_induction_base(
     let solver = induction_solver(config);
     let initial_bindings =
         allocate_initial_activations(system.store_ranges(), system.activations()).ok()?;
+    let initial_active_slots = initial_active_slots_with_store_ranges(
+        &initial_bindings.active_slots,
+        system.store_ranges(),
+    );
     for c in initial_state_constraints_with_store_ranges(
         &pool,
         &initial_bindings.active_slots,
         system.store_ranges(),
     ) {
+        solver.assert(&c);
+    }
+    for c in try_entity_field_initial_constraints(
+        &pool,
+        vctx,
+        system.relevant_entities(),
+        &initial_active_slots,
+    )
+    .ok()?
+    {
         solver.assert(&c);
     }
     for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
@@ -4295,7 +4531,8 @@ fn liveness_saved_state(
                 let name = format!("{prefix}_saved_{}_s{}_{}", entity.name, slot, field.name);
                 let var = match &field.ty {
                     IRType::Bool => smt::bool_var(&name),
-                    IRType::Real | IRType::Float => smt::real_var(&name),
+                    IRType::Real => smt::real_var(&name),
+                    IRType::Float => smt::float_var(&name),
                     _ => smt::int_var(&name),
                 };
                 fields.push((entity.name.clone(), slot, field.name.clone(), var));
@@ -4402,6 +4639,311 @@ fn liveness_state_matches(pool: &SlotPool, saved_state: &LivenessSavedState) -> 
         }
     }
     bool_and_owned(&parts)
+}
+
+/// Independently re-validate a SyGuS-synthesized invariant through the
+/// Z3/IR encoding path — a different encoder than the cvc5 path used both
+/// during synthesis and by the plain-SMT recheck, giving defense-in-depth
+/// against a bug shared by those two. Discharges the three inductive-safety
+/// obligations over the system's own transition relation:
+///
+/// * init:      `initial(s) => inv(s)`
+/// * induction: `inv(s) && trans(s, s') => inv(s')`
+/// * safety:    `inv(s) => property(s)`
+///
+/// Returns `Ok(())` only when all three hold (each obligation's negated
+/// violation is `UNSAT`). Any `SAT` (a genuine counterexample), `Unknown`,
+/// or encoding failure returns `Err`, so the caller downgrades
+/// conservatively. This gate is additive on top of the cvc5 plain-SMT
+/// recheck, so it can only ever increase conservatism.
+fn revalidate_sygus_invariant_via_z3(
+    system: &transition::TransitionSystemSpec<'_>,
+    invariant: &IRExpr,
+    property: &IRExpr,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+) -> Result<(), String> {
+    let encoding = transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
+    )?;
+    let pool = encoding.pool();
+    let systems = system.relevant_systems();
+    let store_ranges: HashMap<String, VerifyStoreRange> = HashMap::new();
+
+    let inv_curr = encode_property_at_step(pool, vctx, defs, invariant, 0, &store_ranges, systems)?;
+    let inv_next = encode_property_at_step(pool, vctx, defs, invariant, 1, &store_ranges, systems)?;
+    let prop_curr = encode_property_at_step(pool, vctx, defs, property, 0, &store_ranges, systems)?;
+
+    let solver = AbideSolver::new();
+    solver.set_timeout(config.induction_timeout_ms);
+    // Variable domains/types hold in every state — assert globally.
+    for c in encoding.domain_constraints() {
+        solver.assert(c);
+    }
+
+    let require_unsat = |obligation: &str, extra: &[&Bool]| -> Result<(), String> {
+        solver.push();
+        for c in extra {
+            solver.assert(*c);
+        }
+        let result = solver.check();
+        solver.pop();
+        match result {
+            SatResult::Unsat => Ok(()),
+            SatResult::Sat => Err(format!(
+                "synthesized invariant failed independent Z3/IR {obligation} revalidation"
+            )),
+            SatResult::Unknown(why) => Err(format!(
+                "independent Z3/IR {obligation} revalidation was inconclusive: {why}"
+            )),
+        }
+    };
+
+    // init: every initial state satisfies inv. The inductive-step plan does
+    // not pin the state to an initial one, so build the initial constraint
+    // directly from the declared field defaults (`field == default`);
+    // fields without a default are unconstrained. `initial(s) ∧ ¬inv(s)`
+    // must be UNSAT.
+    let not_inv_curr = smt::bool_not(&inv_curr);
+    let mut init_eqs: Vec<Bool> = Vec::new();
+    for sys in systems {
+        for field in &sys.fields {
+            if let Some(default) = &field.default {
+                let eq = IRExpr::BinOp {
+                    op: "OpEq".to_owned(),
+                    left: Box::new(IRExpr::Var {
+                        name: field.name.clone(),
+                        ty: field.ty.clone(),
+                        span: None,
+                    }),
+                    right: Box::new(default.clone()),
+                    ty: IRType::Bool,
+                    span: None,
+                };
+                init_eqs.push(encode_property_at_step(
+                    pool,
+                    vctx,
+                    defs,
+                    &eq,
+                    0,
+                    &store_ranges,
+                    systems,
+                )?);
+            }
+        }
+    }
+    let mut init_parts: Vec<&Bool> = init_eqs.iter().collect();
+    init_parts.push(&not_inv_curr);
+    require_unsat("init", &init_parts)?;
+
+    // safety: inv(s) ∧ ¬property(s) must be UNSAT.
+    let not_prop = smt::bool_not(&prop_curr);
+    require_unsat("safety", &[&inv_curr, &not_prop])?;
+
+    // induction: inv(s) ∧ trans(s, s') ∧ ¬inv(s') must be UNSAT.
+    let not_inv_next = smt::bool_not(&inv_next);
+    let mut ind_parts: Vec<&Bool> = vec![&inv_curr];
+    ind_parts.extend(encoding.fire_tracking().constraints.iter());
+    ind_parts.push(&not_inv_next);
+    require_unsat("induction", &ind_parts)?;
+
+    Ok(())
+}
+
+/// Independent slot-aware Z3/IR re-validation of a pooled SyGuS invariant
+/// (abide-wnby.1.10).
+///
+/// The synthesized pooled invariant is expressed over the flat, slot-qualified
+/// state names produced by the cvc5 pooled encoder:
+///
+/// * `<entity>_<slot>_active`  — the per-slot active flag
+/// * `<entity>_<slot>_<field>` — a per-slot entity field
+/// * `<field>`                 — a (globally unique) system field
+///
+/// `encode_property_at_step` maps abide-level names (entity quantifiers, system
+/// fields) and cannot map these flat names, so the invariant is encoded through
+/// `encode_pure_expr` against an explicit environment binding each slot-qualified
+/// name to its pool SMT variable at the requested step. The property is still
+/// encoded with the abide-level `encode_property_at_step`; both encoders target
+/// the same pool variables, so the obligations compose on one solver.
+///
+/// The three obligations re-discharge what the SyGuS engine claimed, with `pre`
+/// matching the cvc5 `pre_body` the invariant was synthesized against (every
+/// slot inactive, every system + slot field pinned to its default):
+///
+/// * init:      `pre(s) ⇒ inv(s)`
+/// * safety:    `inv(s) ⇒ property(s)`
+/// * induction: `inv(s) ∧ trans(s, s') ⇒ inv(s')`
+///
+/// This is additive-safety: it runs on top of the cvc5 plain-SMT recheck, so a
+/// bug here can only make the path more conservative (a spurious downgrade),
+/// never relax it into a false PROVED.
+fn revalidate_pooled_sygus_invariant_via_z3(
+    system: &transition::TransitionSystemSpec<'_>,
+    invariant: &IRExpr,
+    property: &IRExpr,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+) -> Result<(), String> {
+    let encoding = transition::TransitionSmtEncoding::from_plan(
+        transition::TransitionExecutionPlan::for_inductive_step(system.clone()),
+    )?;
+    let pool = encoding.pool();
+    let systems = system.relevant_systems();
+    let entities = system.relevant_entities();
+    // The property carries abide-level entity quantifiers (`all i: Item | …`)
+    // that `encode_property_at_step` ranges over the declared store slots, so
+    // it needs the verify block's real store ranges (an empty map would leave
+    // the quantifier domain unconstrained).
+    let store_ranges = system.store_ranges().clone();
+
+    // Bind every slot-qualified state name to its pool SMT variable at `step`.
+    let slot_env = |step: usize| -> Result<HashMap<String, SmtValue>, String> {
+        let mut env: HashMap<String, SmtValue> = HashMap::new();
+        for sys in systems {
+            for field in &sys.fields {
+                let value = pool
+                    .system_field_at(&sys.name, &field.name, step)
+                    .ok_or_else(|| {
+                        format!(
+                            "missing pooled SMT variable for system field `{}.{}` at step {step}",
+                            sys.name, field.name
+                        )
+                    })?;
+                env.insert(field.name.clone(), value.clone());
+            }
+        }
+        for entity in entities {
+            for slot in 0..pool.slots_for(&entity.name) {
+                let active = pool.active_at(&entity.name, slot, step).ok_or_else(|| {
+                    format!(
+                        "missing pooled SMT active flag for `{}` slot {slot} at step {step}",
+                        entity.name
+                    )
+                })?;
+                env.insert(format!("{}_{}_active", entity.name, slot), active.clone());
+                for field in &entity.fields {
+                    let value = pool
+                        .field_at(&entity.name, slot, &field.name, step)
+                        .ok_or_else(|| {
+                            format!(
+                                "missing pooled SMT variable for `{}` slot {slot} field `{}` at step {step}",
+                                entity.name, field.name
+                            )
+                        })?;
+                    env.insert(
+                        format!("{}_{}_{}", entity.name, slot, field.name),
+                        value.clone(),
+                    );
+                }
+            }
+        }
+        Ok(env)
+    };
+
+    let env_curr = slot_env(0)?;
+    let env_next = slot_env(1)?;
+
+    let inv_curr = encode_pure_expr(invariant, &env_curr, vctx, defs)?.to_bool()?;
+    let inv_next = encode_pure_expr(invariant, &env_next, vctx, defs)?.to_bool()?;
+    let prop_curr = encode_property_at_step(pool, vctx, defs, property, 0, &store_ranges, systems)?;
+
+    let solver = AbideSolver::new();
+    solver.set_timeout(config.induction_timeout_ms);
+    // Variable domains/types hold in every state — assert globally.
+    for c in encoding.domain_constraints() {
+        solver.assert(c);
+    }
+
+    let require_unsat = |obligation: &str, extra: &[&Bool]| -> Result<(), String> {
+        solver.push();
+        for c in extra {
+            solver.assert(*c);
+        }
+        let result = solver.check();
+        solver.pop();
+        match result {
+            SatResult::Unsat => Ok(()),
+            SatResult::Sat => Err(format!(
+                "synthesized pooled invariant failed independent Z3/IR {obligation} revalidation"
+            )),
+            SatResult::Unknown(why) => Err(format!(
+                "independent Z3/IR {obligation} revalidation was inconclusive: {why}"
+            )),
+        }
+    };
+
+    // init: the synthesized invariant must hold in the SyGuS pre-state — every
+    // slot inactive, every system + slot field pinned to its default. The
+    // inductive-step plan does not pin the state to an initial one, so build
+    // those facts directly and require `pre(s) ∧ ¬inv(s)` UNSAT.
+    let field_default_eq =
+        |name: String, ty: &IRType, default: &IRExpr, env: &HashMap<String, SmtValue>| {
+            let eq = IRExpr::BinOp {
+                op: "OpEq".to_owned(),
+                left: Box::new(IRExpr::Var {
+                    name,
+                    ty: ty.clone(),
+                    span: None,
+                }),
+                right: Box::new(default.clone()),
+                ty: IRType::Bool,
+                span: None,
+            };
+            encode_pure_expr(&eq, env, vctx, defs)?.to_bool()
+        };
+
+    let mut init_facts: Vec<Bool> = Vec::new();
+    for sys in systems {
+        for field in &sys.fields {
+            if let Some(default) = &field.default {
+                init_facts.push(field_default_eq(
+                    field.name.clone(),
+                    &field.ty,
+                    default,
+                    &env_curr,
+                )?);
+            }
+        }
+    }
+    for entity in entities {
+        for slot in 0..pool.slots_for(&entity.name) {
+            let active = env_curr
+                .get(&format!("{}_{}_active", entity.name, slot))
+                .ok_or_else(|| format!("missing active flag for `{}` slot {slot}", entity.name))?
+                .as_bool()?;
+            init_facts.push(smt::bool_not(active));
+            for field in &entity.fields {
+                if let Some(default) = &field.default {
+                    init_facts.push(field_default_eq(
+                        format!("{}_{}_{}", entity.name, slot, field.name),
+                        &field.ty,
+                        default,
+                        &env_curr,
+                    )?);
+                }
+            }
+        }
+    }
+    let not_inv_curr = smt::bool_not(&inv_curr);
+    let mut init_parts: Vec<&Bool> = init_facts.iter().collect();
+    init_parts.push(&not_inv_curr);
+    require_unsat("init", &init_parts)?;
+
+    // safety: inv(s) ∧ ¬property(s) must be UNSAT.
+    let not_prop = smt::bool_not(&prop_curr);
+    require_unsat("safety", &[&inv_curr, &not_prop])?;
+
+    // induction: inv(s) ∧ trans(s, s') ∧ ¬inv(s') must be UNSAT.
+    let not_inv_next = smt::bool_not(&inv_next);
+    let mut ind_parts: Vec<&Bool> = vec![&inv_curr];
+    ind_parts.extend(encoding.fire_tracking().constraints.iter());
+    ind_parts.push(&not_inv_next);
+    require_unsat("induction", &ind_parts)?;
+
+    Ok(())
 }
 
 fn prove_liveness_by_ic3(
@@ -4777,6 +5319,110 @@ fn bmc_safety_spec<'a>(
     transition::TransitionSafetySpec::for_verify(ir, vctx, verify_block, defs)
 }
 
+/// Reachability-aware well-definedness pre-check for integer division/modulo.
+///
+/// Integer `/` and `%` are undefined when the divisor is zero; the concrete
+/// evaluators reject it, but the SMT solver leaves div/mod total and would
+/// silently absorb a div-by-zero into an arbitrary value. This checks whether a
+/// reachable state evaluates a `/` or `%` with a zero divisor (where the
+/// division is actually reached — its path guard holds) and, if so, reports it.
+///
+/// It runs *before* any proof technique (induction/IC3/BMC/lasso), so a
+/// div-by-zero can never be proved around. The discharge is reachability-aware
+/// (it asserts the transition-system constraints), so a divisor kept non-zero by
+/// an invariant or a path guard is not falsely flagged.
+fn check_div_by_zero_reachable(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    verify_block: &IRVerify,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let safety = bmc_safety_spec(ir, vctx, defs, verify_block)?;
+    let hint = match div_by_zero_well_definedness(&safety, vctx, defs, config) {
+        DivWellDefinedness::Defined => return None,
+        DivWellDefinedness::Reachable => crate::messages::REACHABLE_DIVISION_BY_ZERO,
+        DivWellDefinedness::Inconclusive => crate::messages::DIVISION_WELL_DEFINEDNESS_INCONCLUSIVE,
+    };
+    Some(verify_unprovable(
+        verify_block,
+        hint.to_owned(),
+        single_assert_span(verify_block),
+    ))
+}
+
+/// Result of discharging the numeric div/mod well-definedness obligation.
+pub(super) enum DivWellDefinedness {
+    /// No checked div/mod is present, or every divisor is provably non-zero in
+    /// every reachable state — the proof may proceed.
+    Defined,
+    /// Some divisor can be zero, under its path guard, in a reachable state.
+    Reachable,
+    /// The obligation is present but could not be discharged (encoding/property
+    /// collection error, or the solver returned `unknown`). The proof must NOT
+    /// fall through to PROVED/CHECKED.
+    Inconclusive,
+}
+
+/// Core of the div-by-zero check, shared by the verify-block and theorem paths:
+/// encode the safety spec's step properties (collecting each checked `/`/`%`
+/// divisor and its path guard), then check whether some divisor can be zero
+/// under its guard in a state consistent with the transition system.
+///
+/// Callers gate on div/mod presence first, so an encoding/collection error or a
+/// solver `unknown` here means the obligation could not be discharged and is
+/// reported `Inconclusive` rather than silently allowing the proof to continue.
+pub(super) fn div_by_zero_well_definedness(
+    safety: &transition::TransitionSafetySpec<'_>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    config: &VerifyConfig,
+) -> DivWellDefinedness {
+    let system = safety.system();
+    let bound = system.bound();
+    // Clear before encoding so both transition-update divisors (recorded by the
+    // harness while building the transition relation) and property divisors
+    // (recorded below) are collected against the same pool.
+    clear_prop_div_obligations();
+    let encoding = match bmc_transition_encoding(system, bound) {
+        Ok(encoding) => encoding,
+        Err(_) => return DivWellDefinedness::Inconclusive,
+    };
+    let pool = encoding.pool();
+
+    // Collect div/mod obligations produced while encoding the properties at
+    // every step. The terms reference the same pool as the reachability solver.
+    let property_result = bmc_properties_all_steps(pool, vctx, defs, safety);
+    let obligations = take_prop_div_obligations();
+    if property_result.is_err() {
+        // Collection is incomplete while div/mod is known present — do not
+        // claim well-definedness.
+        return DivWellDefinedness::Inconclusive;
+    }
+    if obligations.is_empty() {
+        return DivWellDefinedness::Defined;
+    }
+
+    let mut div_zero: Vec<Bool> = Vec::new();
+    for (guard, divisor) in &obligations {
+        if let Some(is_zero) = property::divisor_zero_condition(divisor) {
+            div_zero.push(smt::bool_and(&[guard, &is_zero]));
+        }
+    }
+    if div_zero.is_empty() {
+        return DivWellDefinedness::Defined;
+    }
+
+    let solver = bmc_solver(config, &encoding);
+    let refs: Vec<&Bool> = div_zero.iter().collect();
+    solver.assert(smt::bool_or(&refs));
+    match solver.check() {
+        SatResult::Sat => DivWellDefinedness::Reachable,
+        SatResult::Unsat => DivWellDefinedness::Defined,
+        SatResult::Unknown(_) => DivWellDefinedness::Inconclusive,
+    }
+}
+
 fn validate_bmc_inputs(
     verify_block: &IRVerify,
     safety: &transition::TransitionSafetySpec<'_>,
@@ -4791,7 +5437,7 @@ fn validate_bmc_asserts(
     safety: &transition::TransitionSafetySpec<'_>,
 ) -> Option<VerificationResult> {
     for (assert_expr, property) in verify_block.asserts.iter().zip(safety.step_properties()) {
-        if let Some(kind) = find_unsupported_scene_expr(property) {
+        if let Some(kind) = find_unsupported_scene_expr(&strip_assert_assume(property)) {
             return Some(verify_unprovable(
                 verify_block,
                 format!("unsupported expression kind in verify assert: {kind}"),
@@ -5619,7 +6265,14 @@ fn encode_buchi_lasso_violation(
 ) -> Result<Bool, String> {
     let automaton = buchi.automaton();
     if automaton.state_count() == 0 {
-        return Ok(smt::bool_const(false));
+        // An empty automaton (zero states) is only produced when Büchi
+        // construction is aborted — the formula's subformula closure exceeds
+        // the u128 state-bit width (see `GeneralizedBuchi::from_formula`). A
+        // property that genuinely holds still yields a non-empty automaton with
+        // no accepting lasso. So treat emptiness as a construction failure and
+        // report Unprovable, rather than returning an always-UNSAT violation
+        // that would be read as a vacuous CHECKED.
+        return Err(crate::messages::LTL_AUTOMATON_TOO_LARGE.to_owned());
     }
 
     let var_prefix = buchi_state_var_prefix(ctx);
@@ -5746,7 +6399,412 @@ fn exactly_one_bool(vars: &[Bool]) -> Bool {
 /// nullary defs with their bodies, and App chains matching parameterized defs
 /// with their beta-reduced bodies. Used to resolve pred/prop references in
 /// given constraints before scanning for field references.
+/// Recursively unwrap transparent `assert`/`assume` wrappers from a verifier
+/// expression (`assert e` / `assume e` → `e`) WITHOUT expanding definitions.
+/// This is the same wrapper removal [`expand_through_defs`] performs, so the
+/// property support gate and the property encoder agree on nested wrappers
+/// such as `always (assert P)`. The encoder uses this rather than
+/// `expand_through_defs` because re-running definition expansion at encoding
+/// time would re-derive already-resolved scopes (it regressed call-site /
+/// path-guard encoding); an empty environment expands nothing.
+/// Recursively unwrap transparent `assert`/`assume` wrappers in every
+/// sub-position of a property/verifier expression, leaving every other node
+/// structurally unchanged.
+///
+/// `assert e` / `assume e` are value-transparent in boolean/property
+/// positions (their value is just `e`), so a property like `not (assume P)`,
+/// `(assert P) and Q`, or `if c { assert P } else { Q }` must encode as the
+/// bare property. This is the single normalizer shared by the property
+/// encoder ([`property::encode_prop_expr_with_ctx`]) and the property-claim
+/// support gates, so validation and encoding agree on every wrapper position.
+///
+/// This is a *wrapper-only* pass: unlike [`expand_through_defs`] it performs
+/// no definition expansion, so it is safe in isolation and never re-expands
+/// `def`s. It does **not** make `assert`/`assume` legal in value or
+/// imperative statement positions: those are checked by separate walkers
+/// (the pure encoder, `find_unsupported_in_actions`, the raw support walker)
+/// that do not route through this helper and keep rejecting the misuse.
+///
+/// The match is intentionally exhaustive so a new `IRExpr` variant forces an
+/// explicit decision about wrapper transparency rather than silently halting
+/// the recursion.
+pub(super) fn strip_assert_assume(expr: &IRExpr) -> IRExpr {
+    use crate::ir::types::LetBinding;
+    fn boxed(expr: &IRExpr) -> Box<IRExpr> {
+        Box::new(strip_assert_assume(expr))
+    }
+    fn opt(expr: &Option<Box<IRExpr>>) -> Option<Box<IRExpr>> {
+        expr.as_ref().map(|e| boxed(e))
+    }
+    match expr {
+        // Transparent wrappers: the value is just the inner expression.
+        IRExpr::Assert { expr: inner, .. } | IRExpr::Assume { expr: inner, .. } => {
+            strip_assert_assume(inner)
+        }
+        // Leaves with no expression children.
+        IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {
+            expr.clone()
+        }
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            span,
+        } => IRExpr::Ctor {
+            enum_name: enum_name.clone(),
+            ctor: ctor.clone(),
+            args: args
+                .iter()
+                .map(|(name, value)| (name.clone(), strip_assert_assume(value)))
+                .collect(),
+            span: *span,
+        },
+        IRExpr::BinOp {
+            op,
+            left,
+            right,
+            ty,
+            span,
+        } => IRExpr::BinOp {
+            op: op.clone(),
+            left: boxed(left),
+            right: boxed(right),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::UnOp {
+            op,
+            operand,
+            ty,
+            span,
+        } => IRExpr::UnOp {
+            op: op.clone(),
+            operand: boxed(operand),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::App {
+            func,
+            arg,
+            ty,
+            span,
+        } => IRExpr::App {
+            func: boxed(func),
+            arg: boxed(arg),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Lam {
+            param,
+            param_type,
+            body,
+            span,
+        } => IRExpr::Lam {
+            param: param.clone(),
+            param_type: param_type.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Let {
+            bindings,
+            body,
+            span,
+        } => IRExpr::Let {
+            bindings: bindings
+                .iter()
+                .map(|b| LetBinding {
+                    name: b.name.clone(),
+                    ty: b.ty.clone(),
+                    expr: strip_assert_assume(&b.expr),
+                })
+                .collect(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Forall {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Forall {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Exists {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Exists {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::One {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::One {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Lone {
+            var,
+            domain,
+            body,
+            span,
+        } => IRExpr::Lone {
+            var: var.clone(),
+            domain: domain.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Field {
+            expr: inner,
+            field,
+            ty,
+            span,
+        } => IRExpr::Field {
+            expr: boxed(inner),
+            field: field.clone(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Prime { expr: inner, span } => IRExpr::Prime {
+            expr: boxed(inner),
+            span: *span,
+        },
+        IRExpr::Always { body, span } => IRExpr::Always {
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Eventually { body, span } => IRExpr::Eventually {
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Until { left, right, span } => IRExpr::Until {
+            left: boxed(left),
+            right: boxed(right),
+            span: *span,
+        },
+        IRExpr::Historically { body, span } => IRExpr::Historically {
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Once { body, span } => IRExpr::Once {
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Previously { body, span } => IRExpr::Previously {
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::Since { left, right, span } => IRExpr::Since {
+            left: boxed(left),
+            right: boxed(right),
+            span: *span,
+        },
+        IRExpr::Aggregate {
+            kind,
+            var,
+            domain,
+            body,
+            in_filter,
+            span,
+        } => IRExpr::Aggregate {
+            kind: *kind,
+            var: var.clone(),
+            domain: domain.clone(),
+            body: boxed(body),
+            in_filter: opt(in_filter),
+            span: *span,
+        },
+        IRExpr::Saw {
+            system_name,
+            event_name,
+            args,
+            span,
+        } => IRExpr::Saw {
+            system_name: system_name.clone(),
+            event_name: event_name.clone(),
+            args: args.iter().map(opt).collect(),
+            span: *span,
+        },
+        IRExpr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => IRExpr::Match {
+            scrutinee: boxed(scrutinee),
+            arms: arms
+                .iter()
+                .map(|arm| crate::ir::types::IRMatchArm {
+                    pattern: arm.pattern.clone(),
+                    guard: arm.guard.as_ref().map(strip_assert_assume),
+                    body: strip_assert_assume(&arm.body),
+                })
+                .collect(),
+            span: *span,
+        },
+        IRExpr::Choose {
+            var,
+            domain,
+            predicate,
+            ty,
+            span,
+        } => IRExpr::Choose {
+            var: var.clone(),
+            domain: domain.clone(),
+            predicate: opt(predicate),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::MapUpdate {
+            map,
+            key,
+            value,
+            ty,
+            span,
+        } => IRExpr::MapUpdate {
+            map: boxed(map),
+            key: boxed(key),
+            value: boxed(value),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Index { map, key, ty, span } => IRExpr::Index {
+            map: boxed(map),
+            key: boxed(key),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::SetLit { elements, ty, span } => IRExpr::SetLit {
+            elements: elements.iter().map(strip_assert_assume).collect(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::SeqLit { elements, ty, span } => IRExpr::SeqLit {
+            elements: elements.iter().map(strip_assert_assume).collect(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Tuple { elements, ty, span } => IRExpr::Tuple {
+            elements: elements.iter().map(strip_assert_assume).collect(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::MapLit { entries, ty, span } => IRExpr::MapLit {
+            entries: entries
+                .iter()
+                .map(|(k, v)| (strip_assert_assume(k), strip_assert_assume(v)))
+                .collect(),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::SetComp {
+            var,
+            domain,
+            source,
+            filter,
+            projection,
+            ty,
+            span,
+        } => IRExpr::SetComp {
+            var: var.clone(),
+            domain: domain.clone(),
+            source: opt(source),
+            filter: boxed(filter),
+            projection: opt(projection),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ty,
+            span,
+        } => IRExpr::RelComp {
+            projection: boxed(projection),
+            bindings: bindings
+                .iter()
+                .map(|b| crate::ir::types::IRRelCompBinding {
+                    var: b.var.clone(),
+                    domain: b.domain.clone(),
+                    source: opt(&b.source),
+                })
+                .collect(),
+            filter: boxed(filter),
+            ty: ty.clone(),
+            span: *span,
+        },
+        IRExpr::Card { expr: inner, span } => IRExpr::Card {
+            expr: boxed(inner),
+            span: *span,
+        },
+        IRExpr::Block { exprs, span } => IRExpr::Block {
+            exprs: exprs.iter().map(strip_assert_assume).collect(),
+            span: *span,
+        },
+        IRExpr::VarDecl {
+            name,
+            ty,
+            init,
+            rest,
+            span,
+        } => IRExpr::VarDecl {
+            name: name.clone(),
+            ty: ty.clone(),
+            init: boxed(init),
+            rest: boxed(rest),
+            span: *span,
+        },
+        IRExpr::While {
+            cond,
+            invariants,
+            decreases,
+            body,
+            span,
+        } => IRExpr::While {
+            cond: boxed(cond),
+            invariants: invariants.iter().map(strip_assert_assume).collect(),
+            decreases: decreases.clone(),
+            body: boxed(body),
+            span: *span,
+        },
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            span,
+        } => IRExpr::IfElse {
+            cond: boxed(cond),
+            then_body: boxed(then_body),
+            else_body: opt(else_body),
+            span: *span,
+        },
+    }
+}
+
+/// Definition-expanding verifier-expression normalizer. As a side effect it
+/// also unwraps transparent `assert`/`assume` wrappers (see
+/// [`strip_assert_assume`]). This must only be applied by callers that have
+/// already established a property / verifier-expression context: the wrapper
+/// unwrapping is correct only in boolean/property positions. Value- and
+/// imperative-position checks (Create field values, transition guards and
+/// updates, the pure expression encoder, the raw support walker) must NOT
+/// route through this helper — there `assert`/`assume` are misused statements
+/// that stay rejected.
 pub(super) fn expand_through_defs(expr: &IRExpr, defs: &defenv::DefEnv) -> IRExpr {
+    if let IRExpr::Assert { expr: inner, .. } | IRExpr::Assume { expr: inner, .. } = expr {
+        return expand_through_defs(inner, defs);
+    }
     if let Some(expanded) = expand_direct_def(expr, defs) {
         return expand_through_defs(&expanded, defs);
     }
@@ -6054,6 +7112,9 @@ pub(super) fn find_unsupported_in_actions(actions: &[IRAction]) -> Option<&'stat
                 if let Some(kind) = find_unsupported_scene_expr(expr) {
                     return Some(kind);
                 }
+                if !is_action_assignment_statement(expr) {
+                    return Some("action statement must be an assignment equality");
+                }
             }
             IRAction::Apply { args, .. }
             | IRAction::CrossCall { args, .. }
@@ -6079,6 +7140,13 @@ pub(super) fn find_unsupported_in_actions(actions: &[IRAction]) -> Option<&'stat
         }
     }
     None
+}
+
+fn is_action_assignment_statement(expr: &IRExpr) -> bool {
+    let IRExpr::BinOp { op, left, .. } = expr else {
+        return false;
+    };
+    matches!(op.as_str(), "OpEq" | "==") && matches!(left.as_ref(), IRExpr::Prime { .. })
 }
 
 // ── Assumption formatting ────────────────────────────────────────────

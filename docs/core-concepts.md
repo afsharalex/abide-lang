@@ -54,7 +54,7 @@ system Banking(accounts: Store<Account>) {
 Key points:
 - `Store<T>` constructor parameters define the entity pools the system can operate over.
 - Store parameter bounds are optional cardinality contracts: `[N]` for exact size, `[lo..hi]` for a range, and `[..hi]` for at most `hi`.
-- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define capacity for that check or scene; stores start empty unless the block explicitly activates named entities.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. The lower bound is the active floor for that check or scene; the upper bound is the materialized capacity. Explicit `activate` clauses bind named instances to initial slots, and anonymous slots are used when needed to satisfy a nonzero lower bound.
 - `command` declares public operations and may include executable bodies inline.
 - `query` exposes pure read-only observations.
 - Public application-shaped commands usually take identity or value parameters and choose the target entity inside the command. Entity-valued parameters are still useful for concise specs and closed-world examples.

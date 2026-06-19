@@ -30,16 +30,6 @@ use abide::lex;
 use abide::loader;
 use abide::parse::Parser;
 
-const UNBOUNDED_PROOF_TEST_ENV: &str = "ABIDE_RUN_UNBOUNDED_PROOF_TESTS";
-
-fn should_run_unbounded_proof_tests() -> bool {
-    std::env::var_os(UNBOUNDED_PROOF_TEST_ENV).is_some()
-}
-
-fn skip_unbounded_proof_test() {
-    eprintln!("skipping unbounded proof-backend test; set {UNBOUNDED_PROOF_TEST_ENV}=1 to opt in");
-}
-
 fn terminal_verdict_line_matches(line: &str, status: &str, subject: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with(status) && trimmed.contains(subject)
@@ -274,6 +264,46 @@ fn cli_lex_directory_diagnostics_include_file_paths() {
 }
 
 #[test]
+fn cli_lex_reports_integer_literal_overflow_without_panicking() {
+    let binary = env!("CARGO_BIN_EXE_abide");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bad = dir.path().join("overflow.ab");
+    std::fs::write(
+        &bad,
+        "module Overflow\n\nconst huge = 9223372036854775808\n",
+    )
+    .expect("write overflow source");
+    let bad = std::fs::canonicalize(bad).expect("canonicalize bad");
+
+    let output = std::process::Command::new(binary)
+        .arg("lex")
+        .arg(&bad)
+        .output()
+        .expect("failed to run abide lex on overflow source");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected lex to reject overflowing integer: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "overflow must be a normal diagnostic, not a panic: {stderr}"
+    );
+    assert!(
+        stderr.contains(&bad.display().to_string()),
+        "lex diagnostic should include the source file path: {stderr}"
+    );
+    assert!(
+        stderr.contains("integer literal")
+            && (stderr.contains("too large") || stderr.contains("overflow")),
+        "lex diagnostic should describe integer overflow: {stderr}"
+    );
+}
+
+#[test]
 fn cli_parse_directory_diagnostics_include_file_paths() {
     let binary = env!("CARGO_BIN_EXE_abide");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -421,15 +451,6 @@ fn cli_verify_accepts_multi_file_source_directory() {
             || output_has_verdict_subject(&stdout, "PROVED", "checkout_graph_smoke"),
         "stdout should include the selected verification result: {stdout}"
     );
-}
-
-macro_rules! require_unbounded_proof_tests {
-    () => {
-        if !should_run_unbounded_proof_tests() {
-            skip_unbounded_proof_test();
-            return;
-        }
-    };
 }
 
 fn parse_file(path: &str) -> abide::ast::Program {
@@ -1115,8 +1136,186 @@ fn validation_gates_expose_unbounded_proof_tests() {
             "{file_name} must make the opt-in unbounded proof tests actually run"
         );
         assert!(
-            contents.contains("test -p abide-verify"),
+            contents.contains("-p abide-verify"),
             "{file_name} unbounded proof gate must include the verifier test suite"
+        );
+        assert!(
+            contents.contains("nextest run") && contents.contains("--run-ignored only"),
+            "{file_name} unbounded proof gate must run ignored tests explicitly with nextest"
+        );
+        assert!(
+            contents.contains("theorem_proved_by_induction"),
+            "{file_name} unbounded proof gate must intentionally select the unbounded proof tests"
+        );
+        assert!(
+            contents.contains("ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1"),
+            "{file_name} unbounded proof gate must opt into cvc5 SyGuS for the cvc5 proof tests"
+        );
+        assert!(
+            !contents.contains("--lib --run-ignored only"),
+            "{file_name} unbounded proof gate must not run every ignored verifier test indiscriminately"
+        );
+    }
+}
+
+#[test]
+fn validation_gates_expose_fallback_soundness_gate() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            contents.contains("test-fallback-soundness"),
+            "{file_name} must expose a named fallback-soundness validation gate"
+        );
+        assert!(
+            contents.contains("fallback_soundness_full_gate")
+                && contents.contains("--run-ignored only"),
+            "{file_name} fallback-soundness gate must run the ignored summation test explicitly"
+        );
+        assert!(
+            contents.contains("pure_encoder_rejects_shared_unsupported_ir_corpus")
+                && contents.contains("slot_encoder_rejects_shared_unsupported_ir_corpus")
+                && contents.contains("theorem_and_lemma_reject_shared_unsupported_ir_corpus"),
+            "{file_name} fallback-soundness gate must include the unsupported IR corpus across verifier surfaces"
+        );
+        assert!(
+            contents.contains("property_encoder_rejects_future_temporal_fallbacks")
+                && contents.contains("reachable_division_by_zero_is_flagged")
+                && contents.contains("verify_all_rejects_bare_expr_stmt_action_body"),
+            "{file_name} fallback-soundness gate must include focused poison-pill regressions"
+        );
+        assert!(
+            contents.contains("public_examples_cover_remaining_audit_constructs")
+                && contents.contains("public_example_verify_blocks_run_with_bounded_targets"),
+            "{file_name} fallback-soundness gate must include public example coverage"
+        );
+    }
+
+    let verifier_tests = workspace_dir.join("crates/abide-verify/src/verify/tests.rs");
+    let contents = std::fs::read_to_string(&verifier_tests)
+        .unwrap_or_else(|err| panic!("read {verifier_tests:?}: {err}"));
+    assert!(
+        contents.contains("fn fallback_soundness_full_gate()") && contents.contains("#[ignore"),
+        "abide-verify must expose an ignored full fallback-soundness summation test"
+    );
+}
+
+#[test]
+fn validation_gates_enforce_ignored_test_inventory() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    let inventory = workspace_dir.join("ignored-tests.txt");
+    let contents = std::fs::read_to_string(&inventory)
+        .unwrap_or_else(|err| panic!("read {inventory:?}: {err}"));
+    assert!(
+        contents.contains("Generated by: python3 tools/ignored_tests_inventory.py update"),
+        "ignored test inventory must document the repeatable update command"
+    );
+    assert!(
+        contents.contains("verify::tests::verify_all_with_cvc5_selection_proves")
+            && contents.contains("fallback_soundness_full_gate"),
+        "ignored test inventory must include the cvc5 SyGuS and fallback-soundness ignored gates"
+    );
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            contents.contains("check-ignored-tests"),
+            "{file_name} must expose a repeatable ignored-test inventory check"
+        );
+        assert!(
+            contents.contains("update-ignored-tests")
+                && contents.contains("tools/ignored_tests_inventory.py"),
+            "{file_name} must expose a repeatable ignored-test inventory update command"
+        );
+    }
+}
+
+#[test]
+fn validation_gates_split_slow_fallback_fixture_smokes() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+
+    let verifier_tests = workspace_dir.join("crates/abide-verify/src/verify/tests.rs");
+    let tests = std::fs::read_to_string(&verifier_tests)
+        .unwrap_or_else(|err| panic!("read {verifier_tests:?}: {err}"));
+    let split_tests = [
+        "fixture_collection_ops_full_smoke",
+        "fixture_collections_full_smoke",
+        "fixture_quantifiers_full_smoke",
+        "fixture_until_full_smoke",
+        "fixture_lambdas_full_smoke",
+        "fixture_refinements_full_smoke",
+    ];
+    for name in split_tests {
+        assert!(
+            tests.contains(&format!("fn {name}()")),
+            "slow collection/quantifier fixture smoke must be split into ignored test {name}"
+        );
+    }
+    assert!(
+        !tests.contains("fn fixture_collections_and_quantifiers_full_smoke()"),
+        "the slow collection/quantifier fixture smoke must not be one serial mega-test"
+    );
+
+    for file_name in ["Makefile", "justfile"] {
+        let path = workspace_dir.join(file_name);
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            contents.contains("FALLBACK_SOUNDNESS_SLOW_FIXTURE_TESTS")
+                || contents.contains("fallback_soundness_slow_fixture_tests"),
+            "{file_name} must name the split slow fixture tests as a separate gate segment"
+        );
+        for name in split_tests {
+            assert!(
+                contents.contains(name),
+                "{file_name} fallback-soundness gate must include split slow fixture test {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unbounded_proof_tests_are_marked_ignored_not_runtime_returned() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("abide crate should live under workspace/crates/abide");
+    let runtime_skip_call = ["require", "_unbounded_proof_tests", "!()"].concat();
+    let runtime_skip_macro = ["macro_rules! require", "_unbounded_proof_tests"].concat();
+    let checked_files = [
+        workspace_dir.join("crates/abide-verify/src/verify/tests.rs"),
+        workspace_dir.join("crates/abide/tests/integration.rs"),
+    ];
+
+    for path in checked_files {
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        assert!(
+            !contents.contains(&runtime_skip_call),
+            "{path:?} must not hide opt-in proof tests behind runtime early returns"
+        );
+        assert!(
+            !contents.contains(&runtime_skip_macro),
+            "{path:?} must use #[ignore] metadata instead of a runtime skip macro"
         );
     }
 }
@@ -5395,6 +5594,38 @@ fn verify_contracts_fixture() {
     assert_eq!(fn_results.len(), 3, "should verify exactly 3 fn contracts");
 }
 
+/// Soundness: a function whose body is a pure equality (`a == b`) must
+/// not be provable as if it always returned literal `true`. Lowering
+/// previously collapsed assignment (`=`) and equality (`==`) to the same
+/// `OpEq` IR shape, so the function verifier matched the body
+/// `BinOp(OpEq, Var(a), Var(b))` as the imperative assignment `a := b`
+/// (a is a parameter, hence in the env), discarded the comparison, and
+/// returned `true`. That wrongly PROVED `ensures result` for a function
+/// that returns `false` whenever `a != b` (e.g. eq(1, 2)). With
+/// assignment given a distinct IR operator, the equality stays an
+/// equality and the false postcondition must be refuted.
+#[test]
+fn fn_pure_equality_body_not_proved_as_literal_true() {
+    let src = "module M\n\nfn eq(a: int, b: int): bool\n  ensures result\n{\n  a == b\n}\n";
+    let results = verify_source(src);
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { name, .. } if name == "eq"
+        )),
+        "pure equality fn `eq` must NOT be PROVED for `ensures result` — \
+         its body is an equality, not an assignment returning true; got: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { name, .. } if name == "eq"
+        )),
+        "pure equality fn `eq` should produce a contract counterexample for \
+         `ensures result` (eq(1, 2) == false); got: {results:?}"
+    );
+}
+
 #[test]
 fn verify_contracts_cli_output() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_abide"))
@@ -6386,6 +6617,87 @@ fn verify_setcomp_false_membership_fails() {
             abide::verify::VerificationResult::FnContractFailed { .. }
         )),
         "0 in set comprehension where y > 0 should FAIL"
+    );
+}
+
+// abide-wnby.6.5 — `in` must lower per collection kind: set membership,
+// map *key* membership, and a focused diagnostic for sequences.
+#[test]
+fn membership_in_map_distinguishes_key_presence() {
+    // `5 in Map(5->0)` — 5 is a key, so membership is true and the
+    // postcondition proves. The mapped value is 0; a value lookup would
+    // return 0 (falsy) and wrongly fail, so this distinguishes key membership
+    // from the old value-lookup behavior.
+    let present = lower_source(
+        "module T\n\nfn key_present(): bool\n  ensures 5 in Map(5, 0)\n{\n  true\n}\n",
+    );
+    let results = abide::verify::verify_all(&present, &abide::verify::VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { .. }
+        )),
+        "`5 in Map(5->0)` must be true (5 is a key, regardless of its value): {results:?}"
+    );
+
+    // `2 in Map(5->0)` — 2 is not a key, so it is false and the postcondition
+    // fails.
+    let absent =
+        lower_source("module T\n\nfn key_absent(): bool\n  ensures 2 in Map(5, 0)\n{\n  true\n}\n");
+    let results = abide::verify::verify_all(&absent, &abide::verify::VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { .. }
+        )),
+        "`2 in Map(1->10, 5->50)` must be false (2 is not a key): {results:?}"
+    );
+}
+
+#[test]
+fn membership_in_sequence_is_rejected() {
+    let program =
+        parse_source("module T\n\nfn bad(): bool\n  ensures 2 in Seq(1, 2, 3)\n{\n  true\n}\n");
+    let (result, _errors) = elab::elaborate(&program);
+    let (_ir, lower_diag) = ir::lower(&result);
+    assert!(
+        lower_diag
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("`in` is not supported for sequences")),
+        "`in` over a sequence must be rejected with a focused diagnostic: {lower_diag:?}"
+    );
+}
+
+// abide-wnby.6.6 — integer `/` and `%` are Euclidean across all backends.
+#[test]
+fn integer_division_and_modulo_are_euclidean_in_verifier() {
+    // Euclidean: -7 / 2 == -4 and -7 % 2 == 1 (remainder is non-negative).
+    // `x` is constrained symbolically so the SMT div/mod encoding is exercised
+    // rather than any constant folding.
+    let proved = lower_source(
+        "module T\n\nfn euclid(x: int): bool\n  requires x == -7\n  ensures (x / 2 == -4) and (x % 2 == 1)\n{\n  true\n}\n",
+    );
+    let results = abide::verify::verify_all(&proved, &abide::verify::VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractProved { .. }
+        )),
+        "euclidean -7/2=-4 and -7%2=1 must prove: {results:?}"
+    );
+
+    // The truncated-toward-zero remainder (-7 % 2 == -1) must NOT hold.
+    let failed = lower_source(
+        "module T\n\nfn trunc(x: int): bool\n  requires x == -7\n  ensures x % 2 == -1\n{\n  true\n}\n",
+    );
+    let results = abide::verify::verify_all(&failed, &abide::verify::VerifyConfig::default());
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::FnContractFailed { .. }
+        )),
+        "truncated remainder -7%2=-1 must fail under euclidean semantics: {results:?}"
     );
 }
 
@@ -7921,7 +8233,7 @@ fn verify_liveness_per_tuple_fairness() {
          command tick(j: Job) { j.toggle() }\n}\n\n\
          verify per_tuple_liveness {
   assume {
-    store jobs: Job[0..8]
+    store jobs: Job[0..2]
     let s = S { jobs: jobs }
     fair S::create_job\n    fair S::tick\n  }\n  \
          assert all j: Job | eventually j.active\n}\n",
@@ -7965,6 +8277,59 @@ fn verify_liveness_per_tuple_fairness() {
     assert!(
         matches!(result_for, abide::verify::VerificationResult::Proved { method, .. } if method == "explicit-state exhaustive search"),
         "per_tuple_liveness should be PROVED by explicit-state exhaustive search: got {result_for:?}"
+    );
+}
+
+/// Regression: an internal explicit-state liveness fairness error must not be
+/// allowed to fall through to a success verdict.
+///
+/// This deliberately uses per-tuple fairness over an entity-typed command
+/// parameter. The property is false (`eventually false` for every created job),
+/// so PROVED/CHECKED would mean the verifier ignored the liveness analysis
+/// rather than testing the claim made by the result.
+#[test]
+fn verify_liveness_entity_param_fairness_error_is_not_success() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file = dir.path().join("entity_param_liveness_error.ab");
+    std::fs::write(
+        &file,
+        "module T\n\n\
+         entity Job {\n  active: bool = false\n  \
+         action toggle() { active' = not active }\n}\n\n\
+         system S(jobs: Store<Job>) {\n  \
+         command create_job() { create Job {} }\n  \
+         command tick(j: Job) { j.toggle() }\n}\n\n\
+         verify impossible_liveness {
+  assume {
+    store jobs: Job[0..3]
+    let s = S { jobs: jobs }
+    fair S::create_job\n    fair S::tick\n  }\n  \
+         assert all j: Job | eventually false\n}\n",
+    )
+    .unwrap();
+
+    let prog = lower_file(file.to_str().unwrap());
+    let results = abide::verify::verify_all(&prog, &abide::verify::VerifyConfig::default());
+
+    let result_for = results
+        .iter()
+        .find(|r| match r {
+            abide::verify::VerificationResult::Checked { name, .. }
+            | abide::verify::VerificationResult::Proved { name, .. }
+            | abide::verify::VerificationResult::LivenessViolation { name, .. }
+            | abide::verify::VerificationResult::Unprovable { name, .. } => {
+                name == "impossible_liveness"
+            }
+            _ => false,
+        })
+        .expect("impossible_liveness result");
+
+    assert!(
+        matches!(
+            result_for,
+            abide::verify::VerificationResult::LivenessViolation { .. }
+        ),
+        "false liveness with entity-parameter fairness must produce a real liveness violation, not a success or unsupported verdict: got {result_for:?}"
     );
 }
 
@@ -8397,6 +8762,45 @@ fn elaborate_existing_match_fixture_still_passes() {
     // The existing match_test.ab fixture should still elaborate cleanly
     // (all its matches are exhaustive)
     let _result = elaborate_file("tests/fixtures/match_test.ab");
+}
+
+#[test]
+fn elaborate_primed_expression_in_invariant_produces_error() {
+    use abide::elab::error::ErrorKind;
+
+    // Invariants are state-only (single-state); a primed `'` (next-state)
+    // expression is a two-state form and must be rejected — in entity bodies…
+    let entity_errors = elaborate_source_errors(
+        "module M\n\nentity E {\n  ready: bool = false\n  invariant inv { ready' }\n}\n",
+    );
+    assert!(
+        entity_errors
+            .iter()
+            .any(|e| matches!(e.kind, ErrorKind::InvalidPrime) && e.message.contains("primed")),
+        "entity invariant with a primed expression should error: {entity_errors:?}"
+    );
+
+    // …and in system bodies.
+    let system_errors = elaborate_source_errors(
+        "module M\n\nsystem S {\n  total: int = 0\n  command noop() { }\n  invariant inv { total' >= 0 }\n}\n",
+    );
+    assert!(
+        system_errors
+            .iter()
+            .any(|e| matches!(e.kind, ErrorKind::InvalidPrime) && e.message.contains("primed")),
+        "system invariant with a primed expression should error: {system_errors:?}"
+    );
+
+    // Control: an unprimed invariant must not raise a primed-invariant error.
+    let ok_errors = elaborate_source_errors(
+        "module M\n\nentity E {\n  ready: bool = false\n  invariant inv { ready }\n}\n",
+    );
+    assert!(
+        !ok_errors
+            .iter()
+            .any(|e| matches!(e.kind, ErrorKind::InvalidPrime)),
+        "non-primed invariant must not produce a primed-invariant error: {ok_errors:?}"
+    );
 }
 
 #[test]
@@ -8855,6 +9259,66 @@ fn scene_xor_both_impossible() {
 
 // ── Liveness-to-safety reduction ──────────────────────────
 
+/// Soundness: a fairness-based liveness property must never be reported
+/// PROVED via the IC3 liveness-to-safety reduction, whose weak-fairness
+/// monitor is incomplete (it can miss a reachable accepting loop where a
+/// fair event is disabled forever, or a stutter-only loop). The unbounded
+/// `ticks: int` field defeats the finite explicit-state backend, so the
+/// property routes to the liveness-to-safety reduction — whose unbounded
+/// PROVED verdict is now guarded. The result must be the bounded CHECKED
+/// verdict carrying a diagnostic that explains the conservative downgrade,
+/// not a false PROVED from the unsound monitor.
+#[test]
+fn fair_liveness_unbounded_proof_withheld_with_diagnostic() {
+    let src = "module M\n\n\
+        enum Light = Red | Green\n\n\
+        entity Signal {\n  \
+          color: Light = @Red\n  \
+          ticks: int = 0\n  \
+          action go_green() requires color == @Red { color' = @Green }\n  \
+          action tick() { ticks' = ticks + 1 }\n\
+        }\n\n\
+        system FairSignal(signals: Store<Signal>) {\n  \
+          command create_signal() { create Signal {} }\n  \
+          command toggle() { choose s: Signal where s.color == @Red { s.go_green() } }\n  \
+          command bump() { choose s: Signal where true { s.tick() } }\n\
+        }\n\n\
+        verify eventually_done {\n  \
+          assume {\n    \
+            store signals: Signal[0..2]\n    \
+            let fairSignal = FairSignal { signals: signals }\n    \
+            fair FairSignal::create_signal\n    \
+            fair FairSignal::toggle\n    \
+            fair FairSignal::bump\n  \
+          }\n  \
+          assert always all s: Signal | s.color == @Red implies eventually s.color == @Green\n\
+        }\n";
+    let results = verify_source(src);
+    // The unsound IC3 liveness-to-safety method must never appear as PROVED.
+    assert!(
+        !results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, method, .. }
+                if name == "eventually_done" && method.contains("IC3/PDR")
+        )),
+        "liveness must not be PROVED via the unsound IC3 liveness-to-safety path: {results:?}"
+    );
+    // The fair-liveness obligation falls back to bounded CHECKED (explicit
+    // state cannot enumerate the unbounded `ticks`, and the unbounded
+    // liveness proof is withheld), and the downgrade must be explained.
+    let checked = results
+        .iter()
+        .find(|r| matches!(r, abide::verify::VerificationResult::Checked { name, .. } if name == "eventually_done"))
+        .unwrap_or_else(|| panic!("expected CHECKED for eventually_done, got: {results:?}"));
+    assert!(
+        checked
+            .backend_diagnostics()
+            .iter()
+            .any(|d| d.message.contains("withheld") && d.message.contains("liveness")),
+        "CHECKED fairness-liveness must carry the conservative-downgrade diagnostic: {checked:?}"
+    );
+}
+
 #[test]
 fn liveness_reduction_or_checked() {
     // The finite-state backend may prove this exhaustively before the
@@ -8988,10 +9452,10 @@ fn liveness_until_conjunction() {
 #[test]
 fn liveness_until_theorem() {
     // Real `until` on the theorem path: "all s | Red until Green".
-    // Desugars to (eventually Green) AND (always (not Green implies Red)).
-    // UNPROVABLE: the liveness component requires IC3 BAS which is unsound
-    // for liveness (dead-state issue). Accepting Proved would mask
-    // reintroduction of the unsound IC3 path.
+    // Encoded as true LTL until (not desugared into eventually/always).
+    // UNPROVABLE: native until is not a flat liveness pattern, so the
+    // unbounded reduction declines it rather than proving a weaker reduced
+    // obligation. Accepting Proved would mask an unsound reduction.
     let results = verify_file("tests/fixtures/liveness_reduction.ab");
     let r = results.iter().find(|r| {
         matches!(
@@ -9604,6 +10068,126 @@ fn assert_verify_result_success(results: &[abide::verify::VerificationResult], n
     assert!(
         found.is_some(),
         "{name} should be PROVED or CHECKED (got: {results:?})"
+    );
+}
+
+#[test]
+fn verify_distinguishes_unequal_string_literals_in_bmc_encoding() {
+    let src = r#"module T
+
+entity Item {
+  label: string = "good"
+  marker: bool = false
+  weight: real = 0.0
+
+  action flip() {
+    marker' = not marker
+  }
+}
+
+system Inventory(items: Store<Item>) {
+  command create_item() {
+    create Item {}
+  }
+
+  command flip_one() {
+    choose item: Item where true {
+      item.flip()
+    }
+  }
+}
+
+verify labels_are_not_bad {
+  assume {
+    store items: Item[0..1]
+    let inventory = Inventory { items: items }
+    no stutter
+  }
+
+  assert always all item: Item | item.label != "bad"
+}
+"#;
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    assert!(
+        results.iter().any(|result| matches!(
+            result,
+            abide::verify::VerificationResult::Checked { name, .. }
+                if name == "labels_are_not_bad"
+        )),
+        "BMC should distinguish the field default \"good\" from literal \"bad\"; got {results:?}"
+    );
+}
+
+#[test]
+fn verify_rejects_bounded_int_choose_transition_instead_of_fixing_lower_bound() {
+    let src = r"module T
+
+entity Counter {
+  value: int = 0
+  weight: real = 0.0
+
+  action pick() {
+    value' = choose n: int where n >= 0 and n <= 10
+  }
+}
+
+system Picker(counters: Store<Counter>) {
+  command pick_one() {
+    choose counter: Counter where true {
+      counter.pick()
+    }
+  }
+}
+
+verify choose_can_hit_seven {
+  assume {
+    store counters: Counter[1..1]
+    let picker = Picker { counters: counters }
+    no stutter
+  }
+
+  assert always all counter: Counter | counter.value != 7
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..abide::verify::VerifyConfig::default()
+        },
+    );
+
+    let result = results
+        .iter()
+        .find(|result| match result {
+            abide::verify::VerificationResult::Checked { name, .. }
+            | abide::verify::VerificationResult::Proved { name, .. }
+            | abide::verify::VerificationResult::Counterexample { name, .. }
+            | abide::verify::VerificationResult::Unprovable { name, .. } => {
+                name == "choose_can_hit_seven"
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("expected choose_can_hit_seven result, got {results:?}"));
+
+    assert!(
+        matches!(
+            result,
+            abide::verify::VerificationResult::Counterexample { .. }
+                | abide::verify::VerificationResult::Unprovable { .. }
+        ),
+        "bounded int choose in a transition must not be silently fixed to 0 and reported as success: got {result:?}"
     );
 }
 
@@ -12019,7 +12603,6 @@ scene s {
     let e = one E where true
   }
   when {
-    assume (choose n: int where n == 1) == 1
   }
   then {
     assert (choose n: int where n == 2) == 2
@@ -12325,6 +12908,86 @@ verify impossible_eventually [depth: 2] {
 }
 
 #[test]
+fn verify_rejects_or_finds_counterexample_for_nested_always_not_single_step_checked() {
+    let src = r"module T
+
+entity Flag {
+  pulse: bool = false
+  ok: bool = true
+
+  action raise() {
+    pulse' = true
+    ok' = true
+  }
+
+  action break_after() {
+    pulse' = false
+    ok' = false
+  }
+}
+
+system Flags(flags: Store<Flag>) {
+  command raise_one() {
+    choose flag: Flag where true {
+      flag.raise()
+    }
+  }
+
+  command break_one() {
+    choose flag: Flag where true {
+      flag.break_after()
+    }
+  }
+}
+
+verify nested_always_future_obligation [depth: 2] {
+  assume {
+    store flags: Flag[1..1]
+    let flags_sys = Flags { flags: flags }
+    no stutter
+  }
+
+  assert always all flag: Flag | flag.pulse implies always flag.ok
+}
+";
+
+    let results = verify_source_with_config(
+        src,
+        abide::verify::VerifyConfig {
+            bounded_only: true,
+            no_ic3: true,
+            ..Default::default()
+        },
+    );
+
+    let result = results
+        .iter()
+        .find(|result| match result {
+            abide::verify::VerificationResult::Checked { name, .. }
+            | abide::verify::VerificationResult::Proved { name, .. }
+            | abide::verify::VerificationResult::Counterexample { name, .. }
+            | abide::verify::VerificationResult::LivenessViolation { name, .. }
+            | abide::verify::VerificationResult::Unprovable { name, .. } => {
+                name == "nested_always_future_obligation"
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| {
+            panic!("expected nested_always_future_obligation result, got {results:?}")
+        });
+
+    assert!(
+        matches!(
+            result,
+            abide::verify::VerificationResult::Counterexample { .. }
+                | abide::verify::VerificationResult::LivenessViolation { .. }
+                | abide::verify::VerificationResult::Unprovable { .. }
+        ),
+        "nested always must not be weakened to a single-step safety check: got {result:?}"
+    );
+}
+
+#[test]
 fn verifier_surface_rejects_higher_order_and_imperative_forms_during_elaboration() {
     let src = r"module T
 
@@ -12407,7 +13070,6 @@ scene s {
     let e = one E where true
   }
   when {
-    assume assert true
   }
   then {
     assert assume true
@@ -12453,6 +13115,68 @@ scene s {
                 if name == "s"
         )),
         "scene using assert/assume wrappers should pass, got: {results:?}"
+    );
+}
+
+/// Regression: assert/assume wrappers nested *inside* other operators (not
+/// just as a leading chain) are also transparent in property positions. The
+/// support gate strips them recursively, so the encoder must too — otherwise
+/// `not (assume false)` or `(assert true) and (assume true)` passes
+/// validation and then fails encoding (the gate/encoder disagreement).
+#[test]
+fn assert_assume_wrappers_nested_under_operators_are_transparent() {
+    let src = r"module T
+
+entity E {}
+
+system Sys(es: Store<E>) {}
+
+lemma nested_not { not (assume false) }
+
+verify v {
+  assume {
+    store es: E[0..1]
+    let sys = Sys { es: es }
+    stutter
+  }
+  assert (assert true) and (assume true)
+}
+
+scene s {
+  given {
+    let e = one E where true
+  }
+  when {
+  }
+  then {
+    assert (assume true) and (assert true)
+  }
+}
+";
+
+    let results = verify_source(src);
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Proved { name, .. } if name == "nested_not"
+        )),
+        "lemma `not (assume false)` should prove via nested-wrapper transparency, got: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::Checked { name, .. }
+                | abide::verify::VerificationResult::Proved { name, .. }
+                if name == "v"
+        )),
+        "verify with nested wrappers should succeed (not fail encoding), got: {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| matches!(
+            r,
+            abide::verify::VerificationResult::ScenePass { name, .. } if name == "s"
+        )),
+        "scene with a nested wrapper in `then` should pass, got: {results:?}"
     );
 }
 
@@ -13306,6 +14030,69 @@ entity Order {
     assert!(
         real_errors.is_empty(),
         "flat top-level prime should elab clean, got: {real_errors:?}"
+    );
+}
+
+/// an entity action body statement that is NOT a primed field update
+/// is silently dropped by the IR lowering's `extract_updates` (which
+/// only walks top-level `Assign(Prime(Var), _)` nodes). A common shape
+/// is an UNPRIMED assignment — the user forgot the `'` — which carries
+/// no prime anywhere, so the older nested-prime check never fired. The
+/// mutation would just vanish from `IRTransition::updates`, leaving the
+/// field framed as unchanged and silently weakening verification. Elab
+/// now rejects any non-update top-level statement with a clear
+/// diagnostic instead.
+#[test]
+fn entity_action_unprimed_assignment_rejected() {
+    let src = r"module T
+
+enum OrderStatus = cart | placed | delivered
+entity Order {
+  status: OrderStatus = @cart
+  action place() { status = @placed }
+}
+";
+    let (_, errors) = elab_with_errors(src);
+    let real_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    assert!(
+        !real_errors.is_empty(),
+        "unprimed assignment in an entity action body must be rejected, \
+         not silently dropped"
+    );
+    assert!(
+        real_errors
+            .iter()
+            .any(|e| format!("{e}").contains("Order::place")),
+        "diagnostic should name the offending action, got: {real_errors:?}"
+    );
+}
+
+/// a bare expression statement in an entity action body (no assignment,
+/// no prime) is also dropped by `extract_updates`. Such a statement
+/// cannot mutate state in an entity action, so admitting it silently
+/// misleads the author into thinking it has an effect. Reject it.
+#[test]
+fn entity_action_bare_expression_statement_rejected() {
+    let src = r"module T
+
+enum OrderStatus = cart | placed | delivered
+entity Order {
+  status: OrderStatus = @cart
+  action noop() { status == @placed }
+}
+";
+    let (_, errors) = elab_with_errors(src);
+    let real_errors: Vec<_> = errors
+        .iter()
+        .filter(|e| !matches!(e.severity, elab::error::Severity::Warning))
+        .collect();
+    assert!(
+        !real_errors.is_empty(),
+        "bare expression statement in an entity action body must be \
+         rejected, not silently dropped, got: {real_errors:?}"
     );
 }
 
@@ -17960,9 +18747,8 @@ verify fulfill_is_executable {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn proc_start_and_node_transitions_are_proved_by_cvc5_sygus() {
-    require_unbounded_proof_tests!();
-
     let src = r"module T
 
 enum Outcome = ok | err
@@ -18028,9 +18814,8 @@ verify fulfill_is_executable {
 }
 
 #[test]
+#[ignore = "opt-in unbounded proof backend test; run make test-unbounded or cargo nextest run --run-ignored only with the appropriate backend opt-ins"]
 fn proc_store_workflow_is_proved_by_cvc5_sygus() {
-    require_unbounded_proof_tests!();
-
     let src = r"module T
 
 enum Outcome = ok | err

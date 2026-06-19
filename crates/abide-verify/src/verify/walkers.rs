@@ -151,9 +151,10 @@ pub(super) fn contains_imperative(expr: &IRExpr) -> bool {
         | IRExpr::VarDecl { .. }
         | IRExpr::Assert { .. }
         | IRExpr::Assume { .. } => true,
-        // Assignment: BinOp(OpEq, Var(_), _) is an imperative mutation
+        // Assignment: BinOp(OpAssign, Var(_), _) is an imperative mutation.
+        // Equality comparisons (`OpEq`) are pure and not imperative.
         IRExpr::BinOp { op, left, .. }
-            if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) =>
+            if op == "OpAssign" && matches!(left.as_ref(), IRExpr::Var { .. }) =>
         {
             true
         }
@@ -558,9 +559,11 @@ pub(super) fn extract_model_value(
         }
         SmtValue::Bool(b) => model
             .eval(b, true)
+            // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
             .map_or("?".to_owned(), |v| v.to_string()),
         SmtValue::Real(r) => model
             .eval(r, true)
+            // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
             .map_or("?".to_owned(), |v| v.to_string()),
         _ => "?".to_owned(),
     }
@@ -1336,6 +1339,7 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             ..
         } => bindings
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|binding| binding.source.as_deref())
             .find_map(find_unsupported_scene_expr)
             .or_else(|| find_unsupported_scene_expr(projection))
@@ -1406,6 +1410,7 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
         // saw is a past-time operator; recurse into args.
         IRExpr::Saw { args, .. } => args
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|a| a.as_ref())
             .find_map(|e| find_unsupported_scene_expr(e)),
         IRExpr::BinOp { left, right, .. }
@@ -1418,6 +1423,13 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             // unresolvable function call that can't be encoded in Z3.
             if matches!(func.as_ref(), IRExpr::Var { .. }) {
                 return Some(crate::messages::PRECHECK_UNRESOLVED_FN);
+            }
+            // A direct lambda application `(fn(x) => body)(arg)` is a
+            // beta-redex the encoder reduces; check the lambda body and the
+            // argument rather than rejecting the lambda as an opaque value.
+            if let IRExpr::Lam { body, .. } = func.as_ref() {
+                return find_unsupported_scene_expr(body)
+                    .or_else(|| find_unsupported_scene_expr(arg));
             }
             find_unsupported_scene_expr(func).or_else(|| find_unsupported_scene_expr(arg))
         }
@@ -1443,9 +1455,18 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
         | IRExpr::SeqLit { elements, .. }
         | IRExpr::Tuple { elements, .. } => elements.iter().find_map(find_unsupported_scene_expr),
         IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Ctor { .. } => None,
+        // Aggregate over a finite scalar domain (bool/enum) or over an
+        // entity-pool domain. The entity domain is finite in a bounded
+        // verify/BMC context — bounded by the `store` declaration — and is
+        // enumerated over the slot pool exactly like an entity-domain set
+        // comprehension (see `SetComp` above). Recurse into the body and
+        // optional `in` filter; only genuinely non-finite domains are gated.
         IRExpr::Aggregate {
-            body, in_filter, ..
-        } => {
+            domain,
+            body,
+            in_filter,
+            ..
+        } if is_finite_scene_domain(domain) || matches!(domain, IRType::Entity { .. }) => {
             let r = find_unsupported_scene_expr(body);
             if r.is_some() {
                 return r;
@@ -1455,12 +1476,12 @@ pub(super) fn find_unsupported_scene_expr(expr: &IRExpr) -> Option<&'static str>
             }
             None
         }
+        IRExpr::Aggregate { .. } => Some("Aggregate with non-finite domain"),
         IRExpr::Block { .. } => Some("Block"),
         IRExpr::VarDecl { .. } => Some("VarDecl"),
         IRExpr::While { .. } => Some("While"),
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
-            find_unsupported_scene_expr(expr)
-        }
+        IRExpr::Assert { .. } => Some("Assert"),
+        IRExpr::Assume { .. } => Some("Assume"),
         IRExpr::IfElse {
             cond,
             then_body,
@@ -1577,11 +1598,13 @@ pub(super) fn extract_witness_value(
             _ => Err("expected Real SMT value for Real witness extraction".to_owned()),
         },
         IRType::Float => match val {
-            SmtValue::Real(r) => model
-                .eval(r, true)
-                .map(|v| op::WitnessValue::Float(format!("{v}")))
+            // `float` is IEEE-754 binary64 (DDR-059): read the f64 from the model
+            // and render it so the witness round-trips and matches the simulator.
+            SmtValue::Float(f) => model
+                .eval(f, true)
+                .map(|v| op::WitnessValue::Float(format!("{}", smt::float_as_f64(&v))))
                 .ok_or_else(|| "failed to evaluate Float witness value".to_owned()),
-            _ => Err("expected Real SMT value for Float witness extraction".to_owned()),
+            _ => Err("expected Float SMT value for Float witness extraction".to_owned()),
         },
         IRType::Enum { name, .. } => match val {
             SmtValue::Int(i) => {
@@ -1644,6 +1667,15 @@ pub(super) fn extract_witness_value(
                     })
                     .ok_or_else(|| {
                         "failed to evaluate Real-backed opaque witness value".to_owned()
+                    }),
+                SmtValue::Float(f) => model
+                    .eval(f, true)
+                    .map(|v| op::WitnessValue::Opaque {
+                        display: format!("{v}"),
+                        ty: Some(ty_name),
+                    })
+                    .ok_or_else(|| {
+                        "failed to evaluate Float-backed opaque witness value".to_owned()
                     }),
                 SmtValue::Dynamic(d) => model
                     .eval(d, true)
@@ -1870,7 +1902,8 @@ fn extract_relational_states(
 fn step_param_symbol(param_name: &str, step: usize, ty: &IRType) -> SmtValue {
     match ty {
         IRType::Bool => smt::bool_var(&format!("param_{param_name}_{step}")),
-        IRType::Real | IRType::Float => smt::real_var(&format!("param_{param_name}_{step}")),
+        IRType::Real => smt::real_var(&format!("param_{param_name}_{step}")),
+        IRType::Float => smt::float_var(&format!("param_{param_name}_{step}")),
         _ => smt::int_var(&format!("param_{param_name}_{step}")),
     }
 }
@@ -2301,6 +2334,7 @@ pub(super) fn behavior_to_trace_steps(
                 let entity_label = if entity_slot_counts
                     .get(slot_ref.entity())
                     .copied()
+                    // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                     .unwrap_or(0)
                     > 1
                 {
@@ -2342,9 +2376,11 @@ pub(super) fn behavior_to_trace_steps(
 mod tests {
     use super::*;
     use crate::ir::types::{
-        IRActionMatchArm, IRActionMatchScrutinee, IRAggKind, IRField, IRMatchArm, IRPattern,
-        IRTransition, IRUpdate, IRVariant, LetBinding, LitVal,
+        IRActionMatchArm, IRActionMatchScrutinee, IRAggKind, IRCreateField, IRField, IRMatchArm,
+        IRPattern, IRTransition, IRUpdate, IRVariant, LetBinding, LitVal,
     };
+    use crate::verify::find_unsupported_in_actions;
+    use crate::verify::unsupported_corpus;
 
     fn atomic_step(id: &str, system: &str, command: &str) -> op::AtomicStep {
         op::AtomicStep::builder(
@@ -2643,7 +2679,15 @@ mod tests {
             ty: IRType::Int,
             span: None,
         }));
+        // Assignment (`OpAssign`) is imperative; an equality comparison
+        // (`OpEq`) is pure and must not be treated as imperative.
         assert!(contains_imperative(&bin(
+            "OpAssign",
+            var("x", IRType::Int),
+            int_lit(1),
+            IRType::Bool,
+        )));
+        assert!(!contains_imperative(&bin(
             "OpEq",
             var("x", IRType::Int),
             int_lit(1),
@@ -3090,7 +3134,7 @@ mod tests {
             find_unsupported_scene_expr(&IRExpr::Aggregate {
                 kind: IRAggKind::Sum,
                 var: "x".to_owned(),
-                domain: IRType::Int,
+                domain: IRType::Bool,
                 body: Box::new(IRExpr::Sorry { span: None }),
                 in_filter: None,
                 span: None,
@@ -3130,8 +3174,39 @@ mod tests {
                 expr: Box::new(IRExpr::Sorry { span: None }),
                 span: None,
             }),
-            Some("Sorry")
+            Some("Assume")
         );
+    }
+
+    #[test]
+    fn scene_precheck_rejects_shared_unsupported_ir_corpus() {
+        for case in unsupported_corpus::unsupported_expr_cases() {
+            assert_eq!(
+                find_unsupported_scene_expr(&case.expr),
+                Some(case.expected_kind),
+                "unsupported corpus case `{}` must be rejected conservatively",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn action_precheck_rejects_shared_unsupported_ir_corpus() {
+        for case in unsupported_corpus::unsupported_expr_cases() {
+            let actions = vec![IRAction::Create {
+                entity: "Task".to_owned(),
+                fields: vec![IRCreateField {
+                    name: "flag".to_owned(),
+                    value: case.expr,
+                }],
+            }];
+            assert_eq!(
+                find_unsupported_in_actions(&actions),
+                Some(case.expected_kind),
+                "unsupported action corpus case `{}` must be rejected conservatively",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -3470,6 +3545,7 @@ fn analyze_event_fairness(ctx: EventFairnessCtx<'_>) -> Option<FairnessEventAnal
     let target_sys = witness.systems.iter().find(|s| s.name == ctx.system);
     let matching_steps: Vec<&crate::ir::types::IRSystemAction> = target_sys
         .map(|s| s.actions.iter().filter(|st| st.name == ctx.event).collect())
+        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
         .unwrap_or_default();
 
     let mut enabled_at_every_step = !matching_steps.is_empty();
@@ -3574,6 +3650,7 @@ pub(super) fn extract_deadlock_diagnostics(
                 model
                     .eval(&enabled_bool, true)
                     .and_then(|v| v.as_bool())
+                    // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                     .unwrap_or(false)
             });
 
@@ -3662,6 +3739,7 @@ fn diagnose_disabled_event(
                     .map(|p| (p.name.clone(), p.entity_type.clone()))
                     .collect()
             })
+            // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
             .unwrap_or_default();
         let Ok(guard_val) = harness::try_encode_guard_expr(
             pool,
@@ -3676,6 +3754,7 @@ fn diagnose_disabled_event(
         let guard_ok = model
             .eval(&guard_val, true)
             .and_then(|v| v.as_bool())
+            // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
             .unwrap_or(false);
         if !guard_ok {
             return "guard is false".to_owned();
@@ -3695,6 +3774,7 @@ fn diagnose_disabled_event(
                         let is_active = model
                             .eval(active, true)
                             .and_then(|v| v.as_bool())
+                            // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                             .unwrap_or(false);
                         if is_active {
                             any_active = true;
@@ -3717,6 +3797,7 @@ fn diagnose_disabled_event(
                         let is_active = model
                             .eval(active, true)
                             .and_then(|v| v.as_bool())
+                            // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                             .unwrap_or(false);
                         if !is_active {
                             any_inactive = true;
@@ -3764,6 +3845,7 @@ fn diagnose_disabled_event(
                                     let is_active = model
                                         .eval(active, true)
                                         .and_then(|v| v.as_bool())
+                                        // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                                         .unwrap_or(false);
                                     if !is_active {
                                         continue;
@@ -3790,6 +3872,7 @@ fn diagnose_disabled_event(
                                     if model
                                         .eval(&guard_bool, true)
                                         .and_then(|v| v.as_bool())
+                                        // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                                         .unwrap_or(false)
                                     {
                                         any_guard_true = true;
@@ -3833,6 +3916,7 @@ fn diagnose_disabled_event(
                                     model
                                         .eval(&enabled_bool, true)
                                         .and_then(|v| v.as_bool())
+                                        // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                                         .unwrap_or(false)
                                 })
                         });

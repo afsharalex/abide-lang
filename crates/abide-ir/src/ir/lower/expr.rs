@@ -1,8 +1,8 @@
 //! Expression lowering — EExpr to IRExpr.
 
 use super::super::types::{
-    IRAggKind, IRExpr, IRFieldPat, IRMatchArm, IRPattern, IRRelCompBinding, IRType, LetBinding,
-    LitVal,
+    IRAggKind, IRBinOp, IRExpr, IRFieldPat, IRMatchArm, IRPattern, IRRelCompBinding, IRType,
+    IRUnOp, LetBinding, LitVal,
 };
 use super::{lower_ty, lower_while_contracts, LowerCtx};
 use crate::elab::types as E;
@@ -101,13 +101,33 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             span: *sp,
         },
         E::EExpr::NamedPair(_, _, expr, _) => lower_expr(expr, ctx),
-        E::EExpr::Assign(_, lhs, rhs, sp) => IRExpr::BinOp {
-            op: "OpEq".to_owned(),
-            left: Box::new(lower_expr(lhs, ctx)),
-            right: Box::new(lower_expr(rhs, ctx)),
-            ty: IRType::Bool,
-            span: *sp,
-        },
+        E::EExpr::Assign(_, lhs, rhs, sp) => {
+            let left = lower_expr(lhs, ctx);
+            let right = lower_expr(rhs, ctx);
+            // Assignment (`=`) must be distinguishable from equality (`==`,
+            // `OpEq`) in the IR, otherwise the function verifier executes a
+            // body-position equality comparison as a mutation (a pure
+            // equality-returning function would then prove as literal
+            // `true`). A PRIMED assignment `x' = e` is, by the transition
+            // semantics, a declarative next-state equality constraint, and
+            // the entire model-checking stack already consumes it as
+            // `OpEq` with a primed lhs — keep that. An UNPRIMED assignment
+            // `x = e` is an imperative store in a function body; give it the
+            // dedicated `OpAssign` operator so it can never be confused with
+            // an equality comparison.
+            let op = if matches!(left, IRExpr::Prime { .. }) {
+                "OpEq"
+            } else {
+                "OpAssign"
+            };
+            IRExpr::BinOp {
+                op: op.to_owned(),
+                left: Box::new(left),
+                right: Box::new(right),
+                ty: IRType::Bool,
+                span: *sp,
+            }
+        }
         E::EExpr::Seq(ty, a, b, sp) => IRExpr::BinOp {
             op: "OpSeq".to_owned(),
             left: Box::new(lower_expr(a, ctx)),
@@ -130,15 +150,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
             span: *sp,
         },
         E::EExpr::TupleLit(ty, es, sp) => lower_tuple_lit_expr(ty, es, *sp, ctx),
-        E::EExpr::In(_ty, e, s, sp) => {
-            // `e in S` → `Index(S, e)` which returns Bool (Set<T> = Array<T, Bool>)
-            IRExpr::Index {
-                map: Box::new(lower_expr(s, ctx)),
-                key: Box::new(lower_expr(e, ctx)),
-                ty: IRType::Bool,
-                span: *sp,
-            }
-        }
+        E::EExpr::In(_ty, e, s, sp) => lower_in_expr(e, s, *sp, ctx),
         E::EExpr::Card(_ty, expr, sp) => IRExpr::Card {
             expr: Box::new(lower_expr(expr, ctx)),
             span: *sp,
@@ -214,6 +226,7 @@ pub(super) fn lower_expr(e: &E::EExpr, ctx: &LowerCtx<'_>) -> IRExpr {
         },
         E::EExpr::VarDecl(name, ty, init, rest, sp) => IRExpr::VarDecl {
             name: name.clone(),
+            // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
             ty: ty.as_ref().map_or(IRType::String, |t| lower_ty(t, ctx)),
             init: Box::new(lower_expr(init, ctx)),
             rest: Box::new(lower_expr(rest, ctx)),
@@ -585,6 +598,7 @@ fn lower_let_expr(
             .iter()
             .map(|(name, ty, expr)| LetBinding {
                 name: name.clone(),
+                // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
                 ty: ty.as_ref().map_or(IRType::String, |ty| lower_ty(ty, ctx)),
                 expr: lower_expr(expr, ctx),
             })
@@ -643,11 +657,91 @@ fn lower_match_expr(
         arms: arms
             .iter()
             .map(|(pat, guard, body)| IRMatchArm {
-                pattern: lower_pattern_for_scrutinee(pat, &scrutinee_ty),
+                pattern: lower_pattern_for_scrutinee(pat, &scrutinee_ty, ctx),
                 guard: guard.as_ref().map(|guard| lower_expr(guard, ctx)),
                 body: lower_expr(body, ctx),
             })
             .collect(),
+        span,
+    }
+}
+
+/// Lower the membership operator `e in s` according to the collection kind of
+/// `s`:
+///
+/// - **`Set<T>` / `Store<E>` / `Rel<…>`** → `Index(s, e): Bool` — each is a
+///   characteristic function `Array<_, Bool>`, so indexing is exactly
+///   membership. (Store membership is also how `all x: E in store | …`
+///   restricts its quantifier domain.)
+/// - **`Map<K, V>`** → `OpMapHas(s, e): Bool` — *key* membership, the same IR
+///   the explicit `Map::has(s, e)` lowers to. (Indexing a map returns its
+///   value type, not a boolean, so it must not be used for membership.)
+/// - **`Seq<T>`** → rejected: sequences are ordered/positional and there is no
+///   sound element-of encoding, so emit a focused diagnostic.
+/// - **anything else** → rejected: `in` is only a membership test over a
+///   collection.
+///
+/// Rejected forms still produce a placeholder `false` so lowering can continue
+/// to collect further diagnostics; the emitted error stops verification.
+fn lower_in_expr(
+    elem: &E::EExpr,
+    collection: &E::EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &LowerCtx<'_>,
+) -> IRExpr {
+    let lowered_collection = Box::new(lower_expr(collection, ctx));
+    let lowered_elem = Box::new(lower_expr(elem, ctx));
+    match peel_collection_ty(&collection.ty()) {
+        // Set, store, and relation are all characteristic-function backed
+        // (`Array<_, Bool>`), so `Index` is exactly membership. (A `Store`
+        // membership is how `all x: E in store | …` restricts its domain.)
+        E::Ty::Set(_) | E::Ty::Store(_) | E::Ty::Relation(_) => IRExpr::Index {
+            map: lowered_collection,
+            key: lowered_elem,
+            ty: IRType::Bool,
+            span,
+        },
+        E::Ty::Map(_, _) => IRExpr::BinOp {
+            op: "OpMapHas".to_owned(),
+            left: lowered_collection,
+            right: lowered_elem,
+            ty: IRType::Bool,
+            span,
+        },
+        E::Ty::Seq(_) => {
+            ctx.push_error(crate::messages::IN_NOT_SUPPORTED_FOR_SEQ.to_owned(), span);
+            bool_lit_false(span)
+        }
+        // A prior type error already produced a diagnostic — do not cascade.
+        E::Ty::Error => bool_lit_false(span),
+        _ => {
+            ctx.push_error(
+                crate::messages::IN_REQUIRES_MEMBERSHIP_COLLECTION.to_owned(),
+                span,
+            );
+            bool_lit_false(span)
+        }
+    }
+}
+
+/// Resolve a collection type through aliases, refinements, and newtypes to its
+/// structural form so `in` dispatch sees the underlying `Set`/`Seq`/`Map`.
+/// Newtypes are unwrapped because lowering treats them transparently for
+/// backend shape (`lower_ty` peels them), so `e in newtype_of_set` must
+/// dispatch on the wrapped collection just like the bare collection would.
+fn peel_collection_ty(ty: &E::Ty) -> &E::Ty {
+    match ty {
+        E::Ty::Alias(_, inner) | E::Ty::Refinement(inner, _) | E::Ty::Newtype(_, inner) => {
+            peel_collection_ty(inner)
+        }
+        other => other,
+    }
+}
+
+fn bool_lit_false(span: Option<crate::span::Span>) -> IRExpr {
+    IRExpr::Lit {
+        ty: IRType::Bool,
+        value: LitVal::Bool { value: false },
         span,
     }
 }
@@ -990,6 +1084,7 @@ fn resolve_ctor_record_enum_name(
         .keys()
         .find(|enum_name| variant_list_contains_ctor(ctx, enum_name, ctor_name))
         .cloned()
+        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
         .unwrap_or_default()
 }
 
@@ -1024,17 +1119,49 @@ pub(super) fn lower_pattern(pat: &E::EPattern) -> IRPattern {
     }
 }
 
-fn lower_pattern_for_scrutinee(pat: &E::EPattern, scrutinee_ty: &E::Ty) -> IRPattern {
+pub(super) fn lower_pattern_for_scrutinee(
+    pat: &E::EPattern,
+    scrutinee_ty: &E::Ty,
+    ctx: &LowerCtx<'_>,
+) -> IRPattern {
     match pat {
-        E::EPattern::Var(name) if enum_contains_constructor(scrutinee_ty, name) => {
+        // A bare name that is a constructor of the scrutinee enum is a nullary
+        // constructor pattern, not a binding.
+        E::EPattern::Var(name) if is_enum_constructor(scrutinee_ty, name, ctx) => {
             IRPattern::PCtor {
                 name: name.clone(),
                 fields: Vec::new(),
             }
         }
+        // Record constructor pattern: lower every field sub-pattern
+        // *type-directed* against its declared field type, so a nested bare
+        // constructor name (e.g. the `X` in `A { inner: X }`) lowers to a
+        // nested `PCtor` rather than a `PVar` that would match any value.
+        E::EPattern::Ctor(name, fields) => {
+            let field_types = enum_ctor_field_types(scrutinee_ty, name, ctx);
+            IRPattern::PCtor {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(fname, fpat)| {
+                        let field_ty = field_types
+                            .as_ref()
+                            .and_then(|fts| fts.iter().find(|(n, _)| n == fname).map(|(_, t)| t));
+                        let pattern = match field_ty {
+                            Some(ty) => lower_pattern_for_scrutinee(fpat, ty, ctx),
+                            None => lower_pattern(fpat),
+                        };
+                        IRFieldPat {
+                            name: fname.clone(),
+                            pattern,
+                        }
+                    })
+                    .collect(),
+            }
+        }
         E::EPattern::Or(left, right) => IRPattern::POr {
-            left: Box::new(lower_pattern_for_scrutinee(left, scrutinee_ty)),
-            right: Box::new(lower_pattern_for_scrutinee(right, scrutinee_ty)),
+            left: Box::new(lower_pattern_for_scrutinee(left, scrutinee_ty, ctx)),
+            right: Box::new(lower_pattern_for_scrutinee(right, scrutinee_ty, ctx)),
         },
         _ => lower_pattern(pat),
     }
@@ -1050,6 +1177,50 @@ fn enum_contains_constructor(ty: &E::Ty, name: &str) -> bool {
     }
 }
 
+/// Resolve the underlying enum name of a (possibly aliased/refined/named) type.
+fn resolve_enum_name(ty: &E::Ty) -> Option<&str> {
+    match ty {
+        E::Ty::Enum(name, _) | E::Ty::Named(name) => Some(name),
+        E::Ty::Alias(_, inner) | E::Ty::Refinement(inner, _) => resolve_enum_name(inner),
+        _ => None,
+    }
+}
+
+/// Whether `name` is a constructor of the enum denoted by `ty`. Uses the
+/// constructor list carried by `Ty::Enum` and, for `Named`/alias field types
+/// that don't carry it, the lowering variant registry.
+fn is_enum_constructor(ty: &E::Ty, name: &str, ctx: &LowerCtx<'_>) -> bool {
+    if enum_contains_constructor(ty, name) {
+        return true;
+    }
+    resolve_enum_name(ty)
+        .and_then(|enum_name| ctx.variants.get(enum_name))
+        .is_some_and(|variants| variants.iter().any(|variant| variant_name(variant) == name))
+}
+
+/// Declared record fields `(name, type)` of constructor `ctor` of the enum
+/// denoted by `ty`, when it is a record constructor.
+fn enum_ctor_field_types(
+    ty: &E::Ty,
+    ctor: &str,
+    ctx: &LowerCtx<'_>,
+) -> Option<E::VariantRecordFields> {
+    let enum_name = resolve_enum_name(ty)?;
+    let variants = ctx.variants.get(enum_name)?;
+    variants.iter().find_map(|variant| match variant {
+        E::EVariant::Record(name, fields) if name == ctor => Some(fields.clone()),
+        _ => None,
+    })
+}
+
+fn variant_name(variant: &E::EVariant) -> &str {
+    match variant {
+        E::EVariant::Simple(name) | E::EVariant::Record(name, _) | E::EVariant::Param(name, _) => {
+            name
+        }
+    }
+}
+
 pub(super) fn lower_lit(lit: &E::Literal) -> LitVal {
     match lit {
         E::Literal::Int(i) => LitVal::Int { value: *i },
@@ -1057,56 +1228,6 @@ pub(super) fn lower_lit(lit: &E::Literal) -> LitVal {
         E::Literal::Float(d) => LitVal::Float { value: *d },
         E::Literal::Str(s) => LitVal::Str { value: s.clone() },
         E::Literal::Bool(b) => LitVal::Bool { value: *b },
-    }
-}
-
-/// Operator names match Haskell's `show` output for differential testing.
-#[allow(clippy::enum_variant_names)]
-enum IRBinOp {
-    OpAdd,
-    OpSub,
-    OpMul,
-    OpDiv,
-    OpMod,
-    OpEq,
-    OpNEq,
-    OpLt,
-    OpGt,
-    OpLe,
-    OpGe,
-    OpAnd,
-    OpOr,
-    OpImplies,
-    OpUnord,
-    OpConc,
-    OpXor,
-    OpDiamond,
-    OpDisjoint,
-}
-
-impl std::fmt::Debug for IRBinOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpAdd => write!(f, "OpAdd"),
-            Self::OpSub => write!(f, "OpSub"),
-            Self::OpMul => write!(f, "OpMul"),
-            Self::OpDiv => write!(f, "OpDiv"),
-            Self::OpMod => write!(f, "OpMod"),
-            Self::OpEq => write!(f, "OpEq"),
-            Self::OpNEq => write!(f, "OpNEq"),
-            Self::OpLt => write!(f, "OpLt"),
-            Self::OpGt => write!(f, "OpGt"),
-            Self::OpLe => write!(f, "OpLe"),
-            Self::OpGe => write!(f, "OpGe"),
-            Self::OpAnd => write!(f, "OpAnd"),
-            Self::OpOr => write!(f, "OpOr"),
-            Self::OpImplies => write!(f, "OpImplies"),
-            Self::OpUnord => write!(f, "OpUnord"),
-            Self::OpConc => write!(f, "OpConc"),
-            Self::OpXor => write!(f, "OpXor"),
-            Self::OpDiamond => write!(f, "OpDiamond"),
-            Self::OpDisjoint => write!(f, "OpDisjoint"),
-        }
     }
 }
 
@@ -1134,24 +1255,43 @@ fn lower_binop(op: E::BinOp) -> IRBinOp {
     }
 }
 
-#[allow(clippy::enum_variant_names)]
-enum IRUnOp {
-    OpNot,
-    OpNeg,
-}
-
-impl std::fmt::Debug for IRUnOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpNot => write!(f, "OpNot"),
-            Self::OpNeg => write!(f, "OpNeg"),
-        }
-    }
-}
-
 fn lower_unop(op: E::UnOp) -> IRUnOp {
     match op {
         E::UnOp::Not => IRUnOp::OpNot,
         E::UnOp::Neg => IRUnOp::OpNeg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `peel_collection_ty` unwraps aliases, newtypes, and refinements so the
+    /// `in` dispatch sees the underlying collection. Newtypes are unwrapped to
+    /// match `lower_ty`'s transparent treatment of them for backend shape, so
+    /// `e in newtype_of_set` dispatches as set membership rather than being
+    /// rejected.
+    #[test]
+    fn peel_collection_ty_unwraps_aliases_and_newtypes_to_the_collection() {
+        let set_int = E::Ty::Set(Box::new(E::Ty::Builtin(E::BuiltinTy::Int)));
+
+        let newtype = E::Ty::Newtype("Tags".to_owned(), Box::new(set_int.clone()));
+        assert!(matches!(peel_collection_ty(&newtype), E::Ty::Set(_)));
+
+        let nested = E::Ty::Alias(
+            "Outer".to_owned(),
+            Box::new(E::Ty::Newtype("Mid".to_owned(), Box::new(set_int))),
+        );
+        assert!(matches!(peel_collection_ty(&nested), E::Ty::Set(_)));
+
+        // A newtype over a scalar peels to that scalar (and so `in` rejects it).
+        let scalar = E::Ty::Newtype(
+            "UserId".to_owned(),
+            Box::new(E::Ty::Builtin(E::BuiltinTy::String)),
+        );
+        assert!(matches!(
+            peel_collection_ty(&scalar),
+            E::Ty::Builtin(E::BuiltinTy::String)
+        ));
     }
 }

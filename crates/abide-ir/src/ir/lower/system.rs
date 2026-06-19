@@ -7,7 +7,7 @@ use super::super::types::{
     IRField, IRFunction, IRPattern, IRStoreParam, IRSystem, IRSystemAction, IRTransParam,
     IRTransRef, IRTransition, IRType, IRUpdate, LitVal,
 };
-use super::expr::lower_pattern;
+use super::expr::{lower_pattern, lower_pattern_for_scrutinee};
 use super::qualify::{qualify_action_query_vars, qualify_query_vars_scoped};
 use super::{
     canonical, extract_param_refinements, flatten_system_fields, lower_derived_field, lower_expr,
@@ -68,6 +68,8 @@ pub(super) fn lower_system(
             .map(|store| IRStoreParam {
                 name: store.name.clone(),
                 entity_type: canonical(aliases, &store.entity_type).to_owned(),
+                lo: store.lo,
+                hi: store.hi,
             })
             .collect(),
         fields: flatten_system_fields(&es.fields, ctx),
@@ -291,6 +293,7 @@ pub(super) fn lower_extern(ext: &E::EExtern, ctx: &LowerCtx<'_>) -> IRSystem {
                     })
                     .collect()
             })
+            // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
             .unwrap_or_default();
 
         for ret in &may.returns {
@@ -605,6 +608,7 @@ fn synthesize_proc_workflow(
                             ports.sort();
                             ports
                         })
+                        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                         .unwrap_or_default(),
                     system: let_binding_system_types
                         .get(node.instance.as_str())
@@ -613,12 +617,14 @@ fn synthesize_proc_workflow(
                     return_variants: return_variants_by_node
                         .get(&node.name)
                         .cloned()
+                        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                         .unwrap_or_default(),
                 },
                 &hidden_entity,
                 incoming
                     .get(node.name.as_str())
                     .cloned()
+                    // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                     .unwrap_or_default(),
                 ctx,
             ),
@@ -1026,37 +1032,30 @@ pub(super) fn lower_system_action(
             })
             .collect(),
         guard: lower_guard_refs(&all_requires, ctx),
-        body: action
-            .body
-            .iter()
-            .map(|a| lower_event_action(a, aliases, ctx))
-            .collect(),
+        body: lower_event_action_seq(&action.body, aliases, ctx, &mut HashMap::new()),
         return_expr: action.return_expr.as_ref().map(|e| lower_expr(e, ctx)),
     }
 }
 
-pub(super) fn lower_event_action(
+pub(super) fn lower_event_action<'a>(
     ea: &E::EEventAction,
     aliases: &HashMap<String, String>,
-    ctx: &LowerCtx<'_>,
+    ctx: &LowerCtx<'a>,
+    local_returns: &mut HashMap<String, &'a E::Ty>,
 ) -> IRAction {
     match ea {
         E::EEventAction::Choose(v, ty, guard, body) => IRAction::Choose {
             var: v.clone(),
             entity: ty.name().to_owned(),
             filter: Box::new(lower_expr(guard, ctx)),
-            ops: body
-                .iter()
-                .map(|a| lower_event_action(a, aliases, ctx))
-                .collect(),
+            // A nested block is its own scope: outer `let` bindings are visible,
+            // bindings made inside it do not leak back out.
+            ops: lower_event_action_seq(body, aliases, ctx, &mut local_returns.clone()),
         },
         E::EEventAction::ForAll(v, ty, body) => IRAction::ForAll {
             var: v.clone(),
             entity: ty.name().to_owned(),
-            ops: body
-                .iter()
-                .map(|a| lower_event_action(a, aliases, ctx))
-                .collect(),
+            ops: lower_event_action_seq(body, aliases, ctx, &mut local_returns.clone()),
         },
         E::EEventAction::Create(entity, _store, fields) => IRAction::Create {
             entity: canonical(aliases, entity).to_owned(),
@@ -1068,41 +1067,64 @@ pub(super) fn lower_event_action(
                 })
                 .collect(),
         },
-        E::EEventAction::LetCrossCall(name, sys, ev, args) => IRAction::LetCrossCall {
-            name: name.clone(),
-            system: canonical(aliases, sys).to_owned(),
-            command: ev.clone(),
-            args: args.iter().map(|a| lower_expr(a, ctx)).collect(),
-        },
+        E::EEventAction::LetCrossCall(name, sys, ev, args) => {
+            // Record the result type so a later `match` over this binding can be
+            // lowered type-directed.
+            if let Some(ty) = command_return_ty(ctx, aliases, sys, ev) {
+                local_returns.insert(name.clone(), ty);
+            }
+            IRAction::LetCrossCall {
+                name: name.clone(),
+                system: canonical(aliases, sys).to_owned(),
+                command: ev.clone(),
+                args: args.iter().map(|a| lower_expr(a, ctx)).collect(),
+            }
+        }
         E::EEventAction::CrossCall(sys, ev, args) => IRAction::CrossCall {
             system: canonical(aliases, sys).to_owned(),
             command: ev.clone(),
             args: args.iter().map(|a| lower_expr(a, ctx)).collect(),
         },
-        E::EEventAction::Match(scrutinee, arms) => IRAction::Match {
-            scrutinee: match scrutinee {
-                E::EMatchScrutinee::Var(name) => IRActionMatchScrutinee::Var { name: name.clone() },
-                E::EMatchScrutinee::CrossCall(system, command, args) => {
-                    IRActionMatchScrutinee::CrossCall {
-                        system: canonical(aliases, system).to_owned(),
-                        command: command.clone(),
-                        args: args.iter().map(|a| lower_expr(a, ctx)).collect(),
-                    }
+        E::EEventAction::Match(scrutinee, arms) => {
+            // Resolve the scrutinee's command-result type so nested constructor
+            // patterns lower to `PCtor` rather than a match-anything `PVar`.
+            let scrutinee_ty: Option<&E::Ty> = match scrutinee {
+                E::EMatchScrutinee::Var(name) => local_returns.get(name).copied(),
+                E::EMatchScrutinee::CrossCall(system, command, _) => {
+                    command_return_ty(ctx, aliases, system, command)
                 }
-            },
-            arms: arms
-                .iter()
-                .map(|arm| IRActionMatchArm {
-                    pattern: lower_pattern(&arm.pattern),
-                    guard: arm.guard.as_ref().map(|g| lower_expr(g, ctx)),
-                    body: arm
-                        .body
-                        .iter()
-                        .map(|a| lower_event_action(a, aliases, ctx))
-                        .collect(),
-                })
-                .collect(),
-        },
+            };
+            IRAction::Match {
+                scrutinee: match scrutinee {
+                    E::EMatchScrutinee::Var(name) => {
+                        IRActionMatchScrutinee::Var { name: name.clone() }
+                    }
+                    E::EMatchScrutinee::CrossCall(system, command, args) => {
+                        IRActionMatchScrutinee::CrossCall {
+                            system: canonical(aliases, system).to_owned(),
+                            command: command.clone(),
+                            args: args.iter().map(|a| lower_expr(a, ctx)).collect(),
+                        }
+                    }
+                },
+                arms: arms
+                    .iter()
+                    .map(|arm| IRActionMatchArm {
+                        pattern: match scrutinee_ty {
+                            Some(ty) => lower_pattern_for_scrutinee(&arm.pattern, ty, ctx),
+                            None => lower_pattern(&arm.pattern),
+                        },
+                        guard: arm.guard.as_ref().map(|g| lower_expr(g, ctx)),
+                        body: lower_event_action_seq(
+                            &arm.body,
+                            aliases,
+                            ctx,
+                            &mut local_returns.clone(),
+                        ),
+                    })
+                    .collect(),
+            }
+        }
         E::EEventAction::Apply(target, act, refs, args) => IRAction::Apply {
             target: extract_target_name(target),
             transition: act.clone(),
@@ -1113,6 +1135,37 @@ pub(super) fn lower_event_action(
             expr: lower_expr(e, ctx),
         },
     }
+}
+
+/// Lower a sequence of event actions, threading `local_returns` so a
+/// `let r = Sys::cmd(...)` binding is visible to a later `match r { ... }` in
+/// the same block.
+fn lower_event_action_seq<'a>(
+    body: &[E::EEventAction],
+    aliases: &HashMap<String, String>,
+    ctx: &LowerCtx<'a>,
+    local_returns: &mut HashMap<String, &'a E::Ty>,
+) -> Vec<IRAction> {
+    let mut out = Vec::with_capacity(body.len());
+    for action in body {
+        out.push(lower_event_action(action, aliases, ctx, local_returns));
+    }
+    out
+}
+
+/// The declared result type of `system::command`, resolving the (possibly
+/// aliased) system name to its canonical form. `None` when the command has no
+/// declared result type or is not a known system command.
+fn command_return_ty<'a>(
+    ctx: &LowerCtx<'a>,
+    aliases: &HashMap<String, String>,
+    system: &str,
+    command: &str,
+) -> Option<&'a E::Ty> {
+    let canonical_system = canonical(aliases, system).to_owned();
+    ctx.command_returns
+        .get(&(canonical_system, command.to_owned()))
+        .copied()
 }
 
 pub(super) fn extract_target_name(e: &E::EExpr) -> String {

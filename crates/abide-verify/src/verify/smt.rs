@@ -11,6 +11,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::ir::types::{IRBinOp, IRUnOp};
+
 use super::solver::{self, ActiveBackend, SolverBackend, SolverFamily};
 
 // ── Type re-exports from solver ─────────────────────────────────────
@@ -18,7 +20,7 @@ use super::solver::{self, ActiveBackend, SolverBackend, SolverFamily};
 // needs `use z3::` or `use super::solver::` directly.
 
 // AST types used pervasively as value types throughout verify/
-pub use super::solver::{Array, Bool, Dynamic, Int, Real};
+pub use super::solver::{Array, Bool, Dynamic, Float, Int, Real};
 
 // Sort, function declarations, solver parameters
 pub use super::solver::{FuncDecl, Params, Sort};
@@ -375,6 +377,47 @@ pub fn int_to_real(i: &Int) -> Real {
     backend!(int_to_real, i)
 }
 
+/// Floor a real toward negative infinity (SMT-LIB `to_int`).
+pub fn real_to_int(r: &Real) -> Int {
+    backend!(real_to_int, r)
+}
+
+/// Euclidean real remainder (`%`): `a - |b| * floor(a / |b|)`, in `[0, |b|)`,
+/// matching the integer `%` and the simulator's exact-rational remainder.
+pub fn real_mod(a: &Real, b: &Real) -> Real {
+    let zero = backend!(real_val, 0, 1);
+    let neg_b = backend!(real_sub, &[&zero, b]);
+    let nonneg = backend!(real_ge, b, &zero);
+    let abs_b = backend!(real_ite, &nonneg, b, &neg_b);
+    let floor_q = backend!(real_to_int, &backend!(real_div, a, &abs_b));
+    let q_real = backend!(int_to_real, &floor_q);
+    let scaled = backend!(real_mul, &[&abs_b, &q_real]);
+    backend!(real_sub, &[a, &scaled])
+}
+
+/// IEEE-754 magnitude of a `float`.
+pub fn float_abs(a: &Float) -> Float {
+    backend!(float_abs, a)
+}
+
+/// Round a `float` toward negative infinity to an integral value.
+pub fn float_floor(a: &Float) -> Float {
+    backend!(float_floor, a)
+}
+
+/// Euclidean `float` remainder (`%`): `a - |b| * floor(a / |b|)`, built from the
+/// IEEE-754 binary64 primitives so it is computed by the identical sequence of
+/// correctly-rounded operations the simulator runs on host `f64` — guaranteeing
+/// bit-for-bit SMT/simulator agreement (DDR-059). This matches the Euclidean
+/// `int`/`real` `%` rather than Z3's native `fpa.rem` (IEEE remainder), which
+/// has no host-`f64` equivalent the simulator could replicate exactly.
+pub fn float_rem(a: &Float, b: &Float) -> Float {
+    let abs_b = float_abs(b);
+    let q = float_floor(&float_div(a, &abs_b));
+    let scaled = float_mul(&abs_b, &q);
+    float_sub(a, &scaled)
+}
+
 // ── Quantifiers ─────────────────────────────────────────────────────
 
 /// Universal quantifier: forall bound. body.
@@ -477,6 +520,16 @@ pub fn dynamic_as_int(d: &Dynamic) -> Option<Int> {
 /// Attempt to view a dynamic term as Real.
 pub fn dynamic_as_real(d: &Dynamic) -> Option<Real> {
     backend!(dynamic_as_real, d)
+}
+
+/// Cast a Dynamic to a binary64 `float`, if it has float sort.
+pub fn dynamic_as_float(d: &Dynamic) -> Option<Float> {
+    backend!(dynamic_as_float, d)
+}
+
+/// Read the `f64` value of a (model-evaluated) float numeral.
+pub fn float_as_f64(f: &Float) -> f64 {
+    backend!(float_as_f64, f)
 }
 
 /// Attempt to view a dynamic term as Array.
@@ -637,6 +690,9 @@ pub enum SmtValue {
     Bool(Bool),
     /// Real sort — used for Abide Real type (exact rational).
     Real(Real),
+    /// IEEE-754 binary64 sort — used for the Abide `float` type (DDR-059).
+    /// Distinct from [`SmtValue::Real`]: rounding, NaN, infinities, signed zero.
+    Float(Float),
     /// Array sort — used for `Map<K,V>` (store/select), `Set<T>` (characteristic function).
     Array(Array),
     /// Tuple/product value with its structural elements retained for fieldwise equality.
@@ -692,6 +748,7 @@ impl SmtValue {
             SmtValue::Int(i) => backend!(dynamic_from_int, i),
             SmtValue::Bool(b) => backend!(dynamic_from_bool, b),
             SmtValue::Real(r) => backend!(dynamic_from_real, r),
+            SmtValue::Float(f) => backend!(dynamic_from_float, f),
             SmtValue::Array(a) => backend!(dynamic_from_array, a),
             SmtValue::Tuple { value, .. } => value.clone(),
             SmtValue::Dynamic(d) => d.clone(),
@@ -738,9 +795,10 @@ pub fn dynamic_to_typed_value(d: Dynamic, ty: &IRType) -> SmtValue {
         | IRType::Fn { .. }
         | IRType::Record { .. } => int_like_dynamic_to_smt_value(d),
         IRType::Tuple { .. } => SmtValue::Dynamic(d),
-        IRType::Real | IRType::Float => {
-            dynamic_as_real(&d).map_or(SmtValue::Dynamic(d), SmtValue::Real)
+        IRType::Real => {
+            dynamic_as_real(&d).map_or_else(|| SmtValue::Dynamic(d.clone()), SmtValue::Real)
         }
+        IRType::Float => dynamic_as_float(&d).map_or(SmtValue::Dynamic(d), SmtValue::Float),
         IRType::Set { .. } | IRType::Map { .. } => {
             dynamic_as_array(&d).map_or(SmtValue::Dynamic(d), SmtValue::Array)
         }
@@ -968,7 +1026,8 @@ pub fn ir_type_to_sort(ty: &IRType) -> Sort {
     match ty {
         IRType::Int | IRType::Identity => backend!(int_sort),
         IRType::Bool => backend!(bool_sort),
-        IRType::Real | IRType::Float => backend!(real_sort),
+        IRType::Real => backend!(real_sort),
+        IRType::Float => backend!(float_sort),
         IRType::String => backend!(int_sort), // strings as uninterpreted ints for now
         IRType::Enum { .. } => backend!(int_sort), // enums encoded as sequential int IDs
         IRType::Entity { .. } => backend!(int_sort), // entity refs as slot indices
@@ -1019,13 +1078,84 @@ pub fn real_var(name: &str) -> SmtValue {
     SmtValue::Real(backend!(real_var, name))
 }
 
+// ── IEEE-754 binary64 floating point (DDR-059) ──────────────────────
+// `float` is a distinct sort from `real`; these route to the backend's FP
+// theory (Z3 only). Arithmetic rounds nearest-ties-to-even; comparisons follow
+// IEEE semantics.
+
+/// Create a binary64 `float` constant from an `f64`.
+pub fn float_lit(value: f64) -> SmtValue {
+    SmtValue::Float(backend!(float_lit, value))
+}
+
+/// Create a named binary64 `float` variable.
+pub fn float_var(name: &str) -> SmtValue {
+    SmtValue::Float(backend!(float_var, name))
+}
+
+/// Backend-neutral float addition.
+pub fn float_add(a: &Float, b: &Float) -> Float {
+    backend!(float_add, a, b)
+}
+
+/// Backend-neutral float subtraction.
+pub fn float_sub(a: &Float, b: &Float) -> Float {
+    backend!(float_sub, a, b)
+}
+
+/// Backend-neutral float multiplication.
+pub fn float_mul(a: &Float, b: &Float) -> Float {
+    backend!(float_mul, a, b)
+}
+
+/// Backend-neutral float division.
+pub fn float_div(a: &Float, b: &Float) -> Float {
+    backend!(float_div, a, b)
+}
+
+/// Backend-neutral float negation.
+pub fn float_neg(a: &Float) -> Float {
+    backend!(float_neg, a)
+}
+
+/// Backend-neutral IEEE float equality (`NaN != NaN`, `+0.0 == -0.0`).
+pub fn float_eq(a: &Float, b: &Float) -> Bool {
+    backend!(float_eq, a, b)
+}
+
+/// Backend-neutral IEEE float less-than.
+pub fn float_lt(a: &Float, b: &Float) -> Bool {
+    backend!(float_lt, a, b)
+}
+
+/// Backend-neutral IEEE float less-than-or-equal.
+pub fn float_le(a: &Float, b: &Float) -> Bool {
+    backend!(float_le, a, b)
+}
+
+/// Backend-neutral IEEE float greater-than.
+pub fn float_gt(a: &Float, b: &Float) -> Bool {
+    backend!(float_gt, a, b)
+}
+
+/// Backend-neutral IEEE float greater-than-or-equal.
+pub fn float_ge(a: &Float, b: &Float) -> Bool {
+    backend!(float_ge, a, b)
+}
+
+/// Backend-neutral float if-then-else.
+pub fn float_ite(cond: &Bool, then_val: &Float, else_val: &Float) -> Float {
+    backend!(float_ite, cond, then_val, else_val)
+}
+
 /// Default value for a given IR type, returned as Dynamic.
 /// Used for constant-array initialization in collection literal encoding.
 /// Recurses for nested collections: `Map<K, Set<T>>` gets a const-array default.
 pub fn default_dynamic(ty: &IRType) -> Dynamic {
     match ty {
         IRType::Bool => backend!(dynamic_from_bool, &backend!(bool_const, false)),
-        IRType::Real | IRType::Float => backend!(dynamic_from_real, &backend!(real_val, 0, 1)),
+        IRType::Real => backend!(dynamic_from_real, &backend!(real_val, 0, 1)),
+        IRType::Float => backend!(dynamic_from_float, &backend!(float_lit, 0.0)),
         IRType::Map { key, value } => {
             let key_sort = ir_type_to_sort(key);
             let val_default = map_none_dynamic(value);
@@ -1151,10 +1281,18 @@ type BinopResult = Result<SmtValue, String>;
 ///
 /// Returns the result as an `SmtValue`. Operand types must match.
 pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, String> {
+    let op = IRBinOp::try_from(op)?;
+    binop_typed(op, lhs, rhs)
+}
+
+fn binop_typed(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, String> {
     if let Some(result) = int_binop(op, lhs, rhs) {
         return result;
     }
     if let Some(result) = real_binop(op, lhs, rhs) {
+        return result;
+    }
+    if let Some(result) = float_binop(op, lhs, rhs) {
         return result;
     }
     if let Some(result) = mixed_numeric_binop(op, lhs, rhs) {
@@ -1178,86 +1316,118 @@ pub fn binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Result<SmtValue, Strin
     Err(format!("unsupported binop: {op} on {lhs:?}, {rhs:?}"))
 }
 
-fn int_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn int_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (SmtValue::Int(a), SmtValue::Int(b)) = (lhs, rhs) else {
         return None;
     };
     Some(match op {
-        "OpAdd" => Ok(SmtValue::Int(backend!(int_add, &[a, b]))),
-        "OpSub" => Ok(SmtValue::Int(backend!(int_sub, &[a, b]))),
-        "OpMul" => Ok(SmtValue::Int(backend!(int_mul, &[a, b]))),
-        "OpDiv" => Ok(SmtValue::Int(backend!(int_div, a, b))),
-        "OpMod" => Ok(SmtValue::Int(backend!(int_modulo, a, b))),
-        "OpEq" => Ok(SmtValue::Bool(backend!(int_eq, a, b))),
-        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(int_eq, a, b)))),
-        "OpLt" => Ok(SmtValue::Bool(backend!(int_lt, a, b))),
-        "OpGt" => Ok(SmtValue::Bool(backend!(int_gt, a, b))),
-        "OpLe" => Ok(SmtValue::Bool(backend!(int_le, a, b))),
-        "OpGe" => Ok(SmtValue::Bool(backend!(int_ge, a, b))),
+        IRBinOp::OpAdd => Ok(SmtValue::Int(backend!(int_add, &[a, b]))),
+        IRBinOp::OpSub => Ok(SmtValue::Int(backend!(int_sub, &[a, b]))),
+        IRBinOp::OpMul => Ok(SmtValue::Int(backend!(int_mul, &[a, b]))),
+        // Integer `/` and `%` are EUCLIDEAN: the SMT-LIB `div`/`mod` that the
+        // Z3/cvc5 backends emit satisfy `a = b*(a div b) + (a mod b)` with
+        // `0 <= a mod b < |b|` for `b != 0`. This is the canonical Abide
+        // semantics; the concrete evaluators (explicit-state checker, witness
+        // simulator) use `div_euclid`/`rem_euclid` to match. Division by zero
+        // is undefined — the solver leaves `div`/`mod` total here, while the
+        // concrete evaluators reject it conservatively.
+        IRBinOp::OpDiv => Ok(SmtValue::Int(backend!(int_div, a, b))),
+        IRBinOp::OpMod => Ok(SmtValue::Int(backend!(int_modulo, a, b))),
+        IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(int_eq, a, b))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(bool_not, &backend!(int_eq, a, b)))),
+        IRBinOp::OpLt => Ok(SmtValue::Bool(backend!(int_lt, a, b))),
+        IRBinOp::OpGt => Ok(SmtValue::Bool(backend!(int_gt, a, b))),
+        IRBinOp::OpLe => Ok(SmtValue::Bool(backend!(int_le, a, b))),
+        IRBinOp::OpGe => Ok(SmtValue::Bool(backend!(int_ge, a, b))),
         _ => return None,
     })
 }
 
-fn real_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn real_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (SmtValue::Real(a), SmtValue::Real(b)) = (lhs, rhs) else {
         return None;
     };
     Some(match op {
-        "OpAdd" => Ok(SmtValue::Real(backend!(real_add, &[a, b]))),
-        "OpSub" => Ok(SmtValue::Real(backend!(real_sub, &[a, b]))),
-        "OpMul" => Ok(SmtValue::Real(backend!(real_mul, &[a, b]))),
-        "OpDiv" => Ok(SmtValue::Real(backend!(real_div, a, b))),
-        "OpEq" => Ok(SmtValue::Bool(backend!(real_eq, a, b))),
-        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(real_eq, a, b)))),
-        "OpLt" => Ok(SmtValue::Bool(backend!(real_lt, a, b))),
-        "OpGt" => Ok(SmtValue::Bool(backend!(real_gt, a, b))),
-        "OpLe" => Ok(SmtValue::Bool(backend!(real_le, a, b))),
-        "OpGe" => Ok(SmtValue::Bool(backend!(real_ge, a, b))),
+        IRBinOp::OpAdd => Ok(SmtValue::Real(backend!(real_add, &[a, b]))),
+        IRBinOp::OpSub => Ok(SmtValue::Real(backend!(real_sub, &[a, b]))),
+        IRBinOp::OpMul => Ok(SmtValue::Real(backend!(real_mul, &[a, b]))),
+        IRBinOp::OpDiv => Ok(SmtValue::Real(backend!(real_div, a, b))),
+        IRBinOp::OpMod => Ok(SmtValue::Real(real_mod(a, b))),
+        IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(real_eq, a, b))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(bool_not, &backend!(real_eq, a, b)))),
+        IRBinOp::OpLt => Ok(SmtValue::Bool(backend!(real_lt, a, b))),
+        IRBinOp::OpGt => Ok(SmtValue::Bool(backend!(real_gt, a, b))),
+        IRBinOp::OpLe => Ok(SmtValue::Bool(backend!(real_le, a, b))),
+        IRBinOp::OpGe => Ok(SmtValue::Bool(backend!(real_ge, a, b))),
         _ => return None,
     })
 }
 
-fn mixed_numeric_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+/// IEEE-754 binary64 `float` arithmetic (DDR-059). Only matches `float`/`float`
+/// operands — float never coerces with `int` or `real`, so a mixed expression
+/// is left for the type checker to reject rather than silently converted.
+fn float_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+    let (SmtValue::Float(a), SmtValue::Float(b)) = (lhs, rhs) else {
+        return None;
+    };
+    Some(match op {
+        IRBinOp::OpAdd => Ok(SmtValue::Float(float_add(a, b))),
+        IRBinOp::OpSub => Ok(SmtValue::Float(float_sub(a, b))),
+        IRBinOp::OpMul => Ok(SmtValue::Float(float_mul(a, b))),
+        IRBinOp::OpDiv => Ok(SmtValue::Float(float_div(a, b))),
+        IRBinOp::OpMod => Ok(SmtValue::Float(float_rem(a, b))),
+        IRBinOp::OpEq => Ok(SmtValue::Bool(float_eq(a, b))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(bool_not, &float_eq(a, b)))),
+        IRBinOp::OpLt => Ok(SmtValue::Bool(float_lt(a, b))),
+        IRBinOp::OpGt => Ok(SmtValue::Bool(float_gt(a, b))),
+        IRBinOp::OpLe => Ok(SmtValue::Bool(float_le(a, b))),
+        IRBinOp::OpGe => Ok(SmtValue::Bool(float_ge(a, b))),
+        _ => return None,
+    })
+}
+
+fn mixed_numeric_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (a, b) = mixed_numeric_reals(lhs, rhs)?;
     Some(match op {
-        "OpAdd" => Ok(SmtValue::Real(backend!(real_add, &[&a, &b]))),
-        "OpSub" => Ok(SmtValue::Real(backend!(real_sub, &[&a, &b]))),
-        "OpMul" => Ok(SmtValue::Real(backend!(real_mul, &[&a, &b]))),
-        "OpDiv" => Ok(SmtValue::Real(backend!(real_div, &a, &b))),
-        "OpEq" => Ok(SmtValue::Bool(backend!(real_eq, &a, &b))),
-        "OpNEq" => Ok(SmtValue::Bool(backend!(
+        IRBinOp::OpAdd => Ok(SmtValue::Real(backend!(real_add, &[&a, &b]))),
+        IRBinOp::OpSub => Ok(SmtValue::Real(backend!(real_sub, &[&a, &b]))),
+        IRBinOp::OpMul => Ok(SmtValue::Real(backend!(real_mul, &[&a, &b]))),
+        IRBinOp::OpDiv => Ok(SmtValue::Real(backend!(real_div, &a, &b))),
+        IRBinOp::OpMod => Ok(SmtValue::Real(real_mod(&a, &b))),
+        IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(real_eq, &a, &b))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(
             bool_not,
             &backend!(real_eq, &a, &b)
         ))),
-        "OpLt" => Ok(SmtValue::Bool(backend!(real_lt, &a, &b))),
-        "OpLe" => Ok(SmtValue::Bool(backend!(real_le, &a, &b))),
-        "OpGt" => Ok(SmtValue::Bool(backend!(real_gt, &a, &b))),
-        "OpGe" => Ok(SmtValue::Bool(backend!(real_ge, &a, &b))),
+        IRBinOp::OpLt => Ok(SmtValue::Bool(backend!(real_lt, &a, &b))),
+        IRBinOp::OpLe => Ok(SmtValue::Bool(backend!(real_le, &a, &b))),
+        IRBinOp::OpGt => Ok(SmtValue::Bool(backend!(real_gt, &a, &b))),
+        IRBinOp::OpGe => Ok(SmtValue::Bool(backend!(real_ge, &a, &b))),
         _ => return None,
     })
 }
 
-fn bool_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn bool_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (SmtValue::Bool(a), SmtValue::Bool(b)) = (lhs, rhs) else {
         return None;
     };
     Some(match op {
-        "OpEq" => Ok(SmtValue::Bool(backend!(bool_eq, a, b))),
-        "OpNEq" => Ok(SmtValue::Bool(backend!(bool_not, &backend!(bool_eq, a, b)))),
-        "OpAnd" => Ok(SmtValue::Bool(backend!(bool_and, &[a, b]))),
-        "OpOr" => Ok(SmtValue::Bool(backend!(bool_or, &[a, b]))),
-        "OpImplies" => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
+        IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(bool_eq, a, b))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(bool_not, &backend!(bool_eq, a, b)))),
+        IRBinOp::OpAnd => Ok(SmtValue::Bool(backend!(bool_and, &[a, b]))),
+        IRBinOp::OpOr => Ok(SmtValue::Bool(backend!(bool_or, &[a, b]))),
+        IRBinOp::OpImplies => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
         _ => return None,
     })
 }
 
-fn array_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn array_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (SmtValue::Array(a), SmtValue::Array(b)) = (lhs, rhs) else {
         return None;
     };
     Some(match op {
-        "OpEq" => Ok(SmtValue::Bool(backend!(array_eq, a, b.clone()))),
-        "OpNEq" => Ok(SmtValue::Bool(backend!(
+        IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(array_eq, a, b.clone()))),
+        IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(
             bool_not,
             &backend!(array_eq, a, b.clone())
         ))),
@@ -1265,49 +1435,56 @@ fn array_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> 
     })
 }
 
-fn composition_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn composition_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (SmtValue::Bool(a), SmtValue::Bool(b)) = (lhs, rhs) else {
         return None;
     };
     Some(match op {
-        "OpSeq" => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
-        "OpSameStep" | "OpUnord" | "OpConc" => Ok(SmtValue::Bool(backend!(bool_and, &[a, b]))),
-        "OpXor" => Ok(SmtValue::Bool(backend!(bool_xor, a, b))),
+        IRBinOp::OpSeq => Ok(SmtValue::Bool(backend!(bool_implies, a, b))),
+        IRBinOp::OpSameStep | IRBinOp::OpUnord | IRBinOp::OpConc => {
+            Ok(SmtValue::Bool(backend!(bool_and, &[a, b])))
+        }
+        IRBinOp::OpXor => Ok(SmtValue::Bool(backend!(bool_xor, a, b))),
         _ => return None,
     })
 }
 
-fn collection_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn collection_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     match (op, lhs, rhs) {
-        ("OpDiamond" | "OpSetUnion", SmtValue::Array(a), SmtValue::Array(b)) => {
+        (IRBinOp::OpDiamond | IRBinOp::OpSetUnion, SmtValue::Array(a), SmtValue::Array(b)) => {
             Some(Ok(SmtValue::Array(set_lambda_binop("su", a, b, |x, y| {
                 backend!(bool_or, &[x, y])
             }))))
         }
-        ("OpSetIntersect", SmtValue::Array(a), SmtValue::Array(b)) => {
+        (IRBinOp::OpSetIntersect, SmtValue::Array(a), SmtValue::Array(b)) => {
             Some(Ok(SmtValue::Array(set_lambda_binop("si", a, b, |x, y| {
                 backend!(bool_and, &[x, y])
             }))))
         }
-        ("OpSetDiff", SmtValue::Array(a), SmtValue::Array(b)) => {
+        (IRBinOp::OpSetDiff, SmtValue::Array(a), SmtValue::Array(b)) => {
             Some(Ok(SmtValue::Array(set_lambda_binop("sd", a, b, |x, y| {
                 backend!(bool_and, &[x, &backend!(bool_not, y)])
             }))))
         }
-        ("OpSetSubset", SmtValue::Array(a), SmtValue::Array(b)) => Some(Ok(SmtValue::Bool(
+        (IRBinOp::OpSetSubset, SmtValue::Array(a), SmtValue::Array(b)) => Some(Ok(SmtValue::Bool(
             set_quantified_binop("ss", a, b, |x, y| backend!(bool_implies, x, y)),
         ))),
-        ("OpDisjoint" | "OpSetDisjoint", SmtValue::Array(a), SmtValue::Array(b)) => Some(Ok(
-            SmtValue::Bool(set_quantified_binop("sj", a, b, |x, y| {
-                backend!(bool_not, &backend!(bool_and, &[x, y]))
-            })),
-        )),
-        ("OpSeqConcat" | "OpSeqCons", SmtValue::Array(_), SmtValue::Array(_)) => Some(Err(
-            "Seq::concat on symbolic sequences requires length tracking; \
+        (IRBinOp::OpDisjoint | IRBinOp::OpSetDisjoint, SmtValue::Array(a), SmtValue::Array(b)) => {
+            Some(Ok(SmtValue::Bool(set_quantified_binop(
+                "sj",
+                a,
+                b,
+                |x, y| backend!(bool_not, &backend!(bool_and, &[x, y])),
+            ))))
+        }
+        (IRBinOp::OpSeqConcat | IRBinOp::OpSeqCons, SmtValue::Array(_), SmtValue::Array(_)) => {
+            Some(Err(
+                "Seq::concat on symbolic sequences requires length tracking; \
              use Seq literals directly for concrete concatenation"
-                .to_owned(),
-        )),
-        ("OpSetMember", _, SmtValue::Array(s)) => Some(set_member(lhs, s)),
+                    .to_owned(),
+            ))
+        }
+        (IRBinOp::OpSetMember, _, SmtValue::Array(s)) => Some(set_member(lhs, s)),
         _ => None,
     }
 }
@@ -1360,7 +1537,7 @@ fn set_member(elem: &SmtValue, set: &Array) -> BinopResult {
     ))
 }
 
-fn dynamic_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
+fn dynamic_binop(op: IRBinOp, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult> {
     let (dynamic, other, dynamic_on_left) = match (lhs, rhs) {
         (SmtValue::Dynamic(d), other) => (d, other, true),
         (other, SmtValue::Dynamic(d)) => (d, other, false),
@@ -1369,21 +1546,21 @@ fn dynamic_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult
     if let SmtValue::Dynamic(d2) = other {
         if let Some(i) = backend!(dynamic_as_int, dynamic) {
             return Some(if dynamic_on_left {
-                binop(op, &SmtValue::Int(i), rhs)
+                binop_typed(op, &SmtValue::Int(i), rhs)
             } else {
-                binop(op, lhs, &SmtValue::Int(i))
+                binop_typed(op, lhs, &SmtValue::Int(i))
             });
         }
         if let Some(b) = backend!(dynamic_as_bool, dynamic) {
             return Some(if dynamic_on_left {
-                binop(op, &SmtValue::Bool(b), rhs)
+                binop_typed(op, &SmtValue::Bool(b), rhs)
             } else {
-                binop(op, lhs, &SmtValue::Bool(b))
+                binop_typed(op, lhs, &SmtValue::Bool(b))
             });
         }
         return Some(match op {
-            "OpEq" => Ok(SmtValue::Bool(backend!(dynamic_eq, dynamic, d2))),
-            "OpNEq" => Ok(SmtValue::Bool(backend!(
+            IRBinOp::OpEq => Ok(SmtValue::Bool(backend!(dynamic_eq, dynamic, d2))),
+            IRBinOp::OpNEq => Ok(SmtValue::Bool(backend!(
                 bool_not,
                 &backend!(dynamic_eq, dynamic, d2)
             ))),
@@ -1393,13 +1570,13 @@ fn dynamic_binop(op: &str, lhs: &SmtValue, rhs: &SmtValue) -> Option<BinopResult
         });
     }
     Some(match coerce_dynamic(op, dynamic, other) {
-        Ok(coerced) if dynamic_on_left => binop(op, &coerced, rhs),
-        Ok(coerced) => binop(op, lhs, &coerced),
+        Ok(coerced) if dynamic_on_left => binop_typed(op, &coerced, rhs),
+        Ok(coerced) => binop_typed(op, lhs, &coerced),
         Err(err) => Err(err),
     })
 }
 
-fn coerce_dynamic(op: &str, dynamic: &Dynamic, other: &SmtValue) -> BinopResult {
+fn coerce_dynamic(op: IRBinOp, dynamic: &Dynamic, other: &SmtValue) -> BinopResult {
     match other {
         SmtValue::Int(_) => backend!(dynamic_as_int, dynamic)
             .map(SmtValue::Int)
@@ -1410,6 +1587,9 @@ fn coerce_dynamic(op: &str, dynamic: &Dynamic, other: &SmtValue) -> BinopResult 
         SmtValue::Real(_) => backend!(dynamic_as_real, dynamic)
             .map(SmtValue::Real)
             .ok_or_else(|| format!("type error: Dynamic->Real cast failed in {op}")),
+        SmtValue::Float(_) => backend!(dynamic_as_float, dynamic)
+            .map(SmtValue::Float)
+            .ok_or_else(|| format!("type error: Dynamic->Float cast failed in {op}")),
         SmtValue::Dynamic(_) => unreachable!("handled by dynamic_binop"),
         SmtValue::Array(_) => Err(format!("type error: cannot apply {op} to Array operand")),
         SmtValue::Tuple { .. } => Err(format!("type error: cannot apply {op} to Tuple operand")),
@@ -1420,18 +1600,23 @@ fn coerce_dynamic(op: &str, dynamic: &Dynamic, other: &SmtValue) -> BinopResult 
 /// Negate a boolean or apply unary minus to an int.
 /// Accepts IR op names: `"OpNot"`, `"OpNeg"`.
 pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
+    let op = IRUnOp::try_from(op)?;
+    unop_typed(op, val)
+}
+
+fn unop_typed(op: IRUnOp, val: &SmtValue) -> Result<SmtValue, String> {
     match op {
-        "OpNot" | "not" => {
+        IRUnOp::OpNot => {
             let b = val.as_bool()?;
             Ok(SmtValue::Bool(backend!(bool_not, b)))
         }
-        "OpNeg" | "-" => {
+        IRUnOp::OpNeg => {
             let i = val.as_int()?;
             Ok(SmtValue::Int(backend!(int_neg, i)))
         }
 
         // Collection unary operations
-        "OpSetEmpty" => {
+        IRUnOp::OpSetEmpty => {
             let arr = val.as_array()?;
             let sort = backend!(array_get_sort, arr);
             let empty = backend!(
@@ -1441,11 +1626,11 @@ pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
             );
             Ok(SmtValue::Bool(backend!(array_eq, arr, empty)))
         }
-        "OpSetSize" => {
+        IRUnOp::OpSetSize => {
             // Set size via cardinality — reuse existing Card encoding path
             Err("Set::size should use # (cardinality) operator".to_owned())
         }
-        "OpSeqHead" => {
+        IRUnOp::OpSeqHead => {
             let arr = val.as_array()?;
             let zero = backend!(int_lit, 0);
             Ok(SmtValue::Dynamic(backend!(
@@ -1454,7 +1639,7 @@ pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
                 &backend!(dynamic_from_int, &zero),
             )))
         }
-        "OpSeqTail" => {
+        IRUnOp::OpSeqTail => {
             let arr = val.as_array()?;
             let idx = backend!(dynamic_fresh, "st", &backend!(int_sort));
             let idx_int = backend!(dynamic_as_int, &idx)
@@ -1465,17 +1650,21 @@ pub fn unop(op: &str, val: &SmtValue) -> Result<SmtValue, String> {
             let tail = backend!(lambda, &[&idx], &body);
             Ok(SmtValue::Array(tail))
         }
-        "OpSeqLength" => {
+        IRUnOp::OpSeqLength => {
             // Seq length via cardinality
             Err("Seq::length should use # (cardinality) operator".to_owned())
         }
-        "OpSeqEmpty" => {
+        IRUnOp::OpSeqEmpty => {
             // Check if sequence is empty (length == 0)
             Err("Seq::empty requires length tracking".to_owned())
         }
         // Map::domain, Map::range — deferred: requires domain tracking.
-        // See.
-        _ => Err(format!("unsupported unop: {op}")),
+        IRUnOp::OpMapDomain
+        | IRUnOp::OpMapRange
+        | IRUnOp::OpRelTranspose
+        | IRUnOp::OpRelReach
+        | IRUnOp::OpRelationTranspose
+        | IRUnOp::OpRelationReach => Err(format!("unsupported unop: {op}")),
     }
 }
 
@@ -1504,6 +1693,17 @@ mod tests {
 
     fn assert_real_value(actual: SmtValue, numerator: i64, denominator: i64) {
         assert_value_eq(&actual, &real_val(numerator, denominator));
+    }
+
+    /// Assert a `float` SMT value equals a literal via the IEEE-754 `OpEq`
+    /// predicate (`smt_eq` deliberately has no Float arm — float equality is
+    /// the operator-level `eq_fpa`, not structural Ast equality).
+    fn assert_float_value(actual: SmtValue, expected: f64) {
+        let eq = binop("OpEq", &actual, &float_lit(expected)).expect("float eq");
+        let SmtValue::Bool(b) = eq else {
+            panic!("float OpEq should yield Bool, got {eq:?}");
+        };
+        assert_unsat_with(&bool_not(&b));
     }
 
     fn int_set(elements: &[i64]) -> SmtValue {
@@ -1602,6 +1802,51 @@ mod tests {
         let projected_real =
             dynamic_as_real(&real_dynamic).expect("dynamic should project to real");
         assert_value_eq(&SmtValue::Real(projected_real), &real_val(3, 2));
+
+        let float_dynamic = float_lit(0.25).to_dynamic();
+        let projected_float =
+            dynamic_as_float(&float_dynamic).expect("dynamic should project to float");
+        assert_eq!(float_as_f64(&projected_float), 0.25);
+    }
+
+    #[test]
+    fn tuple_value_rejects_arity_mismatch_before_encoding() {
+        let err = tuple_value(&[IRType::Int, IRType::Bool], vec![int_val(1)])
+            .expect_err("tuple arity mismatch should be rejected");
+        assert!(err.contains("tuple arity mismatch"));
+        assert!(err.contains("type has 2 elements"));
+        assert!(err.contains("value has 1"));
+    }
+
+    #[test]
+    fn smt_eq_compares_tuple_values_structurally() {
+        let left = tuple_value(
+            &[IRType::Int, IRType::Bool],
+            vec![int_val(1), bool_val(true)],
+        )
+        .expect("left tuple");
+        let same = tuple_value(
+            &[IRType::Int, IRType::Bool],
+            vec![int_val(1), bool_val(true)],
+        )
+        .expect("same tuple");
+        let different = tuple_value(
+            &[IRType::Int, IRType::Bool],
+            vec![int_val(1), bool_val(false)],
+        )
+        .expect("different tuple");
+
+        let same_eq = smt_eq(&left, &same).expect("same tuple equality");
+        assert_unsat_with(&bool_not(&same_eq));
+        let different_eq = smt_eq(&left, &different).expect("different tuple equality");
+        assert_unsat_with(&different_eq);
+
+        let short = SmtValue::Tuple {
+            value: int_val(0).to_dynamic(),
+            elements: vec![int_val(1)],
+        };
+        let arity_eq = smt_eq(&left, &short).expect("tuple arity mismatch equality");
+        assert_unsat_with(&arity_eq);
     }
 
     #[test]
@@ -1695,6 +1940,9 @@ mod tests {
         let real_default = dynamic_to_typed_value(default_dynamic(&IRType::Real), &IRType::Real);
         let real_eq = smt_eq(&real_default, &real_val(0, 1)).expect("real default equality");
         assert_unsat_with(&bool_not(&real_eq));
+
+        let float_default = dynamic_to_typed_value(default_dynamic(&IRType::Float), &IRType::Float);
+        assert_float_value(float_default, 0.0);
 
         let seq_ty = IRType::Seq {
             element: Box::new(IRType::Int),
@@ -1823,6 +2071,89 @@ mod tests {
             binop("OpGe", &real_val(3, 1), &real_val(3, 1)).expect("real ge"),
             true,
         );
+        // Euclidean `%`: 15/2 % 2 = 3/2, non-negative even for a negative
+        // dividend (-15/2 % 2 = 1/2), matching the simulator's exact rational.
+        assert_real_value(
+            binop("OpMod", &real_val(15, 2), &real_val(2, 1)).expect("real mod"),
+            3,
+            2,
+        );
+        assert_real_value(
+            binop("OpMod", &real_val(-15, 2), &real_val(2, 1)).expect("real mod neg"),
+            1,
+            2,
+        );
+        assert_real_value(
+            binop("OpMod", &real_val(15, 2), &real_val(-2, 1)).expect("real mod neg divisor"),
+            3,
+            2,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_float_modulo_as_euclidean_binary64() {
+        // `float` `%` is the composed Euclidean remainder `a - |b| * floor(a/|b|)`
+        // (NOT Z3 `fpa.rem`), the same primitive sequence the simulator runs on
+        // host f64 — so SMT and simulation agree bit-for-bit (DDR-059).
+        assert_float_value(
+            binop("OpMod", &float_lit(5.5), &float_lit(2.0)).expect("float mod"),
+            1.5,
+        );
+        // Non-negative remainder for a negative dividend.
+        assert_float_value(
+            binop("OpMod", &float_lit(-5.5), &float_lit(2.0)).expect("float mod neg"),
+            0.5,
+        );
+        // Negative divisor uses |b|.
+        assert_float_value(
+            binop("OpMod", &float_lit(5.5), &float_lit(-2.0)).expect("float mod neg divisor"),
+            1.5,
+        );
+    }
+
+    #[test]
+    fn binop_evaluates_float_operator_family() {
+        assert_float_value(
+            binop("OpAdd", &float_lit(1.25), &float_lit(2.5)).expect("float add"),
+            3.75,
+        );
+        assert_float_value(
+            binop("OpSub", &float_lit(5.5), &float_lit(2.0)).expect("float sub"),
+            3.5,
+        );
+        assert_float_value(
+            binop("OpMul", &float_lit(1.5), &float_lit(4.0)).expect("float mul"),
+            6.0,
+        );
+        assert_float_value(
+            binop("OpDiv", &float_lit(7.0), &float_lit(2.0)).expect("float div"),
+            3.5,
+        );
+
+        assert_bool_value(
+            binop("OpEq", &float_lit(4.0), &float_lit(4.0)).expect("float eq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpNEq", &float_lit(4.0), &float_lit(5.0)).expect("float neq"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLt", &float_lit(2.0), &float_lit(3.0)).expect("float lt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGt", &float_lit(3.0), &float_lit(2.0)).expect("float gt"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpLe", &float_lit(2.0), &float_lit(2.0)).expect("float le"),
+            true,
+        );
+        assert_bool_value(
+            binop("OpGe", &float_lit(3.0), &float_lit(3.0)).expect("float ge"),
+            true,
+        );
     }
 
     #[test]
@@ -1846,6 +2177,11 @@ mod tests {
             binop("OpDiv", &int_val(3), &real_val(2, 1)).expect("mixed div"),
             3,
             2,
+        );
+        assert_real_value(
+            binop("OpMod", &int_val(7), &real_val(2, 1)).expect("mixed mod"),
+            1,
+            1,
         );
 
         assert_bool_value(
@@ -2001,6 +2337,16 @@ mod tests {
     }
 
     #[test]
+    fn binop_rejects_unknown_operator_before_type_dispatch() {
+        let err = binop("OpNeq", &int_val(1), &int_val(2))
+            .expect_err("typo-cased operator should be rejected canonically");
+        assert!(
+            err.contains("unknown IR binary operator `OpNeq`"),
+            "unexpected typo rejection error: {err}"
+        );
+    }
+
+    #[test]
     fn unop_evaluates_scalar_collection_and_error_cases() {
         assert_bool_value(unop("OpNot", &bool_val(false)).expect("bool not"), true);
         assert_int_value(unop("OpNeg", &int_val(3)).expect("int neg"), -3);
@@ -2030,6 +2376,16 @@ mod tests {
         assert!(seq_length_error.contains("cardinality"));
         let seq_empty_error = unop("OpSeqEmpty", &seq_data).expect_err("seq empty should reject");
         assert!(seq_empty_error.contains("length tracking"));
+    }
+
+    #[test]
+    fn unop_rejects_unknown_operator_before_type_dispatch() {
+        let err = unop("OpNoot", &bool_val(false))
+            .expect_err("typo-cased unary operator should be rejected canonically");
+        assert!(
+            err.contains("unknown IR unary operator `OpNoot`"),
+            "unexpected typo rejection error: {err}"
+        );
     }
 
     #[test]

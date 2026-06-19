@@ -1704,6 +1704,7 @@ mod tests {
 
     fn tuple_lit(values: Vec<IRExpr>) -> IRExpr {
         let tuple_ty = IRType::Tuple {
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             elements: values.iter().filter_map(ir_expr_ty).cloned().collect(),
         };
         values.into_iter().fold(

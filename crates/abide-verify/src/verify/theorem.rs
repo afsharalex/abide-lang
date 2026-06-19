@@ -6,27 +6,35 @@ use std::time::Instant;
 use abide_witness::{Countermodel, EvidenceEnvelope, WitnessEnvelope};
 
 use crate::ir::types::{
-    IREntity, IRExpr, IRProgram, IRSystem, IRTheorem, IRVerify, IRVerifySystem,
+    IREntity, IRExpr, IRProgram, IRStoreDecl, IRSystem, IRTheorem, IRVerify, IRVerifySystem,
 };
 
 use super::context::VerifyContext;
 use super::defenv;
 use super::encode::encode_pure_expr_inner;
 use super::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints,
-    try_transition_constraints, SlotPool,
+    create_slot_pool_with_systems, domain_constraints, initial_active_slots_with_store_ranges,
+    initial_state_constraints_with_store_ranges, store_active_cardinality_constraints,
+    try_entity_field_initial_constraints, try_transition_constraints,
+    try_transition_constraints_with_fire, FireTracking, SlotPool,
 };
-use super::property::{encode_prop_expr_with_ctx, PropertyCtx};
+use super::property::{
+    clear_prop_div_obligations, encode_prop_expr_with_ctx, prop_div_obligations_present,
+    PropertyCtx,
+};
+use super::scope::VerifyStoreRange;
 use super::smt::{self, AbideSolver, Bool, SatResult, SmtValue};
+use super::walkers::extract_operational_counterexample_with_fire;
 use super::{
     assert_lambda_axioms_on, collect_in_scope_invariants, compute_theorem_scope, contains_temporal,
     has_multi_entity_quantifier, ic3_trace_to_operational_witness, proof_artifact_ref_for_locator,
     select_verify_relevant, CompiledTemporalFormula,
 };
 use super::{
-    clamp_timeout_to_deadline, elapsed_ms, encode_property_at_step, expand_through_defs, expr_span,
-    find_unsupported_in_actions, find_unsupported_scene_expr, try_liveness_reduction,
-    verification_timeout_hint, VerificationResult, VerifyConfig, WitnessSemantics,
+    clamp_timeout_to_deadline, div_by_zero_well_definedness, elapsed_ms, encode_property_at_step,
+    expand_through_defs, expr_span, find_unsupported_in_actions, find_unsupported_scene_expr,
+    operational_evidence, strip_assert_assume, try_liveness_reduction, verification_timeout_hint,
+    DivWellDefinedness, VerificationResult, VerifyConfig, WitnessSemantics,
 };
 
 fn encode_pure_property_expr(
@@ -176,6 +184,7 @@ fn needs_property_encoder(expr: &IRExpr) -> bool {
 
 // ── Theorem proving (optional IC3 → 1-induction) ────────────────────
 
+#[derive(Clone, Copy)]
 struct TheoremInductionCtx<'a> {
     ir: &'a IRProgram,
     theorem: &'a IRTheorem,
@@ -184,13 +193,18 @@ struct TheoremInductionCtx<'a> {
     config: &'a VerifyConfig,
     deadline: Option<Instant>,
     scope: &'a HashMap<String, usize>,
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
     relevant_entities: &'a [IREntity],
     relevant_systems: &'a [IRSystem],
     show_exprs: &'a [&'a IRExpr],
     lemma_bools: &'a [Bool],
 }
 
-type TheoremScope = (HashMap<String, usize>, Vec<String>);
+type TheoremScope = (
+    HashMap<String, usize>,
+    Vec<String>,
+    HashMap<String, VerifyStoreRange>,
+);
 type BoxedVerificationResult = Box<VerificationResult>;
 
 /// Check a theorem block using IC3/PDR, then 1-induction as fallback.
@@ -208,6 +222,70 @@ type BoxedVerificationResult = Box<VerificationResult>;
 ///
 /// If every pass succeeds, return `PROVED`. Otherwise return `UNPROVABLE`
 /// with a hint.
+/// Reachability-aware div-by-zero well-definedness check for the theorem path.
+///
+/// Theorems over entity/store systems are proved unbounded via 1-induction/IC3,
+/// which would silently absorb a reachable div-by-zero into the solver's total
+/// div/mod. This reports the div-by-zero instead. Gated on a cheap single-step
+/// encoding so a div-free theorem pays nothing for the all-steps reachability
+/// discharge.
+fn theorem_reachable_div_by_zero(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    theorem: &IRTheorem,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let safety = super::transition::TransitionSafetySpec::for_theorem(ir, vctx, theorem, defs)?;
+    let system = safety.system();
+
+    // Gate: single-step encoding to detect integer div/mod presence.
+    clear_prop_div_obligations();
+    let pool0 = create_slot_pool_with_systems(
+        system.relevant_entities(),
+        system.slots_per_entity(),
+        1,
+        system.relevant_systems(),
+    );
+    for prop in safety.step_properties() {
+        let _ = encode_property_at_step(
+            &pool0,
+            vctx,
+            defs,
+            prop,
+            0,
+            system.store_ranges(),
+            system.relevant_systems(),
+        );
+    }
+    // The single-step encoding detects div in non-temporal positions; the
+    // structural scans additionally catch div inside temporal `show` bodies and
+    // in transition/command update values.
+    let has_div = prop_div_obligations_present()
+        || theorem_show_exprs(theorem)
+            .iter()
+            .any(|e| super::contains_integer_div(e))
+        || super::transitions_contain_integer_div(
+            system.relevant_entities(),
+            system.relevant_systems(),
+        );
+    if !has_div {
+        return None;
+    }
+
+    let hint = match div_by_zero_well_definedness(&safety, vctx, defs, config) {
+        DivWellDefinedness::Defined => return None,
+        DivWellDefinedness::Reachable => crate::messages::REACHABLE_DIVISION_BY_ZERO,
+        DivWellDefinedness::Inconclusive => crate::messages::DIVISION_WELL_DEFINEDNESS_INCONCLUSIVE,
+    };
+    Some(VerificationResult::Unprovable {
+        name: theorem.name.clone(),
+        hint: hint.to_owned(),
+        span: theorem.span,
+        file: theorem.file.clone(),
+    })
+}
+
 pub(super) fn check_theorem_block(
     ir: &IRProgram,
     vctx: &VerifyContext,
@@ -222,7 +300,7 @@ pub(super) fn check_theorem_block(
         return result;
     }
 
-    let (scope, system_names) = match theorem_scope(ir, theorem, defs) {
+    let (scope, system_names, store_ranges) = match theorem_scope(ir, theorem, defs) {
         Ok(scope) => scope,
         Err(result) => return *result,
     };
@@ -245,6 +323,16 @@ pub(super) fn check_theorem_block(
         &relevant_entities,
         &relevant_systems,
     ) {
+        return result;
+    }
+
+    // Well-definedness: a `show` that evaluates an integer `/` or `%` with a
+    // reachable zero divisor must not be PROVED on the solver's total div/mod.
+    // Checked before any proof technique so it cannot be proved around.
+    if let Some(result) = theorem_reachable_div_by_zero(ir, vctx, defs, theorem, config) {
+        return result;
+    }
+    if let Some(result) = theorem_initial_state_falsification(ir, vctx, defs, theorem, config) {
         return result;
     }
 
@@ -274,7 +362,7 @@ pub(super) fn check_theorem_block(
         Ok(lemma_bools) => lemma_bools,
         Err(result) => return *result,
     };
-    if let Some(result) = run_theorem_induction(TheoremInductionCtx {
+    let induction_ctx = TheoremInductionCtx {
         ir,
         theorem,
         vctx,
@@ -282,11 +370,18 @@ pub(super) fn check_theorem_block(
         config,
         deadline: _deadline,
         scope: &scope,
+        store_ranges: &store_ranges,
         relevant_entities: &relevant_entities,
         relevant_systems: &relevant_systems,
         show_exprs: &show_exprs,
         lemma_bools: &lemma_bools,
-    }) {
+    };
+    if let Some(result) = run_theorem_induction(induction_ctx) {
+        return result;
+    }
+    if let Some(result) =
+        find_theorem_bounded_counterexample(ir, vctx, defs, theorem, config, _deadline, &scope)
+    {
         return result;
     }
 
@@ -313,6 +408,98 @@ pub(super) fn check_theorem_block(
         ),
         span: None,
         file: None,
+    }
+}
+
+fn theorem_initial_state_falsification(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    theorem: &IRTheorem,
+    config: &VerifyConfig,
+) -> Option<VerificationResult> {
+    let safety = super::transition::TransitionSafetySpec::for_theorem(ir, vctx, theorem, defs)?;
+    let system = safety.system();
+    let pool = create_slot_pool_with_systems(
+        system.relevant_entities(),
+        system.slots_per_entity(),
+        0,
+        system.relevant_systems(),
+    );
+    let solver = AbideSolver::new();
+    solver.set_timeout(config.induction_timeout_ms);
+    let initial_bindings =
+        super::scope::allocate_initial_activations(system.store_ranges(), system.activations())
+            .ok()?;
+    let initial_active_slots = initial_active_slots_with_store_ranges(
+        &initial_bindings.active_slots,
+        system.store_ranges(),
+    );
+    for constraint in initial_state_constraints_with_store_ranges(
+        &pool,
+        &initial_bindings.active_slots,
+        system.store_ranges(),
+    ) {
+        solver.assert(&constraint);
+    }
+    for constraint in try_entity_field_initial_constraints(
+        &pool,
+        vctx,
+        system.relevant_entities(),
+        &initial_active_slots,
+    )
+    .ok()?
+    {
+        solver.assert(&constraint);
+    }
+    for constraint in store_active_cardinality_constraints(&pool, system.store_ranges()) {
+        solver.assert(&constraint);
+    }
+    for constraint in domain_constraints(&pool, vctx, system.relevant_entities()) {
+        solver.assert(&constraint);
+    }
+    let mut negated = Vec::new();
+    for property in safety.step_properties() {
+        let prop = match encode_property_at_step(
+            &pool,
+            vctx,
+            defs,
+            property,
+            0,
+            system.store_ranges(),
+            system.relevant_systems(),
+        ) {
+            Ok(prop) => prop,
+            Err(msg) => {
+                return Some(VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!("initial theorem property encoding error: {msg}"),
+                    span: theorem.span,
+                    file: theorem.file.clone(),
+                });
+            }
+        };
+        negated.push(smt::bool_not(&prop));
+    }
+    let refs: Vec<&Bool> = negated.iter().collect();
+    if refs.is_empty() {
+        return None;
+    }
+    solver.assert(smt::bool_or(&refs));
+    match solver.check() {
+        SatResult::Sat => Some(VerificationResult::Unprovable {
+            name: theorem.name.clone(),
+            hint: crate::messages::THEOREM_BASE_FAILED.to_owned(),
+            span: theorem.span,
+            file: theorem.file.clone(),
+        }),
+        SatResult::Unsat => None,
+        SatResult::Unknown(_) => Some(VerificationResult::Unprovable {
+            name: theorem.name.clone(),
+            hint: crate::messages::THEOREM_BASE_UNKNOWN.to_owned(),
+            span: theorem.span,
+            file: theorem.file.clone(),
+        }),
     }
 }
 
@@ -373,10 +560,9 @@ fn theorem_scope(
         .iter()
         .chain(theorem.invariants.iter())
         .collect();
-    let (scope, system_names, required_slots) =
-        compute_theorem_scope(ir, theorem, &quantifier_exprs, defs);
+    let scope_parts = compute_theorem_scope(ir, theorem, &quantifier_exprs, defs);
 
-    if scope.is_empty() {
+    if scope_parts.slots_per_entity.is_empty() {
         return Err(Box::new(VerificationResult::Unprovable {
             name: theorem.name.clone(),
             hint: crate::messages::VERIFY_EMPTY_SCOPE.to_owned(),
@@ -384,8 +570,8 @@ fn theorem_scope(
             file: None,
         }));
     }
-    for entity_name in required_slots.keys() {
-        if !scope.contains_key(entity_name) {
+    for entity_name in scope_parts.required_slots.keys() {
+        if !scope_parts.slots_per_entity.contains_key(entity_name) {
             return Err(Box::new(VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: format!(
@@ -398,7 +584,40 @@ fn theorem_scope(
             }));
         }
     }
-    Ok((scope, system_names))
+    Ok((
+        scope_parts.slots_per_entity,
+        scope_parts.system_names,
+        scope_parts.store_ranges,
+    ))
+}
+
+fn theorem_store_decls(
+    ir: &IRProgram,
+    theorem: &IRTheorem,
+    defs: &defenv::DefEnv,
+) -> Vec<IRStoreDecl> {
+    let quantifier_exprs: Vec<&IRExpr> = theorem
+        .shows
+        .iter()
+        .chain(theorem.invariants.iter())
+        .collect();
+    let scope = compute_theorem_scope(ir, theorem, &quantifier_exprs, defs);
+    let mut ranges: Vec<_> = scope.store_ranges.into_iter().collect();
+    ranges.sort_by(|(left_name, left), (right_name, right)| {
+        left.entity_type
+            .cmp(&right.entity_type)
+            .then(left.start_slot.cmp(&right.start_slot))
+            .then(left_name.cmp(right_name))
+    });
+    ranges
+        .into_iter()
+        .map(|(name, range)| IRStoreDecl {
+            name,
+            entity_type: range.entity_type,
+            lo: i64::try_from(range.min_active).unwrap_or(i64::MAX),
+            hi: i64::try_from(range.slot_count).unwrap_or(i64::MAX),
+        })
+        .collect()
 }
 
 fn theorem_with_scope_invariants(
@@ -522,7 +741,7 @@ fn handle_theorem_liveness(
                 hi: 10,
             })
             .collect(),
-        stores: vec![],
+        stores: theorem_store_decls(ir, theorem, defs),
         assumption_set: theorem.assumption_set.clone(),
         activations: vec![],
         initial_constraints: vec![],
@@ -550,7 +769,7 @@ fn validate_theorem_supported_forms(
 ) -> Option<VerificationResult> {
     for (i, show_expr) in show_exprs.iter().enumerate() {
         let expanded = expand_through_defs(show_expr, defs);
-        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+        if let Some(kind) = find_unsupported_scene_expr(&strip_assert_assume(&expanded)) {
             return Some(VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: format!("unsupported expression kind in theorem show: {kind}"),
@@ -561,7 +780,7 @@ fn validate_theorem_supported_forms(
     }
     for inv_expr in &theorem.invariants {
         let expanded = expand_through_defs(inv_expr, defs);
-        if let Some(kind) = find_unsupported_scene_expr(&expanded) {
+        if let Some(kind) = find_unsupported_scene_expr(&strip_assert_assume(&expanded)) {
             return Some(VerificationResult::Unprovable {
                 name: theorem.name.clone(),
                 hint: format!("unsupported expression kind in theorem invariant: {kind}"),
@@ -696,9 +915,7 @@ fn prove_invariant_base(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationRes
         Ok(solver) => solver,
         Err(result) => return Some(*result),
     };
-    for c in initial_state_constraints(&pool, &HashSet::new()) {
-        solver.assert(&c);
-    }
+    assert_theorem_initial_state(ctx, &pool, &solver)?;
     assert_domain_and_lemmas(ctx, &pool, &solver);
     assert_negated_properties(ctx, &pool, &solver, &ctx.theorem.invariants, 0, "invariant")?;
     match solver.check() {
@@ -757,9 +974,7 @@ fn prove_theorem_base(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
         Ok(solver) => solver,
         Err(result) => return Some(*result),
     };
-    for c in initial_state_constraints(&pool, &HashSet::new()) {
-        solver.assert(&c);
-    }
+    assert_theorem_initial_state(ctx, &pool, &solver)?;
     assert_domain_and_lemmas(ctx, &pool, &solver);
     assert_negated_properties(
         ctx,
@@ -803,7 +1018,10 @@ fn prove_theorem_step(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
         0,
         "show expression",
     )?;
-    assert_transition_step(ctx, &pool, &solver)?;
+    let fire_tracking = match assert_tracked_transition_step(ctx, &pool, &solver) {
+        Ok(fire_tracking) => fire_tracking,
+        Err(result) => return Some(*result),
+    };
     assert_negated_properties(
         ctx,
         &pool,
@@ -814,12 +1032,12 @@ fn prove_theorem_step(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
     )?;
     match solver.check() {
         SatResult::Unsat => None,
-        SatResult::Sat => Some(VerificationResult::Unprovable {
-            name: ctx.theorem.name.clone(),
-            hint: "inductive step failed — property is not preserved by transitions".to_owned(),
-            span: None,
-            file: None,
-        }),
+        SatResult::Sat => Some(theorem_step_counterexample(
+            ctx,
+            &solver,
+            &pool,
+            &fire_tracking,
+        )),
         SatResult::Unknown(_) => Some(VerificationResult::Unprovable {
             name: ctx.theorem.name.clone(),
             hint: crate::messages::THEOREM_STEP_UNKNOWN.to_owned(),
@@ -827,6 +1045,133 @@ fn prove_theorem_step(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResul
             file: None,
         }),
     }
+}
+
+fn theorem_step_counterexample(
+    ctx: &TheoremInductionCtx<'_>,
+    solver: &AbideSolver,
+    pool: &SlotPool,
+    fire_tracking: &FireTracking,
+) -> VerificationResult {
+    let evidence = extract_operational_counterexample_with_fire(
+        solver,
+        pool,
+        ctx.vctx,
+        ctx.relevant_entities,
+        ctx.relevant_systems,
+        fire_tracking,
+        1,
+    )
+    .and_then(operational_evidence);
+    let (evidence, evidence_extraction_error) = match evidence {
+        Ok(evidence) => (Some(evidence), None),
+        Err(err) => (None, Some(err)),
+    };
+    VerificationResult::Counterexample {
+        name: ctx.theorem.name.clone(),
+        evidence,
+        replay: None,
+        evidence_extraction_error,
+        assumptions: super::build_assumptions_for_system_scope(
+            ctx.ir,
+            &ctx.theorem.systems,
+            &ctx.theorem.assumption_set,
+            &ctx.theorem.by_lemmas,
+        ),
+        span: None,
+        file: None,
+    }
+}
+
+fn find_theorem_bounded_counterexample(
+    ir: &IRProgram,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    theorem: &IRTheorem,
+    config: &VerifyConfig,
+    deadline: Option<Instant>,
+    scope: &HashMap<String, usize>,
+) -> Option<VerificationResult> {
+    let depth = scope.values().copied().max().unwrap_or(2).max(2);
+    let verify_block = IRVerify {
+        name: theorem.name.clone(),
+        depth: Some(depth),
+        systems: theorem
+            .systems
+            .iter()
+            .map(|name| IRVerifySystem {
+                name: name.clone(),
+                lo: 0,
+                hi: i64::try_from(depth).unwrap_or(i64::MAX),
+            })
+            .collect(),
+        stores: theorem_store_decls(ir, theorem, defs),
+        assumption_set: theorem.assumption_set.clone(),
+        activations: vec![],
+        initial_constraints: vec![],
+        asserts: theorem_show_exprs(theorem).into_iter().cloned().collect(),
+        span: theorem.span,
+        file: theorem.file.clone(),
+    };
+    let bounded_config = VerifyConfig {
+        bounded_only: true,
+        no_ic3: true,
+        bmc_timeout_ms: config.bmc_timeout_ms,
+        overall_timeout_ms: config.overall_timeout_ms,
+        witness_semantics: config.witness_semantics,
+        ..VerifyConfig::default()
+    };
+    let result = super::explicit::try_check_verify_block_explicit(
+        ir,
+        vctx,
+        defs,
+        &verify_block,
+        &bounded_config,
+        deadline,
+    );
+    match result {
+        Some(VerificationResult::Counterexample { .. }) => result,
+        Some(
+            VerificationResult::Deadlock { .. } | VerificationResult::LivenessViolation { .. },
+        ) => None,
+        _ => None,
+    }
+}
+
+fn assert_theorem_initial_state(
+    ctx: &TheoremInductionCtx<'_>,
+    pool: &SlotPool,
+    solver: &AbideSolver,
+) -> Option<VerificationResult> {
+    for constraint in
+        initial_state_constraints_with_store_ranges(pool, &HashSet::new(), ctx.store_ranges)
+    {
+        solver.assert(&constraint);
+    }
+    let active_slots = initial_active_slots_with_store_ranges(&HashSet::new(), ctx.store_ranges);
+    let field_constraints = match try_entity_field_initial_constraints(
+        pool,
+        ctx.vctx,
+        ctx.relevant_entities,
+        &active_slots,
+    ) {
+        Ok(constraints) => constraints,
+        Err(msg) => {
+            return Some(VerificationResult::Unprovable {
+                name: ctx.theorem.name.clone(),
+                hint: format!("initial field encoding error: {msg}"),
+                span: ctx.theorem.span,
+                file: ctx.theorem.file.clone(),
+            });
+        }
+    };
+    for constraint in field_constraints {
+        solver.assert(&constraint);
+    }
+    for constraint in store_active_cardinality_constraints(pool, ctx.store_ranges) {
+        solver.assert(&constraint);
+    }
+    None
 }
 
 fn induction_solver(ctx: &TheoremInductionCtx<'_>) -> Result<AbideSolver, BoxedVerificationResult> {
@@ -870,7 +1215,7 @@ fn assert_properties<'a>(
             ctx.defs,
             expr,
             step,
-            &HashMap::new(),
+            ctx.store_ranges,
             ctx.relevant_systems,
         ) {
             Ok(prop) => prop,
@@ -908,7 +1253,7 @@ fn assert_negated_properties<'a>(
             ctx.defs,
             expr,
             step,
-            &HashMap::new(),
+            ctx.store_ranges,
             ctx.relevant_systems,
         ) {
             Ok(prop) => prop,
@@ -961,6 +1306,35 @@ fn assert_transition_step(
     None
 }
 
+fn assert_tracked_transition_step(
+    ctx: &TheoremInductionCtx<'_>,
+    pool: &SlotPool,
+    solver: &AbideSolver,
+) -> Result<FireTracking, BoxedVerificationResult> {
+    let fire_tracking = match try_transition_constraints_with_fire(
+        pool,
+        ctx.vctx,
+        ctx.relevant_entities,
+        ctx.relevant_systems,
+        1,
+        &ctx.theorem.assumption_set,
+    ) {
+        Ok(fire_tracking) => fire_tracking,
+        Err(msg) => {
+            return Err(Box::new(VerificationResult::Unprovable {
+                name: ctx.theorem.name.clone(),
+                hint: format!("transition encoding error: {msg}"),
+                span: None,
+                file: None,
+            }));
+        }
+    };
+    for constraint in &fire_tracking.constraints {
+        solver.assert(constraint);
+    }
+    Ok(fire_tracking)
+}
+
 fn assert_non_vacuous_no_stutter(ctx: &TheoremInductionCtx<'_>) -> Option<VerificationResult> {
     if ctx.theorem.assumption_set.stutter {
         return None;
@@ -978,7 +1352,7 @@ fn assert_non_vacuous_no_stutter(ctx: &TheoremInductionCtx<'_>) -> Option<Verifi
                 hi: 1,
             })
             .collect(),
-        stores: vec![],
+        stores: theorem_store_decls(ctx.ir, ctx.theorem, ctx.defs),
         assumption_set: ctx.theorem.assumption_set.clone(),
         activations: vec![],
         initial_constraints: vec![],
@@ -1012,9 +1386,7 @@ fn assert_non_vacuous_no_stutter(ctx: &TheoremInductionCtx<'_>) -> Option<Verifi
         Ok(solver) => solver,
         Err(result) => return Some(*result),
     };
-    for c in initial_state_constraints(&pool, &HashSet::new()) {
-        solver.assert(&c);
-    }
+    assert_theorem_initial_state(ctx, &pool, &solver)?;
     for c in domain_constraints(&pool, ctx.vctx, ctx.relevant_entities) {
         solver.assert(&c);
     }
@@ -1076,7 +1448,35 @@ fn try_ic3_on_theorem(
                 file: theorem.file.clone(),
             });
         }
-        for c in initial_state_constraints(&pool, &HashSet::new()) {
+        for c in initial_state_constraints_with_store_ranges(
+            &pool,
+            &HashSet::new(),
+            system.store_ranges(),
+        ) {
+            probe_solver.assert(&c);
+        }
+        let active_slots =
+            initial_active_slots_with_store_ranges(&HashSet::new(), system.store_ranges());
+        let field_constraints = match try_entity_field_initial_constraints(
+            &pool,
+            vctx,
+            system.relevant_entities(),
+            &active_slots,
+        ) {
+            Ok(constraints) => constraints,
+            Err(msg) => {
+                return Some(VerificationResult::Unprovable {
+                    name: theorem.name.clone(),
+                    hint: format!("initial field encoding error: {msg}"),
+                    span: theorem.span,
+                    file: theorem.file.clone(),
+                });
+            }
+        };
+        for c in field_constraints {
+            probe_solver.assert(&c);
+        }
+        for c in store_active_cardinality_constraints(&pool, system.store_ranges()) {
             probe_solver.assert(&c);
         }
         for c in domain_constraints(&pool, vctx, system.relevant_entities()) {
@@ -1250,6 +1650,14 @@ pub(super) fn check_lemma_block(
                 file: lemma.file.clone(),
             };
         }
+        if let Some(kind) = find_unsupported_scene_expr(&strip_assert_assume(&expanded)) {
+            return VerificationResult::Unprovable {
+                name: lemma.name.clone(),
+                hint: format!("unsupported expression kind in lemma body: {kind}"),
+                span: expr_span(body_expr).or(lemma.span),
+                file: lemma.file.clone(),
+            };
+        }
     }
 
     // Encode each body expression and conjoin
@@ -1332,6 +1740,7 @@ mod tests {
     };
     use crate::verify::context::VerifyContext;
     use crate::verify::defenv::DefEnv;
+    use crate::verify::unsupported_corpus;
     use crate::verify::{VerificationResult, VerifyConfig};
 
     fn bool_lit(value: bool) -> IRExpr {
@@ -1818,6 +2227,42 @@ mod tests {
             VerificationResult::Unprovable { hint, .. }
                 if hint.contains(crate::messages::LEMMA_TEMPORAL_UNSUPPORTED)
         ));
+    }
+
+    #[test]
+    fn theorem_and_lemma_reject_shared_unsupported_ir_corpus() {
+        let ir = ir_with_system_entity();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        for case in unsupported_corpus::property_position_unsupported_cases() {
+            let lemma_result = check_lemma_block(
+                &vctx,
+                &defs,
+                &lemma(case.name, vec![case.expr.clone()]),
+                &config,
+            );
+            assert!(
+                matches!(lemma_result, VerificationResult::Unprovable { .. }),
+                "unsupported lemma corpus case `{}` must be unprovable, got: {lemma_result:?}",
+                case.name
+            );
+
+            let theorem_result = check_theorem_block(
+                &ir,
+                &vctx,
+                &defs,
+                &scoped_theorem(case.name, vec![case.expr]),
+                &config,
+                None,
+            );
+            assert!(
+                matches!(theorem_result, VerificationResult::Unprovable { .. }),
+                "unsupported theorem corpus case `{}` must be unprovable, got: {theorem_result:?}",
+                case.name
+            );
+        }
     }
 
     #[test]

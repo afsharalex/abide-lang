@@ -5,6 +5,244 @@ use crate::verify::ic3;
 use crate::verify::solver::{active_solver_family, set_active_solver_family, SolverFamily};
 use crate::verify::transition::{solve_transition_obligation, TransitionObligation};
 
+/// The cvc5->IRExpr translator reconstructs a synthesized arithmetic
+/// invariant as an abide `IRExpr` that references system fields by name,
+/// so it can be independently re-validated through the Z3/IR encoding
+/// path (defense-in-depth against shared cvc5 encoder bugs).
+#[test]
+fn cvc5_term_to_ir_translates_arithmetic_invariant() {
+    use crate::ir::types::{IRExpr, IRType, LitVal};
+    let tm = Cvc5Tm::new();
+    let int_sort = tm.integer_sort();
+    let total = tm.mk_var(int_sort.clone(), "total");
+    let zero = tm.mk_integer(0);
+    let hundred = tm.mk_integer(100);
+    // total >= 0 AND total <= 100
+    let lo = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[total.clone(), zero]);
+    let hi = tm.mk_term(Cvc5Kind::CVC5_KIND_LEQ, &[total, hundred]);
+    let conj = tm.mk_term(Cvc5Kind::CVC5_KIND_AND, &[lo, hi]);
+
+    let var_types = HashMap::from([("total".to_owned(), IRType::Int)]);
+    let ir = cvc5_term_to_ir(&conj, &var_types).expect("arithmetic invariant should translate");
+    // Top level: OpAnd of two comparisons; left is `total >= 0` whose RHS
+    // is the int literal 0.
+    match &ir {
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            assert_eq!(op, "OpAnd");
+            match left.as_ref() {
+                IRExpr::BinOp { op, right, .. } => {
+                    assert_eq!(op, "OpGe", "left should be total >= 0, got {left:?}");
+                    assert!(matches!(
+                        right.as_ref(),
+                        IRExpr::Lit {
+                            value: LitVal::Int { value: 0 },
+                            ..
+                        }
+                    ));
+                }
+                other => panic!("expected OpGe, got {other:?}"),
+            }
+            assert!(
+                matches!(right.as_ref(), IRExpr::BinOp { op, .. } if op == "OpLe"),
+                "right should be total <= 100, got {right:?}"
+            );
+        }
+        other => panic!("expected BinOp OpAnd, got {other:?}"),
+    }
+}
+
+/// Unsupported term shapes (here: a free non-field variable) must fail
+/// translation so the SyGuS path downgrades conservatively rather than
+/// re-validating a wrong reconstruction.
+#[test]
+fn cvc5_term_to_ir_rejects_unknown_variable() {
+    use crate::ir::types::IRType;
+    let tm = Cvc5Tm::new();
+    let int_sort = tm.integer_sort();
+    let mystery = tm.mk_var(int_sort.clone(), "mystery");
+    let zero = tm.mk_integer(0);
+    let cmp = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[mystery, zero]);
+    let var_types = HashMap::from([("total".to_owned(), IRType::Int)]);
+    assert!(
+        cvc5_term_to_ir(&cmp, &var_types).is_err(),
+        "a variable that is not a known field must fail translation"
+    );
+}
+
+/// A pooled synthesized invariant references the flat, slot-qualified state
+/// names (`<entity>_<slot>_active`, `<entity>_<slot>_<field>`). The translator
+/// reconstructs it as an `IRExpr` whose `Var` names are exactly those flat
+/// names, so the caller's slot-aware Z3/IR re-validation (abide-wnby.1.10) can
+/// bind each one back to its pool variable.
+#[test]
+fn cvc5_term_to_ir_translates_pooled_slot_qualified_invariant() {
+    use crate::ir::types::{IRExpr, IRType};
+    let tm = Cvc5Tm::new();
+    let bool_sort = tm.boolean_sort();
+    let int_sort = tm.integer_sort();
+    let active = tm.mk_var(bool_sort, "Item_0_active");
+    let total = tm.mk_var(int_sort, "Item_0_total");
+    let zero = tm.mk_integer(0);
+    // Item_0_active => Item_0_total >= 0
+    let ge = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[total, zero]);
+    let implies = tm.mk_term(Cvc5Kind::CVC5_KIND_IMPLIES, &[active, ge]);
+
+    let var_types = HashMap::from([
+        ("Item_0_active".to_owned(), IRType::Bool),
+        ("Item_0_total".to_owned(), IRType::Int),
+    ]);
+    let ir = cvc5_term_to_ir(&implies, &var_types)
+        .expect("slot-qualified pooled invariant should translate");
+    match &ir {
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            assert_eq!(op, "OpImplies");
+            assert!(
+                matches!(left.as_ref(), IRExpr::Var { name, ty: IRType::Bool, .. } if name == "Item_0_active"),
+                "left should be the slot-qualified active flag, got {left:?}"
+            );
+            assert!(
+                matches!(right.as_ref(), IRExpr::BinOp { op, .. } if op == "OpGe"),
+                "right should be the slot-qualified total comparison, got {right:?}"
+            );
+        }
+        other => panic!("expected BinOp OpImplies, got {other:?}"),
+    }
+}
+
+/// Build the cvc5 encoding of a one-field integer counter:
+/// `x: int = 0`, step `x' = x + 1`, property `x >= 0`. Returns
+/// `(tm, curr_order, next_order, pre_body, trans_body, post_body)`.
+#[allow(clippy::type_complexity)]
+fn counter_obligation_terms() -> (
+    Cvc5Tm,
+    Vec<Cvc5Term>,
+    Vec<Cvc5Term>,
+    Cvc5Term,
+    Cvc5Term,
+    Cvc5Term,
+) {
+    let tm = Cvc5Tm::new();
+    let int_sort = tm.integer_sort();
+    let x = tm.mk_var(int_sort.clone(), "x");
+    let x_next = tm.mk_var(int_sort, "x_next");
+    let zero = tm.mk_integer(0);
+    let one = tm.mk_integer(1);
+    // pre: x = 0
+    let pre = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[x.clone(), zero.clone()]);
+    // trans: x_next = x + 1
+    let inc = tm.mk_term(Cvc5Kind::CVC5_KIND_ADD, &[x.clone(), one]);
+    let trans = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[x_next.clone(), inc]);
+    // post: x >= 0
+    let post = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[x.clone(), zero]);
+    (tm, vec![x], vec![x_next], pre, trans, post)
+}
+
+/// A valid inductive safety invariant (`x >= 0`) passes independent
+/// revalidation: all three obligations (init/induction/safety) hold.
+#[test]
+fn revalidate_accepts_valid_inductive_invariant() {
+    let (tm, curr, next, pre, trans, post) = counter_obligation_terms();
+    let zero = tm.mk_integer(0);
+    let inv_curr = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[curr[0].clone(), zero.clone()]);
+    let inv_next = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[next[0].clone(), zero]);
+    let outcome = revalidate_invariant_obligations(
+        &InvariantObligations {
+            tm: &tm,
+            pre_body: &pre,
+            trans_body: &trans,
+            post_body: &post,
+            curr_order: &curr,
+            next_order: &next,
+            logic: "LIA",
+        },
+        &inv_curr,
+        &inv_next,
+    );
+    assert!(
+        outcome.is_ok(),
+        "x >= 0 should revalidate cleanly: {outcome:?}"
+    );
+}
+
+/// An invariant that does not imply the property (`true`) is rejected by
+/// the safety obligation — this is the soundness guard that stops a
+/// discarded/unsound synthesized solution from being reported as PROVED.
+#[test]
+fn revalidate_rejects_invariant_violating_safety() {
+    let (tm, curr, next, pre, trans, post) = counter_obligation_terms();
+    let inv_curr = tm.mk_true();
+    let inv_next = tm.mk_true();
+    let outcome = revalidate_invariant_obligations(
+        &InvariantObligations {
+            tm: &tm,
+            pre_body: &pre,
+            trans_body: &trans,
+            post_body: &post,
+            curr_order: &curr,
+            next_order: &next,
+            logic: "LIA",
+        },
+        &inv_curr,
+        &inv_next,
+    );
+    let err = outcome.expect_err("`true` does not imply x >= 0 and must be rejected");
+    assert!(
+        err.contains("safety"),
+        "error should name the failing obligation: {err}"
+    );
+}
+
+/// An invariant that holds initially but is not inductive (`x = 0`) is
+/// rejected by the induction obligation.
+#[test]
+fn revalidate_rejects_non_inductive_invariant() {
+    let (tm, curr, next, pre, trans, post) = counter_obligation_terms();
+    let zero = tm.mk_integer(0);
+    let inv_curr = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[curr[0].clone(), zero.clone()]);
+    let inv_next = tm.mk_term(Cvc5Kind::CVC5_KIND_EQUAL, &[next[0].clone(), zero]);
+    let outcome = revalidate_invariant_obligations(
+        &InvariantObligations {
+            tm: &tm,
+            pre_body: &pre,
+            trans_body: &trans,
+            post_body: &post,
+            curr_order: &curr,
+            next_order: &next,
+            logic: "LIA",
+        },
+        &inv_curr,
+        &inv_next,
+    );
+    let err = outcome.expect_err("x = 0 is not inductive under x' = x + 1");
+    assert!(
+        err.contains("induction"),
+        "error should name the failing obligation: {err}"
+    );
+}
+
+/// `apply_synth_solution` beta-reduces a synthesized lambda by
+/// substituting its bound parameters with the given state arguments.
+#[test]
+fn apply_synth_solution_beta_reduces_lambda() {
+    let tm = Cvc5Tm::new();
+    let int_sort = tm.integer_sort();
+    let bound = tm.mk_var(int_sort.clone(), "v");
+    let zero = tm.mk_integer(0);
+    let body = tm.mk_term(Cvc5Kind::CVC5_KIND_GEQ, &[bound.clone(), zero]);
+    let var_list = tm.mk_term(Cvc5Kind::CVC5_KIND_VARIABLE_LIST, &[bound]);
+    let lambda = tm.mk_term(Cvc5Kind::CVC5_KIND_LAMBDA, &[var_list, body]);
+    let arg = tm.mk_var(int_sort, "x");
+    let applied = apply_synth_solution(&lambda, std::slice::from_ref(&arg))
+        .expect("lambda of arity 1 applies to one argument");
+    // Result should be `x >= 0`: a GEQ whose first child is the arg.
+    assert_eq!(applied.kind(), Cvc5Kind::CVC5_KIND_GEQ);
+    assert_eq!(applied.num_children(), 2);
+}
+
 #[test]
 fn cvc5_sygus_disabled_reason_documents_hard_cancellation_boundary() {
     let reason = cvc5_sygus_disabled_reason();
@@ -3931,6 +4169,8 @@ fn sygus_core_reports_unsupported_shapes_before_solver_setup() {
     system.store_params.push(IRStoreParam {
         name: "counters".to_owned(),
         entity_type: "Counter".to_owned(),
+        lo: None,
+        hi: None,
     });
     let err = try_cvc5_sygus_system_safety_inner(&system, &non_negative_property(), 0)
         .expect_err("store params unsupported");
@@ -5116,6 +5356,8 @@ fn make_pooled_store_counter_system() -> IRSystem {
         store_params: vec![crate::ir::types::IRStoreParam {
             name: "items".to_owned(),
             entity_type: "Counter".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Counter".to_owned()],
@@ -7633,6 +7875,8 @@ fn cvc5_sygus_multi_system_pooled_safety_supports_callee_store_params() {
         store_params: vec![crate::ir::types::IRStoreParam {
             name: "live".to_owned(),
             entity_type: "Counter".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Counter".to_owned()],
@@ -7829,6 +8073,8 @@ fn cvc5_sygus_multi_system_pooled_safety_ignores_unused_proc_metadata() {
         store_params: vec![crate::ir::types::IRStoreParam {
             name: "live".to_owned(),
             entity_type: "Counter".to_owned(),
+            lo: None,
+            hi: None,
         }],
         fields: vec![],
         entities: vec!["Counter".to_owned()],

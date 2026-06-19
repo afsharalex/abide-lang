@@ -1451,6 +1451,7 @@ fn dfs_use_cycle(
         // BTreeSet iterates in sorted order — deterministic cycle reporting.
         for neighbor in neighbors {
             if in_stack.contains(neighbor.as_str()) {
+                // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                 let pos = path.iter().position(|p| p == neighbor).unwrap_or(0);
                 let mut cycle: Vec<String> = path[pos..].to_vec();
                 cycle.push(neighbor.clone());
@@ -1734,7 +1735,7 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
             invariant.body = resolve_expr(ctx, &system_bound, &invariant.body);
         }
         for cmd in &mut system.commands {
-            let (resolved_params, _) = resolve_params_lr(ctx, &cmd.params, HashMap::new());
+            let (resolved_params, _) = resolve_params_lr(ctx, &cmd.params, system_bound.clone());
             cmd.params = resolved_params;
             // resolve command return type
             if let Some(ref mut rt) = cmd.return_type {
@@ -1743,7 +1744,7 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
         }
         for step in &mut system.actions {
             let (resolved_params, step_bound) =
-                resolve_params_lr(ctx, &step.params, HashMap::new());
+                resolve_params_lr(ctx, &step.params, system_bound.clone());
             step.params = resolved_params;
             step.requires = step
                 .requires
@@ -1762,14 +1763,14 @@ fn resolve_systems(env: &mut Env, ctx: &Ctx) {
         }
         for query in &mut system.queries {
             let (resolved_params, query_bound) =
-                resolve_params_lr(ctx, &query.params, HashMap::new());
+                resolve_params_lr(ctx, &query.params, system_bound.clone());
             query.params = resolved_params;
             query.body = resolve_expr(ctx, &query_bound, &query.body);
         }
         // resolve system-local preds
         for pred in &mut system.preds {
             let (resolved_params, pred_bound) =
-                resolve_params_lr(ctx, &pred.params, HashMap::new());
+                resolve_params_lr(ctx, &pred.params, system_bound.clone());
             pred.params = resolved_params;
             pred.body = resolve_expr(ctx, &pred_bound, &pred.body);
         }
@@ -1988,17 +1989,40 @@ fn resolve_scenes(env: &mut Env, ctx: &Ctx) {
     }
 }
 
+fn theorem_expr_bound(env: &Env, ctx: &Ctx, targets: &[String]) -> HashMap<String, Ty> {
+    let mut bound = HashMap::new();
+    for target in targets {
+        let Some(system) = env.systems.get(target) else {
+            continue;
+        };
+        for store in &system.store_params {
+            let entity = ctx
+                .entity_canonical
+                .get(store.entity_type.as_str())
+                .cloned()
+                .unwrap_or_else(|| store.entity_type.clone());
+            bound.insert(store.name.clone(), Ty::Store(entity));
+        }
+    }
+    bound
+}
+
 fn resolve_theorems(env: &mut Env, ctx: &Ctx) {
-    for theorem in &mut env.theorems {
+    let theorem_bounds = env
+        .theorems
+        .iter()
+        .map(|theorem| theorem_expr_bound(env, ctx, &theorem.targets))
+        .collect::<Vec<_>>();
+    for (theorem, bound) in env.theorems.iter_mut().zip(theorem_bounds) {
         theorem.invariants = theorem
             .invariants
             .iter()
-            .map(|e| resolve_expr(ctx, &HashMap::new(), e))
+            .map(|e| resolve_expr(ctx, &bound, e))
             .collect();
         theorem.shows = theorem
             .shows
             .iter()
-            .map(|e| resolve_expr(ctx, &HashMap::new(), e))
+            .map(|e| resolve_expr(ctx, &bound, e))
             .collect();
     }
 }
@@ -2085,6 +2109,7 @@ fn resolve_event_path(
             // parameterized flag from the event's signature.
             let matches: Vec<(String, bool)> = scope
                 .iter()
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|sys| {
                     system_events
                         .get(sys.as_str())

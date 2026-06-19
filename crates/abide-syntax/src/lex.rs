@@ -284,7 +284,7 @@ pub enum Token {
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse::<f64>().unwrap())]
     DoubleLit(f64),
 
-    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().unwrap())]
+    #[regex(r"[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
     IntLit(i64),
 
     #[regex(r#""[^"]*""#, |lex| {
@@ -472,7 +472,7 @@ pub fn lex(src: &str) -> Result<Vec<(Token, Span)>, Vec<LexError>> {
         let span = Span::from(range);
         match result {
             Ok(token) => tokens.push((token, span)),
-            Err(()) => errors.push(LexError::new(src, span)),
+            Err(()) => errors.push(classify_lex_error(src, span)),
         }
     }
 
@@ -480,6 +480,15 @@ pub fn lex(src: &str) -> Result<Vec<(Token, Span)>, Vec<LexError>> {
         Ok(tokens)
     } else {
         Err(errors)
+    }
+}
+
+fn classify_lex_error(src: &str, span: Span) -> LexError {
+    let slice = &src[span.start..span.end];
+    if !slice.is_empty() && slice.bytes().all(|byte| byte.is_ascii_digit()) {
+        LexError::integer_overflow(src, span)
+    } else {
+        LexError::new(src, span)
     }
 }
 
@@ -844,6 +853,32 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert_eq!(errors.len(), 1);
+        let diagnostic = errors[0].to_diagnostic();
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("abide::lex::unexpected"),
+            "non-numeric invalid characters must not be reported as integer overflow"
+        );
+    }
+
+    #[test]
+    fn integer_literal_overflow_reports_lex_error() {
+        let result = lex("9223372036854775808");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+
+        let diagnostic = errors[0].to_diagnostic();
+        assert_eq!(
+            diagnostic.code.as_deref(),
+            Some("abide::lex::integer_overflow")
+        );
+        assert_eq!(diagnostic.span, Some(Span { start: 0, end: 19 }));
+        assert!(
+            diagnostic.message.contains("integer literal")
+                && diagnostic.message.contains("too large"),
+            "{diagnostic:?}"
+        );
     }
 
     #[test]

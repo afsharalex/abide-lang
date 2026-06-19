@@ -1258,6 +1258,26 @@ mod tests {
         Formula::atom(Q)
     }
 
+    /// A formula whose subformula closure exceeds the 128-bit state width caps
+    /// to an empty automaton (zero states). The lasso encoder must treat that
+    /// as a construction failure (Unprovable), not as "no counterexample"
+    /// (CHECKED).
+    #[test]
+    fn oversized_formula_caps_to_empty_automaton() {
+        // A right-nested conjunction of 130 distinct atoms has > 128 distinct
+        // subformulas in its closure, exceeding `u128::BITS`.
+        let mut formula = Formula::atom(0);
+        for atom in 1..130 {
+            formula = Formula::and(Formula::atom(atom), formula);
+        }
+        let automaton = GeneralizedBuchi::from_formula(&formula, 130);
+        assert_eq!(
+            automaton.state_count(),
+            0,
+            "an oversized formula must cap to an empty automaton"
+        );
+    }
+
     #[test]
     fn lasso_semantics_handles_boolean_atoms_and_next() {
         let word = word(&[&[P]], &[&[Q], &[P, Q]]);

@@ -450,8 +450,11 @@ pub(in crate::verify::ic3) fn guard_to_smt_sys_scoped(
         IRExpr::Let { bindings, body, .. } => {
             guard_let_to_smt_sys_scoped(bindings, body, entity, vctx, ent_name, slot, locals)
         }
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
-            guard_to_smt_sys_scoped(expr, entity, vctx, ent_name, slot, locals)
+        IRExpr::Assert { .. } => {
+            Err("Assert expression reached system IC3 guard encoder".to_owned())
+        }
+        IRExpr::Assume { .. } => {
+            Err("Assume expression reached system IC3 guard encoder".to_owned())
         }
         IRExpr::Forall {
             var, domain, body, ..

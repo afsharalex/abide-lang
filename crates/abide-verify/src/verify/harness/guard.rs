@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::ir::types::IRBinOp;
+use crate::verify::encode::unqualify_ctor_name;
 
 /// Context for guard expression encoding — tracks entity bindings from
 /// enclosing quantifiers, similar to `PropertyCtx` in `mod.rs`.
@@ -212,13 +214,17 @@ fn try_encode_guard_inner(
         }
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpAnd" || op == "OpOr" || op == "OpImplies" => {
+        } if matches!(
+            IRBinOp::try_from(op.as_str()),
+            Ok(IRBinOp::OpAnd | IRBinOp::OpOr | IRBinOp::OpImplies)
+        ) =>
+        {
             let l = try_encode_guard_inner(pool, vctx, ctx, left, step)?;
             let r = try_encode_guard_inner(pool, vctx, ctx, right, step)?;
-            Ok(match op.as_str() {
-                "OpAnd" => smt::bool_and(&[&l, &r]),
-                "OpOr" => smt::bool_or(&[&l, &r]),
-                "OpImplies" => smt::bool_implies(&l, &r),
+            Ok(match IRBinOp::try_from(op.as_str())? {
+                IRBinOp::OpAnd => smt::bool_and(&[&l, &r]),
+                IRBinOp::OpOr => smt::bool_or(&[&l, &r]),
+                IRBinOp::OpImplies => smt::bool_implies(&l, &r),
                 _ => unreachable!(),
             })
         }
@@ -308,7 +314,9 @@ fn try_encode_guard_value(
         IRExpr::Ctor {
             enum_name, ctor, ..
         } => {
-            let id = vctx.variants.try_id_of(enum_name, ctor)?;
+            let id = vctx
+                .variants
+                .try_id_of(enum_name, unqualify_ctor_name(ctor))?;
             Ok(smt::int_val(id))
         }
         IRExpr::BinOp {

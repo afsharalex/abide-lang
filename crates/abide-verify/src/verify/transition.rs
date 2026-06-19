@@ -17,9 +17,10 @@ use super::context::VerifyContext;
 use super::defenv;
 use super::encode::encode_pure_expr;
 use super::harness::{
-    create_slot_pool_with_systems, domain_constraints, initial_state_constraints_with_store_ranges,
-    lasso_loopback, store_active_cardinality_constraints, symmetry_breaking_constraints,
-    try_encode_guard_expr, try_entity_field_initial_constraints, try_fairness_constraints,
+    create_slot_pool_with_systems, domain_constraints, initial_active_slots_with_store_ranges,
+    initial_state_constraints_with_store_ranges, lasso_loopback,
+    store_active_cardinality_constraints, symmetry_breaking_constraints, try_encode_guard_expr,
+    try_entity_field_initial_constraints, try_fairness_constraints,
     try_system_field_initial_constraints, try_transition_constraints_with_fire, FireTracking,
     LassoLoop, SlotPool,
 };
@@ -30,8 +31,6 @@ use super::scope::{
     select_verify_relevant, VerifyStoreRange,
 };
 use super::smt::{self, AbideSolver, Bool, SatResult, SmtValue};
-use super::solver::{active_solver_family, SolverFamily};
-use super::sygus;
 use super::temporal::{CompiledTemporalFormula, LivenessPattern};
 use super::walkers::count_entity_quantifiers;
 
@@ -399,24 +398,23 @@ impl<'a> TransitionSystemSpec<'a> {
         defs: &defenv::DefEnv,
     ) -> Option<Self> {
         let quantifier_exprs: Vec<&IRExpr> = theorem.shows.iter().collect();
-        let (slots_per_entity, system_names, _required_slots) =
-            compute_theorem_scope(ir, theorem, &quantifier_exprs, defs);
-        if system_names.is_empty() {
+        let scope = compute_theorem_scope(ir, theorem, &quantifier_exprs, defs);
+        if scope.system_names.is_empty() {
             return None;
         }
         let (relevant_entities, relevant_systems) =
-            select_verify_relevant(ir, &slots_per_entity, &system_names);
+            select_verify_relevant(ir, &scope.slots_per_entity, &scope.system_names);
         let assumptions = TransitionAssumptions::from_ir(&theorem.assumption_set)
-            .with_reachable_extern_assumptions(ir, &system_names);
+            .with_reachable_extern_assumptions(ir, &scope.system_names);
 
         Some(Self {
             ir,
             vctx,
             selected_system_names: theorem.systems.clone(),
-            system_names,
-            slots_per_entity,
+            system_names: scope.system_names,
+            slots_per_entity: scope.slots_per_entity,
             bound: 0,
-            store_ranges: HashMap::new(),
+            store_ranges: scope.store_ranges,
             assumptions,
             activations: vec![],
             initial_constraints: vec![],
@@ -1055,6 +1053,10 @@ impl<'a> TransitionSmtEncoding<'a> {
         );
         let initial_bindings =
             allocate_initial_activations(system.store_ranges(), system.activations())?;
+        let initial_active_slots = initial_active_slots_with_store_ranges(
+            &initial_bindings.active_slots,
+            system.store_ranges(),
+        );
         let mut initial_constraints = initial_state_constraints_with_store_ranges(
             &pool,
             &initial_bindings.active_slots,
@@ -1064,7 +1066,7 @@ impl<'a> TransitionSmtEncoding<'a> {
             &pool,
             system.vctx,
             system.relevant_entities(),
-            &initial_bindings.active_slots,
+            &initial_active_slots,
         )?);
         initial_constraints.extend(store_active_cardinality_constraints(
             &pool,
@@ -1559,18 +1561,7 @@ impl TransitionBackend for Ic3TransitionBackend {
 
 /// Solve a transition obligation using the current active transition backend.
 pub fn solve_transition_obligation(obligation: TransitionObligation<'_>) -> TransitionResult {
-    match (active_solver_family(), obligation) {
-        (
-            SolverFamily::Cvc5,
-            TransitionObligation::SingleEntitySafety {
-                entity,
-                property,
-                timeout_ms,
-                ..
-            },
-        ) => sygus::try_cvc5_sygus_single_entity(entity, property, timeout_ms),
-        (_, obligation) => Ic3TransitionBackend::solve(obligation),
-    }
+    Ic3TransitionBackend::solve(obligation)
 }
 
 #[cfg(test)]
@@ -1643,6 +1634,81 @@ mod tests {
 
         assert!(matches!(direct, TransitionResult::Proved));
         assert!(matches!(via_transition, TransitionResult::Proved));
+    }
+
+    #[test]
+    fn transition_obligation_single_entity_respects_chc_selection_over_smt_selection() {
+        let previous_solver = crate::verify::solver::active_solver_family();
+        let previous_chc = crate::verify::chc::active_chc_family();
+        crate::verify::solver::set_active_solver_family(crate::verify::solver::SolverFamily::Cvc5)
+            .expect("cvc5 SMT backend should be selectable for routing test");
+        crate::verify::chc::set_active_chc_family(crate::verify::solver::SolverFamily::Z3)
+            .expect("z3 CHC backend should be selectable for routing test");
+
+        let entity = IREntity {
+            name: "Counter".to_owned(),
+            fields: vec![IRField {
+                name: "value".to_owned(),
+                ty: IRType::Int,
+                default: Some(IRExpr::Lit {
+                    ty: IRType::Int,
+                    value: LitVal::Int { value: 0 },
+                    span: None,
+                }),
+                initial_constraint: None,
+            }],
+            transitions: vec![IRTransition {
+                name: "inc".to_owned(),
+                refs: vec![],
+                params: vec![],
+                guard: IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                },
+                updates: vec![],
+                postcondition: None,
+            }],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![entity.clone()],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let property = IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        };
+
+        let result = solve_transition_obligation(TransitionObligation::SingleEntitySafety {
+            entity: &entity,
+            vctx: &vctx,
+            property: &property,
+            timeout_ms: 5_000,
+        });
+
+        crate::verify::solver::set_active_solver_family(previous_solver)
+            .expect("restoring SMT backend should succeed");
+        crate::verify::chc::set_active_chc_family(previous_chc)
+            .expect("restoring CHC backend should succeed");
+
+        assert!(
+            matches!(result, TransitionResult::Proved),
+            "single-entity transition obligations must use the selected CHC backend, got: {result:?}"
+        );
     }
 
     #[test]

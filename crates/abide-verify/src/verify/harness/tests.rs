@@ -516,7 +516,35 @@ fn slot_expr_family_helpers_cover_representative_dispatch() {
         SmtValue::Dynamic(_)
     ));
 
-    let choose_expr = IRExpr::Choose {
+    let exact_choose_expr = IRExpr::Choose {
+        var: "n".to_owned(),
+        domain: IRType::Int,
+        predicate: Some(Box::new(IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "n".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 3 },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        })),
+        ty: IRType::Int,
+        span: None,
+    };
+    assert_value_eq(
+        &super::expr::try_encode_slot_choose_expr(&ctx, &exact_choose_expr, 0)
+            .expect("choose family")
+            .expect("choose value"),
+        &smt::int_val(3),
+    );
+
+    let range_choose_expr = IRExpr::Choose {
         var: "n".to_owned(),
         domain: IRType::Int,
         predicate: Some(Box::new(IRExpr::BinOp {
@@ -537,11 +565,12 @@ fn slot_expr_family_helpers_cover_representative_dispatch() {
         ty: IRType::Int,
         span: None,
     };
-    assert_value_eq(
-        &super::expr::try_encode_slot_choose_expr(&ctx, &choose_expr, 0)
-            .expect("choose family")
-            .expect("choose value"),
-        &smt::int_val(3),
+    let range_choose_error = super::expr::try_encode_slot_choose_expr(&ctx, &range_choose_expr, 0)
+        .expect("choose family")
+        .expect_err("non-singleton choose should be unsupported");
+    assert!(
+        range_choose_error.contains("slot expression encoding not yet supported"),
+        "{range_choose_error}"
     );
 
     let prime_total = IRExpr::Prime {
@@ -1839,6 +1868,53 @@ fn enabled_for_apply_on_param_checks_action_guard() {
     solver.pop();
 }
 
+#[test]
+fn enabled_and_step_both_reject_out_of_domain_enum_params() {
+    let event = IRSystemAction {
+        name: "tick".to_owned(),
+        params: vec![IRTransParam {
+            name: "mode".to_owned(),
+            ty: IRType::Enum {
+                name: "OrderStatus".to_owned(),
+                variants: vec![],
+            },
+        }],
+        guard: IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value: true },
+            span: None,
+        },
+        body: vec![],
+        return_expr: None,
+    };
+
+    let vctx = make_vctx();
+    let scopes = HashMap::new();
+    let pool = create_slot_pool(&[], &scopes, 1);
+    let params = HashMap::from([("mode".to_owned(), smt::int_val(999))]);
+
+    let step_formula =
+        try_encode_step_with_params(&pool, &vctx, &[], &[], &event, 0, params.clone())
+            .expect("step formula");
+    let step_solver = AbideSolver::new();
+    step_solver.assert(&step_formula);
+    assert_eq!(
+        step_solver.check(),
+        SatResult::Unsat,
+        "actual step execution must reject out-of-domain enum parameter values"
+    );
+
+    let enabled_formula =
+        encode_step_enabled_with_params(&pool, &vctx, &[], &[], &event, 0, params);
+    let enabled_solver = AbideSolver::new();
+    enabled_solver.assert(&enabled_formula);
+    assert_eq!(
+        enabled_solver.check(),
+        SatResult::Unsat,
+        "enabledness must use the same enum parameter domain constraints as step execution"
+    );
+}
+
 /// / regression: when a top-level Apply targets an
 /// entity-typed event parameter AND another entity in the program
 /// defines a transition with the same name, the enabledness encoder
@@ -2833,6 +2909,31 @@ fn try_encode_slot_expr_supports_collections_bindings_and_store_quantifiers() {
         "{unsupported_int_setcomp_card}"
     );
 
+    let unsupported_int_setcomp_value = super::expr::try_encode_slot_expr(
+        &ctx,
+        &IRExpr::SetComp {
+            var: "n".to_owned(),
+            domain: IRType::Int,
+            source: None,
+            filter: Box::new(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            }),
+            projection: None,
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        },
+        0,
+    )
+    .expect_err("unsourced Int set comprehension value should be unsupported");
+    assert!(
+        unsupported_int_setcomp_value.contains("slot expression encoding not yet supported"),
+        "{unsupported_int_setcomp_value}"
+    );
+
     let map_card = super::expr::try_encode_slot_expr(
         &ctx,
         &IRExpr::Card {
@@ -3198,6 +3299,84 @@ fn try_encode_action_and_with_vars_enforce_fsm_tables() {
     let chained_solver = AbideSolver::new();
     chained_solver.assert(&chained);
     assert_eq!(chained_solver.check(), SatResult::Unsat);
+}
+
+#[test]
+fn transition_constraints_choose_apply_can_confirm_existing_entity() {
+    let entity = make_order_entity();
+    let vctx = make_vctx();
+    let pending = smt::int_val(vctx.variants.try_id_of("OrderStatus", "Pending").unwrap());
+    let confirmed = smt::int_val(vctx.variants.try_id_of("OrderStatus", "Confirmed").unwrap());
+    let system = IRSystem {
+        name: "Commerce".to_owned(),
+        store_params: vec![],
+        fields: vec![],
+        entities: vec!["Order".to_owned()],
+        commands: vec![],
+        actions: vec![IRSystemAction {
+            name: "confirm_order".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![IRAction::Choose {
+                var: "o".to_owned(),
+                entity: "Order".to_owned(),
+                filter: Box::new(IRExpr::Lit {
+                    ty: IRType::Bool,
+                    value: LitVal::Bool { value: true },
+                    span: None,
+                }),
+                ops: vec![IRAction::Apply {
+                    target: "o".to_owned(),
+                    transition: "confirm".to_owned(),
+                    refs: vec![],
+                    args: vec![],
+                }],
+            }],
+            return_expr: None,
+        }],
+        fsm_decls: vec![],
+        derived_fields: vec![],
+        invariants: vec![],
+        queries: vec![],
+        preds: vec![],
+        let_bindings: vec![],
+        procs: vec![],
+    };
+    let pool = create_slot_pool_with_systems(
+        std::slice::from_ref(&entity),
+        &HashMap::from([(entity.name.clone(), 1_usize)]),
+        1,
+        std::slice::from_ref(&system),
+    );
+    let transition = super::temporal::try_transition_constraints(
+        &pool,
+        &vctx,
+        std::slice::from_ref(&entity),
+        std::slice::from_ref(&system),
+        0,
+        &IRAssumptionSet::default_for_theorem_or_lemma(),
+    )
+    .expect("transition constraints");
+    let solver = AbideSolver::new();
+    solver.assert(&transition);
+    if let Some(SmtValue::Bool(active_t0)) = pool.active_at("Order", 0, 0) {
+        solver.assert(active_t0);
+    }
+    if let Some(SmtValue::Bool(active_t1)) = pool.active_at("Order", 0, 1) {
+        solver.assert(active_t1);
+    }
+    if let Some(status_t0) = pool.field_at("Order", 0, "status", 0) {
+        solver.assert(&smt::smt_eq(status_t0, &pending).expect("pending status at t0"));
+    }
+    if let Some(status_t1) = pool.field_at("Order", 0, "status", 1) {
+        solver.assert(&smt::smt_eq(status_t1, &confirmed).expect("confirmed status at t1"));
+    }
+
+    assert_eq!(solver.check(), SatResult::Sat);
 }
 
 #[test]

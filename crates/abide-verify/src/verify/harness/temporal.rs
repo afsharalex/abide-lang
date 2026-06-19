@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::step::{event_fire_precondition_formula, step_scope_metadata};
 use super::*;
 use crate::verify::encode;
 
@@ -121,7 +122,19 @@ pub fn try_transition_constraints_with_fire(
                     .to_bool()
                     .expect("internal: clause fire var");
 
-                let event_formula = try_encode_step(pool, vctx, entities, systems, event, step)?;
+                // Tie every div/mod well-definedness obligation recorded while
+                // encoding this event to its clause-fire selector. The solver
+                // asserts `clause_fire => event_formula`, so guarding the
+                // obligation by `clause_fire` forces the whole event formula
+                // (active slots, create-slot selection, choose/match branch
+                // disjunctions) when the divisor is probed — a divisor in an
+                // event that can never fire, or behind an unsatisfiable
+                // branch, is no longer falsely flagged.
+                crate::verify::property::push_harness_div_guard(clause_fire_bool.clone());
+                let event_formula_result =
+                    try_encode_step(pool, vctx, entities, systems, event, step);
+                crate::verify::property::pop_harness_div_guard();
+                let event_formula = event_formula_result?;
                 let sys_frames =
                     system_field_frame_conjuncts(pool, vctx, systems, system, &event.body, step);
                 let event_formula = if sys_frames.is_empty() {
@@ -395,37 +408,6 @@ fn enabled_body_contains_macro(actions: &[IRAction]) -> bool {
         }
         _ => false,
     })
-}
-
-fn enabled_step_scope_metadata(
-    systems: &[IRSystem],
-    event: &IRSystemAction,
-) -> (String, HashMap<String, String>, HashMap<String, String>) {
-    let owner = systems.iter().find(|system| {
-        system
-            .actions
-            .iter()
-            .any(|step| std::ptr::eq(step, event) || step.name == event.name)
-    });
-    let system_name = owner.map(|system| system.name.clone()).unwrap_or_default();
-    let store_param_types = owner
-        .map(|system| {
-            system
-                .store_params
-                .iter()
-                .map(|param| (param.name.clone(), param.entity_type.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let entity_param_types = event
-        .params
-        .iter()
-        .filter_map(|param| match &param.ty {
-            IRType::Entity { name } => Some((param.name.clone(), name.clone())),
-            _ => None,
-        })
-        .collect();
-    (system_name, entity_param_types, store_param_types)
 }
 
 fn merged_enabled_params(
@@ -796,30 +778,9 @@ fn try_encode_enabled_branches_for_event(
     let event = ctx.event;
     let step = ctx.step;
 
-    let (owning_system_name, entity_param_types, store_param_types) =
-        enabled_step_scope_metadata(systems, event);
-    let initial_formula = if matches!(
-        &event.guard,
-        IRExpr::Lit {
-            value: LitVal::Bool { value: true },
-            ..
-        }
-    ) {
-        smt::bool_const(true)
-    } else {
-        try_encode_guard_expr_for_system(
-            pool,
-            vctx,
-            &event.guard,
-            step,
-            SystemGuardScope {
-                step_params: &step_params,
-                system_name: &owning_system_name,
-                entity_param_types: &entity_param_types,
-                store_param_types: &store_param_types,
-            },
-        )?
-    };
+    let scope = step_scope_metadata(systems, event);
+    let initial_formula =
+        event_fire_precondition_formula(pool, vctx, event, step, &step_params, &scope)?;
     let mut branches = vec![EnabledBranch {
         formula: initial_formula,
         locals: HashMap::new(),
@@ -829,9 +790,9 @@ fn try_encode_enabled_branches_for_event(
         let macro_ctx = EnabledMacroCtx {
             encoding: *ctx,
             step_params: &step_params,
-            owning_system_name: &owning_system_name,
-            entity_param_types: &entity_param_types,
-            store_param_types: &store_param_types,
+            owning_system_name: &scope.owning_system_name,
+            entity_param_types: &scope.entity_param_types,
+            store_param_types: &scope.store_param_types,
         };
         branches = try_apply_enabled_macro_action(&macro_ctx, action, branches)?;
     }
@@ -844,11 +805,18 @@ fn try_encode_enabled_branches_for_event(
                 slot: 0,
                 params: merged_enabled_params(&step_params, &branch.locals),
                 bindings: HashMap::new(),
-                system_name: &owning_system_name,
-                entity_param_types: &entity_param_types,
-                store_param_types: &store_param_types,
+                system_name: &scope.owning_system_name,
+                entity_param_types: &scope.entity_param_types,
+                store_param_types: &scope.store_param_types,
             };
-            branch.return_value = Some(try_encode_slot_expr(&ctx, ret, step)?);
+            let (value, constraints) = try_encode_macro_value_expr(&ctx, ret, step)?;
+            if !constraints.is_empty() {
+                let mut parts = vec![branch.formula.clone()];
+                parts.extend(constraints);
+                let refs: Vec<&Bool> = parts.iter().collect();
+                branch.formula = smt::bool_and(&refs);
+            }
+            branch.return_value = Some(value);
         }
     }
     Ok(branches)
@@ -877,13 +845,13 @@ fn try_encode_step_enabled_inner(
     step: usize,
     options: EnabledStepOptions,
 ) -> Result<Bool, String> {
-    let empty_ept: HashMap<String, String> = HashMap::new();
     let mut conditions = Vec::new();
 
     let depth = options.depth;
     let params = options
         .override_params
         .unwrap_or_else(|| build_step_params(&event.params, step));
+    let scope = step_scope_metadata(systems, event);
     if enabled_body_contains_macro(&event.body) {
         let ctx = EnabledEncodingCtx {
             pool,
@@ -902,37 +870,9 @@ fn try_encode_step_enabled_inner(
         let refs: Vec<&Bool> = formulas.iter().collect();
         return Ok(smt::bool_or(&refs));
     }
-    let store_param_types: HashMap<String, String> = systems
-        .iter()
-        .find(|s| {
-            s.actions
-                .iter()
-                .any(|st| std::ptr::eq(st, event) || st.name == event.name)
-        })
-        .map(|s| {
-            s.store_params
-                .iter()
-                .map(|p| (p.name.clone(), p.entity_type.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !matches!(
-        &event.guard,
-        IRExpr::Lit {
-            value: LitVal::Bool { value: true },
-            ..
-        }
-    ) {
-        conditions.push(try_encode_guard_expr(
-            pool,
-            vctx,
-            &event.guard,
-            &params,
-            &store_param_types,
-            step,
-        )?);
-    }
+    conditions.push(event_fire_precondition_formula(
+        pool, vctx, event, step, &params, &scope,
+    )?);
 
     for action in &event.body {
         match action {
@@ -954,9 +894,9 @@ fn try_encode_step_enabled_inner(
                                 slot,
                                 params: params.clone(),
                                 bindings: HashMap::new(),
-                                system_name: "",
-                                entity_param_types: &empty_ept,
-                                store_param_types: &empty_ept,
+                                system_name: &scope.owning_system_name,
+                                entity_param_types: &scope.entity_param_types,
+                                store_param_types: &scope.store_param_types,
                             };
                             let filt = try_encode_slot_expr(&ctx, filter, step)?;
                             let filt_bool = filt.to_bool()?;
@@ -1049,9 +989,9 @@ fn try_encode_step_enabled_inner(
                         slot,
                         params: params.clone(),
                         bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &empty_ept,
-                        store_param_types: &empty_ept,
+                        system_name: &scope.owning_system_name,
+                        entity_param_types: &scope.entity_param_types,
+                        store_param_types: &scope.store_param_types,
                     };
                     let action_params =
                         try_build_apply_params(&slot_ctx, trans, args, apply_refs, step)?;
@@ -1062,9 +1002,9 @@ fn try_encode_step_enabled_inner(
                         slot,
                         params: action_params,
                         bindings: HashMap::new(),
-                        system_name: "",
-                        entity_param_types: &empty_ept,
-                        store_param_types: &empty_ept,
+                        system_name: &scope.owning_system_name,
+                        entity_param_types: &scope.entity_param_types,
+                        store_param_types: &scope.store_param_types,
                     };
                     let guard_val = try_encode_slot_expr(&action_ctx, &trans.guard, step)?;
                     let guard_bool = guard_val.to_bool()?;

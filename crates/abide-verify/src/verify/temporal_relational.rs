@@ -34,6 +34,7 @@ impl TemporalRelationalModel {
         verify: &IRVerify,
         loop_start: usize,
     ) -> Result<Self, RelCoreError> {
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let depth = verify.depth.unwrap_or(0);
         let trace = RelTrace::new(depth, loop_start)?;
         let entity_by_name = ir
@@ -1021,6 +1022,7 @@ fn project_witness(
             let stores = model
                 .relations
                 .iter()
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|relation| match &relation.symbol.kind {
                     RelationKind::Active { store, .. } => Some((store, relation)),
                     RelationKind::Field { .. } => None,
@@ -1029,6 +1031,7 @@ fn project_witness(
                     let slots = active_relation.snapshots[step.step]
                         .upper
                         .iter()
+                        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                         .filter_map(|tuple| {
                             let slot = tuple.0.first()?;
                             let active = true_tuples
@@ -1066,6 +1069,7 @@ fn project_slot_fields(
     model
         .relations
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|relation| match &relation.symbol.kind {
             RelationKind::Field {
                 store: field_store,
@@ -1080,6 +1084,7 @@ fn project_slot_fields(
                 .iter()
                 .filter(|tuple| tuple.0.first() == Some(slot))
                 .filter(|tuple| true_tuples.contains(&(relation.symbol.name.as_str(), *tuple)))
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|tuple| tuple.0.get(1).map(|atom| atom.name.clone()))
                 .collect::<Vec<_>>();
             RelProjectedField {
@@ -2053,10 +2058,14 @@ mod tests {
                 crate::ir::types::IRStoreParam {
                     name: "orders".to_owned(),
                     entity_type: "Order".to_owned(),
+                    lo: None,
+                    hi: None,
                 },
                 crate::ir::types::IRStoreParam {
                     name: "payments".to_owned(),
                     entity_type: "Payment".to_owned(),
+                    lo: None,
+                    hi: None,
                 },
             ],
             fields: Vec::new(),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::verify::encode::unqualify_ctor_name;
 
 pub(in crate::verify::ic3) fn ic3_match_pattern_cond(
     scrut: &str,
@@ -215,5 +216,56 @@ where
         ));
     }
 
-    Ok(vctx.variants.try_id_of(enum_name, ctor)?.to_string())
+    Ok(vctx
+        .variants
+        .try_id_of(enum_name, unqualify_ctor_name(ctor))?
+        .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{IRProgram, IRType, IRTypeEntry, IRVariant, IRVariantField};
+
+    #[test]
+    fn ic3_lookup_ctor_variant_finds_bare_and_qualified_payload_ctors() {
+        let payload_ty = IRType::Enum {
+            name: "Result".to_owned(),
+            variants: vec![IRVariant {
+                name: "Some".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "value".to_owned(),
+                    ty: IRType::Int,
+                }],
+            }],
+        };
+        let ir = IRProgram {
+            interfaces: vec![],
+            types: vec![IRTypeEntry {
+                name: "Result".to_owned(),
+                ty: payload_ty,
+            }],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+
+        let bare = ic3_lookup_ctor_variant("Some", &vctx).expect("bare payload ctor");
+        assert_eq!(bare.ctor_name, "Some");
+        assert_eq!(bare.accessor_names, vec!["value"]);
+
+        let qualified =
+            ic3_lookup_ctor_variant("Result::Some", &vctx).expect("qualified payload ctor");
+        assert_eq!(qualified.ctor_name, "Some");
+        assert_eq!(qualified.accessor_names, vec!["value"]);
+
+        assert!(ic3_lookup_ctor_variant("Result::None", &vctx).is_none());
+    }
 }

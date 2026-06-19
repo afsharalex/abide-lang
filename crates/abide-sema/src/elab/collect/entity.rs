@@ -62,15 +62,16 @@ pub(super) fn collect_entity(env: &mut Env, ed: &ast::EntityDecl) {
         check_fsm_reachability(env, name, fsm);
     }
 
-    // reject any action body that contains
-    // a primed assignment nested inside an `if`/`while`/`match`/block.
-    // The IR lowering's `extract_updates` only walks top-level
-    // `Assign(Prime, _)` nodes, so nested primes would silently
-    // disappear from `IRTransition::updates` — bypassing the fsm
-    // validity check and silently dropping the mutation. We close
-    // this gap at elab time so the user gets a clear diagnostic
+    // reject any action body statement that is not a supported
+    // primed field update. The IR lowering's `extract_updates` only
+    // walks top-level `Assign(Prime(Var), _)` nodes, so anything else —
+    // a nested prime (`if cond { f' = x }`), an unprimed assignment
+    // (`f = x`), a primed assignment to a non-field target, or a bare
+    // expression — would silently disappear from `IRTransition::updates`,
+    // bypassing the fsm validity check and dropping the mutation. We
+    // close this gap at elab time so the user gets a clear diagnostic
     // instead of unsound verification.
-    check_action_bodies_no_nested_primes(env, name, &actions);
+    check_action_bodies_supported(env, name, &actions);
 
     // static violation check. For each fsm, scan
     // every entity action that prime-assigns the fsm field. If the
@@ -512,30 +513,70 @@ pub(super) fn check_fsm_reachability(env: &mut Env, entity_name: &str, fsm: &EFs
 /// guarded actions:
 /// action set_done() requires cond { status' = @done }
 /// action set_pending() requires !cond { status' = @pending }
-pub(super) fn check_action_bodies_no_nested_primes(
-    env: &mut Env,
-    entity_name: &str,
-    actions: &[EAction],
-) {
+pub(super) fn check_action_bodies_supported(env: &mut Env, entity_name: &str, actions: &[EAction]) {
     for action in actions {
         for stmt in &action.body {
-            // A statement is well-formed if it is itself a top-level
-            // `Assign(Prime, rhs)` and the RHS contains no further
-            // primes. Otherwise we walk the whole expression and
-            // report any prime we find.
+            // The only shape `extract_updates` lowers is a top-level
+            // `Assign(Prime(Var), rhs)` whose RHS contains no further
+            // prime. Accept exactly that; reject everything else.
             if let EExpr::Assign(_, lhs, rhs, _) = stmt {
-                if matches!(lhs.as_ref(), EExpr::Prime(_, _, _)) {
-                    if let Some(span) = find_first_prime(rhs) {
+                if let EExpr::Prime(_, inner, _) = lhs.as_ref() {
+                    if matches!(inner.as_ref(), EExpr::Var(_, _, _)) {
+                        // Supported update target. The mutation itself is
+                        // lowered, but a nested prime in the RHS would be
+                        // dropped, so flag it with the specific message.
+                        if let Some(span) = find_first_prime(rhs) {
+                            push_nested_prime_error(env, entity_name, &action.name, span);
+                        }
+                        continue;
+                    }
+                    // Primed assignment to a non-variable target
+                    // (e.g. `obj.field' = ...`). `extract_updates` drops
+                    // it; the most useful diagnostic still points at the
+                    // dropped prime.
+                    if let Some(span) = find_first_prime(stmt) {
                         push_nested_prime_error(env, entity_name, &action.name, span);
                     }
                     continue;
                 }
             }
+            // Any other statement shape (unprimed assignment, bare
+            // expression, etc.). If it carries a prime somewhere, the
+            // nested-prime diagnostic is the precise guidance; otherwise
+            // it is an unsupported statement that would vanish silently.
             if let Some(span) = find_first_prime(stmt) {
                 push_nested_prime_error(env, entity_name, &action.name, span);
+            } else {
+                push_unsupported_action_stmt_error(
+                    env,
+                    entity_name,
+                    &action.name,
+                    stmt.span()
+                        .unwrap_or(crate::span::Span { start: 0, end: 0 }),
+                );
             }
         }
     }
+}
+
+/// Push the standardized "unsupported action statement" diagnostic for a
+/// top-level entity action body statement that is not a primed field
+/// update and would be silently dropped by IR lowering.
+pub(super) fn push_unsupported_action_stmt_error(
+    env: &mut Env,
+    entity_name: &str,
+    action_name: &str,
+    span: crate::span::Span,
+) {
+    env.errors.push(ElabError::with_span(
+        ErrorKind::InvalidPrime,
+        format!(
+            "{}: unsupported statement in `{entity_name}::{action_name}`",
+            crate::messages::ACTION_UNSUPPORTED_STMT
+        ),
+        String::new(),
+        span,
+    ));
 }
 
 /// Push the standardized "nested prime" diagnostic for a single
@@ -631,6 +672,7 @@ pub(super) fn find_first_prime(expr: &EExpr) -> Option<crate::span::Span> {
             .or_else(|| {
                 bindings
                     .iter()
+                    // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                     .filter_map(|binding| binding.source.as_deref())
                     .find_map(find_first_prime)
             })
@@ -649,6 +691,7 @@ pub(super) fn find_first_prime(expr: &EExpr) -> Option<crate::span::Span> {
             .or_else(|| else_e.as_ref().and_then(|e| find_first_prime(e))),
         EExpr::Saw(_, _, _, args, _) => args
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|a| a.as_ref())
             .find_map(|e| find_first_prime(e)),
         EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => {
@@ -1269,6 +1312,7 @@ pub(super) fn collect_action(a: &ast::EntityAction) -> EAction {
     let requires: Vec<EExpr> = a
         .contracts
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|c| match c {
             ast::Contract::Requires { expr, .. } => Some(collect_expr(expr)),
             _ => None,
@@ -1277,6 +1321,7 @@ pub(super) fn collect_action(a: &ast::EntityAction) -> EAction {
     let ensures: Vec<EExpr> = a
         .contracts
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|c| match c {
             ast::Contract::Ensures { expr, .. } => Some(collect_expr(expr)),
             _ => None,

@@ -78,6 +78,26 @@ pub(in crate::verify::ic3) fn encode_step_chc(
     encode_step_chc_scoped(chc, ctx, input, visited, &HashMap::new())
 }
 
+/// Whether an event-body action is a standalone state mutation for the
+/// purpose of IC3's atomic-composition guard. `ExprStmt` emits no CHC rule,
+/// and a macro-step binding (`LetCrossCall`) whose target command has an
+/// empty (non-mutating) body is a pure value computation; everything else
+/// (`Choose`/`ForAll`/`Create`/`CrossCall`/`Apply`/`Match`) mutates state.
+/// A non-empty target body is treated conservatively as mutating.
+fn action_mutates_state(action: &IRAction, all_systems: &[&IRSystem]) -> bool {
+    match action {
+        IRAction::ExprStmt { .. } => false,
+        IRAction::LetCrossCall {
+            system, command, ..
+        } => all_systems
+            .iter()
+            .find(|s| s.name == *system)
+            .and_then(|s| s.actions.iter().find(|a| a.name == *command))
+            .is_none_or(|a| !a.body.is_empty()),
+        _ => true,
+    }
+}
+
 fn encode_step_chc_scoped(
     chc: &mut String,
     action_ctx: Ic3SystemActionCtx<'_>,
@@ -98,6 +118,29 @@ fn encode_step_chc_scoped(
         rule_prefix,
         extra_guards,
     } = input;
+    // IC3 encodes each top-level action of an event body as an independent
+    // CHC rule and cannot express the atomic sequential composition of
+    // multiple state-mutating actions: intermediate effects are not threaded
+    // between rules and no-rule forms (e.g. ExprStmt) are silently dropped,
+    // under-approximating the event. If a body contains more than one
+    // state-mutating action it is rejected so the caller downgrades to
+    // Unknown instead of returning a definitive (possibly false) PROVED.
+    // A pure macro-step prelude (`let x = <pure call>`) followed by a single
+    // effectful action — the supported `let .. match ..` routing — stays
+    // atomic and is encoded faithfully. The recursive calls below (Match
+    // arms, CrossCall targets) re-enter this function, so nested multi-op
+    // bodies are caught at every level.
+    let mutating_actions = actions
+        .iter()
+        .filter(|a| action_mutates_state(a, all_systems))
+        .count();
+    if mutating_actions > 1 {
+        return Err(format!(
+            "multi-op event body `{rule_prefix}` ({mutating_actions} state-mutating actions) \
+             is not supported by IC3: independent per-action CHC rules cannot express atomic \
+             sequential composition; downgrading conservatively"
+        ));
+    }
     let mut local_terms = local_terms.clone();
     for (ai, action) in actions.iter().enumerate() {
         match action {
@@ -985,7 +1028,155 @@ pub(in crate::verify::ic3) fn format_chc_rule(
         let guard_str = guards.join(" ");
         format!(
             "(rule (=> (and (State {all_vars_str}) {guard_str}) \
-             (State {next_str})) {rule_name})\n"
+            (State {next_str})) {rule_name})\n"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_non_entity_guards_accept_literals_and_bound_bool_vars_only() {
+        let locals = HashMap::from([("ok".to_owned(), "true".to_owned())]);
+
+        assert_eq!(
+            encode_non_entity_guard_with_locals(&bool_lit(false), &locals)
+                .expect("literal false guard"),
+            "(let ((ok true)) false)"
+        );
+        assert_eq!(
+            encode_non_entity_guard_with_locals(&bool_var("ok"), &locals)
+                .expect("bound bool local guard"),
+            "(let ((ok true)) ok)"
+        );
+        assert!(
+            encode_non_entity_guard_with_locals(&bool_var("missing"), &locals).is_err(),
+            "unbound bool variables are not valid non-entity guards"
+        );
+        assert!(
+            encode_non_entity_guard_with_locals(&int_var("ok"), &locals).is_err(),
+            "non-bool local variables are not valid guards"
+        );
+    }
+
+    #[test]
+    fn action_guards_with_locals_thread_local_names_into_entity_guard_encoding() {
+        let entity = empty_entity("Order");
+        let vctx = VerifyContext::from_ir(&empty_program());
+        let locals = HashMap::from([("ok".to_owned(), "true".to_owned())]);
+
+        let encoded = encode_action_guard_with_locals(
+            &bool_var("ok"),
+            &entity,
+            &vctx,
+            "Order",
+            0,
+            &locals,
+        )
+        .expect("local bool guard should encode through scoped guard path");
+
+        assert_eq!(encoded, "(let ((ok true)) ok)");
+        assert!(
+            !encoded.contains("xyzzy"),
+            "local action guards should use the encoded guard expression"
+        );
+    }
+
+    #[test]
+    fn create_chc_adds_previous_slot_guard_only_after_slot_zero() {
+        let entity = empty_entity("Order");
+        let vctx = VerifyContext::from_ir(&empty_program());
+        let entities = [&entity];
+        let slots = HashMap::from([("Order".to_owned(), 2_usize)]);
+        let systems: [&IRSystem; 0] = [];
+        let mut chc = String::new();
+
+        encode_create_chc(
+            &mut chc,
+            Ic3SystemActionCtx {
+                entities: &entities,
+                vctx: &vctx,
+                slots_per_entity: &slots,
+                all_vars_str: "Order_0_active Order_1_active",
+                all_systems: &systems,
+            },
+            CreateChcInput {
+                entity_name: "Order",
+                fields: &[],
+                guards: &[],
+                rule_prefix: "create_test",
+            },
+        )
+        .expect("create rules");
+
+        let slot0 = rule_line(&chc, "create_test_Order_s0");
+        assert!(
+            !slot0.contains("Order_-1_active"),
+            "slot-zero create rule must not reference a previous slot, got: {slot0}"
+        );
+        let slot1 = rule_line(&chc, "create_test_Order_s1");
+        assert!(
+            slot1.contains("(not Order_1_active) Order_0_active)"),
+            "slot-one create rule should require slot one inactive and slot zero active, got: {slot1}"
+        );
+    }
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn bool_var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn int_var(name: &str) -> IRExpr {
+        IRExpr::Var {
+            name: name.to_owned(),
+            ty: IRType::Int,
+            span: None,
+        }
+    }
+
+    fn empty_entity(name: &str) -> IREntity {
+        IREntity {
+            name: name.to_owned(),
+            fields: vec![],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        }
+    }
+
+    fn empty_program() -> IRProgram {
+        IRProgram {
+            interfaces: vec![],
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    fn rule_line<'a>(chc: &'a str, rule_name: &str) -> &'a str {
+        chc.lines()
+            .find(|line| line.contains(rule_name))
+            .unwrap_or_else(|| panic!("expected CHC rule `{rule_name}` in:\n{chc}"))
     }
 }

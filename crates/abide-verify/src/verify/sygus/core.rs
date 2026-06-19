@@ -28,6 +28,7 @@ pub(super) struct PayloadAccessorInfo {
     ty: IRType,
 }
 
+#[cfg(test)]
 pub(super) struct SygusTransitionScope<'a> {
     pub(super) fields: &'a [IRField],
     pub(super) derived_fields: &'a [IRDerivedField],
@@ -219,6 +220,10 @@ fn type_uses_real(ty: &IRType) -> bool {
     }
 }
 
+fn should_set_cvc5_timeout(timeout_ms: u64) -> bool {
+    timeout_ms > 0
+}
+
 pub(super) fn requires_all_logic(
     enum_catalog: &EnumCatalog,
     fields: &[IRField],
@@ -293,6 +298,7 @@ pub(super) fn collect_unique_system_fields(
     Ok(ordered)
 }
 
+#[cfg(test)]
 pub fn try_cvc5_sygus_single_entity(
     entity: &IREntity,
     property: &IRExpr,
@@ -317,7 +323,9 @@ pub fn try_cvc5_sygus_system_safety(
         return Ic3Result::Unknown(cvc5_sygus_disabled_reason());
     }
     match try_cvc5_sygus_system_safety_inner(system, property, timeout_ms) {
-        Ok(()) => Ic3Result::Proved,
+        // `Ok(_)`: synthesis + plain-SMT pre-filter passed (the test wrapper
+        // does not run the caller-side Z3/IR re-validation).
+        Ok(_) => Ic3Result::Proved,
         Err(err) => Ic3Result::Unknown(err),
     }
 }
@@ -339,6 +347,7 @@ pub(super) fn try_cvc5_sygus_pooled_system_safety(
     }
 }
 
+#[cfg(test)]
 pub(super) fn try_cvc5_sygus_single_entity_inner(
     entity: &IREntity,
     property: &IRExpr,
@@ -349,18 +358,17 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     let mut solver = Cvc5Solver::new(&tm);
     solver.set_option("sygus", "true");
     solver.set_option("incremental", "false");
-    if timeout_ms > 0 {
+    if should_set_cvc5_timeout(timeout_ms) {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
     let enum_catalog =
         build_enum_catalog_with_derived(&tm, &entity.fields, &entity.derived_fields)?;
-    solver.set_logic(
-        if requires_all_logic(&enum_catalog, &entity.fields, &entity.derived_fields) {
-            "ALL"
-        } else {
-            "LIA"
-        },
-    );
+    let logic = if requires_all_logic(&enum_catalog, &entity.fields, &entity.derived_fields) {
+        "ALL"
+    } else {
+        "LIA"
+    };
+    solver.set_logic(logic);
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -421,19 +429,25 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
     let mut trans_params = curr_order.clone();
     trans_params.extend(next_order.iter().cloned());
 
-    let pre_fun = solver.define_fun("pre_abide", &curr_order, bool_sort.clone(), pre_body, false);
+    let pre_fun = solver.define_fun(
+        "pre_abide",
+        &curr_order,
+        bool_sort.clone(),
+        pre_body.clone(),
+        false,
+    );
     let trans_fun = solver.define_fun(
         "trans_abide",
         &trans_params,
         bool_sort.clone(),
-        trans_body,
+        trans_body.clone(),
         false,
     );
     let post_fun = solver.define_fun(
         "post_abide",
         &curr_order,
         bool_sort.clone(),
-        property_body,
+        property_body.clone(),
         false,
     );
     let inv_fun = solver.synth_fun("inv_abide", &curr_order, bool_sort);
@@ -442,9 +456,26 @@ pub(super) fn try_cvc5_sygus_single_entity_inner(
 
     let result = solver.check_synth();
     if result.has_solution() {
-        let _solution = solver.get_synth_solution(inv_fun);
+        let solution = solver.get_synth_solution(inv_fun);
         let _elapsed = start.elapsed();
-        Ok(())
+        // Soundness: independently re-validate the synthesized invariant's
+        // init/induction/safety obligations with plain SMT before reporting
+        // success; failure downgrades to Err instead of a false PROVED.
+        let inv_curr = apply_synth_solution(&solution, &curr_order)?;
+        let inv_next = apply_synth_solution(&solution, &next_order)?;
+        revalidate_invariant_obligations(
+            &InvariantObligations {
+                tm: &tm,
+                pre_body: &pre_body,
+                trans_body: &trans_body,
+                post_body: &property_body,
+                curr_order: &curr_order,
+                next_order: &next_order,
+                logic,
+            },
+            &inv_curr,
+            &inv_next,
+        )
     } else if result.is_unknown() {
         Err(format!(
             "cvc5 SyGuS returned Unknown for single-entity safety ({result})"
@@ -465,7 +496,7 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     system: &IRSystem,
     property: &IRExpr,
     timeout_ms: u64,
-) -> Result<(), String> {
+) -> Result<Option<IRExpr>, String> {
     if !system.store_params.is_empty() {
         return Err("cvc5 SyGuS system safety does not support store params yet".to_owned());
     }
@@ -476,20 +507,19 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     let mut solver = Cvc5Solver::new(&tm);
     solver.set_option("sygus", "true");
     solver.set_option("incremental", "false");
-    if timeout_ms > 0 {
+    if should_set_cvc5_timeout(timeout_ms) {
         solver.set_option("tlimit-per", &timeout_ms.to_string());
     }
     let enum_catalog =
         build_enum_catalog_with_derived(&tm, &system.fields, &system.derived_fields)?;
     let mut enum_catalog = enum_catalog;
     register_system_signature_types(&tm, &mut enum_catalog, system)?;
-    solver.set_logic(
-        if requires_all_logic(&enum_catalog, &system.fields, &system.derived_fields) {
-            "ALL"
-        } else {
-            "LIA"
-        },
-    );
+    let logic = if requires_all_logic(&enum_catalog, &system.fields, &system.derived_fields) {
+        "ALL"
+    } else {
+        "LIA"
+    };
+    solver.set_logic(logic);
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -547,19 +577,25 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
     let mut trans_params = curr_order.clone();
     trans_params.extend(next_order.iter().cloned());
 
-    let pre_fun = solver.define_fun("pre_abide", &curr_order, bool_sort.clone(), pre_body, false);
+    let pre_fun = solver.define_fun(
+        "pre_abide",
+        &curr_order,
+        bool_sort.clone(),
+        pre_body.clone(),
+        false,
+    );
     let trans_fun = solver.define_fun(
         "trans_abide",
         &trans_params,
         bool_sort.clone(),
-        trans_body,
+        trans_body.clone(),
         false,
     );
     let post_fun = solver.define_fun(
         "post_abide",
         &curr_order,
         bool_sort.clone(),
-        property_body,
+        property_body.clone(),
         false,
     );
     let inv_fun = solver.synth_fun("inv_abide", &curr_order, bool_sort);
@@ -568,8 +604,36 @@ pub(super) fn try_cvc5_sygus_system_safety_inner(
 
     let result = solver.check_synth();
     if result.has_solution() {
-        let _solution = solver.get_synth_solution(inv_fun);
-        Ok(())
+        let solution = solver.get_synth_solution(inv_fun);
+        // Soundness: do not trust the SyGuS engine's claim. Independently
+        // re-validate the synthesized invariant's init/induction/safety
+        // obligations with plain SMT before reporting success; any failure
+        // downgrades to Err (conservative) instead of a false PROVED.
+        let inv_curr = apply_synth_solution(&solution, &curr_order)?;
+        let inv_next = apply_synth_solution(&solution, &next_order)?;
+        revalidate_invariant_obligations(
+            &InvariantObligations {
+                tm: &tm,
+                pre_body: &pre_body,
+                trans_body: &trans_body,
+                post_body: &property_body,
+                curr_order: &curr_order,
+                next_order: &next_order,
+                logic,
+            },
+            &inv_curr,
+            &inv_next,
+        )?;
+        // The plain-SMT pre-filter passed. Translate the invariant (whose
+        // variables are the current-state field vars) to IRExpr so the
+        // caller can independently re-validate it through the Z3/IR path.
+        // An untranslatable invariant yields `None` → conservative downgrade.
+        let var_types: HashMap<String, IRType> = system
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty.clone()))
+            .collect();
+        Ok(cvc5_term_to_ir(&inv_curr, &var_types).ok())
     } else if result.is_unknown() {
         Err(format!(
             "cvc5 SyGuS returned Unknown for system safety ({result})"
@@ -693,6 +757,260 @@ pub(super) fn extend_with_derived_fields(
     Ok(())
 }
 
+/// Beta-reduce a synthesized invariant solution by substituting its
+/// bound lambda parameters with the given state arguments. cvc5 returns
+/// the SyGuS solution for `inv` as a lambda over the synth-fun
+/// parameters; applying it to the current- (or next-) state variables
+/// yields the invariant predicate over that state. A non-lambda solution
+/// is a state-independent constant and is returned unchanged. Returns
+/// `Err` when the lambda arity does not match the state arity so the
+/// caller can downgrade conservatively rather than report a false PROVED.
+pub(super) fn apply_synth_solution(
+    solution: &Cvc5Term,
+    args: &[Cvc5Term],
+) -> Result<Cvc5Term, String> {
+    if solution.kind() != Cvc5Kind::CVC5_KIND_LAMBDA {
+        return Ok(solution.clone());
+    }
+    let var_list = solution.child(0);
+    let body = solution.child(1);
+    let params: Vec<Cvc5Term> = (0..var_list.num_children())
+        .map(|i| var_list.child(i))
+        .collect();
+    if params.len() != args.len() {
+        return Err(format!(
+            "synthesized invariant arity {} does not match state arity {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    Ok(body.substitute_terms(&params, args))
+}
+
+/// The SyGuS-INV obligation context for an independent invariant
+/// re-validation: the encoded `pre`/`trans`/`post` bodies, the
+/// current- and next-state variable orders the bodies are expressed
+/// over, and the SMT logic to use.
+pub(super) struct InvariantObligations<'a> {
+    pub tm: &'a Cvc5Tm,
+    pub pre_body: &'a Cvc5Term,
+    pub trans_body: &'a Cvc5Term,
+    pub post_body: &'a Cvc5Term,
+    pub curr_order: &'a [Cvc5Term],
+    pub next_order: &'a [Cvc5Term],
+    pub logic: &'a str,
+}
+
+/// Translate a synthesized invariant cvc5 term — whose variables are the
+/// current-state field variables, named after the system fields — into an
+/// abide [`IRExpr`], so it can be re-validated through the Z3/IR encoding
+/// path (defense-in-depth against bugs shared by the synthesis and the
+/// plain-SMT recheck, which both reuse the cvc5 encoding). Only the bounded
+/// arithmetic/boolean fragment the synthesis grammar can produce is
+/// handled; enum datatypes, unknown kinds, or a variable that is not a
+/// known field return `Err`, so the SyGuS path downgrades conservatively
+/// instead of re-validating a wrong reconstruction.
+/// Translate a synthesized cvc5 invariant `Term` back into an abide `IRExpr`.
+///
+/// `var_types` maps every free variable the invariant may reference to its
+/// abide type. For the system-safety case these are the system fields by
+/// name; for the pooled case they are the flat, slot-qualified state names
+/// (`<entity>_<slot>_active`, `<entity>_<slot>_<field>`, and the unique
+/// system field names). A variable absent from `var_types` fails translation
+/// so the SyGuS path downgrades conservatively rather than re-validating a
+/// reconstruction it cannot map back to the pool.
+pub(super) fn cvc5_term_to_ir(
+    term: &Cvc5Term,
+    var_types: &HashMap<String, IRType>,
+) -> Result<IRExpr, String> {
+    let kind = term.kind();
+    let n = term.num_children();
+
+    // Fold an n-ary connective (cvc5 AND/OR/ADD/MULT may be variadic) into a
+    // right-associated binary IRExpr tree.
+    let fold = |op: &str, ty: IRType| -> Result<IRExpr, String> {
+        if n == 0 {
+            return Err(format!("cvc5 term `{kind:?}` has no children"));
+        }
+        let mut acc = cvc5_term_to_ir(&term.child(n - 1), var_types)?;
+        for i in (0..n - 1).rev() {
+            acc = IRExpr::BinOp {
+                op: op.to_owned(),
+                left: Box::new(cvc5_term_to_ir(&term.child(i), var_types)?),
+                right: Box::new(acc),
+                ty: ty.clone(),
+                span: None,
+            };
+        }
+        Ok(acc)
+    };
+    let binary = |op: &str, ty: IRType| -> Result<IRExpr, String> {
+        if n != 2 {
+            return Err(format!("cvc5 `{kind:?}` expects 2 children, got {n}"));
+        }
+        Ok(IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(cvc5_term_to_ir(&term.child(0), var_types)?),
+            right: Box::new(cvc5_term_to_ir(&term.child(1), var_types)?),
+            ty,
+            span: None,
+        })
+    };
+    let unary = |op: &str, ty: IRType| -> Result<IRExpr, String> {
+        if n != 1 {
+            return Err(format!("cvc5 `{kind:?}` expects 1 child, got {n}"));
+        }
+        Ok(IRExpr::UnOp {
+            op: op.to_owned(),
+            operand: Box::new(cvc5_term_to_ir(&term.child(0), var_types)?),
+            ty,
+            span: None,
+        })
+    };
+
+    match kind {
+        Cvc5Kind::CVC5_KIND_CONST_BOOLEAN => {
+            let value = match term.to_string().as_str() {
+                "true" => true,
+                "false" => false,
+                other => return Err(format!("unrecognized boolean constant `{other}`")),
+            };
+            Ok(IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value },
+                span: None,
+            })
+        }
+        Cvc5Kind::CVC5_KIND_CONST_INTEGER => {
+            let raw = term.integer_value();
+            let value: i64 = raw
+                .parse()
+                .map_err(|_| format!("integer constant `{raw}` out of range"))?;
+            Ok(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value },
+                span: None,
+            })
+        }
+        Cvc5Kind::CVC5_KIND_VARIABLE | Cvc5Kind::CVC5_KIND_CONSTANT => {
+            if !term.has_symbol() {
+                return Err("synthesized invariant references an unnamed variable".to_owned());
+            }
+            let name = term.symbol();
+            let ty = var_types.get(name).ok_or_else(|| {
+                format!("synthesized invariant references unknown variable `{name}`")
+            })?;
+            Ok(IRExpr::Var {
+                name: name.to_owned(),
+                ty: ty.clone(),
+                span: None,
+            })
+        }
+        Cvc5Kind::CVC5_KIND_NOT => unary("OpNot", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_NEG => unary("OpNeg", IRType::Int),
+        Cvc5Kind::CVC5_KIND_AND => fold("OpAnd", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_OR => fold("OpOr", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_IMPLIES => binary("OpImplies", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_EQUAL => binary("OpEq", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_DISTINCT => binary("OpNEq", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_LT => binary("OpLt", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_LEQ => binary("OpLe", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_GT => binary("OpGt", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_GEQ => binary("OpGe", IRType::Bool),
+        Cvc5Kind::CVC5_KIND_ADD => fold("OpAdd", IRType::Int),
+        Cvc5Kind::CVC5_KIND_SUB => binary("OpSub", IRType::Int),
+        Cvc5Kind::CVC5_KIND_MULT => fold("OpMul", IRType::Int),
+        other => Err(format!(
+            "unsupported cvc5 term kind `{other:?}` in synthesized invariant"
+        )),
+    }
+}
+
+/// Independently re-validate a synthesized invariant by discharging the
+/// three inductive-safety obligations with plain SMT — without the SyGuS
+/// engine and without trusting `add_sygus_inv_constraint`:
+///
+/// * init:      `pre(s) => inv(s)`
+/// * induction: `inv(s) && trans(s, s') => inv(s')`
+/// * safety:    `inv(s) => post(s)`
+///
+/// Each obligation is checked by grounding its *violation* over fresh
+/// constants and requiring `UNSAT`. Any `SAT` (a genuine counterexample
+/// to the obligation) or `UNKNOWN` result fails validation, so the SyGuS
+/// path downgrades conservatively instead of reporting a false PROVED
+/// from a fetched-and-discarded solution.
+pub(super) fn revalidate_invariant_obligations(
+    ob: &InvariantObligations<'_>,
+    inv_curr: &Cvc5Term,
+    inv_next: &Cvc5Term,
+) -> Result<(), String> {
+    let tm = ob.tm;
+    let negate = |t: &Cvc5Term| tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, std::slice::from_ref(t));
+    let conj = |ts: &[Cvc5Term]| tm.mk_term(Cvc5Kind::CVC5_KIND_AND, ts);
+
+    // init: ¬(pre ⇒ inv) ≡ pre ∧ ¬inv
+    let init_violation = conj(&[ob.pre_body.clone(), negate(inv_curr)]);
+    require_obligation_unsat(tm, &init_violation, ob.curr_order, ob.logic, "init")?;
+
+    // induction: ¬(inv ∧ trans ⇒ inv′) ≡ inv ∧ trans ∧ ¬inv′
+    let induction_violation = conj(&[inv_curr.clone(), ob.trans_body.clone(), negate(inv_next)]);
+    let mut both_states = ob.curr_order.to_vec();
+    both_states.extend_from_slice(ob.next_order);
+    require_obligation_unsat(
+        tm,
+        &induction_violation,
+        &both_states,
+        ob.logic,
+        "induction",
+    )?;
+
+    // safety: ¬(inv ⇒ post) ≡ inv ∧ ¬post
+    let safety_violation = conj(&[inv_curr.clone(), negate(ob.post_body)]);
+    require_obligation_unsat(tm, &safety_violation, ob.curr_order, ob.logic, "safety")?;
+
+    Ok(())
+}
+
+/// Ground `violation`'s free state variables with fresh constants and
+/// require the result to be `UNSAT`. The `state_vars` are the SyGuS
+/// bound variables (`mk_var`) the obligation bodies are expressed over;
+/// substituting them with fresh constants turns the existential
+/// violation check into a quantifier-free satisfiability query on an
+/// independent plain-SMT solver instance.
+fn require_obligation_unsat(
+    tm: &Cvc5Tm,
+    violation: &Cvc5Term,
+    state_vars: &[Cvc5Term],
+    logic: &str,
+    stage: &str,
+) -> Result<(), String> {
+    let consts: Vec<Cvc5Term> = state_vars
+        .iter()
+        .enumerate()
+        .map(|(i, v)| tm.mk_const(v.sort(), &format!("abide_revalidate_{stage}_{i}")))
+        .collect();
+    let grounded = if state_vars.is_empty() {
+        violation.clone()
+    } else {
+        violation.substitute_terms(state_vars, &consts)
+    };
+    let mut solver = Cvc5Solver::new(tm);
+    solver.set_logic(logic);
+    solver.assert_formula(grounded);
+    let result = solver.check_sat();
+    if result.is_unsat() {
+        Ok(())
+    } else if result.is_sat() {
+        Err(format!(
+            "synthesized invariant failed independent {stage} revalidation (counterexample exists)"
+        ))
+    } else {
+        Err(format!(
+            "independent {stage} revalidation of the synthesized invariant was inconclusive ({result})"
+        ))
+    }
+}
+
 pub(super) fn sort_for_field(
     tm: &Cvc5Tm,
     field: &IRField,
@@ -752,6 +1070,7 @@ pub(super) fn encode_initial_field(
     Ok(mk_and(tm, &conjuncts))
 }
 
+#[cfg(test)]
 pub(super) fn encode_transition(
     tm: &Cvc5Tm,
     trans: &IRTransition,
@@ -1392,7 +1711,7 @@ fn encode_finite_aggregate_expr(
         if let Some(filter) = in_filter {
             active = encode_expr(tm, filter, &scoped, enum_catalog)?;
         }
-        if kind == crate::ir::types::IRAggKind::Count {
+        if aggregate_counts_predicate(kind) {
             let pred = encode_expr(tm, body, &scoped, enum_catalog)?;
             active = mk_and(tm, &[active, pred]);
             slot_data.push((active, tm.mk_integer(1)));
@@ -1455,6 +1774,10 @@ fn encode_finite_aggregate_expr(
             Ok(tm.mk_term(Cvc5Kind::CVC5_KIND_ITE, &[any_active, acc, undef]))
         }
     }
+}
+
+fn aggregate_counts_predicate(kind: crate::ir::types::IRAggKind) -> bool {
+    kind == crate::ir::types::IRAggKind::Count
 }
 
 fn sum_bool_terms(tm: &Cvc5Tm, predicates: &[Cvc5Term]) -> Cvc5Term {
@@ -2788,5 +3111,488 @@ pub(super) fn mk_or(tm: &Cvc5Tm, args: &[Cvc5Term]) -> Cvc5Term {
         [] => tm.mk_boolean(false),
         [only] => only.clone(),
         many => tm.mk_term(Cvc5Kind::CVC5_KIND_OR, many),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::types::{
+        IRAggKind, IRAction, IRActionMatchArm, IRActionMatchScrutinee, IRFieldPat, IRPattern,
+        IRVariant, IRVariantField,
+    };
+
+    #[test]
+    fn type_uses_real_detects_direct_and_payload_enum_real_fields() {
+        assert!(type_uses_real(&IRType::Real));
+        assert!(!type_uses_real(&IRType::Int));
+        assert!(!type_uses_real(&IRType::Bool));
+
+        let fieldless_enum = IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Done")],
+        };
+        assert!(!type_uses_real(&fieldless_enum));
+
+        let payload_enum = IRType::Enum {
+            name: "Measurement".to_owned(),
+            variants: vec![
+                IRVariant::simple("Missing"),
+                IRVariant {
+                    name: "Observed".to_owned(),
+                    fields: vec![IRVariantField {
+                        name: "value".to_owned(),
+                        ty: IRType::Real,
+                    }],
+                },
+            ],
+        };
+        assert!(type_uses_real(&payload_enum));
+    }
+
+    #[test]
+    fn should_set_cvc5_timeout_only_for_positive_limits() {
+        assert!(!should_set_cvc5_timeout(0));
+        assert!(should_set_cvc5_timeout(1));
+        assert!(should_set_cvc5_timeout(u64::MAX));
+    }
+
+    #[test]
+    fn collect_system_exprstmt_update_rejects_non_equality_ops() {
+        let tm = Cvc5Tm::new();
+        let expr = IRExpr::BinOp {
+            op: "OpAdd".to_owned(),
+            left: Box::new(IRExpr::Prime {
+                expr: Box::new(IRExpr::Var {
+                    name: "count".to_owned(),
+                    ty: IRType::Int,
+                    span: None,
+                }),
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: 1 },
+                span: None,
+            }),
+            ty: IRType::Int,
+            span: None,
+        };
+
+        let err = collect_system_exprstmt_update(
+            &tm,
+            &expr,
+            &HashMap::new(),
+            &EnumCatalog::new(),
+            "inc",
+        )
+        .expect_err("non-equality ExprStmt must be rejected");
+        assert!(
+            err.contains("expects primed equality statements"),
+            "diagnostic should name equality update requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_system_match_updates_rejects_guarded_wildcard_fallback() {
+        let tm = Cvc5Tm::new();
+        let fields = vec![bool_field("status"), bool_field("flag")];
+        let curr_vars = HashMap::from([
+            ("status".to_owned(), tm.mk_var(tm.boolean_sort(), "status")),
+            ("flag".to_owned(), tm.mk_var(tm.boolean_sort(), "flag")),
+        ]);
+        let arms = vec![IRActionMatchArm {
+            pattern: IRPattern::PWild,
+            guard: Some(bool_lit(false)),
+            body: vec![IRAction::ExprStmt {
+                expr: primed_eq("flag", bool_lit(false)),
+            }],
+        }];
+
+        let err = collect_system_match_updates(
+            &tm,
+            &IRActionMatchScrutinee::Var {
+                name: "status".to_owned(),
+            },
+            &arms,
+            &fields,
+            &curr_vars,
+            &EnumCatalog::new(),
+        )
+        .expect_err("a final wildcard fallback with a guard is not unconditional");
+        assert!(
+            err.contains("requires a final wildcard or var fallback arm"),
+            "diagnostic should explain fallback arm requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encode_finite_count_aggregate_counts_satisfying_bool_candidates() {
+        let tm = Cvc5Tm::new();
+        let count = encode_finite_aggregate_expr(
+            &tm,
+            IRAggKind::Count,
+            "b",
+            &IRType::Bool,
+            &bool_lit(true),
+            None,
+            SygusExprEnv {
+                vars: &HashMap::new(),
+                enum_catalog: &EnumCatalog::new(),
+            },
+        )
+        .expect("count aggregate over bool domain");
+        let equals_two = tm.mk_term(
+            Cvc5Kind::CVC5_KIND_EQUAL,
+            &[count, tm.mk_integer(2)],
+        );
+        let not_equals_two = tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[equals_two]);
+        let mut solver = Cvc5Solver::new(&tm);
+        solver.set_logic("LIA");
+        solver.assert_formula(not_equals_two);
+        assert!(
+            solver.check_sat().is_unsat(),
+            "count b: bool | true should encode as exactly 2"
+        );
+    }
+
+    #[test]
+    fn aggregate_counts_predicate_only_for_count_kind() {
+        assert!(aggregate_counts_predicate(IRAggKind::Count));
+        assert!(!aggregate_counts_predicate(IRAggKind::Sum));
+        assert!(!aggregate_counts_predicate(IRAggKind::Product));
+        assert!(!aggregate_counts_predicate(IRAggKind::Min));
+        assert!(!aggregate_counts_predicate(IRAggKind::Max));
+    }
+
+    #[test]
+    fn encode_finite_min_and_max_aggregates_choose_opposite_bounds() {
+        let tm = Cvc5Tm::new();
+        let body = IRExpr::IfElse {
+            cond: Box::new(IRExpr::Var {
+                name: "b".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            then_body: Box::new(int_lit(2)),
+            else_body: Some(Box::new(int_lit(1))),
+            span: None,
+        };
+        let env = SygusExprEnv {
+            vars: &HashMap::new(),
+            enum_catalog: &EnumCatalog::new(),
+        };
+        let min = encode_finite_aggregate_expr(
+            &tm,
+            IRAggKind::Min,
+            "b",
+            &IRType::Bool,
+            &body,
+            None,
+            env,
+        )
+        .expect("min aggregate over bool domain");
+        let max = encode_finite_aggregate_expr(
+            &tm,
+            IRAggKind::Max,
+            "b",
+            &IRType::Bool,
+            &body,
+            None,
+            SygusExprEnv {
+                vars: &HashMap::new(),
+                enum_catalog: &EnumCatalog::new(),
+            },
+        )
+        .expect("max aggregate over bool domain");
+        let min_rendered = min.to_string();
+        let max_rendered = max.to_string();
+        assert!(
+            min_rendered.contains("(<"),
+            "Min aggregate should compare candidate values with `<`, got: {min_rendered}"
+        );
+        assert!(
+            max_rendered.contains("(>"),
+            "Max aggregate should compare candidate values with `>`, got: {max_rendered}"
+        );
+    }
+
+    #[test]
+    fn encode_finite_set_membership_rejects_non_set_binary_ops() {
+        let tm = Cvc5Tm::new();
+        let expr = IRExpr::BinOp {
+            op: "OpAdd".to_owned(),
+            left: Box::new(int_set_lit(&[1])),
+            right: Box::new(int_set_lit(&[2])),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        };
+        let mut encode_with_vars = |expr: &IRExpr, vars: &HashMap<String, Cvc5Term>| {
+            encode_expr(&tm, expr, vars, &EnumCatalog::new())
+        };
+
+        let err = encode_finite_set_membership_term(
+            &tm,
+            &expr,
+            &tm.mk_integer(1),
+            &HashMap::new(),
+            &EnumCatalog::new(),
+            &mut encode_with_vars,
+        )
+        .expect_err("non-set binary op must not be treated as set membership");
+        assert!(
+            err.contains("does not support expression shape"),
+            "diagnostic should reject non-set binary op, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encode_finite_set_membership_distinguishes_intersection_and_difference() {
+        let tm = Cvc5Tm::new();
+        let intersection = set_binop("OpSetIntersect", int_set_lit(&[1]), int_set_lit(&[]));
+        let difference = set_binop("OpSetDiff", int_set_lit(&[1]), int_set_lit(&[1]));
+        let mut encode_with_vars = |expr: &IRExpr, vars: &HashMap<String, Cvc5Term>| {
+            encode_expr(&tm, expr, vars, &EnumCatalog::new())
+        };
+
+        for (label, expr) in [
+            ("{1} intersect {}", intersection),
+            ("{1} diff {1}", difference),
+        ] {
+            let membership = encode_finite_set_membership_term(
+                &tm,
+                &expr,
+                &tm.mk_integer(1),
+                &HashMap::new(),
+                &EnumCatalog::new(),
+                &mut encode_with_vars,
+            )
+            .expect(label);
+            assert_cvc5_bool_unsat_when_asserted(&tm, membership, label);
+        }
+    }
+
+    #[test]
+    fn encode_finite_map_lookup_rejects_maplit_with_non_map_type() {
+        let tm = Cvc5Tm::new();
+        let malformed_map = IRExpr::MapLit {
+            entries: Vec::new(),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let mut encode_with_vars = |expr: &IRExpr, vars: &HashMap<String, Cvc5Term>| {
+            encode_expr(&tm, expr, vars, &EnumCatalog::new())
+        };
+
+        let err = encode_finite_map_lookup_expr_inner(
+            &tm,
+            &malformed_map,
+            &int_lit(1),
+            &HashMap::new(),
+            &EnumCatalog::new(),
+            &mut encode_with_vars,
+        )
+        .expect_err("MapLit with non-map type must be a structural error");
+        assert!(
+            err.contains("requires Map type"),
+            "diagnostic should name malformed MapLit type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ctor_name_matches_accepts_bare_exact_and_qualified_constructor_names() {
+        assert!(ctor_name_matches("Done", "Status", "Done"));
+        assert!(ctor_name_matches("Status::Done", "Status", "Done"));
+        assert!(ctor_name_matches("Other::Done", "Status", "Done"));
+        assert!(!ctor_name_matches("Status::Pending", "Status", "Done"));
+    }
+
+    #[test]
+    fn bind_static_payload_pattern_vars_binds_payload_fields_and_rejects_fieldless_ctor() {
+        let tm = Cvc5Tm::new();
+        let scrutinee = payload_ctor("Result", "Some", "value", int_lit(7));
+        let payload_pattern = payload_ctor_pattern(
+            "Result::Some",
+            "value",
+            IRPattern::PVar {
+                name: "v".to_owned(),
+            },
+        );
+        let mut env = HashMap::new();
+
+        assert!(
+            bind_static_payload_pattern_vars(
+                &tm,
+                &payload_pattern,
+                &scrutinee,
+                &mut env,
+                &EnumCatalog::new(),
+            )
+            .expect("payload pattern binding")
+        );
+        assert!(
+            env.contains_key("v"),
+            "payload field binding should be recorded in the CVC5 environment"
+        );
+
+        let fieldless_pattern = IRPattern::PCtor {
+            name: "Result::Some".to_owned(),
+            fields: Vec::new(),
+        };
+        let mut fieldless_env = HashMap::new();
+        assert!(
+            !bind_static_payload_pattern_vars(
+                &tm,
+                &fieldless_pattern,
+                &scrutinee,
+                &mut fieldless_env,
+                &EnumCatalog::new(),
+            )
+            .expect("fieldless constructor pattern")
+        );
+        assert!(
+            fieldless_env.is_empty(),
+            "fieldless constructors are not payload destructuring patterns"
+        );
+    }
+
+    #[test]
+    fn encode_static_payload_pattern_cond_handles_wildcards_or_patterns_and_fieldless_ctors() {
+        let tm = Cvc5Tm::new();
+        let scrutinee = payload_ctor("Result", "Some", "value", int_lit(7));
+
+        let wildcard_cond =
+            encode_static_payload_pattern_cond(&tm, &IRPattern::PWild, &scrutinee)
+                .expect("wildcard condition");
+        assert_cvc5_bool_tautology(&tm, wildcard_cond, "wildcard pattern");
+
+        let var_cond = encode_static_payload_pattern_cond(
+            &tm,
+            &IRPattern::PVar {
+                name: "bound".to_owned(),
+            },
+            &scrutinee,
+        )
+        .expect("variable pattern condition");
+        assert_cvc5_bool_tautology(&tm, var_cond, "variable pattern");
+
+        let nonmatching_payload = payload_ctor_pattern("Result::None", "value", IRPattern::PWild);
+        let right_wildcard = IRPattern::PWild;
+        let or_pattern = IRPattern::POr {
+            left: Box::new(nonmatching_payload),
+            right: Box::new(right_wildcard),
+        };
+        let or_cond = encode_static_payload_pattern_cond(&tm, &or_pattern, &scrutinee)
+            .expect("or-pattern condition");
+        assert_cvc5_bool_tautology(&tm, or_cond, "or-pattern fallback");
+
+        let fieldless_ctor = IRPattern::PCtor {
+            name: "Result::Some".to_owned(),
+            fields: Vec::new(),
+        };
+        assert!(
+            encode_static_payload_pattern_cond(&tm, &fieldless_ctor, &scrutinee).is_none(),
+            "fieldless constructors should stay on the regular pattern path"
+        );
+    }
+
+    fn bool_field(name: &str) -> IRField {
+        IRField {
+            name: name.to_owned(),
+            ty: IRType::Bool,
+            default: None,
+            initial_constraint: None,
+        }
+    }
+
+    fn bool_lit(value: bool) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Bool,
+            value: LitVal::Bool { value },
+            span: None,
+        }
+    }
+
+    fn int_lit(value: i64) -> IRExpr {
+        IRExpr::Lit {
+            ty: IRType::Int,
+            value: LitVal::Int { value },
+            span: None,
+        }
+    }
+
+    fn int_set_lit(values: &[i64]) -> IRExpr {
+        IRExpr::SetLit {
+            elements: values.iter().copied().map(int_lit).collect(),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        }
+    }
+
+    fn payload_ctor(enum_name: &str, ctor: &str, field_name: &str, field_value: IRExpr) -> IRExpr {
+        IRExpr::Ctor {
+            enum_name: enum_name.to_owned(),
+            ctor: ctor.to_owned(),
+            args: vec![(field_name.to_owned(), field_value)],
+            span: None,
+        }
+    }
+
+    fn payload_ctor_pattern(name: &str, field_name: &str, field_pattern: IRPattern) -> IRPattern {
+        IRPattern::PCtor {
+            name: name.to_owned(),
+            fields: vec![IRFieldPat {
+                name: field_name.to_owned(),
+                pattern: field_pattern,
+            }],
+        }
+    }
+
+    fn set_binop(op: &str, left: IRExpr, right: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: op.to_owned(),
+            left: Box::new(left),
+            right: Box::new(right),
+            ty: IRType::Set {
+                element: Box::new(IRType::Int),
+            },
+            span: None,
+        }
+    }
+
+    fn primed_eq(field: &str, value: IRExpr) -> IRExpr {
+        IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Prime {
+                expr: Box::new(IRExpr::Var {
+                    name: field.to_owned(),
+                    ty: IRType::Bool,
+                    span: None,
+                }),
+                span: None,
+            }),
+            right: Box::new(value),
+            ty: IRType::Bool,
+            span: None,
+        }
+    }
+
+    fn assert_cvc5_bool_unsat_when_asserted(tm: &Cvc5Tm, term: Cvc5Term, label: &str) {
+        let mut solver = Cvc5Solver::new(tm);
+        solver.set_logic("LIA");
+        solver.assert_formula(term);
+        assert!(
+            solver.check_sat().is_unsat(),
+            "{label} should encode as false"
+        );
+    }
+
+    fn assert_cvc5_bool_tautology(tm: &Cvc5Tm, term: Cvc5Term, label: &str) {
+        let negated = tm.mk_term(Cvc5Kind::CVC5_KIND_NOT, &[term]);
+        assert_cvc5_bool_unsat_when_asserted(tm, negated, label);
     }
 }

@@ -532,6 +532,7 @@ pub(super) fn collect_system_action(s: &ast::SystemActionDecl) -> ESystemAction 
     let requires = s
         .contracts
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|c| match c {
             ast::Contract::Requires { expr, .. } => Some(collect_expr(expr)),
             _ => None,
@@ -561,6 +562,7 @@ pub(super) fn collect_action_from_command(c: &ast::CommandDecl) -> ESystemAction
     let requires = body
         .contracts
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|contract| match contract {
             ast::Contract::Requires { expr, .. } => Some(collect_expr(expr)),
             _ => None,

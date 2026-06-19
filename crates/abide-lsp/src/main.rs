@@ -35,6 +35,7 @@ use abide::qa::complete::{qa_command_candidates, qa_query_subcommand_candidates}
 use abide::qa::model::FlowModel;
 use abide::workspace::{CompilerWorkspace, FileId};
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 use tower_lsp::jsonrpc::{Error, Result};
 #[allow(clippy::wildcard_imports)]
 use tower_lsp::lsp_types::*;
@@ -195,6 +196,29 @@ struct WorkspaceIndexCache {
     value: Arc<WorkspaceIndex>,
 }
 
+#[derive(Debug, Default)]
+struct DiagnosticScheduler {
+    next_generation: u64,
+    latest_by_root: HashMap<FileId, u64>,
+}
+
+impl DiagnosticScheduler {
+    fn schedule(&mut self, root_file_id: FileId) -> u64 {
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.latest_by_root.insert(root_file_id, generation);
+        generation
+    }
+
+    fn cancel(&mut self, root_file_id: FileId) {
+        self.latest_by_root.remove(&root_file_id);
+    }
+
+    fn is_current(&self, root_file_id: FileId, generation: u64) -> bool {
+        self.latest_by_root.get(&root_file_id) == Some(&generation)
+    }
+}
+
 struct ProjectSnapshot {
     project: ProjectModel,
     workspace: CompilerWorkspace,
@@ -321,13 +345,29 @@ impl ProjectSnapshot {
         state.kind = kind;
         state.file_id = Some(file_id);
         state.revision = state.revision.saturating_add(1);
+        let affected_diagnostic_roots = if kind == ProjectFileKind::AbideSource {
+            self.affected_abide_roots_for_change(file_id)
+        } else {
+            Vec::new()
+        };
         self.invalidate_file(file_id);
+        for affected_file_id in affected_diagnostic_roots {
+            self.invalidate_file(affected_file_id);
+        }
         if kind == ProjectFileKind::AbideSource {
             self.workspace_index_generation = self.workspace_index_generation.saturating_add(1);
             self.workspace_index_cache = None;
             self.invalidate_qa_diagnostics();
         }
         file_id
+    }
+
+    fn affected_diagnostic_roots(&mut self, file_id: FileId) -> Vec<FileId> {
+        match self.file_kind_for_id(file_id) {
+            Some(ProjectFileKind::AbideSource) => self.affected_abide_roots_for_change(file_id),
+            Some(ProjectFileKind::QaScript) => vec![file_id],
+            Some(ProjectFileKind::Unsupported) | None => Vec::new(),
+        }
     }
 
     fn parse(&mut self, file_id: FileId) -> miette::Result<Arc<abide::driver::ParseFileResult>> {
@@ -378,7 +418,7 @@ impl ProjectSnapshot {
         }
 
         let diagnostics = match self.file_kind_for_id(file_id) {
-            Some(ProjectFileKind::AbideSource) => self.lower(file_id)?.diagnostics.clone(),
+            Some(ProjectFileKind::AbideSource) => self.workspace.diagnostics(file_id)?.to_vec(),
             Some(ProjectFileKind::QaScript) => {
                 let Some(source) = self.source_text(file_id) else {
                     return Ok(Arc::new(Vec::new()));
@@ -450,6 +490,80 @@ impl ProjectSnapshot {
         for file_id in qa_file_ids {
             self.diagnostics_cache.remove(&file_id);
         }
+    }
+
+    fn affected_abide_roots_for_change(&mut self, changed_file_id: FileId) -> Vec<FileId> {
+        let Some(changed_path) = self.workspace.path(changed_file_id).map(Path::to_path_buf) else {
+            return Vec::new();
+        };
+        let changed_path = normalize_path_lexical(&changed_path);
+        let abide_file_ids = self.abide_file_ids();
+        let mut affected = Vec::new();
+        for file_id in abide_file_ids {
+            if file_id == changed_file_id {
+                affected.push(file_id);
+                continue;
+            }
+            let mut visiting = HashSet::new();
+            if self.file_includes_path_transitively(file_id, &changed_path, &mut visiting) {
+                affected.push(file_id);
+            }
+        }
+        affected.sort_by_key(|file_id| self.workspace.path(*file_id).map(Path::to_path_buf));
+        affected.dedup();
+        affected
+    }
+
+    fn abide_file_ids(&self) -> Vec<FileId> {
+        self.files
+            .values()
+            .filter(|state| state.kind == ProjectFileKind::AbideSource)
+            .filter_map(|state| state.file_id)
+            .collect()
+    }
+
+    fn file_includes_path_transitively(
+        &mut self,
+        file_id: FileId,
+        target_path: &Path,
+        visiting: &mut HashSet<FileId>,
+    ) -> bool {
+        if !visiting.insert(file_id) {
+            return false;
+        }
+        for include_path in self.include_targets_for_file(file_id) {
+            if include_path == target_path {
+                return true;
+            }
+            if let Some(included_file_id) = self.file_id(&include_path) {
+                if self.file_includes_path_transitively(included_file_id, target_path, visiting) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn include_targets_for_file(&mut self, file_id: FileId) -> Vec<PathBuf> {
+        let Some(path) = self.workspace.path(file_id).map(Path::to_path_buf) else {
+            return Vec::new();
+        };
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let Ok(parsed) = self.parse(file_id) else {
+            return Vec::new();
+        };
+        parsed
+            .program
+            .decls
+            .iter()
+            .filter_map(|decl| {
+                if let abide::ast::TopDecl::Include(include) = decl {
+                    Some(normalize_path_lexical(&base_dir.join(&include.path)))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn qa_diagnostics(&self, path: &Path, source: &str) -> Vec<Diagnostic> {
@@ -698,11 +812,12 @@ fn verify_config_for_editor_policy(
     }
 }
 
-/// LSP request handler. All async methods serialize through the
-/// `state` mutex.
+/// LSP request handler. Workspace access serializes through the state
+/// mutex; diagnostic publishes may be debounced by `diagnostic_scheduler`.
 struct Backend {
     client: Client,
     state: Arc<Mutex<LspState>>,
+    diagnostic_scheduler: Arc<Mutex<DiagnosticScheduler>>,
 }
 
 type LspDiagnosticMap = HashMap<Url, Vec<tower_lsp::lsp_types::Diagnostic>>;
@@ -726,6 +841,7 @@ impl LanguageServer for Backend {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         *self.state.lock().await = LspState::new_with_policy(root_dir, verification_policy);
+        *self.diagnostic_scheduler.lock().await = DiagnosticScheduler::default();
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -750,8 +866,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         let text = params.text_document.text;
-        if let Some(file_id) = self.upsert_document(&uri, version, text).await {
-            self.refresh_diagnostics(file_id).await;
+        if let Some((roots, policy)) = self.upsert_document(&uri, version, text).await {
+            self.refresh_diagnostics_for_policy(roots, policy).await;
         }
     }
 
@@ -761,19 +877,25 @@ impl LanguageServer for Backend {
         let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
-        if let Some(file_id) = self.upsert_document(&uri, version, change.text).await {
-            self.refresh_diagnostics(file_id).await;
+        if let Some((roots, policy)) = self.upsert_document(&uri, version, change.text).await {
+            self.refresh_diagnostics_for_policy(roots, policy).await;
         }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
-        let file_id = {
-            let state = self.state.lock().await;
-            state.documents.get(&uri).map(|doc| doc.file_id)
+        let roots = {
+            let mut state = self.state.lock().await;
+            state
+                .documents
+                .get(&uri)
+                .map(|doc| doc.file_id)
+                .map(|file_id| state.snapshot.affected_diagnostic_roots(file_id))
         };
-        if let Some(file_id) = file_id {
-            self.refresh_diagnostics(file_id).await;
+        if let Some(roots) = roots {
+            for root in roots {
+                self.refresh_diagnostics(root).await;
+            }
         }
     }
 
@@ -929,10 +1051,52 @@ impl Backend {
     /// `version` and `text`, and pushes the new source into the
     /// workspace. Returns the workspace `FileId` if the update was
     /// accepted, or `None` if a newer version was already recorded.
-    async fn upsert_document(&self, uri: &Url, version: i32, text: String) -> Option<FileId> {
+    async fn upsert_document(
+        &self,
+        uri: &Url,
+        version: i32,
+        text: String,
+    ) -> Option<(Vec<FileId>, EditorVerificationPolicy)> {
         let mut state = self.state.lock().await;
         let file_id = state.upsert_open_document(uri, version, text)?;
-        (state.file_kind(file_id) != Some(ProjectFileKind::Unsupported)).then_some(file_id)
+        if state.file_kind(file_id) == Some(ProjectFileKind::Unsupported) {
+            return None;
+        }
+        let roots = state.snapshot.affected_diagnostic_roots(file_id);
+        Some((roots, state.verification_policy))
+    }
+
+    async fn refresh_diagnostics_for_policy(
+        &self,
+        roots: Vec<FileId>,
+        policy: EditorVerificationPolicy,
+    ) {
+        if policy.should_schedule_on_change() {
+            self.schedule_diagnostics(roots, policy.debounce_ms).await;
+        } else {
+            for root in roots {
+                self.refresh_diagnostics(root).await;
+            }
+        }
+    }
+
+    async fn schedule_diagnostics(&self, roots: Vec<FileId>, debounce_ms: u64) {
+        for root in roots {
+            let generation = {
+                let mut scheduler = self.diagnostic_scheduler.lock().await;
+                scheduler.schedule(root)
+            };
+            let client = self.client.clone();
+            let state = Arc::clone(&self.state);
+            let scheduler = Arc::clone(&self.diagnostic_scheduler);
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(debounce_ms)).await;
+                if !scheduler.lock().await.is_current(root, generation) {
+                    return;
+                }
+                publish_diagnostics_for_root(&client, &state, root).await;
+            });
+        }
     }
 
     /// Re-elaborates `root_file_id`, collects the resulting diagnostics
@@ -941,26 +1105,8 @@ impl Backend {
     /// (unless another root still reports against them — see
     /// [`LspState::uri_published_elsewhere`]).
     async fn refresh_diagnostics(&self, root_file_id: FileId) {
-        let (publish, stale, versions, log_error) = {
-            let mut state = self.state.lock().await;
-            collect_diagnostics_for_root(&mut state, root_file_id)
-        };
-
-        if let Some(message) = log_error {
-            self.client.log_message(MessageType::ERROR, message).await;
-        }
-        for (uri, diagnostics) in publish {
-            let version = versions.get(&uri).copied().flatten();
-            self.client
-                .publish_diagnostics(uri, diagnostics, version)
-                .await;
-        }
-        for uri in stale {
-            let version = versions.get(&uri).copied().flatten();
-            self.client
-                .publish_diagnostics(uri, Vec::new(), version)
-                .await;
-        }
+        self.diagnostic_scheduler.lock().await.cancel(root_file_id);
+        publish_diagnostics_for_root(&self.client, &self.state, root_file_id).await;
     }
 
     async fn symbol_at_position(
@@ -975,6 +1121,29 @@ impl Backend {
             symbol.span,
         )?;
         Some((symbol, range))
+    }
+}
+
+async fn publish_diagnostics_for_root(
+    client: &Client,
+    shared_state: &Arc<Mutex<LspState>>,
+    root_file_id: FileId,
+) {
+    let (publish, stale, versions, log_error) = {
+        let mut state = shared_state.lock().await;
+        collect_diagnostics_for_root(&mut state, root_file_id)
+    };
+
+    if let Some(message) = log_error {
+        client.log_message(MessageType::ERROR, message).await;
+    }
+    for (uri, diagnostics) in publish {
+        let version = versions.get(&uri).copied().flatten();
+        client.publish_diagnostics(uri, diagnostics, version).await;
+    }
+    for uri in stale {
+        let version = versions.get(&uri).copied().flatten();
+        client.publish_diagnostics(uri, Vec::new(), version).await;
     }
 }
 
@@ -999,7 +1168,10 @@ fn collect_diagnostics_for_root(state: &mut LspState, root_file_id: FileId) -> D
                     );
                 }
 
-                if state.verification_policy.should_run_automatically() {
+                let has_errors = diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
+                if !has_errors && state.verification_policy.should_run_automatically() {
                     match state.snapshot.lower(root_file_id) {
                         Ok(lowered) => {
                             let config = verify_config_for_editor_policy(state.verification_policy);
@@ -2317,6 +2489,7 @@ async fn main() {
         state: Arc::new(Mutex::new(LspState::new(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         ))),
+        diagnostic_scheduler: Arc::new(Mutex::new(DiagnosticScheduler::default())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -2528,6 +2701,93 @@ mod tests {
             third.is_empty(),
             "fixed source should clear cached diagnostics: {third:#?}"
         );
+    }
+
+    #[test]
+    fn diagnostic_scheduler_marks_superseded_generations_stale() {
+        let mut workspace = CompilerWorkspace::with_root_dir(PathBuf::from("/tmp"));
+        let root = workspace.set_file_source("/tmp/model.ab", "system S { }\n");
+        let mut scheduler = DiagnosticScheduler::default();
+
+        let first = scheduler.schedule(root);
+        let second = scheduler.schedule(root);
+
+        assert!(
+            !scheduler.is_current(root, first),
+            "a newer scheduled refresh should cancel the older generation"
+        );
+        assert!(scheduler.is_current(root, second));
+
+        scheduler.cancel(root);
+
+        assert!(
+            !scheduler.is_current(root, second),
+            "explicit refresh should cancel pending delayed publishes"
+        );
+    }
+
+    #[test]
+    fn project_snapshot_invalidates_including_diagnostics_after_include_update() {
+        let dir = tempfile::tempdir().expect("temp project");
+        let root = dir.path();
+        let main_path = root.join("main.ab");
+        let shared_path = root.join("shared.ab");
+        std::fs::write(&main_path, "include \"shared.ab\"\n").expect("write main");
+        std::fs::write(&shared_path, "entity Broken {\n  status: MissingType\n}\n")
+            .expect("write shared");
+        let shared_uri = Url::from_file_path(&shared_path).expect("shared uri");
+        let mut snapshot = ProjectSnapshot::discover(root).expect("snapshot");
+        let main_file_id = snapshot.file_id(&main_path).expect("main file id");
+        let shared_file_id = snapshot.file_id(&shared_path).expect("shared file id");
+
+        let before = snapshot
+            .diagnostics(main_file_id)
+            .expect("initial main diagnostics");
+        assert!(
+            before
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("MissingType")),
+            "included broken source should be reported by the root: {before:#?}"
+        );
+        assert!(snapshot
+            .affected_diagnostic_roots(shared_file_id)
+            .contains(&main_file_id));
+
+        snapshot.upsert_open_document(
+            &shared_uri,
+            1,
+            "entity Fixed {\n  ready: bool = false\n}\n".to_owned(),
+        );
+        let after = snapshot
+            .diagnostics(main_file_id)
+            .expect("updated main diagnostics");
+
+        assert!(
+            after.is_empty(),
+            "editing an included file should invalidate dependent root diagnostics: {after:#?}"
+        );
+    }
+
+    #[test]
+    fn project_snapshot_finds_transitive_include_diagnostic_roots() {
+        let dir = tempfile::tempdir().expect("temp project");
+        let root = dir.path();
+        let main_path = root.join("main.ab");
+        let mid_path = root.join("mid.ab");
+        let shared_path = root.join("shared.ab");
+        std::fs::write(&main_path, "include \"mid.ab\"\n").expect("write main");
+        std::fs::write(&mid_path, "include \"shared.ab\"\n").expect("write mid");
+        std::fs::write(&shared_path, "entity Shared { }\n").expect("write shared");
+        let mut snapshot = ProjectSnapshot::discover(root).expect("snapshot");
+        let main_file_id = snapshot.file_id(&main_path).expect("main file id");
+        let mid_file_id = snapshot.file_id(&mid_path).expect("mid file id");
+        let shared_file_id = snapshot.file_id(&shared_path).expect("shared file id");
+
+        let affected = snapshot.affected_diagnostic_roots(shared_file_id);
+
+        assert!(affected.contains(&main_file_id), "{affected:#?}");
+        assert!(affected.contains(&mid_file_id), "{affected:#?}");
+        assert!(affected.contains(&shared_file_id), "{affected:#?}");
     }
 
     #[test]
@@ -3817,6 +4077,45 @@ mod tests {
         );
         assert_eq!(diagnostic.range.start, Position::new(0, 6));
         assert_eq!(diagnostic.range.end, Position::new(0, 16));
+    }
+
+    #[test]
+    fn lsp_diagnostics_publish_integer_literal_overflow() {
+        let mut state = LspState::new(PathBuf::from("."));
+        let file_id = state.snapshot.set_file_source(
+            "/tmp/overflow.ab",
+            "module Overflow\n\nconst huge = 9223372036854775808\n",
+        );
+
+        let (diagnostics, _stale, _versions, log_error) =
+            collect_diagnostics_for_root(&mut state, file_id);
+
+        assert!(log_error.is_none(), "{log_error:?}");
+        let all = diagnostics
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all.len(),
+            1,
+            "expected one integer overflow diagnostic: {all:#?}"
+        );
+
+        let diagnostic = all[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                "abide::lex::integer_overflow".to_owned()
+            ))
+        );
+        assert!(
+            diagnostic.message.contains("integer literal")
+                && diagnostic.message.contains("too large"),
+            "unexpected diagnostic message: {}",
+            diagnostic.message
+        );
+        assert_eq!(diagnostic.range.start, Position::new(2, 13));
+        assert_eq!(diagnostic.range.end, Position::new(2, 32));
     }
 
     #[test]

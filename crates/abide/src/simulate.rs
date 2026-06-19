@@ -1634,8 +1634,8 @@ impl<'a> Runtime<'a> {
         match expr {
             IRExpr::Lit { value, .. } => Ok(match value {
                 LitVal::Int { value } => WitnessValue::Int(*value),
-                LitVal::Real { value } => WitnessValue::Real(normalize_float(*value)),
-                LitVal::Float { value } => WitnessValue::Float(normalize_float(*value)),
+                LitVal::Real { value } => real_witness_value(*value),
+                LitVal::Float { value } => float_witness_value(*value),
                 LitVal::Bool { value } => WitnessValue::Bool(*value),
                 LitVal::Str { value } => WitnessValue::String(value.clone()),
             }),
@@ -2296,14 +2296,15 @@ impl<'a> Runtime<'a> {
             op, left, right, ..
         } = expr
         {
-            if op == "OpEq" {
+            // Assignment (`=`) is the dedicated `OpAssign` op, distinct from
+            // an equality comparison (`OpEq`). Keying on `OpAssign` keeps a
+            // body-position `a == b` from being executed as the mutation
+            // `a := b`.
+            if op == "OpAssign" {
                 if let IRExpr::Var { name, .. } = left.as_ref() {
-                    if locals.contains_key(name) {
-                        let value =
-                            self.eval_exec_expr(right, current_system, current_slot, locals)?;
-                        locals.insert(name.clone(), value);
-                        return Ok(WitnessValue::Bool(true));
-                    }
+                    let value = self.eval_exec_expr(right, current_system, current_slot, locals)?;
+                    locals.insert(name.clone(), value);
+                    return Ok(WitnessValue::Bool(true));
                 }
             }
         }
@@ -2388,8 +2389,8 @@ fn eval_static_expr(expr: &IRExpr, fresh_identity: Option<usize>) -> Result<Witn
     match expr {
         IRExpr::Lit { value, .. } => Ok(match value {
             LitVal::Int { value } => WitnessValue::Int(*value),
-            LitVal::Real { value } => WitnessValue::Real(normalize_float(*value)),
-            LitVal::Float { value } => WitnessValue::Float(normalize_float(*value)),
+            LitVal::Real { value } => real_witness_value(*value),
+            LitVal::Float { value } => float_witness_value(*value),
             LitVal::Bool { value } => WitnessValue::Bool(*value),
             LitVal::Str { value } => WitnessValue::String(value.clone()),
         }),
@@ -2634,7 +2635,130 @@ fn pattern_bindings(
     }
 }
 
+/// Parse a witness value as an exact rational real, if it is real- or
+/// float-typed. Returns `None` for non-real operands so callers fall through to
+/// other type handling.
+fn real_operand(value: &WitnessValue) -> Option<Result<abide_core::real::Real, String>> {
+    match value {
+        WitnessValue::Real(text) => Some(
+            text.parse::<abide_core::real::Real>()
+                .map_err(|err| format!("invalid real value `{text}`: {err}")),
+        ),
+        _ => None,
+    }
+}
+
+/// Parse a witness value as an IEEE-754 binary64 `float` (DDR-059). `float` is
+/// host `f64`, distinct from the exact-rational `real`; parsing also accepts
+/// `NaN`/`inf`/`-inf`. Returns `None` for non-float operands.
+fn float_operand(value: &WitnessValue) -> Option<Result<f64, String>> {
+    match value {
+        WitnessValue::Float(text) => Some(
+            text.parse::<f64>()
+                .map_err(|err| format!("invalid float value `{text}`: {err}")),
+        ),
+        _ => None,
+    }
+}
+
+/// Render an `f64` as a witness string that round-trips (`NaN`, `inf`, `-inf`,
+/// `-0` are all parseable by `f64::from_str`).
+fn float_witness(value: f64) -> WitnessValue {
+    WitnessValue::Float(value.to_string())
+}
+
+/// Evaluate a binary operator on two `float` operands with host `f64`
+/// (IEEE-754 binary64) semantics, matching the SMT backend's FP theory. Returns
+/// `None` unless both operands are float-typed.
+// `==`/`!=` on f64 is the intended IEEE comparison (NaN unordered, +0 == -0),
+// not an approximate-equality bug, so the float_cmp lint does not apply.
+#[allow(clippy::float_cmp)]
+fn try_float_binop(
+    op: &str,
+    left: &WitnessValue,
+    right: &WitnessValue,
+) -> Option<Result<WitnessValue, String>> {
+    let (left, right) = (float_operand(left)?, float_operand(right)?);
+    Some((|| {
+        let (l, r) = (left?, right?);
+        Ok(match op {
+            "+" | "OpAdd" => float_witness(l + r),
+            "-" | "OpSub" => float_witness(l - r),
+            "*" | "OpMul" => float_witness(l * r),
+            "/" | "OpDiv" => float_witness(l / r),
+            // Euclidean `%`: `a - |b| * floor(a / |b|)`, computed by the SAME
+            // sequence of correctly-rounded binary64 primitives the SMT backend
+            // composes (`smt::float_rem`), so both agree bit-for-bit (DDR-059).
+            "%" | "OpMod" => {
+                if r == 0.0 {
+                    return Err("float modulo by zero".to_owned());
+                }
+                let abs_b = r.abs();
+                float_witness(l - abs_b * (l / abs_b).floor())
+            }
+            // IEEE comparisons: NaN is unordered, +0.0 == -0.0.
+            "==" | "OpEq" => WitnessValue::Bool(l == r),
+            "!=" | "OpNEq" => WitnessValue::Bool(l != r),
+            ">" | "OpGt" => WitnessValue::Bool(l > r),
+            ">=" | "OpGe" => WitnessValue::Bool(l >= r),
+            "<" | "OpLt" => WitnessValue::Bool(l < r),
+            "<=" | "OpLe" => WitnessValue::Bool(l <= r),
+            other => {
+                return Err(format!(
+                    "unsupported float operator `{other}` in simulation"
+                ))
+            }
+        })
+    })())
+}
+
+/// Render an exact rational real back into a witness value.
+fn real_witness(value: abide_core::real::Real) -> WitnessValue {
+    WitnessValue::Real(value.to_string())
+}
+
+/// Evaluate a binary operator on two real (or float) operands using the shared
+/// exact-rational contract (`abide_core::real`), matching the SMT backends'
+/// exact reals rather than rounding through `f64`. Returns `None` unless BOTH
+/// operands are real-typed, so integer/other handling is unaffected.
+fn try_real_binop(
+    op: &str,
+    left: &WitnessValue,
+    right: &WitnessValue,
+) -> Option<Result<WitnessValue, String>> {
+    let (left, right) = (real_operand(left)?, real_operand(right)?);
+    Some((|| {
+        let (l, r) = (left?, right?);
+        let arith = |res: Result<abide_core::real::Real, abide_core::real::RealArithError>| {
+            res.map(real_witness).map_err(|err| err.to_string())
+        };
+        match op {
+            "+" | "OpAdd" => arith(l.checked_add(r)),
+            "-" | "OpSub" => arith(l.checked_sub(r)),
+            "*" | "OpMul" => arith(l.checked_mul(r)),
+            "/" | "OpDiv" => arith(l.checked_div(r)),
+            "%" | "mod" | "OpMod" => arith(l.checked_rem_euclid(r)),
+            "==" | "OpEq" => Ok(WitnessValue::Bool(l == r)),
+            "!=" | "OpNEq" => Ok(WitnessValue::Bool(l != r)),
+            ">" | "OpGt" => Ok(WitnessValue::Bool(l > r)),
+            ">=" | "OpGe" => Ok(WitnessValue::Bool(l >= r)),
+            "<" | "OpLt" => Ok(WitnessValue::Bool(l < r)),
+            "<=" | "OpLe" => Ok(WitnessValue::Bool(l <= r)),
+            other => Err(format!("unsupported real operator `{other}` in simulation")),
+        }
+    })())
+}
+
 fn eval_binop(op: &str, left: &WitnessValue, right: &WitnessValue) -> Result<WitnessValue, String> {
+    // `real` operands use exact-rational arithmetic and `float` operands use
+    // host f64 (IEEE-754 binary64) — both matching the SMT backend — before the
+    // integer/collection handling below. The two never mix (DDR-059).
+    if let Some(result) = try_real_binop(op, left, right) {
+        return result;
+    }
+    if let Some(result) = try_float_binop(op, left, right) {
+        return result;
+    }
     match op {
         "==" | "OpEq" => Ok(WitnessValue::Bool(witness_values_equal(left, right))),
         "!=" | "OpNEq" => Ok(WitnessValue::Bool(!witness_values_equal(left, right))),
@@ -2648,7 +2772,9 @@ fn eval_binop(op: &str, left: &WitnessValue, right: &WitnessValue) -> Result<Wit
             !expect_bool(left)? || expect_bool(right)?,
         )),
         "+" | "OpAdd" | "OpConc" => match (left, right) {
-            (WitnessValue::Int(l), WitnessValue::Int(r)) => Ok(WitnessValue::Int(l + r)),
+            (WitnessValue::Int(l), WitnessValue::Int(r)) => abide_core::arith::add(*l, *r)
+                .map(WitnessValue::Int)
+                .map_err(|err| err.to_string()),
             (WitnessValue::String(l), WitnessValue::String(r)) => {
                 Ok(WitnessValue::String(format!("{l}{r}")))
             }
@@ -2672,10 +2798,16 @@ fn eval_binop(op: &str, left: &WitnessValue, right: &WitnessValue) -> Result<Wit
                 render_value(right)
             )),
         },
-        "-" | "OpSub" => Ok(WitnessValue::Int(expect_int(left)? - expect_int(right)?)),
-        "*" | "OpMul" => Ok(WitnessValue::Int(expect_int(left)? * expect_int(right)?)),
-        "/" | "OpDiv" => Ok(WitnessValue::Int(expect_int(left)? / expect_int(right)?)),
-        "%" | "mod" | "OpMod" => Ok(WitnessValue::Int(expect_int(left)? % expect_int(right)?)),
+        // Integer arithmetic follows the shared contract in
+        // `abide_core::arith`: `-`/`*` are checked (overflow is an error, never
+        // a wrap or panic), and `/`/`%` are EUCLIDEAN with zero/`MIN`-over-`-1`
+        // rejected — the same semantics the explicit-state checker and the SMT
+        // backends' `div`/`mod` use, so a verified property and the concrete
+        // witness agree on negative operands and undefined cases.
+        "-" | "OpSub" => sim_int_op(abide_core::arith::sub, left, right),
+        "*" | "OpMul" => sim_int_op(abide_core::arith::mul, left, right),
+        "/" | "OpDiv" => sim_int_op(abide_core::arith::div_euclid, left, right),
+        "%" | "mod" | "OpMod" => sim_int_op(abide_core::arith::rem_euclid, left, right),
         ">=" | "OpGe" => Ok(WitnessValue::Bool(expect_int(left)? >= expect_int(right)?)),
         ">" | "OpGt" => Ok(WitnessValue::Bool(expect_int(left)? > expect_int(right)?)),
         "<=" | "OpLe" => Ok(WitnessValue::Bool(expect_int(left)? <= expect_int(right)?)),
@@ -2721,7 +2853,22 @@ fn normalize_type_name(name: &str) -> &str {
 fn eval_unop(op: &str, value: &WitnessValue) -> Result<WitnessValue, String> {
     match op {
         "not" | "!" | "OpNot" => Ok(WitnessValue::Bool(!expect_bool(value)?)),
-        "-" | "OpNeg" => Ok(WitnessValue::Int(-expect_int(value)?)),
+        // Real negation uses the exact-rational contract.
+        "-" | "OpNeg" if real_operand(value).is_some() => {
+            let real = real_operand(value).expect("real operand")?;
+            real.checked_neg()
+                .map(real_witness)
+                .map_err(|err| err.to_string())
+        }
+        // Float negation uses host f64 (IEEE-754, preserves signed zero/NaN).
+        "-" | "OpNeg" if float_operand(value).is_some() => float_operand(value)
+            .expect("float operand")
+            .map(|f| float_witness(-f)),
+        // Checked integer negation via the shared contract: `-i64::MIN` is an
+        // error, never a panic or wrap, matching the explicit-state checker and SMT.
+        "-" | "OpNeg" => abide_core::arith::neg(expect_int(value)?)
+            .map(WitnessValue::Int)
+            .map_err(|err| err.to_string()),
         _ => Err(format!("unsupported unary operator `{op}` in simulation")),
     }
 }
@@ -2738,6 +2885,18 @@ fn expect_int(value: &WitnessValue) -> Result<i64, String> {
         WitnessValue::Int(value) => Ok(*value),
         other => Err(format!("expected int, found {}", render_value(other))),
     }
+}
+
+/// Apply a shared integer-arithmetic operation to two witness values, mapping
+/// its typed error into the simulator's diagnostic vocabulary.
+fn sim_int_op(
+    op: fn(i64, i64) -> abide_core::arith::IntResult,
+    left: &WitnessValue,
+    right: &WitnessValue,
+) -> Result<WitnessValue, String> {
+    op(expect_int(left)?, expect_int(right)?)
+        .map(WitnessValue::Int)
+        .map_err(|err| err.to_string())
 }
 
 fn expr_kind(expr: &IRExpr) -> &'static str {
@@ -2785,6 +2944,21 @@ fn expr_kind(expr: &IRExpr) -> &'static str {
         IRExpr::While { .. } => "while",
         IRExpr::IfElse { .. } => "if_else",
     }
+}
+
+/// Build a `Real` witness value, quantizing the literal to the shared canonical
+/// real scale (`abide_core::arith`) so the concrete witness matches the value
+/// the SMT backend reasons about.
+fn real_witness_value(value: f64) -> WitnessValue {
+    WitnessValue::Real(normalize_float(abide_core::arith::canonical_real(value)))
+}
+
+/// Build a `Float` witness value, quantized to the shared canonical real scale
+/// (the SMT backend encodes `float` literals with the same quantization).
+fn float_witness_value(value: f64) -> WitnessValue {
+    // `float` is IEEE-754 binary64 (DDR-059): keep the actual f64, not the
+    // quantized rational used for `real`.
+    float_witness(value)
 }
 
 fn normalize_float(value: f64) -> String {
@@ -2891,6 +3065,145 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("create source");
         write!(file, "{src}").expect("write source");
         driver::lower_files(std::slice::from_ref(&path)).expect("lower source")
+    }
+
+    /// The witness/QA simulator computes integer `/` and `%` with Euclidean
+    /// semantics (matching the SMT backends and the explicit-state checker) and
+    /// rejects division/modulo by zero conservatively instead of panicking.
+    #[test]
+    fn eval_binop_int_div_mod_are_euclidean_and_reject_zero() {
+        use WitnessValue::Int;
+        assert!(matches!(
+            eval_binop("OpDiv", &Int(-7), &Int(2)),
+            Ok(Int(-4))
+        ));
+        assert!(matches!(eval_binop("OpMod", &Int(-7), &Int(2)), Ok(Int(1))));
+        assert!(matches!(
+            eval_binop("OpDiv", &Int(7), &Int(-2)),
+            Ok(Int(-3))
+        ));
+        assert!(matches!(eval_binop("OpMod", &Int(7), &Int(-2)), Ok(Int(1))));
+        // Division / modulo by zero is rejected, never a panic.
+        assert!(eval_binop("OpDiv", &Int(1), &Int(0)).is_err());
+        assert!(eval_binop("OpMod", &Int(1), &Int(0)).is_err());
+    }
+
+    #[test]
+    fn eval_binop_int_overflow_is_an_error_not_a_wrap_or_panic() {
+        use WitnessValue::Int;
+        // The shared `abide_core::arith` contract makes `+`/`-`/`*` reject i64
+        // overflow instead of wrapping (which would diverge from the SMT
+        // backend's unbounded `Int`) or panicking.
+        assert!(eval_binop("OpAdd", &Int(i64::MAX), &Int(1)).is_err());
+        assert!(eval_binop("OpSub", &Int(i64::MIN), &Int(1)).is_err());
+        assert!(eval_binop("OpMul", &Int(i64::MAX), &Int(2)).is_err());
+        assert!(eval_binop("OpDiv", &Int(i64::MIN), &Int(-1)).is_err());
+        // In-range arithmetic is unchanged.
+        assert!(matches!(eval_binop("OpAdd", &Int(2), &Int(3)), Ok(Int(5))));
+    }
+
+    #[test]
+    fn eval_unop_neg_overflow_is_an_error_not_a_wrap_or_panic() {
+        use WitnessValue::Int;
+        // `-i64::MIN` is rejected via the shared contract, never a panic or
+        // wrap, matching the explicit-state checker and the SMT backend.
+        assert!(eval_unop("OpNeg", &Int(i64::MIN)).is_err());
+        assert!(matches!(eval_unop("OpNeg", &Int(5)), Ok(Int(-5))));
+        assert!(matches!(eval_unop("OpNeg", &Int(-5)), Ok(Int(5))));
+    }
+
+    #[test]
+    fn real_literal_witness_is_quantized_to_canonical_scale() {
+        // A real beyond six decimals is truncated to the shared canonical scale
+        // so the concrete witness matches the value the SMT backend encodes.
+        let WitnessValue::Real(rendered) = real_witness_value(0.123_456_7) else {
+            panic!("expected a real witness value");
+        };
+        let parsed: f64 = rendered.parse().expect("real renders as a number");
+        assert!(
+            (parsed - 0.123_456).abs() < 1e-9,
+            "real should quantize to 0.123456, got {rendered}"
+        );
+        // Exactly representable reals are unchanged.
+        assert_eq!(
+            real_witness_value(0.5),
+            WitnessValue::Real("0.5".to_owned())
+        );
+    }
+
+    #[test]
+    fn eval_binop_float_arithmetic_is_ieee_binary64() {
+        use WitnessValue::{Bool, Float};
+        let f = |s: &str| Float(s.to_owned());
+        // DDR-059: `float` is host f64 (binary64), matching the SMT FP backend
+        // — NOT the exact-rational `real` path. 0.1 + 0.2 is 0.30000000000000004,
+        // so it is NOT equal to 0.3 (which exact `real` arithmetic would give).
+        let sum = eval_binop("OpAdd", &f("0.1"), &f("0.2")).unwrap();
+        assert_eq!(sum, f("0.30000000000000004"));
+        assert_eq!(eval_binop("OpEq", &sum, &f("0.3")), Ok(Bool(false)));
+        assert_eq!(eval_binop("OpDiv", &f("1"), &f("2")), Ok(f("0.5")));
+        assert_eq!(eval_binop("OpLt", &f("0.1"), &f("0.2")), Ok(Bool(true)));
+        assert_eq!(eval_unop("OpNeg", &f("0.5")), Ok(f("-0.5")));
+    }
+
+    #[test]
+    fn eval_binop_float_modulo_is_euclidean_binary64() {
+        use WitnessValue::Float;
+        let f = |s: &str| Float(s.to_owned());
+        // Euclidean `%` matching `smt::float_rem`: `a - |b| * floor(a / |b|)`,
+        // a non-negative result in `[0, |b|)`. 5.5 % 2.0 = 1.5.
+        assert_eq!(eval_binop("OpMod", &f("5.5"), &f("2")), Ok(f("1.5")));
+        // Negative dividend still yields a non-negative remainder: -5.5 % 2 = 0.5.
+        assert_eq!(eval_binop("OpMod", &f("-5.5"), &f("2")), Ok(f("0.5")));
+        // Negative divisor uses |b|: 5.5 % -2 = 1.5.
+        assert_eq!(eval_binop("OpMod", &f("5.5"), &f("-2")), Ok(f("1.5")));
+        // Modulo by either signed zero is rejected, never silently rendered NaN.
+        assert!(eval_binop("OpMod", &f("5.5"), &f("0")).is_err());
+        assert!(eval_binop("OpMod", &f("5.5"), &f("-0")).is_err());
+    }
+
+    #[test]
+    fn eval_binop_real_arithmetic_is_exact_not_rounded() {
+        use WitnessValue::{Bool, Real};
+        let r = |s: &str| Real(s.to_owned());
+        // Exact division: 1 / 3 stays 1/3 (an f64 simulation would round to
+        // 0.333333 and diverge from the SMT backend's exact rational).
+        assert_eq!(eval_binop("OpDiv", &r("1"), &r("3")), Ok(r("1/3")));
+        // 1/3 + 1/3 + 1/3 == 1 exactly.
+        let third = eval_binop("OpDiv", &r("1"), &r("3")).unwrap();
+        let two_thirds = eval_binop("OpAdd", &third, &third).unwrap();
+        assert_eq!(eval_binop("OpAdd", &two_thirds, &third), Ok(r("1")));
+        // Terminating results render as decimals.
+        assert_eq!(eval_binop("OpAdd", &r("0.5"), &r("0.25")), Ok(r("0.75")));
+        assert_eq!(eval_binop("OpMul", &r("0.5"), &r("0.5")), Ok(r("0.25")));
+        assert_eq!(eval_binop("OpSub", &r("1"), &r("0.25")), Ok(r("0.75")));
+        // Ordering and equality compare exact values, not text: 0.5 == 1/2.
+        assert_eq!(eval_binop("OpLt", &third, &r("0.5")), Ok(Bool(true)));
+        assert_eq!(eval_binop("OpEq", &r("0.5"), &r("1/2")), Ok(Bool(true)));
+        assert_eq!(eval_binop("OpEq", &third, &r("1/2")), Ok(Bool(false)));
+        // Division by zero is rejected, never a panic.
+        assert!(eval_binop("OpDiv", &r("1"), &r("0")).is_err());
+        // Euclidean `%` is exact and non-negative: 15/2 % 2 = 3/2 (rendered 1.5).
+        assert_eq!(eval_binop("OpMod", &r("15/2"), &r("2")), Ok(r("1.5")));
+        assert_eq!(eval_binop("OpMod", &r("-15/2"), &r("2")), Ok(r("0.5")));
+        assert_eq!(eval_binop("OpMod", &r("15/2"), &r("-2")), Ok(r("1.5")));
+        // A non-terminating exact remainder stays a fraction: 1/3 % 1/4 = 1/12.
+        assert_eq!(eval_binop("OpMod", &r("1/3"), &r("1/4")), Ok(r("1/12")));
+        // Modulo by zero is rejected, never a panic.
+        assert!(eval_binop("OpMod", &r("1"), &r("0")).is_err());
+    }
+
+    #[test]
+    fn eval_unop_real_negation_is_exact() {
+        use WitnessValue::Real;
+        assert_eq!(
+            eval_unop("OpNeg", &Real("0.5".to_owned())),
+            Ok(Real("-0.5".to_owned()))
+        );
+        assert_eq!(
+            eval_unop("OpNeg", &Real("1/3".to_owned())),
+            Ok(Real("-1/3".to_owned()))
+        );
     }
 
     #[test]

@@ -198,7 +198,7 @@ See [`examples/collections.ab`](../examples/collections.ab) for a complete runna
 - `entity` declares stateful domain objects with fields and private actions.
 - `system ... (orders: Store<Order>)` declares a system over an entity pool. Put concrete checking bounds on `store` declarations in `assume` or `given` blocks.
 - Store bounds in `assume` or `given` blocks can be exact (`[1]`), ranged (`[1..4]`), or at-most (`[..4]`).
-- In concrete checking scopes, store bounds describe capacity. Stores start empty unless the `assume` or `given` block explicitly activates named entities with `activate {o1} in orders`; `create` can then grow the active population up to the upper bound.
+- In concrete checking scopes, the store lower bound is the active floor and the upper bound is capacity. Explicit `activate {o1} in orders` clauses bind named instances to initial slots; anonymous slots satisfy any remaining nonzero floor. `create` can then grow the active population up to the upper bound.
 - Optional bounds on `Store<T>` system parameters are cardinality contracts, not ordinary demo scopes. Omit them unless the system really requires a minimum, maximum, or exact capacity contract.
 - `command` declares a public system operation and may include its body inline.
 - `query` declares a public read-only system observation.

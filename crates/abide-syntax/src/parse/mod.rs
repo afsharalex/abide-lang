@@ -276,6 +276,14 @@ pub fn parse_string_recovering(
 /// and the diagnostic buffer used by recovery. Public so the language
 /// server and tooling can drive it directly when they already have
 /// tokens in hand.
+/// Maximum structural nesting depth of a single expression. Beyond this the
+/// parser emits a diagnostic instead of recursing further, so a pathologically
+/// deep (usually machine-generated) expression yields an error rather than
+/// overflowing the stack of this or any downstream pass. Real specs nest only
+/// tens of levels deep, so this never trips for human-written input. It also
+/// bounds the depth the verification worker thread must accommodate.
+pub(crate) const MAX_EXPR_DEPTH: usize = 1000;
+
 pub struct Parser {
     tokens: Vec<(Token, Span)>,
     pos: usize,
@@ -284,6 +292,9 @@ pub struct Parser {
     /// When true, `Token::In` is not treated as an infix operator.
     /// Used inside `let` binding values to avoid consuming the `let...in` separator.
     no_in: bool,
+    /// Current expression recursion depth, used to bound structural nesting
+    /// (see [`MAX_EXPR_DEPTH`]).
+    expr_depth: usize,
 }
 
 impl Parser {
@@ -295,6 +306,7 @@ impl Parser {
             errors: Vec::new(),
             recovering: false,
             no_in: false,
+            expr_depth: 0,
         }
     }
 

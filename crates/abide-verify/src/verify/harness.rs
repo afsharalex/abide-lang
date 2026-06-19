@@ -11,12 +11,13 @@ use super::smt::Bool;
 
 use crate::ir::types::{
     IRAction, IRAssumptionSet, IREntity, IRExpr, IRSystem, IRSystemAction, IRTransParam,
-    IRTransition, IRType, LitVal,
+    IRTransRef, IRTransition, IRType, LitVal,
 };
 
 use super::context::VerifyContext;
 use super::defenv;
 use super::defenv::AppHeadKind;
+use super::encode::unqualify_ctor_name;
 use super::scope::VerifyStoreRange;
 use super::smt::{self, SmtValue};
 mod action;
@@ -310,8 +311,7 @@ pub fn domain_constraints(
 /// Generate initial state constraints.
 ///
 /// All slots start inactive unless an explicit activation binds a named
-/// instance to a store slot. Store bounds size identity capacity; they do not
-/// create active entities by themselves.
+/// instance to a store slot.
 pub fn initial_state_constraints(
     pool: &SlotPool,
     active_slots: &HashSet<(String, usize)>,
@@ -324,13 +324,21 @@ pub fn initial_state_constraints_with_store_ranges(
     active_slots: &HashSet<(String, usize)>,
     store_ranges: &HashMap<String, VerifyStoreRange>,
 ) -> Vec<Bool> {
+    let required_slots = initial_active_slots_with_store_ranges(active_slots, store_ranges);
+    initial_state_constraints_for_required_slots(pool, &required_slots)
+}
+
+pub fn initial_active_slots_with_store_ranges(
+    active_slots: &HashSet<(String, usize)>,
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> HashSet<(String, usize)> {
     let mut required_slots = active_slots.clone();
     for range in store_ranges.values() {
         for slot in range.start_slot..range.start_slot + range.min_active {
             required_slots.insert((range.entity_type.clone(), slot));
         }
     }
-    initial_state_constraints_for_required_slots(pool, &required_slots)
+    required_slots
 }
 
 fn initial_state_constraints_for_required_slots(
@@ -424,7 +432,11 @@ fn try_encode_field_default_expr(
     ) = (default_expr, field_ty)
     {
         if args.is_empty() {
-            return ctx.vctx.variants.try_id_of(name, ctor).map(smt::int_val);
+            return ctx
+                .vctx
+                .variants
+                .try_id_of(name, unqualify_ctor_name(ctor))
+                .map(smt::int_val);
         }
         if enum_name != name {
             let concrete_ctor = IRExpr::Ctor {
@@ -454,6 +466,7 @@ pub fn store_active_cardinality_constraints(
     for range in store_ranges.values() {
         for step in 0..=pool.bound {
             let terms: Vec<_> = (range.start_slot..range.start_slot + range.slot_count)
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(
                     |slot| match pool.active_at(&range.entity_type, slot, step) {
                         Some(SmtValue::Bool(active)) => {
@@ -526,6 +539,26 @@ pub(super) fn build_step_params(params: &[IRTransParam], step: usize) -> HashMap
         map.insert(p.name.clone(), var);
     }
     map
+}
+
+pub(super) fn step_param_domain_constraints(
+    params: &[IRTransParam],
+    step_params: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+) -> Vec<Bool> {
+    let mut constraints = Vec::new();
+    for param in params {
+        if let IRType::Enum { name, .. } = &param.ty {
+            let Some(&(min_id, max_id)) = vctx.enum_ranges.get(name) else {
+                continue;
+            };
+            if let Some(SmtValue::Int(var)) = step_params.get(&param.name) {
+                constraints.push(smt::int_ge(var, &smt::int_lit(min_id)));
+                constraints.push(smt::int_le(var, &smt::int_lit(max_id)));
+            }
+        }
+    }
+    constraints
 }
 
 // ── Transition relation ─────────────────────────────────────────────

@@ -543,19 +543,19 @@ pub(super) fn encode_fn_body(
             ctx,
         ),
 
-        // Assignment: BinOp(OpEq, Var(name), expr) in imperative context
+        // Assignment (`=`): BinOp(OpAssign, Var(name), expr) in imperative
+        // context. The dedicated `OpAssign` op (distinct from equality's
+        // `OpEq`) means a body-position comparison `a == b` can never be
+        // mistaken for the mutation `a := b`.
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpEq" && matches!(left.as_ref(), IRExpr::Var { .. }) => {
+        } if op == "OpAssign" && matches!(left.as_ref(), IRExpr::Var { .. }) => {
             if let IRExpr::Var { name, .. } = left.as_ref() {
-                if env.contains_key(name) {
-                    let val = encode_pure_expr(right, env, ctx.vctx, ctx.defs)
-                        .map_err(FnContractError::EncodingError)?;
-                    env.insert(name.clone(), val);
-                    return Ok(smt::bool_val(true));
-                }
+                let val = encode_pure_expr(right, env, ctx.vctx, ctx.defs)
+                    .map_err(FnContractError::EncodingError)?;
+                env.insert(name.clone(), val);
             }
-            encode_pure_expr(expr, env, ctx.vctx, ctx.defs).map_err(FnContractError::EncodingError)
+            Ok(smt::bool_val(true))
         }
 
         // IfElse with possible imperative branches
@@ -1094,10 +1094,11 @@ fn execute_loop_body(
             execute_loop_body(rest, env, constraints, assumptions, vctx, defs)
         }
 
-        // Assignment: var = expr
+        // Assignment (`=`): var = expr. Keyed on the dedicated `OpAssign`
+        // op so an equality comparison is never executed as a mutation.
         IRExpr::BinOp {
             op, left, right, ..
-        } if op == "OpEq" => {
+        } if op == "OpAssign" => {
             if let IRExpr::Var { name, .. } = left.as_ref() {
                 let val = encode_pure_expr(right, env, vctx, defs)
                     .map_err(FnContractError::EncodingError)?;
@@ -1301,7 +1302,9 @@ fn collect_modified_vars(body: &IRExpr, modified: &mut Vec<String>) {
         IRExpr::VarDecl { rest, .. } => {
             collect_modified_vars(rest, modified);
         }
-        IRExpr::BinOp { op, left, .. } if op == "OpEq" => {
+        // Only assignments (`OpAssign`) modify variables; an equality
+        // comparison (`OpEq`) does not.
+        IRExpr::BinOp { op, left, .. } if op == "OpAssign" => {
             if let IRExpr::Var { name, .. } = left.as_ref() {
                 modified.push(name.clone());
             }
@@ -1834,7 +1837,9 @@ mod fn_contract_residual_mutation_tests {
 
     fn assign(name: &str, right: IRExpr) -> IRExpr {
         IRExpr::BinOp {
-            op: "OpEq".to_owned(),
+            // Assignment uses the dedicated `OpAssign` op, distinct from
+            // equality's `OpEq`, matching how the lowering encodes `=`.
+            op: "OpAssign".to_owned(),
             left: Box::new(int_var(name)),
             right: Box::new(right),
             ty: IRType::Bool,

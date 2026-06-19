@@ -1162,7 +1162,9 @@ mod tests {
     use super::*;
     use crate::ast::AggKind;
     use crate::ast::Visibility;
-    use crate::elab::types::{EPattern, ERelCompBinding};
+    use crate::elab::types::{
+        BinOp, EEventAction, EFieldDefault, EPattern, ERelCompBinding, Literal,
+    };
     use crate::lex;
     use crate::parse::Parser;
 
@@ -1191,6 +1193,150 @@ mod tests {
 
     fn lit_int(value: i64) -> EExpr {
         EExpr::Lit(int_ty(), super::super::types::Literal::Int(value), None)
+    }
+
+    #[test]
+    fn collect_entity_single_value_in_default_becomes_value_default() {
+        let env = collect_src(
+            r#"
+entity Counter {
+  x: int in { 1 }
+}
+"#,
+        );
+
+        let entity = env.entities.get("Counter").expect("Counter entity");
+        let field = entity
+            .fields
+            .iter()
+            .find(|field| field.name == "x")
+            .expect("x field");
+        match field.default.as_ref().expect("x default") {
+            EFieldDefault::Value(EExpr::Lit(Ty::Builtin(BuiltinTy::Int), Literal::Int(1), _)) => {}
+            other => panic!("single-value `in` default should collect as Value(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_entity_rejects_field_action_name_conflicts() {
+        let env = collect_src(
+            r#"
+entity Counter {
+  x: int = 0
+  action x() {
+    x' = 1
+  }
+}
+"#,
+        );
+
+        assert!(
+            env.errors.iter().any(|error| {
+                error.kind == ErrorKind::DuplicateDecl
+                    && error
+                        .message
+                        .contains("duplicate name `x` in entity `Counter`")
+            }),
+            "field/action name conflict should be reported, got {:?}",
+            env.errors
+        );
+    }
+
+    #[test]
+    fn collect_entity_action_preserves_requires_and_ensures_contracts() {
+        let env = collect_src(
+            r#"
+entity Counter {
+  x: int = 0
+  action set(v: int)
+    requires v > 0
+    ensures x >= 0 {
+    x' = v
+  }
+}
+"#,
+        );
+
+        let entity = env.entities.get("Counter").expect("Counter entity");
+        let action = entity
+            .actions
+            .iter()
+            .find(|action| action.name == "set")
+            .expect("set action");
+        assert_eq!(
+            action.requires.len(),
+            1,
+            "requires contract must be collected"
+        );
+        assert_eq!(
+            action.ensures.len(),
+            1,
+            "ensures contract must be collected"
+        );
+        assert!(
+            matches!(action.requires[0], EExpr::BinOp(_, BinOp::Gt, _, _, _)),
+            "requires should preserve the comparison expression, got {:?}",
+            action.requires[0]
+        );
+        assert!(
+            matches!(action.ensures[0], EExpr::BinOp(_, BinOp::Ge, _, _, _)),
+            "ensures should preserve the comparison expression, got {:?}",
+            action.ensures[0]
+        );
+    }
+
+    #[test]
+    fn collect_system_command_body_requires_and_fsm_prime_assignments_are_checked() {
+        let env = collect_src(
+            r#"
+enum State = Open | Closed
+
+system Door {
+  state: State = @Open
+
+  fsm state {
+    @Open -> @Closed
+    @Closed ->
+  }
+
+  command reopen()
+    requires state == @Closed {
+    state' = @Open
+  }
+}
+"#,
+        );
+
+        let system = env.systems.get("Door").expect("Door system");
+        let action = system
+            .actions
+            .iter()
+            .find(|action| action.name == "reopen")
+            .expect("command body should be collected as an action");
+        assert_eq!(
+            action.requires.len(),
+            1,
+            "command body requires contract must be collected"
+        );
+        assert!(
+            matches!(
+                action.body.as_slice(),
+                [EEventAction::Expr(EExpr::Assign(_, _, _, _))]
+            ),
+            "command body should keep the primed assignment for fsm checking, got {:?}",
+            action.body
+        );
+        assert!(
+            env.errors.iter().any(|error| {
+                error.message.contains("Door::reopen")
+                    && error.message.contains("`@Closed` -> `@Open`")
+                    && error
+                        .message
+                        .contains("valid targets from `@Closed`: (none")
+            }),
+            "invalid system fsm transition should report the collected source and target, got {:?}",
+            env.errors
+        );
     }
 
     #[test]

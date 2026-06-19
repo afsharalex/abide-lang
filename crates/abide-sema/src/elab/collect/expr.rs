@@ -261,6 +261,7 @@ fn collect_set_comp_expr(
     filter: &ast::Expr,
     sp: Option<crate::span::Span>,
 ) -> EExpr {
+    // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
     let dom = domain.as_ref().map_or(Ty::Error, resolve_type_ref);
     let proj = projection.as_ref().map(|p| Box::new(collect_expr(p)));
     EExpr::SetComp(
@@ -302,6 +303,7 @@ fn collect_rel_comp_expr(
 fn collect_saw_expr(path: &[String], args: &[ast::SawArg], sp: Option<crate::span::Span>) -> EExpr {
     let (evt, prefix) = path
         .split_last()
+        // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
         .map_or(("", &[][..]), |(last, prefix)| (last.as_str(), prefix));
     let sys = prefix.join("::");
     let elab_args = args

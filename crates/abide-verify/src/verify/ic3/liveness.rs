@@ -62,8 +62,11 @@ struct DualLivenessRule<'a> {
 /// sound basis for theorem/proof liveness claims in general. In particular,
 /// reachable states where fair events are disabled can make fairness vacuous,
 /// while the monitor still requires justice bits to fire before it recognizes an
-/// accepting loop. Callers that produce unbounded proof claims must guard this
-/// path until per-event enabled tracking or a k-liveness proof engine is wired in.
+/// accepting loop. Because of this, the verdict is mapped through
+/// [`guarded_liveness_chc_verdict`], which downgrades a CHC `Proved` to
+/// `Unknown` so no unbounded liveness `PROVED` can escape from this unsound
+/// encoding. The guard is lifted once per-event enabled tracking or a
+/// k-liveness proof engine is wired in.
 ///
 /// `trigger` and `response` are the P and Q from `always (P implies eventually Q)`.
 /// `fair_events` lists (system, event) pairs with weak fairness.
@@ -119,8 +122,28 @@ pub fn try_ic3_liveness(input: Ic3LivenessInput<'_>) -> Ic3Result {
     };
 
     let result = chc::check_chc(&chc, "Error", timeout_ms);
+    guarded_liveness_chc_verdict(result)
+}
+
+/// Map a CHC reachability result for the liveness-to-safety monitor to an
+/// [`Ic3Result`], **guarding the `Proved` verdict**.
+///
+/// The monitor's weak-fairness encoding uses coarse justice bits and is
+/// not a sound basis for an unbounded liveness proof: the accepting
+/// condition requires a fair event to actually fire, so a reachable
+/// accepting loop where a fair event is disabled forever (weak fairness
+/// vacuously satisfied) — or a stutter-only loop — can be missed. A CHC
+/// `Proved` ("no accepting loop reachable") therefore does NOT entail the
+/// liveness property, and reporting `Ic3Result::Proved` here would be
+/// unsound. Until the encoding tracks per-event enabledness (or a
+/// k-liveness engine is wired in), `Proved` is downgraded to `Unknown`
+/// with a diagnostic. A monitor counterexample (`Counterexample`) and an
+/// existing `Unknown` reason pass through unchanged.
+pub(crate) fn guarded_liveness_chc_verdict(result: ChcResult) -> Ic3Result {
     match result {
-        ChcResult::Proved => Ic3Result::Proved,
+        ChcResult::Proved => {
+            Ic3Result::Unknown(crate::messages::LIVENESS_IC3_PROOF_WITHHELD.to_owned())
+        }
         ChcResult::Counterexample(_) => {
             // Liveness violation detected — the monitor found a loop.
             // For now, return a simple violation without detailed trace.

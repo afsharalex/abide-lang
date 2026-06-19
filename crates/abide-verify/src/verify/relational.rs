@@ -275,6 +275,14 @@ struct RelationalSystemStepSpec {
 #[derive(Debug, Clone)]
 struct RelationalEntitySpec {
     slot_count: usize,
+    /// Minimum active-instance count required in every state — the store's
+    /// declared lower bound (`store name: T[lo..hi]`). Elaboration guarantees
+    /// `lo >= param.lo` for the bound `Store<T>[..]` parameter, so enforcing it
+    /// here also enforces the parameter's cardinality contract. The other
+    /// backends (BMC, explicit) already constrain this; without it the
+    /// relational backend would explore sub-floor states (e.g. 0 active under a
+    /// `[1..N]` store) and report spurious counterexamples.
+    min_active: usize,
     initial_active_slots: HashSet<usize>,
     defaults: HashMap<String, SimpleValue>,
     field_domains: HashMap<String, Vec<SimpleValue>>,
@@ -453,6 +461,7 @@ fn build_create_only_scene_sat(
                 )
             })?;
         let (entity_name, field_values) = create_spec(step, &scene_event.args, &entities_by_name)?;
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let slot_count = store_slots.get(entity_name.as_str()).copied().unwrap_or(0);
         let potential_count = cardinality_budget(&scene_event.cardinality, some_budget);
         let mut fire_lits = Vec::new();
@@ -528,6 +537,7 @@ fn build_create_only_scene_sat(
             let slot_assigns: Vec<_> = create_instances
                 .iter()
                 .filter(|inst| inst.entity == *entity_name)
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|inst| inst.assigns.get(slot).copied())
                 .collect();
             for i in 0..slot_assigns.len() {
@@ -583,6 +593,15 @@ fn build_stateful_scene_sat(
         let active_by_state = vec![(0..entity_spec.slot_count)
             .map(|_| sat.new_lit())
             .collect::<Vec<_>>()];
+
+        // A scene witness must respect the store's active-count floor: prune
+        // witness states with fewer than `min_active` active instances.
+        if entity_spec.min_active > 0 {
+            sat.add_card_constr(CardConstraint::new_lb(
+                active_by_state[0].clone(),
+                entity_spec.min_active,
+            ));
+        }
 
         let mut field_domains = collect_field_domains(
             &entity_spec.defaults,
@@ -652,6 +671,7 @@ fn build_stateful_scene_sat(
             let selectors: Vec<_> = binding_slots
                 .values()
                 .filter(|(entity, _)| entity == entity_name)
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|(_, slots)| slots.get(slot_idx).copied())
                 .collect();
             let selected = or_lit(&mut sat, &selectors)?;
@@ -738,10 +758,23 @@ impl<'a> RelationalVerifyObligation<'a> {
         let mut entity_states = HashMap::new();
         for (entity_name, entity_spec) in &entities {
             let mut active_by_state = Vec::with_capacity(bound + 1);
+            // Initial state: @activated slots are forced active. When the
+            // declared activations alone cannot meet the store's active-count
+            // floor, free the remaining slots so the solver can activate extra
+            // anonymous instances to satisfy `min_active` (initial active is a
+            // superset of @activated). When the floor is already met, keep
+            // unactivated slots inactive ("starts empty unless activated").
+            let need_fill = entity_spec.min_active > entity_spec.initial_active_slots.len();
             active_by_state.push(
                 (0..entity_spec.slot_count)
                     .map(|slot| {
-                        const_lit(&mut sat, entity_spec.initial_active_slots.contains(&slot))
+                        if entity_spec.initial_active_slots.contains(&slot) {
+                            const_lit(&mut sat, true)
+                        } else if need_fill {
+                            sat.new_lit()
+                        } else {
+                            const_lit(&mut sat, false)
+                        }
                     })
                     .collect::<Vec<_>>(),
             );
@@ -751,6 +784,17 @@ impl<'a> RelationalVerifyObligation<'a> {
                         .map(|_| sat.new_lit())
                         .collect::<Vec<_>>(),
                 );
+            }
+            // Enforce the active-count floor at every state, so the relational
+            // backend cannot report a counterexample from a sub-floor state
+            // (e.g. 0 active under a `Store<T>[1..N]` store/parameter contract).
+            if entity_spec.min_active > 0 {
+                for state_lits in &active_by_state {
+                    sat.add_card_constr(CardConstraint::new_lb(
+                        state_lits.clone(),
+                        entity_spec.min_active,
+                    ));
+                }
             }
             let field_domains = collect_field_domains(
                 &entity_spec.defaults,
@@ -907,9 +951,12 @@ impl<'a> RelationalVerifyObligation<'a> {
         let (cnf, _) = sat.into_cnf();
         let mut solver = BasicSolver::default();
         if let Err(err) = solver.add_cnf(cnf) {
-            return RelationalVerifyOutcome::Counterexample {
-                witness: None,
-                witness_error: Some(format!("RustSAT setup failed: {err}")),
+            // A solver setup failure is an encoder/backend error, not a model
+            // witness. Reporting it as a counterexample would invent a
+            // definitive refutation out of a heuristic/backend failure. Mirror
+            // the scene path (`SceneUnknown`) and report it as inconclusive.
+            return RelationalVerifyOutcome::Unknown {
+                hint: format!("RustSAT setup failed: {err}"),
             };
         }
         match solver.solve() {
@@ -1089,10 +1136,17 @@ fn relational_stateful_scene_spec(
         let Some(defaults) = build_scene_default_field_map(entity_ir)? else {
             return Ok(None);
         };
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
+        let slot_count = usize::try_from(store.hi).unwrap_or(0);
+        let min_active = usize::try_from(store.lo.max(0))
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
+            .unwrap_or(0)
+            .min(slot_count);
         entities.insert(
             store.entity_type.clone(),
             RelationalEntitySpec {
-                slot_count: usize::try_from(store.hi).unwrap_or(0),
+                slot_count,
+                min_active,
                 initial_active_slots: HashSet::new(),
                 defaults,
                 field_domains: finite_field_domains(entity_ir),
@@ -1272,6 +1326,7 @@ fn create_spec(
 fn build_store_slots(scene: &IRScene) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for store in &scene.stores {
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let slots = usize::try_from(store.hi.max(0)).unwrap_or(0);
         let entry = out.entry(store.entity_type.clone()).or_insert(0);
         *entry += slots;
@@ -1287,6 +1342,7 @@ fn cardinality_budget(cardinality: &Cardinality, some_budget: usize) -> usize {
             "some" => some_budget,
             _ => 1,
         },
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         Cardinality::Exact { exactly } => usize::try_from(*exactly).unwrap_or(0),
     }
 }
@@ -1306,6 +1362,7 @@ fn add_cardinality_constraint(
         },
         Cardinality::Exact { exactly } => sat.add_card_constr(CardConstraint::new_eq(
             lits,
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             usize::try_from(*exactly).unwrap_or(0),
         )),
     }
@@ -2119,8 +2176,10 @@ fn relational_verify_spec(
         let Some(defaults) = build_default_field_map(entity_ir)? else {
             return Ok(None);
         };
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let slot_count = usize::try_from(store.hi).unwrap_or(0);
         let min_active = usize::try_from(store.lo.max(0))
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             .unwrap_or(0)
             .min(slot_count);
         store_ranges.insert(
@@ -2136,6 +2195,7 @@ fn relational_verify_spec(
             store.entity_type.clone(),
             RelationalEntitySpec {
                 slot_count,
+                min_active,
                 initial_active_slots: HashSet::new(),
                 defaults,
                 field_domains: finite_field_domains(entity_ir),
@@ -4535,7 +4595,7 @@ fn relation_value_domains(
             let left_domains = relation_value_domains(left, entity_states)?;
             let right_domains = relation_value_domains(right, entity_states)?;
             if left_domains.is_empty() || right_domains.is_empty() {
-                return Ok(Vec::new());
+                return Err("Rel::join requires non-empty relation operands".to_owned());
             }
             let mut domains = Vec::new();
             domains.extend(left_domains[..left_domains.len() - 1].iter().cloned());
@@ -4809,7 +4869,7 @@ fn encode_relation_value_membership(
             let left_domains = relation_value_domains(left, entity_states)?;
             let right_domains = relation_value_domains(right, entity_states)?;
             if left_domains.is_empty() || right_domains.is_empty() {
-                return Ok(const_lit(sat, false));
+                return Err("Rel::join requires non-empty relation operands".to_owned());
             }
             let left_arity = left_domains.len();
             let right_arity = right_domains.len();
@@ -5989,7 +6049,7 @@ mod tests {
     }
 
     #[test]
-    fn create_only_scene_bounds_do_not_seed_initial_instances() {
+    fn scene_store_lower_bound_does_not_materialize_named_given_instances() {
         let status_ty = IRType::Enum {
             name: "Status".to_owned(),
             variants: vec![crate::ir::types::IRVariant::simple("Pending")],
@@ -6015,7 +6075,7 @@ mod tests {
         let store_slots = HashMap::from([("Order".to_owned(), 1)]);
         let entities_by_name = HashMap::from([("Order".to_owned(), &order)]);
         let scene = IRScene {
-            name: "capacity_only".to_owned(),
+            name: "active_floor".to_owned(),
             systems: vec!["Commerce".to_owned()],
             stores: vec![IRStoreDecl {
                 name: "orders".to_owned(),
@@ -6036,9 +6096,11 @@ mod tests {
         let instances =
             build_initial_store_instances(&mut sat, &scene, &store_slots, &entities_by_name);
 
-        assert!(
-            instances.is_empty(),
-            "store bounds describe capacity; initial entities must be activated explicitly"
+        assert_eq!(
+            instances.len(),
+            0,
+            "scene store lower bounds are enforced by active-cardinality constraints; \
+             this helper only materializes explicit named given bindings"
         );
     }
 
@@ -6125,5 +6187,29 @@ mod tests {
         symmetrized.add_unit(!inactive_first);
         symmetrized.add_unit(active_second);
         assert!(matches!(solve_instance(symmetrized), SolverResult::Unsat));
+    }
+
+    #[test]
+    fn relation_join_rejects_arityless_operand_without_empty_relation_fallback() {
+        let entity_states = HashMap::new();
+        let left_empty_domain = RelValueExpr::Comprehension {
+            projection: Vec::new(),
+            bindings: Vec::new(),
+            filter: RelScopedPred::True,
+        };
+        let right_empty_domain = RelValueExpr::Comprehension {
+            projection: Vec::new(),
+            bindings: Vec::new(),
+            filter: RelScopedPred::True,
+        };
+        let join = RelValueExpr::Join(Box::new(left_empty_domain), Box::new(right_empty_domain));
+
+        let err = relation_value_domains(&join, &entity_states)
+            .expect_err("arityless relation joins must not silently become empty relations");
+
+        assert!(
+            err.contains("Rel::join requires non-empty relation operands"),
+            "{err}"
+        );
     }
 }

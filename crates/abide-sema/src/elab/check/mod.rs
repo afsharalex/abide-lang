@@ -9,7 +9,7 @@ mod matches;
 mod system;
 
 use ctors::{check_ctor_records_in_expr, walk_event_action_for_ctor_check};
-use entity::{check_entity, check_invariant_body_no_liveness};
+use entity::{check_entity, check_invariant_body_state_only};
 use matches::check_match_exhaustiveness;
 use system::{check_extern, check_system};
 
@@ -581,6 +581,15 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
             check_collection_homogeneity(left, ctx, errors);
             check_collection_homogeneity(right, ctx, errors);
         }
+        // `e in coll` — the collection operand may itself be a literal whose
+        // elements must be homogeneous (and `in` is type-directed at lowering,
+        // so it trusts that operand's type). Additionally check that the
+        // element/key type is compatible with the collection.
+        EExpr::In(_, left, right, span) => {
+            check_membership_compatibility(left, right, *span, ctx, errors);
+            check_collection_homogeneity(left, ctx, errors);
+            check_collection_homogeneity(right, ctx, errors);
+        }
         EExpr::Call(_, f, args, span) => {
             if let EExpr::Var(_, name, _) = f.as_ref() {
                 if name == "Map" && args.len() % 2 != 0 {
@@ -629,6 +638,68 @@ fn check_collection_homogeneity(expr: &EExpr, ctx: &str, errors: &mut Vec<ElabEr
     }
 }
 
+/// Resolve a collection type to its structural form, peeling aliases,
+/// refinements, and newtypes — so `in` dispatch sees the underlying
+/// `Set`/`Seq`/`Map`/`Store`/`Rel`. Mirrors the IR lowering's `peel_collection_ty`.
+fn peel_membership_collection_ty(ty: &Ty) -> &Ty {
+    match ty {
+        Ty::Alias(_, inner) | Ty::Refinement(inner, _) | Ty::Newtype(_, inner) => {
+            peel_membership_collection_ty(inner)
+        }
+        other => other,
+    }
+}
+
+/// Type-check the membership operator `elem in collection` for element/key
+/// compatibility.
+///
+/// `in` is type-directed at lowering (`Set`/`Store`/`Rel` → `Index`,
+/// `Map` → `OpMapHas` key membership), but lowering trusts the operand types
+/// and never checks that the element actually belongs to the collection. This
+/// adds the missing sema check, so `"x" in Set<int>` or `true in Map<int, V>`
+/// are rejected instead of silently lowering to a well-typed-but-wrong
+/// membership test.
+///
+/// Structural rejection of `in` over a `Seq` or a non-collection is left to the
+/// lowering pass (`IN_NOT_SUPPORTED_FOR_SEQ` / `IN_REQUIRES_MEMBERSHIP_COLLECTION`):
+/// lowering runs unconditionally and its diagnostics carry a different code, so
+/// re-emitting them here would duplicate rather than dedup. `Ty::Error`
+/// operands are skipped to avoid cascading from an upstream type error.
+fn check_membership_compatibility(
+    elem: &EExpr,
+    collection: &EExpr,
+    span: Option<crate::span::Span>,
+    ctx: &str,
+    errors: &mut Vec<ElabError>,
+) {
+    let elem_ty = elem.ty();
+    let (kind, expected): (&str, Ty) = match peel_membership_collection_ty(&collection.ty()) {
+        Ty::Set(element) => ("set", (**element).clone()),
+        Ty::Store(entity) => ("store", Ty::Entity(entity.clone())),
+        Ty::Map(key, _) => ("map key", (**key).clone()),
+        Ty::Relation(columns) => {
+            // Membership tests a tuple of the relation's columns; a unary
+            // relation additionally accepts the bare scalar column type.
+            if columns.len() == 1 && types_compatible(&elem_ty, &columns[0]) {
+                return;
+            }
+            ("relation", Ty::Tuple(columns.clone()))
+        }
+        // `Seq`, non-collection, and already-errored operands are handled at
+        // lowering (or intentionally skipped); see the doc comment.
+        _ => return,
+    };
+    if !types_compatible(&elem_ty, &expected) {
+        let mut err = ElabError::new(
+            ErrorKind::TypeMismatch,
+            messages::membership_type_mismatch(elem_ty.name(), kind, expected.name()),
+            ctx,
+        );
+        err.span = span;
+        errors.push(err);
+    }
+}
+
 /// Check if two types are compatible (same kind, ignoring poison).
 pub(super) fn types_compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
@@ -667,6 +738,13 @@ pub(super) fn types_compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::Alias(_, a), b) | (b, Ty::Alias(_, a)) => types_compatible(a, b),
         (Ty::Refinement(a, _), b) | (b, Ty::Refinement(a, _)) => types_compatible(a, b),
         (Ty::Entity(a), Ty::Named(b)) | (Ty::Named(a), Ty::Entity(b)) => a == b,
+        // Newtypes are nominally distinct wrappers, so they are compatible only
+        // with the same-named newtype (never with their bare base type, unlike
+        // the transparent `Alias`/`Refinement` above). A still-unresolved
+        // `Named` reference to the newtype matches by name, mirroring the
+        // entity/named arm.
+        (Ty::Newtype(na, _), Ty::Newtype(nb, _)) => na == nb,
+        (Ty::Newtype(na, _), Ty::Named(nb)) | (Ty::Named(na), Ty::Newtype(nb, _)) => na == nb,
         _ => false,
     }
 }
@@ -1486,6 +1564,7 @@ fn find_sequence_composition_span(expr: &EExpr) -> Option<crate::span::Span> {
                 .or_else(|| {
                     bindings
                         .iter()
+                        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                         .filter_map(|binding| binding.source.as_deref())
                         .find_map(find_sequence_composition_span)
                 })
@@ -1521,6 +1600,7 @@ fn find_sequence_composition_span(expr: &EExpr) -> Option<crate::span::Span> {
             }),
         EExpr::Saw(_, _, _, args, _) => args
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|arg| arg.as_ref())
             .find_map(|expr| find_sequence_composition_span(expr)),
         EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => fields
@@ -1617,6 +1697,7 @@ fn find_unsupported_verifier_expr(expr: &EExpr) -> Option<&'static str> {
                 .or_else(|| {
                     bindings
                         .iter()
+                        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                         .filter_map(|binding| binding.source.as_deref())
                         .find_map(find_unsupported_verifier_expr)
                 })
@@ -1641,6 +1722,7 @@ fn find_unsupported_verifier_expr(expr: &EExpr) -> Option<&'static str> {
             }),
         EExpr::Saw(_, _, _, args, _) => args
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|arg| arg.as_ref())
             .find_map(|expr| find_unsupported_verifier_expr(expr)),
         EExpr::CtorRecord(_, _, _, fields, _) | EExpr::StructCtor(_, _, fields, _) => fields
@@ -2288,6 +2370,256 @@ mod tests {
             None,
         );
         assert_eq!(collect_homogeneity_errors(&nested).len(), 4);
+    }
+
+    #[test]
+    fn collection_homogeneity_descends_into_membership_operand() {
+        // `5 in Set(1, true)` — the membership collection is a heterogeneous
+        // set literal, which must still be flagged even though it sits under
+        // `in` (whose lowering is type-directed and trusts that operand).
+        let expr = EExpr::In(
+            Ty::Builtin(BuiltinTy::Bool),
+            Box::new(int_lit(5)),
+            Box::new(EExpr::SetLit(
+                Ty::Error,
+                vec![int_lit(1), bool_lit(true)],
+                None,
+            )),
+            None,
+        );
+        let errors = collect_homogeneity_errors(&expr);
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e.kind, ErrorKind::TypeMismatch)
+                    && e.message.contains("element 1")),
+            "heterogeneous set literal inside `in` must be flagged: {errors:?}"
+        );
+    }
+
+    fn str_lit(s: &str) -> EExpr {
+        EExpr::Lit(
+            Ty::Builtin(BuiltinTy::String),
+            Literal::Str(s.to_owned()),
+            None,
+        )
+    }
+
+    /// A variable carrying a given (already-resolved) type, used as the
+    /// collection operand of `in`.
+    fn typed_var(name: &str, ty: Ty) -> EExpr {
+        EExpr::Var(ty, name.to_owned(), None)
+    }
+
+    fn membership(elem: EExpr, collection: EExpr) -> EExpr {
+        EExpr::In(
+            Ty::Builtin(BuiltinTy::Bool),
+            Box::new(elem),
+            Box::new(collection),
+            None,
+        )
+    }
+
+    fn set_ty(elem: Ty) -> Ty {
+        Ty::Set(Box::new(elem))
+    }
+
+    fn int_ty() -> Ty {
+        Ty::Builtin(BuiltinTy::Int)
+    }
+
+    fn membership_mismatch_errors(expr: &EExpr) -> Vec<ElabError> {
+        collect_homogeneity_errors(expr)
+            .into_iter()
+            .filter(|e| {
+                matches!(e.kind, ErrorKind::TypeMismatch)
+                    && e.message.contains("membership expects")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn membership_rejects_element_type_mismatch_for_set() {
+        // `"x" in Set<int>`
+        let expr = membership(str_lit("x"), typed_var("s", set_ty(int_ty())));
+        let errors = membership_mismatch_errors(&expr);
+        assert_eq!(errors.len(), 1, "expected one mismatch error: {errors:?}");
+        assert!(
+            errors[0].message.contains("set membership expects `int`"),
+            "message: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn membership_accepts_compatible_set_element() {
+        // `1 in Set<int>` — well-typed, no error.
+        let expr = membership(int_lit(1), typed_var("s", set_ty(int_ty())));
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "compatible set membership must not error"
+        );
+    }
+
+    #[test]
+    fn membership_rejects_map_key_type_mismatch() {
+        // `true in Map<int, bool>` — key membership, bool key vs int.
+        let map_ty = Ty::Map(Box::new(int_ty()), Box::new(Ty::Builtin(BuiltinTy::Bool)));
+        let expr = membership(bool_lit(true), typed_var("m", map_ty));
+        let errors = membership_mismatch_errors(&expr);
+        assert_eq!(errors.len(), 1, "expected one mismatch error: {errors:?}");
+        assert!(
+            errors[0]
+                .message
+                .contains("map key membership expects `int`"),
+            "message: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn membership_rejects_store_entity_type_mismatch() {
+        // `order in Store<Customer>` where `order: Order`.
+        let expr = membership(
+            typed_var("order", Ty::Entity("Order".to_owned())),
+            typed_var("customers", Ty::Store("Customer".to_owned())),
+        );
+        let errors = membership_mismatch_errors(&expr);
+        assert_eq!(errors.len(), 1, "expected one mismatch error: {errors:?}");
+        assert!(
+            errors[0]
+                .message
+                .contains("store membership expects `Customer`"),
+            "message: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn membership_accepts_store_matching_entity() {
+        let expr = membership(
+            typed_var("o", Ty::Entity("Order".to_owned())),
+            typed_var("orders", Ty::Store("Order".to_owned())),
+        );
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "matching store entity membership must not error"
+        );
+    }
+
+    #[test]
+    fn membership_rejects_relation_tuple_mismatch() {
+        // `(1, true) in Rel<int, int>` — tuple column mismatch.
+        let rel_ty = Ty::Relation(vec![int_ty(), int_ty()]);
+        let bad_tuple = EExpr::TupleLit(
+            Ty::Tuple(vec![int_ty(), Ty::Builtin(BuiltinTy::Bool)]),
+            vec![int_lit(1), bool_lit(true)],
+            None,
+        );
+        let expr = membership(bad_tuple, typed_var("r", rel_ty));
+        assert_eq!(
+            membership_mismatch_errors(&expr).len(),
+            1,
+            "relation tuple-column mismatch must be flagged"
+        );
+    }
+
+    #[test]
+    fn membership_accepts_unary_relation_scalar_element() {
+        // `1 in Rel<int>` — a unary relation admits the bare scalar.
+        let expr = membership(int_lit(1), typed_var("r", Ty::Relation(vec![int_ty()])));
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "unary relation scalar membership must not error"
+        );
+    }
+
+    fn newtype_ty(name: &str, base: Ty) -> Ty {
+        Ty::Newtype(name.to_owned(), Box::new(base))
+    }
+
+    #[test]
+    fn membership_accepts_same_newtype_set_element() {
+        // `u in Set<UserId>` where `u: UserId` — newtypes are nominal, so a
+        // same-named newtype element must be accepted (not falsely rejected by
+        // a missing `types_compatible` arm).
+        let uid = || newtype_ty("UserId", int_ty());
+        let expr = membership(typed_var("u", uid()), typed_var("ids", set_ty(uid())));
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "same-named newtype set membership must not error"
+        );
+    }
+
+    #[test]
+    fn membership_accepts_same_newtype_map_key() {
+        // `u in Map<UserId, bool>` key membership.
+        let uid = newtype_ty("UserId", int_ty());
+        let map_ty = Ty::Map(
+            Box::new(uid.clone()),
+            Box::new(Ty::Builtin(BuiltinTy::Bool)),
+        );
+        let expr = membership(typed_var("u", uid), typed_var("m", map_ty));
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "same-named newtype map-key membership must not error"
+        );
+    }
+
+    #[test]
+    fn membership_rejects_distinct_newtypes_over_same_base() {
+        // `o in Set<UserId>` where `o: OrderId` — distinct newtypes over the
+        // same base `int` are NOT interchangeable.
+        let expr = membership(
+            typed_var("o", newtype_ty("OrderId", int_ty())),
+            typed_var("ids", set_ty(newtype_ty("UserId", int_ty()))),
+        );
+        let errors = membership_mismatch_errors(&expr);
+        assert_eq!(errors.len(), 1, "expected one mismatch error: {errors:?}");
+        assert!(
+            errors[0]
+                .message
+                .contains("set membership expects `UserId`"),
+            "message: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn membership_rejects_newtype_against_bare_base() {
+        // `5 in Set<UserId>` — a bare `int` is not a `UserId`.
+        let expr = membership(
+            int_lit(5),
+            typed_var("ids", set_ty(newtype_ty("UserId", int_ty()))),
+        );
+        assert_eq!(
+            membership_mismatch_errors(&expr).len(),
+            1,
+            "bare base value must not satisfy newtype membership"
+        );
+    }
+
+    #[test]
+    fn membership_does_not_cascade_on_errored_collection() {
+        // An upstream type error (Ty::Error collection) must not add a
+        // membership diagnostic.
+        let expr = membership(str_lit("x"), typed_var("oops", Ty::Error));
+        assert!(
+            membership_mismatch_errors(&expr).is_empty(),
+            "errored collection must not produce a membership mismatch"
+        );
+    }
+
+    #[test]
+    fn membership_sees_through_refinement_wrapped_collection() {
+        // A refinement over `Set<int>` still type-checks element membership.
+        let refined = Ty::Refinement(Box::new(set_ty(int_ty())), Box::new(bool_lit(true)));
+        let expr = membership(str_lit("x"), typed_var("s", refined));
+        assert_eq!(
+            membership_mismatch_errors(&expr).len(),
+            1,
+            "refinement-wrapped collection must still be checked"
+        );
     }
 
     #[test]

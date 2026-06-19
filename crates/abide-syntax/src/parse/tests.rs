@@ -75,6 +75,119 @@ fn parse_expr_err(src: &str) -> ParseError {
         .expect_err("expected parse error, got successful parse")
 }
 
+fn expr_depth(expr: &Expr) -> usize {
+    match &expr.kind {
+        ExprKind::Pipe(a, b)
+        | ExprKind::Unord(a, b)
+        | ExprKind::Conc(a, b)
+        | ExprKind::Xor(a, b)
+        | ExprKind::Seq(a, b)
+        | ExprKind::SameStep(a, b)
+        | ExprKind::Impl(a, b)
+        | ExprKind::Until(a, b)
+        | ExprKind::Since(a, b)
+        | ExprKind::Assign(a, b)
+        | ExprKind::Or(a, b)
+        | ExprKind::And(a, b)
+        | ExprKind::Eq(a, b)
+        | ExprKind::NEq(a, b)
+        | ExprKind::In(a, b)
+        | ExprKind::Lt(a, b)
+        | ExprKind::Gt(a, b)
+        | ExprKind::Le(a, b)
+        | ExprKind::Ge(a, b)
+        | ExprKind::Add(a, b)
+        | ExprKind::Sub(a, b)
+        | ExprKind::Mul(a, b)
+        | ExprKind::Div(a, b)
+        | ExprKind::Mod(a, b)
+        | ExprKind::Diamond(a, b)
+        | ExprKind::Disjoint(a, b) => 1 + expr_depth(a).max(expr_depth(b)),
+        _ => 1,
+    }
+}
+
+// ── Expression depth guard ───────────────────────────────────────
+
+#[test]
+fn deep_associative_boolean_chain_parses_without_depth_diagnostic() {
+    // Boolean conjunctions/disjunctions are associative. Long realistic chains
+    // should be represented shallowly instead of being rejected by the
+    // adversarial nesting guard.
+    let chain = (0..super::MAX_EXPR_DEPTH + 50)
+        .map(|i| format!("x == {i}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let _ = parse_expr(&chain);
+}
+
+#[test]
+fn deep_associative_boolean_chain_builds_shallow_tree() {
+    let chain = (0..super::MAX_EXPR_DEPTH + 50)
+        .map(|i| format!("x == {i}"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let expr = parse_expr(&chain);
+    let depth = expr_depth(&expr);
+
+    assert!(
+        depth < 64,
+        "balanced associative boolean tree should stay shallow, got depth {depth}"
+    );
+}
+
+#[test]
+fn deep_non_associative_chain_still_yields_depth_diagnostic() {
+    let chain = (0..super::MAX_EXPR_DEPTH + 50)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" - ");
+    let err = parse_expr_err(&chain);
+    let msg = err.to_diagnostic().message;
+    assert!(
+        msg.contains("too deeply nested"),
+        "expected a depth diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn realistic_depth_chain_parses_without_error() {
+    // A chain comfortably under the budget (far deeper than any human-written
+    // spec) must still parse cleanly.
+    let chain = (0..200)
+        .map(|i| format!("x == {i}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let _ = parse_expr(&chain);
+}
+
+#[test]
+fn deeply_parenthesized_expression_yields_diagnostic_not_crash() {
+    // Genuine recursive nesting (`((((…))))`) must trip the recursion guard.
+    // Reaching the limit needs ~MAX_EXPR_DEPTH parser frames, so run on an
+    // explicitly sized stack rather than the small default test stack.
+    let result = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let depth = super::MAX_EXPR_DEPTH + 50;
+            let src = format!("{}0{}", "(".repeat(depth), ")".repeat(depth));
+            let tokens = lex::lex(&src).expect("lex error");
+            let mut parser = Parser::new(tokens);
+            parser
+                .expr()
+                .map(|_| ())
+                .map_err(|e| e.to_diagnostic().message)
+        })
+        .expect("spawn parser worker")
+        .join()
+        .expect("parser worker must not panic/overflow");
+    let msg = result.expect_err("deeply parenthesized expression must be rejected");
+    assert!(
+        msg.contains("too deeply nested"),
+        "expected a depth diagnostic, got: {msg}"
+    );
+}
+
 // ── Expression precedence tests ──────────────────────────────────
 
 #[test]

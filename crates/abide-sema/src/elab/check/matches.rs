@@ -1,6 +1,6 @@
 //! Match expression exhaustiveness checking.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::super::error::{ElabError, ErrorKind};
 use super::super::types::{EEntity, EExpr, EPattern, Ty, VariantFieldsMap};
@@ -56,22 +56,24 @@ pub(super) fn check_match_exhaustiveness(
                 );
             }
 
-            // Collect covered constructors from unguarded arms.
-            // An unguarded wildcard/variable covers everything.
-            let mut covered: HashSet<&str> = HashSet::new();
+            // Determine which constructors are not fully covered by the
+            // unguarded arms. A top-level wildcard/variable covers everything;
+            // otherwise a constructor is covered only when the arms matching it
+            // exhaustively cover its *nested* field patterns (recursively), so a
+            // partial nested pattern like `A { inner: X }` no longer over-covers
+            // the whole `A` variant. Guarded arms are conservative — the guard
+            // might be false — so they never contribute to coverage.
             let mut has_catchall = false;
-
+            let mut unguarded: Vec<Vec<EPattern>> = Vec::new();
             for (pat, guard, _) in arms {
                 if guard.is_some() {
-                    // Guarded arms are conservative — the guard might be false,
-                    // so this arm doesn't guarantee coverage.
                     continue;
                 }
                 if pattern_is_catchall(pat, constructors) {
                     has_catchall = true;
                     break;
                 }
-                collect_covered_ctors(pat, constructors, &mut covered);
+                unguarded.push(vec![pat.clone()]);
             }
 
             if has_catchall {
@@ -80,7 +82,19 @@ pub(super) fn check_match_exhaustiveness(
 
             let missing: Vec<&str> = constructors
                 .iter()
-                .filter(|c| !covered.contains(c.as_str()))
+                .filter(|ctor| {
+                    let field_types = variant_field_types(enum_name, ctor, variant_fields);
+                    let mut specialized = Vec::new();
+                    specialize(
+                        &unguarded,
+                        constructors,
+                        ctor,
+                        &field_types,
+                        &mut specialized,
+                    );
+                    let sub_types: Vec<Ty> = field_types.iter().map(|(_, t)| t.clone()).collect();
+                    !matrix_exhaustive(&sub_types, &specialized, types, variant_fields)
+                })
                 .map(String::as_str)
                 .collect();
 
@@ -245,32 +259,144 @@ pub(super) fn pattern_is_catchall(pat: &EPattern, constructors: &[String]) -> bo
     }
 }
 
-/// Collect constructor names covered by an unguarded pattern.
-pub(super) fn collect_covered_ctors<'a>(
-    pat: &'a EPattern,
-    constructors: &'a [String],
-    covered: &mut HashSet<&'a str>,
+/// Field declarations `(name, type)` for one constructor, in declared order.
+///
+/// A constructor that is registered in `variant_fields` always returns
+/// `Some`: a nullary one yields the empty field list, a record one yields its
+/// declared fields. The empty fallback below is reached only if the
+/// enum/constructor is *absent* from `variant_fields`, which cannot occur for
+/// an enum resolved from a declaration during elaboration — `variant_fields`
+/// is populated for every declared enum. It is therefore purely defensive: it
+/// never panics and never approximates coverage for well-formed input.
+pub(super) fn variant_field_types(
+    enum_name: &str,
+    ctor: &str,
+    variant_fields: &VariantFieldsMap,
+) -> Vec<(String, Ty)> {
+    variant_fields
+        .get(enum_name)
+        .and_then(|variants| {
+            variants
+                .iter()
+                .find(|(variant, _)| variant == ctor)
+                .map(|(_, fields)| fields.clone())
+        })
+        // abide-audit: allow-silent-fallback -- defensive empty for an enum/constructor absent from variant_fields; unreachable for declared enums, so no coverage is approximated for well-formed input
+        .unwrap_or_default()
+}
+
+/// Specialize a pattern matrix on constructor `ctor`: each row whose head
+/// (column 0, a value of the enum with constructors `head_ctors`) can match
+/// `ctor` contributes a row where the head is replaced by `ctor`'s field
+/// sub-patterns (in `field_types` order, defaulting to wildcard) followed by
+/// the row's remaining columns. Rows that cannot match `ctor` are dropped.
+pub(super) fn specialize(
+    matrix: &[Vec<EPattern>],
+    head_ctors: &[String],
+    ctor: &str,
+    field_types: &[(String, Ty)],
+    out: &mut Vec<Vec<EPattern>>,
 ) {
-    match pat {
+    for row in matrix {
+        let Some((head, rest)) = row.split_first() else {
+            continue;
+        };
+        specialize_head(head, rest, head_ctors, ctor, field_types, out);
+    }
+}
+
+fn specialize_head(
+    head: &EPattern,
+    rest: &[EPattern],
+    head_ctors: &[String],
+    ctor: &str,
+    field_types: &[(String, Ty)],
+    out: &mut Vec<Vec<EPattern>>,
+) {
+    match head {
+        EPattern::Wild => push_wildcard_expansion(rest, field_types, out),
         EPattern::Var(name) => {
-            // A Var that matches a constructor name covers that constructor
-            if let Some(ctor) = constructors.iter().find(|c| c.as_str() == name) {
-                covered.insert(ctor);
+            if head_ctors.iter().any(|c| c == name) {
+                // A bare constructor reference (nullary) only matches its own
+                // constructor.
+                if name == ctor {
+                    push_wildcard_expansion(rest, field_types, out);
+                }
+            } else {
+                // A binding catches everything, covering this constructor.
+                push_wildcard_expansion(rest, field_types, out);
             }
-            // Otherwise it's a variable binding (catch-all) — handled by pattern_is_catchall
         }
-        EPattern::Ctor(name, _) => {
-            if let Some(ctor) = constructors.iter().find(|c| c.as_str() == name) {
-                covered.insert(ctor);
+        EPattern::Ctor(name, fields) => {
+            if name == ctor {
+                let mut expanded: Vec<EPattern> = field_types
+                    .iter()
+                    .map(|(fname, _)| {
+                        fields
+                            .iter()
+                            .find(|(pf, _)| pf == fname)
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or(EPattern::Wild)
+                    })
+                    .collect();
+                expanded.extend_from_slice(rest);
+                out.push(expanded);
             }
         }
         EPattern::Or(left, right) => {
-            collect_covered_ctors(left, constructors, covered);
-            collect_covered_ctors(right, constructors, covered);
+            specialize_head(left, rest, head_ctors, ctor, field_types, out);
+            specialize_head(right, rest, head_ctors, ctor, field_types, out);
         }
-        EPattern::Wild => {
-            // Catch-all — handled by pattern_is_catchall
+    }
+}
+
+fn push_wildcard_expansion(
+    rest: &[EPattern],
+    field_types: &[(String, Ty)],
+    out: &mut Vec<Vec<EPattern>>,
+) {
+    let mut row: Vec<EPattern> = field_types.iter().map(|_| EPattern::Wild).collect();
+    row.extend_from_slice(rest);
+    out.push(row);
+}
+
+/// Standard constructor-specialization exhaustiveness over a pattern matrix:
+/// does `matrix` (rows of column patterns aligned with `col_types`) cover every
+/// value of the column tuple? Abide patterns have no literal patterns, so a
+/// non-enum column (int/bool/string/entity/…) admits only catch-alls, each of
+/// which covers the whole column.
+pub(super) fn matrix_exhaustive(
+    col_types: &[Ty],
+    matrix: &[Vec<EPattern>],
+    types: &HashMap<String, Ty>,
+    variant_fields: &VariantFieldsMap,
+) -> bool {
+    let Some((head_ty, rest_types)) = col_types.split_first() else {
+        // No columns remain: covered iff at least one row survived.
+        return !matrix.is_empty();
+    };
+
+    if let Some((enum_name, ctors)) = resolve_to_enum_info(head_ty, types) {
+        ctors.iter().all(|ctor| {
+            let field_types = variant_field_types(enum_name, ctor, variant_fields);
+            let mut sub = Vec::new();
+            specialize(matrix, ctors, ctor, &field_types, &mut sub);
+            let mut sub_types: Vec<Ty> = field_types.iter().map(|(_, t)| t.clone()).collect();
+            sub_types.extend_from_slice(rest_types);
+            matrix_exhaustive(&sub_types, &sub, types, variant_fields)
+        })
+    } else {
+        // Non-enum column: keep only catch-all rows (the sole possibility),
+        // drop the column from each, and recurse on the remaining columns.
+        let mut sub = Vec::new();
+        for row in matrix {
+            if let Some((head, rest)) = row.split_first() {
+                if pattern_is_catchall(head, &[]) {
+                    sub.push(rest.to_vec());
+                }
+            }
         }
+        matrix_exhaustive(rest_types, &sub, types, variant_fields)
     }
 }
 
@@ -420,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn pattern_helpers_distinguish_catchalls_and_covered_constructors() {
+    fn pattern_is_catchall_distinguishes_bindings_from_constructors() {
         let ctors = constructors();
         assert!(pattern_is_catchall(&EPattern::Wild, &ctors));
         assert!(pattern_is_catchall(
@@ -442,14 +568,6 @@ mod tests {
             &EPattern::Ctor("Open".to_string(), vec![]),
             &ctors
         ));
-
-        let or_pattern = EPattern::Or(
-            Box::new(EPattern::Var("Open".to_string())),
-            Box::new(EPattern::Ctor("Closed".to_string(), vec![])),
-        );
-        let mut covered = HashSet::new();
-        collect_covered_ctors(&or_pattern, &ctors, &mut covered);
-        assert_eq!(covered, HashSet::from(["Open", "Closed"]));
     }
 
     #[test]
@@ -635,5 +753,102 @@ mod tests {
         );
         assert_eq!(errors.len(), 2);
         assert!(errors.iter().all(|error| error.message.contains("Closed")));
+    }
+
+    #[test]
+    fn nested_constructor_pattern_does_not_over_cover_outer_variant() {
+        // enum Inner = X | Y
+        // enum Outer = A { inner: Inner } | B
+        let inner_ty = Ty::Enum("Inner".to_string(), vec!["X".to_string(), "Y".to_string()]);
+        let outer_ty = Ty::Enum("Outer".to_string(), vec!["A".to_string(), "B".to_string()]);
+        let types = HashMap::from([
+            ("Inner".to_string(), inner_ty),
+            ("Outer".to_string(), outer_ty.clone()),
+        ]);
+        let mut variant_fields = VariantFieldsMap::new();
+        variant_fields.insert(
+            "Outer".to_string(),
+            vec![
+                (
+                    "A".to_string(),
+                    vec![("inner".to_string(), Ty::Named("Inner".to_string()))],
+                ),
+                ("B".to_string(), vec![]),
+            ],
+        );
+        variant_fields.insert(
+            "Inner".to_string(),
+            vec![("X".to_string(), vec![]), ("Y".to_string(), vec![])],
+        );
+
+        let scrut = || EExpr::Var(outer_ty.clone(), "o".to_string(), None);
+        // Nullary constructors are written bare (parsed as `Var`); a record
+        // constructor like `A { inner: ... }` keeps its field sub-patterns.
+        let a_inner = |inner_ctor: &str| {
+            EPattern::Ctor(
+                "A".to_string(),
+                vec![("inner".to_string(), EPattern::Var(inner_ctor.to_string()))],
+            )
+        };
+        let b_pat = || EPattern::Var("B".to_string());
+        let check = |expr: &EExpr| {
+            let mut errors = Vec::new();
+            check_match_exhaustiveness(expr, &types, &HashMap::new(), &variant_fields, &mut errors);
+            errors
+        };
+
+        // match o { A { inner: X } => _; B => _ } is NOT exhaustive: A { inner: Y }
+        // is uncovered, so a nested constructor pattern must not over-cover A.
+        let non_exhaustive = EExpr::Match(
+            Box::new(scrut()),
+            vec![
+                (a_inner("X"), None, bool_lit(true)),
+                (b_pat(), None, bool_lit(false)),
+            ],
+            Some(crate::span::Span { start: 1, end: 2 }),
+        );
+        let errors = check(&non_exhaustive);
+        assert_eq!(
+            errors.len(),
+            1,
+            "nested non-exhaustive match must report A as uncovered: {errors:?}"
+        );
+        assert!(matches!(errors[0].kind, ErrorKind::NonExhaustiveMatch));
+
+        // Adding A { inner: Y } makes it exhaustive (X | Y covers Inner).
+        let exhaustive = EExpr::Match(
+            Box::new(scrut()),
+            vec![
+                (a_inner("X"), None, bool_lit(true)),
+                (a_inner("Y"), None, bool_lit(false)),
+                (b_pat(), None, bool_lit(false)),
+            ],
+            Some(crate::span::Span { start: 1, end: 2 }),
+        );
+        assert!(
+            check(&exhaustive).is_empty(),
+            "nested exhaustive match must not error"
+        );
+
+        // A binding at the nested field fully covers the whole A variant.
+        let binding_covers = EExpr::Match(
+            Box::new(scrut()),
+            vec![
+                (
+                    EPattern::Ctor(
+                        "A".to_string(),
+                        vec![("inner".to_string(), EPattern::Var("i".to_string()))],
+                    ),
+                    None,
+                    bool_lit(true),
+                ),
+                (b_pat(), None, bool_lit(false)),
+            ],
+            Some(crate::span::Span { start: 1, end: 2 }),
+        );
+        assert!(
+            check(&binding_covers).is_empty(),
+            "a binding at a nested field must cover the entire variant"
+        );
     }
 }

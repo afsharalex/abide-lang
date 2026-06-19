@@ -453,6 +453,7 @@ fn ensure_pooled_sygus_expr_supported(expr: &IRExpr, context: &str) -> Result<()
         diagnostic
             .span
             .map(|span| format!(" at {}..{}", span.start, span.end))
+            // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
             .unwrap_or_default()
     ))
 }
@@ -637,7 +638,9 @@ pub fn try_cvc5_sygus_multi_system_pooled_safety(
         property,
         timeout_ms,
     ) {
-        Ok(()) => Ic3Result::Proved,
+        // The test wrapper does not run the caller-side Z3/IR re-validation;
+        // `Ok(_)` means synthesis + the plain-SMT pre-filter passed.
+        Ok(_) => Ic3Result::Proved,
         Err(err) => Ic3Result::Unknown(err),
     }
 }
@@ -677,6 +680,7 @@ pub(super) fn try_cvc5_sygus_multi_pooled_system_safety_inner(
         property,
         timeout_ms,
     )
+    .map(|_| ())
 }
 
 pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
@@ -686,7 +690,7 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     slots_per_entity: &HashMap<String, usize>,
     property: &IRExpr,
     timeout_ms: u64,
-) -> Result<(), String> {
+) -> Result<Option<IRExpr>, String> {
     let entities_by_name: HashMap<_, _> = entities.iter().map(|e| (e.name.clone(), e)).collect();
     let systems_by_name: HashMap<_, _> = systems.iter().map(|s| (s.name.clone(), s)).collect();
     ensure_pooled_sygus_system_supported(root_system, systems, entities, property)?;
@@ -784,11 +788,12 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
             enum_catalog.register_type(&tm, &derived.ty)?;
         }
     }
-    solver.set_logic(if requires_all_logic(&enum_catalog, &all_fields, &[]) {
+    let logic = if requires_all_logic(&enum_catalog, &all_fields, &[]) {
         "ALL"
     } else {
         "LIA"
-    });
+    };
+    solver.set_logic(logic);
 
     let mut curr_vars = HashMap::new();
     let mut next_vars = HashMap::new();
@@ -984,19 +989,25 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
     let mut trans_params = curr_order.clone();
     trans_params.extend(next_order.iter().cloned());
 
-    let pre_fun = solver.define_fun("pre_abide", &curr_order, bool_sort.clone(), pre_body, false);
+    let pre_fun = solver.define_fun(
+        "pre_abide",
+        &curr_order,
+        bool_sort.clone(),
+        pre_body.clone(),
+        false,
+    );
     let trans_fun = solver.define_fun(
         "trans_abide",
         &trans_params,
         bool_sort.clone(),
-        trans_body,
+        trans_body.clone(),
         false,
     );
     let post_fun = solver.define_fun(
         "post_abide",
         &curr_order,
         bool_sort.clone(),
-        property_body,
+        property_body.clone(),
         false,
     );
     let inv_fun = solver.synth_fun("inv_abide", &curr_order, bool_sort);
@@ -1005,8 +1016,54 @@ pub(super) fn try_cvc5_sygus_multi_system_pooled_safety_inner(
 
     let result = solver.check_synth();
     if result.has_solution() {
-        let _solution = solver.get_synth_solution(inv_fun);
-        Ok(())
+        let solution = solver.get_synth_solution(inv_fun);
+        // Soundness: independently re-validate the synthesized invariant's
+        // init/induction/safety obligations with plain SMT before reporting
+        // success; failure downgrades to Err instead of a false PROVED.
+        let inv_curr = apply_synth_solution(&solution, &curr_order)?;
+        let inv_next = apply_synth_solution(&solution, &next_order)?;
+        revalidate_invariant_obligations(
+            &InvariantObligations {
+                tm: &tm,
+                pre_body: &pre_body,
+                trans_body: &trans_body,
+                post_body: &property_body,
+                curr_order: &curr_order,
+                next_order: &next_order,
+                logic,
+            },
+            &inv_curr,
+            &inv_next,
+        )?;
+        // The plain-SMT pre-filter passed. Translate the synthesized invariant
+        // — whose variables are the flat, slot-qualified current-state names
+        // (`<entity>_<slot>_active`, `<entity>_<slot>_<field>`, and unique
+        // system field names) that make up `curr_order` — back to IRExpr so
+        // the caller can independently re-validate it through the slot-aware
+        // Z3/IR path. An untranslatable invariant yields `None` → conservative
+        // downgrade.
+        let mut var_types: HashMap<String, IRType> = HashMap::new();
+        for (_, field) in &ordered_system_fields {
+            var_types.insert(field.name.clone(), field.ty.clone());
+        }
+        for entity_name in slots_per_entity.keys() {
+            let entity = entities_by_name
+                .get(entity_name)
+                .ok_or_else(|| format!("missing pooled entity `{entity_name}`"))?;
+            let n_slots = *slots_per_entity
+                .get(entity_name)
+                .ok_or_else(|| format!("missing slot count for pooled entity `{entity_name}`"))?;
+            for slot in 0..n_slots {
+                var_types.insert(format!("{}_{}_active", entity.name, slot), IRType::Bool);
+                for field in &entity.fields {
+                    var_types.insert(
+                        format!("{}_{}_{}", entity.name, slot, field.name),
+                        field.ty.clone(),
+                    );
+                }
+            }
+        }
+        Ok(cvc5_term_to_ir(&inv_curr, &var_types).ok())
     } else if result.is_unknown() {
         Err(format!(
             "cvc5 SyGuS returned Unknown for pooled system safety ({result})"

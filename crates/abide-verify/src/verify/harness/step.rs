@@ -8,8 +8,12 @@ use crate::verify::{encode, walkers};
 mod branching;
 mod nested;
 
+pub(crate) use self::branching::try_encode_macro_value_expr;
 #[cfg(test)]
 use self::branching::*;
+pub(in crate::verify::harness) use self::branching::{
+    event_fire_precondition_formula, step_scope_metadata,
+};
 pub(crate) use self::branching::{try_encode_step_inner, StepEncodingOptions};
 
 /// Encode a system event as a single transition step.
@@ -111,7 +115,7 @@ mod tests {
     use super::*;
     use crate::ir::types::{
         IRActionMatchArm, IRActionMatchScrutinee, IRCreateField, IRField, IRPattern, IRProgram,
-        IRStoreParam, IRTransition, IRTypeEntry, IRUpdate, IRVariant,
+        IRStoreParam, IRTransRef, IRTransition, IRTypeEntry, IRUpdate, IRVariant,
     };
     use crate::verify::smt::{self, AbideSolver, SatResult};
 
@@ -266,6 +270,8 @@ mod tests {
             store_params: vec![IRStoreParam {
                 name: "orders".to_owned(),
                 entity_type: "Order".to_owned(),
+                lo: None,
+                hi: None,
             }],
             fields: vec![],
             entities: vec!["Order".to_owned()],
@@ -910,6 +916,227 @@ mod tests {
         );
         assert_eq!(solver.check(), SatResult::Sat);
         assert!(touched.contains(&("Order".to_owned(), 0)));
+    }
+
+    #[test]
+    fn chained_apply_resolves_cross_entity_ref_field_in_later_apply() {
+        // A bound block with two direct applies on the same var, where the
+        // SECOND apply reads a cross-entity ref field (`m.y`). The chained
+        // path rebuilds the later apply's params separately from the first,
+        // so it must wire the foreign ref binding the same way — otherwise
+        // `m.y` is dropped and encoding fails with "field y not found".
+        let marker_ty = IRType::Entity {
+            name: "Marker".to_owned(),
+        };
+        let counter = IREntity {
+            name: "Counter".to_owned(),
+            fields: vec![IRField {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                default: Some(int_lit(0)),
+                initial_constraint: None,
+            }],
+            transitions: vec![
+                IRTransition {
+                    name: "bump".to_owned(),
+                    refs: vec![],
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                        span: None,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "x".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "self".to_owned(),
+                                    ty: IRType::Entity {
+                                        name: "Counter".to_owned(),
+                                    },
+                                    span: None,
+                                }),
+                                field: "x".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            right: Box::new(int_lit(1)),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                    }],
+                    postcondition: None,
+                },
+                IRTransition {
+                    name: "sync_from_marker".to_owned(),
+                    refs: vec![IRTransRef {
+                        name: "m".to_owned(),
+                        entity: "Marker".to_owned(),
+                    }],
+                    params: vec![],
+                    guard: IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                        span: None,
+                    },
+                    updates: vec![IRUpdate {
+                        field: "x".to_owned(),
+                        value: IRExpr::BinOp {
+                            op: "OpAdd".to_owned(),
+                            left: Box::new(IRExpr::Field {
+                                expr: Box::new(IRExpr::Var {
+                                    name: "m".to_owned(),
+                                    ty: marker_ty.clone(),
+                                    span: None,
+                                }),
+                                field: "y".to_owned(),
+                                ty: IRType::Int,
+                                span: None,
+                            }),
+                            right: Box::new(int_lit(1)),
+                            ty: IRType::Int,
+                            span: None,
+                        },
+                    }],
+                    postcondition: None,
+                },
+            ],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let marker = IREntity {
+            name: "Marker".to_owned(),
+            fields: vec![IRField {
+                name: "y".to_owned(),
+                ty: IRType::Int,
+                default: Some(int_lit(0)),
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let vctx = make_step_test_vctx();
+        // Body: bind `m` via a sibling choose (registers `m.y`), then a
+        // top-level forall whose chained applies read it in the 2nd apply.
+        let event = IRSystemAction {
+            name: "run".to_owned(),
+            params: vec![],
+            guard: IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![
+                IRAction::Choose {
+                    var: "m".to_owned(),
+                    entity: "Marker".to_owned(),
+                    filter: Box::new(IRExpr::Lit {
+                        ty: IRType::Bool,
+                        value: LitVal::Bool { value: true },
+                        span: None,
+                    }),
+                    ops: vec![],
+                },
+                IRAction::ForAll {
+                    var: "c".to_owned(),
+                    entity: "Counter".to_owned(),
+                    ops: vec![
+                        IRAction::Apply {
+                            target: "c".to_owned(),
+                            transition: "bump".to_owned(),
+                            refs: vec![],
+                            args: vec![],
+                        },
+                        IRAction::Apply {
+                            target: "c".to_owned(),
+                            transition: "sync_from_marker".to_owned(),
+                            refs: vec!["m".to_owned()],
+                            args: vec![],
+                        },
+                    ],
+                },
+            ],
+            return_expr: None,
+        };
+        let system = IRSystem {
+            name: "CounterMarker".to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec!["Counter".to_owned(), "Marker".to_owned()],
+            commands: vec![],
+            actions: vec![event],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        };
+        let entities = vec![counter, marker];
+        let pool = create_slot_pool(
+            &entities,
+            &HashMap::from([
+                ("Counter".to_owned(), 1_usize),
+                ("Marker".to_owned(), 1_usize),
+            ]),
+            1,
+        );
+
+        let (formula, _touched) = try_encode_step_inner(
+            &pool,
+            &vctx,
+            &entities,
+            std::slice::from_ref(&system),
+            &system.actions[0],
+            0,
+            StepEncodingOptions::root(),
+        )
+        .expect("chained cross-entity ref step encodes");
+
+        let solver = AbideSolver::new();
+        if let Some(SmtValue::Bool(active)) = pool.active_at("Counter", 0, 0) {
+            solver.assert(active);
+        }
+        if let Some(SmtValue::Bool(active)) = pool.active_at("Marker", 0, 0) {
+            solver.assert(active);
+        }
+        // Marker.y = 5 → the chained `sync_from_marker` overwrites the bumped
+        // value, so Counter.x at step 1 must equal m.y + 1 = 6.
+        solver.assert(
+            &smt::smt_eq(
+                pool.field_at("Marker", 0, "y", 0).expect("marker y"),
+                &smt::int_val(5),
+            )
+            .expect("marker y eq"),
+        );
+        solver.assert(&formula);
+
+        solver.push();
+        solver.assert(
+            &smt::smt_eq(
+                pool.field_at("Counter", 0, "x", 1).expect("counter x next"),
+                &smt::int_val(6),
+            )
+            .expect("counter x eq 6"),
+        );
+        assert_eq!(solver.check(), SatResult::Sat);
+        solver.pop();
+
+        // It must NOT be possible for Counter.x to take any other value.
+        solver.assert(
+            &smt::smt_eq(
+                pool.field_at("Counter", 0, "x", 1).expect("counter x next"),
+                &smt::int_val(7),
+            )
+            .expect("counter x eq 7"),
+        );
+        assert_eq!(solver.check(), SatResult::Unsat);
     }
 
     #[test]

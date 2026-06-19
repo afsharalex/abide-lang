@@ -122,6 +122,16 @@ pub const INVARIANT_LIVENESS_NOT_ALLOWED: &str =
 pub const HINT_INVARIANT_LIVENESS_NOT_ALLOWED: &str =
     "invariants are safety properties — for liveness, use a `prop` and verify it explicitly";
 
+/// A primed (next-state) expression appears in an invariant body. Invariants
+/// are state-only (single-state) predicates; a prime `'` refers to the next
+/// state and is a two-state form, so it is not part of the invariant fragment.
+pub const INVARIANT_PRIME_NOT_ALLOWED: &str =
+    "primed (next-state) expressions are not allowed in invariant bodies";
+
+/// Hint accompanying `INVARIANT_PRIME_NOT_ALLOWED`.
+pub const HINT_INVARIANT_PRIME_NOT_ALLOWED: &str =
+    "invariants are single-state — to relate the current and next state, use an action or command postcondition";
+
 /// past-time temporal operators (`historically`,
 /// `once`, `previously`, `since`) appear in a theorem show or in a
 /// merged entity/system invariant on the theorem path. The 1-induction
@@ -266,6 +276,13 @@ pub fn label_deadlock(name: &str, step: usize) -> String {
 
 /// BMC: Z3 returned unknown without timeout.
 pub const BMC_UNKNOWN: &str = "Z3 returned unknown — try reducing bound or simplifying property";
+
+/// Liveness: the negated property's Büchi automaton could not be constructed
+/// (its subformula closure exceeds the 128-bit state width), so the lasso
+/// search would check nothing. Report this instead of a vacuous CHECKED.
+pub const LTL_AUTOMATON_TOO_LARGE: &str =
+    "could not construct a Büchi automaton for this liveness property — its \
+     subformula closure reaches the 128-state-bit limit; simplify the temporal property";
 
 /// Theorem/verify: no systems or entities in scope.
 pub const VERIFY_EMPTY_SCOPE: &str = "no systems or entities found for theorem";
@@ -436,6 +453,22 @@ pub const ACTION_NESTED_PRIME: &str =
      silently dropped by the verifier — split the action into \
      separate guarded actions instead";
 
+/// an entity action body contains a top-level statement that is not a
+/// primed field update (`field' = ...`). The IR lowering's
+/// `extract_updates` only projects top-level `Assign(Prime(Var), _)`
+/// nodes, so any other statement shape — an unprimed assignment
+/// (`field = ...`), a primed assignment to a non-field target, or a
+/// bare expression — is silently dropped from `IRTransition::updates`.
+/// A dropped mutation leaves the field framed as unchanged, silently
+/// weakening verification. Detected at elab time so the user gets a
+/// clear diagnostic instead.
+pub const ACTION_UNSUPPORTED_STMT: &str =
+    "entity action bodies may only contain primed field updates \
+     (`field' = ...`); this statement is not a supported update and \
+     would be silently dropped by the verifier — write it as a \
+     top-level primed field update, or move guard conditions into a \
+     `requires` clause";
+
 /// an entity action statically prime-assigns the
 /// fsm field to a state that is not a legal target from the source
 /// state implied by the action's `requires` clause. Detected at elab
@@ -605,6 +638,22 @@ pub const LIVENESS_REDUCTION_FAILED: &str =
     "liveness-to-safety reduction could not prove the property; \
      try a verify block with bounded lasso BMC for counterexample search";
 
+/// Diagnostic when an IC3 liveness-to-safety `Proved` result is withheld
+/// because the weak-fairness monitor encoding is incomplete. The coarse
+/// justice bits require a fair event to actually fire before an accepting
+/// loop is recognized, so a reachable loop where a fair event is disabled
+/// forever (weak fairness vacuously satisfied) or a stutter-only accepting
+/// loop can be missed — which would make a genuine liveness counterexample
+/// look `PROVED`. Until per-event enabledness tracking or a k-liveness
+/// engine lands, the unbounded IC3 liveness proof is downgraded
+/// conservatively to bounded checking.
+pub const LIVENESS_IC3_PROOF_WITHHELD: &str =
+    "unbounded liveness proof via IC3 liveness-to-safety is withheld: its \
+     weak-fairness monitor is incomplete (a reachable loop where a fair \
+     event is disabled forever, or a stutter-only accepting loop, can be \
+     missed), so a PROVED verdict would be unsound — reporting bounded \
+     lasso BMC results instead";
+
 /// Hint when symmetry reduction fails (asymmetric system or IC3 timeout).
 pub const SYMMETRY_REDUCTION_FAILED: &str =
     "symmetry reduction could not prove quantified liveness \
@@ -641,6 +690,62 @@ pub fn enum_default_not_constructor(enum_name: &str, ctors: &str) -> String {
 pub fn collection_op_unsupported_arity(type_name: &str, func_name: &str, n: usize) -> String {
     format!("{type_name}::{func_name} takes {n} arguments, which is not supported")
 }
+
+/// The membership operator `in` is applied to a sequence. Sequences are
+/// ordered and positional, not membership-tested, and there is no sound
+/// element-of encoding for them, so `e in seq` is rejected.
+pub const IN_NOT_SUPPORTED_FOR_SEQ: &str =
+    "`in` is not supported for sequences — sequences are ordered, not membership-tested; \
+     quantify over the sequence instead (e.g. `some i: int in 0..#s | s[i] == e`)";
+
+/// The membership operator `in` is applied to something that is not a
+/// membership-testable collection (set/store/relation/map).
+pub const IN_REQUIRES_MEMBERSHIP_COLLECTION: &str = "`in` requires a collection on the right — \
+     set/store/relation membership (`e in S`) and map key membership (`k in Map`) \
+     are the only supported forms";
+
+/// The membership operator `in` is applied with a left operand whose type is
+/// incompatible with the collection's element type (set/store/relation) or key
+/// type (map), e.g. `"x" in Set<int>` or `true in Map<int, V>`.
+pub fn membership_type_mismatch(elem_ty: &str, collection_kind: &str, expected_ty: &str) -> String {
+    format!(
+        "`in` left operand has type `{elem_ty}`, but {collection_kind} membership expects `{expected_ty}`"
+    )
+}
+
+/// A single expression nests deeper than the parser's structural-depth budget.
+/// Emitted as a diagnostic instead of overflowing the stack on a pathologically
+/// deep (usually machine-generated) expression. `limit` is the configured cap.
+pub fn expression_too_deeply_nested(limit: usize) -> String {
+    format!("expression is too deeply nested (exceeds the {limit}-level limit)")
+}
+
+/// Help line paired with [`expression_too_deeply_nested`].
+pub const HELP_EXPRESSION_TOO_DEEP: &str =
+    "split it into smaller named definitions (`fn`/`pred`/`let`) or simplify it";
+
+/// A verify block reaches a state where a checked division/modulo is evaluated
+/// with a zero divisor. The concrete evaluators reject this as undefined, so the
+/// SMT path surfaces it rather than absorbing it into the solver's total div/mod.
+pub const REACHABLE_DIVISION_BY_ZERO: &str =
+    "reachable division/modulo by zero: the spec evaluates `/` or `%` \
+     with a zero divisor in a reachable state — guard the divisor (`d != 0 implies …`) \
+     or maintain an invariant that keeps it non-zero";
+
+/// The div/mod well-definedness obligation is present but could not be
+/// discharged (encoding error, or the solver returned `unknown`). The proof must
+/// not fall through to PROVED/CHECKED while well-definedness is undischarged.
+pub const DIVISION_WELL_DEFINEDNESS_INCONCLUSIVE: &str =
+    "could not prove division/modulo well-definedness: a `/` or `%` operation is \
+     present but the solver could not establish that the divisor is non-zero in \
+     every reachable state";
+
+/// A function body/contract evaluates a checked division/modulo whose divisor
+/// is not provably non-zero under the function's preconditions.
+pub const FN_DIVISION_BY_ZERO: &str =
+    "division/modulo by zero: a `/` or `%` divisor is not provably non-zero \
+     under the function's preconditions — add a `requires d != 0` (or guard the division \
+     with `d != 0 implies …`)";
 
 // ── `saw` operator messages ─────────────────────────────────────────
 
@@ -785,6 +890,15 @@ mod tests {
             collection_op_unsupported_arity("Seq", "slice", 3),
             "Seq::slice takes 3 arguments, which is not supported"
         );
+        assert_eq!(
+            membership_type_mismatch("bool", "map key", "int"),
+            "`in` left operand has type `bool`, but map key membership expects `int`"
+        );
+        assert_eq!(
+            expression_too_deeply_nested(512),
+            "expression is too deeply nested (exceeds the 512-level limit)"
+        );
+        assert!(HELP_EXPRESSION_TOO_DEEP.contains("smaller named definitions"));
     }
 
     #[test]

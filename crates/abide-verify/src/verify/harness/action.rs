@@ -1,4 +1,5 @@
 use super::*;
+use crate::verify::encode::unqualify_ctor_name;
 
 /// Encode an entity action as a transition relation for a specific slot.
 ///
@@ -36,6 +37,21 @@ pub fn try_encode_action(
     );
 
     let empty_ept: HashMap<String, String> = HashMap::new();
+    // Classify the transition's entity-typed inputs so a cross-entity reference
+    // in the body (e.g. `m.y` where `m: Marker` is a `ref`) resolves to the
+    // referenced entity's slot fields rather than falling back to the current
+    // slot's entity. Each `ref` carries its entity type; entity-typed `params`
+    // do too. Their slot values are supplied in `params` by
+    // `try_build_apply_params`.
+    let mut entity_param_types: HashMap<String, String> = HashMap::new();
+    for reference in &action.refs {
+        entity_param_types.insert(reference.name.clone(), reference.entity.clone());
+    }
+    for param in &action.params {
+        if let IRType::Entity { name } = &param.ty {
+            entity_param_types.insert(param.name.clone(), name.clone());
+        }
+    }
     let ctx = SlotEncodeCtx {
         pool,
         vctx,
@@ -44,7 +60,7 @@ pub fn try_encode_action(
         params: params.clone(),
         bindings: HashMap::new(),
         system_name: "",
-        entity_param_types: &empty_ept,
+        entity_param_types: &entity_param_types,
         store_param_types: &empty_ept,
     };
 
@@ -52,17 +68,35 @@ pub fn try_encode_action(
 
     // Guard: encode the requires clause for this slot at this step
     let guard = try_encode_slot_expr(&ctx, &action.guard, step)?;
-    conjuncts.push(guard.to_bool()?);
+    let guard_bool = guard.to_bool()?;
+    conjuncts.push(guard_bool.clone());
 
-    // Updates: for each primed assignment, set the field at step+1
+    // Updates: for each primed assignment, set the field at step+1. The update
+    // only runs when the action's guard holds AND this slot is active (an
+    // inactive slot cannot act — see the active-flag conjuncts below), so guard
+    // div/mod obligations recorded inside the update values by both conditions.
+    // Without the active flag, a div in an inactive slot's update value could be
+    // falsely flagged even though that slot's update is never asserted.
     let updated_fields: Vec<String> = action.updates.iter().map(|u| u.field.clone()).collect();
 
-    for update in &action.updates {
-        let new_val = try_encode_slot_expr(&ctx, &update.value, step)?;
-        if let Some(field_next) = pool.field_at(&entity.name, slot, &update.field, step + 1) {
-            conjuncts.push(smt::smt_eq(&new_val, field_next)?);
+    let div_guard = match pool.active_at(&entity.name, slot, step) {
+        Some(SmtValue::Bool(act_curr)) => smt::bool_and(&[&guard_bool, act_curr]),
+        _ => guard_bool,
+    };
+    crate::verify::property::push_harness_div_guard(div_guard);
+    let updates_result = (|| {
+        for update in &action.updates {
+            let (new_val, value_constraints) =
+                try_encode_macro_value_expr(&ctx, &update.value, step)?;
+            conjuncts.extend(value_constraints);
+            if let Some(field_next) = pool.field_at(&entity.name, slot, &update.field, step + 1) {
+                conjuncts.push(smt::smt_eq(&new_val, field_next)?);
+            }
         }
-    }
+        Ok::<(), String>(())
+    })();
+    crate::verify::property::pop_harness_div_guard();
+    updates_result?;
 
     // Frame: fields NOT in updates stay the same
     for field in &entity.fields {
@@ -172,16 +206,26 @@ pub fn try_encode_action_with_vars(
 
     // Guard: evaluate against read_vars
     let guard = try_eval_expr_with_vars(&action.guard, entity, read_vars, vctx, params)?;
-    conjuncts.push(guard.to_bool()?);
+    let guard_bool = guard.to_bool()?;
+    conjuncts.push(guard_bool.clone());
 
-    // Updates: evaluate value from read_vars, constrain write_vars
+    // Updates: evaluate value from read_vars, constrain write_vars. The update
+    // only runs when this apply's guard holds, so guard div/mod obligations
+    // recorded inside the update values by that guard (mirroring the
+    // single-apply `try_encode_action` path).
     let updated_fields: Vec<String> = action.updates.iter().map(|u| u.field.clone()).collect();
-    for update in &action.updates {
-        let new_val = try_eval_expr_with_vars(&update.value, entity, read_vars, vctx, params)?;
-        if let Some(write_val) = write_vars.get(&update.field) {
-            conjuncts.push(smt::smt_eq(&new_val, write_val)?);
+    crate::verify::property::push_harness_div_guard(guard_bool);
+    let updates_result = (|| {
+        for update in &action.updates {
+            let new_val = try_eval_expr_with_vars(&update.value, entity, read_vars, vctx, params)?;
+            if let Some(write_val) = write_vars.get(&update.field) {
+                conjuncts.push(smt::smt_eq(&new_val, write_val)?);
+            }
         }
-    }
+        Ok::<(), String>(())
+    })();
+    crate::verify::property::pop_harness_div_guard();
+    updates_result?;
 
     // Frame: fields NOT in updates copied from read to write
     for field in &entity.fields {
@@ -305,7 +349,9 @@ pub(super) fn try_eval_expr_with_vars(
         IRExpr::Ctor {
             enum_name, ctor, ..
         } => {
-            let id = vctx.variants.try_id_of(enum_name, ctor)?;
+            let id = vctx
+                .variants
+                .try_id_of(enum_name, unqualify_ctor_name(ctor))?;
             Ok(smt::int_val(id))
         }
         IRExpr::BinOp {
@@ -313,6 +359,18 @@ pub(super) fn try_eval_expr_with_vars(
         } => {
             let l = try_eval_expr_with_vars(left, entity, vars, vctx, params)?;
             let r = try_eval_expr_with_vars(right, entity, vars, vctx, params)?;
+            // Integer `/`/`%` in a chained-apply update value is undefined when
+            // the divisor is zero. The chained encoder evaluates these directly
+            // (not through the shared slot encoder), so record the
+            // well-definedness obligation here too, guarded by the current
+            // harness path guard, or a div-by-zero in a second-or-later
+            // sequential apply would be silently absorbed into solver-total
+            // division.
+            if matches!(op.as_str(), "OpDiv" | "OpMod") {
+                if let SmtValue::Int(_) = &r {
+                    crate::verify::property::record_harness_div_obligation(r.clone());
+                }
+            }
             Ok(smt::binop(op, &l, &r)?)
         }
         IRExpr::UnOp { op, operand, .. } => {
@@ -423,7 +481,8 @@ pub fn try_encode_create(
         let create_field_names: HashSet<&str> =
             create_fields.iter().map(|(n, _)| n.as_str()).collect();
         for (field_name, value_expr) in create_fields {
-            let val = try_encode_slot_expr(&ctx, value_expr, step)?;
+            let (val, value_constraints) = try_encode_macro_value_expr(&ctx, value_expr, step)?;
+            conjuncts.extend(value_constraints);
             if let Some(field_next) = pool.field_at(entity_name, slot, field_name, step + 1) {
                 conjuncts.push(smt::smt_eq(&val, field_next)?);
             }
@@ -529,15 +588,45 @@ pub(super) fn try_build_apply_params(
         map.insert(param.name.clone(), val);
     }
 
-    // Wire refs to action refs (entity variable names → resolve from slot context)
-    for (ref_decl, ref_name) in action.refs.iter().zip(refs.iter()) {
+    wire_apply_refs(&mut map, ctx, &action.refs, refs, step);
+
+    Ok(map)
+}
+
+/// Wire a transition's `ref` parameters into an apply's params map: bind each
+/// caller ref name to the referenced entity's slot value, and carry any
+/// pre-resolved qualified field bindings (`m.y`) under the callee's ref name.
+///
+/// Shared by the single-apply (`try_build_apply_params`) and chained-apply
+/// (`legacy_chain_apply_params`) paths so a later apply in a chained bound
+/// block that reads a cross-entity ref field (`m.y`) resolves it the same way
+/// the first apply does — otherwise the binding is silently dropped and the
+/// transition fails to encode ("field y not found in chained encoding").
+pub(super) fn wire_apply_refs(
+    map: &mut HashMap<String, SmtValue>,
+    ctx: &SlotEncodeCtx<'_>,
+    action_refs: &[IRTransRef],
+    refs: &[String],
+    step: usize,
+) {
+    for (ref_decl, ref_name) in action_refs.iter().zip(refs.iter()) {
         // refs are entity variable names — resolve from params first, then slot fields
         if let Some(val) = ctx.params.get(ref_name) {
             map.insert(ref_decl.name.clone(), val.clone());
         } else if let Some(val) = ctx.pool.field_at(ctx.entity, ctx.slot, ref_name, step) {
             map.insert(ref_decl.name.clone(), val.clone());
         }
-    }
 
-    Ok(map)
+        // Carry over any pre-resolved qualified field bindings for this ref
+        // (e.g. the caller resolved `m.y` into ctx.params under the outer name
+        // `m`). Re-key them under the callee's ref name so the transition body,
+        // which references its own ref parameter (`m.y`), can resolve the
+        // cross-entity field access without re-deriving the slot.
+        let outer_prefix = format!("{ref_name}.");
+        for (key, val) in ctx.params.iter() {
+            if let Some(field) = key.strip_prefix(&outer_prefix) {
+                map.insert(format!("{}.{field}", ref_decl.name), val.clone());
+            }
+        }
+    }
 }

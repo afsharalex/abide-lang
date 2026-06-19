@@ -112,6 +112,240 @@ impl IRType {
     }
 }
 
+/// Canonical lowered binary operators.
+///
+/// `IRExpr::BinOp` stores the operator name as a string for wire/back-compat
+/// with existing serialized IR and hand-written tests. Verifier code should
+/// parse that string through this enum before dispatching, so typo-cased names
+/// such as `OpNeq` cannot accidentally drift into partially-supported paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)]
+pub enum IRBinOp {
+    OpAdd,
+    OpSub,
+    OpMul,
+    OpDiv,
+    OpMod,
+    OpEq,
+    OpNEq,
+    OpLt,
+    OpGt,
+    OpLe,
+    OpGe,
+    OpAnd,
+    OpOr,
+    OpImplies,
+    OpUnord,
+    OpConc,
+    OpSameStep,
+    OpSeq,
+    OpXor,
+    OpDiamond,
+    OpDisjoint,
+    OpAssign,
+    OpMapHas,
+    OpMapMerge,
+    OpSetUnion,
+    OpSetIntersect,
+    OpSetDiff,
+    OpSetSubset,
+    OpSetDisjoint,
+    OpSetMember,
+    OpSeqConcat,
+    OpSeqCons,
+    OpRelJoin,
+    OpRelProduct,
+    OpRelProject,
+    OpRelTranspose,
+    OpRelReach,
+    OpRelationField,
+    OpRelationJoin,
+    OpRelationProduct,
+    OpRelationProject,
+    OpRelationTranspose,
+    OpRelationReach,
+}
+
+impl IRBinOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpAdd => "OpAdd",
+            Self::OpSub => "OpSub",
+            Self::OpMul => "OpMul",
+            Self::OpDiv => "OpDiv",
+            Self::OpMod => "OpMod",
+            Self::OpEq => "OpEq",
+            Self::OpNEq => "OpNEq",
+            Self::OpLt => "OpLt",
+            Self::OpGt => "OpGt",
+            Self::OpLe => "OpLe",
+            Self::OpGe => "OpGe",
+            Self::OpAnd => "OpAnd",
+            Self::OpOr => "OpOr",
+            Self::OpImplies => "OpImplies",
+            Self::OpUnord => "OpUnord",
+            Self::OpConc => "OpConc",
+            Self::OpSameStep => "OpSameStep",
+            Self::OpSeq => "OpSeq",
+            Self::OpXor => "OpXor",
+            Self::OpDiamond => "OpDiamond",
+            Self::OpDisjoint => "OpDisjoint",
+            Self::OpAssign => "OpAssign",
+            Self::OpMapHas => "OpMapHas",
+            Self::OpMapMerge => "OpMapMerge",
+            Self::OpSetUnion => "OpSetUnion",
+            Self::OpSetIntersect => "OpSetIntersect",
+            Self::OpSetDiff => "OpSetDiff",
+            Self::OpSetSubset => "OpSetSubset",
+            Self::OpSetDisjoint => "OpSetDisjoint",
+            Self::OpSetMember => "OpSetMember",
+            Self::OpSeqConcat => "OpSeqConcat",
+            Self::OpSeqCons => "OpSeqCons",
+            Self::OpRelJoin => "OpRelJoin",
+            Self::OpRelProduct => "OpRelProduct",
+            Self::OpRelProject => "OpRelProject",
+            Self::OpRelTranspose => "OpRelTranspose",
+            Self::OpRelReach => "OpRelReach",
+            Self::OpRelationField => "OpRelationField",
+            Self::OpRelationJoin => "OpRelationJoin",
+            Self::OpRelationProduct => "OpRelationProduct",
+            Self::OpRelationProject => "OpRelationProject",
+            Self::OpRelationTranspose => "OpRelationTranspose",
+            Self::OpRelationReach => "OpRelationReach",
+        }
+    }
+}
+
+impl std::fmt::Display for IRBinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for IRBinOp {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "OpAdd" => Ok(Self::OpAdd),
+            "OpSub" => Ok(Self::OpSub),
+            "OpMul" => Ok(Self::OpMul),
+            "OpDiv" => Ok(Self::OpDiv),
+            "OpMod" => Ok(Self::OpMod),
+            "OpEq" => Ok(Self::OpEq),
+            "OpNEq" => Ok(Self::OpNEq),
+            "OpLt" => Ok(Self::OpLt),
+            "OpGt" => Ok(Self::OpGt),
+            "OpLe" => Ok(Self::OpLe),
+            "OpGe" => Ok(Self::OpGe),
+            "OpAnd" => Ok(Self::OpAnd),
+            "OpOr" => Ok(Self::OpOr),
+            "OpImplies" => Ok(Self::OpImplies),
+            "OpUnord" => Ok(Self::OpUnord),
+            "OpConc" => Ok(Self::OpConc),
+            "OpSameStep" => Ok(Self::OpSameStep),
+            "OpSeq" => Ok(Self::OpSeq),
+            "OpXor" => Ok(Self::OpXor),
+            "OpDiamond" => Ok(Self::OpDiamond),
+            "OpDisjoint" => Ok(Self::OpDisjoint),
+            "OpAssign" => Ok(Self::OpAssign),
+            "OpMapHas" => Ok(Self::OpMapHas),
+            "OpMapMerge" => Ok(Self::OpMapMerge),
+            "OpSetUnion" => Ok(Self::OpSetUnion),
+            "OpSetIntersect" => Ok(Self::OpSetIntersect),
+            "OpSetDiff" => Ok(Self::OpSetDiff),
+            "OpSetSubset" => Ok(Self::OpSetSubset),
+            "OpSetDisjoint" => Ok(Self::OpSetDisjoint),
+            "OpSetMember" => Ok(Self::OpSetMember),
+            "OpSeqConcat" => Ok(Self::OpSeqConcat),
+            "OpSeqCons" => Ok(Self::OpSeqCons),
+            "OpRelJoin" => Ok(Self::OpRelJoin),
+            "OpRelProduct" => Ok(Self::OpRelProduct),
+            "OpRelProject" => Ok(Self::OpRelProject),
+            "OpRelTranspose" => Ok(Self::OpRelTranspose),
+            "OpRelReach" => Ok(Self::OpRelReach),
+            "OpRelationField" => Ok(Self::OpRelationField),
+            "OpRelationJoin" => Ok(Self::OpRelationJoin),
+            "OpRelationProduct" => Ok(Self::OpRelationProduct),
+            "OpRelationProject" => Ok(Self::OpRelationProject),
+            "OpRelationTranspose" => Ok(Self::OpRelationTranspose),
+            "OpRelationReach" => Ok(Self::OpRelationReach),
+            other => Err(format!("unknown IR binary operator `{other}`")),
+        }
+    }
+}
+
+/// Canonical lowered unary operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)]
+pub enum IRUnOp {
+    OpNot,
+    OpNeg,
+    OpMapDomain,
+    OpMapRange,
+    OpSeqEmpty,
+    OpSeqHead,
+    OpSeqTail,
+    OpSeqLength,
+    OpSetEmpty,
+    OpSetSize,
+    OpRelTranspose,
+    OpRelReach,
+    OpRelationTranspose,
+    OpRelationReach,
+}
+
+impl IRUnOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpNot => "OpNot",
+            Self::OpNeg => "OpNeg",
+            Self::OpMapDomain => "OpMapDomain",
+            Self::OpMapRange => "OpMapRange",
+            Self::OpSeqEmpty => "OpSeqEmpty",
+            Self::OpSeqHead => "OpSeqHead",
+            Self::OpSeqTail => "OpSeqTail",
+            Self::OpSeqLength => "OpSeqLength",
+            Self::OpSetEmpty => "OpSetEmpty",
+            Self::OpSetSize => "OpSetSize",
+            Self::OpRelTranspose => "OpRelTranspose",
+            Self::OpRelReach => "OpRelReach",
+            Self::OpRelationTranspose => "OpRelationTranspose",
+            Self::OpRelationReach => "OpRelationReach",
+        }
+    }
+}
+
+impl std::fmt::Display for IRUnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for IRUnOp {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "OpNot" => Ok(Self::OpNot),
+            "OpNeg" => Ok(Self::OpNeg),
+            "OpMapDomain" => Ok(Self::OpMapDomain),
+            "OpMapRange" => Ok(Self::OpMapRange),
+            "OpSeqEmpty" => Ok(Self::OpSeqEmpty),
+            "OpSeqHead" => Ok(Self::OpSeqHead),
+            "OpSeqTail" => Ok(Self::OpSeqTail),
+            "OpSeqLength" => Ok(Self::OpSeqLength),
+            "OpSetEmpty" => Ok(Self::OpSetEmpty),
+            "OpSetSize" => Ok(Self::OpSetSize),
+            "OpRelTranspose" => Ok(Self::OpRelTranspose),
+            "OpRelReach" => Ok(Self::OpRelReach),
+            "OpRelationTranspose" => Ok(Self::OpRelationTranspose),
+            "OpRelationReach" => Ok(Self::OpRelationReach),
+            other => Err(format!("unknown IR unary operator `{other}`")),
+        }
+    }
+}
+
 // ── Expressions ──────────────────────────────────────────────────────
 
 /// Lowered Abide expression.
@@ -458,6 +692,110 @@ pub enum IRExpr {
         #[serde(skip)]
         span: Option<Span>,
     },
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::{IRBinOp, IRUnOp};
+
+    #[test]
+    fn canonical_binary_operator_names_roundtrip_through_display_and_parse() {
+        let cases = [
+            (IRBinOp::OpAdd, "OpAdd"),
+            (IRBinOp::OpSub, "OpSub"),
+            (IRBinOp::OpMul, "OpMul"),
+            (IRBinOp::OpDiv, "OpDiv"),
+            (IRBinOp::OpMod, "OpMod"),
+            (IRBinOp::OpEq, "OpEq"),
+            (IRBinOp::OpNEq, "OpNEq"),
+            (IRBinOp::OpLt, "OpLt"),
+            (IRBinOp::OpGt, "OpGt"),
+            (IRBinOp::OpLe, "OpLe"),
+            (IRBinOp::OpGe, "OpGe"),
+            (IRBinOp::OpAnd, "OpAnd"),
+            (IRBinOp::OpOr, "OpOr"),
+            (IRBinOp::OpImplies, "OpImplies"),
+            (IRBinOp::OpUnord, "OpUnord"),
+            (IRBinOp::OpConc, "OpConc"),
+            (IRBinOp::OpSameStep, "OpSameStep"),
+            (IRBinOp::OpSeq, "OpSeq"),
+            (IRBinOp::OpXor, "OpXor"),
+            (IRBinOp::OpDiamond, "OpDiamond"),
+            (IRBinOp::OpDisjoint, "OpDisjoint"),
+            (IRBinOp::OpAssign, "OpAssign"),
+            (IRBinOp::OpMapHas, "OpMapHas"),
+            (IRBinOp::OpMapMerge, "OpMapMerge"),
+            (IRBinOp::OpSetUnion, "OpSetUnion"),
+            (IRBinOp::OpSetIntersect, "OpSetIntersect"),
+            (IRBinOp::OpSetDiff, "OpSetDiff"),
+            (IRBinOp::OpSetSubset, "OpSetSubset"),
+            (IRBinOp::OpSetDisjoint, "OpSetDisjoint"),
+            (IRBinOp::OpSetMember, "OpSetMember"),
+            (IRBinOp::OpSeqConcat, "OpSeqConcat"),
+            (IRBinOp::OpSeqCons, "OpSeqCons"),
+            (IRBinOp::OpRelJoin, "OpRelJoin"),
+            (IRBinOp::OpRelProduct, "OpRelProduct"),
+            (IRBinOp::OpRelProject, "OpRelProject"),
+            (IRBinOp::OpRelTranspose, "OpRelTranspose"),
+            (IRBinOp::OpRelReach, "OpRelReach"),
+            (IRBinOp::OpRelationField, "OpRelationField"),
+            (IRBinOp::OpRelationJoin, "OpRelationJoin"),
+            (IRBinOp::OpRelationProduct, "OpRelationProduct"),
+            (IRBinOp::OpRelationProject, "OpRelationProject"),
+            (IRBinOp::OpRelationTranspose, "OpRelationTranspose"),
+            (IRBinOp::OpRelationReach, "OpRelationReach"),
+        ];
+
+        for (op, name) in cases {
+            assert_eq!(op.as_str(), name);
+            assert_eq!(op.to_string(), name);
+            assert_eq!(IRBinOp::try_from(name), Ok(op));
+        }
+    }
+
+    #[test]
+    fn canonical_binary_operator_names_reject_typo_variants() {
+        assert_eq!(IRBinOp::try_from("OpNEq"), Ok(IRBinOp::OpNEq));
+        assert!(
+            IRBinOp::try_from("OpNeq").is_err(),
+            "canonical operator parsing must reject typo-cased spellings"
+        );
+    }
+
+    #[test]
+    fn canonical_unary_operator_names_roundtrip_through_display_and_parse() {
+        let cases = [
+            (IRUnOp::OpNot, "OpNot"),
+            (IRUnOp::OpNeg, "OpNeg"),
+            (IRUnOp::OpMapDomain, "OpMapDomain"),
+            (IRUnOp::OpMapRange, "OpMapRange"),
+            (IRUnOp::OpSeqEmpty, "OpSeqEmpty"),
+            (IRUnOp::OpSeqHead, "OpSeqHead"),
+            (IRUnOp::OpSeqTail, "OpSeqTail"),
+            (IRUnOp::OpSeqLength, "OpSeqLength"),
+            (IRUnOp::OpSetEmpty, "OpSetEmpty"),
+            (IRUnOp::OpSetSize, "OpSetSize"),
+            (IRUnOp::OpRelTranspose, "OpRelTranspose"),
+            (IRUnOp::OpRelReach, "OpRelReach"),
+            (IRUnOp::OpRelationTranspose, "OpRelationTranspose"),
+            (IRUnOp::OpRelationReach, "OpRelationReach"),
+        ];
+
+        for (op, name) in cases {
+            assert_eq!(op.as_str(), name);
+            assert_eq!(op.to_string(), name);
+            assert_eq!(IRUnOp::try_from(name), Ok(op));
+        }
+    }
+
+    #[test]
+    fn canonical_unary_operator_names_reject_typo_variants() {
+        assert_eq!(IRUnOp::try_from("OpNot"), Ok(IRUnOp::OpNot));
+        assert!(
+            IRUnOp::try_from("OpNoot").is_err(),
+            "canonical unary operator parsing must reject typo spellings"
+        );
+    }
 }
 
 /// Arithmetic aggregator kind in IR.
@@ -832,6 +1170,10 @@ pub struct IRSystem {
 pub struct IRStoreParam {
     pub name: std::string::String,
     pub entity_type: std::string::String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lo: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi: Option<i64>,
 }
 
 /// proc declaration in IR — a named DAG of command invocations.
@@ -1024,9 +1366,10 @@ pub struct IRVerify {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth: Option<usize>,
     pub systems: Vec<IRVerifySystem>,
-    /// Per-store bounds: each store declaration carries its own entity type
-    /// and pool size. `compute_verify_scope` sizes entities from these
-    /// instead of collapsing all stores into a single max(hi) per system.
+    /// Per-store active-cardinality bounds: each store declaration carries its
+    /// own entity type, lower active floor, and upper capacity.
+    /// `compute_verify_scope` sizes entities from these instead of collapsing
+    /// all stores into a single max(hi) per system.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<IRStoreDecl>,
     /// Normalized assumption set populated during elaboration.
@@ -1048,8 +1391,11 @@ pub struct IRVerify {
     pub file: Option<std::string::String>,
 }
 
-/// Per-store bounds declaration. Each store has its own entity type and
-/// pool size, enabling independent sizing of entity pools across stores
+/// Per-store bounds declaration.
+///
+/// `lo` is the required active floor for the store at each checked state;
+/// `hi` is the materialized capacity. Each store has its own entity type and
+/// range, enabling independent active-cardinality constraints across stores
 /// that bind different entity types.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IRStoreDecl {

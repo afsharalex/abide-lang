@@ -10,7 +10,13 @@
 //!   variants, and the [`diagnostic::DiagnosticSink`] that collects them.
 //! - [`messages`] — centralized user-facing message strings used by the
 //!   parser and elaborator.
+//! - [`arith`] — the shared integer-arithmetic contract (checked add/sub/mul,
+//!   Euclidean div/mod) the concrete evaluators agree on.
+//! - [`real`] — exact rational real arithmetic, so the concrete simulator
+//!   matches the SMT backends' exact-rational reals.
 
+pub mod arith;
 pub mod diagnostic;
 pub mod messages;
+pub mod real;
 pub mod span;

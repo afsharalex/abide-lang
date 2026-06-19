@@ -76,16 +76,36 @@ pub(crate) fn try_encode_step_inner_legacy(
     validate_legacy_step_context(ctx)?;
     let scope = step_scope_metadata(ctx.all_systems, event);
     let mut state = LegacyStepState::new(event, override_params, ctx.step, &scope);
-    if let Some(guard) = encode_legacy_event_guard(ctx, event, &scope, &state.step_params)? {
-        state.conjuncts.push(guard);
-    }
+    state.conjuncts.push(event_fire_precondition_formula(
+        ctx.pool,
+        ctx.vctx,
+        event,
+        ctx.step,
+        &state.step_params,
+        &scope,
+    )?);
+    let guard = encode_legacy_event_guard(ctx, event, &scope, &state.step_params)?;
     let action_ctx = LegacyActionCtx {
         step: *ctx,
         scope: &scope,
     };
-    for action in &event.body {
-        encode_legacy_action(&action_ctx, &mut state, action)?;
+    // The command body only runs when the command fires (its guard holds), so
+    // guard div/mod obligations recorded inside it (e.g. `x' = a / b`) by the
+    // command guard — a divisor kept non-zero by a `requires` is not flagged.
+    let guarded = guard.is_some();
+    if let Some(guard) = guard {
+        crate::verify::property::push_harness_div_guard(guard);
     }
+    let result = (|| {
+        for action in &event.body {
+            encode_legacy_action(&action_ctx, &mut state, action)?;
+        }
+        Ok::<(), String>(())
+    })();
+    if guarded {
+        crate::verify::property::pop_harness_div_guard();
+    }
+    result?;
     Ok((legacy_formula(state.conjuncts), state.touched))
 }
 
@@ -105,11 +125,12 @@ impl LegacyStepState {
         step: usize,
         scope: &StepScopeMetadata,
     ) -> Self {
+        let step_params = override_params.unwrap_or_else(|| build_step_params(&event.params, step));
         Self {
             conjuncts: Vec::new(),
             touched: HashSet::new(),
             chain_id: 0,
-            step_params: override_params.unwrap_or_else(|| build_step_params(&event.params, step)),
+            step_params,
             var_to_entity: scope.entity_param_types.clone(),
             choose_var_params: HashMap::new(),
         }
@@ -303,15 +324,28 @@ fn encode_legacy_choose_slot(
 ) -> Result<Bool, String> {
     let slot_ctx = legacy_slot_ctx(ctx, bound.entity_name, bound.slot, params.clone(), "");
     let mut parts = Vec::new();
-    if let Some(SmtValue::Bool(active)) =
-        ctx.step
-            .pool
-            .active_at(bound.entity_name, bound.slot, ctx.step.step)
+    let active_opt = match ctx
+        .step
+        .pool
+        .active_at(bound.entity_name, bound.slot, ctx.step.step)
     {
+        Some(SmtValue::Bool(active)) => Some(active.clone()),
+        _ => None,
+    };
+    if let Some(active) = &active_opt {
         parts.push(active.clone());
     }
-    parts.push(try_encode_slot_expr(&slot_ctx, filter, ctx.step.step)?.to_bool()?);
-    encode_legacy_bound_ops(
+    let filter_bool = try_encode_slot_expr(&slot_ctx, filter, ctx.step.step)?.to_bool()?;
+    parts.push(filter_bool.clone());
+    // A div/mod in this slot's body is only evaluated when the slot is active
+    // and passes the filter, so guard its well-definedness obligation by both;
+    // a divisor in a non-selected `choose` slot is not falsely flagged.
+    let div_guard = match &active_opt {
+        Some(active) => smt::bool_and(&[active, &filter_bool]),
+        None => filter_bool,
+    };
+    crate::verify::property::push_harness_div_guard(div_guard);
+    let ops_result = encode_legacy_bound_ops(
         ctx,
         state,
         bound,
@@ -319,7 +353,9 @@ fn encode_legacy_choose_slot(
         params,
         &mut parts,
         nested_touched,
-    )?;
+    );
+    crate::verify::property::pop_harness_div_guard();
+    ops_result?;
     constrain_legacy_choose_slot_params(ctx, bound, &mut parts);
     parts.extend(frame_entity_slots_except(
         ctx.step.pool,
@@ -377,6 +413,14 @@ fn encode_legacy_forall(
         return Ok(());
     };
     let params = state.merged_params();
+    // Entities this body may write (field update, create, or activation),
+    // resolving Apply targets through the bound variables in scope. Used to
+    // decide which foreign-entity slots a forall's *inactive* iteration may
+    // safely frame: framing an entity the body writes would over-constrain
+    // the transition (and is unsound — it could mask real behaviours).
+    let mut modified: HashSet<String> = HashSet::new();
+    let mut scope = vec![(var.to_owned(), entity_name.to_owned())];
+    collect_modified_entities(ops, ctx.step.entities, &mut scope, &mut modified);
     let mut nested_touched = HashSet::new();
     for slot in 0..n_slots {
         let slot_formula = encode_legacy_forall_slot(
@@ -391,6 +435,7 @@ fn encode_legacy_forall(
                 ops,
             },
             &params,
+            &modified,
             &mut nested_touched,
         )?;
         state.conjuncts.push(slot_formula);
@@ -400,29 +445,139 @@ fn encode_legacy_forall(
     Ok(())
 }
 
+/// Collect the set of entity names a `forall`/`choose` body may modify —
+/// write a field, `create`, or activate a slot. `Apply` targets are resolved
+/// through the bound variables in `scope` (innermost first), then by entity
+/// name, then by unique transition owner. Unresolvable targets and any
+/// cross-system call conservatively mark every candidate entity as modified,
+/// so the set is a sound over-approximation: callers that frame only
+/// *unmodified* entities never drop a real write.
+fn collect_modified_entities(
+    ops: &[IRAction],
+    entities: &[IREntity],
+    scope: &mut Vec<(String, String)>,
+    out: &mut HashSet<String>,
+) {
+    for op in ops {
+        match op {
+            IRAction::Create { entity, .. } => {
+                out.insert(entity.clone());
+            }
+            IRAction::Apply {
+                target, transition, ..
+            } => {
+                let resolved = scope
+                    .iter()
+                    .rev()
+                    .find(|(v, _)| v == target)
+                    .map(|(_, e)| e.clone())
+                    .or_else(|| {
+                        entities
+                            .iter()
+                            .find(|e| e.name == *target)
+                            .map(|e| e.name.clone())
+                    });
+                if let Some(name) = resolved {
+                    out.insert(name);
+                } else {
+                    // Unresolved target — conservatively mark every entity
+                    // that owns this transition as potentially modified.
+                    for entity in entities
+                        .iter()
+                        .filter(|e| e.transitions.iter().any(|t| t.name == *transition))
+                    {
+                        out.insert(entity.name.clone());
+                    }
+                }
+            }
+            IRAction::Choose {
+                var, entity, ops, ..
+            }
+            | IRAction::ForAll {
+                var, entity, ops, ..
+            } => {
+                scope.push((var.clone(), entity.clone()));
+                collect_modified_entities(ops, entities, scope, out);
+                scope.pop();
+            }
+            IRAction::Match { arms, .. } => {
+                for arm in arms {
+                    collect_modified_entities(&arm.body, entities, scope, out);
+                }
+            }
+            IRAction::CrossCall { .. } | IRAction::LetCrossCall { .. } => {
+                // A cross-system command may mutate any entity; over-approximate.
+                for entity in entities {
+                    out.insert(entity.name.clone());
+                }
+            }
+            IRAction::ExprStmt { .. } => {}
+        }
+    }
+}
+
 fn encode_legacy_forall_slot(
     ctx: &LegacyActionCtx<'_>,
     state: &mut LegacyStepState,
     bound: LegacyBoundSlot<'_>,
     params: &HashMap<String, SmtValue>,
+    modified: &HashSet<String>,
     nested_touched: &mut HashSet<(String, usize)>,
 ) -> Result<Bool, String> {
     let slot_ctx = legacy_slot_ctx(ctx, bound.entity_name, bound.slot, params.clone(), "");
     let mut op_parts = Vec::new();
-    encode_legacy_bound_ops(
+    // Track the slots THIS iteration's body would constrain so they can be
+    // framed in the inactive branch. A `forall` ranges over every slot and
+    // "fires" even when no slot is active, so unlike `choose` it cannot rely
+    // on an empty disjunction to forbid an empty step. Cross-entity bodies
+    // (e.g. `forall c { choose m { c.sync_from_marker(m) } }`) mark the other
+    // entity's slots as touched, which suppresses the global frame for them;
+    // when this counter slot is inactive its body emits no constraint, so we
+    // must re-frame those touched slots here or they would be left free.
+    let mut slot_touched: HashSet<(String, usize)> = HashSet::new();
+    // A `forall` body's constraints (and any div/mod inside them) are only
+    // asserted for active slots — the inactive branch just frames the slot. So
+    // guard div obligations recorded here by this slot's active flag, or a
+    // divisor in an inactive iteration could be falsely flagged.
+    let div_guard = match ctx
+        .step
+        .pool
+        .active_at(bound.entity_name, bound.slot, ctx.step.step)
+    {
+        Some(SmtValue::Bool(active)) => Some(active.clone()),
+        _ => None,
+    };
+    if let Some(active) = &div_guard {
+        crate::verify::property::push_harness_div_guard(active.clone());
+    }
+    let ops_result = encode_legacy_bound_ops(
         ctx,
         state,
         bound,
         &slot_ctx,
         params,
         &mut op_parts,
-        nested_touched,
-    )?;
+        &mut slot_touched,
+    );
+    if div_guard.is_some() {
+        crate::verify::property::pop_harness_div_guard();
+    }
+    ops_result?;
+    // Only re-frame *foreign* slots the body reads but never writes. The bound
+    // entity's own slots are already covered by every iteration's active/
+    // inactive split and the global frame; framing an entity the body writes
+    // would over-constrain the transition.
+    let frame_targets: HashSet<(String, usize)> = slot_touched
+        .iter()
+        .filter(|(ent, _)| *ent != bound.entity_name && !modified.contains(ent))
+        .cloned()
+        .collect();
     let Some(SmtValue::Bool(active)) =
         ctx.step
             .pool
             .active_at(bound.entity_name, bound.slot, ctx.step.step)
     else {
+        nested_touched.extend(slot_touched);
         return Ok(smt::bool_const(true));
     };
     let active_branch = if op_parts.is_empty() {
@@ -432,7 +587,15 @@ fn encode_legacy_forall_slot(
         parts.extend(op_parts);
         and_all(parts)
     };
-    let inactive_branch = legacy_inactive_slot_frame(ctx, bound, active)?;
+    let mut inactive_parts = vec![legacy_inactive_slot_frame(ctx, bound, active)?];
+    inactive_parts.extend(frame_specific_slots(
+        ctx.step.pool,
+        ctx.step.entities,
+        &frame_targets,
+        ctx.step.step,
+    ));
+    let inactive_branch = and_all(inactive_parts);
+    nested_touched.extend(slot_touched);
     Ok(smt::bool_or(&[&active_branch, &inactive_branch]))
 }
 
@@ -630,10 +793,24 @@ fn legacy_chain_apply_params(
             params.insert(param.name.clone(), val);
         }
     }
+    // Wire refs (and any cross-entity qualified field bindings such as `m.y`)
+    // exactly as the first apply does, so a later chained apply reading a
+    // foreign ref field resolves it identically.
+    wire_apply_refs(
+        &mut params,
+        slot_ctx,
+        &trans.refs,
+        apply.refs,
+        ctx.step.step,
+    );
+    // Fallback: a ref naming one of the bound entity's own chained intermediate
+    // fields resolves from the prior apply's write.
     for (ref_index, target_ref) in trans.refs.iter().enumerate() {
         if let Some(ref_name) = apply.refs.get(ref_index) {
-            if let Some(val) = read_from.get(ref_name) {
-                params.insert(target_ref.name.clone(), val.clone());
+            if !params.contains_key(&target_ref.name) {
+                if let Some(val) = read_from.get(ref_name) {
+                    params.insert(target_ref.name.clone(), val.clone());
+                }
             }
         }
     }
@@ -687,6 +864,7 @@ fn assert_legacy_chain_active(
 
 fn legacy_bound_applies<'a>(bound_var: &str, ops: &'a [IRAction]) -> Vec<LegacyBoundApply<'a>> {
     ops.iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|op| match op {
             IRAction::Apply {
                 target,
@@ -843,6 +1021,7 @@ fn encode_legacy_apply_slot(
     if let Some(param_val) = target_param_eq {
         parts.push(smt::smt_eq(
             param_val,
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             &smt::int_val(i64::try_from(slot).unwrap_or(0)),
         )?);
     }
@@ -1043,6 +1222,7 @@ fn legacy_field_values(
     entity
         .fields
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|field| {
             pool.field_at(entity_name, slot, &field.name, step)
                 .map(|value| (field.name.clone(), value.clone()))
@@ -1205,7 +1385,14 @@ pub(super) fn try_encode_step_branches_dispatch(
     }
 
     let mut branches = vec![MacroBranch {
-        formula: macro_initial_formula(ctx, event, &step_params, &scope)?,
+        formula: event_fire_precondition_formula(
+            ctx.pool,
+            ctx.vctx,
+            event,
+            ctx.step,
+            &step_params,
+            &scope,
+        )?,
         touched: HashSet::new(),
         locals: HashMap::new(),
         return_value: None,
@@ -1235,10 +1422,10 @@ pub(super) fn try_encode_step_branches_dispatch(
     Ok(branches)
 }
 
-pub(super) struct StepScopeMetadata {
-    pub(super) owning_system_name: String,
-    pub(super) entity_param_types: HashMap<String, String>,
-    pub(super) store_param_types: HashMap<String, String>,
+pub(in crate::verify::harness) struct StepScopeMetadata {
+    pub(in crate::verify::harness) owning_system_name: String,
+    pub(in crate::verify::harness) entity_param_types: HashMap<String, String>,
+    pub(in crate::verify::harness) store_param_types: HashMap<String, String>,
 }
 
 fn encode_non_macro_step_branch(
@@ -1260,12 +1447,15 @@ fn encode_non_macro_step_branch(
     Ok(vec![branch])
 }
 
-fn macro_initial_formula(
-    ctx: &StepEncodingCtx<'_>,
+pub(in crate::verify::harness) fn event_fire_precondition_formula(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
     event: &IRSystemAction,
+    step: usize,
     step_params: &HashMap<String, SmtValue>,
     scope: &StepScopeMetadata,
 ) -> Result<Bool, String> {
+    let mut parts = step_param_domain_constraints(&event.params, step_params, vctx);
     if matches!(
         &event.guard,
         IRExpr::Lit {
@@ -1273,20 +1463,38 @@ fn macro_initial_formula(
             ..
         }
     ) {
-        return Ok(smt::bool_const(true));
+        if parts.is_empty() {
+            return Ok(smt::bool_const(true));
+        }
+        let refs: Vec<&Bool> = parts.iter().collect();
+        return Ok(smt::bool_and(&refs));
     }
-    try_encode_guard_expr_for_system(
-        ctx.pool,
-        ctx.vctx,
-        &event.guard,
-        ctx.step,
-        SystemGuardScope {
+    let guard = if scope.owning_system_name.is_empty() {
+        try_encode_guard_expr(
+            pool,
+            vctx,
+            &event.guard,
             step_params,
-            system_name: &scope.owning_system_name,
-            entity_param_types: &scope.entity_param_types,
-            store_param_types: &scope.store_param_types,
-        },
-    )
+            &scope.store_param_types,
+            step,
+        )
+    } else {
+        try_encode_guard_expr_for_system(
+            pool,
+            vctx,
+            &event.guard,
+            step,
+            SystemGuardScope {
+                step_params,
+                system_name: &scope.owning_system_name,
+                entity_param_types: &scope.entity_param_types,
+                store_param_types: &scope.store_param_types,
+            },
+        )
+    }?;
+    parts.push(guard);
+    let refs: Vec<&Bool> = parts.iter().collect();
+    Ok(smt::bool_and(&refs))
 }
 
 fn attach_macro_return_values(
@@ -1343,7 +1551,7 @@ fn macro_value_slot_ctx<'a>(
     }
 }
 
-pub(super) fn step_scope_metadata(
+pub(in crate::verify::harness) fn step_scope_metadata(
     all_systems: &[IRSystem],
     event: &IRSystemAction,
 ) -> StepScopeMetadata {
@@ -1352,10 +1560,12 @@ pub(super) fn step_scope_metadata(
             .iter()
             .any(|st| std::ptr::eq(st, event) || st.name == event.name)
     });
+    // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
     let owning_system_name = owning_system.map(|s| s.name.clone()).unwrap_or_default();
     let entity_param_types: HashMap<String, String> = event
         .params
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|p| match &p.ty {
             IRType::Entity { name } => Some((p.name.clone(), name.clone())),
             _ => None,
@@ -1368,6 +1578,7 @@ pub(super) fn step_scope_metadata(
                 .map(|p| (p.name.clone(), p.entity_type.clone()))
                 .collect()
         })
+        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
         .unwrap_or_default();
     StepScopeMetadata {
         owning_system_name,
@@ -1394,7 +1605,7 @@ pub(super) fn fresh_smt_value(prefix: &str, ty: &IRType) -> SmtValue {
     }
 }
 
-pub(super) fn try_encode_macro_value_expr(
+pub(crate) fn try_encode_macro_value_expr(
     ctx: &SlotEncodeCtx<'_>,
     expr: &IRExpr,
     step: usize,
@@ -1408,6 +1619,7 @@ pub(super) fn try_encode_macro_value_expr(
             if let Some(pred) = predicate {
                 let mut pred_params = ctx.params.clone();
                 pred_params.insert(var.clone(), fresh.clone());
+                pred_params.insert("$".to_owned(), fresh.clone());
                 let pred_ctx = SlotEncodeCtx {
                     pool: ctx.pool,
                     vctx: ctx.vctx,
@@ -1422,6 +1634,86 @@ pub(super) fn try_encode_macro_value_expr(
                 constraints.push(try_encode_slot_expr(&pred_ctx, pred, step)?.to_bool()?);
             }
             Ok((fresh, constraints))
+        }
+        IRExpr::Ctor {
+            enum_name,
+            ctor,
+            args,
+            ..
+        } if !args.is_empty() => {
+            let Some(dt) = ctx.vctx.adt_sorts.get(enum_name) else {
+                return Ok((try_encode_slot_expr(ctx, expr, step)?, Vec::new()));
+            };
+            let Some(variant) = dt
+                .variants
+                .iter()
+                .find(|variant| smt::func_decl_name(&variant.constructor) == ctor.as_str())
+            else {
+                return Ok((try_encode_slot_expr(ctx, expr, step)?, Vec::new()));
+            };
+            let declared_names: Vec<String> =
+                variant.accessors.iter().map(smt::func_decl_name).collect();
+            let args_map: HashMap<&str, &IRExpr> = args
+                .iter()
+                .map(|(name, expr)| (name.as_str(), expr))
+                .collect();
+            for (field_name, _) in args {
+                if !declared_names.iter().any(|name| name == field_name) {
+                    return Err(format!(
+                        "unknown field '{field_name}' in constructor '{ctor}' of '{enum_name}'"
+                    ));
+                }
+            }
+
+            let mut constraints = Vec::new();
+            let mut z3_args: Vec<smt::Dynamic> = Vec::new();
+            for name in &declared_names {
+                let Some(field_expr) = args_map.get(name.as_str()) else {
+                    return Err(format!(
+                        "constructor '{ctor}' of '{enum_name}' is missing field '{name}'"
+                    ));
+                };
+                let (value, mut field_constraints) =
+                    try_encode_macro_value_expr(ctx, field_expr, step)?;
+                constraints.append(&mut field_constraints);
+                z3_args.push(value.to_dynamic());
+            }
+            let refs: Vec<&smt::Dynamic> = z3_args.iter().collect();
+            let result = smt::func_decl_apply(&variant.constructor, &refs);
+            Ok((walkers::dynamic_to_smt_value(result), constraints))
+        }
+        IRExpr::App { .. } => {
+            let Some((enum_name, ctor, args)) = decompose_macro_ctor_app(expr) else {
+                return Ok((try_encode_slot_expr(ctx, expr, step)?, Vec::new()));
+            };
+            let Some(dt) = ctx.vctx.adt_sorts.get(enum_name) else {
+                return Ok((try_encode_slot_expr(ctx, expr, step)?, Vec::new()));
+            };
+            let Some(variant) = dt
+                .variants
+                .iter()
+                .find(|variant| smt::func_decl_name(&variant.constructor) == ctor)
+            else {
+                return Err(format!("unknown constructor '{ctor}' of '{enum_name}'"));
+            };
+            if variant.accessors.len() != args.len() {
+                return Err(format!(
+                    "constructor '{ctor}' of '{enum_name}' expects {} argument(s), got {}",
+                    variant.accessors.len(),
+                    args.len()
+                ));
+            }
+
+            let mut constraints = Vec::new();
+            let mut z3_args: Vec<smt::Dynamic> = Vec::new();
+            for arg in args {
+                let (value, mut arg_constraints) = try_encode_macro_value_expr(ctx, arg, step)?;
+                constraints.append(&mut arg_constraints);
+                z3_args.push(value.to_dynamic());
+            }
+            let refs: Vec<&smt::Dynamic> = z3_args.iter().collect();
+            let result = smt::func_decl_apply(&variant.constructor, &refs);
+            Ok((walkers::dynamic_to_smt_value(result), constraints))
         }
         IRExpr::Let { bindings, body, .. } => {
             let mut params = ctx.params.clone();
@@ -1527,6 +1819,29 @@ pub(super) fn try_encode_macro_value_expr(
         }
         _ => Ok((try_encode_slot_expr(ctx, expr, step)?, Vec::new())),
     }
+}
+
+fn decompose_macro_ctor_app(expr: &IRExpr) -> Option<(&str, &str, Vec<&IRExpr>)> {
+    let mut args = Vec::new();
+    let mut head = expr;
+    while let IRExpr::App { func, arg, .. } = head {
+        args.push(arg.as_ref());
+        head = func.as_ref();
+    }
+    let IRExpr::Ctor {
+        enum_name,
+        ctor,
+        args: named_args,
+        ..
+    } = head
+    else {
+        return None;
+    };
+    if !named_args.is_empty() {
+        return None;
+    }
+    args.reverse();
+    Some((enum_name, ctor, args))
 }
 
 pub(super) struct MacroActionCtx<'a> {
@@ -1982,6 +2297,7 @@ fn encode_macro_apply_slot(
     if let Some(param_val) = slot.target_param_eq {
         parts.push(smt::smt_eq(
             param_val,
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             &smt::int_val(i64::try_from(slot.slot).unwrap_or(0)),
         )?);
     }
@@ -2108,7 +2424,7 @@ fn macro_match_arm_branches(
         formula: and_all(vec![
             branch.formula.clone(),
             call_branch.formula.clone(),
-            arm_cond,
+            arm_cond.clone(),
         ]),
         touched: {
             let mut touched = branch.touched.clone();
@@ -2118,9 +2434,20 @@ fn macro_match_arm_branches(
         locals: arm_locals,
         return_value: branch.return_value.clone(),
     }];
-    for nested in &arm.body {
-        arm_branches = try_apply_macro_action(ctx, nested, arm_branches)?;
-    }
+    // A div/mod in this arm's body is only evaluated when the arm is selected
+    // (its pattern matches and any arm guard holds), so guard obligations
+    // recorded while encoding the body by the arm condition — a divisor in a
+    // non-taken match arm is not falsely flagged.
+    crate::verify::property::push_harness_div_guard(arm_cond);
+    let body_result = (|| {
+        let mut branches = arm_branches;
+        for nested in &arm.body {
+            branches = try_apply_macro_action(ctx, nested, branches)?;
+        }
+        Ok::<Vec<MacroBranch>, String>(branches)
+    })();
+    crate::verify::property::pop_harness_div_guard();
+    arm_branches = body_result?;
     Ok(arm_branches)
 }
 

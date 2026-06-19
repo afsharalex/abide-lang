@@ -4,6 +4,10 @@ default:
   @just --list
 
 cargo_timeout := env_var_or_default("ABIDE_CARGO_TIMEOUT_SECS", "3600")
+unbounded_verify_tests := "theorem_proved_by_induction theorem_unprovable_when_not_inductive theorem_step_case_does_not_vacuously_prove_under_no_stutter theorem_invariant_preservation_does_not_vacuously_prove_under_no_stutter tiered_unbounded_only_returns_unknown_on_failure ic3_proves_property_induction_cannot no_ic3_flag_skips_ic3_verify_falls_to_bmc unbounded_only_no_ic3_gives_accurate_hint multi_apply_ic3_proves_property verify_all_with_independent_z3_chc_selection_preserves_ic3_proofs verify_all_with_cvc5_chc_selection_is_honest_about_current_chc_limit"
+fallback_soundness_verify_tests := "verifier_lowering_code_documents_silent_fallback_patterns pure_encoder_rejects_shared_unsupported_ir_corpus slot_encoder_rejects_shared_unsupported_ir_corpus property_encoder_rejects_shared_unsupported_ir_corpus check_scene_block_rejects_shared_unsupported_ir_corpus scene_precheck_rejects_shared_unsupported_ir_corpus action_precheck_rejects_shared_unsupported_ir_corpus ic3_encoders_reject_shared_unsupported_ir_corpus theorem_and_lemma_reject_shared_unsupported_ir_corpus explicit_state_eval_rejects_shared_unsupported_ir_corpus property_encoder_rejects_future_temporal_fallbacks reachable_division_by_zero_is_flagged verify_all_rejects_bare_expr_stmt_action_body liveness_body_division_is_not_silently_checked transition_update_division_by_zero_is_flagged theorem_reachable_division_by_zero_is_not_proved fn_contract_division_by_zero_is_not_proved"
+fallback_soundness_slow_fixture_tests := "fixture_collection_ops_full_smoke fixture_collections_full_smoke fixture_quantifiers_full_smoke fixture_until_full_smoke fixture_lambdas_full_smoke fixture_refinements_full_smoke"
+fallback_soundness_example_tests := "public_examples_cover_remaining_audit_constructs public_example_verify_blocks_run_with_bounded_targets public_intentional_failure_examples_report_expected_outcomes"
 mutants_timeout := env_var_or_default("ABIDE_MUTANTS_TIMEOUT_SECS", "900")
 mutants_profile := env_var_or_default("ABIDE_MUTANTS_PROFILE", "mutants")
 mutants_jobs := env_var_or_default("ABIDE_MUTANTS_JOBS", "1")
@@ -14,6 +18,9 @@ mutants_per_test_timeout := env_var_or_default("ABIDE_MUTANTS_PER_TEST_TIMEOUT_S
 mutants_build_timeout := env_var_or_default("ABIDE_MUTANTS_BUILD_TIMEOUT_SECS", "180")
 mutants_output_dir := env_var_or_default("ABIDE_MUTANTS_OUTPUT_DIR", ".mutants-out")
 mutants_shard_total := "4"
+mutants_verify_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_TIMEOUT_SECS", "1800")
+mutants_verify_per_test_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_PER_TEST_TIMEOUT_SECS", "75")
+mutants_verify_build_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_BUILD_TIMEOUT_SECS", "900")
 mutants_cli_shard_total := "32"
 mutants_cli_timeout := env_var_or_default("ABIDE_MUTANTS_CLI_TIMEOUT_SECS", "1200")
 mutants_cli_per_test_timeout := env_var_or_default("ABIDE_MUTANTS_CLI_PER_TEST_TIMEOUT_SECS", "75")
@@ -38,6 +45,7 @@ mutants_verifier_expr_build_timeout := env_var_or_default("ABIDE_MUTANTS_VERIFY_
 runner := "python3 tools/run_with_timeout.py"
 mutants_env := "env RUSTC_WRAPPER=sccache CARGO_BUILD_JOBS=" + mutants_cargo_build_jobs + " CMAKE_BUILD_PARALLEL_LEVEL=" + mutants_cmake_build_parallel_level
 mutants_common_args := "--profile " + mutants_profile + " --jobs " + mutants_jobs + " --timeout " + mutants_per_test_timeout + " --build-timeout " + mutants_build_timeout
+mutants_verify_common_args := "--profile " + mutants_profile + " --timeout " + mutants_verify_per_test_timeout + " --build-timeout " + mutants_verify_build_timeout + " --in-place --baseline skip"
 mutants_verifier_expr_common_args := "--profile " + mutants_profile + " --timeout " + mutants_verifier_expr_per_test_timeout + " --build-timeout " + mutants_verifier_expr_build_timeout + " --in-place --baseline skip"
 mutants_cli_common_args := "--profile " + mutants_profile + " --timeout " + mutants_cli_per_test_timeout + " --build-timeout " + mutants_cli_build_timeout + " --in-place --baseline skip"
 mutants_qa_common_args := "--profile " + mutants_profile + " --timeout " + mutants_qa_per_test_timeout + " --build-timeout " + mutants_qa_build_timeout + " --in-place --baseline skip"
@@ -68,6 +76,31 @@ verifier_expr_slot_shard_3_re := "try_encode_slot_app_expr|try_encode_slot_app|t
 verifier_expr_slot_shard_4_re := "try_encode_slot_finite_set_comp_expr|try_encode_slot_card_expr|try_encode_slot_sourced_set_comp_card|try_encode_slot_finite_set_comp_card|try_encode_slot_control_expr|try_encode_slot_store_quantifier"
 verifier_expr_collection_re := "encode_set_literal|encode_seq_literal|encode_map_literal|encode_collection_index|encode_collection_update|finite_literal_cardinality|encode_unique_projected_cardinality|int_sum_or_zero|unique_expr_count"
 verifier_expr_pooled_support_re := "diagnose_pooled_sygus_expr_support|diagnose_pooled_sygus_expr_support_inner|unsupported_expr|is_pooled_sygus_finite_scalar_domain|ensure_pooled_sygus_expr_supported|ensure_pooled_sygus_action_supported|ensure_pooled_sygus_actions_supported|ensure_pooled_sygus_system_supported"
+wnby_syntax_lex_re := "classify_lex_error"
+wnby_simulate_re := "real_operand|float_operand|float_witness|try_float_binop|real_witness|try_real_binop|eval_binop|witness_values_equal|eval_unop|sim_int_op|real_witness_value|float_witness_value|normalize_float"
+wnby_verify_literal_re := "string_literal_id"
+wnby_verify_support_re := "classify_expr_support|classify_action_support|classify_quantifier|is_finite_domain|statement_like_expr_cases|property_position_unsupported_cases|unsupported_expr_cases"
+wnby_verify_explicit_re := "supports_state_expr|pattern_matches|fieldless_enum_variant_value|fieldless_enum_variant_value_for_type|eval_expr|eval_expr_with_store_ranges|eval_cardinality_expr|eval_quantifier|explicit_store_scoped_quantifier_body|eval_choose|eval_bool_with_store_ranges|eval_binop|eval_eq|eval_neq|eval_int_comparison|compare_reals|explicit_int_op|eval_unop|finite_values_for_type|witness_value"
+wnby_verify_float_route_re := "program_uses_float|ty_uses_float|expr_uses_float|action_uses_float|scrutinee_uses_float|function_uses_float|entity_uses_float|field_uses_float|system_uses_float|verify_uses_float|theorem_uses_float|scene_uses_float"
+wnby_verify_temporal_re := "compile_buchi_formula|lower_to_buchi_formula|lower_to_temporal_formula|buchi_atom_for|render_spot_formula|extract_liveness_pattern_inner|strip_liveness_from_conjunction|extract_liveness_pattern_with_always|action_contains_integer_div|render_hoa_acceptance_condition|local_consistency_holds|transition_consistency_holds|initial_past_consistency_holds|formula_present|formula_id_present"
+wnby_verify_theorem_transition_re := "encode_pure_property_expr|needs_property_encoder|theorem_reachable_div_by_zero|theorem_scope|theorem_store_decls|theorem_with_scope_invariants|validate_theorem_temporal_forms|handle_theorem_liveness|validate_theorem_supported_forms|validate_theorem_transition_forms|run_theorem_induction|prove_invariant_base|prove_invariant_step|assert_domain_and_lemmas|assert_transition_step|try_ic3_on_theorem|simplify_static_bool_fragments|try_extern_assume_expr_constraints|solve_transition_obligation"
+wnby_verify_relational_re := "build_initial_store_instances|build_stateful_scene_sat|relational_stateful_scene_spec|create_spec|add_cardinality_constraint|relational_verify_spec|build_default_field_map|finite_field_domains|finite_type_values|encode_verify_violation_into|encode_verify_snapshot_into|relation_state_index|build_relational_verify_counterexample_witness|const_lit|and_lit|or_lit|at_most_one_lit|exactly_one_lit|classify_static_relation_solver_result|check_static_relation_assertions|encode_static_relation_assertion|lower_static_relation_expr|relation_type_from_ir_type|solve_static_relation|contains_relation_surface"
+wnby_verify_harness_re := "expr_type|create_slot_pool|domain_constraints|initial_state_constraints_with_store_ranges|initial_active_slots_with_store_ranges|try_entity_field_initial_constraints|try_encode_field_default_expr|store_active_cardinality_constraints|try_encode_action|try_encode_action_with_vars|eval_expr_with_vars|build_apply_params|try_build_apply_params|wire_apply_refs|try_encode_guard_inner|try_encode_guard_value|try_encode_step|try_encode_step_with_params|transition_constraints|try_transition_constraints|transition_constraints_with_fire|try_transition_constraints_with_fire|try_encode_step_enabled|try_encode_step_enabled_with_params|try_encode_enabled_cross_call_branches|apply_enabled_match|enabled_match_scrutinee_branches|enabled_match_arm_condition|encode_legacy_choose|register_legacy_choose_params|encode_legacy_forall|collect_modified_entities|legacy_chain_apply_params|encode_legacy_chain_apply|legacy_inactive_slot_frame|merged_branch_params"
+wnby_verify_ic3_re := "try_ic3_liveness|encode_liveness_event_chc|action_mutates_state|encode_step_chc_scoped|encode_ops_chc_scoped|top_level_action_guards|encode_macro_call_chc|encode_action_match_scrutinee|encode_macro_return_expr|encode_action_guard_with_locals|encode_non_entity_guard_with_locals|encode_create_chc|ic3_lookup_ctor_variant"
+wnby_verify_sygus_re := "cvc5_sygus_enabled|cvc5_sygus_disabled_reason|type_uses_real|try_cvc5_sygus_single_entity|try_cvc5_sygus_system_safety|require_obligation_unsat|collect_system_action_updates|collect_system_exprstmt_update|collect_system_action_sequence_updates|merge_system_match_update_maps|collect_system_match_updates|encode_finite_aggregate_expr|encode_finite_map_key_membership_expr|encode_finite_source_membership|encode_finite_set_membership_term|default_term_for_type|encode_finite_map_lookup_expr_inner|ctor_name_matches|bind_static_payload_pattern_vars|encode_static_payload_pattern_cond"
+wnby_verify_pure_scene_context_re := "register_enum_type|collect_program_enum_types|collect_enum_types_from_expr|default_expr_to_string|default_match_arm_to_string|default_pattern_to_string"
+wnby_verify_pure_scene_defenv_re := "rewrite_self_field_refs|decompose_app_chain_public|classify_app_chain_public|substitute_var|free_vars_inner|subst_match|subst_rel_comp|subst_quantifier"
+wnby_verify_pure_scene_encode_ctors_re := "encode_pure_ctor|encode_adt_ctor|validate_ctor_fields"
+wnby_verify_pure_scene_encode_apps_re := "encode_pure_app|verify_call_preconditions|check_fn_div_well_defined|encode_recursive_app|encode_func_application"
+wnby_verify_pure_scene_encode_collections_re := "encode_pure_card|encode_pure_set_comp|encode_set_comp_source_pred|combine_set_comp_restrictions|encode_projected_set_comp"
+wnby_verify_pure_scene_encode_lambda_re := "encode_lambda|encode_partial_application|unique_theorem_store_name|field_refinement_obligation|expr_quantifies_over_entity"
+wnby_verify_pure_scene_scene_re := "scene_solver_result|direct_choose_equality_witness|encode_scene_direct_choose_arg|scene_pass_evidence|assert_scene_then_assertions|is_supported_finite_setcomp_source|is_finite_scene_cardinality_target|extract_command_params|extract_transition_from_fire|analyze_event_fairness|diagnose_disabled_event"
+wnby_verify_pure_scene_scope_walkers_re := "expr_quantifies_over_entity|is_supported_finite_setcomp_source|is_finite_scene_cardinality_target"
+wnby_verify_dispatch_re := "verify_all|verify_all_with_events|verify_all_on_worker|verify_all_inner|verify_all_single|verify_all_single_impl|reconcile_solver_results|float_requires_z3_result|catch_verification_panic|record_verify_assert_precondition_obligations|check_verify_block_tiered|try_cvc5_sygus_on_verify|try_induction_on_verify|prove_induction_base|prove_induction_step|liveness_reduction_applicable|prove_liveness_by_monitor_induction|revalidate_sygus_invariant_via_z3|revalidate_pooled_sygus_invariant_via_z3|prove_liveness_by_ic3|try_ic3_on_verify|try_ic3_on_verify_with_diagnostics|check_verify_block_with_depth_search|check_div_by_zero_reachable|validate_bmc_inputs|bmc_transition_encoding|check_verify_block_lasso|check_lasso_asserts|encode_buchi_lasso_violation|expand_expr_node|expand_basic_expr_node"
+wnby_verify_dispatch_reconcile_re := "reconcile_solver_results|result_signature|result_name|solver_label"
+wnby_verify_dispatch_float_backend_re := "float_requires_z3_result|unavailable_solver_result"
+wnby_ir_types_re := "simple|base_without_refinement|as_str|is_assignment|try_from|fmt"
+wnby_sema_collect_types_re := "collect_entity|collect_field|collect_action|collect_assignment|elaborate_store_param|check_system_action_fsm_violations|collect_system_prime_assignments|collect_system_prime_assignments_inner|collect_match_scrutinee|collect_match_arm|base_without_refinement|domain|fmt"
 
 build:
   {{runner}} --timeout-secs {{cargo_timeout}} --label "workspace build" -- cargo build --workspace
@@ -94,16 +127,36 @@ test-integration:
   {{runner}} --timeout-secs {{cargo_timeout}} --label "abide integration tests" -- cargo test -p abide --test integration
 
 test-unbounded:
-  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide-verify unbounded proof tests" -- env ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 cargo test -p abide-verify --lib
-  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide integration unbounded proof tests" -- env ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 cargo test -p abide --test integration cvc5_sygus_boundary
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide-verify unbounded proof tests" -- env RUSTC_WRAPPER=sccache ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 cargo nextest run -p abide-verify --lib {{unbounded_verify_tests}} --run-ignored only
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide integration unbounded proof tests" -- env RUSTC_WRAPPER=sccache ABIDE_RUN_UNBOUNDED_PROOF_TESTS=1 ABIDE_ENABLE_INPROCESS_CVC5_SYGUS=1 cargo nextest run -p abide --test integration cvc5_sygus --run-ignored only
+
+test-fallback-soundness:
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide-verify fallback-soundness corpus" -- env RUSTC_WRAPPER=sccache cargo nextest run -p abide-verify {{fallback_soundness_verify_tests}}
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide-verify fallback-soundness full gate" -- env RUSTC_WRAPPER=sccache cargo nextest run -p abide-verify --lib fallback_soundness_full_gate --run-ignored only
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide-verify fallback-soundness slow fixture shards" -- env RUSTC_WRAPPER=sccache cargo nextest run -p abide-verify --lib {{fallback_soundness_slow_fixture_tests}} --run-ignored only
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "abide public example fallback-soundness corpus" -- env RUSTC_WRAPPER=sccache cargo nextest run -p abide --test integration {{fallback_soundness_example_tests}}
+
+check-ignored-tests:
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "ignored test inventory check" -- env RUSTC_WRAPPER=sccache python3 tools/ignored_tests_inventory.py check
+
+update-ignored-tests:
+  {{runner}} --timeout-secs {{cargo_timeout}} --label "ignored test inventory update" -- env RUSTC_WRAPPER=sccache python3 tools/ignored_tests_inventory.py update
 
 check-lang-mutants-core:
   just check-lang-mutants-core-baseline
+  just check-lang-mutants-core-arith
+  just check-lang-mutants-core-real
   just check-lang-mutants-core-diagnostics
   just check-lang-mutants-core-support
 
 check-lang-mutants-core-baseline:
   {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-core baseline tests" -- {{mutants_env}} cargo test -p abide-core --lib {{mutants_libtest_args}}
+
+check-lang-mutants-core-arith:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-core integer/real literal arithmetic mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-core --file crates/abide-core/src/arith.rs --output {{mutants_output_dir}}/mutants.out.core-arith -- --lib arith {{mutants_libtest_args}}
+
+check-lang-mutants-core-real:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-core exact rational real mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-core --file crates/abide-core/src/real.rs --output {{mutants_output_dir}}/mutants.out.core-real -- --lib real {{mutants_libtest_args}}
 
 check-lang-mutants-core-diagnostics:
   {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-core diagnostic mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-core --file crates/abide-core/src/diagnostic.rs --output {{mutants_output_dir}}/mutants.out.core-diagnostics -- --lib diagnostic {{mutants_libtest_args}}
@@ -529,18 +582,178 @@ check-lang-mutants-verifier-expr-pooled-support:
   {{runner}} --timeout-secs {{mutants_verifier_expr_timeout}} --label "abide verifier pooled SyGuS support diagnostic mutants" -- {{mutants_env}} cargo mutants {{mutants_verifier_expr_common_args}} -p abide-verify --file crates/abide-verify/src/verify/sygus/pooled.rs --re '{{verifier_expr_pooled_support_re}}' --output {{mutants_output_dir}}/mutants.out.verifier-expr.pooled-support -- --lib pooled_sygus {{mutants_libtest_args}}
 
 check-lang-mutants-fn-vc:
-  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify function VC mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/fn_verify.rs --output {{mutants_output_dir}}/mutants.out.fn-vc -- --lib fn_contract {{mutants_libtest_args}}
+  just check-lang-mutants-fn-vc-shard 1
+  just check-lang-mutants-fn-vc-shard 2
+  just check-lang-mutants-fn-vc-shard 3
+  just check-lang-mutants-fn-vc-shard 4
+
+check-lang-mutants-fn-vc-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "abide-verify function VC mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/fn_verify.rs --output {{mutants_output_dir}}/mutants.out.fn-vc.{{shard}}-of-{{mutants_shard_total}} -- --lib fn_contract {{mutants_libtest_args}}
 
 check-lang-mutants-smt-facade:
-  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify SMT facade mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/smt.rs --output {{mutants_output_dir}}/mutants.out.smt-facade -- --lib smt {{mutants_libtest_args}}
+  just check-lang-mutants-smt-facade-shard 1
+  just check-lang-mutants-smt-facade-shard 2
+  just check-lang-mutants-smt-facade-shard 3
+  just check-lang-mutants-smt-facade-shard 4
+
+check-lang-mutants-smt-facade-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "abide-verify SMT facade mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/smt.rs --output {{mutants_output_dir}}/mutants.out.smt-facade.{{shard}}-of-{{mutants_shard_total}} -- --lib smt {{mutants_libtest_args}}
 
 check-lang-mutants-solver-routing:
-  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify solver routing mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'SolverCapabilities|backend_score|set_active_solver_family|is_solver_family_available|AbideSolver|z3_check_chc' --output {{mutants_output_dir}}/mutants.out.solver-routing -- --lib solver {{mutants_libtest_args}}
+  just check-lang-mutants-solver-routing-shard 1
+  just check-lang-mutants-solver-routing-shard 2
+  just check-lang-mutants-solver-routing-shard 3
+  just check-lang-mutants-solver-routing-shard 4
+
+check-lang-mutants-solver-routing-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "abide-verify solver routing mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'SolverCapabilities|backend_score|set_active_solver_family|is_solver_family_available|AbideSolver|z3_check_chc' --output {{mutants_output_dir}}/mutants.out.solver-routing.{{shard}}-of-{{mutants_shard_total}} -- --lib solver {{mutants_libtest_args}}
 
 check-lang-mutants-runtime-backend:
-  {{runner}} --timeout-secs {{mutants_timeout}} --label "abide-verify runtime backend mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'RuntimeBackend|RuntimeModel|RuntimeDynamic|RuntimeBool|RuntimeReal|RuntimeArray|RuntimeModelEval' --output {{mutants_output_dir}}/mutants.out.runtime-backend -- --lib solver {{mutants_libtest_args}}
+  just check-lang-mutants-runtime-backend-shard 1
+  just check-lang-mutants-runtime-backend-shard 2
+  just check-lang-mutants-runtime-backend-shard 3
+  just check-lang-mutants-runtime-backend-shard 4
+
+check-lang-mutants-runtime-backend-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "abide-verify runtime backend mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/solver.rs --re 'RuntimeBackend|RuntimeModel|RuntimeDynamic|RuntimeBool|RuntimeReal|RuntimeArray|RuntimeModelEval' --output {{mutants_output_dir}}/mutants.out.runtime-backend.{{shard}}-of-{{mutants_shard_total}} -- --lib solver {{mutants_libtest_args}}
 
 check-lang-mutants-verify: check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend check-lang-mutants-verifier-expr
+
+check-lang-mutants-wnby: check-lang-mutants-core check-lang-mutants-syntax-parser check-lang-mutants-sema-expr-helpers check-lang-mutants-sema-checker check-lang-mutants-ir-lowering check-lang-mutants-fn-vc check-lang-mutants-smt-facade check-lang-mutants-solver-routing check-lang-mutants-runtime-backend check-lang-mutants-verifier-expr check-lang-mutants-wnby-ir-types check-lang-mutants-wnby-sema-collect-types check-lang-mutants-wnby-syntax-lex check-lang-mutants-wnby-simulate check-lang-mutants-wnby-verify-literal check-lang-mutants-wnby-verify-support check-lang-mutants-wnby-verify-explicit check-lang-mutants-wnby-verify-float-route check-lang-mutants-wnby-verify-temporal check-lang-mutants-wnby-verify-theorem-transition check-lang-mutants-wnby-verify-relational check-lang-mutants-wnby-verify-harness check-lang-mutants-wnby-verify-ic3 check-lang-mutants-wnby-verify-sygus-core check-lang-mutants-wnby-verify-pure-scene check-lang-mutants-wnby-verify-dispatch
+
+check-lang-mutants-wnby-ir-types:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "wnby IR typed-operator/type helper mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-ir --file crates/abide-ir/src/ir/types.rs --re '{{wnby_ir_types_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.ir-types -- --lib types {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-sema-collect-types:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "wnby sema collection/type helper mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-sema --file crates/abide-sema/src/elab/collect/entity.rs --file crates/abide-sema/src/elab/collect/system.rs --file crates/abide-sema/src/elab/types.rs --re '{{wnby_sema_collect_types_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.sema-collect-types -- --lib collect {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-syntax-lex:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "wnby lexer overflow/diagnostic mutants" -- {{mutants_env}} cargo mutants {{mutants_common_args}} -p abide-syntax --file crates/abide-syntax/src/lex.rs --re '{{wnby_syntax_lex_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.syntax-lex -- --lib lex {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-simulate:
+  just check-lang-mutants-wnby-simulate-shard 1
+  just check-lang-mutants-wnby-simulate-shard 2
+  just check-lang-mutants-wnby-simulate-shard 3
+  just check-lang-mutants-wnby-simulate-shard 4
+
+check-lang-mutants-wnby-simulate-shard shard:
+  {{runner}} --timeout-secs {{mutants_timeout}} --label "wnby simulator concrete-semantics mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide --file crates/abide/src/simulate.rs --re '{{wnby_simulate_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.simulate.{{shard}}-of-{{mutants_shard_total}} -- --lib simulate {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-literal:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier literal/string mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/literal.rs --re '{{wnby_verify_literal_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-literal -- --lib literal {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-support:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier support/corpus mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/support.rs --file crates/abide-verify/src/verify/unsupported_corpus.rs --re '{{wnby_verify_support_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-support -- --lib support {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-explicit:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby explicit-state evaluator mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/explicit.rs --re '{{wnby_verify_explicit_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-explicit -- --lib explicit {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-float-route:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier float-routing mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/float_route.rs --re '{{wnby_verify_float_route_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-float-route -- --lib float_route {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-temporal:
+  just check-lang-mutants-wnby-verify-temporal-shard 1
+  just check-lang-mutants-wnby-verify-temporal-shard 2
+  just check-lang-mutants-wnby-verify-temporal-shard 3
+  just check-lang-mutants-wnby-verify-temporal-shard 4
+
+check-lang-mutants-wnby-verify-temporal-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby temporal/liveness mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/temporal.rs --file crates/abide-verify/src/verify/ltl.rs --re '{{wnby_verify_temporal_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-temporal.{{shard}}-of-{{mutants_shard_total}} -- --lib temporal {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-theorem-transition:
+  just check-lang-mutants-wnby-verify-theorem-transition-shard 1
+  just check-lang-mutants-wnby-verify-theorem-transition-shard 2
+  just check-lang-mutants-wnby-verify-theorem-transition-shard 3
+  just check-lang-mutants-wnby-verify-theorem-transition-shard 4
+
+check-lang-mutants-wnby-verify-theorem-transition-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby theorem/transition mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/theorem.rs --file crates/abide-verify/src/verify/transition.rs --re '{{wnby_verify_theorem_transition_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-theorem-transition.{{shard}}-of-{{mutants_shard_total}} -- --lib theorem {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-relational:
+  just check-lang-mutants-wnby-verify-relational-shard 1
+  just check-lang-mutants-wnby-verify-relational-shard 2
+  just check-lang-mutants-wnby-verify-relational-shard 3
+  just check-lang-mutants-wnby-verify-relational-shard 4
+
+check-lang-mutants-wnby-verify-relational-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby relational backend mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/relational.rs --file crates/abide-verify/src/verify/relation_sat.rs --re '{{wnby_verify_relational_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-relational.{{shard}}-of-{{mutants_shard_total}} -- --lib relational {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-harness:
+  just check-lang-mutants-wnby-verify-harness-shard 1
+  just check-lang-mutants-wnby-verify-harness-shard 2
+  just check-lang-mutants-wnby-verify-harness-shard 3
+  just check-lang-mutants-wnby-verify-harness-shard 4
+
+check-lang-mutants-wnby-verify-harness-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby harness transition/action mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/harness.rs --file crates/abide-verify/src/verify/harness/action.rs --file crates/abide-verify/src/verify/harness/guard.rs --file crates/abide-verify/src/verify/harness/step.rs --file crates/abide-verify/src/verify/harness/step/branching.rs --file crates/abide-verify/src/verify/harness/temporal.rs --re '{{wnby_verify_harness_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-harness.{{shard}}-of-{{mutants_shard_total}} -- --lib harness {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-ic3:
+  just check-lang-mutants-wnby-verify-ic3-shard 1
+  just check-lang-mutants-wnby-verify-ic3-shard 2
+  just check-lang-mutants-wnby-verify-ic3-shard 3
+  just check-lang-mutants-wnby-verify-ic3-shard 4
+
+check-lang-mutants-wnby-verify-ic3-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby IC3/liveness mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/ic3/liveness.rs --file crates/abide-verify/src/verify/ic3/system/actions.rs --file crates/abide-verify/src/verify/ic3/multi_slot/expr.rs --file crates/abide-verify/src/verify/ic3/multi_slot/patterns.rs --file crates/abide-verify/src/verify/ic3/system/expr.rs --re '{{wnby_verify_ic3_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-ic3.{{shard}}-of-{{mutants_shard_total}} -- --lib ic3 {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-sygus-core:
+  just check-lang-mutants-wnby-verify-sygus-core-shard 1
+  just check-lang-mutants-wnby-verify-sygus-core-shard 2
+  just check-lang-mutants-wnby-verify-sygus-core-shard 3
+  just check-lang-mutants-wnby-verify-sygus-core-shard 4
+
+check-lang-mutants-wnby-verify-sygus-core-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby SyGuS core/revalidation mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/sygus.rs --file crates/abide-verify/src/verify/sygus/core.rs --re '{{wnby_verify_sygus_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-sygus-core.{{shard}}-of-{{mutants_shard_total}} -- --lib sygus {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene:
+  just check-lang-mutants-wnby-verify-pure-scene-context
+  just check-lang-mutants-wnby-verify-pure-scene-defenv
+  just check-lang-mutants-wnby-verify-pure-scene-encode-ctors
+  just check-lang-mutants-wnby-verify-pure-scene-encode-apps
+  just check-lang-mutants-wnby-verify-pure-scene-encode-collections
+  just check-lang-mutants-wnby-verify-pure-scene-encode-lambda
+  just check-lang-mutants-wnby-verify-pure-scene-scene
+  just check-lang-mutants-wnby-verify-pure-scene-scope-walkers
+
+check-lang-mutants-wnby-verify-pure-scene-shard shard:
+  @echo "The broad pure/scene shard was split after it caused excessive filesystem churn. Use check-lang-mutants-wnby-verify-pure-scene or one of its focused child targets."
+
+check-lang-mutants-wnby-verify-pure-scene-context:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene context/default mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/context.rs --re '{{wnby_verify_pure_scene_context_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.context -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-defenv:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene defenv mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/defenv.rs --re '{{wnby_verify_pure_scene_defenv_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.defenv -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-encode-ctors:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene encode constructor mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/encode.rs --re '{{wnby_verify_pure_scene_encode_ctors_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.encode-ctors -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-encode-apps:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene encode application mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/encode.rs --re '{{wnby_verify_pure_scene_encode_apps_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.encode-apps -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-encode-collections:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene encode collection mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/encode.rs --re '{{wnby_verify_pure_scene_encode_collections_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.encode-collections -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-encode-lambda:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene encode lambda/refinement mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/encode.rs --re '{{wnby_verify_pure_scene_encode_lambda_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.encode-lambda -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-scene:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene scene mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/scene.rs --re '{{wnby_verify_pure_scene_scene_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.scene -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-pure-scene-scope-walkers:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby pure/scene scope/walker mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/scope.rs --file crates/abide-verify/src/verify/walkers.rs --re '{{wnby_verify_pure_scene_scope_walkers_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-pure-scene.scope-walkers -- --lib pure_scene {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-dispatch:
+  just check-lang-mutants-wnby-verify-dispatch-reconcile
+  just check-lang-mutants-wnby-verify-dispatch-float-backend
+
+check-lang-mutants-wnby-verify-dispatch-reconcile:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier dispatch reconciliation mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/mod.rs --re '{{wnby_verify_dispatch_reconcile_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-dispatch.reconcile -- --lib solver_result_reconciliation {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-dispatch-float-backend:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier dispatch float-backend mutants" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} -p abide-verify --file crates/abide-verify/src/verify/mod.rs --re '{{wnby_verify_dispatch_float_backend_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-dispatch.float-backend -- --lib float_requires_z3_result {{mutants_libtest_args}}
+
+check-lang-mutants-wnby-verify-dispatch-broad-shard shard:
+  {{runner}} --timeout-secs {{mutants_verify_timeout}} --label "wnby verifier dispatch/lasso mutants shard {{shard}}/{{mutants_shard_total}}" -- {{mutants_env}} cargo mutants {{mutants_verify_common_args}} --shard "$(({{shard}} - 1))/{{mutants_shard_total}}" -p abide-verify --file crates/abide-verify/src/verify/mod.rs --re '{{wnby_verify_dispatch_re}}' --output {{mutants_output_dir}}/mutants.out.wnby.verify-dispatch.{{shard}}-of-{{mutants_shard_total}} -- --lib verify {{mutants_libtest_args}}
 
 coverage:
   {{runner}} --timeout-secs {{cargo_timeout}} --label "abide coverage" -- cargo llvm-cov -p abide --lib --tests

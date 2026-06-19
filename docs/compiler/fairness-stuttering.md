@@ -74,3 +74,22 @@ Backends that support temporal reasoning must preserve the effective
   `no stutter`, a TLC model may use an explicit real-transition fairness
   approximation only to rule out infinite synthetic stuttering before the target
   condition is reached.
+
+## Oracle Fixture Contract
+
+Liveness fixtures must distinguish bounded smoke coverage from temporal
+fairness oracles. A bounded `CHECKED` result under default stutter and no fair
+commands only says that the bounded backend did not find a counterexample in
+the explored prefix; it is not an unbounded progress guarantee.
+
+Fixtures that are intended to validate liveness semantics should either:
+
+- include a matching fairness assumption and expect the property to hold, or
+- intentionally omit the required fairness and expect a liveness violation.
+
+External parity suites use their manifest expectation only to pin the external
+tool's own expected result. Abide results are then compared against the external
+tool result, not directly against the manifest answer key. For parameterized
+commands, hand-written TLC models should represent per-tuple fairness by
+splitting each finite command/argument tuple into a separate action and applying
+the corresponding weak or strong fairness obligation to each action.

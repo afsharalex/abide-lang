@@ -103,9 +103,12 @@ fn infer_numeric_binop_type(op: crate::elab::types::BinOp, left: &Ty, right: &Ty
         return None;
     }
     match (left, right) {
-        (Ty::Builtin(Float), Ty::Builtin(_)) | (Ty::Builtin(_), Ty::Builtin(Float)) => {
-            Some(Ty::Builtin(Float))
-        }
+        // `float` (IEEE-754 binary64) is a closed domain (DDR-059): it combines
+        // only with `float`. Mixing `float` with `real` or `int` requires an
+        // explicit conversion, so such an expression is a type error here rather
+        // than being silently promoted (which would hide the loss of exactness).
+        (Ty::Builtin(Float), Ty::Builtin(Float)) => Some(Ty::Builtin(Float)),
+        // `int` promotes to `real` (exact, lossless).
         (Ty::Builtin(Real), Ty::Builtin(Int | Real)) | (Ty::Builtin(Int), Ty::Builtin(Real)) => {
             Some(Ty::Builtin(Real))
         }
@@ -387,6 +390,7 @@ fn resolve_set_literal_expr(
     sp: Option<crate::span::Span>,
 ) -> EExpr {
     let resolved_elems: Vec<EExpr> = elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+    // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
     let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
     let collection_ty = if matches!(ty, Ty::Relation(_)) {
         match elem_ty {
@@ -407,6 +411,7 @@ fn resolve_seq_literal_expr(
     sp: Option<crate::span::Span>,
 ) -> EExpr {
     let resolved_elems: Vec<EExpr> = elems.iter().map(|e| resolve_expr(ctx, bound, e)).collect();
+    // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
     let elem_ty = resolved_elems.first().map_or(Ty::Error, |e| e.ty().clone());
     EExpr::SeqLit(Ty::Seq(Box::new(elem_ty)), resolved_elems, sp)
 }
@@ -423,9 +428,11 @@ fn resolve_map_literal_expr(
         .collect();
     let key_ty = resolved_entries
         .first()
+        // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
         .map_or(Ty::Error, |(k, _)| k.ty().clone());
     let val_ty = resolved_entries
         .first()
+        // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
         .map_or(Ty::Error, |(_, v)| v.ty().clone());
     EExpr::MapLit(
         Ty::Map(Box::new(key_ty), Box::new(val_ty)),
@@ -1575,14 +1582,35 @@ mod tests {
     }
 
     #[test]
-    fn infer_numeric_binop_type_promotes_real_and_float_operands() {
+    fn infer_numeric_binop_type_keeps_real_and_float_domains_distinct() {
+        // DDR-059: `float` is a closed domain — only float+float yields float.
         assert!(
             matches!(
-                infer_numeric_binop_type(BinOp::Add, &Ty::Builtin(BuiltinTy::Float), &int_ty()),
+                infer_numeric_binop_type(
+                    BinOp::Add,
+                    &Ty::Builtin(BuiltinTy::Float),
+                    &Ty::Builtin(BuiltinTy::Float)
+                ),
                 Some(Ty::Builtin(BuiltinTy::Float))
             ),
-            "float arithmetic should promote to float"
+            "float + float should be float"
         );
+        // Mixing float with int or real is NOT implicit — it is a type error.
+        assert!(
+            infer_numeric_binop_type(BinOp::Add, &Ty::Builtin(BuiltinTy::Float), &int_ty())
+                .is_none(),
+            "float + int must not implicitly promote"
+        );
+        assert!(
+            infer_numeric_binop_type(
+                BinOp::Add,
+                &Ty::Builtin(BuiltinTy::Float),
+                &Ty::Builtin(BuiltinTy::Real)
+            )
+            .is_none(),
+            "float + real must not implicitly mix"
+        );
+        // `int` still promotes to `real` (exact, lossless).
         assert!(
             matches!(
                 infer_numeric_binop_type(BinOp::Sub, &int_ty(), &Ty::Builtin(BuiltinTy::Real)),

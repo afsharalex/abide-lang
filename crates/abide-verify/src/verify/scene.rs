@@ -34,7 +34,7 @@ use super::walkers::{
 };
 use super::{
     clamp_timeout_to_deadline, collect_var_refs_in_expr, expand_through_defs, expr_span,
-    find_unsupported_in_actions,
+    find_unsupported_in_actions, strip_assert_assume,
 };
 use super::{VerificationResult, VerifyConfig};
 
@@ -201,10 +201,12 @@ pub(super) fn collect_same_step_event_pairs_expr(
         if op == "OpSameStep" {
             let left_vars: Vec<usize> = collect_ordering_leaf_vars(left)
                 .into_iter()
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|v| var_to_idx.get(v).copied())
                 .collect();
             let right_vars: Vec<usize> = collect_ordering_leaf_vars(right)
                 .into_iter()
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|v| var_to_idx.get(v).copied())
                 .collect();
             for &a in &left_vars {
@@ -315,10 +317,12 @@ pub(super) fn encode_scene_ordering_v2(
                 // XOR on their fires variables.
                 let left_events: Vec<usize> = collect_ordering_leaf_vars(left)
                     .into_iter()
+                    // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                     .filter_map(|v| var_to_idx.get(v).copied())
                     .collect();
                 let right_events: Vec<usize> = collect_ordering_leaf_vars(right)
                     .into_iter()
+                    // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                     .filter_map(|v| var_to_idx.get(v).copied())
                     .collect();
                 for &a in &left_events {
@@ -396,12 +400,26 @@ pub(super) fn encode_scene_ordering_v2(
                     scene_name,
                 )?;
             }
-            _ => {}
+            other => {
+                return Err(unsupported_scene_ordering_expr(scene_name, other));
+            }
         },
         IRExpr::Var { .. } => {}
-        _ => {}
+        _ => {
+            return Err(unsupported_scene_ordering_expr(
+                scene_name,
+                "state predicate",
+            ));
+        }
     }
     Ok(())
+}
+
+fn unsupported_scene_ordering_expr(scene_name: &str, kind: &str) -> String {
+    format!(
+        "scene '{scene_name}': unsupported scene ordering expression in `assume` block ({kind}); \
+         scene `when assume` only supports event variables combined with ->, &, ||, |, and ^|"
+    )
 }
 
 /// Reverse lookup: event index → variable name
@@ -968,6 +986,7 @@ fn initial_scene_scope(scene: &IRScene) -> HashMap<String, usize> {
     for store in &scene.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let hi = store.hi.max(0) as usize;
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         scope.insert(store.entity_type.clone(), existing + hi);
     }
@@ -1073,6 +1092,7 @@ fn scene_store_ranges(scene: &IRScene) -> SceneStores {
         .stores
         .iter()
         .map(|store| {
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             let min_active = usize::try_from(store.lo.max(0)).unwrap_or(0);
             (store.name.as_str(), min_active)
         })
@@ -1083,6 +1103,7 @@ fn scene_store_ranges(scene: &IRScene) -> SceneStores {
             let min_active = store_lowers
                 .get(store_name.as_str())
                 .copied()
+                // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                 .unwrap_or(0)
                 .min(*slot_count);
             (
@@ -1105,6 +1126,7 @@ fn raw_scene_store_ranges(scene: &IRScene) -> HashMap<String, (String, usize, us
     for store in &scene.stores {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let count = store.hi.max(0) as usize;
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let start = running.get(&store.entity_type).copied().unwrap_or(0);
         ranges.insert(
             store.name.clone(),
@@ -1516,7 +1538,7 @@ fn build_scene_firing_plan<'a>(
 
 fn validate_scene_assertions(scene: &IRScene, defs: &defenv::DefEnv) -> SceneCheckResult<()> {
     for assertion in &scene.assertions {
-        let expanded = expand_through_defs(assertion, defs);
+        let expanded = strip_assert_assume(&expand_through_defs(assertion, defs));
         if let Some(kind) = find_unsupported_scene_expr(&expanded) {
             return Err(scene_fail(
                 scene,
@@ -1955,6 +1977,7 @@ fn assert_scene_fire_constraints(solver: &AbideSolver, plan: &SceneFiringPlan<'_
         let range = &plan.event_instance_ranges[event_idx];
         let fire_vars: Vec<&Bool> = plan.instances[range.clone()]
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|inst| inst.fires_var.as_ref())
             .collect();
         if fire_vars.is_empty() {
@@ -2463,6 +2486,7 @@ fn bool_and_values(values: Vec<Bool>) -> Bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::unsupported_corpus;
 
     fn empty_ir() -> IRProgram {
         IRProgram {
@@ -2727,6 +2751,19 @@ mod tests {
             "ordering_errors",
         );
         assert!(matches!(no_fire, Err(reason) if reason.contains("ordering_errors")));
+
+        let non_ordering_predicate = encode_scene_ordering_v2(
+            &bool_lit(false),
+            &var_to_idx,
+            &[0..1, 1..2],
+            &instances,
+            &solver,
+            "ordering_errors",
+        );
+        assert!(matches!(
+            non_ordering_predicate,
+            Err(reason) if reason.contains("unsupported scene ordering")
+        ));
     }
 
     #[test]
@@ -2772,6 +2809,72 @@ mod tests {
             VerificationResult::SceneFail { name, reason, .. }
                 if name == "empty_scene" && reason == crate::messages::SCENE_EMPTY_SCOPE
         ));
+    }
+
+    #[test]
+    fn check_scene_block_rejects_non_ordering_when_assumptions() {
+        let mut ir = empty_ir();
+        ir.entities.push(crate::ir::types::IREntity {
+            name: "Marker".to_owned(),
+            fields: vec![],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        });
+        ir.systems.push(IRSystem {
+            name: "Markers".to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec!["Marker".to_owned()],
+            commands: vec![],
+            actions: vec![IRSystemAction {
+                name: "tick".to_owned(),
+                params: vec![],
+                guard: bool_lit(true),
+                body: vec![],
+                return_expr: None,
+            }],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        });
+        let scene = IRScene {
+            name: "reject_state_assume".to_owned(),
+            systems: vec![],
+            stores: vec![],
+            givens: vec![],
+            events: vec![IRSceneEvent {
+                var: "event".to_owned(),
+                system: "Markers".to_owned(),
+                event: "tick".to_owned(),
+                args: vec![],
+                cardinality: crate::ir::types::Cardinality::Named("one".to_owned()),
+            }],
+            ordering: vec![bool_lit(false)],
+            assertions: vec![],
+            given_constraints: vec![],
+            activations: vec![],
+            span: None,
+            file: None,
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let result = check_scene_block(&ir, &vctx, &defs, &scene, &VerifyConfig::default(), None);
+
+        assert!(
+            matches!(
+                result,
+                VerificationResult::SceneFail { ref name, ref reason, .. }
+                    if name == "reject_state_assume"
+                        && reason.contains("unsupported scene ordering expression")
+            ),
+            "non-ordering scene when assume predicate must be rejected, got: {result}"
+        );
     }
 
     #[test]
@@ -3025,6 +3128,41 @@ mod tests {
             VerificationResult::SceneFail { reason, .. }
                 if reason.contains("unsupported expression kind in scene then assertion")
         ));
+    }
+
+    #[test]
+    fn check_scene_block_rejects_shared_unsupported_ir_corpus() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let config = VerifyConfig::default();
+
+        for case in unsupported_corpus::property_position_unsupported_cases() {
+            let result = check_scene_block(
+                &ir,
+                &vctx,
+                &defs,
+                &store_scene(
+                    case.name,
+                    vec![store_decl("tasks", "Task", 1)],
+                    vec![],
+                    vec![],
+                    vec![case.expr],
+                    vec![],
+                ),
+                &config,
+                None,
+            );
+            assert!(
+                matches!(
+                    result,
+                    VerificationResult::SceneFail { ref reason, .. }
+                        if reason.contains("unsupported expression kind in scene then assertion")
+                ),
+                "unsupported scene corpus case `{}` must fail conservatively, got: {result:?}",
+                case.name
+            );
+        }
     }
 
     #[test]

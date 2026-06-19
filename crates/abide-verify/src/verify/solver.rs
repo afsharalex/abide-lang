@@ -20,9 +20,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 // ── Z3 imports (the ONLY place in verify/ that touches z3::) ─────────
+use z3::ast::RoundingMode as Z3RoundingMode;
 use z3::ast::{
-    Array as Z3Array, Ast as Z3Ast, Bool as Z3Bool, Dynamic as Z3Dynamic, Int as Z3Int,
-    Real as Z3Real,
+    Array as Z3Array, Ast as Z3Ast, Bool as Z3Bool, Dynamic as Z3Dynamic, Float as Z3Float,
+    Int as Z3Int, Real as Z3Real,
 };
 use z3::{
     DatatypeAccessor as Z3DatatypeAccessor, DatatypeBuilder as Z3DatatypeBuilder,
@@ -374,6 +375,12 @@ pub trait SolverBackend {
     type Int: Clone + fmt::Debug;
     /// Real AST node.
     type Real: Clone + fmt::Debug;
+    /// IEEE-754 binary64 floating-point AST node (DDR-059). Distinct from
+    /// [`Self::Real`]: `real` is exact rational, `float` is binary64 with
+    /// rounding, NaN, infinities, and signed zero. Only the Z3 backend supports
+    /// it; the `float_*` methods default to `unimplemented!` so other backends
+    /// need not implement floating point (float obligations route to Z3).
+    type Float: Clone + fmt::Debug;
     /// Dynamically-typed AST node (uninterpreted / generic).
     type Dynamic: Clone + fmt::Debug;
     /// Array AST node.
@@ -448,6 +455,9 @@ pub trait SolverBackend {
     fn int_ge(ctx: &Self::Context, a: &Self::Int, b: &Self::Int) -> Self::Bool;
     fn int_ite(ctx: &Self::Context, cond: &Self::Bool, t: &Self::Int, e: &Self::Int) -> Self::Int;
     fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real;
+    /// Floor of a real toward negative infinity (SMT-LIB `to_int`). Used to
+    /// build Euclidean real modulo.
+    fn real_to_int(ctx: &Self::Context, a: &Self::Real) -> Self::Int;
 
     // ── Real operations ─────────────────────────────────────────────
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real;
@@ -467,6 +477,84 @@ pub trait SolverBackend {
         t: &Self::Real,
         e: &Self::Real,
     ) -> Self::Real;
+
+    // ── IEEE-754 binary64 floating point (DDR-059) ──────────────────
+    // Arithmetic uses round-nearest-ties-to-even. Comparisons follow IEEE
+    // semantics (e.g. `NaN` is unordered, `+0.0 == -0.0`). Default bodies
+    // panic so only the Z3 backend need implement these; float-bearing
+    // obligations are routed to Z3.
+    #[doc(hidden)]
+    fn float_unsupported() -> ! {
+        unimplemented!("IEEE-754 floating point is only supported by the Z3 backend")
+    }
+    fn float_lit(_ctx: &Self::Context, _value: f64) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_var(_ctx: &Self::Context, _name: &str) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_add(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_sub(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_mul(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_div(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    /// IEEE-754 magnitude (`Z3_mk_fpa_abs`), used to build the Euclidean
+    /// `float` `%` operator from primitives.
+    fn float_abs(_ctx: &Self::Context, _a: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    /// Round toward negative infinity to an integral `float`
+    /// (`Z3_mk_fpa_round_to_integral` with RTN) — the floor used by the
+    /// composed Euclidean `float` `%` operator.
+    fn float_floor(_ctx: &Self::Context, _a: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_neg(_ctx: &Self::Context, _a: &Self::Float) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_eq(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Bool {
+        Self::float_unsupported()
+    }
+    fn float_lt(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Bool {
+        Self::float_unsupported()
+    }
+    fn float_le(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Bool {
+        Self::float_unsupported()
+    }
+    fn float_gt(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Bool {
+        Self::float_unsupported()
+    }
+    fn float_ge(_ctx: &Self::Context, _a: &Self::Float, _b: &Self::Float) -> Self::Bool {
+        Self::float_unsupported()
+    }
+    fn float_ite(
+        _ctx: &Self::Context,
+        _cond: &Self::Bool,
+        _t: &Self::Float,
+        _e: &Self::Float,
+    ) -> Self::Float {
+        Self::float_unsupported()
+    }
+    fn float_sort(_ctx: &Self::Context) -> Self::Sort {
+        Self::float_unsupported()
+    }
+    fn dynamic_from_float(_ctx: &Self::Context, _f: &Self::Float) -> Self::Dynamic {
+        Self::float_unsupported()
+    }
+    fn dynamic_as_float(_ctx: &Self::Context, _d: &Self::Dynamic) -> Option<Self::Float> {
+        None
+    }
+    /// Read the `f64` value of a (model-evaluated) float numeral.
+    fn float_as_f64(_ctx: &Self::Context, _f: &Self::Float) -> f64 {
+        Self::float_unsupported()
+    }
 
     // ── Sort operations ─────────────────────────────────────────────
     fn int_sort(ctx: &Self::Context) -> Self::Sort;
@@ -613,6 +701,7 @@ impl SolverBackend for Z3Backend {
     type Bool = Z3Bool;
     type Int = Z3Int;
     type Real = Z3Real;
+    type Float = Z3Float;
     type Dynamic = Z3Dynamic;
     type Array = Z3Array;
     type Sort = Z3Sort;
@@ -648,6 +737,7 @@ impl SolverBackend for Z3Backend {
             Z3SatResult::Sat => SatResult::Sat,
             Z3SatResult::Unsat => SatResult::Unsat,
             Z3SatResult::Unknown => {
+                // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                 SatResult::Unknown(self.solver.get_reason_unknown().unwrap_or_default())
             }
         })
@@ -768,6 +858,10 @@ impl SolverBackend for Z3Backend {
         cond.ite(t, e)
     }
 
+    fn real_to_int(_ctx: &Self::Context, a: &Z3Real) -> Z3Int {
+        a.to_int()
+    }
+
     fn int_to_real(_ctx: &Self::Context, a: &Z3Int) -> Z3Real {
         a.to_real()
     }
@@ -820,6 +914,73 @@ impl SolverBackend for Z3Backend {
 
     fn real_ite(_ctx: &Self::Context, cond: &Z3Bool, t: &Z3Real, e: &Z3Real) -> Z3Real {
         cond.ite(t, e)
+    }
+
+    // ── IEEE-754 binary64 floating point (DDR-059) ──────────────────
+    fn float_lit(_ctx: &Self::Context, value: f64) -> Z3Float {
+        Z3Float::from_f64(value)
+    }
+
+    fn float_var(_ctx: &Self::Context, name: &str) -> Z3Float {
+        Z3Float::new_const_double(name)
+    }
+
+    fn float_add(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Float {
+        a.add_with_rounding_mode(b.clone(), &Z3RoundingMode::round_nearest_ties_to_even())
+    }
+
+    fn float_sub(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Float {
+        a.sub_with_rounding_mode(b.clone(), &Z3RoundingMode::round_nearest_ties_to_even())
+    }
+
+    fn float_mul(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Float {
+        a.mul_with_rounding_mode(b.clone(), &Z3RoundingMode::round_nearest_ties_to_even())
+    }
+
+    fn float_div(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Float {
+        a.div_with_rounding_mode(b.clone(), &Z3RoundingMode::round_nearest_ties_to_even())
+    }
+
+    fn float_abs(_ctx: &Self::Context, a: &Z3Float) -> Z3Float {
+        a.unary_abs()
+    }
+
+    fn float_floor(_ctx: &Self::Context, a: &Z3Float) -> Z3Float {
+        a.round_to_integral_with_rounding_mode(&Z3RoundingMode::round_towards_negative())
+    }
+
+    fn float_neg(_ctx: &Self::Context, a: &Z3Float) -> Z3Float {
+        a.unary_neg()
+    }
+
+    fn float_eq(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Bool {
+        // IEEE-754 equality (`Z3_mk_fpa_eq`), not structural Ast equality:
+        // `NaN != NaN` and `+0.0 == -0.0`, matching the simulator's host f64.
+        a.eq_fpa(b.clone())
+    }
+
+    fn float_lt(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Bool {
+        a.lt(b.clone())
+    }
+
+    fn float_le(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Bool {
+        a.le(b.clone())
+    }
+
+    fn float_gt(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Bool {
+        a.gt(b.clone())
+    }
+
+    fn float_ge(_ctx: &Self::Context, a: &Z3Float, b: &Z3Float) -> Z3Bool {
+        a.ge(b.clone())
+    }
+
+    fn float_ite(_ctx: &Self::Context, cond: &Z3Bool, t: &Z3Float, e: &Z3Float) -> Z3Float {
+        cond.ite(t, e)
+    }
+
+    fn float_sort(_ctx: &Self::Context) -> Z3Sort {
+        Z3Sort::double()
     }
 
     // ── Sort operations ─────────────────────────────────────────────
@@ -876,6 +1037,18 @@ impl SolverBackend for Z3Backend {
 
     fn dynamic_from_real(_ctx: &Self::Context, r: &Z3Real) -> Z3Dynamic {
         Z3Dynamic::from_ast(r)
+    }
+
+    fn dynamic_from_float(_ctx: &Self::Context, f: &Z3Float) -> Z3Dynamic {
+        Z3Dynamic::from_ast(f)
+    }
+
+    fn dynamic_as_float(_ctx: &Self::Context, d: &Z3Dynamic) -> Option<Z3Float> {
+        d.as_float()
+    }
+
+    fn float_as_f64(_ctx: &Self::Context, f: &Z3Float) -> f64 {
+        f.as_f64()
     }
 
     fn dynamic_from_array(_ctx: &Self::Context, a: &Z3Array) -> Z3Dynamic {
@@ -1160,6 +1333,10 @@ impl SolverBackend for Cvc5Backend {
 
     type Bool = Cvc5Term;
     type Int = Cvc5Term;
+    // cvc5 can build FP sorts/constants but not FP arithmetic kinds, so float
+    // obligations route to Z3; the default `unimplemented!` float_* methods are
+    // never reached. `Float` is set to `Cvc5Term` only to satisfy the trait.
+    type Float = Cvc5Term;
     type Real = Cvc5Term;
     type Dynamic = Cvc5Term;
     type Array = Cvc5Term;
@@ -1360,6 +1537,11 @@ impl SolverBackend for Cvc5Backend {
     fn int_to_real(ctx: &Self::Context, a: &Self::Int) -> Self::Real {
         ctx.tm
             .mk_term(Cvc5Kind::CVC5_KIND_TO_REAL, std::slice::from_ref(a))
+    }
+
+    fn real_to_int(ctx: &Self::Context, a: &Self::Real) -> Self::Int {
+        ctx.tm
+            .mk_term(Cvc5Kind::CVC5_KIND_TO_INTEGER, std::slice::from_ref(a))
     }
 
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real {
@@ -1758,6 +1940,16 @@ pub enum RuntimeReal {
     Cvc5(Cvc5Term),
 }
 
+/// Runtime float value. Only the Z3 variant is ever constructed — float
+/// obligations route to Z3 because cvc5 cannot do FP arithmetic — but the
+/// `Cvc5` variant exists to mirror the other runtime types and is treated as
+/// unreachable in the float dispatch.
+#[derive(Clone, Debug)]
+pub enum RuntimeFloat {
+    Z3(Z3Float),
+    Cvc5(Cvc5Term),
+}
+
 #[derive(Clone, Debug)]
 pub enum RuntimeDynamic {
     Z3(Z3Dynamic),
@@ -1998,6 +2190,27 @@ impl fmt::Display for RuntimeReal {
     }
 }
 
+impl RuntimeModelEval for RuntimeFloat {
+    fn runtime_eval(model: &RuntimeModel, ast: &Self, _model_completion: bool) -> Option<Self> {
+        match (model, ast) {
+            (RuntimeModel::Z3(model), RuntimeFloat::Z3(ast)) => {
+                model.eval(ast, true).map(RuntimeFloat::Z3)
+            }
+            // cvc5 never holds a float value.
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RuntimeFloat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeFloat::Z3(v) => write!(f, "{v}"),
+            RuntimeFloat::Cvc5(v) => write!(f, "{v}"),
+        }
+    }
+}
+
 impl fmt::Display for RuntimeDynamic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2023,6 +2236,16 @@ fn panic_mixed_solver_terms(expected: SolverFamily) -> ! {
     )
 }
 
+/// IEEE-754 floating point is only available on the Z3 backend (cvc5 lacks FP
+/// arithmetic kinds). Float-bearing obligations must be routed to Z3, so this
+/// is unreachable in correct operation.
+fn panic_float_on_cvc5() -> ! {
+    panic!(
+        "IEEE-754 floating-point obligations must be solved with the Z3 backend; \
+         the cvc5 backend has no floating-point arithmetic"
+    )
+}
+
 #[allow(unreachable_patterns)]
 impl SolverBackend for RuntimeBackend {
     fn family() -> SolverFamily {
@@ -2040,6 +2263,7 @@ impl SolverBackend for RuntimeBackend {
     type Bool = RuntimeBool;
     type Int = RuntimeInt;
     type Real = RuntimeReal;
+    type Float = RuntimeFloat;
     type Dynamic = RuntimeDynamic;
     type Array = RuntimeArray;
     type Sort = RuntimeSort;
@@ -2483,6 +2707,19 @@ impl SolverBackend for RuntimeBackend {
         }
     }
 
+    fn real_to_int(ctx: &Self::Context, a: &Self::Real) -> Self::Int {
+        match (ctx, a) {
+            (RuntimeContext::Z3(ctx), RuntimeReal::Z3(a)) => {
+                RuntimeInt::Z3(Z3Backend::real_to_int(ctx, a))
+            }
+            (RuntimeContext::Cvc5(ctx), RuntimeReal::Cvc5(a)) => {
+                RuntimeInt::Cvc5(Cvc5Backend::real_to_int(ctx, a))
+            }
+            (RuntimeContext::Z3(_), _) => panic_mixed_solver_terms(SolverFamily::Z3),
+            (RuntimeContext::Cvc5(_), _) => panic_mixed_solver_terms(SolverFamily::Cvc5),
+        }
+    }
+
     fn real_val(ctx: &Self::Context, num: i64, den: i64) -> Self::Real {
         match ctx {
             RuntimeContext::Z3(ctx) => RuntimeReal::Z3(Z3Backend::real_val(ctx, num, den)),
@@ -2674,6 +2911,153 @@ impl SolverBackend for RuntimeBackend {
         }
     }
 
+    // ── IEEE-754 binary64 floating point — Z3 only (DDR-059) ────────
+    fn float_lit(ctx: &Self::Context, value: f64) -> Self::Float {
+        match ctx {
+            RuntimeContext::Z3(ctx) => RuntimeFloat::Z3(Z3Backend::float_lit(ctx, value)),
+            RuntimeContext::Cvc5(_) => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_var(ctx: &Self::Context, name: &str) -> Self::Float {
+        match ctx {
+            RuntimeContext::Z3(ctx) => RuntimeFloat::Z3(Z3Backend::float_var(ctx, name)),
+            RuntimeContext::Cvc5(_) => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_add(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Float {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeFloat::Z3(Z3Backend::float_add(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_sub(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Float {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeFloat::Z3(Z3Backend::float_sub(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_mul(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Float {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeFloat::Z3(Z3Backend::float_mul(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_div(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Float {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeFloat::Z3(Z3Backend::float_div(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_abs(ctx: &Self::Context, a: &Self::Float) -> Self::Float {
+        match (ctx, a) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a)) => {
+                RuntimeFloat::Z3(Z3Backend::float_abs(ctx, a))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_floor(ctx: &Self::Context, a: &Self::Float) -> Self::Float {
+        match (ctx, a) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a)) => {
+                RuntimeFloat::Z3(Z3Backend::float_floor(ctx, a))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_neg(ctx: &Self::Context, a: &Self::Float) -> Self::Float {
+        match (ctx, a) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a)) => {
+                RuntimeFloat::Z3(Z3Backend::float_neg(ctx, a))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_eq(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Bool {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeBool::Z3(Z3Backend::float_eq(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_lt(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Bool {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeBool::Z3(Z3Backend::float_lt(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_le(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Bool {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeBool::Z3(Z3Backend::float_le(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_gt(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Bool {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeBool::Z3(Z3Backend::float_gt(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_ge(ctx: &Self::Context, a: &Self::Float, b: &Self::Float) -> Self::Bool {
+        match (ctx, a, b) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(a), RuntimeFloat::Z3(b)) => {
+                RuntimeBool::Z3(Z3Backend::float_ge(ctx, a, b))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_ite(
+        ctx: &Self::Context,
+        cond: &Self::Bool,
+        t: &Self::Float,
+        e: &Self::Float,
+    ) -> Self::Float {
+        match (ctx, cond, t, e) {
+            (
+                RuntimeContext::Z3(ctx),
+                RuntimeBool::Z3(cond),
+                RuntimeFloat::Z3(t),
+                RuntimeFloat::Z3(e),
+            ) => RuntimeFloat::Z3(Z3Backend::float_ite(ctx, cond, t, e)),
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn float_sort(ctx: &Self::Context) -> Self::Sort {
+        match ctx {
+            RuntimeContext::Z3(ctx) => RuntimeSort::Z3(Z3Backend::float_sort(ctx)),
+            RuntimeContext::Cvc5(_) => panic_float_on_cvc5(),
+        }
+    }
+
     fn int_sort(ctx: &Self::Context) -> Self::Sort {
         match ctx {
             RuntimeContext::Z3(ctx) => RuntimeSort::Z3(Z3Backend::int_sort(ctx)),
@@ -2820,6 +3204,32 @@ impl SolverBackend for RuntimeBackend {
             }
             (RuntimeContext::Z3(_), _) => panic_mixed_solver_terms(SolverFamily::Z3),
             (RuntimeContext::Cvc5(_), _) => panic_mixed_solver_terms(SolverFamily::Cvc5),
+        }
+    }
+
+    fn dynamic_from_float(ctx: &Self::Context, f: &Self::Float) -> Self::Dynamic {
+        match (ctx, f) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(f)) => {
+                RuntimeDynamic::Z3(Z3Backend::dynamic_from_float(ctx, f))
+            }
+            _ => panic_float_on_cvc5(),
+        }
+    }
+
+    fn dynamic_as_float(ctx: &Self::Context, d: &Self::Dynamic) -> Option<Self::Float> {
+        match (ctx, d) {
+            (RuntimeContext::Z3(ctx), RuntimeDynamic::Z3(d)) => {
+                Z3Backend::dynamic_as_float(ctx, d).map(RuntimeFloat::Z3)
+            }
+            // cvc5 never carries floats; a dynamic is never a float there.
+            _ => None,
+        }
+    }
+
+    fn float_as_f64(ctx: &Self::Context, f: &Self::Float) -> f64 {
+        match (ctx, f) {
+            (RuntimeContext::Z3(ctx), RuntimeFloat::Z3(f)) => Z3Backend::float_as_f64(ctx, f),
+            _ => panic_float_on_cvc5(),
         }
     }
 
@@ -3543,6 +3953,7 @@ pub type ActiveBackend = RuntimeBackend;
 pub type Bool = <ActiveBackend as SolverBackend>::Bool;
 pub type Int = <ActiveBackend as SolverBackend>::Int;
 pub type Real = <ActiveBackend as SolverBackend>::Real;
+pub type Float = <ActiveBackend as SolverBackend>::Float;
 pub type Dynamic = <ActiveBackend as SolverBackend>::Dynamic;
 pub type Array = <ActiveBackend as SolverBackend>::Array;
 pub type Sort = <ActiveBackend as SolverBackend>::Sort;

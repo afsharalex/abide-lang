@@ -2,7 +2,9 @@
 
 use serde::Serialize;
 
-use crate::ir::types::{IRExpr, IRVerify, LitVal};
+use crate::ir::types::{
+    IRAction, IRActionMatchScrutinee, IREntity, IRExpr, IRSystem, IRVerify, LitVal,
+};
 
 use super::defenv;
 use super::ltl::{Formula as LtlFormula, GeneralizedBuchi};
@@ -78,7 +80,6 @@ pub struct PatternExtraction {
 #[derive(Clone)]
 pub struct CompiledTemporalFormula {
     expanded: IRExpr,
-    normalized: IRExpr,
     contains_liveness: bool,
     contains_temporal: bool,
     contains_past_time: bool,
@@ -94,16 +95,21 @@ impl CompiledTemporalFormula {
     }
 
     pub fn from_expanded(expanded: IRExpr) -> Self {
-        let normalized = desugar_until(&expanded);
+        // `until` is *not* desugared into `eventually`/`always`: strong until is
+        // not expressible with only F/G, so any such rewrite is unsound (it
+        // forces the left operand to hold at every step where the right is
+        // absent, even after the right has already occurred). Instead `until`
+        // flows through to the native LTL→Büchi automaton and the Spot `U`
+        // operator, and the liveness-pattern extractor declines to reduce it
+        // (returning `None` → conservative Büchi fallback).
         let contains_liveness = contains_liveness(&expanded);
         let contains_temporal = contains_temporal(&expanded);
         let contains_past_time = contains_past_time(&expanded);
-        let extraction = extract_liveness_pattern_inner(&normalized);
-        let spot = compile_spot_formula(&normalized, contains_past_time);
-        let buchi = compile_buchi_formula(&normalized, contains_past_time);
+        let extraction = extract_liveness_pattern_inner(&expanded);
+        let spot = compile_spot_formula(&expanded, contains_past_time);
+        let buchi = compile_buchi_formula(&expanded, contains_past_time);
         Self {
             expanded,
-            normalized,
             contains_liveness,
             contains_temporal,
             contains_past_time,
@@ -115,10 +121,6 @@ impl CompiledTemporalFormula {
 
     pub fn expanded(&self) -> &IRExpr {
         &self.expanded
-    }
-
-    pub fn normalized(&self) -> &IRExpr {
-        &self.normalized
     }
 
     pub fn contains_liveness(&self) -> bool {
@@ -157,6 +159,7 @@ pub enum TemporalFormula {
     Implies(Box<TemporalFormula>, Box<TemporalFormula>),
     Always(Box<TemporalFormula>),
     Eventually(Box<TemporalFormula>),
+    Until(Box<TemporalFormula>, Box<TemporalFormula>),
 }
 
 #[derive(Clone)]
@@ -437,6 +440,10 @@ fn lower_to_temporal_formula(
         IRExpr::Eventually { body, .. } => Some(TemporalFormula::Eventually(Box::new(
             lower_to_temporal_formula(body, atoms, next_atom)?,
         ))),
+        IRExpr::Until { left, right, .. } => Some(TemporalFormula::Until(
+            Box::new(lower_to_temporal_formula(left, atoms, next_atom)?),
+            Box::new(lower_to_temporal_formula(right, atoms, next_atom)?),
+        )),
         IRExpr::UnOp { op, operand, .. } if op == "OpNot" => Some(TemporalFormula::Not(Box::new(
             lower_to_temporal_formula(operand, atoms, next_atom)?,
         ))),
@@ -529,6 +536,11 @@ fn render_spot_formula(formula: &TemporalFormula) -> String {
         ),
         TemporalFormula::Always(inner) => format!("G({})", render_spot_formula(inner)),
         TemporalFormula::Eventually(inner) => format!("F({})", render_spot_formula(inner)),
+        TemporalFormula::Until(left, right) => format!(
+            "({} U {})",
+            render_spot_formula(left),
+            render_spot_formula(right)
+        ),
     }
 }
 
@@ -772,138 +784,6 @@ fn is_implies_op(op: &str) -> bool {
     matches!(op, "OpImplies" | "implies" | "=>")
 }
 
-#[allow(clippy::match_same_arms)]
-pub(super) fn desugar_until(expr: &IRExpr) -> IRExpr {
-    match expr {
-        IRExpr::Until { left, right, .. } => {
-            let p = desugar_until(left);
-            let q = desugar_until(right);
-            let eventually_q = IRExpr::Eventually {
-                body: Box::new(q.clone()),
-                span: None,
-            };
-            let not_q = IRExpr::UnOp {
-                op: "OpNot".to_owned(),
-                operand: Box::new(q),
-                ty: crate::ir::types::IRType::Bool,
-                span: None,
-            };
-            let not_q_implies_p = IRExpr::BinOp {
-                op: "OpImplies".to_owned(),
-                left: Box::new(not_q),
-                right: Box::new(p),
-                ty: crate::ir::types::IRType::Bool,
-                span: None,
-            };
-            let always_guard = IRExpr::Always {
-                body: Box::new(not_q_implies_p),
-                span: None,
-            };
-            IRExpr::BinOp {
-                op: "OpAnd".to_owned(),
-                left: Box::new(eventually_q),
-                right: Box::new(always_guard),
-                ty: crate::ir::types::IRType::Bool,
-                span: None,
-            }
-        }
-        IRExpr::Always { body, span } => IRExpr::Always {
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Eventually { body, span } => IRExpr::Eventually {
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Historically { body, span } => IRExpr::Historically {
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Once { body, span } => IRExpr::Once {
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Previously { body, span } => IRExpr::Previously {
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Since { left, right, span } => IRExpr::Since {
-            left: Box::new(desugar_until(left)),
-            right: Box::new(desugar_until(right)),
-            span: *span,
-        },
-        IRExpr::Forall {
-            var,
-            domain,
-            body,
-            span,
-        } => IRExpr::Forall {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Exists {
-            var,
-            domain,
-            body,
-            span,
-        } => IRExpr::Exists {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::One {
-            var,
-            domain,
-            body,
-            span,
-        } => IRExpr::One {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::Lone {
-            var,
-            domain,
-            body,
-            span,
-        } => IRExpr::Lone {
-            var: var.clone(),
-            domain: domain.clone(),
-            body: Box::new(desugar_until(body)),
-            span: *span,
-        },
-        IRExpr::BinOp {
-            op,
-            left,
-            right,
-            ty,
-            span,
-        } => IRExpr::BinOp {
-            op: op.clone(),
-            left: Box::new(desugar_until(left)),
-            right: Box::new(desugar_until(right)),
-            ty: ty.clone(),
-            span: *span,
-        },
-        IRExpr::UnOp {
-            op,
-            operand,
-            ty,
-            span,
-        } => IRExpr::UnOp {
-            op: op.clone(),
-            operand: Box::new(desugar_until(operand)),
-            ty: ty.clone(),
-            span: *span,
-        },
-        _ => expr.clone(),
-    }
-}
-
 pub(super) fn contains_liveness(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Eventually { .. } | IRExpr::Until { .. } => true,
@@ -1127,6 +1007,179 @@ pub(super) fn contains_temporal(expr: &IRExpr) -> bool {
     }
 }
 
+/// Structural scan for any integer `/` or `%` anywhere in an expression,
+/// descending through temporal operators (`always`/`eventually`/`until`/…),
+/// quantifiers, branches, and every other sub-expression. Used to gate the
+/// div-by-zero well-definedness discharge: unlike a single-step property
+/// encoding (which does not descend into temporal bodies), this never misses a
+/// division hidden inside a liveness body.
+pub(super) fn contains_integer_div(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::BinOp {
+            op, left, right, ..
+        } => {
+            matches!(op.as_str(), "OpDiv" | "OpMod")
+                || contains_integer_div(left)
+                || contains_integer_div(right)
+        }
+        IRExpr::Until { left, right, .. }
+        | IRExpr::Since { left, right, .. }
+        | IRExpr::App {
+            func: left,
+            arg: right,
+            ..
+        } => contains_integer_div(left) || contains_integer_div(right),
+        IRExpr::UnOp { operand: body, .. }
+        | IRExpr::Field { expr: body, .. }
+        | IRExpr::Prime { expr: body, .. }
+        | IRExpr::Card { expr: body, .. }
+        | IRExpr::Assert { expr: body, .. }
+        | IRExpr::Assume { expr: body, .. }
+        | IRExpr::Always { body, .. }
+        | IRExpr::Eventually { body, .. }
+        | IRExpr::Historically { body, .. }
+        | IRExpr::Once { body, .. }
+        | IRExpr::Previously { body, .. }
+        | IRExpr::Forall { body, .. }
+        | IRExpr::Exists { body, .. }
+        | IRExpr::One { body, .. }
+        | IRExpr::Lone { body, .. }
+        | IRExpr::Lam { body, .. } => contains_integer_div(body),
+        IRExpr::Saw { args, .. } => args.iter().flatten().any(|a| contains_integer_div(a)),
+        IRExpr::Tuple { elements, .. }
+        | IRExpr::SetLit { elements, .. }
+        | IRExpr::SeqLit { elements, .. } => elements.iter().any(contains_integer_div),
+        IRExpr::Choose { predicate, .. } => {
+            predicate.as_ref().is_some_and(|p| contains_integer_div(p))
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            contains_integer_div(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(contains_integer_div)
+                        || contains_integer_div(&a.body)
+                })
+        }
+        IRExpr::MapUpdate {
+            map, key, value, ..
+        } => contains_integer_div(map) || contains_integer_div(key) || contains_integer_div(value),
+        IRExpr::Index { map, key, .. } => contains_integer_div(map) || contains_integer_div(key),
+        IRExpr::SetComp {
+            source,
+            filter,
+            projection,
+            ..
+        } => {
+            source.as_ref().is_some_and(|s| contains_integer_div(s))
+                || contains_integer_div(filter)
+                || projection.as_ref().is_some_and(|p| contains_integer_div(p))
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ..
+        } => {
+            contains_integer_div(projection)
+                || contains_integer_div(filter)
+                || bindings
+                    .iter()
+                    .any(|b| b.source.as_ref().is_some_and(|s| contains_integer_div(s)))
+        }
+        IRExpr::MapLit { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| contains_integer_div(k) || contains_integer_div(v)),
+        IRExpr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| contains_integer_div(&b.expr)) || contains_integer_div(body)
+        }
+        IRExpr::Block { exprs, .. } => exprs.iter().any(contains_integer_div),
+        IRExpr::VarDecl { init, rest, .. } => {
+            contains_integer_div(init) || contains_integer_div(rest)
+        }
+        IRExpr::While {
+            cond,
+            invariants,
+            body,
+            ..
+        } => {
+            contains_integer_div(cond)
+                || invariants.iter().any(contains_integer_div)
+                || contains_integer_div(body)
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            contains_integer_div(cond)
+                || contains_integer_div(then_body)
+                || else_body.as_ref().is_some_and(|e| contains_integer_div(e))
+        }
+        IRExpr::Ctor { args, .. } => args.iter().any(|(_, v)| contains_integer_div(v)),
+        IRExpr::Aggregate {
+            body, in_filter, ..
+        } => {
+            contains_integer_div(body)
+                || in_filter.as_ref().is_some_and(|f| contains_integer_div(f))
+        }
+        IRExpr::Lit { .. } | IRExpr::Var { .. } | IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {
+            false
+        }
+    }
+}
+
+/// Whether any integer `/`/`%` appears in a body-level action (a command/action
+/// body statement), descending through nested `choose`/`for`/`match` blocks.
+fn action_contains_integer_div(action: &IRAction) -> bool {
+    match action {
+        IRAction::ExprStmt { expr } => contains_integer_div(expr),
+        IRAction::Choose { filter, ops, .. } => {
+            contains_integer_div(filter) || ops.iter().any(action_contains_integer_div)
+        }
+        IRAction::ForAll { ops, .. } => ops.iter().any(action_contains_integer_div),
+        IRAction::Create { fields, .. } => fields.iter().any(|f| contains_integer_div(&f.value)),
+        IRAction::Apply { args, .. }
+        | IRAction::CrossCall { args, .. }
+        | IRAction::LetCrossCall { args, .. } => args.iter().any(contains_integer_div),
+        IRAction::Match { scrutinee, arms } => {
+            let scrutinee_div = match scrutinee {
+                IRActionMatchScrutinee::Var { .. } => false,
+                IRActionMatchScrutinee::CrossCall { args, .. } => {
+                    args.iter().any(contains_integer_div)
+                }
+            };
+            scrutinee_div
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(contains_integer_div)
+                        || a.body.iter().any(action_contains_integer_div)
+                })
+        }
+    }
+}
+
+/// Whether any integer `/`/`%` appears in a transition guard or update value of
+/// the given entities/systems. Used to gate the div-by-zero discharge on
+/// transition-side div/mod (a division in `x' = a / b` that never appears in a
+/// property).
+pub(super) fn transitions_contain_integer_div(entities: &[IREntity], systems: &[IRSystem]) -> bool {
+    entities.iter().any(|entity| {
+        entity.transitions.iter().any(|transition| {
+            contains_integer_div(&transition.guard)
+                || transition
+                    .updates
+                    .iter()
+                    .any(|update| contains_integer_div(&update.value))
+        })
+    }) || systems.iter().any(|system| {
+        system.actions.iter().any(|action| {
+            contains_integer_div(&action.guard)
+                || action.body.iter().any(action_contains_integer_div)
+        })
+    })
+}
+
 pub(super) fn contains_past_time(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Historically { .. }
@@ -1251,8 +1304,99 @@ mod tests {
         }
     }
 
+    /// A liveness formula with more than 128 distinct subformulas exceeds the
+    /// u128 Büchi state width, so construction caps to an empty automaton. The
+    /// lasso encoder must treat that empty automaton as a construction failure
+    /// (Unprovable), not as "no counterexample found" (a vacuous CHECKED).
     #[test]
-    fn compiled_temporal_formula_desugars_until() {
+    fn oversized_temporal_formula_caps_to_empty_buchi() {
+        use crate::ir::types::LitVal;
+        let atom = |i: i64| IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Var {
+                name: "x".to_owned(),
+                ty: IRType::Int,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Lit {
+                ty: IRType::Int,
+                value: LitVal::Int { value: i },
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        // `eventually (x == 0 and x == 1 and ... and x == 129)` — 130 distinct
+        // atoms, so the closure is well over 128.
+        let mut conj = atom(0);
+        for i in 1..130 {
+            conj = IRExpr::BinOp {
+                op: "OpAnd".to_owned(),
+                left: Box::new(atom(i)),
+                right: Box::new(conj),
+                ty: IRType::Bool,
+                span: None,
+            };
+        }
+        let formula = IRExpr::Eventually {
+            body: Box::new(conj),
+            span: None,
+        };
+        let compiled = CompiledTemporalFormula::from_expanded(formula);
+        let buchi = compiled
+            .buchi()
+            .expect("a liveness formula compiles to a Büchi automaton");
+        assert_eq!(
+            buchi.automaton().state_count(),
+            0,
+            "oversized temporal formula must cap to an empty automaton"
+        );
+    }
+
+    /// `P until Q` must preserve true LTL until, not be rewritten into the
+    /// non-equivalent `eventually Q and always(not Q implies P)`. Concrete
+    /// counterexample distinguishing the two: a run where P holds at step 0,
+    /// Q first holds at step 1, then both stay false forever.
+    ///
+    /// * true until `P U Q`: satisfied (Q occurs at step 1; P held at every
+    ///   step strictly before, i.e. step 0).
+    /// * naive desugaring `F Q & G(¬Q ⇒ P)`: violated, because after Q at
+    ///   step 1 the run reaches a state with ¬Q and ¬P, so `G(¬Q ⇒ P)` fails.
+    ///
+    /// The native LTL→Büchi automaton must accept this run while the naive
+    /// desugaring's automaton rejects it.
+    #[test]
+    fn surface_until_buchi_distinguishes_from_naive_desugaring() {
+        use super::super::ltl::LassoWord;
+
+        // atom 0 = P, atom 1 = Q
+        let until = LtlFormula::until(LtlFormula::atom(0), LtlFormula::atom(1));
+        // F Q & G(¬Q ⇒ P) ≡ F Q & G(Q ∨ P)
+        let naive = LtlFormula::and(
+            LtlFormula::eventually(LtlFormula::atom(1)),
+            LtlFormula::always(LtlFormula::or(LtlFormula::atom(1), LtlFormula::atom(0))),
+        );
+
+        let until_buchi = GeneralizedBuchi::from_formula(&until, 2);
+        let naive_buchi = GeneralizedBuchi::from_formula(&naive, 2);
+
+        // Run: {P} · {Q} · ({} )^ω  — P at step 0, Q at step 1, then neither.
+        let word = LassoWord::new(vec![vec![0], vec![1]], vec![vec![]]);
+
+        assert!(
+            until_buchi.accepts_lasso(&word),
+            "true `P until Q` must accept the run where P holds until Q first occurs"
+        );
+        assert!(
+            !naive_buchi.accepts_lasso(&word),
+            "the naive desugaring rejects this run, proving it is not equivalent to until"
+        );
+    }
+
+    /// The Spot export of `P until Q` must render Spot's native `U` operator,
+    /// not the unsound `F`/`G` desugaring.
+    #[test]
+    fn compiled_until_renders_native_spot_until() {
         let until = IRExpr::Until {
             left: Box::new(bool_var("p")),
             right: Box::new(bool_var("q")),
@@ -1260,12 +1404,36 @@ mod tests {
         };
 
         let compiled = CompiledTemporalFormula::from_expanded(until);
-
         assert!(compiled.contains_liveness());
-        match compiled.normalized() {
-            IRExpr::BinOp { op, .. } => assert_eq!(op, "OpAnd"),
-            other => panic!("expected desugared conjunction, got {other:?}"),
-        }
+        let spot = compiled
+            .spot()
+            .expect("until should compile to a Spot formula");
+        let rendered = spot.to_spot_input();
+        assert!(
+            rendered.contains(" U "),
+            "until must render Spot's native U operator, got `{rendered}`"
+        );
+    }
+
+    /// `P until Q` is not a flat liveness pattern (eventuality/recurrence/
+    /// persistence/response). The earlier desugaring turned it into
+    /// `F Q & G(…)` and pattern extraction then picked off the `F Q` part,
+    /// silently dropping the P-until-Q safety obligation. With true until
+    /// preserved, extraction must yield nothing so the verdict falls back to
+    /// the native Büchi until rather than a weaker reduced obligation.
+    #[test]
+    fn compiled_until_does_not_misextract_liveness_pattern() {
+        let until = IRExpr::Until {
+            left: Box::new(bool_var("p")),
+            right: Box::new(bool_var("q")),
+            span: None,
+        };
+
+        let compiled = CompiledTemporalFormula::from_expanded(until);
+        assert!(
+            compiled.extraction().is_none(),
+            "until must not be reduced to a flat liveness pattern"
+        );
     }
 
     #[test]

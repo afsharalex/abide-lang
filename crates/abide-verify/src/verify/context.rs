@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use super::defenv::DefEnv;
 use super::smt::{self, DatatypeAccessor, DatatypeSort};
 
-use crate::ir::types::{IRExpr, IRMatchArm, IRPattern, IRProgram, IRQuery, IRType, LitVal};
+use crate::ir::types::{
+    IRAction, IRDecreases, IRExpr, IRMatchArm, IRPattern, IRProgram, IRQuery, IRType, LitVal,
+};
 
 // ── Variant ID mapping ──────────────────────────────────────────────
 
@@ -109,6 +111,525 @@ pub struct ActionInfo {
     pub param_count: usize,
 }
 
+fn register_enum_type(
+    ty: &IRType,
+    variants: &mut VariantMap,
+    enum_ranges: &mut HashMap<String, (i64, i64)>,
+    adt_sorts: &mut HashMap<String, DatatypeSort>,
+) {
+    let IRType::Enum { name, variants: vs } = ty else {
+        return;
+    };
+    if enum_ranges.contains_key(name) {
+        return;
+    }
+
+    let ctor_names: Vec<String> = vs.iter().map(|v| v.name.clone()).collect();
+    let (min, max) = variants.register_enum(name, &ctor_names);
+    enum_ranges.insert(name.clone(), (min, max));
+
+    if vs.iter().any(|v| !v.fields.is_empty()) {
+        let mut builder = smt::datatype_builder(name.as_str());
+        for v in vs {
+            let fields: Vec<(&str, DatatypeAccessor)> = v
+                .fields
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.as_str(),
+                        smt::datatype_accessor_sort(crate::verify::smt::ir_type_to_sort(&f.ty)),
+                    )
+                })
+                .collect();
+            builder = smt::datatype_builder_variant(builder, &v.name, fields);
+        }
+        let dt = smt::datatype_builder_finish(builder);
+        adt_sorts.insert(name.clone(), dt);
+    }
+}
+
+fn collect_program_enum_types<'a>(ir: &'a IRProgram, out: &mut Vec<&'a IRType>) {
+    for ty_entry in &ir.types {
+        collect_enum_types_from_ty(&ty_entry.ty, out);
+    }
+    for constant in &ir.constants {
+        collect_enum_types_from_ty(&constant.ty, out);
+        collect_enum_types_from_expr(&constant.value, out);
+    }
+    for function in &ir.functions {
+        collect_enum_types_from_ty(&function.ty, out);
+        collect_enum_types_from_expr(&function.body, out);
+        for requires in &function.requires {
+            collect_enum_types_from_expr(requires, out);
+        }
+        for ensures in &function.ensures {
+            collect_enum_types_from_expr(ensures, out);
+        }
+        if let Some(decreases) = &function.decreases {
+            collect_enum_types_from_decreases(decreases, out);
+        }
+    }
+    for entity in &ir.entities {
+        collect_enum_types_from_fields(&entity.fields, out);
+        for transition in &entity.transitions {
+            for param in &transition.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            collect_enum_types_from_expr(&transition.guard, out);
+            for update in &transition.updates {
+                collect_enum_types_from_expr(&update.value, out);
+            }
+            if let Some(postcondition) = &transition.postcondition {
+                collect_enum_types_from_expr(postcondition, out);
+            }
+        }
+        for derived in &entity.derived_fields {
+            collect_enum_types_from_ty(&derived.ty, out);
+            collect_enum_types_from_expr(&derived.body, out);
+        }
+        for invariant in &entity.invariants {
+            collect_enum_types_from_expr(&invariant.body, out);
+        }
+    }
+    for interface in &ir.interfaces {
+        for command in &interface.commands {
+            for param in &command.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            if let Some(return_type) = &command.return_type {
+                collect_enum_types_from_ty(return_type, out);
+            }
+        }
+        for query in &interface.queries {
+            for param in &query.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            collect_enum_types_from_ty(&query.return_type, out);
+        }
+    }
+    for system in &ir.systems {
+        collect_enum_types_from_fields(&system.fields, out);
+        for command in &system.commands {
+            for param in &command.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            if let Some(return_type) = &command.return_type {
+                collect_enum_types_from_ty(return_type, out);
+            }
+        }
+        for action in &system.actions {
+            for param in &action.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            collect_enum_types_from_expr(&action.guard, out);
+            for op in &action.body {
+                collect_enum_types_from_action(op, out);
+            }
+            if let Some(return_expr) = &action.return_expr {
+                collect_enum_types_from_expr(return_expr, out);
+            }
+        }
+        for derived in &system.derived_fields {
+            collect_enum_types_from_ty(&derived.ty, out);
+            collect_enum_types_from_expr(&derived.body, out);
+        }
+        for invariant in &system.invariants {
+            collect_enum_types_from_expr(&invariant.body, out);
+        }
+        for query in &system.queries {
+            for param in &query.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            for requires in &query.requires {
+                collect_enum_types_from_expr(requires, out);
+            }
+            collect_enum_types_from_expr(&query.body, out);
+        }
+        for pred in &system.preds {
+            collect_enum_types_from_ty(&pred.ty, out);
+            collect_enum_types_from_expr(&pred.body, out);
+        }
+        for proc in &system.procs {
+            for param in &proc.params {
+                collect_enum_types_from_ty(&param.ty, out);
+            }
+            if let Some(requires) = &proc.requires {
+                collect_enum_types_from_expr(requires, out);
+            }
+            for node in &proc.nodes {
+                for arg in &node.args {
+                    collect_enum_types_from_expr(arg, out);
+                }
+            }
+        }
+    }
+    for verify in &ir.verifies {
+        for constraint in &verify.initial_constraints {
+            collect_enum_types_from_expr(constraint, out);
+        }
+        for assert in &verify.asserts {
+            collect_enum_types_from_expr(assert, out);
+        }
+    }
+    for theorem in &ir.theorems {
+        for invariant in &theorem.invariants {
+            collect_enum_types_from_expr(invariant, out);
+        }
+        for show in &theorem.shows {
+            collect_enum_types_from_expr(show, out);
+        }
+    }
+    for axiom in &ir.axioms {
+        collect_enum_types_from_expr(&axiom.body, out);
+    }
+    for lemma in &ir.lemmas {
+        for body in &lemma.body {
+            collect_enum_types_from_expr(body, out);
+        }
+    }
+    for scene in &ir.scenes {
+        for given in &scene.givens {
+            collect_enum_types_from_expr(&given.constraint, out);
+        }
+        for event in &scene.events {
+            for arg in &event.args {
+                collect_enum_types_from_expr(arg, out);
+            }
+        }
+        for ordering in &scene.ordering {
+            collect_enum_types_from_expr(ordering, out);
+        }
+        for assertion in &scene.assertions {
+            collect_enum_types_from_expr(assertion, out);
+        }
+        for constraint in &scene.given_constraints {
+            collect_enum_types_from_expr(constraint, out);
+        }
+    }
+}
+
+fn collect_enum_types_from_fields<'a>(
+    fields: &'a [crate::ir::types::IRField],
+    out: &mut Vec<&'a IRType>,
+) {
+    for field in fields {
+        collect_enum_types_from_ty(&field.ty, out);
+        if let Some(default) = &field.default {
+            collect_enum_types_from_expr(default, out);
+        }
+        if let Some(initial_constraint) = &field.initial_constraint {
+            collect_enum_types_from_expr(initial_constraint, out);
+        }
+    }
+}
+
+fn collect_enum_types_from_ty<'a>(ty: &'a IRType, out: &mut Vec<&'a IRType>) {
+    match ty {
+        IRType::Enum { variants, .. } => {
+            out.push(ty);
+            for variant in variants {
+                for field in &variant.fields {
+                    collect_enum_types_from_ty(&field.ty, out);
+                }
+            }
+        }
+        IRType::Record { fields, .. } => {
+            for field in fields {
+                collect_enum_types_from_ty(&field.ty, out);
+            }
+        }
+        IRType::Fn { param, result } => {
+            collect_enum_types_from_ty(param, out);
+            collect_enum_types_from_ty(result, out);
+        }
+        IRType::Set { element } | IRType::Seq { element } => {
+            collect_enum_types_from_ty(element, out);
+        }
+        IRType::Map { key, value } => {
+            collect_enum_types_from_ty(key, out);
+            collect_enum_types_from_ty(value, out);
+        }
+        IRType::Tuple { elements } => {
+            for element in elements {
+                collect_enum_types_from_ty(element, out);
+            }
+        }
+        IRType::Refinement { base, predicate } => {
+            collect_enum_types_from_ty(base, out);
+            collect_enum_types_from_expr(predicate, out);
+        }
+        IRType::Int
+        | IRType::Bool
+        | IRType::String
+        | IRType::Identity
+        | IRType::Real
+        | IRType::Float
+        | IRType::Entity { .. } => {}
+    }
+}
+
+fn collect_enum_types_from_expr<'a>(expr: &'a IRExpr, out: &mut Vec<&'a IRType>) {
+    match expr {
+        IRExpr::Lit { ty, .. } | IRExpr::Var { ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+        }
+        IRExpr::Ctor { args, .. } => {
+            for (_, arg) in args {
+                collect_enum_types_from_expr(arg, out);
+            }
+        }
+        IRExpr::BinOp {
+            left, right, ty, ..
+        } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(left, out);
+            collect_enum_types_from_expr(right, out);
+        }
+        IRExpr::Until { left, right, .. } | IRExpr::Since { left, right, .. } => {
+            collect_enum_types_from_expr(left, out);
+            collect_enum_types_from_expr(right, out);
+        }
+        IRExpr::UnOp { operand, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(operand, out);
+        }
+        IRExpr::App { func, arg, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(func, out);
+            collect_enum_types_from_expr(arg, out);
+        }
+        IRExpr::Lam {
+            param_type, body, ..
+        } => {
+            collect_enum_types_from_ty(param_type, out);
+            collect_enum_types_from_expr(body, out);
+        }
+        IRExpr::Let { bindings, body, .. } => {
+            for binding in bindings {
+                collect_enum_types_from_ty(&binding.ty, out);
+                collect_enum_types_from_expr(&binding.expr, out);
+            }
+            collect_enum_types_from_expr(body, out);
+        }
+        IRExpr::Forall { domain, body, .. }
+        | IRExpr::Exists { domain, body, .. }
+        | IRExpr::One { domain, body, .. }
+        | IRExpr::Lone { domain, body, .. } => {
+            collect_enum_types_from_ty(domain, out);
+            collect_enum_types_from_expr(body, out);
+        }
+        IRExpr::Field { expr, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(expr, out);
+        }
+        IRExpr::Prime { expr, .. }
+        | IRExpr::Always { body: expr, .. }
+        | IRExpr::Eventually { body: expr, .. }
+        | IRExpr::Historically { body: expr, .. }
+        | IRExpr::Once { body: expr, .. }
+        | IRExpr::Previously { body: expr, .. }
+        | IRExpr::Card { expr, .. }
+        | IRExpr::Assert { expr, .. }
+        | IRExpr::Assume { expr, .. } => {
+            collect_enum_types_from_expr(expr, out);
+        }
+        IRExpr::Aggregate {
+            domain,
+            body,
+            in_filter,
+            ..
+        } => {
+            collect_enum_types_from_ty(domain, out);
+            collect_enum_types_from_expr(body, out);
+            if let Some(in_filter) = in_filter {
+                collect_enum_types_from_expr(in_filter, out);
+            }
+        }
+        IRExpr::Saw { args, .. } => {
+            for arg in args.iter().flatten() {
+                collect_enum_types_from_expr(arg, out);
+            }
+        }
+        IRExpr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_enum_types_from_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_enum_types_from_expr(guard, out);
+                }
+                collect_enum_types_from_expr(&arm.body, out);
+            }
+        }
+        IRExpr::Choose {
+            domain,
+            predicate,
+            ty,
+            ..
+        } => {
+            collect_enum_types_from_ty(domain, out);
+            collect_enum_types_from_ty(ty, out);
+            if let Some(predicate) = predicate {
+                collect_enum_types_from_expr(predicate, out);
+            }
+        }
+        IRExpr::MapUpdate {
+            map,
+            key,
+            value,
+            ty,
+            ..
+        } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(map, out);
+            collect_enum_types_from_expr(key, out);
+            collect_enum_types_from_expr(value, out);
+        }
+        IRExpr::Index { map, key, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(map, out);
+            collect_enum_types_from_expr(key, out);
+        }
+        IRExpr::SetLit { elements, ty, .. }
+        | IRExpr::SeqLit { elements, ty, .. }
+        | IRExpr::Tuple { elements, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            for element in elements {
+                collect_enum_types_from_expr(element, out);
+            }
+        }
+        IRExpr::MapLit { entries, ty, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            for (key, value) in entries {
+                collect_enum_types_from_expr(key, out);
+                collect_enum_types_from_expr(value, out);
+            }
+        }
+        IRExpr::SetComp {
+            domain,
+            source,
+            filter,
+            projection,
+            ty,
+            ..
+        } => {
+            collect_enum_types_from_ty(domain, out);
+            collect_enum_types_from_ty(ty, out);
+            if let Some(source) = source {
+                collect_enum_types_from_expr(source, out);
+            }
+            collect_enum_types_from_expr(filter, out);
+            if let Some(projection) = projection {
+                collect_enum_types_from_expr(projection, out);
+            }
+        }
+        IRExpr::RelComp {
+            projection,
+            bindings,
+            filter,
+            ty,
+            ..
+        } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(projection, out);
+            for binding in bindings {
+                collect_enum_types_from_ty(&binding.domain, out);
+                if let Some(source) = &binding.source {
+                    collect_enum_types_from_expr(source, out);
+                }
+            }
+            collect_enum_types_from_expr(filter, out);
+        }
+        IRExpr::Block { exprs, .. } => {
+            for expr in exprs {
+                collect_enum_types_from_expr(expr, out);
+            }
+        }
+        IRExpr::VarDecl { ty, init, rest, .. } => {
+            collect_enum_types_from_ty(ty, out);
+            collect_enum_types_from_expr(init, out);
+            collect_enum_types_from_expr(rest, out);
+        }
+        IRExpr::While {
+            cond,
+            invariants,
+            decreases,
+            body,
+            ..
+        } => {
+            collect_enum_types_from_expr(cond, out);
+            for invariant in invariants {
+                collect_enum_types_from_expr(invariant, out);
+            }
+            if let Some(decreases) = decreases {
+                collect_enum_types_from_decreases(decreases, out);
+            }
+            collect_enum_types_from_expr(body, out);
+        }
+        IRExpr::IfElse {
+            cond,
+            then_body,
+            else_body,
+            ..
+        } => {
+            collect_enum_types_from_expr(cond, out);
+            collect_enum_types_from_expr(then_body, out);
+            if let Some(else_body) = else_body {
+                collect_enum_types_from_expr(else_body, out);
+            }
+        }
+        IRExpr::Sorry { .. } | IRExpr::Todo { .. } => {}
+    }
+}
+
+fn collect_enum_types_from_action<'a>(action: &'a IRAction, out: &mut Vec<&'a IRType>) {
+    match action {
+        IRAction::Choose { filter, ops, .. } => {
+            collect_enum_types_from_expr(filter, out);
+            for op in ops {
+                collect_enum_types_from_action(op, out);
+            }
+        }
+        IRAction::ForAll { ops, .. } => {
+            for op in ops {
+                collect_enum_types_from_action(op, out);
+            }
+        }
+        IRAction::Create { fields, .. } => {
+            for field in fields {
+                collect_enum_types_from_expr(&field.value, out);
+            }
+        }
+        IRAction::LetCrossCall { args, .. } | IRAction::CrossCall { args, .. } => {
+            for arg in args {
+                collect_enum_types_from_expr(arg, out);
+            }
+        }
+        IRAction::Apply { args, .. } => {
+            for arg in args {
+                collect_enum_types_from_expr(arg, out);
+            }
+        }
+        IRAction::Match { arms, .. } => {
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_enum_types_from_expr(guard, out);
+                }
+                for op in &arm.body {
+                    collect_enum_types_from_action(op, out);
+                }
+            }
+        }
+        IRAction::ExprStmt { expr } => collect_enum_types_from_expr(expr, out),
+    }
+}
+
+fn collect_enum_types_from_decreases<'a>(decreases: &'a IRDecreases, out: &mut Vec<&'a IRType>) {
+    for measure in &decreases.measures {
+        collect_enum_types_from_expr(measure, out);
+    }
+}
+
 // ── Verification context ────────────────────────────────────────────
 
 /// All metadata needed for Z3 encoding, extracted from the IR.
@@ -146,38 +667,15 @@ impl VerifyContext {
         let mut entities = HashMap::new();
         let mut adt_sorts = HashMap::new();
 
-        // Register all enum types
-        for ty_entry in &ir.types {
-            if let IRType::Enum {
-                name, variants: vs, ..
-            } = &ty_entry.ty
-            {
-                let ctor_names: Vec<String> = vs.iter().map(|v| v.name.clone()).collect();
-                let (min, max) = variants.register_enum(name, &ctor_names);
-                enum_ranges.insert(name.clone(), (min, max));
-
-                // Build Z3 ADT for enums with constructor fields
-                if vs.iter().any(|v| !v.fields.is_empty()) {
-                    let mut builder = smt::datatype_builder(name.as_str());
-                    for v in vs {
-                        let fields: Vec<(&str, DatatypeAccessor)> = v
-                            .fields
-                            .iter()
-                            .map(|f| {
-                                (
-                                    f.name.as_str(),
-                                    smt::datatype_accessor_sort(
-                                        crate::verify::smt::ir_type_to_sort(&f.ty),
-                                    ),
-                                )
-                            })
-                            .collect();
-                        builder = smt::datatype_builder_variant(builder, &v.name, fields);
-                    }
-                    let dt = smt::datatype_builder_finish(builder);
-                    adt_sorts.insert(name.clone(), dt);
-                }
-            }
+        // Register all enum types. Most lowered programs list named enums in
+        // `ir.types`, but verifier tests and some generated IR paths can carry
+        // enum definitions structurally on fields, params, or expression type
+        // annotations. Treat those structural definitions as authoritative
+        // metadata too, so every encoder sees the same variant map.
+        let mut enum_types = Vec::new();
+        collect_program_enum_types(ir, &mut enum_types);
+        for ty in enum_types {
+            register_enum_type(ty, &mut variants, &mut enum_ranges, &mut adt_sorts);
         }
 
         // Register all entities
@@ -434,7 +932,7 @@ mod default_tests {
     };
 
     #[test]
-    fn from_ir_preserves_entity_field_defaults() {
+    fn pure_scene_from_ir_preserves_entity_field_defaults() {
         let status_ty = IRType::Enum {
             name: "Status".to_owned(),
             variants: vec![IRVariant::simple("Open"), IRVariant::simple("Closed")],
@@ -519,7 +1017,7 @@ mod default_tests {
     }
 
     #[test]
-    fn default_display_covers_structured_exprs_without_debug_fallback() {
+    fn pure_scene_default_display_covers_structured_exprs_without_debug_fallback() {
         let bool_lit = IRExpr::Lit {
             ty: IRType::Bool,
             value: LitVal::Bool { value: true },
@@ -636,6 +1134,46 @@ mod default_tests {
             )
         );
         assert_eq!(
+            default_expr_to_string(&IRExpr::Ctor {
+                enum_name: "Decision".to_owned(),
+                ctor: "Accept".to_owned(),
+                args: vec![("allowed".to_owned(), bool_lit.clone())],
+                span: None,
+            }),
+            Some("@Accept { allowed: true }".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::SetLit {
+                elements: vec![bool_lit.clone()],
+                ty: IRType::Set {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            Some("Set(true)".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::SeqLit {
+                elements: vec![bool_lit.clone()],
+                ty: IRType::Seq {
+                    element: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            Some("[true]".to_owned())
+        );
+        assert_eq!(
+            default_expr_to_string(&IRExpr::MapLit {
+                entries: vec![(bool_lit.clone(), bool_lit.clone())],
+                ty: IRType::Map {
+                    key: Box::new(IRType::Bool),
+                    value: Box::new(IRType::Bool),
+                },
+                span: None,
+            }),
+            Some("Map(true: true)".to_owned())
+        );
+        assert_eq!(
             default_expr_to_string(&IRExpr::IfElse {
                 cond: Box::new(bool_lit.clone()),
                 then_body: Box::new(IRExpr::Lit {
@@ -653,7 +1191,55 @@ mod default_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::VariantMap;
+    use super::{VariantMap, VerifyContext};
+    use crate::ir::types::{
+        IRConst, IRExpr, IRField, IRProgram, IRSystem, IRSystemAction, IRTransParam, IRType,
+        IRTypeEntry, IRVariant, IRVariantField, LitVal,
+    };
+
+    fn empty_program() -> IRProgram {
+        IRProgram {
+            types: vec![],
+            constants: vec![],
+            functions: vec![],
+            entities: vec![],
+            interfaces: vec![],
+            systems: vec![],
+            verifies: vec![],
+            theorems: vec![],
+            axioms: vec![],
+            lemmas: vec![],
+            scenes: vec![],
+        }
+    }
+
+    fn empty_system(name: &str) -> IRSystem {
+        IRSystem {
+            name: name.to_owned(),
+            store_params: vec![],
+            fields: vec![],
+            entities: vec![],
+            commands: vec![],
+            actions: vec![],
+            fsm_decls: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            queries: vec![],
+            preds: vec![],
+            let_bindings: vec![],
+            procs: vec![],
+        }
+    }
+
+    fn enum_ty(name: &str, variants: &[&str]) -> IRType {
+        IRType::Enum {
+            name: name.to_owned(),
+            variants: variants
+                .iter()
+                .map(|variant| IRVariant::simple(*variant))
+                .collect(),
+        }
+    }
 
     #[test]
     fn try_id_of_returns_error_for_unknown_variant() {
@@ -666,5 +1252,103 @@ mod tests {
             variants.try_id_of("Status", "Missing"),
             Err("unknown variant: Status::Missing".to_owned())
         );
+    }
+
+    #[test]
+    fn pure_scene_verify_context_registers_enum_from_system_field_type_once() {
+        let status = enum_ty("Status", &["Pending", "Done"]);
+        let mut system = empty_system("Workflow");
+        system.fields.push(IRField {
+            name: "status".to_owned(),
+            ty: status.clone(),
+            default: None,
+            initial_constraint: None,
+        });
+        let mut program = empty_program();
+        program.types.push(crate::ir::types::IRTypeEntry {
+            name: "Status".to_owned(),
+            ty: status,
+        });
+        program.systems.push(system);
+
+        let vctx = VerifyContext::from_ir(&program);
+
+        assert_eq!(vctx.variants.try_id_of("Status", "Pending"), Ok(0));
+        assert_eq!(vctx.variants.try_id_of("Status", "Done"), Ok(1));
+        assert_eq!(vctx.enum_ranges.get("Status"), Some(&(0, 1)));
+    }
+
+    #[test]
+    fn pure_scene_verify_context_registers_enum_from_system_action_param_type() {
+        let mode = enum_ty("Mode", &["Off", "On"]);
+        let mut system = empty_system("Switch");
+        system.actions.push(IRSystemAction {
+            name: "set_mode".to_owned(),
+            params: vec![IRTransParam {
+                name: "next_mode".to_owned(),
+                ty: mode,
+            }],
+            guard: crate::ir::types::IRExpr::Lit {
+                ty: IRType::Bool,
+                value: LitVal::Bool { value: true },
+                span: None,
+            },
+            body: vec![],
+            return_expr: None,
+        });
+        let mut program = empty_program();
+        program.systems.push(system);
+
+        let vctx = VerifyContext::from_ir(&program);
+
+        assert_eq!(vctx.variants.try_id_of("Mode", "Off"), Ok(0));
+        assert_eq!(vctx.variants.try_id_of("Mode", "On"), Ok(1));
+    }
+
+    #[test]
+    fn pure_scene_verify_context_registers_payload_enum_adt_sorts() {
+        let result = IRType::Enum {
+            name: "Result".to_owned(),
+            variants: vec![IRVariant {
+                name: "Some".to_owned(),
+                fields: vec![IRVariantField {
+                    name: "value".to_owned(),
+                    ty: IRType::Int,
+                }],
+            }],
+        };
+        let mut program = empty_program();
+        program.types.push(IRTypeEntry {
+            name: "Result".to_owned(),
+            ty: result,
+        });
+
+        let vctx = VerifyContext::from_ir(&program);
+
+        assert_eq!(vctx.variants.try_id_of("Result", "Some"), Ok(0));
+        assert!(
+            vctx.adt_sorts.contains_key("Result"),
+            "payload enums should register an ADT sort"
+        );
+    }
+
+    #[test]
+    fn pure_scene_verify_context_collects_enum_types_from_expression_annotations() {
+        let status = enum_ty("Status", &["Pending", "Done"]);
+        let mut program = empty_program();
+        program.constants.push(IRConst {
+            name: "status_seen".to_owned(),
+            ty: IRType::Bool,
+            value: IRExpr::Var {
+                name: "status".to_owned(),
+                ty: status,
+                span: None,
+            },
+        });
+
+        let vctx = VerifyContext::from_ir(&program);
+
+        assert_eq!(vctx.variants.try_id_of("Status", "Pending"), Ok(0));
+        assert_eq!(vctx.variants.try_id_of("Status", "Done"), Ok(1));
     }
 }

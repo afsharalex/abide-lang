@@ -45,6 +45,7 @@ pub(super) fn make_z3_var_from_smt(name: &str, template: &SmtValue) -> SmtValue 
         SmtValue::Int(_) => smt::int_var(name),
         SmtValue::Bool(_) => smt::bool_var(name),
         SmtValue::Real(_) => smt::real_var(name),
+        SmtValue::Float(_) => smt::float_var(name),
         SmtValue::Array(_) => {
             // For arrays/dynamic/func, fall back to int (best effort)
             smt::int_var(name)
@@ -93,7 +94,8 @@ pub(super) fn make_z3_var_ctx(
     match ty {
         IRType::Int | IRType::Identity | IRType::String => Ok(smt::int_var(name)),
         IRType::Bool => Ok(smt::bool_var(name)),
-        IRType::Real | IRType::Float => Ok(smt::real_var(name)),
+        IRType::Real => Ok(smt::real_var(name)),
+        IRType::Float => Ok(smt::float_var(name)),
         IRType::Enum {
             name: enum_name, ..
         } => {
@@ -144,6 +146,16 @@ fn expr_type(expr: &IRExpr) -> Option<&IRType> {
         IRExpr::Ctor { .. } => None,
         _ => None,
     }
+}
+
+pub(crate) fn unqualify_ctor_name(ctor: &str) -> &str {
+    ctor.rsplit_once("::").map_or(ctor, |(_, name)| name)
+}
+
+pub(crate) fn ctor_name_matches(enum_name: &str, declared_ctor: &str, candidate: &str) -> bool {
+    declared_ctor == candidate
+        || declared_ctor == unqualify_ctor_name(candidate)
+        || format!("{enum_name}::{declared_ctor}") == candidate
 }
 
 fn expr_mentions_var(expr: &IRExpr, target: &str) -> bool {
@@ -382,10 +394,24 @@ pub(super) fn encode_pure_expr_inner(
             smt::map_merge(&left_val, &right_val, key, value)
         }
         IRExpr::BinOp {
-            op, left, right, ..
+            op,
+            left,
+            right,
+            span,
+            ..
         } => {
             let lhs = encode_pure_expr_inner(left, env, vctx, defs, precheck)?;
             let rhs = encode_pure_expr_inner(right, env, vctx, defs, precheck)?;
+            // In the checked (fn-contract) encoding, numeric `/`/`%` operations
+            // with undefined zero-divisor cases carry a well-definedness
+            // obligation: the divisor must be provably non-zero under the
+            // function's preconditions, otherwise the contract would be proved
+            // on solver-total arithmetic.
+            if super::property::div_mod_requires_nonzero(op.as_str(), &rhs) {
+                if let Some(ctx) = precheck {
+                    check_fn_div_well_defined(&rhs, env, vctx, defs, ctx, *span)?;
+                }
+            }
             smt::binop(op, &lhs, &rhs)
         }
 
@@ -736,7 +762,7 @@ pub(super) fn encode_pure_expr_inner(
                 precheck,
             },
         ),
-        IRExpr::Sorry { .. } => Ok(smt::bool_val(true)),
+        IRExpr::Sorry { .. } => Err("sorry expression in pure proof context".to_owned()),
         IRExpr::Todo { .. } => Err("todo expression in fn contract body".to_owned()),
     }
 }
@@ -749,12 +775,15 @@ fn encode_pure_ctor(
 ) -> Result<SmtValue, String> {
     if let Some(dt) = scope.vctx.adt_sorts.get(enum_name) {
         for variant in &dt.variants {
-            if smt::func_decl_name(&variant.constructor) == ctor {
+            if ctor_name_matches(enum_name, &smt::func_decl_name(&variant.constructor), ctor) {
                 return encode_adt_ctor(enum_name, ctor, args, variant, scope);
             }
         }
     }
-    let id = scope.vctx.variants.try_id_of(enum_name, ctor)?;
+    let id = scope
+        .vctx
+        .variants
+        .try_id_of(enum_name, unqualify_ctor_name(ctor))?;
     Ok(smt::int_val(id))
 }
 
@@ -906,6 +935,38 @@ fn verify_call_preconditions(expr: &IRExpr, scope: PureEncodingScope<'_>) -> Res
     Ok(())
 }
 
+/// Well-definedness check for a numeric `/`/`%` in the checked (fn-contract)
+/// encoding: the divisor `d` must be provably non-zero under the function's
+/// preconditions and accumulated assumptions. If `d == 0` is satisfiable, the
+/// division is undefined and the contract must not be proved.
+fn check_fn_div_well_defined(
+    divisor: &SmtValue,
+    env: &HashMap<String, SmtValue>,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PrecheckCtx<'_>,
+    span: Option<crate::span::Span>,
+) -> Result<(), String> {
+    let vc = AbideSolver::new();
+    super::assert_lambda_axioms_on(&vc);
+    for req in ctx.fn_requires {
+        let req_val = encode_pure_expr(req, env, vctx, defs)?;
+        vc.assert(req_val.to_bool()?);
+    }
+    for assumption in ctx.extra_assumptions {
+        vc.assert(assumption);
+    }
+    let Some(is_zero) = super::property::divisor_zero_condition(divisor) else {
+        return Ok(());
+    };
+    vc.assert(is_zero);
+    if vc.check() != SatResult::Unsat {
+        record_fn_precondition_failure_span(span);
+        return Err(crate::messages::FN_DIVISION_BY_ZERO.to_owned());
+    }
+    Ok(())
+}
+
 fn encode_recursive_app(
     expr: &IRExpr,
     scope: PureEncodingScope<'_>,
@@ -975,6 +1036,7 @@ fn encode_pure_card(inner: &IRExpr, scope: PureEncodingScope<'_>) -> Result<SmtV
     match inner {
         IRExpr::SetLit { elements, .. } => encode_distinct_cardinality(elements.iter(), scope),
         IRExpr::SeqLit { elements, .. } => {
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             Ok(smt::int_val(i64::try_from(elements.len()).unwrap_or(0)))
         }
         IRExpr::MapLit { entries, .. } => {
@@ -1708,26 +1770,18 @@ pub(super) fn encode_pure_lit(
         LitVal::Int { value } => Ok(smt::int_val(*value)),
         LitVal::Bool { value } => Ok(smt::bool_val(*value)),
         LitVal::Real { value } => {
-            // Approximate: convert f64 to rational
-            #[allow(clippy::cast_possible_truncation)]
-            let scaled = (*value * 1_000_000.0) as i64;
-            Ok(smt::real_val(scaled, 1_000_000))
+            // Canonical real semantics: quantize to the shared millionth scale
+            // so the SMT encoding matches the concrete witness (abide_core::arith).
+            let (num, den) = abide_core::arith::real_to_rational(*value);
+            Ok(smt::real_val(num, den))
         }
-        LitVal::Float { value } => {
-            #[allow(clippy::cast_possible_truncation)]
-            let scaled = (*value * 1_000_000.0) as i64;
-            Ok(smt::real_val(scaled, 1_000_000))
-        }
+        // `float` is IEEE-754 binary64, a distinct sort from `real` (DDR-059).
+        LitVal::Float { value } => Ok(smt::float_lit(*value)),
         LitVal::Str { value } => {
             // Strings are encoded as Int (see smt::ir_type_to_sort).
-            // Each distinct string literal must produce a distinct Int constant.
-            // We use a deterministic hash so "a" != "b" but "a" == "a".
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            value.hash(&mut hasher);
-            // Use the lower 62 bits to stay safely in i64 range
-            let hash = (hasher.finish() & 0x3FFF_FFFF_FFFF_FFFF) as i64;
-            Ok(smt::int_val(hash))
+            Ok(smt::int_val(crate::verify::literal::string_literal_id(
+                value,
+            )))
         }
     }
 }
@@ -1833,7 +1887,7 @@ pub(super) fn encode_pattern_cond(
     use crate::ir::types::IRPattern;
     match pattern {
         IRPattern::PWild | IRPattern::PVar { .. } => Ok(smt::bool_const(true)),
-        IRPattern::PCtor { name, .. } => {
+        IRPattern::PCtor { name, fields } => {
             // Type-directed: resolve against the scrutinee's ADT sort
             if let Some((_enum_name, dt)) = resolve_scrut_adt(scrut, vctx) {
                 for variant in &dt.variants {
@@ -1841,15 +1895,37 @@ pub(super) fn encode_pattern_cond(
                     if ctor_name == *name || format!("{_enum_name}::{ctor_name}") == *name {
                         let scrut_dyn = scrut.to_dynamic();
                         let result = smt::func_decl_apply(&variant.tester, &[&scrut_dyn]);
-                        return smt::dynamic_as_bool(&result)
-                            .ok_or_else(|| format!("ADT tester did not return Bool for {name}"));
+                        let mut cond = smt::dynamic_as_bool(&result)
+                            .ok_or_else(|| format!("ADT tester did not return Bool for {name}"))?;
+                        // A constructor pattern matches only if the nested field
+                        // patterns also match: extract each field via its
+                        // accessor and conjoin the field's own match condition.
+                        // Without this, `A { inner: X }` would match any `A`.
+                        for field_pat in fields {
+                            let accessor = variant
+                                .accessors
+                                .iter()
+                                .find(|a| smt::func_decl_name(a) == field_pat.name)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "unknown field '{}' in pattern for constructor '{name}'",
+                                        field_pat.name
+                                    )
+                                })?;
+                            let field_val = smt::func_decl_apply(accessor, &[&scrut_dyn]);
+                            let field_smt = dynamic_to_smt_value(field_val);
+                            let field_cond =
+                                encode_pattern_cond(&field_smt, &field_pat.pattern, _env, vctx)?;
+                            cond = smt::bool_and(&[&cond, &field_cond]);
+                        }
+                        return Ok(cond);
                     }
                 }
                 return Err(format!(
                     "unknown constructor '{name}' for enum '{_enum_name}'"
                 ));
             }
-            // Fallback: flat Int encoding for fieldless enums
+            // Fallback: flat Int encoding for fieldless enums (no nested fields).
             let scrut_int = scrut.as_int()?;
             for ((type_name, variant_name), id) in &vctx.variants.to_id {
                 if variant_name == name || format!("{type_name}::{variant_name}") == *name {
@@ -1959,6 +2035,7 @@ mod tests {
         IRExpr, IRFunction, IRMatchArm, IRPattern, IRProgram, IRType, IRTypeEntry, IRVariant,
         LitVal,
     };
+    use crate::verify::unsupported_corpus;
 
     fn empty_ir() -> IRProgram {
         IRProgram {
@@ -1987,6 +2064,20 @@ mod tests {
                 },
             }],
             ..empty_ir()
+        }
+    }
+
+    #[test]
+    fn pure_encoder_rejects_shared_unsupported_ir_corpus() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let env = HashMap::new();
+
+        for case in unsupported_corpus::pure_expression_rejection_cases() {
+            encode_pure_expr(&case.expr, &env, &vctx, &defs).expect_err(
+                "unsupported pure corpus case must not encode to a successful SMT value",
+            );
         }
     }
 
@@ -2052,17 +2143,19 @@ mod tests {
         ));
         assert!(matches!(
             encode_pure_lit(&LitVal::Float { value: 2.5 }, &IRType::Float),
-            Ok(SmtValue::Real(_))
+            Ok(SmtValue::Float(_))
         ));
-        assert!(matches!(
-            encode_pure_lit(
-                &LitVal::Str {
-                    value: "abc".to_owned()
-                },
-                &IRType::String
-            ),
-            Ok(SmtValue::Int(_))
-        ));
+        let string_lit = encode_pure_lit(
+            &LitVal::Str {
+                value: "abc".to_owned(),
+            },
+            &IRType::String,
+        )
+        .expect("string literal");
+        assert_eq!(
+            string_lit.as_int().expect("string int").as_i64(),
+            Some(crate::verify::literal::string_literal_id("abc"))
+        );
 
         let cond = smt::bool_const(true);
         assert!(matches!(

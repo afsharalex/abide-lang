@@ -416,8 +416,11 @@ pub(in crate::verify::ic3) fn constraint_to_smt_with_dollar_scoped(
             }
             Ok(out)
         }
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
-            constraint_to_smt_with_dollar_scoped(expr, dollar_var, entity, vctx, locals)
+        IRExpr::Assert { .. } => {
+            Err("Assert expression reached IC3 initial-constraint encoder".to_owned())
+        }
+        IRExpr::Assume { .. } => {
+            Err("Assume expression reached IC3 initial-constraint encoder".to_owned())
         }
         _ => Err(format!(
             "unsupported expression in initial_constraint: {:?}",

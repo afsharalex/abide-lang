@@ -18,7 +18,7 @@ use crate::ir::types::{
 
 use super::context::{EntityInfo, VerifyContext};
 use super::defenv;
-use super::scope::allocate_initial_activations;
+use super::scope::{allocate_initial_activations, VerifyStoreRange};
 use super::transition;
 use super::{
     build_assumptions_for_system_scope, verification_timeout_hint, CounterexampleReplayReport,
@@ -201,6 +201,7 @@ struct ExplicitModel<'a> {
     extern_assume_exprs: Vec<IRExpr>,
     initial_constraints: Vec<IRExpr>,
     initial_slot_locals: HashMap<String, ExplicitSlotBinding>,
+    store_ranges: HashMap<String, VerifyStoreRange>,
     stutter: bool,
     weak_fair: Vec<(String, String)>,
     strong_fair: Vec<(String, String)>,
@@ -234,6 +235,7 @@ struct ExplicitEvalCtx<'a, 'spec> {
     current_system: Option<&'a str>,
     system_fields: &'a HashMap<String, usize>,
     entity_specs: &'a [ExplicitEntitySpec<'spec>],
+    store_ranges: &'a HashMap<String, VerifyStoreRange>,
     value_locals: &'a HashMap<String, ExplicitValue>,
     slot_locals: &'a HashMap<String, ExplicitSlotBinding>,
 }
@@ -314,6 +316,7 @@ fn infer_fieldless_enum_return_type(expr: Option<&IRExpr>, vctx: &VerifyContext)
         .variants
         .to_id
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|((candidate_enum, variant), id)| {
             (candidate_enum == enum_name).then_some((*id, IRVariant::simple(variant.clone())))
         })
@@ -688,6 +691,7 @@ impl<'a> ExplicitModel<'a> {
             extern_assume_exprs,
             initial_constraints,
             initial_slot_locals,
+            store_ranges: system.store_ranges().clone(),
             stutter: system.assumptions().stutter(),
             weak_fair: system.assumptions().weak_fair_event_keys().to_vec(),
             strong_fair: system.assumptions().strong_fair_event_keys().to_vec(),
@@ -711,11 +715,13 @@ impl<'a> ExplicitModel<'a> {
         initial_states.retain(|state| {
             model
                 .state_satisfies_initial_constraints(state)
+                // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                 .unwrap_or(false)
         });
         initial_states.retain(|state| {
             model
                 .state_satisfies_extern_assumptions(state)
+                // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                 .unwrap_or(false)
         });
         if initial_states.is_empty() {
@@ -753,14 +759,17 @@ impl<'a> ExplicitModel<'a> {
 
     fn state_satisfies_initial_constraints(&self, state: &ExplicitState) -> Result<bool, String> {
         for expr in &self.initial_constraints {
-            if !eval_bool_with_locals(
-                state,
+            if !eval_bool_with_store_ranges(
+                ExplicitEvalCtx {
+                    state,
+                    current_system: None,
+                    system_fields: &self.system_field_indices,
+                    entity_specs: &self.entity_specs,
+                    store_ranges: &self.store_ranges,
+                    value_locals: &HashMap::new(),
+                    slot_locals: &self.initial_slot_locals,
+                },
                 expr,
-                None,
-                &self.system_field_indices,
-                &self.entity_specs,
-                &HashMap::new(),
-                &self.initial_slot_locals,
             )? {
                 return Ok(false);
             }
@@ -769,14 +778,17 @@ impl<'a> ExplicitModel<'a> {
     }
 
     fn eval_bool(&self, state: &ExplicitState, expr: &IRExpr) -> Result<bool, String> {
-        match eval_expr(
-            state,
+        match eval_expr_with_store_ranges(
+            ExplicitEvalCtx {
+                state,
+                current_system: None,
+                system_fields: &self.system_field_indices,
+                entity_specs: &self.entity_specs,
+                store_ranges: &self.store_ranges,
+                value_locals: &HashMap::new(),
+                slot_locals: &HashMap::new(),
+            },
             expr,
-            None,
-            &self.system_field_indices,
-            &self.entity_specs,
-            &HashMap::new(),
-            &HashMap::new(),
         )? {
             ExplicitValue::Bool(value) => Ok(value),
             other => Err(format!("expected bool expression, found {other:?}")),
@@ -837,14 +849,17 @@ impl<'a> ExplicitModel<'a> {
         step: &ExplicitStepRef<'_>,
         bindings: &HashMap<String, ExplicitValue>,
     ) -> Result<Vec<(ExplicitState, Vec<op::Choice>)>, String> {
-        if !eval_bool_with_locals(
-            state,
+        if !eval_bool_with_store_ranges(
+            ExplicitEvalCtx {
+                state,
+                current_system: Some(&step.system),
+                system_fields: &self.system_field_indices,
+                entity_specs: &self.entity_specs,
+                store_ranges: &self.store_ranges,
+                value_locals: bindings,
+                slot_locals: &HashMap::new(),
+            },
             &step.step.guard,
-            Some(&step.system),
-            &self.system_field_indices,
-            &self.entity_specs,
-            bindings,
-            &HashMap::new(),
         )? {
             return Ok(Vec::new());
         }
@@ -879,23 +894,29 @@ impl<'a> ExplicitModel<'a> {
             }
             let (trigger, response) = if slot_active {
                 (
-                    eval_bool_with_locals(
-                        state,
+                    eval_bool_with_store_ranges(
+                        ExplicitEvalCtx {
+                            state,
+                            current_system: None,
+                            system_fields: &self.system_field_indices,
+                            entity_specs: &self.entity_specs,
+                            store_ranges: &self.store_ranges,
+                            value_locals: &HashMap::new(),
+                            slot_locals: &slot_locals,
+                        },
                         &monitor.trigger,
-                        None,
-                        &self.system_field_indices,
-                        &self.entity_specs,
-                        &HashMap::new(),
-                        &slot_locals,
                     )?,
-                    eval_bool_with_locals(
-                        state,
+                    eval_bool_with_store_ranges(
+                        ExplicitEvalCtx {
+                            state,
+                            current_system: None,
+                            system_fields: &self.system_field_indices,
+                            entity_specs: &self.entity_specs,
+                            store_ranges: &self.store_ranges,
+                            value_locals: &HashMap::new(),
+                            slot_locals: &slot_locals,
+                        },
                         &monitor.response,
-                        None,
-                        &self.system_field_indices,
-                        &self.entity_specs,
-                        &HashMap::new(),
-                        &slot_locals,
                     )?,
                 )
             } else {
@@ -956,6 +977,7 @@ impl<'a> ExplicitModel<'a> {
             }
             let enabled = self
                 .step_enabled_by_key(state, &step.system, &step.step.name)
+                // abide-audit: allow-silent-fallback -- missing optional predicate metadata intentionally uses this boolean default
                 .unwrap_or(false);
             if !enabled {
                 diagnostics.push(DeadlockEventDiag {
@@ -1014,7 +1036,10 @@ impl<'a> ExplicitModel<'a> {
         if step.step.params.is_empty() {
             return Ok(None);
         }
-        Ok(Some(enumerate_param_bindings(&step.step.params)?))
+        Ok(Some(enumerate_fair_param_bindings(
+            &step.step.params,
+            &self.entity_specs,
+        )?))
     }
 
     fn edge_fired_tuple(
@@ -1061,6 +1086,7 @@ impl<'a> ExplicitModel<'a> {
         }
         let tuple: Vec<_> = choices
             .iter()
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|choice| match choice {
                 op::Choice::Choose { binder, selected } => Some(ExplicitChoiceBinding {
                     binder: binder.clone(),
@@ -1082,6 +1108,7 @@ impl<'a> ExplicitModel<'a> {
         cycle_nodes
             .iter()
             .flat_map(|node_index| adjacency[*node_index].iter())
+            // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
             .filter_map(|(_, edge)| self.edge_choice_tuple(edge, system, command))
             .collect()
     }
@@ -1452,6 +1479,7 @@ impl<'a> ExplicitModel<'a> {
             let pending_nodes: HashSet<usize> = nodes
                 .iter()
                 .enumerate()
+                // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
                 .filter_map(|(index, node)| {
                     (node.monitors[monitor_index] == MonitorStatus::Pending).then_some(index)
                 })
@@ -1696,6 +1724,7 @@ pub fn explore_verify_state_space(
             .map(|store| ExplicitStateSpaceStoreBound {
                 name: store.name.clone(),
                 entity_type: store.entity_type.clone(),
+                // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                 slots: usize::try_from(store.hi.max(0)).unwrap_or(0),
             })
             .collect(),
@@ -2030,14 +2059,23 @@ pub(super) fn try_check_verify_block_explicit(
         }
     }
 
-    if let Ok(Some(result)) = model.find_liveness_violation(
+    match model.find_liveness_violation(
         &nodes,
         &adjacency,
         &parents,
         verify_block,
         assumptions.clone(),
     ) {
-        return Some(result);
+        Ok(Some(result)) => return Some(result),
+        Ok(None) => {}
+        Err(err) => {
+            return Some(VerificationResult::Unprovable {
+                name: verify_block.name.clone(),
+                hint: format!("explicit-state liveness search failed: {err}"),
+                span: verify_block.span,
+                file: verify_block.file.clone(),
+            });
+        }
     }
 
     if config.bounded_only {
@@ -2656,6 +2694,7 @@ fn int_domain_representative(
         },
         None => None,
     };
+    // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
     let candidate = min.or_else(|| max.map(|max| max.min(0))).unwrap_or(0);
     if let Some(max) = max {
         if candidate > max {
@@ -3183,9 +3222,6 @@ fn validate_action(
                 }
             }
             for arm in arms {
-                if !pattern_supported(&arm.pattern) {
-                    return Err("unsupported match pattern in explicit-state fragment".to_owned());
-                }
                 let arm_value_locals = pattern_value_local_names(value_locals, &arm.pattern);
                 if let Some(guard) = &arm.guard {
                     if !supports_state_expr(
@@ -3981,18 +4017,6 @@ fn execute_cross_call_like_result(
     Ok(out)
 }
 
-fn pattern_supported(pattern: &crate::ir::types::IRPattern) -> bool {
-    match pattern {
-        crate::ir::types::IRPattern::PWild | crate::ir::types::IRPattern::PVar { .. } => true,
-        crate::ir::types::IRPattern::PCtor { name: _, fields } => {
-            fields.iter().all(|field| pattern_supported(&field.pattern))
-        }
-        crate::ir::types::IRPattern::POr { left, right } => {
-            pattern_supported(left) && pattern_supported(right)
-        }
-    }
-}
-
 fn pattern_matches(value: &ExplicitValue, pattern: &crate::ir::types::IRPattern) -> bool {
     match pattern {
         crate::ir::types::IRPattern::PWild | crate::ir::types::IRPattern::PVar { .. } => true,
@@ -4333,6 +4357,7 @@ fn fieldless_enum_variant_value(
     let mut matches = entity_specs
         .iter()
         .flat_map(|spec| spec.fields.iter())
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|field| {
             let IRType::Enum { name, variants } = &field.ty else {
                 return None;
@@ -4815,9 +4840,6 @@ fn supports_state_expr(
                 value_locals,
                 slot_locals,
             ) && arms.iter().all(|arm| {
-                if !pattern_supported(&arm.pattern) {
-                    return false;
-                }
                 let arm_value_locals = pattern_value_local_names(value_locals, &arm.pattern);
                 arm.guard.as_ref().is_none_or(|guard| {
                     supports_state_expr(
@@ -5042,19 +5064,42 @@ fn eval_expr(
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<ExplicitValue, String> {
-    let eval_ctx = ExplicitEvalCtx {
-        state,
-        current_system,
-        system_fields,
-        entity_specs,
-        value_locals,
-        slot_locals,
-    };
+    eval_expr_with_store_ranges(
+        ExplicitEvalCtx {
+            state,
+            current_system,
+            system_fields,
+            entity_specs,
+            store_ranges: &HashMap::new(),
+            value_locals,
+            slot_locals,
+        },
+        expr,
+    )
+}
+
+fn eval_expr_with_store_ranges(
+    eval_ctx: ExplicitEvalCtx<'_, '_>,
+    expr: &IRExpr,
+) -> Result<ExplicitValue, String> {
+    let state = eval_ctx.state;
+    let current_system = eval_ctx.current_system;
+    let system_fields = eval_ctx.system_fields;
+    let entity_specs = eval_ctx.entity_specs;
+    let value_locals = eval_ctx.value_locals;
+    let slot_locals = eval_ctx.slot_locals;
     match expr {
         IRExpr::Lit { value, .. } => match value {
             LitVal::Int { value } => Ok(ExplicitValue::Int(*value)),
             LitVal::Real { value } | LitVal::Float { value } => {
-                Ok(ExplicitValue::Real(value.to_string()))
+                // Quantize to the shared canonical real scale so explicit-state
+                // equality/comparison agrees with the SMT backend and the
+                // simulator (which both quantize via abide_core::arith); without
+                // this, `0.1234567` and `0.123456` differ here but are equal
+                // after SMT quantization.
+                Ok(ExplicitValue::Real(
+                    abide_core::arith::canonical_real(*value).to_string(),
+                ))
             }
             LitVal::Bool { value } => Ok(ExplicitValue::Bool(*value)),
             LitVal::Str { value } => Ok(ExplicitValue::Str(value.clone())),
@@ -5742,8 +5787,10 @@ fn eval_cardinality_expr(
                     slot_locals,
                 )?);
             }
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             Ok(i64::try_from(unique.len()).unwrap_or(0))
         }
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         IRExpr::SeqLit { elements, .. } => Ok(i64::try_from(elements.len()).unwrap_or(0)),
         IRExpr::MapLit { entries, .. } => {
             let mut unique = HashSet::new();
@@ -5758,6 +5805,7 @@ fn eval_cardinality_expr(
                     slot_locals,
                 )?);
             }
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             Ok(i64::try_from(unique.len()).unwrap_or(0))
         }
         IRExpr::SetComp {
@@ -5887,6 +5935,7 @@ fn eval_cardinality_expr(
                     )
                 }
             }
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             Ok(i64::try_from(unique.len()).unwrap_or(0))
         }
         _ => Err("unsupported cardinality expression in explicit-state fragment".to_owned()),
@@ -5946,20 +5995,20 @@ fn eval_quantifier(
     let current_system = ctx.current_system;
     let system_fields = ctx.system_fields;
     let entity_specs = ctx.entity_specs;
-    let value_locals = ctx.value_locals;
-    let slot_locals = ctx.slot_locals;
+    let (bindings, body) = quantifier_bindings_for_body(ctx, var, domain, body, mode)?;
     let mut matches = 0usize;
-    for (nested_values, nested_slots) in
-        quantifier_bindings(state, var, domain, entity_specs, value_locals, slot_locals)?
-    {
-        if eval_bool_with_locals(
-            state,
+    for (nested_values, nested_slots) in bindings {
+        if eval_bool_with_store_ranges(
+            ExplicitEvalCtx {
+                state,
+                current_system,
+                system_fields,
+                entity_specs,
+                store_ranges: ctx.store_ranges,
+                value_locals: &nested_values,
+                slot_locals: &nested_slots,
+            },
             body,
-            current_system,
-            system_fields,
-            entity_specs,
-            &nested_values,
-            &nested_slots,
         )? {
             matches += 1;
             if matches > 1 && matches!(mode, QuantifierMode::Lone | QuantifierMode::One) {
@@ -5980,6 +6029,111 @@ fn eval_quantifier(
         QuantifierMode::Lone => true,
     };
     Ok(ExplicitValue::Bool(result))
+}
+
+fn quantifier_bindings_for_body<'a>(
+    ctx: ExplicitEvalCtx<'_, '_>,
+    var: &str,
+    domain: &IRType,
+    body: &'a IRExpr,
+    mode: QuantifierMode,
+) -> Result<
+    (
+        Vec<(
+            HashMap<String, ExplicitValue>,
+            HashMap<String, ExplicitSlotBinding>,
+        )>,
+        &'a IRExpr,
+    ),
+    String,
+> {
+    let IRType::Entity { name: entity_name } = domain else {
+        return quantifier_bindings(
+            ctx.state,
+            var,
+            domain,
+            ctx.entity_specs,
+            ctx.value_locals,
+            ctx.slot_locals,
+        )
+        .map(|bindings| (bindings, body));
+    };
+    let guard_op = match mode {
+        QuantifierMode::Forall => "OpImplies",
+        QuantifierMode::Exists | QuantifierMode::One | QuantifierMode::Lone => "OpAnd",
+    };
+    let Some((range, guarded_body)) =
+        explicit_store_scoped_quantifier_body(ctx.store_ranges, var, entity_name, body, guard_op)
+    else {
+        return quantifier_bindings(
+            ctx.state,
+            var,
+            domain,
+            ctx.entity_specs,
+            ctx.value_locals,
+            ctx.slot_locals,
+        )
+        .map(|bindings| (bindings, body));
+    };
+    let Some((entity_index, spec)) = ctx
+        .entity_specs
+        .iter()
+        .enumerate()
+        .find(|(_, spec)| spec.name == *entity_name)
+    else {
+        return Err("unknown explicit-state quantifier entity".to_owned());
+    };
+    let mut bindings = Vec::new();
+    for slot in range.start.min(spec.slot_count)..range.end.min(spec.slot_count) {
+        if !ctx.state.entity_slots[entity_index][slot].active {
+            continue;
+        }
+        let mut nested_slots = ctx.slot_locals.clone();
+        nested_slots.insert(var.to_owned(), ExplicitSlotBinding { entity_index, slot });
+        bindings.push((ctx.value_locals.clone(), nested_slots));
+    }
+    Ok((bindings, guarded_body))
+}
+
+fn explicit_store_scoped_quantifier_body<'a>(
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+    var: &str,
+    entity_name: &str,
+    body: &'a IRExpr,
+    guard_op: &str,
+) -> Option<(std::ops::Range<usize>, &'a IRExpr)> {
+    let IRExpr::BinOp {
+        op, left, right, ..
+    } = body
+    else {
+        return None;
+    };
+    if op != guard_op {
+        return None;
+    }
+    let IRExpr::Index { map, key, .. } = left.as_ref() else {
+        return None;
+    };
+    let IRExpr::Var {
+        name: store_name, ..
+    } = map.as_ref()
+    else {
+        return None;
+    };
+    let IRExpr::Var { name: key_var, .. } = key.as_ref() else {
+        return None;
+    };
+    if key_var != var {
+        return None;
+    }
+    let range = store_ranges.get(store_name)?;
+    if range.entity_type != entity_name {
+        return None;
+    }
+    Some((
+        range.start_slot..range.start_slot.saturating_add(range.slot_count),
+        right.as_ref(),
+    ))
 }
 
 fn eval_choose(
@@ -6082,15 +6236,25 @@ fn eval_bool_with_locals(
     value_locals: &HashMap<String, ExplicitValue>,
     slot_locals: &HashMap<String, ExplicitSlotBinding>,
 ) -> Result<bool, String> {
-    match eval_expr(
-        state,
+    eval_bool_with_store_ranges(
+        ExplicitEvalCtx {
+            state,
+            current_system,
+            system_fields,
+            entity_specs,
+            store_ranges: &HashMap::new(),
+            value_locals,
+            slot_locals,
+        },
         expr,
-        current_system,
-        system_fields,
-        entity_specs,
-        value_locals,
-        slot_locals,
-    )? {
+    )
+}
+
+fn eval_bool_with_store_ranges(
+    eval_ctx: ExplicitEvalCtx<'_, '_>,
+    expr: &IRExpr,
+) -> Result<bool, String> {
+    match eval_expr_with_store_ranges(eval_ctx, expr)? {
         ExplicitValue::Bool(value) => Ok(value),
         other => Err(format!("expected bool expression, found {other:?}")),
     }
@@ -6107,23 +6271,17 @@ fn eval_binop(
         "<" | "OpLt" | "<=" | "OpLe" | ">" | "OpGt" | ">=" | "OpGe" => {
             eval_int_comparison(op, left, right)
         }
-        "+" | "OpAdd" => Ok(ExplicitValue::Int(expect_int(left)? + expect_int(right)?)),
-        "-" | "OpSub" => Ok(ExplicitValue::Int(expect_int(left)? - expect_int(right)?)),
-        "*" | "OpMul" => Ok(ExplicitValue::Int(expect_int(left)? * expect_int(right)?)),
-        "/" | "OpDiv" => {
-            let rhs = expect_int(right)?;
-            if rhs == 0 {
-                return Err("division by zero in explicit-state fragment".to_owned());
-            }
-            Ok(ExplicitValue::Int(expect_int(left)? / rhs))
-        }
-        "%" | "OpMod" => {
-            let rhs = expect_int(right)?;
-            if rhs == 0 {
-                return Err("modulo by zero in explicit-state fragment".to_owned());
-            }
-            Ok(ExplicitValue::Int(expect_int(left)? % rhs))
-        }
+        // Integer arithmetic follows the shared contract in
+        // `abide_core::arith`: `+`/`-`/`*` are checked (overflow is an error,
+        // never a wrap or panic), and `/`/`%` are EUCLIDEAN with zero/`MIN`-over-
+        // `-1` rejected — the same semantics the simulator and the SMT backends'
+        // `div`/`mod` use, so the explicit-state checker, the concrete witness,
+        // and the solver agree on negative operands and undefined cases.
+        "+" | "OpAdd" => explicit_int_op(abide_core::arith::add, left, right),
+        "-" | "OpSub" => explicit_int_op(abide_core::arith::sub, left, right),
+        "*" | "OpMul" => explicit_int_op(abide_core::arith::mul, left, right),
+        "/" | "OpDiv" => explicit_int_op(abide_core::arith::div_euclid, left, right),
+        "%" | "OpMod" => explicit_int_op(abide_core::arith::rem_euclid, left, right),
         "and" | "&&" | "OpAnd" => Ok(ExplicitValue::Bool(
             expect_bool(left)? && expect_bool(right)?,
         )),
@@ -6275,10 +6433,26 @@ fn expect_int(value: ExplicitValue) -> Result<i64, String> {
     }
 }
 
+/// Apply a shared integer-arithmetic operation to two explicit-state values,
+/// mapping its typed error into the explicit-state diagnostic vocabulary.
+fn explicit_int_op(
+    op: fn(i64, i64) -> abide_core::arith::IntResult,
+    left: ExplicitValue,
+    right: ExplicitValue,
+) -> Result<ExplicitValue, String> {
+    op(expect_int(left)?, expect_int(right)?)
+        .map(ExplicitValue::Int)
+        .map_err(|err| format!("{err} in explicit-state fragment"))
+}
+
 fn eval_unop(op: &str, value: ExplicitValue) -> Result<ExplicitValue, String> {
     match op {
         "not" | "!" | "OpNot" => Ok(ExplicitValue::Bool(!expect_bool(value)?)),
-        "-" | "OpNeg" => Ok(ExplicitValue::Int(-expect_int(value)?)),
+        // Checked negation via the shared contract: `-i64::MIN` is an error,
+        // never a panic or wrap, matching the simulator and the SMT backend.
+        "-" | "OpNeg" => abide_core::arith::neg(expect_int(value)?)
+            .map(ExplicitValue::Int)
+            .map_err(|err| format!("{err} in explicit-state fragment")),
         _ => Err(format!("unsupported explicit-state unary operator `{op}`")),
     }
 }
@@ -6626,12 +6800,33 @@ fn finite_values_for_param(
     }
 }
 
+#[cfg(test)]
 fn enumerate_param_bindings(
     params: &[IRTransParam],
 ) -> Result<Vec<HashMap<String, ExplicitValue>>, String> {
     let mut out = vec![HashMap::new()];
     for param in params {
         let domain = finite_values_for_type(&param.ty)?;
+        let mut next = Vec::new();
+        for bindings in &out {
+            for value in &domain {
+                let mut extended = bindings.clone();
+                extended.insert(param.name.clone(), value.clone());
+                next.push(extended);
+            }
+        }
+        out = next;
+    }
+    Ok(out)
+}
+
+fn enumerate_fair_param_bindings(
+    params: &[IRTransParam],
+    entity_specs: &[ExplicitEntitySpec<'_>],
+) -> Result<Vec<HashMap<String, ExplicitValue>>, String> {
+    let mut out = vec![HashMap::new()];
+    for param in params {
+        let domain = finite_values_for_fair_param(&param.ty, entity_specs)?;
         let mut next = Vec::new();
         for bindings in &out {
             for value in &domain {
@@ -6664,6 +6859,25 @@ fn enumerate_param_bindings_for_state(
         out = next;
     }
     Ok(out)
+}
+
+fn finite_values_for_fair_param(
+    ty: &IRType,
+    entity_specs: &[ExplicitEntitySpec<'_>],
+) -> Result<Vec<ExplicitValue>, String> {
+    match explicit_runtime_type(ty) {
+        IRType::Entity { name } => {
+            let Some(spec) = entity_specs.iter().find(|spec| spec.name == *name) else {
+                return Err(format!(
+                    "unknown explicit-state entity fairness parameter domain `{name}`"
+                ));
+            };
+            Ok((0..spec.slot_count)
+                .map(|slot| ExplicitValue::SlotRef(op::EntitySlotRef::new(name.clone(), slot)))
+                .collect())
+        }
+        _ => finite_values_for_type(ty),
+    }
 }
 
 fn witness_value(value: &ExplicitValue) -> op::WitnessValue {
@@ -6828,6 +7042,94 @@ mod tests {
         IRActionMatchArm, IRActionMatchScrutinee, IRFieldPat, IRMatchArm, IRPattern, IRTransRef,
         IRUpdate, IRVariant,
     };
+    use crate::verify::unsupported_corpus;
+
+    /// The explicit-state evaluator computes integer `/` and `%` with Euclidean
+    /// semantics (matching the SMT backends) and rejects division/modulo by
+    /// zero conservatively instead of panicking.
+    #[test]
+    fn eval_binop_int_div_mod_are_euclidean_and_reject_zero() {
+        use ExplicitValue::Int;
+        // Negative dividend: remainder is non-negative.
+        assert_eq!(eval_binop("OpDiv", Int(-7), Int(2)), Ok(Int(-4)));
+        assert_eq!(eval_binop("OpMod", Int(-7), Int(2)), Ok(Int(1)));
+        // Negative divisor.
+        assert_eq!(eval_binop("OpDiv", Int(7), Int(-2)), Ok(Int(-3)));
+        assert_eq!(eval_binop("OpMod", Int(7), Int(-2)), Ok(Int(1)));
+        // Positive operands are unchanged.
+        assert_eq!(eval_binop("OpDiv", Int(9), Int(3)), Ok(Int(3)));
+        assert_eq!(eval_binop("OpMod", Int(10), Int(4)), Ok(Int(2)));
+        // Division / modulo by zero is rejected, never a panic.
+        assert!(eval_binop("OpDiv", Int(1), Int(0)).is_err());
+        assert!(eval_binop("OpMod", Int(1), Int(0)).is_err());
+    }
+
+    #[test]
+    fn eval_binop_int_overflow_is_an_error_not_a_wrap_or_panic() {
+        use ExplicitValue::Int;
+        // The shared `abide_core::arith` contract makes `+`/`-`/`*` reject i64
+        // overflow instead of wrapping (which would diverge from the SMT
+        // backend's unbounded `Int`) or panicking.
+        assert!(eval_binop("OpAdd", Int(i64::MAX), Int(1)).is_err());
+        assert!(eval_binop("OpSub", Int(i64::MIN), Int(1)).is_err());
+        assert!(eval_binop("OpMul", Int(i64::MAX), Int(2)).is_err());
+        assert!(eval_binop("OpDiv", Int(i64::MIN), Int(-1)).is_err());
+        // In-range arithmetic is unchanged.
+        assert_eq!(eval_binop("OpAdd", Int(2), Int(3)), Ok(Int(5)));
+    }
+
+    #[test]
+    fn eval_unop_neg_overflow_is_an_error_not_a_wrap_or_panic() {
+        use ExplicitValue::Int;
+        // `-i64::MIN` is rejected via the shared contract, never a panic or
+        // wrap, matching the simulator and the SMT backend's unbounded neg.
+        assert!(eval_unop("OpNeg", Int(i64::MIN)).is_err());
+        assert_eq!(eval_unop("OpNeg", Int(5)), Ok(Int(-5)));
+        assert_eq!(eval_unop("OpNeg", Int(-5)), Ok(Int(5)));
+    }
+
+    #[test]
+    fn real_literal_eval_is_quantized_to_canonical_scale() {
+        use std::collections::HashMap;
+        // A real beyond six decimals quantizes to the shared canonical scale,
+        // so explicit-state equality agrees with the SMT backend (which
+        // quantizes via abide_core::arith) instead of comparing full f64 text.
+        let state = ExplicitState {
+            system_values: vec![],
+            entity_slots: vec![],
+        };
+        let specs: Vec<ExplicitEntitySpec> = vec![];
+        let fields = HashMap::new();
+        let vals = HashMap::new();
+        let slots = HashMap::new();
+        let real_lit = |v: f64| IRExpr::Lit {
+            ty: IRType::Real,
+            value: LitVal::Real { value: v },
+            span: None,
+        };
+        let a = eval_expr(
+            &state,
+            &real_lit(0.123_456_7),
+            None,
+            &fields,
+            &specs,
+            &vals,
+            &slots,
+        )
+        .unwrap();
+        let b = eval_expr(
+            &state,
+            &real_lit(0.123_456),
+            None,
+            &fields,
+            &specs,
+            &vals,
+            &slots,
+        )
+        .unwrap();
+        assert_eq!(a, b, "quantized reals must be equal in explicit-state");
+        assert_eq!(eval_eq(a, b), Ok(ExplicitValue::Bool(true)));
+    }
 
     fn bool_lit(value: bool) -> IRExpr {
         IRExpr::Lit {
@@ -7011,6 +7313,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7078,6 +7381,34 @@ mod tests {
         assert!(field_types_with_params(&HashMap::new(), &payload_params)
             .get("decision")
             .is_some_and(|ty| enum_payload_type_has_field(ty, "allowed")));
+
+        let entity_param = vec![IRTransParam {
+            name: "task".to_owned(),
+            ty: IRType::Entity {
+                name: "Task".to_owned(),
+            },
+        }];
+        assert!(
+            enumerate_param_bindings(&entity_param).is_err(),
+            "ordinary static param enumeration must not pretend entity params are finite without a store"
+        );
+        let entity_specs = vec![entity_spec()];
+        let fair_bindings = enumerate_fair_param_bindings(&entity_param, &entity_specs).unwrap();
+        assert_eq!(fair_bindings.len(), 2);
+        assert_eq!(
+            fair_bindings[0].get("task"),
+            Some(&ExplicitValue::SlotRef(op::EntitySlotRef::new(
+                "Task".to_owned(),
+                0
+            )))
+        );
+        assert_eq!(
+            fair_bindings[1].get("task"),
+            Some(&ExplicitValue::SlotRef(op::EntitySlotRef::new(
+                "Task".to_owned(),
+                1
+            )))
+        );
     }
 
     #[test]
@@ -7252,6 +7583,27 @@ mod tests {
             &slot_locals,
         )
         .is_err());
+    }
+
+    #[test]
+    fn explicit_state_eval_rejects_shared_unsupported_ir_corpus() {
+        let state = empty_state();
+        let system_fields = HashMap::new();
+        let value_locals = HashMap::new();
+        let slot_locals = HashMap::new();
+
+        for case in unsupported_corpus::pure_expression_rejection_cases() {
+            eval_expr(
+                &state,
+                &case.expr,
+                None,
+                &system_fields,
+                &[],
+                &value_locals,
+                &slot_locals,
+            )
+            .expect_err("unsupported explicit-state corpus case must not evaluate successfully");
+        }
     }
 
     #[test]
@@ -7430,6 +7782,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7639,6 +7992,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7698,6 +8052,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7763,6 +8118,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -7849,6 +8205,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8030,6 +8387,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8133,6 +8491,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8262,6 +8621,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -8426,6 +8786,7 @@ mod tests {
             extern_assume_exprs: vec![],
             initial_constraints: vec![],
             initial_slot_locals: HashMap::new(),
+            store_ranges: HashMap::new(),
             stutter: true,
             weak_fair: vec![],
             strong_fair: vec![],
@@ -9487,11 +9848,18 @@ mod tests {
                 pattern: IRPattern::PWild,
             }],
         };
-        assert!(pattern_supported(&IRPattern::POr {
+        let wildcard_or_ctor = IRPattern::POr {
             left: Box::new(IRPattern::PWild),
             right: Box::new(ctor.clone()),
-        }));
-        assert!(pattern_supported(&unsupported_ctor));
+        };
+        assert!(pattern_matches(
+            &ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Closed".to_owned(),
+                fields: vec![],
+            },
+            &wildcard_or_ctor
+        ));
         assert!(pattern_matches(
             &ExplicitValue::Enum {
                 enum_name: "Status".to_owned(),
@@ -9499,6 +9867,14 @@ mod tests {
                 fields: vec![],
             },
             &ctor
+        ));
+        assert!(!pattern_matches(
+            &ExplicitValue::Enum {
+                enum_name: "Status".to_owned(),
+                variant: "Open".to_owned(),
+                fields: vec![],
+            },
+            &unsupported_ctor
         ));
         assert!(!pattern_matches(
             &ExplicitValue::Enum {

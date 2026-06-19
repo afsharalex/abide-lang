@@ -343,15 +343,61 @@ fn severity_rank(severity: DiagnosticSeverity) -> u8 {
     }
 }
 
+/// Classifies lexer failures before they are converted into diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexErrorKind {
+    /// A byte sequence did not match any token.
+    Unexpected,
+    /// A decimal integer literal is syntactically valid but outside the
+    /// current `int` literal range.
+    IntegerOverflow,
+}
+
+impl LexErrorKind {
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unexpected => "unexpected character",
+            Self::IntegerOverflow => "integer literal is too large for int",
+        }
+    }
+
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unexpected => "abide::lex::unexpected",
+            Self::IntegerOverflow => "abide::lex::integer_overflow",
+        }
+    }
+
+    #[must_use]
+    pub fn help(self) -> Option<&'static str> {
+        match self {
+            Self::Unexpected => None,
+            Self::IntegerOverflow => {
+                Some("use a smaller integer literal or model the value with another type")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LexErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// A lexer error carrying its own copy of the source string so
 /// `miette` can render the offending character in context.
 ///
 /// Prefer [`Self::to_diagnostic`] when forwarding the error into the
 /// regular [`DiagnosticSink`] pipeline.
 #[derive(Error, MietteDiagnostic, Debug, Clone)]
-#[error("unexpected character")]
+#[error("{kind}")]
 #[diagnostic(code(abide::lex::unexpected))]
 pub struct LexError {
+    /// Specific lexer failure class.
+    pub kind: LexErrorKind,
     /// Owned source text used by `miette` for label rendering.
     #[source_code]
     pub src: String,
@@ -366,6 +412,16 @@ impl LexError {
     /// lexer's lifetime.
     pub fn new(src: &str, span: Span) -> Self {
         Self {
+            kind: LexErrorKind::Unexpected,
+            src: src.to_owned(),
+            span: span.into(),
+        }
+    }
+
+    /// Constructs a lexer error for an overflowing integer literal.
+    pub fn integer_overflow(src: &str, span: Span) -> Self {
+        Self {
+            kind: LexErrorKind::IntegerOverflow,
             src: src.to_owned(),
             span: span.into(),
         }
@@ -376,9 +432,14 @@ impl LexError {
     /// only the span and code).
     #[must_use]
     pub fn to_diagnostic(&self) -> Diagnostic {
-        Diagnostic::error("unexpected character")
-            .with_code("abide::lex::unexpected")
-            .with_span(source_span_to_span(self.span))
+        let diagnostic = Diagnostic::error(self.kind.message())
+            .with_code(self.kind.code())
+            .with_span(source_span_to_span(self.span));
+        if let Some(help) = self.kind.help() {
+            diagnostic.with_help(help)
+        } else {
+            diagnostic
+        }
     }
 }
 
@@ -653,7 +714,30 @@ mod tests {
         assert_eq!(diagnostic.code.as_deref(), Some("abide::lex::unexpected"));
         assert_eq!(diagnostic.message, "unexpected character");
         assert_eq!(diagnostic.span, Some(Span { start: 0, end: 1 }));
+        assert_eq!(diagnostic.help, None);
         assert!(diagnostic.is_error());
+
+        assert_eq!(LexErrorKind::Unexpected.to_string(), "unexpected character");
+        assert_eq!(LexErrorKind::Unexpected.help(), None);
+
+        let overflow = LexError::integer_overflow("999", Span { start: 0, end: 3 }).to_diagnostic();
+        assert_eq!(
+            overflow.code.as_deref(),
+            Some("abide::lex::integer_overflow")
+        );
+        assert_eq!(overflow.message, "integer literal is too large for int");
+        assert_eq!(
+            overflow.help.as_deref(),
+            Some("use a smaller integer literal or model the value with another type")
+        );
+        assert_eq!(
+            LexErrorKind::IntegerOverflow.to_string(),
+            "integer literal is too large for int"
+        );
+        assert_eq!(
+            LexErrorKind::IntegerOverflow.help(),
+            Some("use a smaller integer literal or model the value with another type")
+        );
     }
 
     #[test]

@@ -1215,6 +1215,7 @@ impl EExpr {
             | Self::StructCtor(ty, _, _, _) => ty.clone(),
             Self::Let(_, body, _) => body.ty(),
             Self::Match(scrut, _, _) => scrut.ty(),
+            // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
             Self::Block(items, _) => items.last().map_or(Ty::Error, EExpr::ty),
             Self::VarDecl(_, _, _, rest, _) => rest.ty(),
             Self::While(_, _, _, _) => Ty::Error,
@@ -1223,6 +1224,62 @@ impl EExpr {
             Self::Sorry(_) | Self::Todo(_) | Self::Lam(_, _, _, _) | Self::Unresolved(_, _) => {
                 Ty::Error
             }
+        }
+    }
+
+    /// Get the source span of an expression, if one was recorded.
+    pub fn span(&self) -> Option<crate::span::Span> {
+        match self {
+            Self::Lit(_, _, sp)
+            | Self::Var(_, _, sp)
+            | Self::BinOp(_, _, _, _, sp)
+            | Self::UnOp(_, _, _, sp)
+            | Self::Call(_, _, _, sp)
+            | Self::CallR(_, _, _, _, sp)
+            | Self::Qual(_, _, _, sp)
+            | Self::QualCall(_, _, _, _, sp)
+            | Self::Field(_, _, _, sp)
+            | Self::Prime(_, _, sp)
+            | Self::Quant(_, _, _, _, _, sp)
+            | Self::Always(_, _, sp)
+            | Self::Eventually(_, _, sp)
+            | Self::Until(_, _, _, sp)
+            | Self::Historically(_, _, sp)
+            | Self::Once(_, _, sp)
+            | Self::Previously(_, _, sp)
+            | Self::Since(_, _, _, sp)
+            | Self::Assert(_, _, sp)
+            | Self::Assume(_, _, sp)
+            | Self::Assign(_, _, _, sp)
+            | Self::NamedPair(_, _, _, sp)
+            | Self::Seq(_, _, _, sp)
+            | Self::SameStep(_, _, _, sp)
+            | Self::Let(_, _, sp)
+            | Self::Lam(_, _, _, sp)
+            | Self::Unresolved(_, sp)
+            | Self::TupleLit(_, _, sp)
+            | Self::In(_, _, _, sp)
+            | Self::Card(_, _, sp)
+            | Self::Pipe(_, _, _, sp)
+            | Self::Match(_, _, sp)
+            | Self::Choose(_, _, _, _, sp)
+            | Self::MapUpdate(_, _, _, _, sp)
+            | Self::Index(_, _, _, sp)
+            | Self::SetComp(_, _, _, _, _, _, sp)
+            | Self::RelComp(_, _, _, _, sp)
+            | Self::SetLit(_, _, sp)
+            | Self::SeqLit(_, _, sp)
+            | Self::MapLit(_, _, sp)
+            | Self::Sorry(sp)
+            | Self::Todo(sp)
+            | Self::Block(_, sp)
+            | Self::VarDecl(_, _, _, _, sp)
+            | Self::While(_, _, _, sp)
+            | Self::IfElse(_, _, _, sp)
+            | Self::Aggregate(_, _, _, _, _, _, sp)
+            | Self::Saw(_, _, _, _, sp)
+            | Self::CtorRecord(_, _, _, _, sp)
+            | Self::StructCtor(_, _, _, sp) => *sp,
         }
     }
 }
@@ -1355,6 +1412,14 @@ mod assumption_set_tests {
 
     fn ev(sys: &str, name: &str) -> EventRef {
         EventRef::new(sys, name)
+    }
+
+    #[test]
+    fn collect_event_ref_display_uses_system_scope_separator() {
+        assert_eq!(
+            EventRef::new("Workflow", "advance").to_string(),
+            "Workflow::advance"
+        );
     }
 
     #[test]

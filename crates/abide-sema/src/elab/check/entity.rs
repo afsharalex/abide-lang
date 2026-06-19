@@ -12,27 +12,33 @@ pub(super) fn check_entity(entity: &EEntity, all_known_names: &[String]) -> Vec<
     for action in &entity.actions {
         errors.extend(check_action(entity, action, all_known_names));
     }
-    // invariants are safety-only — liveness
-    // temporal operators (`eventually`, `until`, `previously`, `since`)
-    // are not allowed in invariant bodies.
+    // Invariants are restricted to the state-only safety fragment: no
+    // liveness/past-time temporal operators and no primed (next-state)
+    // expressions.
     for inv in &entity.invariants {
-        check_invariant_body_no_liveness(&inv.body, &mut errors);
+        check_invariant_body_state_only(&inv.body, &mut errors);
     }
 
     errors
 }
 
-/// walk an invariant body and emit
-/// `INVARIANT_LIVENESS_NOT_ALLOWED` for any liveness temporal
-/// operator. The forbidden set is the full list:
+/// Walk an invariant body and emit a diagnostic for any construct outside the
+/// state-only safety fragment. Invariants are single-state predicates, so the
+/// forbidden set is:
 ///
-/// - **Future-time liveness:** `eventually`, `until` (and `next`,
-///   `releases` once those are added to the expression language).
-/// - **Past-time liveness:** `previously`, `since`.
+/// - **Future-time liveness:** `eventually`, `until` (and `next`, `releases`
+///   once those are added to the expression language) →
+///   `INVARIANT_LIVENESS_NOT_ALLOWED`.
+/// - **Past-time liveness:** `previously`, `since` →
+///   `INVARIANT_LIVENESS_NOT_ALLOWED`; the `saw` event observation →
+///   `SAW_NOT_ALLOWED_IN_INVARIANT`.
+/// - **Two-state forms:** a primed `'` (next-state) expression →
+///   `INVARIANT_PRIME_NOT_ALLOWED`.
 ///
-/// Safety operators (`always` — implicit per, `historically`,
-/// `once`) are explicitly allowed and recurse normally.
-pub(super) fn check_invariant_body_no_liveness(expr: &EExpr, errors: &mut Vec<ElabError>) {
+/// Safety operators (`always`, `historically`, `once`) are allowed and recurse
+/// normally. Each rejection still walks its operands so nested violations are
+/// surfaced too.
+pub(super) fn check_invariant_body_state_only(expr: &EExpr, errors: &mut Vec<ElabError>) {
     fn walk(e: &EExpr, errors: &mut Vec<ElabError>) {
         match e {
             EExpr::Eventually(_, _, sp)
@@ -80,13 +86,34 @@ pub(super) fn check_invariant_body_no_liveness(expr: &EExpr, errors: &mut Vec<El
                     _ => unreachable!(),
                 }
             }
+            // Primed (next-state) expressions are a two-state form; invariants
+            // are state-only, so reject them. Recurse to surface nested
+            // violations.
+            EExpr::Prime(_, body, sp) => {
+                let mut err = if let Some(span) = sp {
+                    ElabError::with_span(
+                        ErrorKind::InvalidPrime,
+                        crate::messages::INVARIANT_PRIME_NOT_ALLOWED.to_owned(),
+                        "invariant body".to_owned(),
+                        *span,
+                    )
+                } else {
+                    ElabError::new(
+                        ErrorKind::InvalidPrime,
+                        crate::messages::INVARIANT_PRIME_NOT_ALLOWED.to_owned(),
+                        "invariant body".to_owned(),
+                    )
+                };
+                err.help = Some(crate::messages::HINT_INVARIANT_PRIME_NOT_ALLOWED.into());
+                errors.push(err);
+                walk(body, errors);
+            }
             // Recurse through all other forms.
             EExpr::Always(_, body, _)
             | EExpr::Historically(_, body, _)
             | EExpr::Once(_, body, _)
             | EExpr::UnOp(_, _, body, _)
             | EExpr::Field(_, body, _, _)
-            | EExpr::Prime(_, body, _)
             | EExpr::Card(_, body, _)
             | EExpr::Assert(_, body, _)
             | EExpr::Assume(_, body, _)
@@ -539,7 +566,7 @@ mod tests {
             None,
         );
         let mut errors = Vec::new();
-        check_invariant_body_no_liveness(&expr, &mut errors);
+        check_invariant_body_state_only(&expr, &mut errors);
         assert_eq!(errors.len(), 4);
         for kind in ["eventually", "until", "previously", "since"] {
             assert!(
@@ -547,6 +574,38 @@ mod tests {
                 "expected invariant liveness error for {kind}: {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn invariant_checker_rejects_primed_expressions() {
+        let primed = |span| {
+            EExpr::Prime(
+                Ty::Builtin(BuiltinTy::Bool),
+                Box::new(var(Ty::Builtin(BuiltinTy::Bool), "ready")),
+                span,
+            )
+        };
+
+        // Direct: an invariant body of `ready'` is a two-state expression.
+        let mut errors = Vec::new();
+        check_invariant_body_state_only(
+            &primed(Some(crate::span::Span { start: 1, end: 2 })),
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1, "primed invariant must error: {errors:?}");
+        assert!(matches!(errors[0].kind, ErrorKind::InvalidPrime));
+        assert!(errors[0].message.contains("primed"));
+
+        // Nested under an allowed form (`always (ready')`) must still be caught.
+        let nested = EExpr::Always(Ty::Builtin(BuiltinTy::Bool), Box::new(primed(None)), None);
+        let mut errors = Vec::new();
+        check_invariant_body_state_only(&nested, &mut errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "nested primed invariant must error: {errors:?}"
+        );
+        assert!(matches!(errors[0].kind, ErrorKind::InvalidPrime));
     }
 
     #[test]

@@ -67,10 +67,10 @@ theorem true_each_eventually_painted for Painter {
 
 // ── Until theorem (actual until expression) ─────────────────────
 // Each ball stays Red until it gets painted (non-Red).
-// Desugars to (eventually color != @Red) AND (always (color == @Red implies color == @Red))
-// The Forall wrapping fix correctly extracts QuantifiedEventuality + safety.
-// UNPROVABLE: liveness part requires IC3 BAS which is unsound for
-// liveness (dead-state issue). Sound proof requires k-liveness.
+// Encoded as true LTL until (not desugared into eventually/always).
+// UNPROVABLE: native until is not a flat liveness pattern, so the
+// unbounded reduction declines it rather than proving a weaker reduced
+// obligation. Sound proof requires k-liveness.
 theorem until_painted for Painter {
   assume {
     fair Painter::spawn_ball

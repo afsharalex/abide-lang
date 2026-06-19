@@ -103,9 +103,10 @@ verify persistence_check {
   assert eventually always all s: Signal | s.color == @Green or s.color == @Red
 }
 
-// ── Test 7: Until (conjunction decomposition) ───────────────────────
-// Red until Green: desugars to (eventually Green) AND (always (not Green implies Red))
-// The liveness part should be extracted from the conjunction.
+// ── Test 7: Until (native LTL until) ────────────────────────────────
+// Red until Green: encoded as true LTL until (Green eventually holds, and
+// Red holds at every step strictly before Green first occurs) via the
+// native LTL→Büchi automaton — NOT desugared into eventually/always.
 verify until_check {
   assume {
     store signals: Signal[0..3]
@@ -119,8 +120,8 @@ verify until_check {
 
 // ── Test 8: Until theorem (unbounded path) ──────────────────────────
 // Same as Test 7 but on the theorem/unbounded path.
-// Desugars to quantified eventuality + safety tautology.
-// PROVED via symmetry reduction: liveness on 1-slot, safety by induction.
+// Native until is not a flat liveness pattern, so the unbounded path does
+// not reduce it and reports UNPROVABLE conservatively.
 theorem until_theorem for FairSignal {
   assume {
     fair FairSignal::create_signal

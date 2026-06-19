@@ -17,14 +17,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::smt::{AbideSolver, Bool, Dynamic, Int, SatResult};
 
-use crate::ir::types::{IRExpr, IRSystem, IRType};
+use crate::ir::types::{IRBinOp, IRExpr, IRSystem, IRType};
 
 use super::collections;
 use super::context::VerifyContext;
 use super::defenv;
 use super::encode::{
-    bind_pattern_vars, build_domain_predicate, build_z3_quantifier, encode_ite,
-    encode_pattern_cond, enum_variant_count, make_z3_bound_var_ctx, PureEncodingScope,
+    bind_pattern_vars, build_domain_predicate, build_z3_quantifier, ctor_name_matches, encode_ite,
+    encode_pattern_cond, enum_variant_count, make_z3_bound_var_ctx, unqualify_ctor_name,
+    PureEncodingScope,
 };
 use super::harness::SlotPool;
 use super::scope::VerifyStoreRange;
@@ -251,6 +252,111 @@ pub(super) fn current_path_guard() -> Bool {
             smt::bool_and(&refs)
         }
     })
+}
+
+// Well-definedness obligations for division/modulo. Each records the
+// divisor term that must be non-zero, guarded by the path condition under which
+// the division is actually evaluated. Unlike the precondition obligations
+// above, these are discharged *reachability-aware* against the transition
+// system (see `check_div_by_zero_reachable`), so an invariant-protected divisor
+// is not falsely flagged.
+thread_local! {
+    static PROP_DIV_OBLIGATIONS: RefCell<Vec<(Bool, SmtValue)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Return whether this operator/divisor pair has an undefined zero-divisor case.
+///
+/// `int` and exact-rational `real` `/` and `%` reject zero divisors. IEEE-754
+/// `float` `/` is defined by infinities/NaN, but Abide's Euclidean `float` `%`
+/// has the same nonzero-divisor requirement as the rest of `%`.
+pub(in crate::verify) fn div_mod_requires_nonzero(op: &str, divisor: &SmtValue) -> bool {
+    matches!(
+        (op, divisor),
+        ("OpDiv" | "OpMod", SmtValue::Int(_) | SmtValue::Real(_)) | ("OpMod", SmtValue::Float(_))
+    )
+}
+
+/// Build the SMT condition that a divisor is zero.
+pub(in crate::verify) fn divisor_zero_condition(divisor: &SmtValue) -> Option<Bool> {
+    match divisor {
+        SmtValue::Int(d) => Some(smt::int_eq(d, &smt::int_lit(0))),
+        SmtValue::Real(d) => {
+            let SmtValue::Real(zero) = smt::real_val(0, 1) else {
+                return None;
+            };
+            Some(smt::real_eq(d, &zero))
+        }
+        SmtValue::Float(d) => {
+            let SmtValue::Float(zero) = smt::float_lit(0.0) else {
+                return None;
+            };
+            Some(smt::float_eq(d, &zero))
+        }
+        _ => None,
+    }
+}
+
+/// Record a div/mod well-definedness obligation: under `guard`, the `divisor`
+/// must be non-zero.
+pub(super) fn record_prop_div_obligation(guard: Bool, divisor: SmtValue) {
+    PROP_DIV_OBLIGATIONS.with(|v| v.borrow_mut().push((guard, divisor)));
+}
+
+/// Take (and clear) all recorded div/mod obligations.
+pub(super) fn take_prop_div_obligations() -> Vec<(Bool, SmtValue)> {
+    PROP_DIV_OBLIGATIONS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Clear all recorded div/mod obligations (call before encoding).
+pub(super) fn clear_prop_div_obligations() {
+    PROP_DIV_OBLIGATIONS.with(|v| v.borrow_mut().clear());
+}
+
+// Path-guard stack for the harness (transition) encoder, mirroring
+// `PROP_PATH_GUARD` for the property encoder. The harness pushes a
+// command/action guard around its update-value encoding so a div/mod in a
+// transition update (`x' = a / b`) records the right reachability guard
+// (e.g. the command's `requires`), and is not falsely flagged when the command
+// cannot fire with a zero divisor.
+thread_local! {
+    static HARNESS_DIV_GUARD: RefCell<Vec<Bool>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(in crate::verify) fn push_harness_div_guard(guard: Bool) {
+    HARNESS_DIV_GUARD.with(|v| v.borrow_mut().push(guard));
+}
+
+pub(in crate::verify) fn pop_harness_div_guard() {
+    HARNESS_DIV_GUARD.with(|v| {
+        v.borrow_mut().pop();
+    });
+}
+
+/// The conjunction of the harness path-guard stack (or `true` when empty).
+pub(in crate::verify) fn current_harness_div_guard() -> Bool {
+    HARNESS_DIV_GUARD.with(|v| {
+        let guards = v.borrow();
+        if guards.is_empty() {
+            smt::bool_const(true)
+        } else {
+            let refs: Vec<&Bool> = guards.iter().collect();
+            smt::bool_and(&refs)
+        }
+    })
+}
+
+/// Record an integer div/mod obligation from the harness (transition) encoder,
+/// guarded by the current harness path guard.
+pub(in crate::verify) fn record_harness_div_obligation(divisor: SmtValue) {
+    record_prop_div_obligation(current_harness_div_guard(), divisor);
+}
+
+/// Whether any div/mod obligation is currently recorded (peek, does not clear).
+/// Used to gate the (more expensive) reachability discharge on actual div/mod
+/// presence after a cheap single-step property encoding.
+pub(super) fn prop_div_obligations_present() -> bool {
+    PROP_DIV_OBLIGATIONS.with(|v| !v.borrow().is_empty())
 }
 
 /// Check accumulated precondition obligations. Returns the first
@@ -524,7 +630,15 @@ pub(super) fn encode_prop_expr_with_ctx(
     step: usize,
 ) -> Result<Bool, String> {
     clear_path_guard_stack();
-    let normalized = normalize_verifier_choose_expr(expr)?;
+    // Recursively unwrap transparent `assert`/`assume` property wrappers
+    // before encoding so a property like `assert (assume e)` — or a nested
+    // `always (assert e)` — encodes as the bare property. This uses the same
+    // recursive strip as the support gate (`strip_assert_assume`), so
+    // validation and encoding agree on every wrapper position. The raw
+    // `encode_prop_expr` still rejects a bare Assert/Assume, which the
+    // per-context support corpus relies on.
+    let unwrapped = super::strip_assert_assume(expr);
+    let normalized = normalize_verifier_choose_expr(&unwrapped)?;
     let body = encode_prop_expr(pool, vctx, defs, ctx, &normalized, step)?;
     clear_path_guard_stack();
     Ok(body)
@@ -805,9 +919,16 @@ pub(super) fn encode_prop_expr(
     }
 
     match expr {
-        IRExpr::Assert { expr, .. } | IRExpr::Assume { expr, .. } => {
-            encode_prop_expr(pool, vctx, defs, ctx, expr, step)
-        }
+        IRExpr::Assert { .. } => Err(
+            "Assert expression reached property encoder; assert is an imperative statement"
+                .to_owned(),
+        ),
+        IRExpr::Assume { .. } => Err(
+            "Assume expression reached property encoder; assume is an imperative statement"
+                .to_owned(),
+        ),
+        IRExpr::Sorry { .. } => Err("Sorry expression reached property encoder".to_owned()),
+        IRExpr::Todo { .. } => Err("Todo expression reached property encoder".to_owned()),
         IRExpr::Let { bindings, body, .. } => {
             encode_prop_let_expr(pool, vctx, defs, ctx, bindings, body, step)
         }
@@ -818,9 +939,18 @@ pub(super) fn encode_prop_expr(
             ..
         } => {
             let cond_bool = encode_prop_expr(pool, vctx, defs, ctx, cond, step)?;
-            let then_bool = encode_prop_expr(pool, vctx, defs, ctx, then_body, step)?;
+            // Each branch is only evaluated under its arm of the condition, so
+            // guard obligations recorded inside it (e.g. div/mod well-definedness)
+            // accordingly: `cond` for the then-branch, `not cond` for the else.
+            push_path_guard(cond_bool.clone());
+            let then_result = encode_prop_expr(pool, vctx, defs, ctx, then_body, step);
+            pop_path_guard();
+            let then_bool = then_result?;
             if let Some(else_body) = else_body {
-                let else_bool = encode_prop_expr(pool, vctx, defs, ctx, else_body, step)?;
+                push_path_guard(smt::bool_not(&cond_bool));
+                let else_result = encode_prop_expr(pool, vctx, defs, ctx, else_body, step);
+                pop_path_guard();
+                let else_bool = else_result?;
                 Ok(smt::bool_ite(&cond_bool, &then_bool, &else_bool))
             } else {
                 Ok(smt::bool_implies(&cond_bool, &then_bool))
@@ -842,7 +972,8 @@ pub(super) fn encode_prop_expr(
             // Push the LHS as a path guard so that precondition obligations
             // inside the RHS are guarded by it. Use a scope guard to ensure
             // pop happens even if encoding the RHS returns an error.
-            let is_implies = op == "OpImplies";
+            let logical_op = IRBinOp::try_from(op.as_str())?;
+            let is_implies = matches!(logical_op, IRBinOp::OpImplies);
             if is_implies {
                 push_path_guard(l.clone());
             }
@@ -851,11 +982,11 @@ pub(super) fn encode_prop_expr(
                 pop_path_guard();
             }
             let r = r_result?;
-            match op.as_str() {
-                "OpAnd" => Ok(smt::bool_and(&[&l, &r])),
-                "OpOr" => Ok(smt::bool_or(&[&l, &r])),
-                "OpImplies" => Ok(smt::bool_implies(&l, &r)),
-                "OpXor" => Ok(smt::bool_xor(&l, &r)),
+            match logical_op {
+                IRBinOp::OpAnd => Ok(smt::bool_and(&[&l, &r])),
+                IRBinOp::OpOr => Ok(smt::bool_or(&[&l, &r])),
+                IRBinOp::OpImplies => Ok(smt::bool_implies(&l, &r)),
+                IRBinOp::OpXor => Ok(smt::bool_xor(&l, &r)),
                 _ => Err(format!("unsupported boolean operator: {op}")),
             }
         }
@@ -863,10 +994,12 @@ pub(super) fn encode_prop_expr(
             let inner = encode_prop_expr(pool, vctx, defs, ctx, operand, step)?;
             Ok(smt::bool_not(&inner))
         }
-        // `always P` at a single BMC step is P; the caller supplies the
-        // universal step iteration. Future-time liveness forms must be routed
-        // to the lasso/Buchi encoders instead of weakened at a single step.
-        IRExpr::Always { body, .. } => encode_prop_expr(pool, vctx, defs, ctx, body, step),
+        // `always P` at step n means P holds for every future state in the
+        // bounded trace suffix n..=bound. Top-level always checks are still
+        // supplied by the caller's universal step iteration; this suffix
+        // expansion is what preserves nested always under implication,
+        // quantifiers, matches, etc.
+        IRExpr::Always { body, .. } => encode_prop_always_suffix(pool, vctx, defs, ctx, body, step),
         IRExpr::Eventually { .. } | IRExpr::Until { .. } => Err(
             "future-time temporal property reached single-step property encoder; route through lasso/Buchi temporal verification".to_owned(),
         ),
@@ -1113,6 +1246,29 @@ pub(super) fn encode_prop_expr(
     }
 }
 
+fn encode_prop_always_suffix(
+    pool: &SlotPool,
+    vctx: &VerifyContext,
+    defs: &defenv::DefEnv,
+    ctx: &PropertyCtx,
+    body: &IRExpr,
+    step: usize,
+) -> Result<Bool, String> {
+    if step > pool.bound {
+        return Err(format!(
+            "always suffix starts at step {step}, beyond bounded trace end {}",
+            pool.bound
+        ));
+    }
+
+    let mut conjuncts = Vec::with_capacity(pool.bound - step + 1);
+    for future_step in step..=pool.bound {
+        conjuncts.push(encode_prop_expr(pool, vctx, defs, ctx, body, future_step)?);
+    }
+    let refs: Vec<&Bool> = conjuncts.iter().collect();
+    Ok(smt::bool_and(&refs))
+}
+
 fn encode_prop_let_expr(
     pool: &SlotPool,
     vctx: &VerifyContext,
@@ -1208,7 +1364,10 @@ fn wrap_let_expr(bindings: Vec<crate::ir::types::LetBinding>, body: IRExpr) -> I
 }
 
 fn logical_binop(op: &str) -> bool {
-    matches!(op, "OpAnd" | "OpOr" | "OpImplies" | "OpXor")
+    matches!(
+        IRBinOp::try_from(op),
+        Ok(IRBinOp::OpAnd | IRBinOp::OpOr | IRBinOp::OpImplies | IRBinOp::OpXor)
+    )
 }
 
 fn bindings_contain_choose(bindings: &[crate::ir::types::LetBinding]) -> bool {
@@ -1858,6 +2017,7 @@ fn normalize_verifier_choose_term(
                 .as_ref()
                 .map(|expr| normalize_verifier_choose_term(expr))
                 .transpose()?
+                // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
                 .map_or((Vec::new(), None), |(bindings, expr)| {
                     (bindings, Some(Box::new(expr)))
                 });
@@ -1907,6 +2067,7 @@ fn normalize_verifier_choose_term(
                 .as_ref()
                 .map(|body| normalize_verifier_choose_term(body))
                 .transpose()?
+                // abide-audit: allow-silent-fallback -- default branch is the documented absent or unresolved-type sentinel
                 .map_or((Vec::new(), None), |(bindings, expr)| {
                     (bindings, Some(Box::new(expr)))
                 });
@@ -2154,7 +2315,8 @@ fn default_smt_value_for_expr(expr: &IRExpr) -> Result<SmtValue, String> {
 fn default_smt_value_for_type(ty: &IRType) -> Result<SmtValue, String> {
     match ty {
         IRType::Bool => Ok(smt::bool_val(false)),
-        IRType::Real | IRType::Float => Ok(smt::real_val(0, 1)),
+        IRType::Real => Ok(smt::real_val(0, 1)),
+        IRType::Float => Ok(smt::float_lit(0.0)),
         IRType::Int | IRType::Identity | IRType::String | IRType::Enum { .. } => {
             Ok(smt::int_val(0))
         }
@@ -2568,7 +2730,7 @@ fn encode_prop_value_expr(enc: PropertyEncodingCtx<'_>, expr: &IRExpr) -> Result
             expr,
             enc.step,
         )?)),
-        IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_expr(
+        IRExpr::Always { body, .. } => Ok(SmtValue::Bool(encode_prop_always_suffix(
             enc.pool,
             enc.vctx,
             enc.defs,
@@ -2699,23 +2861,32 @@ fn encode_prop_if_value(
     else_body: Option<&IRExpr>,
 ) -> Result<SmtValue, String> {
     let cond_bool = encode_prop_expr(enc.pool, enc.vctx, enc.defs, enc.property, cond, enc.step)?;
-    let then_val = encode_prop_value(
+    // Each branch's value is only evaluated under its arm of the condition, so
+    // guard obligations recorded inside it (div/mod well-definedness) under
+    // `cond` (then) / `not cond` (else).
+    push_path_guard(cond_bool.clone());
+    let then_result = encode_prop_value(
         enc.pool,
         enc.vctx,
         enc.defs,
         enc.property,
         then_body,
         enc.step,
-    )?;
+    );
+    pop_path_guard();
+    let then_val = then_result?;
     if let Some(else_body) = else_body {
-        let else_val = encode_prop_value(
+        push_path_guard(smt::bool_not(&cond_bool));
+        let else_result = encode_prop_value(
             enc.pool,
             enc.vctx,
             enc.defs,
             enc.property,
             else_body,
             enc.step,
-        )?;
+        );
+        pop_path_guard();
+        let else_val = else_result?;
         encode_ite(&cond_bool, &then_val, &else_val)
     } else {
         let then_bool = then_val.to_bool()?;
@@ -2751,12 +2922,17 @@ fn encode_prop_lit_value(value: &crate::ir::types::LitVal) -> Result<SmtValue, S
     match value {
         crate::ir::types::LitVal::Int { value } => Ok(smt::int_val(*value)),
         crate::ir::types::LitVal::Bool { value } => Ok(smt::bool_val(*value)),
-        crate::ir::types::LitVal::Real { value } | crate::ir::types::LitVal::Float { value } => {
-            #[allow(clippy::cast_possible_truncation)]
-            let scaled = (*value * 1_000_000.0) as i64;
-            Ok(smt::real_val(scaled, 1_000_000))
+        crate::ir::types::LitVal::Real { value } => {
+            // Canonical real semantics: quantize to the shared millionth scale
+            // so the SMT encoding matches the concrete witness (abide_core::arith).
+            let (num, den) = abide_core::arith::real_to_rational(*value);
+            Ok(smt::real_val(num, den))
         }
-        crate::ir::types::LitVal::Str { .. } => Ok(smt::int_val(0)),
+        // `float` is IEEE-754 binary64, a distinct sort from `real` (DDR-059).
+        crate::ir::types::LitVal::Float { value } => Ok(smt::float_lit(*value)),
+        crate::ir::types::LitVal::Str { value } => Ok(smt::int_val(
+            crate::verify::literal::string_literal_id(value),
+        )),
     }
 }
 
@@ -2945,7 +3121,10 @@ fn encode_prop_ctor_value(
     if let Some(value) = encode_prop_adt_ctor_value(enc, enum_name, ctor, args)? {
         return Ok(value);
     }
-    let id = enc.vctx.variants.try_id_of(enum_name, ctor)?;
+    let id = enc
+        .vctx
+        .variants
+        .try_id_of(enum_name, unqualify_ctor_name(ctor))?;
     Ok(smt::int_val(id))
 }
 
@@ -2959,7 +3138,7 @@ fn encode_prop_adt_ctor_value(
         return Ok(None);
     };
     for variant in &dt.variants {
-        if smt::func_decl_name(&variant.constructor) != ctor {
+        if !ctor_name_matches(enum_name, &smt::func_decl_name(&variant.constructor), ctor) {
             continue;
         }
         if args.is_empty() {
@@ -3004,6 +3183,14 @@ fn encode_prop_binop_value(
         _ => {
             let l = encode_prop_value_for_comparison(&enc, left, right)?;
             let r = encode_prop_value_for_comparison(&enc, right, left)?;
+            // Some numeric division/modulo operations are undefined when the
+            // divisor is zero.
+            // Record a well-definedness obligation (discharged reachability-aware)
+            // so a reachable div-by-zero surfaces rather than being absorbed by
+            // the solver's total arithmetic, matching the concrete evaluators.
+            if div_mod_requires_nonzero(op, &r) {
+                record_prop_div_obligation(current_path_guard(), r.clone());
+            }
             Ok(smt::binop(op, &l, &r)?)
         }
     }
@@ -3024,13 +3211,18 @@ fn encode_prop_value_for_comparison(
         Some(IRType::Enum { name, variants }),
     ) = (expr, slot_field_expr_type(enc.property, other))
     {
+        let ctor_name = unqualify_ctor_name(ctor);
         if args.is_empty()
             && enum_name == name
             && variants
                 .iter()
-                .any(|variant| variant.name == *ctor && variant.fields.is_empty())
+                .any(|variant| variant.name == ctor_name && variant.fields.is_empty())
         {
-            return enc.vctx.variants.try_id_of(name, ctor).map(smt::int_val);
+            return enc
+                .vctx
+                .variants
+                .try_id_of(name, ctor_name)
+                .map(smt::int_val);
         }
     }
 
@@ -3580,6 +3772,7 @@ fn encode_prop_store_sourced_entity_set_comp_value(
             comp.filter,
             enc.step,
         )?;
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let fallback = smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic();
         let (key, constraints) =
             encode_set_comp_key(enc.with_property(&inner_ctx), comp.projection, fallback)?;
@@ -3611,6 +3804,7 @@ fn encode_prop_entity_set_comp_value(
         let inner_ctx = enc.property.with_binding(var, entity_name, slot);
         let filter_val =
             encode_prop_expr(enc.pool, enc.vctx, enc.defs, &inner_ctx, filter, enc.step)?;
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let fallback = smt::int_val(i64::try_from(slot).unwrap_or(0)).to_dynamic();
         let (key, constraints) =
             encode_set_comp_key(enc.with_property(&inner_ctx), projection, fallback)?;
@@ -3633,6 +3827,7 @@ fn encode_prop_finite_set_comp_value(
 ) -> Result<SmtValue, String> {
     let mut arr = empty_set_comp_array(enc.vctx, ty)?;
     let true_val = smt::bool_val(true).to_dynamic();
+    // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
     let values = finite_domain_values_with_payloads(enc.vctx, domain).unwrap_or_default();
     for value in values {
         let inner_ctx = enc.property.with_local(var, value.clone());
@@ -3817,7 +4012,13 @@ fn encode_prop_match(
             arm_cond.clone()
         };
 
-        let body_val = encode_prop_value(pool, vctx, defs, &arm_ctx, &arm.body, step)?;
+        // The arm body is only evaluated when the scrutinee matches this arm, so
+        // guard obligations recorded inside it (div/mod well-definedness) by the
+        // arm discriminator.
+        push_path_guard(full_cond.clone());
+        let body_result = encode_prop_value(pool, vctx, defs, &arm_ctx, &arm.body, step);
+        pop_path_guard();
+        let body_val = body_result?;
         result = Some(match result {
             Some(else_val) => encode_ite(&full_cond, &body_val, &else_val)?,
             None => body_val,
@@ -4321,12 +4522,15 @@ pub(super) fn encode_card(
     step: usize,
 ) -> Result<SmtValue, String> {
     if let Some(keys) = finite_set_algebra_keys(inner) {
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         return Ok(smt::int_val(i64::try_from(keys.len()).unwrap_or(0)));
     }
 
     match inner {
         IRExpr::SetLit { .. } | IRExpr::SeqLit { .. } | IRExpr::MapLit { .. } => {
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             let count = collections::finite_literal_cardinality(inner).unwrap_or(0);
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             Ok(smt::int_val(i64::try_from(count).unwrap_or(0)))
         }
         IRExpr::SetComp {
@@ -4360,6 +4564,7 @@ pub(super) fn encode_card(
             ..
         } if finite_domain_values_with_payloads(vctx, domain).is_some() => {
             collections::encode_unique_projected_cardinality(
+                // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                 finite_domain_values_with_payloads(vctx, domain).unwrap_or_default(),
                 |value| {
                     let inner_ctx = ctx.with_local(var, value.clone());
@@ -4401,6 +4606,7 @@ pub(super) fn encode_card(
                         pool, vctx, defs, &inner_ctx, projection, step,
                     )?
                 } else {
+                    // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                     (smt::int_val(i64::try_from(slot).unwrap_or(0)), vec![])
                 };
                 let mut cond_parts = vec![is_active, filter_val];
@@ -4472,6 +4678,7 @@ mod tests {
         IRTypeEntry, IRVariant, IRVariantField, LitVal,
     };
     use crate::verify::harness::create_slot_pool;
+    use crate::verify::unsupported_corpus;
 
     fn empty_ir() -> IRProgram {
         IRProgram {
@@ -4521,6 +4728,31 @@ mod tests {
         let err = check_prop_precondition_obligations().expect("expected violation");
         assert!(err.contains("bad"));
         assert!(take_prop_precondition_obligations().is_empty());
+    }
+
+    #[test]
+    fn property_literal_encoding_distinguishes_string_literals() {
+        let good = encode_prop_lit_value(&LitVal::Str {
+            value: "good".to_owned(),
+        })
+        .expect("good string literal");
+        let bad = encode_prop_lit_value(&LitVal::Str {
+            value: "bad".to_owned(),
+        })
+        .expect("bad string literal");
+
+        assert_eq!(
+            good.as_int().expect("good string int").as_i64(),
+            Some(crate::verify::literal::string_literal_id("good"))
+        );
+        assert_eq!(
+            bad.as_int().expect("bad string int").as_i64(),
+            Some(crate::verify::literal::string_literal_id("bad"))
+        );
+        assert_ne!(
+            good.as_int().expect("good string int").as_i64(),
+            bad.as_int().expect("bad string int").as_i64()
+        );
     }
 
     #[test]
@@ -4645,6 +4877,79 @@ mod tests {
         let until_err = encode_prop_expr(&pool, &vctx, &defs, &ctx, &until, 0)
             .expect_err("until must not be weakened in property fallback");
         assert!(until_err.contains("future-time temporal"), "{until_err}");
+    }
+
+    #[test]
+    fn property_encoder_rejects_shared_unsupported_ir_corpus() {
+        let ir = empty_ir();
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = empty_pool();
+        let ctx = PropertyCtx::new();
+
+        for case in unsupported_corpus::pure_expression_rejection_cases() {
+            encode_prop_expr(&pool, &vctx, &defs, &ctx, &case.expr, 0).expect_err(
+                "unsupported property corpus case must not encode to a successful SMT bool",
+            );
+        }
+    }
+
+    #[test]
+    fn property_encoder_expands_nested_always_over_bounded_suffix() {
+        let entity = IREntity {
+            name: "Flag".to_owned(),
+            fields: vec![IRField {
+                name: "ok".to_owned(),
+                ty: IRType::Bool,
+                default: None,
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let ir = IRProgram {
+            entities: vec![entity.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = create_slot_pool(
+            std::slice::from_ref(&entity),
+            &HashMap::from([("Flag".to_owned(), 1_usize)]),
+            1,
+        );
+        let ctx = PropertyCtx::new().with_binding("flag", "Flag", 0);
+        let nested_always = IRExpr::Always {
+            body: Box::new(IRExpr::Var {
+                name: "ok".to_owned(),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+
+        let encoded = encode_prop_expr(&pool, &vctx, &defs, &ctx, &nested_always, 0)
+            .expect("nested always suffix");
+        let ok_0 = pool
+            .field_at("Flag", 0, "ok", 0)
+            .and_then(|value| value.as_bool().ok())
+            .expect("ok at step 0");
+        let ok_1 = pool
+            .field_at("Flag", 0, "ok", 1)
+            .and_then(|value| value.as_bool().ok())
+            .expect("ok at step 1");
+        let solver = AbideSolver::new();
+        solver.assert(&encoded);
+        solver.assert(ok_0);
+        solver.assert(smt::bool_not(ok_1));
+
+        assert_eq!(
+            solver.check(),
+            SatResult::Unsat,
+            "nested always at step 0 must constrain all future bounded steps"
+        );
     }
 
     #[test]
@@ -7014,6 +7319,23 @@ mod tests {
                 .to_bool()
                 .expect("bool"),
         );
+        solver.assert(&smt::int_eq(
+            pool.field_at("Order", 0, "status", 0)
+                .expect("status0")
+                .as_int()
+                .expect("int"),
+            &smt::int_lit(0),
+        ));
+        solver.assert(&smt::bool_not(&forall));
+        assert_eq!(solver.check(), SatResult::Sat);
+
+        let solver = AbideSolver::new();
+        solver.assert(
+            pool.active_at("Order", 0, 0)
+                .expect("active0")
+                .to_bool()
+                .expect("bool"),
+        );
         solver.assert(
             pool.active_at("Order", 1, 0)
                 .expect("active1")
@@ -7116,6 +7438,118 @@ mod tests {
         );
         solver.assert(&archived_membership);
         assert_eq!(solver.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn encode_prop_expr_store_scoped_forall_distinguishes_enum_constructors() {
+        let status_ty = IRType::Enum {
+            name: "Status".to_owned(),
+            variants: vec![IRVariant::simple("Pending"), IRVariant::simple("Confirmed")],
+        };
+        let entity = IREntity {
+            name: "Order".to_owned(),
+            fields: vec![IRField {
+                name: "status".to_owned(),
+                ty: status_ty.clone(),
+                default: None,
+                initial_constraint: None,
+            }],
+            transitions: vec![],
+            derived_fields: vec![],
+            invariants: vec![],
+            fsm_decls: vec![],
+        };
+        let ir = IRProgram {
+            entities: vec![entity.clone()],
+            ..empty_ir()
+        };
+        let vctx = VerifyContext::from_ir(&ir);
+        let defs = defenv::DefEnv::from_ir(&ir);
+        let pool = create_slot_pool(
+            std::slice::from_ref(&entity),
+            &HashMap::from([("Order".to_owned(), 1_usize)]),
+            0,
+        );
+        let ctx = PropertyCtx::new().with_store_ranges(HashMap::from([(
+            "orders".to_owned(),
+            crate::verify::scope::VerifyStoreRange {
+                entity_type: "Order".to_owned(),
+                start_slot: 0,
+                min_active: 1,
+                slot_count: 1,
+            },
+        )]));
+        let order_var = IRExpr::Var {
+            name: "o".to_owned(),
+            ty: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            span: None,
+        };
+        let membership = IRExpr::Index {
+            map: Box::new(IRExpr::Var {
+                name: "orders".to_owned(),
+                ty: IRType::Set {
+                    element: Box::new(IRType::Entity {
+                        name: "Order".to_owned(),
+                    }),
+                },
+                span: None,
+            }),
+            key: Box::new(order_var.clone()),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let status_confirmed = IRExpr::BinOp {
+            op: "OpEq".to_owned(),
+            left: Box::new(IRExpr::Field {
+                expr: Box::new(order_var),
+                field: "status".to_owned(),
+                ty: status_ty,
+                span: None,
+            }),
+            right: Box::new(IRExpr::Ctor {
+                enum_name: "Status".to_owned(),
+                ctor: "Confirmed".to_owned(),
+                args: vec![],
+                span: None,
+            }),
+            ty: IRType::Bool,
+            span: None,
+        };
+        let forall_confirmed = IRExpr::Forall {
+            var: "o".to_owned(),
+            domain: IRType::Entity {
+                name: "Order".to_owned(),
+            },
+            body: Box::new(IRExpr::BinOp {
+                op: "OpImplies".to_owned(),
+                left: Box::new(membership),
+                right: Box::new(status_confirmed),
+                ty: IRType::Bool,
+                span: None,
+            }),
+            span: None,
+        };
+        let encoded = encode_prop_expr(&pool, &vctx, &defs, &ctx, &forall_confirmed, 0)
+            .expect("store-scoped enum forall should encode");
+        let pending_id = vctx.variants.id_of("Status", "Pending");
+        let solver = AbideSolver::new();
+        solver.assert(
+            pool.active_at("Order", 0, 0)
+                .expect("active")
+                .to_bool()
+                .expect("bool"),
+        );
+        solver.assert(&smt::int_eq(
+            pool.field_at("Order", 0, "status", 0)
+                .expect("status")
+                .as_int()
+                .expect("int"),
+            &smt::int_lit(pending_id),
+        ));
+        solver.assert(&smt::bool_not(&encoded));
+        assert_eq!(solver.check(), SatResult::Sat);
     }
 
     #[test]

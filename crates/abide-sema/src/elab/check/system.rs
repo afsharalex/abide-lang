@@ -162,7 +162,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
     // temporal operators (`eventually`, `until`, `previously`, `since`)
     // are not allowed in system invariant bodies either.
     for inv in &system.invariants {
-        super::check_invariant_body_no_liveness(&inv.body, &mut errors);
+        super::check_invariant_body_state_only(&inv.body, &mut errors);
     }
 
     // validate struct constructor defaults on system fields.
@@ -264,6 +264,7 @@ pub(super) fn check_system(env: &Env, system: &ESystem) -> Vec<ElabError> {
                                     .find(|(vn, _)| vn == name)
                                     .map(|(_, fs)| fs.clone())
                             })
+                            // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
                             .unwrap_or_default();
                         match payload {
                             ReturnPayload::Positional(args) => {

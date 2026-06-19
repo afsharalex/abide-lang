@@ -15,6 +15,10 @@ use super::temporal::LivenessPattern;
 // ── Shared scope construction for verify-block proof techniques ────
 
 /// Slot range owned by a single store within an entity pool.
+///
+/// `min_active` is the store's active lower bound, not just allocation
+/// capacity. Verification backends use it to seed required initial slots and
+/// enforce active cardinality at every encoded state.
 /// Multiple stores of the same entity type share the pool but own
 /// disjoint slot ranges (e.g., `pending: Order[0..3]` → slots 0-2,
 /// `archived: Order[0..2]` → slots 3-4, total Order pool = 5).
@@ -31,6 +35,13 @@ pub struct VerifyStoreRange {
 pub struct VerifyInitialBindings {
     pub bindings: HashMap<String, (String, usize)>,
     pub active_slots: HashSet<(String, usize)>,
+}
+
+pub(super) struct TheoremScopeParts {
+    pub slots_per_entity: HashMap<String, usize>,
+    pub system_names: Vec<String>,
+    pub required_slots: HashMap<String, usize>,
+    pub store_ranges: HashMap<String, VerifyStoreRange>,
 }
 
 pub(super) fn allocate_initial_activations(
@@ -134,6 +145,7 @@ pub(super) fn compute_verify_scope(
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let min_active = (store.lo.max(0) as usize).min(slot_count);
         bound = bound.max(slot_count);
+        // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
         let existing = scope.get(&store.entity_type).copied().unwrap_or(0);
         // Track this store's slot range before accumulating.
         store_ranges.insert(
@@ -160,6 +172,7 @@ pub(super) fn compute_verify_scope(
             bound = bound.max(hi);
             if let Some(sys) = ir.systems.iter().find(|s| s.name == vs.name) {
                 for ent_name in &sys.entities {
+                    // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                     let existing = scope.get(ent_name).copied().unwrap_or(0);
                     scope.insert(ent_name.clone(), existing.max(hi));
                 }
@@ -195,6 +208,7 @@ pub(super) fn compute_verify_scope(
                 }
             }
             for ent_name in &sys.entities {
+                // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                 let existing = scope.get(ent_name).copied().unwrap_or(0);
                 scope.insert(ent_name.clone(), existing.max(bound));
             }
@@ -251,7 +265,7 @@ pub(super) fn compute_theorem_scope(
     theorem: &IRTheorem,
     quantifier_exprs: &[&IRExpr],
     defs: &defenv::DefEnv,
-) -> (HashMap<String, usize>, Vec<String>, HashMap<String, usize>) {
+) -> TheoremScopeParts {
     // Compute quantifier depth per entity from the supplied expressions.
     // Expand through DefEnv first so pred/prop bodies with entity
     // quantifiers contribute their depth.
@@ -261,6 +275,7 @@ pub(super) fn compute_theorem_scope(
         let mut counts: HashMap<String, usize> = HashMap::new();
         super::count_entity_quantifiers(&expanded, &mut counts);
         for (entity, count) in &counts {
+            // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
             let existing = required_slots.get(entity).copied().unwrap_or(0);
             required_slots.insert(entity.clone(), existing.max(*count));
         }
@@ -271,7 +286,10 @@ pub(super) fn compute_theorem_scope(
     // simultaneously bound variables plus one slot for Create
     // transitions.
     let mut scope: HashMap<String, usize> = HashMap::new();
+    let mut store_ranges: HashMap<String, VerifyStoreRange> = HashMap::new();
     let mut system_names: Vec<String> = theorem.systems.clone();
+    let theorem_target_systems: HashSet<&str> =
+        theorem.systems.iter().map(String::as_str).collect();
     let mut systems_to_scan = system_names.clone();
     let mut scanned: HashSet<String> = HashSet::new();
     while let Some(sys_name) = systems_to_scan.pop() {
@@ -293,14 +311,82 @@ pub(super) fn compute_theorem_scope(
                     systems_to_scan.push(lb.system_type.clone());
                 }
             }
+            let mut store_entities: HashSet<&str> = HashSet::new();
+            if theorem_target_systems.contains(sys.name.as_str()) {
+                for store in &sys.store_params {
+                    let required_for_entity = match required_slots.get(&store.entity_type) {
+                        Some(required) => *required,
+                        None => 0,
+                    };
+                    let min_slots = required_for_entity + 1;
+                    let lo = match store.lo {
+                        Some(lo) => lo.max(0),
+                        None => 0,
+                    };
+                    let default_hi = i64::try_from(min_slots.max(2)).unwrap_or(i64::MAX).max(lo);
+                    let hi = store.hi.unwrap_or(default_hi).max(lo).max(0);
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let slot_count = hi as usize;
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let min_active = (lo as usize).min(slot_count);
+                    let existing = match scope.get(&store.entity_type) {
+                        Some(existing) => *existing,
+                        None => 0,
+                    };
+                    let range_name =
+                        unique_theorem_store_name(&store.name, &sys.name, &store_ranges);
+                    store_ranges.insert(
+                        range_name,
+                        VerifyStoreRange {
+                            entity_type: store.entity_type.clone(),
+                            start_slot: existing,
+                            min_active,
+                            slot_count,
+                        },
+                    );
+                    scope.insert(store.entity_type.clone(), existing + slot_count);
+                    store_entities.insert(store.entity_type.as_str());
+                }
+            }
             for ent_name in &sys.entities {
+                if store_entities.contains(ent_name.as_str()) {
+                    continue;
+                }
+                // abide-audit: allow-silent-fallback -- bounded count or slot conversion intentionally collapses invalid capacity to zero
                 let min_slots = required_slots.get(ent_name).copied().unwrap_or(0) + 1;
                 scope.entry(ent_name.clone()).or_insert(min_slots.max(2));
             }
         }
     }
 
-    (scope, system_names, required_slots)
+    TheoremScopeParts {
+        slots_per_entity: scope,
+        system_names,
+        required_slots,
+        store_ranges,
+    }
+}
+
+fn unique_theorem_store_name(
+    store_name: &str,
+    system_name: &str,
+    store_ranges: &HashMap<String, VerifyStoreRange>,
+) -> String {
+    if !store_ranges.contains_key(store_name) {
+        return store_name.to_owned();
+    }
+    let qualified = format!("{system_name}::{store_name}");
+    if !store_ranges.contains_key(&qualified) {
+        return qualified;
+    }
+    let mut index = 2usize;
+    loop {
+        let candidate = format!("{qualified}#{index}");
+        if !store_ranges.contains_key(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 // ── In-scope invariant collection ───────────────────────────────────

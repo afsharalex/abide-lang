@@ -61,7 +61,7 @@ system Commerce(orders: Store<Order>) {
 Notes:
 - `Store<T>` constructor params are the current entity-pool surface.
 - Store constructor params may optionally carry cardinality contracts: `Store<Order>[N]`, `Store<Order>[lo..hi]`, or `Store<Order>[..hi]`.
-- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. Those bounds define store capacity; stores start empty unless the block explicitly activates named entities with `activate {o1} in orders`. Create actions may grow the active population up to the upper bound.
+- Concrete checking scopes belong in `store` declarations inside `assume` or `given` blocks. The lower bound is the active floor and the upper bound is store capacity. Explicit `activate {o1} in orders` clauses bind named instances to initial slots; anonymous slots satisfy any remaining nonzero floor. Create actions may grow the active population up to the upper bound.
 - `command` declares the public API and may carry its executable body inline.
 - `query` is public and pure.
 - `action` is private implementation behavior called by commands or other internal behavior.

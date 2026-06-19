@@ -89,6 +89,7 @@ fn expected_constructor_payload_types(
     }
 
     expected_generic_constructor_payload_types(ctx, written_expected_ty, ctor_name)
+        // abide-audit: allow-silent-fallback -- empty collection/string is the documented neutral value for this path
         .unwrap_or_default()
 }
 

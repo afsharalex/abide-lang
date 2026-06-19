@@ -37,6 +37,62 @@ fn lower_expr_propagates_none_span() {
     }
 }
 
+/// Assignment (`=`) must lower to a distinct IR operator from equality
+/// (`==`), otherwise the function verifier executes a body-position
+/// equality comparison as a mutation. A PRIMED assignment is a
+/// declarative next-state equality constraint and keeps `OpEq` for the
+/// model-checking stack.
+#[test]
+fn lower_distinguishes_assignment_from_equality() {
+    let vi = VariantInfo::new();
+    let ctx = LowerCtx::new(&vi, std::collections::HashSet::new());
+    let int_ty = || E::Ty::Builtin(E::BuiltinTy::Int);
+    let var = |n: &str| E::EExpr::Var(int_ty(), n.to_owned(), None);
+
+    // Unprimed assignment `x = y` → distinct `OpAssign`.
+    let assign = E::EExpr::Assign(int_ty(), Box::new(var("x")), Box::new(var("y")), None);
+    match lower_expr(&assign, &ctx) {
+        IRExpr::BinOp { op, .. } => {
+            assert_eq!(op, "OpAssign", "unprimed assignment must lower to OpAssign");
+        }
+        other => panic!("expected BinOp, got {other:?}"),
+    }
+
+    // Equality `x == y` → `OpEq`, never `OpAssign`.
+    let eq = E::EExpr::BinOp(
+        E::Ty::Builtin(E::BuiltinTy::Bool),
+        E::BinOp::Eq,
+        Box::new(var("x")),
+        Box::new(var("y")),
+        None,
+    );
+    match lower_expr(&eq, &ctx) {
+        IRExpr::BinOp { op, .. } => assert_eq!(op, "OpEq", "equality must lower to OpEq"),
+        other => panic!("expected BinOp, got {other:?}"),
+    }
+
+    // Primed assignment `x' = y` stays `OpEq` (next-state constraint).
+    let primed = E::EExpr::Assign(
+        int_ty(),
+        Box::new(E::EExpr::Prime(int_ty(), Box::new(var("x")), None)),
+        Box::new(var("y")),
+        None,
+    );
+    match lower_expr(&primed, &ctx) {
+        IRExpr::BinOp { op, left, .. } => {
+            assert_eq!(
+                op, "OpEq",
+                "primed assignment stays OpEq for the transition encoder"
+            );
+            assert!(
+                matches!(left.as_ref(), IRExpr::Prime { .. }),
+                "primed assignment keeps its primed lhs"
+            );
+        }
+        other => panic!("expected BinOp, got {other:?}"),
+    }
+}
+
 #[test]
 fn lower_tuple_literal_uses_first_class_tuple_ir() {
     let tuple_ty = E::Ty::Tuple(vec![

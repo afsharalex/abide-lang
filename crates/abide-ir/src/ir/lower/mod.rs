@@ -73,7 +73,26 @@ pub fn lower(er: &E::ElabResult) -> (IRProgram, LowerDiagnostics) {
         .filter(|t| matches!(t.ty, E::Ty::Newtype(_, _)))
         .map(|t| t.name.clone())
         .collect();
-    let ctx = LowerCtx::new(&variant_info, newtypes);
+    let mut ctx = LowerCtx::new(&variant_info, newtypes);
+    // Index system AND extern command result types so body-level `match` over a
+    // command result can lower its arm patterns type-directed. Externs are
+    // included because a cross-call scrutinee can target an extern boundary
+    // (`match Gateway::authorize() { … }`), which sema validates against the
+    // extern command's result type just like a system command.
+    let command_signatures = er
+        .systems
+        .iter()
+        .map(|s| (&s.name, &s.commands))
+        .chain(er.externs.iter().map(|e| (&e.name, &e.commands)));
+    for (target, commands) in command_signatures {
+        for command in commands {
+            if let Some(ty) = &command.return_type {
+                ctx.command_returns
+                    .insert((target.clone(), command.name.clone()), ty);
+            }
+        }
+    }
+    let ctx = ctx;
 
     // All definitions (fn, pred, prop) are lowered uniformly into IRFunction.
     // pred is fn -> Bool with params. prop is nullary fn -> Bool.
@@ -137,6 +156,7 @@ fn lower_interface(
     let mut implementors: Vec<IRInterfaceImplementor> = er
         .systems
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|system| {
             let implemented = system.implements.as_deref()?;
             (canonical(aliases, implemented) == interface.name).then(|| IRInterfaceImplementor {
@@ -145,6 +165,7 @@ fn lower_interface(
             })
         })
         .collect();
+    // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
     implementors.extend(er.externs.iter().filter_map(|external| {
         let implemented = external.implements.as_deref()?;
         (canonical(aliases, implemented) == interface.name).then(|| IRInterfaceImplementor {
@@ -206,11 +227,21 @@ type VariantInfo<'a> = std::collections::HashMap<String, &'a [E::EVariant]>;
 /// metadata for enum field lowering and accumulates diagnostics for
 /// any issues discovered during lowering (e.g. unresolved types that
 /// survived elaboration).
+/// Maps `(system, command)` to the command's declared result type, so a
+/// body-level `match` over a command result can be lowered type-directed
+/// (resolving nested constructor patterns to `PCtor` rather than `PVar`).
+pub type CommandReturns<'a> = std::collections::HashMap<(String, String), &'a E::Ty>;
+
 pub struct LowerCtx<'a> {
     pub variants: &'a VariantInfo<'a>,
     /// Names of newtype declarations. Used to detect newtype constructor
     /// calls during lowering and make them transparent (identity).
     pub newtypes: std::collections::HashSet<String>,
+    /// Declared result types of system commands, keyed by `(system, command)`.
+    /// Empty when not populated (e.g. unit tests that lower expressions in
+    /// isolation); body-level command-result `match` then falls back to
+    /// non-type-directed pattern lowering.
+    pub command_returns: CommandReturns<'a>,
     pub diagnostics: std::cell::RefCell<DiagnosticSink>,
 }
 
@@ -219,6 +250,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             variants,
             newtypes,
+            command_returns: CommandReturns::new(),
             diagnostics: std::cell::RefCell::new(DiagnosticSink::new()),
         }
     }
@@ -440,6 +472,7 @@ fn lower_fn(ef: &E::EFn, ctx: &LowerCtx<'_>) -> IRFunction {
     let refinement_requires: Vec<IRExpr> = ef
         .params
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|(name, ty)| {
             if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
                 Some(lower_expr(&subst_dollar_elab(name, pred), ctx))
@@ -742,6 +775,7 @@ fn lower_action(ea: &E::EAction, ctx: &LowerCtx<'_>) -> IRTransition {
 fn extract_param_refinements(params: &[(String, E::Ty)]) -> Vec<E::EExpr> {
     params
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|(name, ty)| {
             if let E::Ty::Refinement(_, pred) = unwrap_alias(ty) {
                 Some(subst_dollar_elab(name, pred))
@@ -1212,7 +1246,13 @@ fn lower_guard_refs(reqs: &[&E::EExpr], ctx: &LowerCtx<'_>) -> IRExpr {
 }
 
 fn extract_updates(body: &[E::EExpr], ctx: &LowerCtx<'_>) -> Vec<IRUpdate> {
+    // Sema's `check_action_bodies_supported` rejects any entity action
+    // body statement that is not a top-level `Assign(Prime(Var), rhs)`
+    // before lowering runs, so by this point every statement is a
+    // supported primed field update. The projection below is therefore a
+    // defensive backstop — it never silently drops a reachable mutation.
     body.iter()
+        // abide-audit: allow-silent-fallback -- statements are pre-gated by sema check_action_bodies_supported; this only projects the already-validated primed-update shape
         .filter_map(|e| {
             if let E::EExpr::Assign(_, lhs, rhs, _) = e {
                 if let E::EExpr::Prime(_, inner, _) = lhs.as_ref() {
@@ -1357,6 +1397,7 @@ fn lower_scene(
         .collect();
     let mut ordering: Vec<_> = assumes
         .iter()
+        // abide-audit: allow-silent-fallback -- iterator intentionally projects supported variants and drops nonmatching shapes
         .filter_map(|w| match w {
             E::ESceneWhen::Assume(e) => Some(lower_expr(e, ctx)),
             E::ESceneWhen::Action { .. } => None,
